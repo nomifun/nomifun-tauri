@@ -1028,6 +1028,59 @@ mod tests {
         assert_eq!(env.get("COLORTERM").map(String::as_str), Some("truecolor"));
     }
 
+    // End-to-end: prove the injected TERM/COLORTERM actually reach the spawned
+    // child through the REAL PtyHandle path (not just the env map). This mirrors
+    // the Finder-launch case: `cmd.env()` overrides portable-pty's inherited
+    // base, so the child sees xterm-256color regardless of the parent's env.
+    #[cfg(unix)]
+    #[test]
+    fn pty_child_actually_receives_injected_term() {
+        use crate::pty::{PtyHandle, SpawnParams};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut env: HashMap<String, String> = HashMap::new();
+        apply_emulator_env_defaults(&mut env); // exactly what spawn_pty does
+
+        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let cap = captured.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let done_cb = done.clone();
+        let _handle = PtyHandle::spawn(
+            SpawnParams {
+                program: "sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "printf 'TERM=[%s] CT=[%s]\\n' \"$TERM\" \"$COLORTERM\"".to_owned(),
+                ],
+                cwd: String::new(),
+                env,
+                cols: 80,
+                rows: 24,
+            },
+            0,
+            move |chunk| cap.lock().unwrap().extend_from_slice(&chunk),
+            move |_code, _sb| done_cb.store(true, Ordering::SeqCst),
+        )
+        .expect("spawn sh");
+
+        for _ in 0..250 {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let out = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+        assert!(
+            out.contains("TERM=[xterm-256color]"),
+            "child must receive the injected TERM, got: {out:?}"
+        );
+        assert!(
+            out.contains("CT=[truecolor]"),
+            "child must receive the injected COLORTERM, got: {out:?}"
+        );
+    }
+
     // --- In-memory repo --------------------------------------------------
 
     #[derive(Default)]
