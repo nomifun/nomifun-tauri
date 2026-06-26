@@ -27,6 +27,7 @@ use nomifun_idmm::idmm_routes;
 use nomifun_knowledge::knowledge_routes;
 use nomifun_mcp::mcp_routes;
 use nomifun_office::{office_proxy_routes, office_routes};
+use nomifun_orchestrator::orchestrator_routes;
 use nomifun_realtime::{WsHandlerState, ws_upgrade_handler};
 use nomifun_requirement::requirement_routes;
 use nomifun_shell::shell_routes;
@@ -365,6 +366,10 @@ pub fn create_router_with_all_state(
     let webhook_authenticated = webhook_routes(states.webhook)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // 智能编排 (orchestration) fleet + workspace CRUD routes protected by auth middleware
+    let orchestrator_authenticated = orchestrator_routes(states.orchestrator)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // P3-X2: per-pet browser-use credential secret routes protected by auth middleware
     let secret_authenticated = secret_routes(states.secret)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -463,6 +468,7 @@ pub fn create_router_with_all_state(
         .merge(companion_authenticated)
         .merge(knowledge_authenticated)
         .merge(webhook_authenticated)
+        .merge(orchestrator_authenticated)
         .merge(secret_authenticated)
         .merge(terminal_authenticated)
         .merge(office_authenticated)

@@ -37,6 +37,7 @@ use nomifun_office::{
     ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService,
     SnapshotService as OfficeSnapshotService, StarOfficeDetector,
 };
+use nomifun_orchestrator::OrchestratorRouterState;
 use nomifun_companion::CompanionRouterState;
 use nomifun_realtime::{NoopMessageRouter, WsHandlerState};
 use nomifun_requirement::RequirementRouterState;
@@ -78,6 +79,8 @@ pub struct ModuleStates {
     pub knowledge: KnowledgeRouterState,
     pub companion: CompanionRouterState,
     pub webhook: WebhookRouterState,
+    /// 智能编排 (orchestration): fleet + workspace CRUD state (P0).
+    pub orchestrator: OrchestratorRouterState,
     /// P3-X2: per-pet browser-use credential secret CRUD state.
     pub secret: SecretRouterState,
     pub terminal: TerminalRouterState,
@@ -220,6 +223,7 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
         knowledge: KnowledgeRouterState::new(services.knowledge_service.clone()),
         companion: companion_state,
         webhook: build_webhook_state(services),
+        orchestrator: build_orchestrator_state(services),
         secret: build_secret_state(services),
         terminal: build_terminal_state(services),
         office: build_office_state(services),
@@ -871,6 +875,21 @@ pub fn build_webhook_state(services: &AppServices) -> WebhookRouterState {
     let sender: Arc<dyn nomifun_webhook::WebhookSender> = Arc::new(nomifun_webhook::DefaultWebhookSender::new());
     let service = nomifun_webhook::WebhookService::new(webhook_repo, tag_setting_repo, sender);
     WebhookRouterState { service }
+}
+
+/// Build the `OrchestratorRouterState` (智能编排: fleet + workspace CRUD). P0 needs
+/// no AppServices singleton — just the DB pool — so it constructs fresh repos +
+/// services inline, mirroring `build_webhook_state`. The repos are root-re-exported
+/// from `nomifun_db`; the services wrap them as `Arc<dyn ...>`.
+pub fn build_orchestrator_state(services: &AppServices) -> OrchestratorRouterState {
+    let pool = services.database.pool().clone();
+    let fleet_repo: Arc<dyn nomifun_db::IFleetRepository> =
+        Arc::new(nomifun_db::SqliteFleetRepository::new(pool.clone()));
+    let ws_repo: Arc<dyn nomifun_db::IOrchWorkspaceRepository> =
+        Arc::new(nomifun_db::SqliteOrchWorkspaceRepository::new(pool));
+    let fleet = nomifun_orchestrator::FleetService::new(fleet_repo);
+    let workspace = nomifun_orchestrator::WorkspaceService::new(ws_repo);
+    OrchestratorRouterState::new(fleet, workspace)
 }
 
 /// **P3-X2**: build the `SecretRouterState` (browser-use credential CRUD).

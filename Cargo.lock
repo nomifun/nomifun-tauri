@@ -5355,6 +5355,7 @@ dependencies = [
  "nomifun-mcp",
  "nomifun-net",
  "nomifun-office",
+ "nomifun-orchestrator",
  "nomifun-public",
  "nomifun-realtime",
  "nomifun-requirement",

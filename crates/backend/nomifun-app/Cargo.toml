@@ -69,6 +69,7 @@ nomifun-cron.workspace = true
 nomifun-requirement.workspace = true
 nomifun-idmm.workspace = true
 nomifun-knowledge.workspace = true
+nomifun-orchestrator.workspace = true
 nomifun-companion.workspace = true
 nomifun-gateway.workspace = true
 nomifun-public.workspace = true
