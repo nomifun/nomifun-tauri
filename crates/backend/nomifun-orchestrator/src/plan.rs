@@ -67,16 +67,45 @@ impl LlmPlanProducer {
     }
 }
 
+/// Pick the planning "lead" model from the fleet members.
+///
+/// The app wires `LlmPlanProducer` with an EMPTY placeholder `lead`
+/// (`provider_id:""`, `model:""`), which `resolve_provider_config` rejects
+/// before `parse_plan`'s fail-soft can ever run — so every real run would stall
+/// in `planning`. The real provider+model live on the fleet members, so derive
+/// the lead from the FIRST member that carries BOTH a non-empty `provider_id`
+/// AND a non-empty `model` (mirroring the Nomi-engine member contract in
+/// `worker.rs`). If no member qualifies, fall back to the construction-time
+/// `lead` override.
+fn pick_lead(members: &[FleetMember], fallback: &ProviderWithModel) -> ProviderWithModel {
+    for m in members {
+        if let (Some(pid), Some(model)) = (m.provider_id.as_ref(), m.model.as_ref()) {
+            if !pid.is_empty() && !model.is_empty() {
+                return ProviderWithModel {
+                    provider_id: pid.clone(),
+                    model: model.clone(),
+                    use_model: Some(model.clone()),
+                };
+            }
+        }
+    }
+    fallback.clone()
+}
+
 #[async_trait]
 impl PlanProducer for LlmPlanProducer {
     async fn produce(&self, goal: &str, members: &[FleetMember]) -> Result<PlannedDag, AppError> {
+        // Derive the lead from the fleet members; `self.lead` is the
+        // construction-time override/fallback only (the app wires it empty).
+        let lead = pick_lead(members, &self.lead);
+
         // The model to plan with: prefer the explicit use_model alias, else model.
-        let model = self.lead.use_model.as_deref().unwrap_or(&self.lead.model);
+        let model = lead.use_model.as_deref().unwrap_or(&lead.model);
 
         let cfg = resolve_provider_config(
             &self.provider_repo,
             &self.encryption_key,
-            &self.lead.provider_id,
+            &lead.provider_id,
             model,
             self.workspace.as_path(),
         )
@@ -394,5 +423,70 @@ mod tests {
         let prompt = build_plan_user_prompt("Solo goal", &[]);
         assert!(prompt.contains("Solo goal"));
         assert!(prompt.contains("none"));
+    }
+
+    /// Build a minimal `FleetMember` carrying the given provider/model.
+    fn member_with(provider_id: Option<&str>, model: Option<&str>) -> FleetMember {
+        FleetMember {
+            id: "fm".to_string(),
+            agent_id: "agent".to_string(),
+            provider_id: provider_id.map(str::to_string),
+            model: model.map(str::to_string),
+            role_hint: None,
+            capability_profile: None,
+            constraints: None,
+            sort_order: 0,
+        }
+    }
+
+    #[test]
+    fn pick_lead_picks_first_member_with_provider_and_model() {
+        let fallback = ProviderWithModel {
+            provider_id: String::new(),
+            model: String::new(),
+            use_model: None,
+        };
+        // members[0] lacks a model; members[1] is fully specified → pick [1].
+        let members = vec![
+            member_with(Some("prov_a"), None),
+            member_with(Some("prov_b"), Some("model_b")),
+        ];
+        let lead = pick_lead(&members, &fallback);
+        assert_eq!(lead.provider_id, "prov_b");
+        assert_eq!(lead.model, "model_b");
+        assert_eq!(lead.use_model.as_deref(), Some("model_b"));
+    }
+
+    #[test]
+    fn pick_lead_skips_empty_string_provider() {
+        let fallback = ProviderWithModel {
+            provider_id: String::new(),
+            model: String::new(),
+            use_model: None,
+        };
+        // members[0] has an EMPTY provider_id → skipped; members[1] qualifies.
+        let members = vec![
+            member_with(Some(""), Some("model_x")),
+            member_with(Some("prov_real"), Some("model_real")),
+        ];
+        let lead = pick_lead(&members, &fallback);
+        assert_eq!(lead.provider_id, "prov_real");
+        assert_eq!(lead.model, "model_real");
+        assert_eq!(lead.use_model.as_deref(), Some("model_real"));
+    }
+
+    #[test]
+    fn pick_lead_falls_back_when_no_member_qualifies() {
+        let fallback = ProviderWithModel {
+            provider_id: "fallback_prov".to_string(),
+            model: "fallback_model".to_string(),
+            use_model: Some("fallback_use".to_string()),
+        };
+        // No member carries both provider+model → return the fallback as-is.
+        let members = vec![member_with(None, Some("m")), member_with(Some("p"), None), member_with(Some(""), Some(""))];
+        let lead = pick_lead(&members, &fallback);
+        assert_eq!(lead.provider_id, "fallback_prov");
+        assert_eq!(lead.model, "fallback_model");
+        assert_eq!(lead.use_model.as_deref(), Some("fallback_use"));
     }
 }

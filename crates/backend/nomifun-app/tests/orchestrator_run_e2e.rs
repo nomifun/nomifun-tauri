@@ -260,7 +260,7 @@ async fn run_create_plan_execute_completes_through_routes() {
     let deps = detail["deps"].as_array().expect("deps array");
     assert_eq!(deps.len(), 1, "one dep edge (Gather→Synthesize)");
 
-    // 3 assignments? No — 2 tasks → 2 assignments, both source=auto.
+    // 2 tasks → 2 auto assignments, both source=auto.
     let assignments = detail["assignments"].as_array().expect("assignments array");
     assert_eq!(assignments.len(), 2, "2 assignments persisted");
     for a in assignments {
