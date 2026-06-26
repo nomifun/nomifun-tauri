@@ -5832,6 +5832,7 @@ dependencies = [
  "nomifun-auth",
  "nomifun-common",
  "nomifun-db",
+ "nomifun-realtime",
  "serde_json",
  "sqlx",
  "thiserror 2.0.18",
