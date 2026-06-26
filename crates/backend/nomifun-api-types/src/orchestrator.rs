@@ -128,6 +128,135 @@ pub struct UpdateWorkspaceRequest {
     pub default_fleet_id: Option<Option<String>>,
 }
 
+// ---------------------------------------------------------------------------
+// Run / Task / Plan DTOs
+//
+// `status` (run + task) and `source` stay as plain `String` on the wire to match
+// the TEXT columns in the Row structs (`OrchRunRow`, `OrchRunTaskRow`,
+// `OrchAssignmentRow`) and the project-wide convention (acp/cron/team/... all use
+// `status: String`). The service layer (Task 6) maps Row↔DTO 1:1, decoding the
+// JSON-as-TEXT columns (`task_profile`, `output_files`) into the structured
+// shapes below.
+// ---------------------------------------------------------------------------
+
+/// An orchestration run as returned to clients: a goal plus its decomposed task
+/// DAG. Mirrors [`OrchRunRow`](../../nomifun_db) minus `user_id`/`fleet_snapshot`/
+/// `forked_from` (internal columns not surfaced on the wire).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Run {
+    pub id: String,
+    pub workspace_id: String,
+    pub goal: String,
+    pub autonomy: String,
+    pub max_parallel: Option<i64>,
+    pub status: String,
+    pub summary: Option<String>,
+    /// Lead/coordinator worker conversation — local `conversations.id` INTEGER.
+    pub lead_conv_id: Option<i64>,
+    pub total_tokens: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// One decomposed task within a run. Mirrors `OrchRunTaskRow` with the
+/// JSON-as-TEXT columns decoded: `task_profile` (JSON → [`TaskProfile`]) and
+/// `output_files` (JSON → `Vec<String>`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunTask {
+    pub id: String,
+    pub run_id: String,
+    pub title: String,
+    pub spec: String,
+    pub task_profile: Option<TaskProfile>,
+    pub status: String,
+    /// Worker conversation — local `conversations.id` INTEGER.
+    pub conversation_id: Option<i64>,
+    pub output_summary: Option<String>,
+    pub output_files: Vec<String>,
+    pub attempt: i64,
+    pub tokens: Option<i64>,
+    pub graph_x: Option<f64>,
+    pub graph_y: Option<f64>,
+}
+
+/// A blocker→blocked edge in the task DAG. Mirrors `OrchRunTaskDepRow`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunTaskDep {
+    pub blocker_task_id: String,
+    pub blocked_task_id: String,
+}
+
+/// A member assigned to a task (auto-scored or locked). Mirrors
+/// `OrchAssignmentRow` with `locked` decoded from the INTEGER column to `bool`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Assignment {
+    pub id: String,
+    pub task_id: String,
+    pub member_id: String,
+    pub score: Option<f64>,
+    pub rationale: Option<String>,
+    pub source: String,
+    pub locked: bool,
+}
+
+/// Structured capability requirements of a task, used to route it to a member.
+/// Stored as JSON in the `orch_run_tasks.task_profile` TEXT column.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskProfile {
+    pub kind: String,
+    pub needs_vision: bool,
+    pub needs_long_context: bool,
+    pub needs_high_reasoning: bool,
+    pub bulk: bool,
+}
+
+/// A run plus its full task DAG: tasks, dependency edges, and assignments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunDetail {
+    pub run: Run,
+    pub tasks: Vec<RunTask>,
+    pub deps: Vec<RunTaskDep>,
+    pub assignments: Vec<Assignment>,
+}
+
+/// Create (and kick off) an orchestration run within a workspace against a fleet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateRunRequest {
+    pub workspace_id: String,
+    pub goal: String,
+    pub fleet_id: String,
+    #[serde(default)]
+    pub autonomy: Option<String>,
+    #[serde(default)]
+    pub max_parallel: Option<i64>,
+}
+
+/// One planned task in a [`PlannedDag`]. Produced by the PlanProducer (主管规划)
+/// and accepted as the `nomi_run_plan` gateway input. Dependencies and member
+/// assignment reference other tasks/members by 0-based index because no ids exist
+/// yet at planning time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedTask {
+    pub title: String,
+    pub spec: String,
+    #[serde(default)]
+    pub task_profile: Option<TaskProfile>,
+    /// 0-based indices into [`PlannedDag::tasks`] this task depends on.
+    #[serde(default)]
+    pub depends_on: Vec<usize>,
+    /// 0-based index into the fleet's members, if pre-assigned.
+    #[serde(default)]
+    pub member_index: Option<usize>,
+    #[serde(default)]
+    pub rationale: Option<String>,
+}
+
+/// The planned task DAG: the PlanProducer output / `nomi_run_plan` input.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedDag {
+    pub tasks: Vec<PlannedTask>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +359,207 @@ mod tests {
         let keep: UpdateWorkspaceRequest =
             serde_json::from_str(r#"{}"#).expect("deserialize keep");
         assert_eq!(keep.default_fleet_id, None);
+    }
+
+    #[test]
+    fn planned_dag_round_trips() {
+        let dag = PlannedDag {
+            tasks: vec![
+                PlannedTask {
+                    title: "Gather sources".to_string(),
+                    spec: "Search the web for primary sources.".to_string(),
+                    task_profile: Some(TaskProfile {
+                        kind: "research".to_string(),
+                        needs_vision: false,
+                        needs_long_context: true,
+                        needs_high_reasoning: false,
+                        bulk: true,
+                    }),
+                    depends_on: vec![],
+                    member_index: None,
+                    rationale: Some("breadth-first collection".to_string()),
+                },
+                PlannedTask {
+                    title: "Synthesize report".to_string(),
+                    spec: "Write a cited synthesis from the gathered sources.".to_string(),
+                    task_profile: None,
+                    depends_on: vec![0],
+                    member_index: Some(1),
+                    rationale: None,
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&dag).expect("serialize");
+        let back: PlannedDag = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(back.tasks.len(), 2);
+        assert_eq!(back.tasks[0].title, "Gather sources");
+        assert!(back.tasks[0].depends_on.is_empty());
+        assert_eq!(back.tasks[0].member_index, None);
+        let profile = back.tasks[0].task_profile.as_ref().expect("profile");
+        assert_eq!(profile.kind, "research");
+        assert!(profile.needs_long_context);
+        assert!(profile.bulk);
+        assert!(!profile.needs_vision);
+
+        assert_eq!(back.tasks[1].title, "Synthesize report");
+        assert_eq!(back.tasks[1].depends_on, vec![0]);
+        assert_eq!(back.tasks[1].member_index, Some(1));
+        assert!(back.tasks[1].task_profile.is_none());
+        assert_eq!(back.tasks[1].rationale, None);
+    }
+
+    #[test]
+    fn create_run_request_round_trips() {
+        let req = CreateRunRequest {
+            workspace_id: "ws_abc".to_string(),
+            goal: "Research the orchestration market.".to_string(),
+            fleet_id: "fleet_xyz".to_string(),
+            autonomy: Some("supervised".to_string()),
+            max_parallel: Some(4),
+        };
+
+        let json = serde_json::to_string(&req).expect("serialize");
+        let back: CreateRunRequest = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(back.workspace_id, "ws_abc");
+        assert_eq!(back.goal, "Research the orchestration market.");
+        assert_eq!(back.fleet_id, "fleet_xyz");
+        assert_eq!(back.autonomy.as_deref(), Some("supervised"));
+        assert_eq!(back.max_parallel, Some(4));
+
+        // Optional fields default when absent.
+        let minimal: CreateRunRequest = serde_json::from_str(
+            r#"{"workspace_id":"ws_1","goal":"g","fleet_id":"f_1"}"#,
+        )
+        .expect("deserialize minimal");
+        assert_eq!(minimal.autonomy, None);
+        assert_eq!(minimal.max_parallel, None);
+    }
+
+    #[test]
+    fn run_detail_round_trips() {
+        let detail = RunDetail {
+            run: Run {
+                id: "run_1".to_string(),
+                workspace_id: "ws_abc".to_string(),
+                goal: "Research and synthesize.".to_string(),
+                autonomy: "supervised".to_string(),
+                max_parallel: Some(2),
+                status: "running".to_string(),
+                summary: Some("in progress".to_string()),
+                lead_conv_id: Some(101),
+                total_tokens: Some(4242),
+                created_at: 1_700_000_000_000,
+                updated_at: 1_700_000_500_000,
+            },
+            tasks: vec![
+                RunTask {
+                    id: "task_1".to_string(),
+                    run_id: "run_1".to_string(),
+                    title: "Gather".to_string(),
+                    spec: "collect".to_string(),
+                    task_profile: Some(TaskProfile {
+                        kind: "research".to_string(),
+                        needs_vision: false,
+                        needs_long_context: true,
+                        needs_high_reasoning: true,
+                        bulk: false,
+                    }),
+                    status: "done".to_string(),
+                    conversation_id: Some(201),
+                    output_summary: Some("found 12 sources".to_string()),
+                    output_files: vec!["sources.md".to_string(), "notes.txt".to_string()],
+                    attempt: 1,
+                    tokens: Some(1234),
+                    graph_x: Some(10.5),
+                    graph_y: Some(20.0),
+                },
+                RunTask {
+                    id: "task_2".to_string(),
+                    run_id: "run_1".to_string(),
+                    title: "Synthesize".to_string(),
+                    spec: "write".to_string(),
+                    task_profile: None,
+                    status: "pending".to_string(),
+                    conversation_id: None,
+                    output_summary: None,
+                    output_files: vec![],
+                    attempt: 0,
+                    tokens: None,
+                    graph_x: None,
+                    graph_y: None,
+                },
+            ],
+            deps: vec![RunTaskDep {
+                blocker_task_id: "task_1".to_string(),
+                blocked_task_id: "task_2".to_string(),
+            }],
+            assignments: vec![Assignment {
+                id: "asg_1".to_string(),
+                task_id: "task_1".to_string(),
+                member_id: "fm_1".to_string(),
+                score: Some(0.87),
+                rationale: Some("best at research".to_string()),
+                source: "auto".to_string(),
+                locked: false,
+            }],
+        };
+
+        let json = serde_json::to_string(&detail).expect("serialize");
+        let back: RunDetail = serde_json::from_str(&json).expect("deserialize");
+
+        // Run.
+        assert_eq!(back.run.id, "run_1");
+        assert_eq!(back.run.workspace_id, "ws_abc");
+        assert_eq!(back.run.autonomy, "supervised");
+        assert_eq!(back.run.max_parallel, Some(2));
+        assert_eq!(back.run.status, "running");
+        assert_eq!(back.run.summary.as_deref(), Some("in progress"));
+        assert_eq!(back.run.lead_conv_id, Some(101));
+        assert_eq!(back.run.total_tokens, Some(4242));
+        assert_eq!(back.run.created_at, 1_700_000_000_000);
+        assert_eq!(back.run.updated_at, 1_700_000_500_000);
+
+        // Tasks.
+        assert_eq!(back.tasks.len(), 2);
+        let t1 = &back.tasks[0];
+        assert_eq!(t1.id, "task_1");
+        assert_eq!(t1.run_id, "run_1");
+        assert_eq!(t1.status, "done");
+        assert_eq!(t1.conversation_id, Some(201));
+        assert_eq!(t1.output_files, vec!["sources.md", "notes.txt"]);
+        assert_eq!(t1.attempt, 1);
+        assert_eq!(t1.tokens, Some(1234));
+        assert_eq!(t1.graph_x, Some(10.5));
+        assert_eq!(t1.graph_y, Some(20.0));
+        let t1_profile = t1.task_profile.as_ref().expect("t1 profile");
+        assert!(t1_profile.needs_high_reasoning);
+        assert!(!t1_profile.bulk);
+
+        let t2 = &back.tasks[1];
+        assert_eq!(t2.id, "task_2");
+        assert_eq!(t2.status, "pending");
+        assert_eq!(t2.conversation_id, None);
+        assert!(t2.output_files.is_empty());
+        assert!(t2.task_profile.is_none());
+        assert_eq!(t2.attempt, 0);
+
+        // Deps.
+        assert_eq!(back.deps.len(), 1);
+        assert_eq!(back.deps[0].blocker_task_id, "task_1");
+        assert_eq!(back.deps[0].blocked_task_id, "task_2");
+
+        // Assignments.
+        assert_eq!(back.assignments.len(), 1);
+        let asg = &back.assignments[0];
+        assert_eq!(asg.id, "asg_1");
+        assert_eq!(asg.task_id, "task_1");
+        assert_eq!(asg.member_id, "fm_1");
+        assert_eq!(asg.score, Some(0.87));
+        assert_eq!(asg.rationale.as_deref(), Some("best at research"));
+        assert_eq!(asg.source, "auto");
+        assert!(!asg.locked);
     }
 }
