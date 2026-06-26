@@ -37,7 +37,10 @@ use nomifun_office::{
     ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService,
     SnapshotService as OfficeSnapshotService, StarOfficeDetector,
 };
-use nomifun_orchestrator::OrchestratorRouterState;
+use nomifun_orchestrator::{
+    ConversationWorkerRunner, OrchestratorRouterState, OrchestratorRunEventEmitter, PlanProducer,
+    RunEngine, RunEngineDeps, RunService, WorkerRunner,
+};
 use nomifun_companion::CompanionRouterState;
 use nomifun_realtime::{NoopMessageRouter, WsHandlerState};
 use nomifun_requirement::RequirementRouterState;
@@ -877,19 +880,90 @@ pub fn build_webhook_state(services: &AppServices) -> WebhookRouterState {
     WebhookRouterState { service }
 }
 
-/// Build the `OrchestratorRouterState` (智能编排: fleet + workspace CRUD). P0 needs
-/// no AppServices singleton — just the DB pool — so it constructs fresh repos +
-/// services inline, mirroring `build_webhook_state`. The repos are root-re-exported
-/// from `nomifun_db`; the services wrap them as `Arc<dyn ...>`.
+/// Build the `OrchestratorRouterState` (智能编排: fleet + workspace CRUD + the Run
+/// control-plane). P0 needed no AppServices singleton; P1a adds the Run
+/// [`RunService`] (create/plan/inspect/cancel) + [`RunEngine`] (serial execution
+/// loop). The fleet/workspace repos + the run repo are root-re-exported from
+/// `nomifun_db`; the worker runs tasks on real nomi conversations via a
+/// `ConversationWorkerRunner` built from a fresh `ConversationService` (the same
+/// recipe `build_cron_state` / `build_requirement_state` use).
+///
+/// NOTE(Task 9): the [`PlanProducer`] is wired here as a placeholder that errors
+/// at plan time — selecting the real "lead" model + building an `LlmPlanProducer`
+/// (and resuming persisted `running` runs at boot) is Task 9's app-integration
+/// job. Fleet/workspace CRUD and run create/inspect/cancel are fully functional
+/// with this placeholder; only `plan()` is gated until Task 9 supplies the lead.
 pub fn build_orchestrator_state(services: &AppServices) -> OrchestratorRouterState {
     let pool = services.database.pool().clone();
     let fleet_repo: Arc<dyn nomifun_db::IFleetRepository> =
         Arc::new(nomifun_db::SqliteFleetRepository::new(pool.clone()));
     let ws_repo: Arc<dyn nomifun_db::IOrchWorkspaceRepository> =
-        Arc::new(nomifun_db::SqliteOrchWorkspaceRepository::new(pool));
-    let fleet = nomifun_orchestrator::FleetService::new(fleet_repo);
-    let workspace = nomifun_orchestrator::WorkspaceService::new(ws_repo);
-    OrchestratorRouterState::new(fleet, workspace)
+        Arc::new(nomifun_db::SqliteOrchWorkspaceRepository::new(pool.clone()));
+    let run_repo: Arc<dyn nomifun_db::IRunRepository> =
+        Arc::new(nomifun_db::SqliteRunRepository::new(pool.clone()));
+    let fleet = nomifun_orchestrator::FleetService::new(fleet_repo.clone());
+    let workspace = nomifun_orchestrator::WorkspaceService::new(ws_repo.clone());
+
+    // Realtime emitter shares the app's broadcast bus.
+    let emitter = OrchestratorRunEventEmitter::new(services.event_bus.clone());
+
+    // Worker = a fresh nomi conversation. Build a ConversationService mirroring
+    // build_cron_state's recipe, then a ConversationWorkerRunner over it.
+    let conv_repo: Arc<dyn nomifun_db::IConversationRepository> =
+        Arc::new(SqliteConversationRepository::new(pool.clone()));
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
+        Arc::new(SqliteAgentMetadataRepository::new(pool.clone()));
+    let acp_session_repo: Arc<dyn IAcpSessionRepository> =
+        Arc::new(SqliteAcpSessionRepository::new(pool.clone()));
+    let skill_resolver = Arc::new(nomifun_conversation::skill_resolver::ExtensionSkillResolver::new(
+        services.skill_paths.clone(),
+    ));
+    let conv_service = ConversationService::new(
+        services.work_dir.clone(),
+        services.event_bus.clone(),
+        skill_resolver,
+        services.worker_task_manager.clone(),
+        conv_repo,
+        agent_metadata_repo,
+        acp_session_repo,
+    )
+    .with_runtime_state(services.conversation_runtime_state.clone());
+    let worker: Arc<dyn WorkerRunner> = Arc::new(ConversationWorkerRunner::new(
+        conv_service,
+        services.worker_task_manager.clone(),
+        "system_default_user".to_string(),
+    ));
+
+    // Placeholder planner (Task 9 replaces with a real LlmPlanProducer).
+    let planner: Arc<dyn PlanProducer> = Arc::new(UnwiredPlanProducer);
+
+    let run_service = Arc::new(RunService::new(
+        run_repo.clone(),
+        fleet_repo,
+        ws_repo,
+        planner,
+        emitter.clone(),
+    ));
+    let engine = RunEngine::new(Arc::new(RunEngineDeps::new(run_repo, worker, emitter)));
+    OrchestratorRouterState::new(fleet, workspace, run_service, engine)
+}
+
+/// Placeholder [`PlanProducer`] until Task 9 wires the real lead-model planner.
+/// Erroring (rather than returning a fake DAG) makes a premature `plan()` call
+/// fail loudly instead of silently producing a degenerate run.
+struct UnwiredPlanProducer;
+
+#[async_trait::async_trait]
+impl PlanProducer for UnwiredPlanProducer {
+    async fn produce(
+        &self,
+        _goal: &str,
+        _members: &[nomifun_api_types::FleetMember],
+    ) -> Result<nomifun_api_types::PlannedDag, nomifun_common::AppError> {
+        Err(nomifun_common::AppError::Internal(
+            "orchestrator planner not yet wired (Task 9)".to_string(),
+        ))
+    }
 }
 
 /// **P3-X2**: build the `SecretRouterState` (browser-use credential CRUD).

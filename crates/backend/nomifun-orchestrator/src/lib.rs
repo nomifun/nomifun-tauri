@@ -13,18 +13,22 @@
 //!   endpoints. Auth is layered externally in nomifun-app, so handlers safely
 //!   extract `CurrentUser`.
 
+pub mod engine;
 pub mod error;
 pub mod events;
 pub mod plan;
 pub mod routes;
+pub mod run_service;
 pub mod service;
 pub mod state;
 pub mod worker;
 
+pub use engine::{RunEngine, RunEngineDeps};
 pub use error::OrchestratorError;
 pub use events::OrchestratorRunEventEmitter;
 pub use plan::{LlmPlanProducer, PlanProducer};
 pub use routes::orchestrator_routes;
+pub use run_service::RunService;
 pub use service::{FleetService, WorkspaceService};
 pub use state::OrchestratorRouterState;
 pub use worker::{ConversationWorkerRunner, MockWorkerRunner, WorkerOutcome, WorkerRunner};

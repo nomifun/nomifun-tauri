@@ -138,21 +138,63 @@ async fn delete_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::{RunEngine, RunEngineDeps};
+    use crate::events::OrchestratorRunEventEmitter;
+    use crate::plan::PlanProducer;
+    use crate::run_service::RunService;
     use crate::service::{FleetService, WorkspaceService};
+    use crate::worker::{MockWorkerRunner, WorkerRunner};
     use axum::body::Body;
     use axum::http::Request;
+    use nomifun_api_types::{FleetMember, PlannedDag, WebSocketMessage};
+    use nomifun_common::AppError;
     use nomifun_db::{
-        SqliteFleetRepository, SqliteOrchWorkspaceRepository, init_database_memory,
+        SqliteFleetRepository, SqliteOrchWorkspaceRepository, SqliteRunRepository,
+        init_database_memory,
     };
+    use nomifun_realtime::EventBroadcaster;
     use std::sync::Arc;
     use tower::ServiceExt; // for `oneshot`
 
+    /// No-op broadcaster: the router-builds test never asserts the event trail.
+    struct NoopBroadcaster;
+    impl EventBroadcaster for NoopBroadcaster {
+        fn broadcast(&self, _event: WebSocketMessage<serde_json::Value>) {}
+    }
+
+    /// Minimal planner so a RunService can be constructed for the state.
+    struct EmptyPlanProducer;
+    #[async_trait::async_trait]
+    impl PlanProducer for EmptyPlanProducer {
+        async fn produce(
+            &self,
+            _goal: &str,
+            _members: &[FleetMember],
+        ) -> Result<PlannedDag, AppError> {
+            Ok(PlannedDag { tasks: vec![] })
+        }
+    }
+
     async fn build_state() -> OrchestratorRouterState {
         let db = init_database_memory().await.expect("db init");
-        let fleet = FleetService::new(Arc::new(SqliteFleetRepository::new(db.pool().clone())));
-        let workspace =
-            WorkspaceService::new(Arc::new(SqliteOrchWorkspaceRepository::new(db.pool().clone())));
-        OrchestratorRouterState::new(fleet, workspace)
+        let pool = db.pool().clone();
+        let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
+        let ws_repo = Arc::new(SqliteOrchWorkspaceRepository::new(pool.clone()));
+        let run_repo = Arc::new(SqliteRunRepository::new(pool));
+        let fleet = FleetService::new(fleet_repo.clone());
+        let workspace = WorkspaceService::new(ws_repo.clone());
+        let emitter = OrchestratorRunEventEmitter::new(Arc::new(NoopBroadcaster));
+        let planner: Arc<dyn PlanProducer> = Arc::new(EmptyPlanProducer);
+        let run_service = Arc::new(RunService::new(
+            run_repo.clone(),
+            fleet_repo,
+            ws_repo,
+            planner,
+            emitter.clone(),
+        ));
+        let worker: Arc<dyn WorkerRunner> = Arc::new(MockWorkerRunner::with_text(1, "x"));
+        let engine = RunEngine::new(Arc::new(RunEngineDeps::new(run_repo, worker, emitter)));
+        OrchestratorRouterState::new(fleet, workspace, run_service, engine)
     }
 
     /// The router builds without panicking.
