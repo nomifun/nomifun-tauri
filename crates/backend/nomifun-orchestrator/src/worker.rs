@@ -62,6 +62,10 @@ pub trait WorkerRunner: Send + Sync {
     /// - `brief` — the supervisor brief, injected as the conversation `system_prompt`.
     /// - `task_spec` — the actual instruction sent as the first user message.
     /// - `timeout` — max wall-clock budget for the turn.
+    /// - `on_started` — fired EXACTLY ONCE with the worker `conversation_id`, right
+    ///   after the conversation is created and BEFORE send/await. Lets the engine
+    ///   record the in-flight conversation (for cancellation) and immediately stamp
+    ///   `task.conversation_id` (for the frontend live transcript).
     async fn run(
         &self,
         member: &FleetMember,
@@ -71,6 +75,7 @@ pub trait WorkerRunner: Send + Sync {
         brief: &str,
         task_spec: &str,
         timeout: Duration,
+        on_started: Box<dyn FnOnce(i64) + Send>,
     ) -> Result<WorkerOutcome, AppError>;
 }
 
@@ -103,6 +108,7 @@ impl WorkerRunner for ConversationWorkerRunner {
         brief: &str,
         task_spec: &str,
         timeout: Duration,
+        on_started: Box<dyn FnOnce(i64) + Send>,
     ) -> Result<WorkerOutcome, AppError> {
         // P1 supports Nomi-engine members: both provider_id and model are required.
         // Non-Nomi / ACP members (which carry their model differently) are out of
@@ -138,6 +144,11 @@ impl WorkerRunner for ConversationWorkerRunner {
             )
             .await?;
         let id = conv.id.to_string();
+
+        // Report the freshly-created conversation id BEFORE send/await, so the
+        // engine can record the in-flight conversation (for cancellation) and
+        // stamp task.conversation_id for the live transcript while the turn runs.
+        on_started(conv.id);
 
         // Send the task spec as the first user message. The turn is claimed
         // synchronously before send_message returns, so await_turn sees
@@ -272,11 +283,22 @@ fn latest_assistant_text(v: &Value) -> Option<String> {
 /// crates' / modules' tests can construct it.
 pub struct MockWorkerRunner {
     pub outcome: WorkerOutcome,
+    /// Artificial delay awaited (after firing `on_started`) before returning the
+    /// outcome. Defaults to [`Duration::ZERO`]; Task 2's concurrency test sets a
+    /// non-zero delay to create overlap windows between parallel workers.
+    pub delay: Duration,
 }
 
 impl MockWorkerRunner {
-    /// Build a mock that always succeeds with `text` on a fixed `conversation_id`.
+    /// Build a mock that always succeeds with `text` on a fixed `conversation_id`,
+    /// returning immediately (zero delay).
     pub fn with_text(conversation_id: i64, text: impl Into<String>) -> Self {
+        Self::with_text_and_delay(conversation_id, text, Duration::ZERO)
+    }
+
+    /// Like [`with_text`](Self::with_text) but awaits `delay` (after `on_started`)
+    /// before returning — used to overlap parallel workers in scheduler tests.
+    pub fn with_text_and_delay(conversation_id: i64, text: impl Into<String>, delay: Duration) -> Self {
         let text = text.into();
         Self {
             outcome: WorkerOutcome {
@@ -284,6 +306,7 @@ impl MockWorkerRunner {
                 text: Some(text),
                 ok: true,
             },
+            delay,
         }
     }
 }
@@ -299,7 +322,14 @@ impl WorkerRunner for MockWorkerRunner {
         _brief: &str,
         _task_spec: &str,
         _timeout: Duration,
+        on_started: Box<dyn FnOnce(i64) + Send>,
     ) -> Result<WorkerOutcome, AppError> {
+        // Mirror the production runner: report the conversation id up front,
+        // before any (simulated) work.
+        on_started(self.outcome.conversation_id);
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
         Ok(self.outcome.clone())
     }
 }
@@ -313,12 +343,80 @@ mod tests {
         let runner: Arc<dyn WorkerRunner> = Arc::new(MockWorkerRunner::with_text(42, "done"));
         let member = sample_member(None, None);
         let outcome = runner
-            .run(&member, None, "run_1", "task_1", "brief", "spec", Duration::from_secs(1))
+            .run(
+                &member,
+                None,
+                "run_1",
+                "task_1",
+                "brief",
+                "spec",
+                Duration::from_secs(1),
+                Box::new(|_| {}),
+            )
             .await
             .expect("mock never errors");
         assert_eq!(outcome.conversation_id, 42);
         assert_eq!(outcome.text.as_deref(), Some("done"));
         assert!(outcome.ok);
+    }
+
+    #[tokio::test]
+    async fn mock_worker_runner_reports_conv_id_via_on_started() {
+        let runner = MockWorkerRunner::with_text(7, "done");
+        let member = sample_member(None, None);
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<i64>::new()));
+        let sink = seen.clone();
+        let outcome = runner
+            .run(
+                &member,
+                None,
+                "run_1",
+                "task_1",
+                "brief",
+                "spec",
+                Duration::from_secs(1),
+                Box::new(move |conv_id| sink.lock().unwrap().push(conv_id)),
+            )
+            .await
+            .expect("mock never errors");
+        // on_started fires exactly once with the fixed conversation id.
+        assert_eq!(*seen.lock().unwrap(), vec![7]);
+        assert_eq!(outcome.conversation_id, 7);
+    }
+
+    #[tokio::test]
+    async fn mock_worker_runner_respects_delay() {
+        // A non-zero delay must be observed before the outcome returns; the
+        // concurrency test in Task 2 relies on this to create overlap windows.
+        let runner = MockWorkerRunner::with_text_and_delay(9, "done", Duration::from_millis(60));
+        let member = sample_member(None, None);
+        let start = Instant::now();
+        let outcome = runner
+            .run(
+                &member,
+                None,
+                "run_1",
+                "task_1",
+                "brief",
+                "spec",
+                Duration::from_secs(1),
+                Box::new(|_| {}),
+            )
+            .await
+            .expect("mock never errors");
+        assert!(
+            start.elapsed() >= Duration::from_millis(60),
+            "delay was not awaited (elapsed {:?})",
+            start.elapsed()
+        );
+        assert_eq!(outcome.conversation_id, 9);
+    }
+
+    #[tokio::test]
+    async fn mock_worker_runner_default_delay_is_zero() {
+        // with_text keeps a zero delay so existing callers are unaffected.
+        let runner = MockWorkerRunner::with_text(1, "x");
+        assert_eq!(runner.delay, Duration::ZERO);
     }
 
     #[test]

@@ -279,6 +279,11 @@ async fn run_one_task(deps: &Arc<RunEngineDeps>, run_id: &str, task: &OrchRunTas
             &brief,
             &task.spec,
             deps.worker_timeout,
+            // Task 1 placeholder: the engine stays SERIAL here, so the early
+            // conv_id report is a no-op. Task 2 replaces this with real in-flight
+            // recording + immediate task.conversation_id stamping for cancellation
+            // and the live transcript.
+            Box::new(|_conv_id| {}),
         )
         .await;
 
