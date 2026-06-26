@@ -5,7 +5,10 @@ use crate::requirement::{AutoWorkRunState, AutoWorkTargetKind};
 /// Deserialize a present field (including explicit `null`) into `Some(_)`, so an
 /// absent field is `None` (keep) while `null` is `Some(None)` (clear). Without
 /// this, serde collapses `null` to the outer `None`, making "clear" impossible.
-fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+///
+/// Shared with [`crate::orchestrator`] for its fleet/workspace patch DTOs; keep
+/// this the single source of truth so the patch semantics never drift.
+pub(crate) fn double_option<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,

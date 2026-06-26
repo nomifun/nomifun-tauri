@@ -19,6 +19,7 @@ mod knowledge;
 mod lifecycle;
 mod mcp;
 mod office;
+mod orchestrator;
 mod provider;
 mod remote_agent;
 mod requirement;
@@ -142,6 +143,10 @@ pub use office::{
     PreviewHistoryTargetDto, PreviewSnapshotInfoDto, PreviewState, PreviewStatusEvent,
     PreviewUrlResponse, SaveSnapshotRequest, SnapshotContentResponse, StarOfficeDetectResponse,
     StartPreviewRequest, StopPreviewRequest,
+};
+pub use orchestrator::{
+    CapabilityProfile, CreateFleetRequest, CreateWorkspaceRequest, Fleet, FleetMember,
+    FleetMemberInput, MemberConstraints, OrchWorkspace, UpdateFleetRequest, UpdateWorkspaceRequest,
 };
 pub use provider::{
     BedrockAuthMethod, BedrockConfig, CreateProviderRequest, DetectProtocolRequest,
