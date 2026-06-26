@@ -201,6 +201,11 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
         "startup: module states bundle started"
     );
     let (requirement_state, idmm_state) = build_requirement_state(services);
+    // P3b: clone the IDMM manager (as a `ConversationSupervisionHook`) BEFORE the
+    // `ModuleStates` literal moves `idmm_state` into the `idmm:` field — used to
+    // arm supervision on the orchestrator engine's dedicated ConversationService.
+    let orchestrator_idmm_hook: Arc<dyn nomifun_conversation::ConversationSupervisionHook> =
+        Arc::new(idmm_state.service.manager().clone());
     let companion_state = build_companion_state(services, channel_components.manager.clone());
     let states = ModuleStates {
         system: build_system_state(services),
@@ -229,7 +234,16 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
         knowledge: KnowledgeRouterState::new(services.knowledge_service.clone()),
         companion: companion_state,
         webhook: build_webhook_state(services),
-        orchestrator: build_orchestrator_state(services),
+        // P3b: arm IDMM supervision on the orchestrator engine's DEDICATED
+        // ConversationService (the one worker turns run on) by handing it the
+        // same IdmmManager (as a `ConversationSupervisionHook`) the route/terminal
+        // instances use. `orchestrator_idmm_hook` was cloned above (before
+        // `idmm_state` moved into the `idmm:` field) — autonomous worker (nomi
+        // yolo) turns then arm 智能决策 per turn and auto-resolve
+        // decisions/open-questions instead of stalling. The wiring lives entirely
+        // in this app layer (no orchestrator→idmm dependency — the hook is a
+        // `nomifun_conversation` trait the orchestrator's conv_service accepts).
+        orchestrator: build_orchestrator_state(services, orchestrator_idmm_hook),
         secret: build_secret_state(services),
         terminal: build_terminal_state(services),
         office: build_office_state(services),
@@ -961,7 +975,10 @@ impl ConversationSteerer for OrchestratorConversationSteerer {
 /// (lead resolved at plan time — see the LEAD CHOICE note inline), the worker is
 /// the production [`ConversationWorkerRunner`], and every persisted `running` run
 /// resumes its loop at boot via [`RunEngine::resume_persisted_runs`].
-pub fn build_orchestrator_state(services: &AppServices) -> OrchestratorRouterState {
+pub fn build_orchestrator_state(
+    services: &AppServices,
+    idmm_hook: Arc<dyn nomifun_conversation::ConversationSupervisionHook>,
+) -> OrchestratorRouterState {
     let pool = services.database.pool().clone();
     let fleet_repo: Arc<dyn nomifun_db::IFleetRepository> =
         Arc::new(nomifun_db::SqliteFleetRepository::new(pool.clone()));
@@ -1003,6 +1020,14 @@ pub fn build_orchestrator_state(services: &AppServices) -> OrchestratorRouterSta
         Arc::new(SqliteProviderRepository::new(pool.clone())),
         Arc::new(SqliteClientPreferenceRepository::new(pool.clone())),
     );
+    // P3b: arm IDMM supervision on the worker's ConversationService so each worker
+    // (autonomous nomi yolo) turn fires `on_turn_start` and IDMM auto-resolves
+    // decisions/open-questions instead of stalling to timeout. `with_supervision_hook`
+    // is `&self` interior-mutable, so the cancel/steer/worker clones below all share
+    // this same armed hook slot. The hook is the same IdmmManager (as a
+    // `ConversationSupervisionHook`) the route/terminal instances use — threaded in
+    // from `build_module_states` (no orchestrator→idmm dependency).
+    conv_service.with_supervision_hook(idmm_hook);
     // Cancel hook (P2 Task 3): clone the ConversationService for a canceller that
     // ends an in-flight worker conversation on run cancel. `ConversationService`
     // is `Clone` (Arc internals), so the clone shares the same runtime state /
