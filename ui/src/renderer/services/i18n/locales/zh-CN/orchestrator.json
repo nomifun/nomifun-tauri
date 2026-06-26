@@ -103,5 +103,44 @@
     "title": "Run 历史",
     "emptyTitle": "Run 执行即将上线（P1）",
     "emptyDesc": "编排执行记录将在后续版本中展示。"
+  },
+  "run": {
+    "title": "Run 历史",
+    "subtitle": "选择工作间，查看其编排执行记录",
+    "newRun": "新建 Run",
+    "selectWorkspace": "选择工作间",
+    "noWorkspace": "请先创建一个工作间，再发起 Run",
+    "emptyTitle": "还没有 Run",
+    "emptyDesc": "点击「新建 Run」，为编队下达目标，让它们在工作间里协同完成任务。",
+    "loadError": "加载 Run 失败",
+    "untitledGoal": "（未填写目标）",
+    "modal": {
+      "title": "新建 Run",
+      "workspace": "工作间",
+      "workspacePlaceholder": "选择工作间",
+      "workspaceRequired": "请选择工作间",
+      "fleet": "编队",
+      "fleetPlaceholder": "选择编队",
+      "fleetRequired": "请选择编队",
+      "goal": "目标",
+      "goalPlaceholder": "描述你希望编队完成的目标",
+      "goalRequired": "请输入目标",
+      "autonomy": "自主程度",
+      "autonomyAutonomous": "自主",
+      "autonomySupervised": "守护",
+      "autonomyInteractive": "协同",
+      "cancel": "取消",
+      "confirm": "发起",
+      "createSuccess": "Run 已创建",
+      "createError": "创建 Run 失败：{{error}}"
+    },
+    "status": {
+      "planning": "规划中",
+      "running": "执行中",
+      "completed": "已完成",
+      "failed": "已失败",
+      "cancelled": "已取消",
+      "unknown": "未知"
+    }
   }
 }

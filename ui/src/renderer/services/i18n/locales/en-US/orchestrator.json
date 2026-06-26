@@ -103,5 +103,44 @@
     "title": "Run History",
     "emptyTitle": "Run execution coming soon (P1)",
     "emptyDesc": "Orchestration run records will appear here in a future release."
+  },
+  "run": {
+    "title": "Run History",
+    "subtitle": "Pick a workspace to review its orchestration run records",
+    "newRun": "New Run",
+    "selectWorkspace": "Select a workspace",
+    "noWorkspace": "Create a workspace first, then start a run",
+    "emptyTitle": "No runs yet",
+    "emptyDesc": "Click “New Run” to give the fleet a goal and let them collaborate inside the workspace.",
+    "loadError": "Failed to load runs",
+    "untitledGoal": "(No goal)",
+    "modal": {
+      "title": "New Run",
+      "workspace": "Workspace",
+      "workspacePlaceholder": "Select a workspace",
+      "workspaceRequired": "Please select a workspace",
+      "fleet": "Fleet",
+      "fleetPlaceholder": "Select a fleet",
+      "fleetRequired": "Please select a fleet",
+      "goal": "Goal",
+      "goalPlaceholder": "Describe what you want the fleet to accomplish",
+      "goalRequired": "Please enter a goal",
+      "autonomy": "Autonomy",
+      "autonomyAutonomous": "Autonomous",
+      "autonomySupervised": "Supervised",
+      "autonomyInteractive": "Interactive",
+      "cancel": "Cancel",
+      "confirm": "Start",
+      "createSuccess": "Run created",
+      "createError": "Failed to create run: {{error}}"
+    },
+    "status": {
+      "planning": "Planning",
+      "running": "Running",
+      "completed": "Completed",
+      "failed": "Failed",
+      "cancelled": "Cancelled",
+      "unknown": "Unknown"
+    }
   }
 }
