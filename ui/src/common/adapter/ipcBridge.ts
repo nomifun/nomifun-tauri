@@ -85,6 +85,14 @@ import type {
   TeamAgent,
 } from '../types/team/teamTypes';
 import type {
+  TCreateFleet,
+  TCreateWorkspace,
+  TFleet,
+  TOrchWorkspace,
+  TUpdateFleet,
+  TUpdateWorkspace,
+} from '../types/orchestrator/orchestratorTypes';
+import type {
   AutoUpdateStatus,
   UpdateCheckRequest,
   UpdateCheckResult,
@@ -2708,6 +2716,34 @@ export const webhook = {
     (p) => `/api/tags/${encodeURIComponent(p.tag)}/settings`,
     (p) => p.updates
   ),
+};
+
+// ─────────────────────────── 智能编排 (Orchestration) ───────────────────────────
+// REST client for fleets + orchestration workspaces, routed to
+// /api/orchestrator/*. Mirrors the plain-REST webhook block above; IDs are
+// strings (`fleet_…` / `ows_…`).
+
+export const orchestrator = {
+  fleets: {
+    list: httpGet<TFleet[], void>('/api/orchestrator/fleets'),
+    get: httpGet<TFleet, { id: string }>((p) => `/api/orchestrator/fleets/${p.id}`),
+    create: httpPost<TFleet, TCreateFleet>('/api/orchestrator/fleets'),
+    update: httpPut<TFleet, { id: string; updates: TUpdateFleet }>(
+      (p) => `/api/orchestrator/fleets/${p.id}`,
+      (p) => p.updates
+    ),
+    remove: httpDelete<void, { id: string }>((p) => `/api/orchestrator/fleets/${p.id}`),
+  },
+  workspaces: {
+    list: httpGet<TOrchWorkspace[], void>('/api/orchestrator/workspaces'),
+    get: httpGet<TOrchWorkspace, { id: string }>((p) => `/api/orchestrator/workspaces/${p.id}`),
+    create: httpPost<TOrchWorkspace, TCreateWorkspace>('/api/orchestrator/workspaces'),
+    update: httpPut<TOrchWorkspace, { id: string; updates: TUpdateWorkspace }>(
+      (p) => `/api/orchestrator/workspaces/${p.id}`,
+      (p) => p.updates
+    ),
+    remove: httpDelete<void, { id: string }>((p) => `/api/orchestrator/workspaces/${p.id}`),
+  },
 };
 
 // ─────────────────────────── Companion (nomi 桌面伙伴) ───────────────────────────
