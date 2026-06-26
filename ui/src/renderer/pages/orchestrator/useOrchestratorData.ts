@@ -6,7 +6,7 @@
 
 import useSWR, { type SWRConfiguration } from 'swr';
 import { ipcBridge } from '@/common';
-import type { TFleet, TOrchWorkspace } from '@/common/types/orchestrator/orchestratorTypes';
+import type { TFleet, TOrchWorkspace, TRun } from '@/common/types/orchestrator/orchestratorTypes';
 
 /**
  * SWR hooks for the 「智能编排」(orchestration) page. Fleets and workspaces are
@@ -40,3 +40,31 @@ export const useFleets = () => {
 export const useWorkspaces = () => {
   return useSWR<TOrchWorkspace[]>(ORCH_WORKSPACES_SWR_KEY, fetchWorkspaces, ORCH_SWR_OPTIONS);
 };
+
+/**
+ * Load the runs for a single orchestration workspace. SWR key
+ * `orchestrator/runs/${workspaceId}`; passing `undefined` yields a null key so
+ * SWR skips fetching (e.g. before a workspace is selected). Like the fleet/
+ * workspace hooks we never poll — realtime freshness comes from `useRunLive`
+ * (per-run) and explicit `mutate()` after create/cancel.
+ */
+export function useRuns(workspaceId: string | undefined): {
+  runs: TRun[];
+  isLoading: boolean;
+  error: unknown;
+  mutate: () => void;
+} {
+  const { data, isLoading, error, mutate } = useSWR<TRun[]>(
+    workspaceId ? `orchestrator/runs/${workspaceId}` : null,
+    async () => (await ipcBridge.orchestrator.runs.list.invoke({ workspace_id: workspaceId! })) ?? [],
+    ORCH_SWR_OPTIONS
+  );
+  return {
+    runs: data ?? [],
+    isLoading,
+    error,
+    mutate: () => {
+      void mutate();
+    },
+  };
+}
