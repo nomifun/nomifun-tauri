@@ -12,8 +12,6 @@
     "create": "新建工作间",
     "empty": "暂无工作间，点击「新建工作间」开始",
     "loadError": "加载工作间失败",
-    "openMenu": "更多操作",
-    "defaultFleet": "默认编队",
     "noDefaultFleet": "未设置默认编队",
     "modal": {
       "title": "新建工作间",
@@ -22,7 +20,6 @@
       "nameRequired": "请输入工作间名称",
       "defaultFleetLabel": "默认编队（可选）",
       "defaultFleetPlaceholder": "选择默认编队",
-      "noFleetOption": "不设置",
       "cancel": "取消",
       "confirm": "创建",
       "createOk": "工作间已创建",
@@ -30,7 +27,78 @@
     }
   },
   "fleet": {
-    "placeholder": "编队管理（即将上线）"
+    "title": "编队",
+    "subtitle": "把多个智能体编成一队，按强项与约束协同分工",
+    "create": "新建编队",
+    "loadError": "加载编队失败",
+    "emptyTitle": "还没有编队",
+    "emptyDesc": "新建一支编队，挑选成员并配置模型与强项，让它们在工作间里协同完成任务。",
+    "deleteOk": "编队已删除",
+    "deleteError": "删除编队失败：{{error}}",
+    "card": {
+      "memberCount": "{{count}} 名成员",
+      "noMembers": "暂无成员",
+      "noModel": "未配置模型",
+      "unknownAgent": "未知智能体",
+      "maxParallelHint": "最大并发任务数",
+      "menu": "更多操作",
+      "delete": "删除编队",
+      "deleteConfirm": "确定删除编队「{{name}}」吗？此操作不可撤销。"
+    },
+    "edit": {
+      "createTitle": "新建编队",
+      "editTitle": "编辑编队",
+      "nameLabel": "编队名称",
+      "namePlaceholder": "为这支编队取个名字",
+      "nameRequired": "请输入编队名称",
+      "descLabel": "描述",
+      "descPlaceholder": "这支编队擅长做什么？",
+      "maxParallelLabel": "并发上限",
+      "maxParallelPlaceholder": "不限",
+      "maxParallelHint": "同时执行的最大任务数（留空表示不限）",
+      "membersLabel": "成员",
+      "membersCount": "已选 {{count}} 名",
+      "membersEmpty": "暂无成员，点击「添加成员」开始",
+      "membersRequired": "请至少添加一名成员并选择智能体",
+      "addMember": "添加成员",
+      "createOk": "编队已创建",
+      "updateOk": "编队已更新",
+      "saveError": "保存编队失败：{{error}}"
+    },
+    "member": {
+      "agentPlaceholder": "选择智能体",
+      "providerPlaceholder": "选择服务商",
+      "modelPlaceholder": "选择模型",
+      "roleHintPlaceholder": "角色提示（可选）",
+      "concurrencyPlaceholder": "并发",
+      "costTierPlaceholder": "成本档",
+      "strengthsPlaceholder": "强项标签（可多选 / 自定义）",
+      "remove": "移除成员"
+    },
+    "role": {
+      "planner": "规划",
+      "coder": "编码",
+      "reviewer": "评审",
+      "researcher": "调研",
+      "tester": "测试"
+    },
+    "strength": {
+      "coding": "编码",
+      "reasoning": "推理",
+      "planning": "规划",
+      "research": "调研",
+      "writing": "写作",
+      "review": "评审",
+      "longContext": "长上下文",
+      "speed": "高速",
+      "vision": "视觉",
+      "tools": "工具调用"
+    },
+    "costTier": {
+      "low": "低成本",
+      "medium": "中等",
+      "high": "高成本"
+    }
   },
   "runHistory": {
     "title": "Run 历史",

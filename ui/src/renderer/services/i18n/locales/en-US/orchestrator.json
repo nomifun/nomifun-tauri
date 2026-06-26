@@ -12,8 +12,6 @@
     "create": "New Workspace",
     "empty": "No workspaces yet — click “New Workspace” to start",
     "loadError": "Failed to load workspaces",
-    "openMenu": "More actions",
-    "defaultFleet": "Default fleet",
     "noDefaultFleet": "No default fleet",
     "modal": {
       "title": "New Workspace",
@@ -22,7 +20,6 @@
       "nameRequired": "Please enter a workspace name",
       "defaultFleetLabel": "Default fleet (optional)",
       "defaultFleetPlaceholder": "Select a default fleet",
-      "noFleetOption": "None",
       "cancel": "Cancel",
       "confirm": "Create",
       "createOk": "Workspace created",
@@ -30,7 +27,78 @@
     }
   },
   "fleet": {
-    "placeholder": "Fleet management (coming soon)"
+    "title": "Fleets",
+    "subtitle": "Assemble agents into a fleet that collaborates by strengths and constraints",
+    "create": "New Fleet",
+    "loadError": "Failed to load fleets",
+    "emptyTitle": "No fleets yet",
+    "emptyDesc": "Create a fleet, pick its members, and configure their models and strengths so they can collaborate inside a workspace.",
+    "deleteOk": "Fleet deleted",
+    "deleteError": "Failed to delete fleet: {{error}}",
+    "card": {
+      "memberCount": "{{count}} members",
+      "noMembers": "No members",
+      "noModel": "No model configured",
+      "unknownAgent": "Unknown agent",
+      "maxParallelHint": "Max concurrent tasks",
+      "menu": "More actions",
+      "delete": "Delete fleet",
+      "deleteConfirm": "Delete the fleet “{{name}}”? This cannot be undone."
+    },
+    "edit": {
+      "createTitle": "New Fleet",
+      "editTitle": "Edit Fleet",
+      "nameLabel": "Fleet name",
+      "namePlaceholder": "Give this fleet a name",
+      "nameRequired": "Please enter a fleet name",
+      "descLabel": "Description",
+      "descPlaceholder": "What is this fleet good at?",
+      "maxParallelLabel": "Max parallel",
+      "maxParallelPlaceholder": "Unlimited",
+      "maxParallelHint": "Maximum tasks run concurrently (leave empty for unlimited)",
+      "membersLabel": "Members",
+      "membersCount": "{{count}} selected",
+      "membersEmpty": "No members yet — click “Add member” to start",
+      "membersRequired": "Please add at least one member with an agent selected",
+      "addMember": "Add member",
+      "createOk": "Fleet created",
+      "updateOk": "Fleet updated",
+      "saveError": "Failed to save fleet: {{error}}"
+    },
+    "member": {
+      "agentPlaceholder": "Select an agent",
+      "providerPlaceholder": "Select a provider",
+      "modelPlaceholder": "Select a model",
+      "roleHintPlaceholder": "Role hint (optional)",
+      "concurrencyPlaceholder": "Concurrency",
+      "costTierPlaceholder": "Cost tier",
+      "strengthsPlaceholder": "Strength tags (multi-select / custom)",
+      "remove": "Remove member"
+    },
+    "role": {
+      "planner": "Planner",
+      "coder": "Coder",
+      "reviewer": "Reviewer",
+      "researcher": "Researcher",
+      "tester": "Tester"
+    },
+    "strength": {
+      "coding": "Coding",
+      "reasoning": "Reasoning",
+      "planning": "Planning",
+      "research": "Research",
+      "writing": "Writing",
+      "review": "Review",
+      "longContext": "Long context",
+      "speed": "Speed",
+      "vision": "Vision",
+      "tools": "Tool use"
+    },
+    "costTier": {
+      "low": "Low cost",
+      "medium": "Medium",
+      "high": "High cost"
+    }
   },
   "runHistory": {
     "title": "Run History",

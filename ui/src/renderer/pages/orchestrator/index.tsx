@@ -15,6 +15,7 @@ import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
 import { useResizableSplit } from '@/renderer/hooks/ui/useResizableSplit';
 import { useContainerWidth } from '@/renderer/hooks/ui/useContainerWidth';
 import WorkspaceList from './WorkspaceList';
+import FleetManager from './FleetManager';
 import RunHistory from './RunHistory';
 
 type Section = 'workspace' | 'fleet' | 'run-history';
@@ -94,8 +95,7 @@ const OrchestratorPage: React.FC = () => {
   const content = (
     <>
       {section === 'workspace' && <WorkspaceList />}
-      {/* Task 12 replaces this placeholder with <FleetManager/>. */}
-      {section === 'fleet' && <div className='text-13px text-t-tertiary'>{t('orchestrator.fleet.placeholder')}</div>}
+      {section === 'fleet' && <FleetManager />}
       {section === 'run-history' && <RunHistory />}
     </>
   );
