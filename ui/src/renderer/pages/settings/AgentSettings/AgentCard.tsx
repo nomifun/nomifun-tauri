@@ -57,6 +57,13 @@ type AgentCardProps =
       onToggleTeam?: (supportsTeam: boolean) => void;
       /** Disables the toggle (e.g. while the override request is in flight). */
       teamToggleLoading?: boolean;
+      /**
+       * Locks the team toggle ON and disables it. Used for the built-in Nomi
+       * agent, which the backend hard-whitelists as team-capable
+       * (`TEAM_CAPABLE_BACKENDS`) — toggling it off would silently revert, so we
+       * surface it as a fixed, non-editable state instead.
+       */
+      teamLocked?: boolean;
     }
   | {
       type: 'installable';
@@ -79,7 +86,7 @@ const AgentCard: React.FC<AgentCardProps> = (props) => {
   const goToChatButtonClassName = '!w-full !justify-center !rounded-10px !text-12px';
 
   if (props.type === 'detected') {
-    const { agent, onGoToChat, teamCapable, mcpDeclared, onToggleTeam, teamToggleLoading } = props;
+    const { agent, onGoToChat, teamCapable, mcpDeclared, onToggleTeam, teamToggleLoading, teamLocked } = props;
     const extensionAvatar = resolveExtensionAssetUrl(agent.isExtension ? agent.avatar : undefined);
     const logo =
       extensionAvatar ||
@@ -118,12 +125,15 @@ const AgentCard: React.FC<AgentCardProps> = (props) => {
             </Typography.Text>
             {showTeamRisk && (
               <Tooltip content={t('settings.agentManagement.teamRiskHint')} position='top'>
-                <Help theme='outline' size='12' className='shrink-0 text-warning-6 cursor-help' />
+                <span className='inline-flex shrink-0 cursor-help'>
+                  <Help theme='outline' size='12' className='text-warning-6' />
+                </span>
               </Tooltip>
             )}
             <Switch
               size='small'
-              checked={Boolean(teamCapable)}
+              checked={teamLocked || Boolean(teamCapable)}
+              disabled={teamLocked}
               loading={teamToggleLoading}
               onChange={(v) => onToggleTeam(v)}
             />

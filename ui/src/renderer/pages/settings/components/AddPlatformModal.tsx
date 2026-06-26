@@ -567,11 +567,13 @@ const AddPlatformModal = ModalHOC<{
                     </div>
                   }
                 >
-                  <Info
-                    theme='outline'
-                    size={14}
-                    className='text-t-secondary hover:text-[rgb(var(--primary-6))] cursor-pointer flex'
-                  />
+                  <span className='inline-flex cursor-pointer'>
+                    <Info
+                      theme='outline'
+                      size={14}
+                      className='text-t-secondary hover:text-[rgb(var(--primary-6))] flex'
+                    />
+                  </span>
                 </Popover>
               </div>
             }

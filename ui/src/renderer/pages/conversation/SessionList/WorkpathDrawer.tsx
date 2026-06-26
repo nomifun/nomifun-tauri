@@ -218,7 +218,9 @@ const WorkpathDrawer: React.FC<WorkpathDrawerProps> = ({
     if (workpathDisplay.kind === 'compressed') {
       return (
         <Tooltip content={node.key} position='top'>
-          <PathText path={node.key} className='text-14px font-[500] text-t-primary' />
+          <span className='inline-flex min-w-0'>
+            <PathText path={node.key} className='text-14px font-[500] text-t-primary' />
+          </span>
         </Tooltip>
       );
     }

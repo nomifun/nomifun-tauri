@@ -246,6 +246,7 @@ const LocalAgents: React.FC = () => {
             mcpDeclared={agentDeclaresMcp(nomiAgent)}
             teamToggleLoading={teamToggleBusy === nomiAgent.id}
             onToggleTeam={(v) => void handleToggleTeam(nomiAgent, v)}
+            teamLocked
           />
         )}
         {otherDetected.map((agent) => (

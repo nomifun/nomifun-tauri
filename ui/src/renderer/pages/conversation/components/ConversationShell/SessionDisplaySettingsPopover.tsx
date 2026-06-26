@@ -128,16 +128,18 @@ const SessionDisplaySettingsPopover: React.FC<SessionDisplaySettingsPopoverProps
       getPopupContainer={() => document.body}
       unmountOnExit={false}
     >
-      <InstantHoverTooltip content={t('sessionList.displaySettings')} position='bottom'>
-        <button
-          type='button'
-          data-testid='session-display-settings-btn'
-          className='size-22px rd-4px flex items-center justify-center cursor-pointer shrink-0 transition-colors text-t-secondary hover:text-t-primary hover:bg-fill-4 bg-transparent border-none outline-none focus:outline-none focus-visible:outline-none'
-          aria-label={t('sessionList.displaySettings')}
-        >
-          <SettingTwo theme='outline' size='14' fill='currentColor' className='block leading-none' />
-        </button>
-      </InstantHoverTooltip>
+      <span className='inline-flex'>
+        <InstantHoverTooltip content={t('sessionList.displaySettings')} position='bottom'>
+          <button
+            type='button'
+            data-testid='session-display-settings-btn'
+            className='size-22px rd-4px flex items-center justify-center cursor-pointer shrink-0 transition-colors text-t-secondary hover:text-t-primary hover:bg-fill-4 bg-transparent border-none outline-none focus:outline-none focus-visible:outline-none'
+            aria-label={t('sessionList.displaySettings')}
+          >
+            <SettingTwo theme='outline' size='14' fill='currentColor' className='block leading-none' />
+          </button>
+        </InstantHoverTooltip>
+      </span>
     </Popover>
   );
 };
