@@ -38,8 +38,8 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use nomifun_api_types::{
-    CreateFleetRequest, CreateRunRequest, CreateWorkspaceRequest, FleetMember, FleetMemberInput,
-    PlannedDag, PlannedTask, WebSocketMessage,
+    CreateAdhocRunRequest, CreateFleetRequest, CreateRunRequest, CreateWorkspaceRequest,
+    FleetMember, FleetMemberInput, ModelRange, ModelRef, PlannedDag, PlannedTask, WebSocketMessage,
 };
 use nomifun_auth::CurrentUser;
 use nomifun_common::AppError;
@@ -599,4 +599,189 @@ async fn run_cancel_propagates_to_in_flight_worker_conversations() {
         .expect("get run request");
     let json = body_json(resp).await;
     assert_eq!(json["data"]["run"]["status"], "cancelled", "run persisted as cancelled");
+}
+
+// ----------------------------------------------------------------------------
+// P1: the create-from-model-range SEAM, end to end through the engine.
+//
+// Task 2 unit-tested `create_adhoc` (Range → 2 synthetic members snapshotted) and
+// Task 3 unit-tested the gateway caps handler's pure functions (parse_lead_extra +
+// expand_auto_range). But neither drives a `create_adhoc`-synthesized fleet
+// snapshot THROUGH the planner + engine to `completed` — i.e. proves the engine
+// can resolve the synthetic `rmbr_*` members from the snapshot, dispatch workers
+// for them, and that the run's own `work_dir` (not a workspace dir — there is no
+// workspace) reaches the worker. This test closes that seam.
+//
+// It mirrors `nomi_run_create`'s exact choreography (caps_orchestrator.rs:126-135):
+//   create_adhoc(Range)  →  plan  →  engine.start  →  poll to completed
+// with the same mock planner/worker stack the other e2e tests use, so it runs in
+// CI without a live LLM. (The gateway tool's own create→plan→start wrapping +
+// `Auto` expansion are covered by Task 3's unit tests; this proves the service +
+// engine seam underneath it.)
+// ----------------------------------------------------------------------------
+
+/// Tiny owned snapshot of the fields the adhoc seam test asserts on after the
+/// poll, so the borrow on the awaited detail doesn't escape the loop.
+struct RunDetailLike {
+    tasks_done: usize,
+    tasks_total: usize,
+    summary: String,
+}
+
+/// A worker that records, per call, the `workspace_dir` it was handed and the
+/// resolved member's provider+model — so the adhoc seam test can assert the run's
+/// own `work_dir` propagated (no workspace exists) and that the synthetic members
+/// reached the worker. Returns a fixed conv id + ok outcome so the run completes.
+struct RecordingAdhocWorkerRunner {
+    seen_workspace_dir: Mutex<Vec<Option<String>>>,
+    seen_member: Mutex<Vec<(Option<String>, Option<String>)>>,
+}
+#[async_trait]
+impl WorkerRunner for RecordingAdhocWorkerRunner {
+    async fn run(
+        &self,
+        member: &FleetMember,
+        workspace_dir: Option<&str>,
+        _run_id: &str,
+        _task_id: &str,
+        _brief: &str,
+        _task_spec: &str,
+        _timeout: Duration,
+        on_started: Box<dyn FnOnce(i64) + Send>,
+    ) -> Result<WorkerOutcome, AppError> {
+        self.seen_workspace_dir
+            .lock()
+            .unwrap()
+            .push(workspace_dir.map(str::to_string));
+        self.seen_member
+            .lock()
+            .unwrap()
+            .push((member.provider_id.clone(), member.model.clone()));
+        on_started(7777);
+        Ok(WorkerOutcome {
+            conversation_id: 7777,
+            text: Some("adhoc task output".to_string()),
+            ok: true,
+        })
+    }
+}
+
+/// The conversation-native seam: a run created straight from a model range (no
+/// workspace, no pre-built fleet) plans + executes to `completed` through the real
+/// RunService + RunEngine, with the run's own `work_dir` reaching the worker and
+/// the synthetic members resolved from the frozen snapshot.
+#[tokio::test]
+async fn adhoc_run_from_model_range_completes_through_engine() {
+    // Build state exactly like `build_run_state`, but hold the recording worker so
+    // we can assert what it received. Single-member chain DAG is enough — the
+    // planner pre-assigns both tasks to member 0 (a synthetic `rmbr_*` member).
+    let db = init_database_memory().await.expect("db init");
+    let pool = db.pool().clone();
+    let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
+    let ws_repo = Arc::new(SqliteOrchWorkspaceRepository::new(pool.clone()));
+    let run_repo = Arc::new(SqliteRunRepository::new(pool));
+
+    let _fleet = FleetService::new(fleet_repo.clone());
+    let _workspace = WorkspaceService::new(ws_repo.clone());
+    let emitter = OrchestratorRunEventEmitter::new(Arc::new(NoopBroadcaster));
+    let planner: Arc<dyn PlanProducer> = Arc::new(ChainPlanProducer);
+
+    let run_service = Arc::new(RunService::new(
+        run_repo.clone(),
+        fleet_repo,
+        ws_repo.clone(),
+        planner,
+        emitter.clone(),
+    ));
+    let worker = Arc::new(RecordingAdhocWorkerRunner {
+        seen_workspace_dir: Mutex::new(vec![]),
+        seen_member: Mutex::new(vec![]),
+    });
+    let worker_dyn: Arc<dyn WorkerRunner> = worker.clone();
+    let mut engine_deps = RunEngineDeps::new(run_repo, worker_dyn, emitter, ws_repo);
+    engine_deps.worker_timeout = Duration::from_secs(5);
+    let engine = RunEngine::new(Arc::new(engine_deps));
+
+    // The exact choreography `nomi_run_create` performs (caps_orchestrator.rs):
+    // create_adhoc(Range of 2 models, with the lead conversation's work_dir) → plan
+    // → engine.start. No workspace, no fleet — the fleet is synthesized from the
+    // range. `autonomous` so `plan` flips straight to `running` (no approval gate).
+    let run = run_service
+        .create_adhoc(
+            "u1",
+            CreateAdhocRunRequest {
+                goal: "ship the conversation-native run".to_string(),
+                work_dir: Some("/tmp/adhoc-proj".to_string()),
+                model_range: ModelRange::Range {
+                    models: vec![
+                        ModelRef { provider_id: "prov_a".to_string(), model: "model-a".to_string() },
+                        ModelRef { provider_id: "prov_b".to_string(), model: "model-b".to_string() },
+                    ],
+                },
+                pinned_roles: vec![],
+                autonomy: Some("autonomous".to_string()),
+                max_parallel: None,
+                lead_conv_id: Some(909),
+            },
+        )
+        .await
+        .expect("create_adhoc from range");
+
+    // The fleet snapshot must hold two Nomi-runnable synthetic members (this is the
+    // create_adhoc → snapshot half of the seam; the engine half is asserted below).
+    let detail = run_service.get_detail(&run.id).await.expect("detail after create");
+    assert!(detail.run.workspace_id.is_none(), "ad-hoc run has no workspace");
+    assert_eq!(detail.run.work_dir.as_deref(), Some("/tmp/adhoc-proj"));
+    assert_eq!(detail.fleet_members.len(), 2, "two synthetic members from the range");
+    assert!(
+        detail.fleet_members.iter().all(|m| m.id.starts_with("rmbr_")),
+        "synthetic member ids use the rmbr_ prefix"
+    );
+
+    run_service.plan(&run.id).await.expect("plan");
+    engine.start(run.id.clone());
+
+    // Poll the service directly (this seam is below the HTTP layer — the gateway
+    // tool, not a REST route, drives it) until the run completes (~50×100ms).
+    let mut completed = false;
+    let mut last: Option<RunDetailLike> = None;
+    for _ in 0..50 {
+        let d = run_service.get_detail(&run.id).await.expect("detail poll");
+        if d.run.status == "completed" {
+            last = Some(RunDetailLike {
+                tasks_done: d.tasks.iter().filter(|t| t.status == "done").count(),
+                tasks_total: d.tasks.len(),
+                summary: d.run.summary.clone().unwrap_or_default(),
+            });
+            completed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(completed, "ad-hoc run must reach completed within the bounded poll");
+    let last = last.unwrap();
+
+    // Engine half of the seam: both tasks ran to done (the engine resolved the
+    // synthetic members from the snapshot + dispatched workers for them).
+    assert_eq!(last.tasks_total, 2, "2 tasks planned");
+    assert_eq!(last.tasks_done, 2, "both tasks done");
+    assert!(last.summary.contains("2/2"), "summary reflects 2/2 done, got: {}", last.summary);
+
+    // The run's OWN work_dir (there is no workspace) reached every worker call.
+    let dirs = worker.seen_workspace_dir.lock().unwrap().clone();
+    assert_eq!(dirs.len(), 2, "worker invoked once per task");
+    for d in &dirs {
+        assert_eq!(
+            d.as_deref(),
+            Some("/tmp/adhoc-proj"),
+            "the ad-hoc run's own work_dir must reach the worker (no workspace dir exists)"
+        );
+    }
+    // The synthetic member reached the worker as a Nomi-runnable member. Both tasks
+    // are pre-assigned to member 0 ⇒ provider_a/model-a on both calls.
+    let members = worker.seen_member.lock().unwrap().clone();
+    for (provider, model) in &members {
+        assert_eq!(provider.as_deref(), Some("prov_a"), "worker got the synthetic member's provider");
+        assert_eq!(model.as_deref(), Some("model-a"), "worker got the synthetic member's model");
+    }
 }
