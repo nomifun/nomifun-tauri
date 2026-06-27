@@ -50,6 +50,12 @@
     "cancel": "取消",
     "createError": "发起 Run 失败：{{error}}"
   },
+  "roster": {
+    "title": "agent 花名册",
+    "count": "{{count}} 个任务",
+    "roleUnknown": "待分派",
+    "modelUnknown": "未指定模型"
+  },
   "run": {
     "role": {
       "planner": "规划",

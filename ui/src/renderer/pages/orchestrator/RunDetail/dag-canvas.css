@@ -76,3 +76,26 @@
 .nomi-dag-flow .react-flow__handle {
   cursor: default;
 }
+
+/* Slim, theme-tinted horizontal scrollbar for the AgentRoster strip — subtle so
+   the row of cards reads cleanly, only nudging visible on hover. */
+.nomi-roster-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+.nomi-roster-scroll:hover {
+  scrollbar-color: var(--border-base) transparent;
+}
+.nomi-roster-scroll::-webkit-scrollbar {
+  height: 6px;
+}
+.nomi-roster-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.nomi-roster-scroll::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 100px;
+}
+.nomi-roster-scroll:hover::-webkit-scrollbar-thumb {
+  background: var(--border-base);
+}

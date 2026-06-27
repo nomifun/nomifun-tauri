@@ -50,6 +50,12 @@
     "cancel": "Cancel",
     "createError": "Failed to start run: {{error}}"
   },
+  "roster": {
+    "title": "Agent roster",
+    "count": "{{count}} task(s)",
+    "roleUnknown": "Unassigned",
+    "modelUnknown": "No model set"
+  },
   "run": {
     "role": {
       "planner": "Planner",
