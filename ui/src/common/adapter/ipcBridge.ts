@@ -74,17 +74,10 @@ import type {
 } from '../types/provider/providerApi';
 import type { SpeechToTextRequest, SpeechToTextResult } from '../types/provider/speech';
 import type {
-  TCreateFleet,
-  TCreateRun,
-  TCreateWorkspace,
-  TFleet,
-  TOrchWorkspace,
   TReassign,
   TRun,
   TRunDetail,
   TSteer,
-  TUpdateFleet,
-  TUpdateWorkspace,
 } from '../types/orchestrator/orchestratorTypes';
 import type {
   TOrchRunCompletedEvent,
@@ -2679,31 +2672,7 @@ export const webhook = {
 // strings (`fleet_…` / `ows_…`).
 
 export const orchestrator = {
-  fleets: {
-    list: httpGet<TFleet[], void>('/api/orchestrator/fleets'),
-    get: httpGet<TFleet, { id: string }>((p) => `/api/orchestrator/fleets/${p.id}`),
-    create: httpPost<TFleet, TCreateFleet>('/api/orchestrator/fleets'),
-    update: httpPut<TFleet, { id: string; updates: TUpdateFleet }>(
-      (p) => `/api/orchestrator/fleets/${p.id}`,
-      (p) => p.updates
-    ),
-    remove: httpDelete<void, { id: string }>((p) => `/api/orchestrator/fleets/${p.id}`),
-  },
-  workspaces: {
-    list: httpGet<TOrchWorkspace[], void>('/api/orchestrator/workspaces'),
-    get: httpGet<TOrchWorkspace, { id: string }>((p) => `/api/orchestrator/workspaces/${p.id}`),
-    create: httpPost<TOrchWorkspace, TCreateWorkspace>('/api/orchestrator/workspaces'),
-    update: httpPut<TOrchWorkspace, { id: string; updates: TUpdateWorkspace }>(
-      (p) => `/api/orchestrator/workspaces/${p.id}`,
-      (p) => p.updates
-    ),
-    remove: httpDelete<void, { id: string }>((p) => `/api/orchestrator/workspaces/${p.id}`),
-  },
   runs: {
-    create: httpPost<TRun, TCreateRun>('/api/orchestrator/runs'),
-    list: httpGet<TRun[], { workspace_id: string }>(
-      (p) => `/api/orchestrator/workspaces/${p.workspace_id}/runs`
-    ),
     // Every run owned by the current user (all workspaces + ad-hoc/workspace-less
     // runs), newest first — the read path for the read-only Run-history library.
     listMine: httpGet<TRun[], void>('/api/orchestrator/runs'),

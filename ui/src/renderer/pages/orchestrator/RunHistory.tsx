@@ -4,14 +4,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { Select, Spin } from '@arco-design/web-react';
-import { History, Plus, Right } from '@icon-park/react';
-import classNames from 'classnames';
+import { useNavigate } from 'react-router-dom';
+import { Spin } from '@arco-design/web-react';
+import { History, Right, Comment } from '@icon-park/react';
 import type { TRun } from '@/common/types/orchestrator/orchestratorTypes';
-import CreateRunModal from './CreateRunModal';
-import { useFleets, useRuns, useWorkspaces } from './useOrchestratorData';
+import { useMyRuns } from './useOrchestratorData';
 
 /** Map a run status string to a theme-var color + i18n label key suffix. */
 const STATUS_META: Record<string, { color: string; key: string }> = {
@@ -20,12 +19,22 @@ const STATUS_META: Record<string, { color: string; key: string }> = {
   completed: { color: 'var(--success)', key: 'completed' },
   failed: { color: 'var(--danger)', key: 'failed' },
   cancelled: { color: 'var(--color-text-3)', key: 'cancelled' },
+  paused: { color: 'var(--color-text-3)', key: 'paused' },
+  awaiting_plan_approval: { color: 'var(--warning)', key: 'awaiting_plan_approval' },
 };
 
 const formatTime = (ms: number): string => new Date(ms).toLocaleString();
 
-/** A single run row/card. */
-const RunCard: React.FC<{ run: TRun; onOpen: () => void }> = ({ run, onOpen }) => {
+/**
+ * A single run row/card. Clicking the body opens the read-only DAG replay
+ * (via `onOpen`); when the run has an owning conversation an extra "open
+ * conversation" link jumps straight to it without opening the canvas.
+ */
+const RunCard: React.FC<{ run: TRun; onOpen: () => void; onOpenConversation?: () => void }> = ({
+  run,
+  onOpen,
+  onOpenConversation,
+}) => {
   const { t } = useTranslation();
   const meta = STATUS_META[run.status];
   const dotColor = meta?.color ?? 'var(--color-text-3)';
@@ -56,104 +65,54 @@ const RunCard: React.FC<{ run: TRun; onOpen: () => void }> = ({ run, onOpen }) =
           <span className='truncate'>{formatTime(run.created_at)}</span>
         </div>
       </div>
+      {onOpenConversation && (
+        <div
+          role='button'
+          tabIndex={0}
+          aria-label={t('orchestrator.run.openConversation')}
+          title={t('orchestrator.run.openConversation')}
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpenConversation();
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              e.stopPropagation();
+              onOpenConversation();
+            }
+          }}
+          className='shrink-0 size-30px rd-8px flex items-center justify-center text-t-tertiary transition-colors hover:bg-fill-2 hover:text-primary-6'
+        >
+          <Comment theme='outline' size='16' strokeWidth={3} />
+        </div>
+      )}
       <Right theme='outline' size='16' strokeWidth={3} className='shrink-0 text-t-tertiary' />
     </div>
   );
 };
 
 /**
- * RunHistory — the 「Run 历史」section of the orchestration page. Runs are
- * persisted per-workspace, so the section offers a workspace selector (default
- * = first workspace) and lists that workspace's runs via SWR `useRuns`. A
- * 「新建 Run」action opens {@link CreateRunModal}; on creation the parent is
- * notified via `onOpenRun` to navigate to the new run.
+ * RunHistory — the read-only Run-history library. Runs are created from
+ * conversations (the DAG lives in the conversation rail), so this section no
+ * longer offers a create affordance or a workspace selector; it simply lists
+ * the current user's runs (all workspaces + ad-hoc) via `useMyRuns`. Clicking
+ * a run opens its read-only DAG replay (parent's `onOpenRun` → `?run=`); runs
+ * tied to a conversation also expose an "open conversation" jump.
  */
 const RunHistory: React.FC<{ onOpenRun?: (runId: string) => void }> = ({ onOpenRun }) => {
   const { t } = useTranslation();
-  const { data: workspaces } = useWorkspaces();
-  const { data: fleets } = useFleets();
-  const workspaceList = useMemo(() => workspaces ?? [], [workspaces]);
-  const fleetList = fleets ?? [];
-
-  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | undefined>(undefined);
-  const [createOpen, setCreateOpen] = useState(false);
-
-  // Default to the first workspace once the list loads (and recover if the
-  // current selection disappears, e.g. after a workspace is deleted elsewhere).
-  useEffect(() => {
-    if (workspaceList.length === 0) {
-      setSelectedWorkspaceId(undefined);
-      return;
-    }
-    setSelectedWorkspaceId((prev) =>
-      prev && workspaceList.some((w) => w.id === prev) ? prev : workspaceList[0].id
-    );
-  }, [workspaceList]);
-
-  const { runs, isLoading, error, mutate } = useRuns(selectedWorkspaceId);
-
-  const openRun = (runId: string) => {
-    onOpenRun?.(runId);
-  };
-
-  const hasWorkspace = workspaceList.length > 0;
+  const navigate = useNavigate();
+  const { runs, isLoading, error } = useMyRuns();
 
   return (
     <div className='w-full'>
-      <div className='flex items-center justify-between gap-12px mb-16px'>
-        <div className='min-w-0'>
-          <div className='text-18px font-600 text-t-primary leading-tight'>{t('orchestrator.run.title')}</div>
-          <div className='mt-4px text-12px leading-16px text-t-tertiary'>{t('orchestrator.run.subtitle')}</div>
-        </div>
-        <div
-          role='button'
-          tabIndex={hasWorkspace ? 0 : -1}
-          aria-disabled={!hasWorkspace}
-          onClick={() => {
-            if (hasWorkspace) setCreateOpen(true);
-          }}
-          onKeyDown={(e) => {
-            if (hasWorkspace && (e.key === 'Enter' || e.key === ' ')) {
-              e.preventDefault();
-              setCreateOpen(true);
-            }
-          }}
-          className={classNames(
-            'shrink-0 h-34px px-14px rd-8px flex items-center gap-6px select-none transition-opacity',
-            hasWorkspace
-              ? 'bg-primary-6 text-white cursor-pointer hover:opacity-90 active:opacity-80'
-              : 'bg-fill-2 text-t-tertiary cursor-not-allowed'
-          )}
-        >
-          <Plus theme='outline' size='15' strokeWidth={4} />
-          <span className='text-13px font-500'>{t('orchestrator.run.newRun')}</span>
-        </div>
+      <div className='mb-16px min-w-0'>
+        <div className='text-18px font-600 text-t-primary leading-tight'>{t('orchestrator.run.title')}</div>
+        <div className='mt-4px text-12px leading-16px text-t-tertiary'>{t('orchestrator.run.subtitle')}</div>
       </div>
 
-      {hasWorkspace && (
-        <div className='mb-12px flex items-center gap-8px'>
-          <span className='text-12px text-t-tertiary shrink-0'>{t('orchestrator.run.selectWorkspace')}</span>
-          <Select
-            value={selectedWorkspaceId}
-            onChange={(v: string) => setSelectedWorkspaceId(v)}
-            options={workspaceList.map((w) => ({ label: w.name, value: w.id }))}
-            style={{ width: 220 }}
-            size='small'
-          />
-        </div>
-      )}
-
-      {!hasWorkspace ? (
-        <div className='rd-12px bg-1 px-24px py-48px flex flex-col items-center justify-center text-center'>
-          <span className='size-48px rd-14px bg-fill-2 text-t-tertiary flex items-center justify-center mb-14px'>
-            <History theme='outline' size='24' strokeWidth={3} />
-          </span>
-          <div className='text-15px font-600 text-t-primary'>{t('orchestrator.run.emptyTitle')}</div>
-          <div className='mt-6px text-12px leading-18px text-t-tertiary max-w-320px'>
-            {t('orchestrator.run.noWorkspace')}
-          </div>
-        </div>
-      ) : isLoading ? (
+      {isLoading ? (
         <div className='py-48px flex items-center justify-center'>
           <Spin />
         </div>
@@ -172,22 +131,17 @@ const RunHistory: React.FC<{ onOpenRun?: (runId: string) => void }> = ({ onOpenR
       ) : (
         <div className='flex flex-col gap-10px'>
           {runs.map((run) => (
-            <RunCard key={run.id} run={run} onOpen={() => openRun(run.id)} />
+            <RunCard
+              key={run.id}
+              run={run}
+              onOpen={() => onOpenRun?.(run.id)}
+              onOpenConversation={
+                run.lead_conv_id != null ? () => void navigate(`/conversation/${run.lead_conv_id}`) : undefined
+              }
+            />
           ))}
         </div>
       )}
-
-      <CreateRunModal
-        visible={createOpen}
-        workspaces={workspaceList}
-        fleets={fleetList}
-        defaultWorkspaceId={selectedWorkspaceId}
-        onClose={() => setCreateOpen(false)}
-        onCreated={(runId) => {
-          mutate();
-          openRun(runId);
-        }}
-      />
     </div>
   );
 };

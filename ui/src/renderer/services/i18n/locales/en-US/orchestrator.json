@@ -1,138 +1,18 @@
 {
   "title": "Orchestration",
-  "subtitle": "Orchestrate multi-agent fleets and collaborate inside workspaces",
-  "section": {
-    "workspace": "Workspaces",
-    "fleet": "Fleets",
-    "runHistory": "Run History"
-  },
-  "workspace": {
-    "title": "Workspaces",
-    "subtitle": "Give each fleet an isolated working directory and a default fleet",
-    "create": "New Workspace",
-    "empty": "No workspaces yet — click “New Workspace” to start",
-    "loadError": "Failed to load workspaces",
-    "noDefaultFleet": "No default fleet",
-    "modal": {
-      "title": "New Workspace",
-      "nameLabel": "Name",
-      "namePlaceholder": "Enter a workspace name",
-      "nameRequired": "Please enter a workspace name",
-      "defaultFleetLabel": "Default fleet (optional)",
-      "defaultFleetPlaceholder": "Select a default fleet",
-      "cancel": "Cancel",
-      "confirm": "Create",
-      "createOk": "Workspace created",
-      "createError": "Failed to create workspace: {{error}}"
-    }
-  },
-  "fleet": {
-    "title": "Fleets",
-    "subtitle": "Assemble agents into a fleet that collaborates by strengths and constraints",
-    "create": "New Fleet",
-    "loadError": "Failed to load fleets",
-    "emptyTitle": "No fleets yet",
-    "emptyDesc": "Create a fleet, pick its members, and configure their models and strengths so they can collaborate inside a workspace.",
-    "deleteOk": "Fleet deleted",
-    "deleteError": "Failed to delete fleet: {{error}}",
-    "card": {
-      "memberCount": "{{count}} members",
-      "noMembers": "No members",
-      "noModel": "No model configured",
-      "unknownAgent": "Unknown agent",
-      "maxParallelHint": "Max concurrent tasks",
-      "delete": "Delete fleet",
-      "deleteConfirm": "Delete the fleet “{{name}}”? This cannot be undone."
-    },
-    "edit": {
-      "createTitle": "New Fleet",
-      "editTitle": "Edit Fleet",
-      "nameLabel": "Fleet name",
-      "namePlaceholder": "Give this fleet a name",
-      "nameRequired": "Please enter a fleet name",
-      "descLabel": "Description",
-      "descPlaceholder": "What is this fleet good at?",
-      "maxParallelLabel": "Max parallel",
-      "maxParallelPlaceholder": "Unlimited",
-      "maxParallelHint": "Maximum tasks run concurrently (leave empty for unlimited)",
-      "membersLabel": "Members",
-      "membersCount": "{{count}} selected",
-      "membersEmpty": "No members yet — click “Add member” to start",
-      "membersRequired": "Please add at least one member with an agent selected",
-      "addMember": "Add member",
-      "createOk": "Fleet created",
-      "updateOk": "Fleet updated",
-      "saveError": "Failed to save fleet: {{error}}"
-    },
-    "member": {
-      "agentPlaceholder": "Select an agent",
-      "providerPlaceholder": "Select a provider",
-      "modelPlaceholder": "Select a model",
-      "roleHintPlaceholder": "Role hint (optional)",
-      "concurrencyPlaceholder": "Concurrency",
-      "costTierPlaceholder": "Cost tier",
-      "strengthsPlaceholder": "Strength tags (multi-select / custom)",
-      "remove": "Remove member"
-    },
-    "role": {
-      "planner": "Planner",
-      "coder": "Coder",
-      "reviewer": "Reviewer",
-      "researcher": "Researcher",
-      "tester": "Tester"
-    },
-    "strength": {
-      "coding": "Coding",
-      "reasoning": "Reasoning",
-      "planning": "Planning",
-      "research": "Research",
-      "writing": "Writing",
-      "review": "Review",
-      "longContext": "Long context",
-      "speed": "Speed",
-      "vision": "Vision",
-      "tools": "Tool use"
-    },
-    "costTier": {
-      "low": "Low cost",
-      "medium": "Medium",
-      "high": "High cost"
-    }
-  },
+  "subtitle": "Review the multi-agent runs you started from conversations",
   "run": {
     "title": "Run History",
-    "subtitle": "Pick a workspace to review its orchestration run records",
-    "newRun": "New Run",
-    "selectWorkspace": "Select a workspace",
-    "noWorkspace": "Create a workspace first, then start a run",
+    "subtitle": "Browse every orchestration run you started — click any one to replay its task graph",
+    "openConversation": "Open conversation",
     "emptyTitle": "No runs yet",
-    "emptyDesc": "Click “New Run” to give the fleet a goal and let them collaborate inside the workspace.",
+    "emptyDesc": "Give a multi-agent team a goal inside a conversation to start a run — it will show up here for review afterwards.",
     "loadError": "Failed to load runs",
     "untitledGoal": "(No goal)",
     "dagTab": "Orchestration",
     "mobile": {
       "tasksLabel": "Tasks",
       "noTasks": "The fleet is breaking the goal into tasks — they will appear here shortly."
-    },
-    "modal": {
-      "title": "New Run",
-      "workspace": "Workspace",
-      "workspacePlaceholder": "Select a workspace",
-      "workspaceRequired": "Please select a workspace",
-      "fleet": "Fleet",
-      "fleetPlaceholder": "Select a fleet",
-      "fleetRequired": "Please select a fleet",
-      "goal": "Goal",
-      "goalPlaceholder": "Describe what you want the fleet to accomplish",
-      "goalRequired": "Please enter a goal",
-      "autonomy": "Autonomy",
-      "autonomyAutonomous": "Autonomous",
-      "autonomySupervised": "Supervised",
-      "autonomyInteractive": "Interactive",
-      "cancel": "Cancel",
-      "confirm": "Start",
-      "createSuccess": "Run created",
-      "createError": "Failed to create run: {{error}}"
     },
     "status": {
       "planning": "Planning",
