@@ -4,9 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ReactFlow, Background, BackgroundVariant, Controls, MiniMap, type Edge } from '@xyflow/react';
+import { ReactFlow, Background, BackgroundVariant, Controls, MiniMap, type Edge, type ReactFlowInstance } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import './dag-canvas.css';
 import { Branch } from '@icon-park/react';
@@ -23,6 +23,12 @@ import TaskNode, { taskStatusMeta, type TaskFlowNode } from './nodes/TaskNode';
 
 /** Stable nodeTypes ref so react-flow doesn't warn about a new object each render. */
 const NODE_TYPES = { task: TaskNode } as const;
+
+/** fitView tuning — shared by the static `fitView` prop (initial mount) and the
+ * ResizeObserver-driven refit (see below). A small padding keeps the DAG from
+ * wasting the narrow conversation rail's width, while a generous maxZoom lets a
+ * small (1-2 node) graph grow to a legible size instead of staying pinned tiny. */
+const FIT_VIEW_OPTIONS = { padding: 0.12, maxZoom: 1.6 } as const;
 
 /** Statuses that count as "done" for the aggregate progress pill. */
 const DONE_STATUSES = new Set(['done', 'completed', 'skipped', 'cancelled']);
@@ -70,6 +76,45 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onBack, onOpenTask, embedd
   const { detail, loading, refetch } = useRunLive(runId);
   const [message, ctx] = useArcoMessage();
   const [busy, setBusy] = useState(false);
+
+  // The static `fitView` prop fits ONCE at initial mount. In the conversation
+  // rail (DagRailTab) the canvas mounts while the rail is COLLAPSED (≈0-size
+  // container), so that initial fit happens against a zero viewport and leaves
+  // the nodes tiny in a corner; when the rail later auto-expands, react-flow
+  // never re-fits on its own. We capture the instance via `onInit` and re-run
+  // `fitView()` whenever the wrapper transitions from ~0 → a real size (i.e.
+  // becomes visible). The standalone orchestrator page is sized at mount, so it
+  // simply gets a harmless extra refit. `wasVisibleRef` guards against thrashing
+  // by only firing on the 0→visible edge.
+  const rfRef = useRef<ReactFlowInstance<TaskFlowNode, Edge> | null>(null);
+  const flowWrapRef = useRef<HTMLDivElement | null>(null);
+  const wasVisibleRef = useRef(false);
+  useEffect(() => {
+    const el = flowWrapRef.current;
+    if (!el) return;
+    let raf = 0;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      const { width, height } = entry.contentRect;
+      const visible = width > 0 && height > 0;
+      // Only refit on the collapsed→visible edge so dragging the rail wider
+      // (already visible) doesn't yank the viewport out from under the user.
+      if (visible && !wasVisibleRef.current) {
+        cancelAnimationFrame(raf);
+        // Defer one frame so react-flow has measured the new viewport before we fit.
+        raf = requestAnimationFrame(() => {
+          rfRef.current?.fitView(FIT_VIEW_OPTIONS);
+        });
+      }
+      wasVisibleRef.current = visible;
+    });
+    observer.observe(el);
+    return () => {
+      cancelAnimationFrame(raf);
+      observer.disconnect();
+    };
+  }, []);
 
   // Mirror the global data-theme attribute (light/dark) for react-flow internals
   // whose colors are JS props (MiniMap mask, Background dots) and cannot read CSS
@@ -285,7 +330,7 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onBack, onOpenTask, embedd
           panel renders nothing when there are no roles / all already exist. */}
       {detail.run.status === 'completed' && <RolePrecipitationPanel detail={detail} />}
 
-      <div className='flex-1 min-h-0'>
+      <div ref={flowWrapRef} className='flex-1 min-h-0'>
         {noTasks ? (
           <div className='flex size-full flex-col items-center justify-center gap-12px px-24px text-center'>
             <span className='nomi-dag-pulse flex size-52px items-center justify-center rd-16px bg-fill-2 text-primary-6'>
@@ -299,12 +344,15 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onBack, onOpenTask, embedd
         ) : (
           <ReactFlow
             className='nomi-dag-flow'
+            onInit={(instance) => {
+              rfRef.current = instance;
+            }}
             nodes={nodes}
             edges={edges}
             nodeTypes={NODE_TYPES}
             colorMode={theme}
             fitView
-            fitViewOptions={{ padding: 0.25, maxZoom: 1.1 }}
+            fitViewOptions={FIT_VIEW_OPTIONS}
             minZoom={0.2}
             maxZoom={1.8}
             proOptions={{ hideAttribution: true }}
