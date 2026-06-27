@@ -115,11 +115,18 @@ const refreshConversations = () => {
                 companionSession?: boolean;
                 companionId?: string;
                 channelPlatform?: string;
+                orchestrator_run_id?: string;
                 multi_agent?: { enabled?: boolean };
               }
             | undefined;
           const isCompanionConversation =
             !!extra?.companionSession || !!extra?.companionId || !!extra?.channelPlatform;
+          // 智能编排 (orchestrator) WORKER conversations are spawned by the Run
+          // engine to execute fleet-member tasks; they carry an
+          // `orchestrator_run_id` marker (stamped in build_worker_extra). They
+          // live under the orchestrator Run view, never in this work
+          // conversation list — hide them exactly like companion rows.
+          const isOrchestratorWorkerConversation = !!extra?.orchestrator_run_id;
           // Multi-agent: the LEAD is the user's own conversation (it carries the
           // frontend-only `multi_agent` config the user toggled on); the backend
           // never writes `multi_agent` into a teammate's extra. So hide only
@@ -128,7 +135,12 @@ const refreshConversations = () => {
           const inTeam = !!extra?.team_id || !!extra?.teamId;
           const isMultiAgentLead = inTeam && extra?.multi_agent?.enabled === true;
           const hideAsTeammate = inTeam && !isMultiAgentLead;
-          return extra?.is_health_check !== true && !hideAsTeammate && !isCompanionConversation;
+          return (
+            extra?.is_health_check !== true &&
+            !hideAsTeammate &&
+            !isCompanionConversation &&
+            !isOrchestratorWorkerConversation
+          );
         });
         conversationsState = filteredData;
         // Use ALL conversation IDs (including team/legacy health-check rows) so the

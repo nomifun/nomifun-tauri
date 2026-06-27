@@ -770,6 +770,13 @@ fn append_filter_conditions(filters: &ConversationFilters, where_parts: &mut Vec
     if filters.exclude_companion_companion {
         where_parts.push("json_extract(c.extra, '$.companionSession') IS NOT 1".to_string());
     }
+    // 智能编排 (orchestrator) WORKER 会话由 Run 引擎为执行编队任务而创建,
+    // 带有 `extra.orchestrator_run_id` 标记 (build_worker_extra 写入)。它们
+    // 只属于编排 Run 视图,绝不出现在普通会话列表中。与 companion 不同,这一
+    // 排除是无条件的:没有任何 ConversationService::list 的消费者需要看到 worker
+    // 会话(编排器按 id 经 get/list_messages 读取各 worker)。`IS NULL` 同时
+    // 覆盖缺失键的普通会话(json_extract 缺失时返回 NULL → 保留)。
+    where_parts.push("json_extract(c.extra, '$.orchestrator_run_id') IS NULL".to_string());
 }
 
 /// Builds a count query and bind values for the total (ignoring cursor).
@@ -1242,8 +1249,42 @@ mod tests {
         assert!(result.items[0].pinned);
     }
 
-    // ── Extended query tests ────────────────────────────────────────
+    /// 智能编排 worker 会话 (extra.orchestrator_run_id 非空) 无条件从普通列表排除;
+    /// 不带该标记的普通会话保留。镜像 companion 排除机制 (json_extract WHERE)。
+    #[tokio::test]
+    async fn list_excludes_orchestrator_worker_conversations() {
+        let (repo, _db) = setup().await;
 
+        // Worker conversation — stamped with orchestrator_run_id (build_worker_extra).
+        let mut worker = sample_conversation(SYSTEM_USER_ID);
+        worker.extra = r#"{"orchestrator_run_id":"run_abc","orchestrator_task_id":"task_1"}"#.to_string();
+        let worker_id = repo.create(&worker).await.unwrap();
+
+        // Normal conversation — no orchestrator marker.
+        let mut normal = sample_conversation(SYSTEM_USER_ID);
+        normal.extra = r#"{"workspace":"/project"}"#.to_string();
+        let normal_id = repo.create(&normal).await.unwrap();
+
+        let result = repo
+            .list_paginated(
+                SYSTEM_USER_ID,
+                &ConversationFilters {
+                    limit: 20,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Only the normal conversation is returned; the worker is filtered from
+        // both the page and the total count.
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.total, 1);
+        assert_eq!(result.items[0].id, normal_id);
+        assert!(result.items.iter().all(|c| c.id != worker_id));
+    }
+
+    // ── Extended query tests ────────────────────────────────────────
     #[tokio::test]
     async fn find_by_source_and_chat() {
         let (repo, _db) = setup().await;
