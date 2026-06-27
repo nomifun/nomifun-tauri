@@ -453,10 +453,24 @@ async fn run_loop(deps: Arc<RunEngineDeps>, run_id: &str, cancelled: Arc<AtomicB
         // re-checks, so a `resume` (status → `running`) is observed on the next
         // iteration and filling resumes. A read error is treated as not-paused
         // (fail-open: better to keep driving than to wedge on a transient error).
-        let paused = matches!(
-            deps.run_repo.get_run(run_id).await,
-            Ok(Some(r)) if r.status == "paused"
-        );
+        let status = match deps.run_repo.get_run(run_id).await {
+            Ok(Some(r)) => Some(r.status),
+            _ => None,
+        };
+        let paused = matches!(status.as_deref(), Some("paused"));
+
+        // (a'') Awaiting-approval gate (P6 Task 1): an `interactive` run parked at
+        // `awaiting_plan_approval` must NOT dispatch any worker — the human-in-the-
+        // loop sits at the PLAN gate, approved via `approve_plan` (which then
+        // `engine.start`s the loop afresh). The conversation-native choreography
+        // already SKIPS `engine.start` for an awaiting run, so this is
+        // defense-in-depth: a stray start (or a future boot-resume that mis-listed
+        // an awaiting run) must run nothing. With no in-flight work on a fresh start
+        // there is nothing to drain, so we exit cleanly — approval will restart us.
+        if matches!(status.as_deref(), Some("awaiting_plan_approval")) && inflight.is_empty() {
+            info!(run_id, "Run loop: run awaits plan approval — not dispatching (exiting until approved)");
+            break;
+        }
 
         // (b) Fill: dispatch ready tasks up to the free slots — SKIPPED while
         // paused (no new workers dispatch). Re-query every fill so completion-
@@ -908,8 +922,9 @@ mod tests {
 
     use async_trait::async_trait;
     use nomifun_api_types::{
-        CapabilityProfile, CreateFleetRequest, CreateRunRequest, CreateWorkspaceRequest,
-        FleetMember, FleetMemberInput, PlannedDag, PlannedTask,
+        CapabilityProfile, CreateAdhocRunRequest, CreateFleetRequest, CreateRunRequest,
+        CreateWorkspaceRequest, FleetMember, FleetMemberInput, ModelRange, ModelRef, PlannedDag,
+        PlannedTask,
     };
     use nomifun_common::AppError;
     use nomifun_db::{
@@ -1188,6 +1203,132 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(deregistered, "engine loop should deregister after the run completes");
+    }
+
+    // ── P6 Task 1: interactive ad-hoc run parks before the engine ─────────────
+
+    // The conversation-native lead path creates an AD-HOC (workspace_id NULL) run
+    // with autonomy `interactive`. After plan() the run must park at
+    // `awaiting_plan_approval` and the engine, when started for it, must dispatch
+    // ZERO workers (the human-in-the-loop gate sits at the PLAN, not per-worker) —
+    // tasks stay `pending`. After `approve_plan` flips it to `running`, starting
+    // the engine again drives the chain to completion. This is the whole point of
+    // the interactive default: no auto-start, workers wait for approval.
+    //
+    // Crucially this exercises the AD-HOC path (no workspace entity): approve_plan
+    // + engine.start must work off the run's own `work_dir`, with no workspace
+    // lookup — the engine resolves work_dir from `run.work_dir` first (it is set
+    // here), and approve_plan only reads the run row.
+    #[tokio::test]
+    async fn interactive_adhoc_run_waits_for_approval_then_completes() {
+        let db = init_database_memory().await.expect("db init");
+        let pool = db.pool().clone();
+        let run_repo = Arc::new(SqliteRunRepository::new(pool.clone()));
+        let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
+        let ws_repo = Arc::new(SqliteOrchWorkspaceRepository::new(pool.clone()));
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let emitter = OrchestratorRunEventEmitter::new(broadcaster);
+        // The A→B→C chain planner so we get a real multi-task DAG to (not) run.
+        let planner: Arc<dyn PlanProducer> = Arc::new(ChainPlanProducer);
+        let run_service = RunService::new(
+            run_repo.clone(),
+            fleet_repo,
+            ws_repo.clone(),
+            planner,
+            emitter.clone(),
+        );
+        // A worker that records every dispatch via its start_order — so we can
+        // assert the engine dispatched NOTHING while the run awaits approval.
+        let worker = Arc::new(ConcurrencyMockWorkerRunner::new(Duration::ZERO));
+        let worker_dyn: Arc<dyn WorkerRunner> = worker.clone();
+        let mut engine_deps =
+            RunEngineDeps::new(run_repo.clone(), worker_dyn, emitter, ws_repo.clone());
+        engine_deps.worker_timeout = Duration::from_secs(10);
+        let engine = RunEngine::new(Arc::new(engine_deps));
+
+        // Ad-hoc (workspace-less) interactive run with its own work_dir — exactly
+        // what the conversation-native lead path builds (autonomy "interactive").
+        let run = run_service
+            .create_adhoc(
+                "u1",
+                CreateAdhocRunRequest {
+                    goal: "build the chain".to_string(),
+                    work_dir: Some("/tmp/adhoc-proj".to_string()),
+                    model_range: ModelRange::Single {
+                        model: ModelRef {
+                            provider_id: "prov_x".to_string(),
+                            model: "claude-opus-4-8".to_string(),
+                        },
+                    },
+                    pinned_roles: vec![],
+                    role_members: vec![],
+                    autonomy: Some("interactive".to_string()),
+                    max_parallel: None,
+                    lead_conv_id: Some(909),
+                },
+            )
+            .await
+            .expect("create_adhoc interactive");
+        assert!(run.workspace_id.is_none(), "ad-hoc run has no workspace");
+
+        // Plan: the autonomy gate parks an interactive run at awaiting_plan_approval.
+        run_service.plan(&run.id).await.expect("plan");
+        let detail = run_service.get_detail(&run.id).await.expect("detail");
+        assert_eq!(
+            detail.run.status, "awaiting_plan_approval",
+            "interactive ad-hoc run parks at awaiting_plan_approval after plan"
+        );
+        assert_eq!(detail.tasks.len(), 3, "the 3-task chain was planned");
+
+        // The conversation-native choreography must NOT start the engine for an
+        // awaiting run. Start it anyway here to PROVE the engine itself dispatches
+        // nothing for a non-`running` run (defense-in-depth: even a stray start
+        // before approval must not run a worker).
+        engine.start(run.id.clone());
+        // Give the loop a moment; it should read the non-running status and exit
+        // without dispatching any worker.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            worker.start_order.lock().unwrap().len(),
+            0,
+            "no worker may dispatch while the run awaits plan approval"
+        );
+        // Tasks remain pending (nothing was marked running/done).
+        let detail = run_service.get_detail(&run.id).await.expect("detail");
+        assert!(
+            detail.tasks.iter().all(|t| t.status == "pending"),
+            "all tasks stay pending until approval; got {:?}",
+            detail.tasks.iter().map(|t| (&t.title, &t.status)).collect::<Vec<_>>()
+        );
+
+        // Approve → running, then start the engine (the approve route's exact
+        // choreography). The chain now runs to completion off the run's work_dir.
+        run_service.approve_plan(&run.id).await.expect("approve");
+        assert_eq!(
+            run_service.get_detail(&run.id).await.unwrap().run.status,
+            "running",
+            "approve flips the ad-hoc run to running"
+        );
+        engine.start(run.id.clone());
+
+        let mut completed = false;
+        for _ in 0..80 {
+            let d = run_service.get_detail(&run.id).await.expect("detail");
+            if d.run.status == "completed" {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(completed, "approved ad-hoc run must reach completed");
+        // The worker ran exactly the 3 chain tasks (each off the ad-hoc work_dir).
+        let dispatched = worker.start_order.lock().unwrap().clone();
+        assert_eq!(dispatched.len(), 3, "all 3 tasks dispatched after approval");
+        let dirs = worker.seen_workspace_dir.lock().unwrap().clone();
+        assert!(
+            dirs.iter().all(|d| d.as_deref() == Some("/tmp/adhoc-proj")),
+            "workers run off the ad-hoc run's own work_dir (no workspace); got {dirs:?}"
+        );
     }
 
     #[tokio::test]

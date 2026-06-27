@@ -10,15 +10,19 @@
 //! - `nomifun_orchestrator::RunEngine` — the serial execution loop; `start`
 //!   spawns (or restarts) the loop that drives ready tasks to completion.
 //!
-//! `nomi_run_create` performs the full create → plan → start choreography so a
-//! single tool call kicks off a run end-to-end. As of the conversation-native
-//! redesign (P1) it takes ONLY `{goal, autonomy?}` and pulls everything else —
-//! `work_dir`, `model_range`, `lead_conv_id` — from the CALLING conversation's
-//! `extra` (the "orchestration lead" context), then drives the workspace-less
-//! [`create_adhoc`](nomifun_orchestrator::RunService::create_adhoc) path. The two
-//! read tools project the rich `RunDetail` down to a compact, LLM-friendly shape
-//! (run status + per-task title/status, and on result the per-task
-//! `output_summary`).
+//! `nomi_run_create` performs the create → plan → (conditionally) start
+//! choreography so a single tool call sets up a run from the calling conversation.
+//! As of the conversation-native redesign (P1) it takes ONLY `{goal, autonomy?}`
+//! and pulls everything else — `work_dir`, `model_range`, `lead_conv_id` — from
+//! the CALLING conversation's `extra` (the "orchestration lead" context), then
+//! drives the workspace-less
+//! [`create_adhoc`](nomifun_orchestrator::RunService::create_adhoc) path. As of
+//! P6 Task 1 the lead path defaults autonomy to **`interactive`**: the run parks
+//! at `awaiting_plan_approval` and the engine is NOT started until the user
+//! approves the plan (the tool returns that status + a relay message for the
+//! 主管). Other autonomy levels start immediately. The two read tools project the
+//! rich `RunDetail` down to a compact, LLM-friendly shape (run status + per-task
+//! title/status, and on result the per-task `output_summary`).
 //!
 //! ## `ModelRange::Auto` expansion (Task 3 decision)
 //! `RunService::create_adhoc` rejects an unexpanded `Auto` — it has no provider
@@ -69,8 +73,10 @@ const ORCHESTRATOR_DENY_SURFACES: &[Surface] = &[Surface::Remote];
 struct RunCreateParams {
     /// The high-level goal to decompose into tasks and execute.
     goal: String,
-    /// Autonomy mode: "supervised" (default) or "autonomous". Controls how much
-    /// the run pauses for confirmation. Omit for the default.
+    /// Autonomy mode: "interactive" (the default for conversation-native runs —
+    /// the run parks at `awaiting_plan_approval` for the user to approve the plan
+    /// in the 编排面板 before any worker runs), "supervised", or "autonomous".
+    /// Omit for the interactive default.
     #[serde(default)]
     autonomy: Option<String>,
 }
@@ -149,7 +155,12 @@ async fn create(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: RunCreat
         model_range,
         pinned_roles: vec![],
         role_members,
-        autonomy: p.autonomy,
+        // Conversation-native lead runs default to `interactive` (P6 Task 1): the
+        // 主管 proposes the team + DAG and the run parks at
+        // `awaiting_plan_approval` for the user to approve in the 编排面板. An
+        // explicit autonomy arg overrides this; `create_adhoc`'s own default
+        // (supervised) is NOT used here.
+        autonomy: Some(lead_autonomy(p.autonomy)),
         // Serial loop (P1): parallelism is not yet a gateway-exposed knob.
         max_parallel: None,
         lead_conv_id,
@@ -160,18 +171,37 @@ async fn create(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: RunCreat
         Ok(run) => run,
         Err(e) => return json!({ "error": e.to_string() }),
     };
-    // 4. Plan: decompose the goal → task DAG + assignments, flip to `running`.
+    // 4. Plan: decompose the goal → task DAG + assignments, then apply the
+    //    autonomy gate. An `interactive` run (the conversation-native default)
+    //    parks at `awaiting_plan_approval`; every other level flips to `running`.
     if let Err(e) = deps.orchestrator_run_service.plan(&run.id).await {
         return json!({ "error": format!("run {} created but planning failed: {e}", run.id) });
     }
-    // 5. Start the serial execution loop (idempotent; restarts any existing loop).
-    deps.orchestrator_run_engine.start(run.id.clone());
 
-    // 6. Write the run id back into the lead conversation's `extra` so the
+    // 5. Read the post-plan detail ONCE: it tells us the resulting status (did the
+    //    autonomy gate park the run?) and the planned task count (for the relay
+    //    message). The run exists (we just created + planned it); a read error is
+    //    non-fatal — we fall back to the create-time status and an empty task list.
+    let (status, task_count) = match deps.orchestrator_run_service.get_detail(&run.id).await {
+        Ok(detail) => (detail.run.status, detail.tasks.len()),
+        Err(_) => (run.status.clone(), 0),
+    };
+    let awaiting = is_awaiting_approval(&status);
+
+    // 6. Start the execution loop ONLY when the run is not awaiting approval. An
+    //    `interactive` run must NOT auto-start — it waits for the user to approve
+    //    the plan in the 编排面板 (the `approve` route then starts the engine).
+    //    All other autonomy levels start immediately (idempotent; restarts any
+    //    existing loop).
+    if !awaiting {
+        deps.orchestrator_run_engine.start(run.id.clone());
+    }
+
+    // 7. Write the run id back into the lead conversation's `extra` so the
     //    frontend DAG can locate this run later (P2). `ConversationService::update`
     //    MERGES `extra` (top-level keys overwritten, others preserved), so this
     //    does not clobber `workspace` / `model_range` / etc. Best-effort: a
-    //    write-back failure is logged but does not fail the (already-started) run.
+    //    write-back failure is logged but does not fail the (already-created) run.
     let update = UpdateConversationRequest {
         name: None,
         pinned: None,
@@ -191,13 +221,20 @@ async fn create(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: RunCreat
         );
     }
 
-    // Re-read so the returned status reflects the post-plan state (`running`).
-    let status = match deps.orchestrator_run_service.get_detail(&run.id).await {
-        Ok(detail) => detail.run.status,
-        // The run exists (we just created it); fall back to the create-time status.
-        Err(_) => run.status,
-    };
-    ok(json!({ "run_id": run.id, "status": status }))
+    // 8. Return. When the run parked at `awaiting_plan_approval`, include a
+    //    `message` instructing the 主管 to relay to the user that a team for
+    //    `task_count` subtasks was drafted and is pending approval in the 编排面板.
+    //    Otherwise (the run is running) return the bare run id + status.
+    if awaiting {
+        ok(json!({
+            "run_id": run.id,
+            "status": status,
+            "task_count": task_count,
+            "message": awaiting_plan_message(task_count),
+        }))
+    } else {
+        ok(json!({ "run_id": run.id, "status": status }))
+    }
 }
 
 // ── lead-conversation context parsing + Auto expansion ────────────────────
@@ -255,6 +292,43 @@ fn expand_auto_range(summaries: &[ProviderSummary]) -> Result<ModelRange, Value>
         }));
     }
     Ok(ModelRange::Range { models })
+}
+
+// ── interactive default + awaiting-approval relay (P6 Task 1) ──────────────
+
+/// The autonomy a conversation-native ("lead") run uses. Decision (P6 Task 1):
+/// multi-agent runs created from a conversation default to **`interactive`** —
+/// the 主管 proposes the team + task DAG and the run parks at
+/// `awaiting_plan_approval` for the user to approve in the 编排面板 before any
+/// worker dispatches. An EXPLICIT autonomy override (a non-blank tool arg) is
+/// honored verbatim (trimmed); an omitted or blank value falls back to the
+/// interactive default.
+///
+/// NOTE: this is the LEAD-path default only. `RunService::create_adhoc`'s own
+/// `DEFAULT_AUTONOMY` stays `"supervised"` (other callers / the e2e rely on it);
+/// the interactive default is applied HERE, at the caps layer, so only the
+/// conversation-native lead path goes interactive by default.
+fn lead_autonomy(autonomy: Option<String>) -> String {
+    autonomy
+        .map(|a| a.trim().to_string())
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| "interactive".to_string())
+}
+
+/// Whether a run status means "parked, waiting for the user to approve the plan".
+/// The choreography must NOT `engine.start` such a run — it waits for `approve`.
+fn is_awaiting_approval(status: &str) -> bool {
+    status == "awaiting_plan_approval"
+}
+
+/// The 主管-facing relay message for a run that parked at `awaiting_plan_approval`:
+/// it instructs the lead LLM to tell the user that a team for `task_count`
+/// subtasks was drafted and is pending approval in the 编排面板. The concrete
+/// count is interpolated so the LLM relays the real number.
+fn awaiting_plan_message(task_count: usize) -> String {
+    format!(
+        "已拟定 {task_count} 个子任务的团队，待你在编排面板批准后开始执行。请把这一情况转达给用户，并等待其批准。"
+    )
 }
 
 // ── assistant → role member resolution (P4 Task 2) ─────────────────────────
@@ -493,7 +567,7 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
         CapabilityMeta::new(
             "nomi_run_create",
             "orchestrator",
-            "Create and start an orchestration run from THIS conversation's context: decompose the goal into a task DAG over the conversation's chosen model range and drive it to completion. Only works in an orchestration-lead conversation (one with a model_range). Returns the run id and status.",
+            "Create an orchestration run from THIS conversation's context: decompose the goal into a task DAG over the conversation's chosen model range and propose a team to execute it. Only works in an orchestration-lead conversation (one with a model_range). Defaults to interactive: the run parks awaiting your plan approval in the 编排面板 (returns status `awaiting_plan_approval` + a message to relay to the user) rather than auto-running. Returns the run id and status.",
             DangerTier::Write,
         )
         .deny_on(ORCHESTRATOR_DENY_SURFACES),
@@ -775,5 +849,48 @@ mod tests {
         let members = build_role_members_from_assistants(&assistants, &range);
         assert_eq!(members.len(), 1);
         assert!(members[0].system_prompt.is_none(), "blank persona → None");
+    }
+
+    // ── P6 Task 1: conversation-native runs default to `interactive` ──────────
+
+    // The conversation-native lead path (nomi_run_create) defaults autonomy to
+    // `interactive` when the caller omits it — so the 主管's plan parks at
+    // `awaiting_plan_approval` for the user to approve in the 编排面板, rather
+    // than auto-starting. An EXPLICIT autonomy override is honored verbatim;
+    // a blank/whitespace value is treated as absent → the interactive default.
+    #[test]
+    fn lead_autonomy_defaults_to_interactive() {
+        // Omitted → interactive (the conversation-native default).
+        assert_eq!(lead_autonomy(None), "interactive", "omitted autonomy → interactive");
+        // Blank/whitespace → treated as absent → interactive.
+        assert_eq!(lead_autonomy(Some("   ".to_string())), "interactive", "blank → interactive");
+        // Explicit overrides are honored verbatim (trimmed).
+        assert_eq!(lead_autonomy(Some("supervised".to_string())), "supervised");
+        assert_eq!(lead_autonomy(Some("autonomous".to_string())), "autonomous");
+        assert_eq!(lead_autonomy(Some(" interactive ".to_string())), "interactive", "trimmed");
+    }
+
+    // When a run parks at `awaiting_plan_approval`, the tool return must carry the
+    // awaiting status AND a 主管-facing message instructing it to tell the user a
+    // team of N subtasks was drafted, pending approval in the 编排面板. The task
+    // count is interpolated so the LLM relays the concrete number.
+    #[test]
+    fn awaiting_message_names_task_count_and_panel() {
+        let msg = awaiting_plan_message(3);
+        assert!(msg.contains('3'), "message must name the task count (3): {msg}");
+        assert!(msg.contains("批准"), "message must mention approval: {msg}");
+        assert!(
+            msg.contains("编排面板"),
+            "message must point the user at the 编排面板: {msg}"
+        );
+    }
+
+    // A run that did NOT park (e.g. supervised/autonomous → `running`) is not an
+    // awaiting state, so the choreography must START the engine for it.
+    #[test]
+    fn awaiting_status_predicate_only_for_awaiting() {
+        assert!(is_awaiting_approval("awaiting_plan_approval"));
+        assert!(!is_awaiting_approval("running"));
+        assert!(!is_awaiting_approval("planning"));
     }
 }
