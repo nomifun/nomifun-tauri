@@ -40,6 +40,11 @@ export type ConfigKeyMap = {
   'css.activeThemeId': string;
   'nomi.config': { preferredMode?: string } | undefined;
   'nomi.defaultModel': { id: string; use_model: string } | undefined;
+  /**
+   * 会话入口模型选择器三态：单一模型 / 自动编排 / 范围多选。
+   * Guid-entry model selector tri-state: single model / auto-orchestrate / range multi-select.
+   */
+  'nomi.modelSelectionMode': 'single' | 'auto' | 'range' | undefined;
   // Default provider+model for the knowledge-base AI description/overview
   // generators (autogen / description.generate / description.polish). Empty
   // value = let the backend fall back to its own default completer model.

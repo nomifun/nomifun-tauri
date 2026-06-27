@@ -9,9 +9,10 @@ import type { IProvider, TProviderWithModel } from '@/common/config/storage';
 import { iconColors } from '@/renderer/styles/colors';
 import { getModelDisplayLabel } from '@/renderer/utils/model/agentLogo';
 import type { AcpModelInfo } from '../types';
+import type { GuidModelSelectionMode } from '../hooks/useGuidModelSelection';
 import { getAvailableModels } from '../utils/modelUtils';
-import { Button, Dropdown, Menu, Tooltip } from '@arco-design/web-react';
-import { Brain, Down, Plus } from '@icon-park/react';
+import { Button, Checkbox, Dropdown, Menu, Radio, Tooltip } from '@arco-design/web-react';
+import { Brain, Down, Plus, Robot } from '@icon-park/react';
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
@@ -24,6 +25,14 @@ type GuidModelSelectorProps = {
   current_model: TProviderWithModel | undefined;
   setCurrentModel: (model: TProviderWithModel) => Promise<void>;
 
+  // Tri-state orchestration selection (single / auto / range). Optional: when
+  // omitted (e.g. the scheduled-task dialog reuses this selector) the component
+  // behaves as a classic single-select model picker with no segmented control.
+  selectionMode?: GuidModelSelectionMode;
+  setSelectionMode?: (mode: GuidModelSelectionMode) => void;
+  selectedRange?: TProviderWithModel[];
+  toggleRangeModel?: (model: TProviderWithModel) => void;
+
   // ACP model state
   currentAcpCachedModelInfo: AcpModelInfo | null;
   selectedAcpModel: string | null;
@@ -35,6 +44,10 @@ const GuidModelSelector: React.FC<GuidModelSelectorProps> = ({
   modelList,
   current_model,
   setCurrentModel,
+  selectionMode,
+  setSelectionMode,
+  selectedRange,
+  toggleRangeModel,
   currentAcpCachedModelInfo,
   selectedAcpModel,
   setSelectedAcpModel,
@@ -42,6 +55,12 @@ const GuidModelSelector: React.FC<GuidModelSelectorProps> = ({
   const { t } = useTranslation();
   const navigate = useNavigate();
   const defaultModelLabel = t('common.defaultModel');
+
+  // Orchestration tri-state is only active when the host wired the setter (the
+  // 会话 entry). Other reuse sites (scheduled-task dialog) leave it single.
+  const orchestrationEnabled = typeof setSelectionMode === 'function';
+  const effectiveMode: GuidModelSelectionMode = orchestrationEnabled ? (selectionMode ?? 'single') : 'single';
+  const effectiveRange = selectedRange ?? [];
 
   // 获取模型配置数据（包含健康状态）
   const { data: modelConfig } = useProvidersQuery();
@@ -64,6 +83,17 @@ const GuidModelSelector: React.FC<GuidModelSelectorProps> = ({
       fallbackLabel: defaultModelLabel,
     });
   }, [current_model?.use_model, defaultModelLabel, geminiSelectedLabel]);
+
+  // The trigger button reflects the active tri-state mode:
+  //   single → the selected model name; auto → 自动编排; range → N 个模型.
+  const triStateButtonLabel = React.useMemo(() => {
+    if (effectiveMode === 'auto') return t('guid.modelSelector.autoLabel');
+    if (effectiveMode === 'range') return t('guid.modelSelector.rangeLabel', { count: effectiveRange.length });
+    return geminiButtonLabel;
+  }, [effectiveMode, effectiveRange.length, geminiButtonLabel, t]);
+
+  // The trigger icon hints at orchestration when not in plain single mode.
+  const TriStateIcon = effectiveMode === 'single' ? Brain : Robot;
 
   const acpSelectedLabel = React.useMemo(() => {
     return (
@@ -89,91 +119,156 @@ const GuidModelSelector: React.FC<GuidModelSelectorProps> = ({
   }, [acpSelectedLabel, currentAcpCachedModelInfo?.current_model_id, defaultModelLabel, selectedAcpModel]);
 
   if (isGeminiMode) {
+    const hasModels = !!enabledModelList && enabledModelList.length > 0;
+    const rangeKeySet = new Set(effectiveRange.map((m) => m.id + m.use_model));
+
+    // Per-model health dot color (shared by single + range bodies).
+    const healthDotColor = (providerId: string, modelName: string): string | null => {
+      const matchedProvider = modelConfig?.find((p) => p.id === providerId);
+      const healthStatus = matchedProvider?.model_health?.[modelName]?.status || 'unknown';
+      if (healthStatus === 'unknown') return null;
+      return healthStatus === 'healthy' ? 'bg-green-500' : healthStatus === 'unhealthy' ? 'bg-red-500' : 'bg-gray-400';
+    };
+
+    // Segmented tri-state switch, pinned to the top of the droplist. Only shown
+    // when the host enabled orchestration (the 会话 entry).
+    const modeHeader = orchestrationEnabled ? (
+      <div className='px-12px pt-10px pb-8px border-b border-solid border-border-2'>
+        <Radio.Group
+          type='button'
+          size='small'
+          value={effectiveMode}
+          onChange={(mode: GuidModelSelectionMode) => setSelectionMode?.(mode)}
+        >
+          <Radio value='single'>{t('guid.modelSelector.modeSingle')}</Radio>
+          <Radio value='auto'>{t('guid.modelSelector.modeAuto')}</Radio>
+          <Radio value='range'>{t('guid.modelSelector.modeRange')}</Radio>
+        </Radio.Group>
+      </div>
+    ) : null;
+
+    const addModelRow = (
+      <div
+        role='button'
+        tabIndex={0}
+        className='flex items-center gap-6px px-12px py-8px text-12px text-t-secondary cursor-pointer hover:bg-2 rounded-4px'
+        onClick={() => navigate('/settings/model')}
+      >
+        <Plus theme='outline' size='12' />
+        <span>{t('settings.addModel')}</span>
+      </div>
+    );
+
+    let body: React.ReactNode;
+    if (!hasModels) {
+      // No models configured — same empty + add-model affordance as before.
+      body = (
+        <div className='py-4px'>
+          <div className='px-12px py-12px text-t-secondary text-14px text-center'>{t('settings.noAvailableModels')}</div>
+          {addModelRow}
+        </div>
+      );
+    } else if (effectiveMode === 'auto') {
+      // Auto mode hides the list — the lead fans out over every enabled model.
+      body = (
+        <div className='px-12px py-16px flex flex-col items-center gap-6px text-center'>
+          <Robot theme='outline' size='20' fill={iconColors.secondary} />
+          <span className='text-13px text-t-primary font-500'>{t('guid.modelSelector.autoTitle')}</span>
+          <span className='text-12px text-t-secondary leading-relaxed'>{t('guid.modelSelector.autoHint')}</span>
+        </div>
+      );
+    } else if (effectiveMode === 'range') {
+      // Range mode — multi-select checkboxes grouped per provider.
+      body = (
+        <div className='py-4px max-h-300px overflow-y-auto'>
+          {enabledModelList.map((provider) => {
+            const available_models = getAvailableModels(provider);
+            if (available_models.length === 0) return null;
+            return (
+              <div key={provider.id} className='mb-2px'>
+                <div className='px-12px pt-6px pb-2px text-12px text-t-tertiary'>{provider.name}</div>
+                {available_models.map((modelName) => {
+                  const checked = rangeKeySet.has(provider.id + modelName);
+                  const dot = healthDotColor(provider.id, modelName);
+                  return (
+                    <div
+                      key={provider.id + modelName}
+                      role='button'
+                      tabIndex={0}
+                      className={`flex items-center gap-8px px-12px py-6px mx-4px rounded-4px cursor-pointer hover:bg-2 ${checked ? '!bg-2' : ''}`}
+                      onClick={() => toggleRangeModel?.({ ...provider, use_model: modelName })}
+                    >
+                      <Checkbox checked={checked} onChange={() => toggleRangeModel?.({ ...provider, use_model: modelName })} />
+                      {dot && <div className={`w-6px h-6px rounded-full shrink-0 ${dot}`} />}
+                      <span className='text-14px text-t-primary truncate'>{modelName}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })}
+          {addModelRow}
+        </div>
+      );
+    } else {
+      // Single mode — the original single-select Arco menu, unchanged behavior.
+      body = (
+        <Menu selectedKeys={current_model ? [current_model.id + current_model.use_model] : []}>
+          {[
+            ...enabledModelList.map((provider) => {
+              const available_models = getAvailableModels(provider);
+              if (available_models.length === 0) return null;
+              return (
+                <Menu.ItemGroup title={provider.name} key={provider.id}>
+                  {available_models.map((modelName) => {
+                    const dot = healthDotColor(provider.id, modelName);
+                    return (
+                      <Menu.Item
+                        key={provider.id + modelName}
+                        className={
+                          (current_model?.id ?? '') + (current_model?.use_model ?? '') === provider.id + modelName
+                            ? '!bg-2'
+                            : ''
+                        }
+                        onClick={() => {
+                          setCurrentModel({ ...provider, use_model: modelName }).catch((error) => {
+                            console.error('Failed to set current model:', error);
+                          });
+                        }}
+                      >
+                        <div className='flex items-center gap-8px w-full'>
+                          {dot && <div className={`w-6px h-6px rounded-full shrink-0 ${dot}`} />}
+                          <span>{modelName}</span>
+                        </div>
+                      </Menu.Item>
+                    );
+                  })}
+                </Menu.ItemGroup>
+              );
+            }),
+            <Menu.Item key='add-model' className='text-12px text-t-secondary' onClick={() => navigate('/settings/model')}>
+              <Plus theme='outline' size='12' />
+              {t('settings.addModel')}
+            </Menu.Item>,
+          ]}
+        </Menu>
+      );
+    }
+
     return (
       <Dropdown
-        trigger='hover'
+        trigger='click'
         droplist={
-          <Menu selectedKeys={current_model ? [current_model.id + current_model.use_model] : []}>
-            {!enabledModelList || enabledModelList.length === 0
-              ? [
-                  <Menu.Item
-                    key='no-models'
-                    className='px-12px py-12px text-t-secondary text-14px text-center flex justify-center items-center'
-                    disabled
-                  >
-                    {t('settings.noAvailableModels')}
-                  </Menu.Item>,
-                  <Menu.Item
-                    key='add-model'
-                    className='text-12px text-t-secondary'
-                    onClick={() => navigate('/settings/model')}
-                  >
-                    <Plus theme='outline' size='12' />
-                    {t('settings.addModel')}
-                  </Menu.Item>,
-                ]
-              : [
-                  ...(enabledModelList || []).map((provider) => {
-                    const available_models = getAvailableModels(provider);
-                    if (available_models.length === 0) return null;
-                    return (
-                      <Menu.ItemGroup title={provider.name} key={provider.id}>
-                        {available_models.map((modelName) => {
-                          // 获取模型健康状态
-                          const matchedProvider = modelConfig?.find((p) => p.id === provider.id);
-                          const healthStatus = matchedProvider?.model_health?.[modelName]?.status || 'unknown';
-                          const healthColor =
-                            healthStatus === 'healthy'
-                              ? 'bg-green-500'
-                              : healthStatus === 'unhealthy'
-                                ? 'bg-red-500'
-                                : 'bg-gray-400';
-
-                          return (
-                            <Menu.Item
-                              key={provider.id + modelName}
-                              className={
-                                (current_model?.id ?? '') + (current_model?.use_model ?? '') === provider.id + modelName ? '!bg-2' : ''
-                              }
-                              onClick={() => {
-                                setCurrentModel({ ...provider, use_model: modelName }).catch((error) => {
-                                  console.error('Failed to set current model:', error);
-                                });
-                              }}
-                            >
-                              <div className='flex items-center gap-8px w-full'>
-                                {healthStatus !== 'unknown' && (
-                                  <div className={`w-6px h-6px rounded-full shrink-0 ${healthColor}`} />
-                                )}
-                                <span>{modelName}</span>
-                              </div>
-                            </Menu.Item>
-                          );
-                        })}
-                      </Menu.ItemGroup>
-                    );
-                  }),
-                  <Menu.Item
-                    key='add-model'
-                    className='text-12px text-t-secondary'
-                    onClick={() => navigate('/settings/model')}
-                  >
-                    <Plus theme='outline' size='12' />
-                    {t('settings.addModel')}
-                  </Menu.Item>,
-                ]}
-          </Menu>
+          <div className='min-w-260px max-w-340px bg-1 rounded-8px overflow-hidden'>
+            {modeHeader}
+            {body}
+          </div>
         }
       >
-        <Button
-          className={'sendbox-model-btn guid-config-btn'}
-          shape='round'
-          size='small'
-          data-testid='guid-model-selector'
-        >
+        <Button className={'sendbox-model-btn guid-config-btn'} shape='round' size='small' data-testid='guid-model-selector'>
           <span className='flex items-center gap-6px min-w-0'>
-            <Brain theme='outline' size='14' fill={iconColors.secondary} className='shrink-0' />
-            <span>{geminiButtonLabel}</span>
+            <TriStateIcon theme='outline' size='14' fill={iconColors.secondary} className='shrink-0' />
+            <span className='truncate'>{triStateButtonLabel}</span>
             <Down theme='outline' size='12' fill={iconColors.secondary} className='shrink-0' />
           </span>
         </Button>

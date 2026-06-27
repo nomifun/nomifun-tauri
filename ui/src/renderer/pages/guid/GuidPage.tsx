@@ -172,6 +172,8 @@ const GuidPage: React.FC = () => {
     selectedAcpModel: agentSelection.selectedAcpModel,
     currentAcpCachedModelInfo: agentSelection.currentAcpCachedModelInfo,
     current_model: modelSelection.current_model,
+    selectionMode: modelSelection.selectionMode,
+    selectedRange: modelSelection.selectedRange,
 
     // Agent helpers
     findAgentByKey: agentSelection.findAgentByKey,
@@ -516,6 +518,10 @@ const GuidPage: React.FC = () => {
       modelList={modelSelection.modelList}
       current_model={modelSelection.current_model}
       setCurrentModel={modelSelection.setCurrentModel}
+      selectionMode={modelSelection.selectionMode}
+      setSelectionMode={modelSelection.setSelectionMode}
+      selectedRange={modelSelection.selectedRange}
+      toggleRangeModel={modelSelection.toggleRangeModel}
       currentAcpCachedModelInfo={agentSelection.currentAcpCachedModelInfo}
       selectedAcpModel={agentSelection.selectedAcpModel}
       setSelectedAcpModel={agentSelection.setSelectedAcpModel}

@@ -1710,6 +1710,25 @@ export interface ICreateConversationParams {
     remote_agent_id?: number;
     extra_skill_paths?: string[];
     team_id?: string;
+    /**
+     * Orchestration role marker. Set to `'lead'` when the 会话 entry created
+     * this conversation with the model selector in `auto`/`range` mode: the
+     * backend nomi factory then arms it with a 编排主管 (orchestration lead)
+     * system prompt so it can fan out via `nomi_run_create`. Absent for every
+     * single-model conversation (today's behavior). Must stay snake_case to
+     * match `NomiBuildExtra.orchestrator_role`.
+     */
+    orchestrator_role?: 'lead';
+    /**
+     * The model range the lead may execute its synthetic fleet over. Shape
+     * mirrors the backend `ModelRange` serde (tag `mode`, snake_case variants;
+     * `{ provider_id, model }` refs) so the lead's `nomi_run_create` parses it
+     * verbatim. Only sent alongside `orchestrator_role: 'lead'`.
+     */
+    model_range?:
+      | { mode: 'single'; model: { provider_id: string; model: string } }
+      | { mode: 'auto' }
+      | { mode: 'range'; models: Array<{ provider_id: string; model: string }> };
   };
 }
 

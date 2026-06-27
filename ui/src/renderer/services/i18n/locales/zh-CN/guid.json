@@ -9,6 +9,16 @@
   "selectAssistantHint": "选择一位助手开始任务",
   "agentSwitcherLabel": "Agent",
   "switchedToAgent": "已切换到 {{agent}}",
+  "modelSelector": {
+    "modeSingle": "单一",
+    "modeAuto": "自动",
+    "modeRange": "范围",
+    "autoLabel": "自动编排",
+    "rangeLabel": "{{count}} 个模型",
+    "autoTitle": "全部启用模型",
+    "autoHint": "主管会从所有已启用模型中自动择优，按需分派子任务。",
+    "rangeEmpty": "请至少选择一个模型用于范围编排。"
+  },
   "workspace": {
     "workInProject": "在项目中工作",
     "optional": "可选",

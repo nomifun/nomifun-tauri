@@ -71,6 +71,11 @@ export interface IConfigStorageRefer {
     preferredMode?: string;
   };
   'nomi.defaultModel'?: { id: string; use_model: string };
+  /**
+   * 会话入口模型选择器三态：单一模型 / 自动编排 / 范围多选。
+   * Guid-entry model selector tri-state: single model / auto-orchestrate / range multi-select.
+   */
+  'nomi.modelSelectionMode'?: 'single' | 'auto' | 'range';
   'tools.imageGenerationModel': TProviderWithModel & {
     /** @deprecated Image generation is now controlled via built-in MCP server toggle */
     switch?: boolean;

@@ -10,6 +10,7 @@ import { configService } from '@/common/config/configService';
 import { useGoogleAuthModels } from '@/renderer/hooks/agent/useGoogleAuthModels';
 import { useProvidersQuery } from '@/renderer/hooks/agent/useModelProviderList';
 import { hasAvailableModels } from '../utils/modelUtils';
+import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 /**
@@ -39,12 +40,28 @@ const MODEL_STORAGE_KEY: Record<ProviderAgentKey, 'nomi.defaultModel'> = {
   nomi: 'nomi.defaultModel',
 };
 
+/**
+ * Tri-state for the 会话 entry model selector:
+ * - `single` — one fixed model (today's behavior, no orchestration);
+ * - `auto`   — let the lead pick from every enabled model (fan-out);
+ * - `range`  — an explicit multi-select allow-list the lead expands over.
+ */
+export type GuidModelSelectionMode = 'single' | 'auto' | 'range';
+
 export type GuidModelSelectionResult = {
   modelList: IProvider[];
   isGoogleAuth: boolean;
   formatGeminiModelLabel: (provider: { platform?: string } | undefined, modelName?: string) => string;
   current_model: TProviderWithModel | undefined;
   setCurrentModel: (model_info: TProviderWithModel) => Promise<void>;
+  /** Tri-state selection mode (single / auto / range). */
+  selectionMode: GuidModelSelectionMode;
+  setSelectionMode: (mode: GuidModelSelectionMode) => void;
+  /** Models chosen in `range` mode (the lead's synthetic fleet). */
+  selectedRange: TProviderWithModel[];
+  setSelectedRange: React.Dispatch<React.SetStateAction<TProviderWithModel[]>>;
+  /** Toggle a single model in/out of the `range` selection by id+use_model. */
+  toggleRangeModel: (model_info: TProviderWithModel) => void;
 };
 
 /**
@@ -68,6 +85,31 @@ export const useGuidModelSelection = (agentKey: ProviderAgentKey = 'nomi'): Guid
   const [current_model, _setCurrentModel] = useState<TProviderWithModel>();
   const selectedModelKeyRef = useRef<string | null>(null);
   const prevStorageKeyRef = useRef<string | null>(null);
+
+  // Tri-state model selection (single / auto / range). Persisted so the entry
+  // remembers the user's last orchestration intent across visits. The mode is
+  // global to the nomi entry (not per provider), so it lives under its own key.
+  const [selectionMode, _setSelectionMode] = useState<GuidModelSelectionMode>(() => {
+    const saved = configService.get('nomi.modelSelectionMode');
+    return saved === 'auto' || saved === 'range' || saved === 'single' ? saved : 'single';
+  });
+  const [selectedRange, setSelectedRange] = useState<TProviderWithModel[]>([]);
+
+  const setSelectionMode = useCallback((mode: GuidModelSelectionMode) => {
+    _setSelectionMode(mode);
+    configService.set('nomi.modelSelectionMode', mode).catch((error) => {
+      console.error('Failed to save model selection mode:', error);
+    });
+  }, []);
+
+  const toggleRangeModel = useCallback((model_info: TProviderWithModel) => {
+    const key = buildModelKey(model_info.id, model_info.use_model);
+    if (!key) return;
+    setSelectedRange((prev) => {
+      const exists = prev.some((m) => buildModelKey(m.id, m.use_model) === key);
+      return exists ? prev.filter((m) => buildModelKey(m.id, m.use_model) !== key) : [...prev, model_info];
+    });
+  }, []);
 
   const storageKey = MODEL_STORAGE_KEY[agentKey];
 
@@ -139,11 +181,26 @@ export const useGuidModelSelection = (agentKey: ProviderAgentKey = 'nomi'): Guid
       console.error('Failed to set default model:', error);
     });
   }, [modelList, storageKey]);
+
+  // Drop any range selections whose provider/model is no longer available, so
+  // the lead never fans out over a model the user has since removed/disabled.
+  useEffect(() => {
+    setSelectedRange((prev) => {
+      const pruned = prev.filter((m) => isModelKeyAvailable(buildModelKey(m.id, m.use_model), modelList));
+      return pruned.length === prev.length ? prev : pruned;
+    });
+  }, [modelList]);
+
   return {
     modelList,
     isGoogleAuth,
     formatGeminiModelLabel,
     current_model,
     setCurrentModel,
+    selectionMode,
+    setSelectionMode,
+    selectedRange,
+    setSelectedRange,
+    toggleRangeModel,
   };
 };
