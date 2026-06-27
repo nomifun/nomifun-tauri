@@ -1,6 +1,8 @@
 {
   "label": "IDMM",
   "hint": "Intelligent Decision-Making Mode keeps a chat/terminal session moving through provider faults and decision stalls. Two independent, default-off watches share one engine: Fault watch and Decision watch.",
+  "expandConfig": "Expand config",
+  "collapseConfig": "Collapse config",
   "tierLabel": "Mode",
   "tier": {
     "ruleOnly": "Rule only (no model)",
@@ -61,6 +63,7 @@
   },
   "sessionBackupHint": "Leave empty to prefer the global default backup provider (Settings → Intelligent Decision-Making), then fall back to this session's own model; set one here to apply it to this watch only.",
   "backupRequired": "Backup-model mode needs a usable model: pick one here, set a global default in Settings → Intelligent Decision-Making, or enable it on a session that already has a model (its model is reused automatically).",
+  "backupModelIncomplete": "Select a complete backup model (provider and model) before enabling the watch.",
   "state": {
     "off": "Off",
     "armed": "Armed",
