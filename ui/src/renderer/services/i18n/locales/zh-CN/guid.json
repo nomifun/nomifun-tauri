@@ -10,10 +10,9 @@
   "agentSwitcherLabel": "Agent",
   "switchedToAgent": "已切换到 {{agent}}",
   "modelSelector": {
-    "autoLabel": "自动编排",
+    "leadLabel": "主管模型: {{model}}",
+    "leadHint": "这是主管（lead）自己运行的模型；子任务会在所有已启用模型上自动派发。",
     "rangeLabel": "{{count}} 个模型",
-    "autoTitle": "全部启用模型",
-    "autoHint": "主管会从所有已启用模型中自动择优，按需分派子任务。",
     "rangeEmpty": "请至少选择一个模型用于范围编排。"
   },
   "orchestration": {

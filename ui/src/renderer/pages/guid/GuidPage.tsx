@@ -512,11 +512,13 @@ const GuidPage: React.FC = () => {
     />
   );
 
-  // Build the model selector node. Hidden in `auto` orchestration mode — auto
-  // fans the lead out over ALL enabled models, so there is nothing to pick and a
-  // model button would just duplicate the "自动编排" segmented label beside it.
-  const hideModelSelector = isGeminiMode && modelSelection.selectionMode === 'auto';
-  const modelSelectorNode = hideModelSelector ? null : (
+  // Build the model selector node. In `auto` orchestration mode it renders as a
+  // single-select 「主管模型」 picker: the lead (主管) itself still runs on one
+  // model (current_model, sent verbatim by useGuidSend), while workers fan out
+  // over every enabled model. Keeping the picker visible in auto means the lead
+  // model is always changeable — without it, a user with no resolvable default
+  // would be stuck (submit blocks on `!current_model`).
+  const modelSelectorNode = (
     <GuidModelSelector
       isGeminiMode={isGeminiMode}
       modelList={modelSelection.modelList}

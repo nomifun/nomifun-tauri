@@ -85,15 +85,22 @@ const GuidModelSelector: React.FC<GuidModelSelectorProps> = ({
   }, [current_model?.use_model, defaultModelLabel, geminiSelectedLabel]);
 
   // The trigger button reflects the active tri-state mode:
-  //   single → the selected model name; auto → 自动编排; range → N 个模型.
+  //   single → the selected model name;
+  //   auto   → 「主管模型: <model>」 — the lead itself still runs on one model
+  //            (workers fan out over every enabled model separately), so we show
+  //            that lead model rather than echoing the "自动编排" segmented label;
+  //   range  → N 个模型.
   const triStateButtonLabel = React.useMemo(() => {
-    if (effectiveMode === 'auto') return t('guid.modelSelector.autoLabel');
+    if (effectiveMode === 'auto') return t('guid.modelSelector.leadLabel', { model: geminiButtonLabel });
     if (effectiveMode === 'range') return t('guid.modelSelector.rangeLabel', { count: effectiveRange.length });
     return geminiButtonLabel;
   }, [effectiveMode, effectiveRange.length, geminiButtonLabel, t]);
 
-  // The trigger icon hints at orchestration when not in plain single mode.
-  const TriStateIcon = effectiveMode === 'single' ? Brain : Robot;
+  // The trigger icon: single + auto both point at one concrete model (the lead),
+  // so they share the Brain glyph. Range stays Robot. The Robot glyph is reserved
+  // for the adjacent orchestration-mode switch so the two controls don't read as
+  // duplicates.
+  const TriStateIcon = effectiveMode === 'range' ? Robot : Brain;
 
   const acpSelectedLabel = React.useMemo(() => {
     return (
@@ -147,6 +154,51 @@ const GuidModelSelector: React.FC<GuidModelSelectorProps> = ({
       </div>
     );
 
+    // Single-select model menu — picks the lead (主管) model. Shared by `single`
+    // mode and `auto` mode (in auto it sets the lead's own model while workers
+    // fan out over every enabled model).
+    const singleSelectMenu = (
+      <Menu selectedKeys={current_model ? [current_model.id + current_model.use_model] : []}>
+        {[
+          ...enabledModelList.map((provider) => {
+            const available_models = getAvailableModels(provider);
+            if (available_models.length === 0) return null;
+            return (
+              <Menu.ItemGroup title={provider.name} key={provider.id}>
+                {available_models.map((modelName) => {
+                  const dot = healthDotColor(provider.id, modelName);
+                  return (
+                    <Menu.Item
+                      key={provider.id + modelName}
+                      className={
+                        (current_model?.id ?? '') + (current_model?.use_model ?? '') === provider.id + modelName
+                          ? '!bg-2'
+                          : ''
+                      }
+                      onClick={() => {
+                        setCurrentModel({ ...provider, use_model: modelName }).catch((error) => {
+                          console.error('Failed to set current model:', error);
+                        });
+                      }}
+                    >
+                      <div className='flex items-center gap-8px w-full'>
+                        {dot && <div className={`w-6px h-6px rounded-full shrink-0 ${dot}`} />}
+                        <span>{modelName}</span>
+                      </div>
+                    </Menu.Item>
+                  );
+                })}
+              </Menu.ItemGroup>
+            );
+          }),
+          <Menu.Item key='add-model' className='text-12px text-t-secondary' onClick={() => navigate('/settings/model')}>
+            <Plus theme='outline' size='12' />
+            {t('settings.addModel')}
+          </Menu.Item>,
+        ]}
+      </Menu>
+    );
+
     let body: React.ReactNode;
     if (!hasModels) {
       // No models configured — same empty + add-model affordance as before.
@@ -157,12 +209,16 @@ const GuidModelSelector: React.FC<GuidModelSelectorProps> = ({
         </div>
       );
     } else if (effectiveMode === 'auto') {
-      // Auto mode hides the list — the lead fans out over every enabled model.
+      // Auto mode — pick the lead (主管) model here; a one-line hint explains that
+      // workers fan out over every enabled model. This is a single-select picker,
+      // NOT the orchestration switch, so it never duplicates the "自动编排" tab.
       body = (
-        <div className='px-12px py-16px flex flex-col items-center gap-6px text-center'>
-          <Robot theme='outline' size='20' fill={iconColors.secondary} />
-          <span className='text-13px text-t-primary font-500'>{t('guid.modelSelector.autoTitle')}</span>
-          <span className='text-12px text-t-secondary leading-relaxed'>{t('guid.modelSelector.autoHint')}</span>
+        <div className='py-4px'>
+          <div className='px-12px pt-8px pb-6px flex items-start gap-6px'>
+            <Robot theme='outline' size='14' fill={iconColors.secondary} className='shrink-0 mt-2px' />
+            <span className='text-12px text-t-secondary leading-relaxed'>{t('guid.modelSelector.leadHint')}</span>
+          </div>
+          {singleSelectMenu}
         </div>
       );
     } else if (effectiveMode === 'range') {
@@ -200,47 +256,7 @@ const GuidModelSelector: React.FC<GuidModelSelectorProps> = ({
       );
     } else {
       // Single mode — the original single-select Arco menu, unchanged behavior.
-      body = (
-        <Menu selectedKeys={current_model ? [current_model.id + current_model.use_model] : []}>
-          {[
-            ...enabledModelList.map((provider) => {
-              const available_models = getAvailableModels(provider);
-              if (available_models.length === 0) return null;
-              return (
-                <Menu.ItemGroup title={provider.name} key={provider.id}>
-                  {available_models.map((modelName) => {
-                    const dot = healthDotColor(provider.id, modelName);
-                    return (
-                      <Menu.Item
-                        key={provider.id + modelName}
-                        className={
-                          (current_model?.id ?? '') + (current_model?.use_model ?? '') === provider.id + modelName
-                            ? '!bg-2'
-                            : ''
-                        }
-                        onClick={() => {
-                          setCurrentModel({ ...provider, use_model: modelName }).catch((error) => {
-                            console.error('Failed to set current model:', error);
-                          });
-                        }}
-                      >
-                        <div className='flex items-center gap-8px w-full'>
-                          {dot && <div className={`w-6px h-6px rounded-full shrink-0 ${dot}`} />}
-                          <span>{modelName}</span>
-                        </div>
-                      </Menu.Item>
-                    );
-                  })}
-                </Menu.ItemGroup>
-              );
-            }),
-            <Menu.Item key='add-model' className='text-12px text-t-secondary' onClick={() => navigate('/settings/model')}>
-              <Plus theme='outline' size='12' />
-              {t('settings.addModel')}
-            </Menu.Item>,
-          ]}
-        </Menu>
-      );
+      body = singleSelectMenu;
     }
 
     return (

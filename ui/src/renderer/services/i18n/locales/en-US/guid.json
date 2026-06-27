@@ -10,10 +10,9 @@
   "agentSwitcherLabel": "Agent",
   "switchedToAgent": "Switched to {{agent}}",
   "modelSelector": {
-    "autoLabel": "Auto-orchestrate",
+    "leadLabel": "Lead: {{model}}",
+    "leadHint": "The model the lead itself runs on; sub-tasks fan out across every enabled model.",
     "rangeLabel": "{{count}} model(s)",
-    "autoTitle": "All enabled models",
-    "autoHint": "The lead picks the best model from every enabled one and dispatches sub-tasks as needed.",
     "rangeEmpty": "Select at least one model for range orchestration."
   },
   "orchestration": {

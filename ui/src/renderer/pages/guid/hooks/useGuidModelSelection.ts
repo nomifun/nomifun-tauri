@@ -9,7 +9,7 @@ import type { IProvider, TProviderWithModel } from '@/common/config/storage';
 import { configService } from '@/common/config/configService';
 import { useGoogleAuthModels } from '@/renderer/hooks/agent/useGoogleAuthModels';
 import { useProvidersQuery } from '@/renderer/hooks/agent/useModelProviderList';
-import { hasAvailableModels } from '../utils/modelUtils';
+import { getAvailableModels, hasAvailableModels } from '../utils/modelUtils';
 import type React from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
@@ -148,25 +148,37 @@ export const useGuidModelSelection = (agentKey: ProviderAgentKey = 'nomi'): Guid
 
       const isNewFormat = savedModel && typeof savedModel === 'object' && 'id' in savedModel;
 
+      // First-available enabled model — the fallback whenever nothing valid was
+      // saved. `modelList` is already filtered by `hasAvailableModels`, so the
+      // first provider is guaranteed to expose at least one selectable model.
+      // Use `getAvailableModels(provider)[0]` (the FILTERED list the picker shows)
+      // rather than raw `provider.models[0]`, which can be a model that lacks
+      // function_calling / is excludeFromPrimary and thus never appears in the
+      // picker — picking it would leave current_model pointing at an unselectable
+      // model. This guarantees the lead (主管) model is always set and editable,
+      // so submit is never silently blocked in auto/range mode.
+      const firstProvider = modelList[0];
+      const firstAvailableModel = firstProvider ? (getAvailableModels(firstProvider)[0] ?? '') : '';
+
       let defaultModel: IProvider | undefined;
       let resolvedUseModel: string;
 
       if (isNewFormat) {
         const { id, use_model } = savedModel;
         const exactMatch = modelList.find((m) => m.id === id);
-        if (exactMatch && exactMatch.models.includes(use_model)) {
+        if (exactMatch && getAvailableModels(exactMatch).includes(use_model)) {
           defaultModel = exactMatch;
           resolvedUseModel = use_model;
         } else {
-          defaultModel = modelList[0];
-          resolvedUseModel = defaultModel?.models[0] ?? '';
+          defaultModel = firstProvider;
+          resolvedUseModel = firstAvailableModel;
         }
       } else if (typeof savedModel === 'string') {
-        defaultModel = modelList.find((m) => m.models.includes(savedModel)) || modelList[0];
-        resolvedUseModel = defaultModel?.models.includes(savedModel) ? savedModel : (defaultModel?.models[0] ?? '');
+        defaultModel = modelList.find((m) => getAvailableModels(m).includes(savedModel)) || firstProvider;
+        resolvedUseModel = defaultModel && getAvailableModels(defaultModel).includes(savedModel) ? savedModel : firstAvailableModel;
       } else {
-        defaultModel = modelList[0];
-        resolvedUseModel = defaultModel?.models[0] ?? '';
+        defaultModel = firstProvider;
+        resolvedUseModel = firstAvailableModel;
       }
 
       if (!defaultModel || !resolvedUseModel) return;
