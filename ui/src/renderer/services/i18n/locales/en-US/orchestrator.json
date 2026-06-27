@@ -2,6 +2,13 @@
   "title": "Orchestration",
   "subtitle": "Review the multi-agent runs you started from conversations",
   "run": {
+    "role": {
+      "planner": "Planner",
+      "coder": "Coder",
+      "reviewer": "Reviewer",
+      "researcher": "Researcher",
+      "tester": "Tester"
+    },
     "title": "Run History",
     "subtitle": "Browse every orchestration run you started — click any one to replay its task graph",
     "openConversation": "Open conversation",

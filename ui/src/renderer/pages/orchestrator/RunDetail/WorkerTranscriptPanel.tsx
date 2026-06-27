@@ -92,7 +92,7 @@ const WorkerTranscriptPanel: React.FC<WorkerTranscriptPanelProps> = ({ open, onC
   }, [task, conversationId]);
 
   const roleLabel = (role: string) =>
-    t(`orchestrator.fleet.role.${role}` as 'orchestrator.fleet.role.planner', { defaultValue: role });
+    t(`orchestrator.run.role.${role}` as 'orchestrator.run.role.planner', { defaultValue: role });
 
   // Apply a reassignment / lock change, then refetch so the canvas + panel sync.
   const applyReassign = async (memberId: string, locked: boolean) => {

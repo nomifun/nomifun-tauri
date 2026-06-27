@@ -2,6 +2,13 @@
   "title": "智能编排",
   "subtitle": "在这里复盘由会话发起的多智能体 Run",
   "run": {
+    "role": {
+      "planner": "规划",
+      "coder": "编码",
+      "reviewer": "评审",
+      "researcher": "调研",
+      "tester": "测试"
+    },
     "title": "Run 历史",
     "subtitle": "查看你发起过的全部编排 Run，点击任意一条复盘其任务图",
     "openConversation": "打开会话",
