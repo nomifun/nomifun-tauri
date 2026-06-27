@@ -122,12 +122,14 @@ const ConversationShell: React.FC = () => {
       if (!projectPath) return;
       addProjectWorkpath(projectPath);
       addRecentWorkspace(projectPath);
+      void navigate('/guid', { state: { workspace: projectPath } });
+      if (isMobile) setMobileOpen(false);
       Message.success(t('sessionList.createProjectSuccess'));
     } catch (error) {
       console.error('[ConversationShell] Failed to create project:', error);
       Message.error(t('sessionList.createProjectFailed'));
     }
-  }, [t]);
+  }, [isMobile, navigate, t]);
 
   const handleConversationSelect = useCallback(() => {
     setBatchMode(false);
@@ -135,7 +137,6 @@ const ConversationShell: React.FC = () => {
 
   const header = (
     <SessionCreateBar
-      isMobile={isMobile}
       batchMode={batchMode}
       onToggleBatchMode={() => setBatchMode((prev) => !prev)}
       onNewChat={handleNewChat}

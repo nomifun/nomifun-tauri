@@ -1,5 +1,6 @@
 {
   "title": "会话",
+  "workpathSection": "项目/工作路径",
   "defaultWorkpath": "默认工作路径",
   "interactiveGroup": "交互会话",
   "terminalGroup": "终端会话",
@@ -9,6 +10,8 @@
   "createProject": "创建项目",
   "createProjectSuccess": "项目已创建",
   "createProjectFailed": "创建项目失败",
+  "batchSelect": "批量选择",
+  "exitBatchSelect": "退出选择",
   "displaySettings": "显示设置",
   "displaySettingsTitle": "侧边栏显示",
   "displayPreset": "显示策略",

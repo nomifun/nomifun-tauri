@@ -12,14 +12,13 @@ import { useTranslation } from 'react-i18next';
 import classNames from 'classnames';
 import { useSettingsViewMode } from '../settingsViewContext';
 import { isElectronDesktop, openExternalUrl } from '@/renderer/utils/platform';
-import FeedbackReportModal from './FeedbackReportModal';
+import { NOMIFUN_PUBLIC_LINKS } from './FeedbackReportModal';
 
 const ABOUT_SYSTEM_VERSION = '1.0.0';
-const ABOUT_LINK_TARGET = '#';
 
 type LinkItem =
-  | { title: string; url: string; icon: React.ReactNode; onClick?: never }
-  | { title: string; onClick: () => void; icon: React.ReactNode; url?: never };
+  | { title: string; detail: string; url: string; icon: React.ReactNode; onClick?: never }
+  | { title: string; detail: string; onClick: () => void; icon: React.ReactNode; url?: never };
 
 const AboutModalContent: React.FC = () => {
   const { t } = useTranslation();
@@ -28,7 +27,6 @@ const AboutModalContent: React.FC = () => {
   const isElectron = isElectronDesktop();
 
   const [includePrerelease, setIncludePrerelease] = useState(false);
-  const [showFeedbackModal, setShowFeedbackModal] = useState(false);
 
   useEffect(() => {
     const saved = localStorage.getItem('update.includePrerelease');
@@ -57,27 +55,38 @@ const AboutModalContent: React.FC = () => {
   const linkItems: LinkItem[] = [
     {
       title: t('settings.helpDocumentation'),
-      url: ABOUT_LINK_TARGET,
+      detail: NOMIFUN_PUBLIC_LINKS.officialWebsite,
+      url: NOMIFUN_PUBLIC_LINKS.officialWebsite,
       icon: <Right theme='outline' size='16' />,
     },
     {
       title: t('settings.updateLog'),
-      url: ABOUT_LINK_TARGET,
+      detail: NOMIFUN_PUBLIC_LINKS.releases,
+      url: NOMIFUN_PUBLIC_LINKS.releases,
       icon: <Right theme='outline' size='16' />,
     },
     {
       title: t('settings.bugReport'),
-      onClick: () => setShowFeedbackModal(true),
+      detail: NOMIFUN_PUBLIC_LINKS.issues,
+      url: NOMIFUN_PUBLIC_LINKS.issues,
       icon: <Right theme='outline' size='16' />,
     },
     {
       title: t('settings.contactMe'),
-      url: ABOUT_LINK_TARGET,
+      detail: NOMIFUN_PUBLIC_LINKS.contact,
+      url: NOMIFUN_PUBLIC_LINKS.contact,
       icon: <Right theme='outline' size='16' />,
     },
     {
       title: t('settings.officialWebsite'),
-      url: ABOUT_LINK_TARGET,
+      detail: NOMIFUN_PUBLIC_LINKS.officialWebsite,
+      url: NOMIFUN_PUBLIC_LINKS.officialWebsite,
+      icon: <Right theme='outline' size='16' />,
+    },
+    {
+      title: t('settings.contactEmail'),
+      detail: `${NOMIFUN_PUBLIC_LINKS.email}${t('settings.contactEmailPending')}`,
+      url: NOMIFUN_PUBLIC_LINKS.emailHref,
       icon: <Right theme='outline' size='16' />,
     },
   ];
@@ -107,7 +116,7 @@ const AboutModalContent: React.FC = () => {
               <div
                 className='text-t-primary cursor-pointer hover:text-t-secondary transition-colors p-4px'
                 onClick={() =>
-                  openLink(ABOUT_LINK_TARGET).catch((error) => console.error('Failed to open link:', error))
+                  openLink(NOMIFUN_PUBLIC_LINKS.repository).catch((error) => console.error('Failed to open link:', error))
                 }
               >
                 <Github theme='outline' size='20' />
@@ -149,14 +158,18 @@ const AboutModalContent: React.FC = () => {
                   }
                 }}
               >
-                <Typography.Text className='text-14px text-t-primary'>{item.title}</Typography.Text>
+                <div className='min-w-0 pr-12px'>
+                  <Typography.Text className='block text-14px text-t-primary'>{item.title}</Typography.Text>
+                  <Typography.Text className='block break-all text-12px leading-18px text-t-secondary'>
+                    {item.detail}
+                  </Typography.Text>
+                </div>
                 <div className='text-t-secondary group-hover:text-t-primary transition-colors'>{item.icon}</div>
               </div>
             ))}
           </div>
         </div>
       </div>
-      <FeedbackReportModal visible={showFeedbackModal} onCancel={() => setShowFeedbackModal(false)} />
     </div>
   );
 };

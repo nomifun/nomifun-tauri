@@ -16,7 +16,7 @@ pub mod types;
 
 pub use ansi::{AnsiLineScanner, strip_ansi};
 pub use driver::{TerminalDescription, TerminalDriver};
-pub use enhance::{apply_enhancement, resolve_agent_family, AgentCli, LifecycleHookWiring, McpServerSpec, TerminalLaunchEnhancement};
+pub use enhance::{apply_enhancement, resolve_agent_family, terminal_autowork_capable, AgentCli, LifecycleHookWiring, McpServerSpec, TerminalLaunchEnhancement};
 pub use events::TerminalEventEmitter;
 pub use lifecycle::{LifecycleKind, TerminalLifecycleEvent, TerminalLifecycleServer};
 pub use routes::terminal_routes;

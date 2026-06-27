@@ -31,6 +31,10 @@ import { renderIdmmCapabilityIcon } from '@/renderer/components/capability/idmmC
 import { applyIdmmStateToSessionCapabilities } from '@/renderer/pages/conversation/SessionList/hooks/useSessionCapabilities';
 import { useProvidersQuery } from '@renderer/hooks/agent/useModelProviderList';
 import IdmmInterventionRow from './IdmmInterventionRow';
+import {
+  getWatchBackupValidationErrorKey,
+  type IdmmBackupValidationKey,
+} from './IdmmControl.validation';
 
 export type IdmmTarget = {
   kind: IdmmTargetKind;
@@ -278,14 +282,13 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
   const enabled = draft ? anyEnabled : (state?.enabled ?? false);
   const runState: IdmmRunState = state?.run_state ?? 'off';
 
-  // A model-tier watch needs a backup provider — either its own bypass_model
-  // override or a resolvable global default. Surface a hint rather than a raw
-  // 400 from the backend when the toggle would be invalid.
+  // A model-tier watch needs a complete local backup model or a resolvable
+  // fallback. Surface a hint before mutating the toggle state.
   const globalBackupResolved = draft ? draftBackupResolved : (state?.sidecar_provider_resolved ?? false);
-  const watchBackupMissing = (w: IIdmmWatchBase): boolean =>
-    w.enabled && isModelTier(w.tier) && !(w.bypass_model.provider_id ?? '').length && !globalBackupResolved;
-  const faultBackupMissing = watchBackupMissing(cfg.fault_watch);
-  const decisionBackupMissing = watchBackupMissing(cfg.decision_watch);
+  const watchBackupErrorKey = (w: IIdmmWatchBase): IdmmBackupValidationKey | null =>
+    getWatchBackupValidationErrorKey(w, globalBackupResolved);
+  const faultBackupErrorKey = watchBackupErrorKey(cfg.fault_watch);
+  const decisionBackupErrorKey = watchBackupErrorKey(cfg.decision_watch);
 
   const dotColor = draft ? (enabled ? CAPABILITY_COLORS.primary : CAPABILITY_COLORS.off) : DOT_COLOR[runState];
   const statusText = draft
@@ -299,15 +302,16 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
   const persist = useMemo(
     () => async (nextCfg: IIdmmConfig) => {
       const d = draftRef.current;
+      const validationKey = watchBackupErrorKey(nextCfg.fault_watch) ?? watchBackupErrorKey(nextCfg.decision_watch);
+      if (validationKey) {
+        message.warning(t(validationKey));
+        return;
+      }
       if (d) {
         d.onChange(nextCfg);
         return;
       }
       if (!kind || !id) return;
-      if (watchBackupMissing(nextCfg.fault_watch) || watchBackupMissing(nextCfg.decision_watch)) {
-        message.warning(t('idmm.backupRequired'));
-        return;
-      }
       const params: IIdmmSetParams = { kind, target_id: id, ...nextCfg };
       try {
         const s = await ipcBridge.idmm.set.invoke(params);
@@ -318,7 +322,7 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
         message.error(String(e));
       }
     },
-    // watchBackupMissing closes over draft/globalBackupResolved; recompute when those change.
+    // watchBackupErrorKey closes over draft/globalBackupResolved; recompute when those change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [kind, id, message, t, globalBackupResolved, draft]
   );
@@ -345,6 +349,12 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
   // Toggle a single watch's enabled flag and persist the resulting config.
   const toggleFault = (next: boolean) => {
     const nextCfg: IIdmmConfig = { ...cfg, fault_watch: { ...cfg.fault_watch, enabled: next } };
+    const validationKey = next ? watchBackupErrorKey(nextCfg.fault_watch) : null;
+    if (validationKey) {
+      setFaultOpen(true);
+      message.warning(t(validationKey));
+      return;
+    }
     if (draftRef.current) draftRef.current.onChange(nextCfg);
     else setPersistedCfg(nextCfg);
     if (next) setFaultOpen(true);
@@ -352,6 +362,12 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
   };
   const toggleDecision = (next: boolean) => {
     const nextCfg: IIdmmConfig = { ...cfg, decision_watch: { ...cfg.decision_watch, enabled: next } };
+    const validationKey = next ? watchBackupErrorKey(nextCfg.decision_watch) : null;
+    if (validationKey) {
+      setDecisionOpen(true);
+      message.warning(t(validationKey));
+      return;
+    }
     if (draftRef.current) draftRef.current.onChange(nextCfg);
     else setPersistedCfg(nextCfg);
     if (next) setDecisionOpen(true);
@@ -378,7 +394,7 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
     update: (updater: (w: IIdmmWatchBase) => IIdmmWatchBase) => void,
     commitUpdate: (u: (w: IIdmmWatchBase) => IIdmmWatchBase) => void,
     locked: boolean,
-    backupMissing: boolean
+    backupErrorKey: IdmmBackupValidationKey | null
   ) => {
     const model = isModelTier(base.tier);
     return (
@@ -452,9 +468,9 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
           <div className={fieldStackClass}>
             <div className='flex items-center justify-between gap-8px'>
               <span className={fieldLabelClass}>{t('idmm.watch.bypassModel')}</span>
-              {backupMissing ? (
+              {backupErrorKey ? (
                 <span className='rounded-full bg-[rgb(var(--warning-1))] px-6px py-2px text-10px text-[rgb(var(--warning-6))]'>
-                  {t('idmm.backupRequired')}
+                  {t(backupErrorKey)}
                 </span>
               ) : null}
             </div>
@@ -485,8 +501,8 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
               />
             </div>
             <span className='text-t-tertiary text-11px leading-16px'>{t('idmm.sessionBackupHint')}</span>
-            {backupMissing ? (
-              <span className='text-11px text-[rgb(var(--warning-6))]'>{t('idmm.backupRequired')}</span>
+            {backupErrorKey ? (
+              <span className='text-11px text-[rgb(var(--warning-6))]'>{t(backupErrorKey)}</span>
             ) : null}
           </div>
         ) : null}
@@ -565,6 +581,7 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
       <button
         type='button'
         aria-expanded={open}
+        aria-label={t(open ? 'idmm.collapseConfig' : 'idmm.expandConfig')}
         className='min-w-0 flex flex-1 items-center gap-9px border-0 bg-transparent p-0 text-left cursor-pointer select-none'
         onClick={onToggleOpen}
       >
@@ -577,7 +594,10 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
         <span className='min-w-0 flex flex-col gap-2px'>
           <span className='min-w-0 flex items-center gap-6px'>
             <span className='truncate text-t-primary text-13px font-600'>{t(titleKey)}</span>
-            <span className='shrink-0 text-t-tertiary text-10px leading-none'>{open ? '▼' : '▶'}</span>
+            <span className='inline-flex shrink-0 items-center gap-4px text-t-tertiary text-10px leading-none'>
+              <span>{open ? '▼' : '▶'}</span>
+              <span className='text-11px leading-14px'>{t(open ? 'idmm.collapseConfig' : 'idmm.expandConfig')}</span>
+            </span>
           </span>
           <span className='truncate text-t-tertiary text-11px leading-15px'>{t(descKey)}</span>
         </span>
@@ -630,7 +650,7 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
                 (u) => updateFault((w) => ({ ...w, ...u(w) })),
                 (u) => commitFault((w) => ({ ...w, ...u(w) })),
                 faultLocked,
-                faultBackupMissing
+                faultBackupErrorKey
               )}
             </div>
           ) : null}
@@ -654,13 +674,14 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
                 (u) => updateDecision((w) => ({ ...w, ...u(w) })),
                 (u) => commitDecision((w) => ({ ...w, ...u(w) })),
                 decisionLocked,
-                decisionBackupMissing
+                decisionBackupErrorKey
               )}
 
               <div className='rounded-10px bg-fill-0 px-9px py-8px'>
                 <button
                   type='button'
                   aria-expanded={strategyOpen}
+                  aria-label={t(strategyOpen ? 'idmm.collapseConfig' : 'idmm.expandConfig')}
                   className='flex w-full items-center justify-between gap-10px border-0 bg-transparent p-0 text-left cursor-pointer select-none'
                   onClick={() => setStrategyOpen((v) => !v)}
                 >
@@ -668,8 +689,11 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
                     <span className='text-t-primary text-12px font-600'>{t('idmm.strategy.title')}</span>
                     <span className='truncate text-t-tertiary text-11px leading-15px'>{strategySummary}</span>
                   </span>
-                  <span className='shrink-0 text-t-tertiary text-10px leading-none'>
-                    {strategyOpen ? '▼' : '▶'}
+                  <span className='inline-flex shrink-0 items-center gap-4px text-t-tertiary text-10px leading-none'>
+                    <span>{strategyOpen ? '▼' : '▶'}</span>
+                    <span className='text-11px leading-14px'>
+                      {t(strategyOpen ? 'idmm.collapseConfig' : 'idmm.expandConfig')}
+                    </span>
                   </span>
                 </button>
 

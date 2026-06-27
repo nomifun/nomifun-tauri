@@ -1,5 +1,6 @@
 {
   "title": "Sessions",
+  "workpathSection": "Projects / workspaces",
   "defaultWorkpath": "Default workspace",
   "interactiveGroup": "Chats",
   "terminalGroup": "Terminals",
@@ -9,6 +10,8 @@
   "createProject": "Create project",
   "createProjectSuccess": "Project created",
   "createProjectFailed": "Failed to create project",
+  "batchSelect": "Batch select",
+  "exitBatchSelect": "Exit selection",
   "displaySettings": "Display settings",
   "displaySettingsTitle": "Sidebar display",
   "displayPreset": "Display strategy",

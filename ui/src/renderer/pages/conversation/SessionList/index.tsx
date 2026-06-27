@@ -656,6 +656,17 @@ const WorkpathSessionList: React.FC<WorkpathSessionListProps> = ({
     <>
       {modals}
       <div className='min-w-0'>
+        <div data-testid='workpath-section-toolbar' className='px-2px pb-6px'>
+          <div className='h-22px px-2px flex items-center justify-between gap-8px select-none'>
+            <span className='text-13px text-t-tertiary font-[500] leading-none tracking-wide truncate'>
+              {t('sessionList.workpathSection')}
+            </span>
+            {totalSelectable > 0 && (
+              <span className='text-12px text-t-tertiary leading-none shrink-0'>{totalSelectable}</span>
+            )}
+          </div>
+        </div>
+
         {tree.map((node) => (
           <WorkpathDrawer
             key={node.key}

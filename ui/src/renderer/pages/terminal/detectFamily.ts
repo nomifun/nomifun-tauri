@@ -79,3 +79,29 @@ export function detectFamily(command: string): AgentFamily | null {
   }
   return null;
 }
+
+/**
+ * Agent families terminal AutoWork can actually drive: only those with a
+ * lifecycle-hook renderer on the backend (Stop → TurnEnd). Mirrors the Rust
+ * `AgentCli::supports_lifecycle_hooks` (`nomifun-terminal/src/enhance.rs`).
+ * Gemini is intentionally excluded — it has no launch-time hook injection, so
+ * the orchestrator cannot detect turn-end and the backend gate rejects it.
+ */
+const AUTOWORK_CAPABLE_FAMILIES: AgentFamily[] = ['claude', 'codex'];
+
+/**
+ * Whether a terminal launch is eligible for AutoWork. Mirrors the backend gate
+ * (`nomifun_terminal::terminal_autowork_capable`): a declared `backend` wins
+ * (preset launches), otherwise resolve the family from the command + args (so
+ * wrappers like `stepcode claude` / `npx codex` and bare custom commands count),
+ * then require a lifecycle-hook-capable family.
+ *
+ * Keep in lock-step with the backend — the gate there is authoritative; this is
+ * only the UI's disable/enable hint.
+ */
+export function isTerminalAutoworkCapable(command: string, args: string[] = [], backend?: string): boolean {
+  const declared = backend ? (basenameStem(backend) as AgentFamily) : null;
+  const family =
+    declared && KNOWN_FAMILIES.includes(declared) ? declared : detectFamily([command, ...args].join(' '));
+  return !!family && AUTOWORK_CAPABLE_FAMILIES.includes(family);
+}

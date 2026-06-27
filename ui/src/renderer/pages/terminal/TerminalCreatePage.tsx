@@ -25,6 +25,7 @@ import {
 } from './launchPresets';
 import ExtendedCapabilitiesPanel from './ExtendedCapabilitiesPanel';
 import LabelWithTip from './LabelWithTip';
+import { isTerminalAutoworkCapable } from './detectFamily';
 import { addRecentLaunchCommand, getRecentLaunchCommands } from './recentLaunchCommands';
 
 const TerminalCreatePage: React.FC = () => {
@@ -114,8 +115,10 @@ const TerminalCreatePage: React.FC = () => {
           );
         }
       }
-      // Best-effort: apply AutoWork draft (backend must be claude/codex).
-      if (autowork.enabled && autowork.tag && (preset.backend === 'claude' || preset.backend === 'codex')) {
+      // Best-effort: apply AutoWork draft. Capability is resolved from the
+      // command/args/backend the same way the backend gate does — so a wrapper
+      // (`stepcode claude`) or a bare custom command also qualifies.
+      if (autowork.enabled && autowork.tag && isTerminalAutoworkCapable(command, args, preset.backend)) {
         try {
           await ipcBridge.requirements.setAutoWork.invoke({
             kind: 'terminal',

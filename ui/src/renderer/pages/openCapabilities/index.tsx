@@ -235,7 +235,7 @@ const OpenCapabilitiesPage: React.FC = () => {
 
   return (
     <HubPageShell
-      title={t('settings.openCapabilities.title', { defaultValue: '开放能力' })}
+      title={t('settings.openCapabilities.title', { defaultValue: '远程&开放能力' })}
       subtitle={t('settings.openCapabilities.subtitle', {
         defaultValue: '分开管理 WebUI 访问入口，以及 NomiFun Remote MCP / REST 对外开放能力。',
       })}

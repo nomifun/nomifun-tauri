@@ -5,9 +5,9 @@
   "empty": "No terminals yet",
   "extended": {
     "autoworkApplyFailed": "Terminal created, but AutoWork failed to enable — retry inside the terminal",
-    "autoworkDesc": "Let the orchestrator auto-drive this terminal by requirement tag (Claude / Codex only)",
+    "autoworkDesc": "Let the orchestrator auto-drive this terminal by requirement tag (Claude / Codex, including wrappers like stepcode claude)",
     "autoworkLabel": "AutoWork",
-    "autoworkRequiresAgent": "AutoWork requires a Claude / Codex terminal",
+    "autoworkRequiresAgent": "AutoWork requires a Claude / Codex terminal (including wrappers like stepcode claude)",
     "idmmApplyFailed": "Terminal created, but Smart Decision failed to enable — retry inside the terminal",
     "idmmApplyNote": "Takes effect as soon as the terminal is created; you can adjust it inside the terminal.",
     "knowledgeConnectNote": "Built-in Claude / Codex auto-inject on mount; for wrapper / custom / external commands, use One-click Connect to write into the workspace.",
@@ -109,7 +109,7 @@
   "deleteConfirmContent": "Delete this terminal session? The running process will be terminated.",
   "submitHint": "Press Enter to run",
   "autowork": {
-    "requiresAgentCli": "AutoWork requires an agent CLI terminal (Claude / Codex / Gemini)",
+    "requiresAgentCli": "AutoWork requires an agent CLI terminal (Claude / Codex, including wrappers like stepcode claude)",
     "terminalExited": "Terminal has exited — relaunch to use AutoWork",
     "fullAutoHint": "Not in full-auto mode: injected requirements may stall on approval prompts."
   },

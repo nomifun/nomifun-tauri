@@ -24,13 +24,6 @@ pub const DEFAULT_LEASE_MS: i64 = 120_000;
 /// Max claim attempts before a requirement is left `failed` (poison-pill guard).
 pub const MAX_ATTEMPTS: i64 = 3;
 
-/// Terminal backends AutoWork may drive — restricted to verdict-capable agent
-/// CLIs that expose the lifecycle hook (Stop → TurnEnd) AND can be given the
-/// requirement MCP tools. `gemini` is excluded: `detect_agent_cli` does not
-/// recognize it (no Plan-1 MCP injection profile), so it cannot call
-/// `requirement_complete` and has no structured turn-end signal.
-pub const AUTOWORK_AGENT_BACKENDS: [&str; 2] = ["claude", "codex"];
-
 /// Parse an AutoWork/IDMM string `target_id` (a `conversation`/`terminal`
 /// session id) into the integer key the repos/driver now use. The AutoWork DTO
 /// carries `target_id` as a string (the generic, kind-agnostic target handle);
@@ -756,8 +749,15 @@ impl RequirementService {
     }
 
     /// Ensure a terminal is eligible for AutoWork: it must be a verdict-capable
-    /// agent CLI (claude/codex — those with lifecycle hooks + requirement MCP)
-    /// and currently running. `BadRequest` otherwise.
+    /// agent CLI (one with a lifecycle-hook renderer — claude/codex, including
+    /// wrappers like `stepcode claude` — those get the Stop → TurnEnd hook +
+    /// requirement MCP injected) and currently running. `BadRequest` otherwise.
+    ///
+    /// Eligibility is resolved from the launch `(command, args, backend)` via
+    /// `nomifun_terminal::terminal_autowork_capable`, the SAME logic the launch
+    /// injector uses — so the gate never rejects a terminal the platform would
+    /// actually hook (the historical bug: a custom/wrapper launch stored
+    /// `backend = None` and was rejected despite being injectable).
     pub async fn ensure_terminal_autowork_eligible(&self, terminal_id: &str) -> Result<(), AppError> {
         let Some(driver) = &self.terminal_driver else {
             return Err(AppError::Internal("terminal driver not attached".into()));
@@ -766,14 +766,11 @@ impl RequirementService {
             .describe(parse_target_id(terminal_id)?)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("terminal {terminal_id}")))?;
-        let is_agent = desc
-            .backend
-            .as_deref()
-            .map(|b| AUTOWORK_AGENT_BACKENDS.contains(&b))
-            .unwrap_or(false);
+        let is_agent =
+            nomifun_terminal::terminal_autowork_capable(&desc.command, &desc.args, desc.backend.as_deref());
         if !is_agent {
             return Err(AppError::BadRequest(
-                "AutoWork requires a verdict-capable agent CLI terminal (claude / codex)".into(),
+                "AutoWork requires an agent CLI terminal with lifecycle hooks (claude / codex, including wrappers like `stepcode claude`)".into(),
             ));
         }
         if desc.last_status != "running" {
@@ -1995,6 +1992,8 @@ mod tests {
 
     struct MockDriver {
         user_id: String,
+        command: String,
+        args: Vec<String>,
         backend: Option<String>,
         last_status: String,
         exists: bool,
@@ -2006,6 +2005,12 @@ mod tests {
         fn agent() -> Self {
             Self {
                 user_id: "user_1".into(),
+                // Empty command/no-args: eligibility for the existing cases is
+                // driven purely by the declared `backend` (which `resolve_agent_family`
+                // checks first). The wrapper/custom-command tests set command/args
+                // explicitly to exercise the program-stem / arg-token paths.
+                command: String::new(),
+                args: vec![],
                 backend: Some("claude".into()),
                 last_status: "running".into(),
                 exists: true,
@@ -2033,6 +2038,8 @@ mod tests {
             Ok(Some(TerminalDescription {
                 user_id: self.user_id.clone(),
                 cwd: String::new(),
+                command: self.command.clone(),
+                args: self.args.clone(),
                 backend: self.backend.clone(),
                 mode: None,
                 last_status: self.last_status.clone(),
@@ -2164,6 +2171,53 @@ mod tests {
         let s_unknown = svc_with_driver(unknown).await;
         assert!(matches!(
             s_unknown.ensure_terminal_autowork_eligible("1").await.unwrap_err(),
+            AppError::BadRequest(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn ensure_terminal_autowork_eligible_accepts_wrappers_and_custom_commands() {
+        // The bug this fixes: a wrapper / custom launch stores `backend = None`
+        // (no preset declared it), yet the launch injector resolves it to an
+        // agent family via the command/args and DOES inject the lifecycle hook.
+        // Eligibility must agree — it now resolves the family the same way.
+
+        // Wrapper `stepcode claude` with no declared backend → eligible.
+        let wrapper = Arc::new(MockDriver {
+            command: "stepcode".into(),
+            args: vec!["claude".into()],
+            backend: None,
+            ..MockDriver::agent()
+        });
+        svc_with_driver(wrapper).await.ensure_terminal_autowork_eligible("1").await.unwrap();
+
+        // `npx codex` wrapper → eligible.
+        let npx = Arc::new(MockDriver {
+            command: "npx".into(),
+            args: vec!["codex".into()],
+            backend: None,
+            ..MockDriver::agent()
+        });
+        svc_with_driver(npx).await.ensure_terminal_autowork_eligible("1").await.unwrap();
+
+        // Bare `claude` typed into a custom (shell-preset) command, backend None → eligible.
+        let bare = Arc::new(MockDriver {
+            command: "claude".into(),
+            args: vec!["--dangerously-skip-permissions".into()],
+            backend: None,
+            ..MockDriver::agent()
+        });
+        svc_with_driver(bare).await.ensure_terminal_autowork_eligible("1").await.unwrap();
+
+        // A wrapper around a non-agent (e.g. `stepcode frob`) → still rejected.
+        let bad_wrapper = Arc::new(MockDriver {
+            command: "stepcode".into(),
+            args: vec!["frob".into()],
+            backend: None,
+            ..MockDriver::agent()
+        });
+        assert!(matches!(
+            svc_with_driver(bad_wrapper).await.ensure_terminal_autowork_eligible("1").await.unwrap_err(),
             AppError::BadRequest(_)
         ));
     }

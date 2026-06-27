@@ -19,7 +19,7 @@ interface SiderOpenCapabilitiesEntryProps {
   onClick: () => void;
 }
 
-/** Open Capabilities — WebUI, Remote MCP/REST, and external-client access. */
+/** Remote & Open — WebUI, Remote MCP/REST, and external-client access. */
 const SiderOpenCapabilitiesEntry: React.FC<SiderOpenCapabilitiesEntryProps> = ({
   isMobile,
   isActive,
@@ -28,7 +28,7 @@ const SiderOpenCapabilitiesEntry: React.FC<SiderOpenCapabilitiesEntryProps> = ({
   onClick,
 }) => {
   const { t } = useTranslation();
-  const label = t('settings.openCapabilities.railTitle', { defaultValue: '开放能力' });
+  const label = t('settings.openCapabilities.railTitle', { defaultValue: '远程&开放能力' });
 
   if (collapsed) {
     return (

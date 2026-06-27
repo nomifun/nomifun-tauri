@@ -16,7 +16,16 @@ pub struct TerminalDescription {
     /// Working directory the PTY was launched in. Consumers probe it for the
     /// `.nomi/knowledge/README.md` contract file to prepend knowledge guidance.
     pub cwd: String,
-    /// Preset backend: "claude" | "codex" | "gemini" | None (plain shell).
+    /// The stored launch program (the `command` column; `$SHELL` sentinel for a
+    /// plain shell). With `args` + `backend`, lets the AutoWork gate resolve the
+    /// agent family the SAME way launch injection does (`terminal_autowork_capable`).
+    pub command: String,
+    /// The stored launch argv (the parsed `args` column). Carries the wrapped CLI
+    /// token for wrapper launches (`stepcode claude` → `["claude", …]`).
+    pub args: Vec<String>,
+    /// Preset backend: "claude" | "codex" | "gemini" | None (plain shell / custom
+    /// command). Only set when a preset declared it — do NOT use it alone for
+    /// eligibility; resolve the family from `command`/`args`/`backend` together.
     pub backend: Option<String>,
     /// Permission mode label: "default" | "full-auto" | None.
     pub mode: Option<String>,

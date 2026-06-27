@@ -97,6 +97,30 @@ pub fn detect_agent_cli(program: &str) -> Option<AgentCli> {
     resolve_agent_family(program, &[], None)
 }
 
+impl AgentCli {
+    /// Whether this CLI family has a lifecycle-hook renderer (Stop → TurnEnd)
+    /// in `apply_enhancement`. Terminal AutoWork requires this: it is the ONLY
+    /// structured turn-end signal (see `nomifun-requirement`'s orchestrator —
+    /// no quiescence fallback). Claude/Codex have launch-flag renderers; Gemini
+    /// has no launch-time injection mechanism, so it is NOT autowork-capable.
+    pub fn supports_lifecycle_hooks(self) -> bool {
+        matches!(self, AgentCli::Claude | AgentCli::Codex)
+    }
+}
+
+/// Whether a terminal launch is eligible for AutoWork: it resolves to an agent
+/// CLI family that has a lifecycle-hook renderer, so the platform can detect
+/// turn boundaries. This MIRRORS exactly what `apply_enhancement` will inject
+/// for the same `(command, args, declared_backend)` — the single source of
+/// truth for "AutoWork can drive this terminal". Covers wrappers (`stepcode
+/// claude`, `npx codex`), bare/custom commands, and explicitly declared
+/// backends, so the eligibility gate never rejects a launch the injector would
+/// have hooked.
+pub fn terminal_autowork_capable(command: &str, args: &[String], declared_backend: Option<&str>) -> bool {
+    let (program, prog_args) = crate::types::resolve_command(command, args);
+    resolve_agent_family(&program, &prog_args, declared_backend).is_some_and(AgentCli::supports_lifecycle_hooks)
+}
+
 /// Render the enhancement as a claude `--mcp-config` JSON file in `session_dir`
 /// and return the EXTRA argv to append. Additive (no `--strict-mcp-config`) so
 /// the user's own project/user `.mcp.json` servers are preserved; ours is added
@@ -616,5 +640,39 @@ mod tests {
         let (out, _env) = apply_enhancement("stepcode", vec!["claude".into()], &enh, dir.path(), Some("gemini"));
         // Gemini = no-op for launch injection, args are unchanged
         assert_eq!(out, vec!["claude".to_owned()], "gemini declared must not inject launch flags");
+    }
+
+    #[test]
+    fn supports_lifecycle_hooks_only_claude_and_codex() {
+        assert!(AgentCli::Claude.supports_lifecycle_hooks());
+        assert!(AgentCli::Codex.supports_lifecycle_hooks());
+        // Gemini has no launch-time lifecycle renderer → not autowork-capable.
+        assert!(!AgentCli::Gemini.supports_lifecycle_hooks());
+    }
+
+    #[test]
+    fn terminal_autowork_capable_matches_what_apply_enhancement_hooks() {
+        let no_args: Vec<String> = vec![];
+
+        // Bare / direct agent CLIs are capable.
+        assert!(terminal_autowork_capable("claude", &no_args, None));
+        assert!(terminal_autowork_capable("codex", &no_args, None));
+
+        // Wrappers resolve via the arg token (no declared backend) — exactly the
+        // case the old backend-string gate wrongly rejected.
+        assert!(terminal_autowork_capable("stepcode", &["claude".to_owned()], None));
+        assert!(terminal_autowork_capable("npx", &["codex".to_owned()], None));
+
+        // Declared backend wins.
+        assert!(terminal_autowork_capable("stepcode", &["claude".to_owned()], Some("codex")));
+
+        // Gemini resolves to a family but has no lifecycle renderer → NOT capable.
+        assert!(!terminal_autowork_capable("gemini", &no_args, None));
+        assert!(!terminal_autowork_capable("stepcode", &["gemini".to_owned()], None));
+
+        // Plain shell / unknown CLI → not capable.
+        assert!(!terminal_autowork_capable(crate::types::SHELL_SENTINEL, &no_args, None));
+        assert!(!terminal_autowork_capable("/bin/bash", &["-l".to_owned()], None));
+        assert!(!terminal_autowork_capable("stepcode", &["frobnicate".to_owned()], None));
     }
 }

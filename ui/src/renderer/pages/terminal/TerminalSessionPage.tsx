@@ -26,6 +26,7 @@ import RegisterKnowledgeButton from './RegisterKnowledgeButton';
 import TerminalWorkspaceRail from './TerminalWorkspaceRail';
 import XtermView, { type XtermViewHandle } from './XtermView';
 import TerminalSendBox from './TerminalSendBox';
+import { isTerminalAutoworkCapable } from './detectFamily';
 import styles from './XtermView.module.css';
 
 /** Workspace rail width bounds (px), mirroring the conversation workspace panel. */
@@ -35,9 +36,6 @@ const TERMINAL_WORKSPACE_MAX_PX = 560;
 
 /** Preview column minimum width (px) so it never collapses to nothing. */
 const TERMINAL_PREVIEW_MIN_PX = 260;
-
-/** Terminal backends AutoWork can drive (agent CLIs; a plain shell is excluded). */
-const AUTOWORK_AGENT_BACKENDS = new Set(['claude', 'codex', 'gemini']);
 
 /**
  * TerminalRightRegion — the right side of the terminal page (preview + rail).
@@ -297,7 +295,10 @@ const TerminalSessionPage: React.FC = () => {
   const isExited = session?.last_status && session.last_status !== 'running';
 
   // AutoWork is only meaningful for agent-CLI terminals running in the foreground.
-  const isAgentCli = !!session?.backend && AUTOWORK_AGENT_BACKENDS.has(session.backend);
+  // Capability is resolved from the launch command/args/backend the SAME way the
+  // backend gate does (wrappers like `stepcode claude` count; a plain shell or
+  // gemini does not).
+  const isAgentCli = isTerminalAutoworkCapable(session?.command ?? '', session?.args ?? [], session?.backend);
   const autoWorkDisabledReason = !isAgentCli
     ? t('terminal.autowork.requiresAgentCli')
     : isExited

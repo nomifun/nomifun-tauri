@@ -14,6 +14,7 @@ import type { AutoWorkDraftValue } from '@/renderer/pages/conversation/component
 import IdmmControl from '@/renderer/pages/conversation/components/IdmmControl';
 import PlatformMcpRegisterPanel from './PlatformMcpRegisterPanel';
 import RegisterKnowledgeButton from './RegisterKnowledgeButton';
+import { isTerminalAutoworkCapable } from './detectFamily';
 
 interface ExtendedCapabilitiesPanelProps {
   cwd: string;
@@ -30,18 +31,17 @@ interface ExtendedCapabilitiesPanelProps {
   onAutoworkChange: (next: AutoWorkDraftValue) => void;
 }
 
-const AUTOWORK_BACKENDS = new Set(['claude', 'codex']);
-
 /**
  * Unified "Extended Capabilities" section on the terminal create page — the
- * single home for the platform's signature terminal superpowers.
+ * single home for the platform's signature terminal superpowers (knowledge
+ * mount + connect, IDMM, AutoWork).
  *
- * The knowledge sub-block is now self-contained: it owns BOTH halves of the
- * knowledge flow that used to be split across the page — mounting libraries
- * (which bases bind to this workpath) AND connecting (writing the knowledge MCP
- * into the workpath so wrapper / custom / external CLIs can search them). Built-in
- * Claude / Codex auto-inject the search tool on mount; the one-click "connect"
- * (and the advanced manual templates) cover everything else.
+ * The knowledge sub-block is self-contained: it owns BOTH halves of the
+ * knowledge flow — mounting libraries (which bases bind to this workpath) AND
+ * connecting (writing the knowledge MCP into the workpath so wrapper / custom /
+ * external CLIs can search them). Built-in Claude / Codex auto-inject the search
+ * tool on mount; the one-click "connect" (and advanced manual templates) cover
+ * everything else.
  */
 const ExtendedCapabilitiesPanel: React.FC<ExtendedCapabilitiesPanelProps> = ({
   cwd,
@@ -58,9 +58,14 @@ const ExtendedCapabilitiesPanel: React.FC<ExtendedCapabilitiesPanelProps> = ({
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
 
-  const autoworkDisabledReason = backend && AUTOWORK_BACKENDS.has(backend)
+  // Resolve AutoWork capability from the launch command + declared backend the
+  // SAME way the backend gate does — so a wrapper (`stepcode claude`) or a bare
+  // custom command typed into the shell preset also qualifies, not just the
+  // claude/codex presets. `command` here is the full editable preview string;
+  // detectFamily tokenizes it, so passing it with empty args is correct.
+  const autoworkDisabledReason = isTerminalAutoworkCapable(command, [], backend)
     ? undefined
-    : t('terminal.extended.autoworkRequiresAgent', { defaultValue: '自动工作需要 Claude / Codex 终端' });
+    : t('terminal.extended.autoworkRequiresAgent', { defaultValue: '自动工作需要 Claude / Codex 终端（含 stepcode claude 等代理形式）' });
 
   const hasKnowledge = knowledgeBases.length > 0;
 

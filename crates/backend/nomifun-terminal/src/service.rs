@@ -946,6 +946,8 @@ impl TerminalDriver for TerminalService {
         Ok(Some(TerminalDescription {
             user_id: row.user_id,
             cwd: row.cwd,
+            command: row.command,
+            args: crate::types::parse_args(&row.args),
             backend: row.backend,
             mode: row.mode,
             last_status: row.last_status,

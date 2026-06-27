@@ -5,9 +5,9 @@
   "empty": "暂无终端",
   "extended": {
     "autoworkApplyFailed": "终端已创建，但自动工作启用失败，可在终端内重试",
-    "autoworkDesc": "让编排器在该终端按需求标签自动驱动并裁决完成（仅 Claude / Codex）",
+    "autoworkDesc": "让编排器在该终端按需求标签自动驱动并裁决完成（Claude / Codex，含 stepcode claude 等代理形式）",
     "autoworkLabel": "自动工作",
-    "autoworkRequiresAgent": "自动工作需要 Claude / Codex 终端",
+    "autoworkRequiresAgent": "自动工作需要 Claude / Codex 终端（含 stepcode claude 等代理形式）",
     "idmmApplyFailed": "终端已创建，但智能决策启用失败，可在终端内重试",
     "idmmApplyNote": "创建终端后立即生效，可在终端内继续调整。",
     "knowledgeConnectNote": "内置 Claude / Codex 挂载即自动注入；包装命令 / 自定义 / 外置终端请用「一键接入」写入工作路径。",
@@ -109,7 +109,7 @@
   "deleteConfirmContent": "确认删除该终端会话？运行中的进程将被终止。",
   "submitHint": "回车发送并执行",
   "autowork": {
-    "requiresAgentCli": "自动工作需要 Agent CLI 终端（Claude / Codex / Gemini）",
+    "requiresAgentCli": "自动工作需要 Agent CLI 终端（Claude / Codex，含 stepcode claude 等代理形式）",
     "terminalExited": "终端已退出 —— 请重新启动后再使用自动工作",
     "fullAutoHint": "当前不是 full-auto 模式：注入的需求可能卡在审批确认。"
   },
