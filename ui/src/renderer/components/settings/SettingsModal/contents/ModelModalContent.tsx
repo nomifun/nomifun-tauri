@@ -7,7 +7,7 @@
 
 import { ipcBridge } from '@/common';
 import type { IProvider } from '@/common/config/storage';
-import { Button, Divider, Message, Popconfirm, Collapse, Tag, Switch, Tooltip } from '@arco-design/web-react';
+import { Button, Divider, Message, Popconfirm, Popover, Input, Collapse, Tag, Switch, Tooltip } from '@arco-design/web-react';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 import { DeleteFour, Info, Minus, Plus, Write, Heartbeat } from '@icon-park/react';
 import React, { useEffect, useState } from 'react';
@@ -94,6 +94,80 @@ const isModelEnabled = (platform: IProvider, model: string): boolean => {
   if (!platform.model_enabled) return true; // 默认启用
   return platform.model_enabled[model] !== false;
 };
+
+/**
+ * 每模型描述编辑浮层 / Per-model description editor popover.
+ * 描述用于自动编排选用模型；空态显示占位提示。
+ * The description drives orchestration model auto-selection; empty shows placeholder.
+ */
+const ModelDescriptionEditor: React.FC<{
+  description: string;
+  onSave: (text: string) => void;
+}> = ({ description, onSave }) => {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState(description);
+
+  const placeholder = t('settings.modelDescriptionPlaceholder', {
+    defaultValue: '描述该模型擅长什么，用于自动编排选用',
+  });
+
+  // 每次打开时同步最新描述，避免外部更新后草稿陈旧
+  // Re-sync draft when opening so external updates aren't masked by stale draft.
+  const handleVisibleChange = (visible: boolean) => {
+    if (visible) setDraft(description);
+    setOpen(visible);
+  };
+
+  const handleSave = () => {
+    const next = draft.trim();
+    if (next !== (description ?? '').trim()) {
+      onSave(next);
+    }
+    setOpen(false);
+  };
+
+  return (
+    <Popover
+      trigger='click'
+      position='bl'
+      popupVisible={open}
+      onVisibleChange={handleVisibleChange}
+      content={
+        <div className='flex flex-col gap-8px w-280px' onClick={(e) => e.stopPropagation()}>
+          <div className='text-12px text-t-secondary'>
+            {t('settings.modelDescriptionTitle', { defaultValue: '模型描述（用于自动编排）' })}
+          </div>
+          <Input.TextArea
+            autoFocus
+            value={draft}
+            onChange={setDraft}
+            placeholder={placeholder}
+            autoSize={{ minRows: 3, maxRows: 6 }}
+          />
+          <div className='flex items-center justify-end gap-8px'>
+            <Button size='mini' onClick={() => setOpen(false)}>
+              {t('common.cancel', { defaultValue: '取消' })}
+            </Button>
+            <Button size='mini' type='primary' onClick={handleSave}>
+              {t('common.save', { defaultValue: '保存' })}
+            </Button>
+          </div>
+        </div>
+      }
+    >
+      <Tooltip content={t('settings.editModelDescription', { defaultValue: '编辑模型描述' })}>
+        <Button
+          size='mini'
+          className={`model-provider-action-btn !w-24px !h-24px !min-w-24px shrink-0 ${description ? 'text-[rgb(var(--primary-6))] hover:text-[rgb(var(--primary-5))]' : 'text-t-secondary hover:text-t-primary'}`}
+          icon={<Write theme='outline' size='14' />}
+          onClick={(e) => e.stopPropagation()}
+        />
+      </Tooltip>
+    </Popover>
+  );
+};
+
 
 const ModelModalContent: React.FC = () => {
   const { t } = useTranslation();
@@ -494,72 +568,105 @@ const ModelModalContent: React.FC = () => {
                       const modelProtocol = platform.model_protocols?.[model] || 'openai';
                       const model_health = platform.model_health?.[model];
                       const healthStatus = model_health?.status || 'unknown';
+                      const modelDescription = platform.model_descriptions?.[model] ?? '';
 
                       return (
                         <div key={model}>
                           <div className='flex items-center justify-between px-8px py-12px transition-colors hover:bg-[var(--fill-0)]'>
-                            <div className='flex items-center gap-8px min-w-0 flex-1'>
-                              {/* 健康状态指示器 / Health status indicator */}
-                              {healthStatus !== 'unknown' && (
-                                <Tooltip
-                                  content={
-                                    <div>
-                                      <div className='flex items-center gap-4px'>
-                                        <span>{healthStatus === 'healthy' ? '✅' : '❌'}</span>
-                                        <span>
-                                          {healthStatus === 'healthy' ? t('common.success') : t('common.failed')}
-                                        </span>
+                            <div className='flex flex-col min-w-0 flex-1 gap-2px'>
+                              <div className='flex items-center gap-8px min-w-0'>
+                                {/* 健康状态指示器 / Health status indicator */}
+                                {healthStatus !== 'unknown' && (
+                                  <Tooltip
+                                    content={
+                                      <div>
+                                        <div className='flex items-center gap-4px'>
+                                          <span>{healthStatus === 'healthy' ? '✅' : '❌'}</span>
+                                          <span>
+                                            {healthStatus === 'healthy' ? t('common.success') : t('common.failed')}
+                                          </span>
+                                        </div>
+                                        {model_health?.latency && (
+                                          <div className='text-12px mt-4px'>
+                                            {t('settings.latency')}: {model_health.latency}ms
+                                          </div>
+                                        )}
+                                        {model_health?.error && (
+                                          <div className='text-12px mt-4px'>{model_health.error}</div>
+                                        )}
+                                        {model_health?.last_check && (
+                                          <div className='text-12px mt-4px'>
+                                            {t('mcp.lastCheck')}: {new Date(model_health.last_check).toLocaleString()}
+                                          </div>
+                                        )}
                                       </div>
-                                      {model_health?.latency && (
-                                        <div className='text-12px mt-4px'>
-                                          {t('settings.latency')}: {model_health.latency}ms
-                                        </div>
-                                      )}
-                                      {model_health?.error && (
-                                        <div className='text-12px mt-4px'>{model_health.error}</div>
-                                      )}
-                                      {model_health?.last_check && (
-                                        <div className='text-12px mt-4px'>
-                                          {t('mcp.lastCheck')}: {new Date(model_health.last_check).toLocaleString()}
-                                        </div>
-                                      )}
-                                    </div>
-                                  }
-                                >
-                                  <div
-                                    className={`w-8px h-8px rounded-full shrink-0 ${healthStatus === 'healthy' ? 'bg-green-500' : 'bg-red-500'}`}
-                                  />
-                                </Tooltip>
-                              )}
+                                    }
+                                  >
+                                    <div
+                                      className={`w-8px h-8px rounded-full shrink-0 ${healthStatus === 'healthy' ? 'bg-green-500' : 'bg-red-500'}`}
+                                    />
+                                  </Tooltip>
+                                )}
 
-                              <span className='text-14px text-t-primary min-w-0 truncate' title={model}>
-                                {model}
-                              </span>
+                                <span className='text-14px text-t-primary min-w-0 truncate' title={model}>
+                                  {model}
+                                </span>
 
-                              {/* New API 协议标签（点击循环切换）/ New API protocol badge (click to cycle) */}
-                              {isNewApiProvider && (
-                                <Tag
+                                {/* New API 协议标签（点击循环切换）/ New API protocol badge (click to cycle) */}
+                                {isNewApiProvider && (
+                                  <Tag
+                                    size='small'
+                                    color={getProtocolColor(modelProtocol)}
+                                    className='cursor-pointer select-none shrink-0'
+                                    onClick={() => {
+                                      const nextProtocol = getNextProtocol(modelProtocol);
+                                      const newProtocols = { ...platform.model_protocols };
+                                      newProtocols[model] = nextProtocol;
+                                      updatePlatform({ ...platform, model_protocols: newProtocols }, () => {});
+                                    }}
+                                  >
+                                    {getProtocolLabel(modelProtocol)}
+                                  </Tag>
+                                )}
+
+                                {/* 模型启用开关 / Model enable switch */}
+                                <Switch
                                   size='small'
-                                  color={getProtocolColor(modelProtocol)}
-                                  className='cursor-pointer select-none shrink-0'
-                                  onClick={() => {
-                                    const nextProtocol = getNextProtocol(modelProtocol);
-                                    const newProtocols = { ...platform.model_protocols };
-                                    newProtocols[model] = nextProtocol;
-                                    updatePlatform({ ...platform, model_protocols: newProtocols }, () => {});
-                                  }}
-                                >
-                                  {getProtocolLabel(modelProtocol)}
-                                </Tag>
-                              )}
+                                  className='shrink-0'
+                                  checked={isModelEnabled(platform, model)}
+                                  onChange={(checked) => toggleModelEnabled(platform, model, checked)}
+                                />
 
-                              {/* 模型启用开关 / Model enable switch */}
-                              <Switch
-                                size='small'
-                                className='shrink-0'
-                                checked={isModelEnabled(platform, model)}
-                                onChange={(checked) => toggleModelEnabled(platform, model, checked)}
-                              />
+                                {/* 每模型描述编辑（驱动自动编排选用）/ Per-model description editor */}
+                                <ModelDescriptionEditor
+                                  description={modelDescription}
+                                  onSave={(text) => {
+                                    const next = { ...platform.model_descriptions };
+                                    if (text) {
+                                      next[model] = text;
+                                    } else {
+                                      delete next[model];
+                                    }
+                                    updatePlatform(
+                                      {
+                                        ...platform,
+                                        model_descriptions: Object.keys(next).length > 0 ? next : undefined,
+                                      },
+                                      () => {}
+                                    );
+                                  }}
+                                />
+                              </div>
+
+                              {/* 描述次级行（空态隐藏）/ Description secondary line (hidden when empty) */}
+                              {modelDescription && (
+                                <div
+                                  className='text-12px text-t-secondary leading-snug line-clamp-2 break-words pr-8px'
+                                  title={modelDescription}
+                                >
+                                  {modelDescription}
+                                </div>
+                              )}
                             </div>
 
                             <div className='flex items-center gap-6px shrink-0'>
@@ -583,9 +690,11 @@ const ModelModalContent: React.FC = () => {
                                   const newProtocols = { ...platform.model_protocols };
                                   const newModelEnabled = { ...platform.model_enabled };
                                   const newModelHealth = { ...platform.model_health };
+                                  const newModelDescriptions = { ...platform.model_descriptions };
                                   delete newProtocols[model];
                                   delete newModelEnabled[model];
                                   delete newModelHealth[model];
+                                  delete newModelDescriptions[model];
 
                                   updatePlatform(
                                     {
@@ -595,6 +704,8 @@ const ModelModalContent: React.FC = () => {
                                       model_enabled:
                                         Object.keys(newModelEnabled).length > 0 ? newModelEnabled : undefined,
                                       model_health: Object.keys(newModelHealth).length > 0 ? newModelHealth : undefined,
+                                      model_descriptions:
+                                        Object.keys(newModelDescriptions).length > 0 ? newModelDescriptions : undefined,
                                     },
                                     () => {}
                                   );
