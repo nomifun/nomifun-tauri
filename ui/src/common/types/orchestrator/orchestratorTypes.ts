@@ -195,6 +195,39 @@ export type TCreateRun = {
   max_parallel?: number;
 };
 
+/** A single provider+model pair. Mirrors the backend `ModelRef`. */
+export type TModelRef = {
+  provider_id: string;
+  model: string;
+};
+
+/** The model range an ad-hoc run executes over. Tagged by `mode`, mirroring the
+ * backend `ModelRange` serde EXACTLY (`#[serde(tag = "mode", rename_all =
+ * "snake_case")]`):
+ * - `single` — one fixed model (every synthetic member uses it);
+ * - `auto`   — "pick from all enabled models" (carries no inline list; the
+ *   caps_orchestrator layer expands it — the REST/Tab path sends `single`/`range`);
+ * - `range`  — an explicit allow-list of models (one synthetic member each). */
+export type TModelRange =
+  | { mode: 'single'; model: TModelRef }
+  | { mode: 'auto' }
+  | { mode: 'range'; models: TModelRef[] };
+
+/** Body for `POST /api/orchestrator/runs/adhoc`. Creates an ad-hoc run straight
+ * from the「智能编排」Tab's structured form — no workspace, no pre-built fleet
+ * (the fleet is synthesized from `model_range`). Defaults: `autonomy` =
+ * `interactive` on the backend (the Tab approval门), so the run parks at
+ * `awaiting_plan_approval` until approved. `lead_conv_id` is left unset by the
+ * Tab. Field names are snake_case to match the JSON wire exactly. */
+export type TCreateAdhocRun = {
+  goal: string;
+  work_dir?: string;
+  model_range: TModelRange;
+  pinned_roles?: string[];
+  autonomy?: string;
+  max_parallel?: number;
+};
+
 /** Body for `PUT /api/orchestrator/runs/{run_id}/tasks/{task_id}/assignment`.
  * Reassign a task to a different fleet member and/or lock the assignment so the
  * orchestrator's auto-router won't override it on the next plan update. */

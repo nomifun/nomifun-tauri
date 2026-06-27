@@ -14,8 +14,9 @@ use axum::http::StatusCode;
 use axum::routing::{get, post, put};
 
 use nomifun_api_types::{
-    ApiResponse, CreateFleetRequest, CreateRunRequest, CreateWorkspaceRequest, Fleet, OrchWorkspace,
-    ReassignRequest, Run, RunDetail, SteerRequest, UpdateFleetRequest, UpdateWorkspaceRequest,
+    ApiResponse, CreateAdhocRunRequest, CreateFleetRequest, CreateRunRequest, CreateWorkspaceRequest,
+    Fleet, OrchWorkspace, ReassignRequest, Run, RunDetail, SteerRequest, UpdateFleetRequest,
+    UpdateWorkspaceRequest,
 };
 use nomifun_auth::CurrentUser;
 use nomifun_common::AppError;
@@ -43,6 +44,10 @@ pub fn orchestrator_routes(state: OrchestratorRouterState) -> Router {
         .route(
             "/api/orchestrator/runs",
             get(list_my_runs).post(create_run),
+        )
+        .route(
+            "/api/orchestrator/runs/adhoc",
+            post(create_adhoc_run),
         )
         .route(
             "/api/orchestrator/workspaces/{ws}/runs",
@@ -185,7 +190,40 @@ async fn create_run(
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(run))))
 }
 
-/// List every run owned by the current user, newest first — across all
+/// Create an **ad-hoc** run straight from a structured Tab form (no workspace, no
+/// pre-built fleet — the fleet is synthesized from the request's `model_range`),
+/// then plan it and apply the same autonomy gate as [`create_run`].
+///
+/// **Default autonomy is `interactive`** (the Tab's approval门): unlike the
+/// workspace path's `create`, an ad-hoc run launched from the Tab should park at
+/// `awaiting_plan_approval` for a human to confirm the plan before any worker
+/// dispatches. The default is injected onto the REQUEST here — BEFORE
+/// `create_adhoc` persists it — so `plan` (which re-reads the persisted autonomy)
+/// applies the gate, and the `engine.start` decision below reads the same value.
+/// (The MCP/caps front door, by contrast, defaults to `supervised` — it has no
+/// Tab to approve through. See `caps_orchestrator`.)
+async fn create_adhoc_run(
+    State(state): State<OrchestratorRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<CreateAdhocRunRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<Run>>), AppError> {
+    let Json(mut req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    // Tab default: park at the plan-approval gate unless the form picks another
+    // level. Applied to the request so the value is what `create_adhoc` PERSISTS
+    // and `plan` re-reads for the autonomy gate (an empty string is treated as
+    // absent — same rule as RunService).
+    if req.autonomy.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        req.autonomy = Some("interactive".to_string());
+    }
+    let run = state.run_service.create_adhoc(&user.id, req).await?;
+    state.run_service.plan(&run.id).await?;
+    // `interactive` parks at `awaiting_plan_approval` — do NOT start the engine
+    // until the plan is approved. All other autonomy levels start immediately.
+    if run.autonomy != "interactive" {
+        state.engine.start(run.id.clone());
+    }
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(run))))
+}
 /// workspaces AND ad-hoc (workspace-less) runs. This is the read path for the
 /// read-only Run-history library (the repurposed orchestrator tab); ad-hoc runs
 /// created from a conversation carry no workspace, so they only surface here,
@@ -569,6 +607,106 @@ mod tests {
                 Request::builder()
                     .uri("/api/orchestrator/runs")
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request");
+        assert_ne!(resp.status(), StatusCode::OK);
+    }
+
+    /// `POST /api/orchestrator/runs/adhoc` with a `CurrentUser` extension creates
+    /// an ad-hoc run straight from a structured form body (no workspace, no
+    /// pre-built fleet): the fleet is synthesized from the `model_range` (a 2-model
+    /// `range` here), the run is planned, and — because the ad-hoc front door
+    /// DEFAULTS autonomy to `interactive` (the Tab审批门) when the body omits it —
+    /// the run parks at `awaiting_plan_approval` (NOT `running`) and the engine is
+    /// NOT started. Exercises the new route end to end through the router
+    /// (auth extract → create_adhoc → plan → autonomy gate → 201). RED before the
+    /// route exists (404 ≠ CREATED), GREEN after.
+    #[tokio::test]
+    async fn create_adhoc_run_parks_at_awaiting_plan_approval_with_user() {
+        let state = build_state().await;
+        // Keep a handle to read back the created run's persisted status.
+        let run_service = state.run_service.clone();
+        let app = orchestrator_routes(state).layer(axum::Extension(CurrentUser {
+            id: "u1".to_string(),
+            username: "tester".to_string(),
+        }));
+
+        let body = serde_json::json!({
+            "goal": "ad-hoc smoke goal",
+            "model_range": {
+                "mode": "range",
+                "models": [
+                    { "provider_id": "openai", "model": "gpt-x" },
+                    { "provider_id": "anthropic", "model": "claude-y" }
+                ]
+            }
+        })
+        .to_string();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/orchestrator/runs/adhoc")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .expect("request");
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "ad-hoc create must 201 CREATED"
+        );
+
+        // Parse the returned Run and confirm the interactive-default autonomy
+        // parked it at `awaiting_plan_approval` after plan (engine NOT started).
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let api: ApiResponse<Run> = serde_json::from_slice(&bytes).expect("decode ApiResponse<Run>");
+        let run = api.data.expect("run in response");
+        assert_eq!(run.autonomy, "interactive", "ad-hoc default autonomy");
+
+        let detail = run_service.get_detail(&run.id).await.expect("detail");
+        assert_eq!(
+            detail.run.status, "awaiting_plan_approval",
+            "interactive ad-hoc run must park at awaiting_plan_approval after plan"
+        );
+    }
+
+    /// `POST /api/orchestrator/runs/adhoc` still requires the `CurrentUser`
+    /// extension — without it the handler cannot run (axum returns a non-200).
+    /// Guards that the ad-hoc create route was not wired as a public route (a
+    /// public handler that extracted `Extension<CurrentUser>` would 500 with
+    /// axum 0.8 MissingExtension).
+    #[tokio::test]
+    async fn create_adhoc_run_without_user_is_not_ok() {
+        let state = build_state().await;
+        let app = orchestrator_routes(state);
+
+        let body = serde_json::json!({
+            "goal": "ad-hoc smoke goal",
+            "model_range": {
+                "mode": "range",
+                "models": [
+                    { "provider_id": "openai", "model": "gpt-x" },
+                    { "provider_id": "anthropic", "model": "claude-y" }
+                ]
+            }
+        })
+        .to_string();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/orchestrator/runs/adhoc")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
                     .unwrap(),
             )
             .await

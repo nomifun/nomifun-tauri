@@ -74,6 +74,7 @@ import type {
 } from '../types/provider/providerApi';
 import type { SpeechToTextRequest, SpeechToTextResult } from '../types/provider/speech';
 import type {
+  TCreateAdhocRun,
   TReassign,
   TRun,
   TRunDetail,
@@ -2676,6 +2677,12 @@ export const orchestrator = {
     // Every run owned by the current user (all workspaces + ad-hoc/workspace-less
     // runs), newest first — the read path for the read-only Run-history library.
     listMine: httpGet<TRun[], void>('/api/orchestrator/runs'),
+    // Create an ad-hoc run straight from the「智能编排」Tab's structured form
+    // (no workspace / pre-built fleet — the fleet is synthesized from
+    // `model_range`). Backend defaults autonomy to `interactive`, so the run
+    // parks at `awaiting_plan_approval` until approved. Body matches the wire
+    // shape verbatim, so no mapBody is needed.
+    createAdhoc: httpPost<TRun, TCreateAdhocRun>('/api/orchestrator/runs/adhoc'),
     get: httpGet<TRunDetail, { id: string }>((p) => `/api/orchestrator/runs/${p.id}`),
     cancel: httpPost<void, { id: string }>(
       (p) => `/api/orchestrator/runs/${p.id}/cancel`,
