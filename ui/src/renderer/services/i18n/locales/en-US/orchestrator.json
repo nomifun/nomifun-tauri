@@ -201,6 +201,20 @@
       "send": "Send",
       "sent": "Steering message sent",
       "error": "Failed to send steering message: {{error}}"
+    },
+    "precipitate": {
+      "title": "Save roles as assistants",
+      "subtitle": "{{count}} role(s) from this run can be saved as assistants for reuse",
+      "modelsLabel": "Models",
+      "skillsLabel": "{{count}} skill(s)",
+      "saveAsAssistant": "Save as assistant",
+      "saved": "Saved",
+      "exists": "An assistant with this name already exists",
+      "saveOk": "Saved “{{name}}” as an assistant",
+      "saveError": "Failed to save assistant: {{error}}",
+      "synthDesc": "“{{role}}” role — handled: {{tasks}}",
+      "synthDescBare": "“{{role}}” role precipitated from a run",
+      "taskSep": ", "
     }
   }
 }

@@ -17,6 +17,7 @@ import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 import { useRunLive } from '../useRunLive';
 import { layoutDag } from './layoutDag';
 import { memberLogo, memberShortLabel } from './memberLabel';
+import RolePrecipitationPanel from './RolePrecipitationPanel';
 import RunDetailHeader from './RunDetailHeader';
 import TaskNode, { taskStatusMeta, type TaskFlowNode } from './nodes/TaskNode';
 
@@ -277,6 +278,12 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onBack, onOpenTask, embedd
         onResume={() => void handleResume()}
         busy={busy}
       />
+
+      {/* Role precipitation — when the run is done, suggest saving its used
+          roles as assistants. Lives as a `shrink-0` sibling above the canvas so
+          the react-flow region keeps its `flex-1 min-h-0` sizing intact. The
+          panel renders nothing when there are no roles / all already exist. */}
+      {detail.run.status === 'completed' && <RolePrecipitationPanel detail={detail} />}
 
       <div className='flex-1 min-h-0'>
         {noTasks ? (

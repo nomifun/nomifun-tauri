@@ -201,6 +201,20 @@
       "send": "发送",
       "sent": "已发送引导消息",
       "error": "发送引导消息失败：{{error}}"
+    },
+    "precipitate": {
+      "title": "沉淀为助手",
+      "subtitle": "这个 Run 里有 {{count}} 个角色可一键保存为助手，下次直接复用",
+      "modelsLabel": "模型",
+      "skillsLabel": "{{count}} 项技能",
+      "saveAsAssistant": "保存为助手",
+      "saved": "已保存",
+      "exists": "已存在同名助手",
+      "saveOk": "已将「{{name}}」保存为助手",
+      "saveError": "保存助手失败：{{error}}",
+      "synthDesc": "「{{role}}」角色，负责：{{tasks}}",
+      "synthDescBare": "从 Run 沉淀的「{{role}}」角色",
+      "taskSep": "、"
     }
   }
 }

@@ -34,6 +34,14 @@ export type TFleetMember = {
   capability_profile?: TCapabilityProfile;
   constraints?: TMemberConstraints;
   sort_order: number;
+  /** Role/model description fed to the description-driven planner (P3/P4). */
+  description?: string;
+  /** Assistant persona (rule text); the worker uses it as `preset_rules` (P4). */
+  system_prompt?: string;
+  /** Assistant skills the worker enables (P4). Empty for bare-model members. */
+  enabled_skills?: string[];
+  /** Assistant's disabled built-in skills (P4). Empty for bare-model members. */
+  disabled_builtin_skills?: string[];
 };
 
 /** A persisted fleet (group of agents) record. */
@@ -143,6 +151,9 @@ export type TRunTask = {
   tokens?: number;
   graph_x?: number;
   graph_y?: number;
+  /** Short role the planner named for this task (P5 沉淀捕获, migration 022).
+   * Nullable: tasks planned before this column existed read back as absent. */
+  role?: string;
 };
 
 /** A dependency edge between two run tasks (blocker → blocked). */
