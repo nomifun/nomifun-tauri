@@ -87,9 +87,7 @@
     "progress": {
       "elapsed": "耗时",
       "tokens": "Tokens",
-      "current": "当前",
-      "summaryTitle": "小结",
-      "idle": "—"
+      "current": "当前"
     },
     "timing": {
       "took": "用时 {{value}}",
@@ -97,7 +95,6 @@
     },
     "workspace": {
       "title": "文件",
-      "noDir": "该 Run 没有可浏览的工作目录。",
       "collapse": "收起文件",
       "expand": "展开文件"
     },

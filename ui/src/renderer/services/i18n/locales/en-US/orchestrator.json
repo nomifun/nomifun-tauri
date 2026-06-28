@@ -87,9 +87,7 @@
     "progress": {
       "elapsed": "Elapsed",
       "tokens": "Tokens",
-      "current": "Now",
-      "summaryTitle": "Summary",
-      "idle": "—"
+      "current": "Now"
     },
     "timing": {
       "took": "Took {{value}}",
@@ -97,7 +95,6 @@
     },
     "workspace": {
       "title": "Files",
-      "noDir": "This run has no working directory to browse.",
       "collapse": "Collapse files",
       "expand": "Show files"
     },
