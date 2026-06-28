@@ -76,6 +76,7 @@ import type { SpeechToTextRequest, SpeechToTextResult } from '../types/provider/
 import type {
   TCreateAdhocRun,
   TReassign,
+  TReplanRequest,
   TRun,
   TRunDetail,
   TSteer,
@@ -2673,6 +2674,16 @@ export const orchestrator = {
     rename: httpPatch<void, { id: string; goal: string }>(
       (p) => `/api/orchestrator/runs/${p.id}`,
       (p) => ({ goal: p.goal })
+    ),
+    // Re-plan a run IN PLACE (owner-scoped, POST). Clears the run's old task graph
+    // and re-decomposes against the (optionally) edited goal / model_range /
+    // autonomy / pinned_roles — every edit field is optional (omitted = keep
+    // current). Returns the re-planned run. The backend stops any live engine
+    // loop, applies the edits, clears the old plan, then re-plans + re-arms the
+    // engine for non-`interactive` runs (`interactive` re-parks at approval).
+    replan: httpPost<TRun, { id: string } & TReplanRequest>(
+      (p) => `/api/orchestrator/runs/${p.id}/replan`,
+      ({ id: _id, ...body }) => body
     ),
     cancel: httpPost<void, { id: string }>(
       (p) => `/api/orchestrator/runs/${p.id}/cancel`,

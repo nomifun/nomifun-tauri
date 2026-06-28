@@ -228,6 +228,19 @@ export type TCreateAdhocRun = {
   max_parallel?: number;
 };
 
+/** Body for `POST /api/orchestrator/runs/{id}/replan`. Re-plans a run IN PLACE:
+ * the backend clears the run's old task graph and re-decomposes against the
+ * (optionally) edited inputs. Every field is optional — an omitted field keeps
+ * the run's current value. `model_range` here must be `single`/`range` (an
+ * unexpanded `auto` is rejected, same as create — the caller expands it).
+ * Mirrors the backend `ReplanRequest`. */
+export type TReplanRequest = {
+  goal?: string;
+  model_range?: TModelRange;
+  autonomy?: string;
+  pinned_roles?: string[];
+};
+
 /** Body for `PUT /api/orchestrator/runs/{run_id}/tasks/{task_id}/assignment`.
  * Reassign a task to a different fleet member and/or lock the assignment so the
  * orchestrator's auto-router won't override it on the next plan update. */

@@ -125,6 +125,12 @@ impl IRunRepository for SqliteRunRepository {
         if p.goal.is_some() {
             sets.push("goal = ?");
         }
+        if p.autonomy.is_some() {
+            sets.push("autonomy = ?");
+        }
+        if p.fleet_snapshot.is_some() {
+            sets.push("fleet_snapshot = ?");
+        }
         if sets.is_empty() {
             return Ok(());
         }
@@ -146,6 +152,12 @@ impl IRunRepository for SqliteRunRepository {
         }
         if let Some(goal) = &p.goal {
             q = q.bind(goal);
+        }
+        if let Some(autonomy) = &p.autonomy {
+            q = q.bind(autonomy);
+        }
+        if let Some(fleet_snapshot) = &p.fleet_snapshot {
+            q = q.bind(fleet_snapshot);
         }
         q = q.bind(now_ms());
         q = q.bind(id);
@@ -289,6 +301,18 @@ impl IRunRepository for SqliteRunRepository {
         q = q.bind(now_ms());
         q = q.bind(id);
         q.execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn clear_run_tasks(&self, run_id: &str) -> Result<(), sqlx::Error> {
+        // One statement: deleting the run's tasks fires the task-keyed
+        // `ON DELETE CASCADE` FKs (migration 018), sweeping out that run's deps +
+        // assignments. The `orch_runs` row is untouched. Requires PRAGMA
+        // foreign_keys=ON on the connection (project default).
+        sqlx::query("DELETE FROM orch_run_tasks WHERE run_id = ?")
+            .bind(run_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -604,6 +628,8 @@ mod tests {
                 lead_conv_id: Some(Some(42)),
                 total_tokens: None,
                 goal: None,
+                autonomy: None,
+                fleet_snapshot: None,
             },
         )
         .await
@@ -922,6 +948,8 @@ mod tests {
                 lead_conv_id: None,
                 total_tokens: None,
                 goal: Some("new goal".into()),
+                autonomy: None,
+                fleet_snapshot: None,
             },
         )
         .await
@@ -930,5 +958,101 @@ mod tests {
         let refreshed = repo.get_run(&run.id).await.unwrap().unwrap();
         assert_eq!(refreshed.goal, "new goal", "goal rewritten");
         assert_eq!(refreshed.status, "planning", "status untouched (goal-only update)");
+    }
+
+    // P1 Task 2: clear_run_tasks removes a run's tasks (and cascades their deps +
+    // assignments via the task-keyed FKs) while LEAVING the run row intact — this
+    // is the replan "clear old plan" step. We seed a full aggregate (run + 2 tasks
+    // + 1 dep + 2 assignments), clear the tasks, then assert the tasks/deps/
+    // assignments are gone but the run survives. A second, untouched run's rows
+    // must survive (clear is scoped to the target run_id).
+    #[tokio::test]
+    async fn clear_run_tasks_removes_tasks_deps_assignments_keeps_run() {
+        let db = init_database_memory().await.unwrap();
+        let pool = db.pool().clone();
+        let ws_id = make_workspace(&pool).await;
+        let repo = SqliteRunRepository::new(pool);
+
+        // Target run with a 2-task chain (A→B), each carrying an assignment.
+        let run = repo
+            .create_run(CreateRunParams {
+                workspace_id: Some(ws_id.clone()),
+                user_id: "u1".into(),
+                goal: "to be replanned".into(),
+                fleet_snapshot: "[]".into(),
+                autonomy: "supervised".into(),
+                max_parallel: None,
+                lead_conv_id: None,
+                work_dir: None,
+            })
+            .await
+            .unwrap();
+        let mk = |run_id: String, title: &str| CreateTaskParams {
+            run_id,
+            title: title.into(),
+            spec: "s".into(),
+            task_profile: None,
+            status: "pending".into(),
+            graph_x: None,
+            graph_y: None,
+            role: None,
+        };
+        let a = repo.create_task(mk(run.id.clone(), "A")).await.unwrap();
+        let b = repo.create_task(mk(run.id.clone(), "B")).await.unwrap();
+        repo.add_dep(&a.id, &b.id).await.unwrap();
+        for t in [&a, &b] {
+            repo.create_assignment(CreateAssignmentParams {
+                task_id: t.id.clone(),
+                member_id: "fmem_x".into(),
+                score: None,
+                rationale: None,
+                source: "auto".into(),
+                locked: false,
+            })
+            .await
+            .unwrap();
+        }
+
+        // A second run that must NOT be touched by clearing the first's tasks.
+        let survivor = repo
+            .create_run(CreateRunParams {
+                workspace_id: Some(ws_id),
+                user_id: "u1".into(),
+                goal: "survivor".into(),
+                fleet_snapshot: "[]".into(),
+                autonomy: "supervised".into(),
+                max_parallel: None,
+                lead_conv_id: None,
+                work_dir: None,
+            })
+            .await
+            .unwrap();
+        let s_task = repo.create_task(mk(survivor.id.clone(), "S")).await.unwrap();
+
+        // Pre-condition: the full aggregate is present.
+        assert_eq!(repo.list_tasks(&run.id).await.unwrap().len(), 2);
+        assert_eq!(repo.list_deps(&run.id).await.unwrap().len(), 1);
+        assert_eq!(repo.list_assignments(&run.id).await.unwrap().len(), 2);
+
+        // Clear the run's tasks → the task-keyed FK cascade sweeps deps + assignments.
+        repo.clear_run_tasks(&run.id).await.unwrap();
+
+        // The run row survives; its tasks + deps + assignments are all gone.
+        assert!(repo.get_run(&run.id).await.unwrap().is_some(), "run row kept");
+        assert!(repo.list_tasks(&run.id).await.unwrap().is_empty(), "tasks cleared");
+        assert!(repo.list_deps(&run.id).await.unwrap().is_empty(), "deps cascaded");
+        assert!(
+            repo.list_assignments(&run.id).await.unwrap().is_empty(),
+            "assignments cascaded"
+        );
+        // Row-level too: the task A row + its assignment are gone (FK reached them).
+        assert!(repo.get_task(&a.id).await.unwrap().is_none(), "task A row gone");
+        assert!(
+            repo.get_assignment_for_task(&a.id).await.unwrap().is_none(),
+            "assignment A gone"
+        );
+
+        // The untouched run's task survived (clear is scoped to the target run).
+        assert!(repo.get_task(&s_task.id).await.unwrap().is_some(), "survivor task kept");
     }
 }

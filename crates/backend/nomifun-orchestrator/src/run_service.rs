@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use nomifun_api_types::{
     Assignment, CreateAdhocRunRequest, CreateRunRequest, FleetMember, ModelRange, PlannedDag,
-    ReassignRequest, Run, RunDetail, RunTask, RunTaskDep, TaskProfile,
+    ReassignRequest, ReplanRequest, Run, RunDetail, RunTask, RunTaskDep, TaskProfile,
 };
 use nomifun_common::AppError;
 use nomifun_common::generate_prefixed_id;
@@ -420,6 +420,8 @@ impl RunService {
                     lead_conv_id: None,
                     total_tokens: None,
                     goal: None,
+                    autonomy: None,
+                    fleet_snapshot: None,
                 },
             )
             .await
@@ -485,6 +487,8 @@ impl RunService {
                     lead_conv_id: None,
                     total_tokens: None,
                     goal: None,
+                    autonomy: None,
+                    fleet_snapshot: None,
                 },
             )
             .await
@@ -575,6 +579,8 @@ impl RunService {
                     lead_conv_id: None,
                     total_tokens: None,
                     goal: None,
+                    autonomy: None,
+                    fleet_snapshot: None,
                 },
             )
             .await
@@ -623,12 +629,103 @@ impl RunService {
                     lead_conv_id: None,
                     total_tokens: None,
                     goal: Some(goal.to_string()),
+                    autonomy: None,
+                    fleet_snapshot: None,
                 },
             )
             .await
             .map_err(OrchestratorError::from)?;
         self.emitter.emit_run_plan_updated(run_id);
         Ok(())
+    }
+
+    /// Re-plan a run in place (owner-scoped): clear the run's old plan and
+    /// re-decompose against the (optionally) edited goal / model range / autonomy.
+    /// This is the "全局重新规划" path — when the current decomposition is wrong,
+    /// the user edits the run's inputs and the fleet re-plans from scratch (same
+    /// run, no fork; the old plan is destroyed).
+    ///
+    /// Order matters: the edits (goal / autonomy / fleet_snapshot) are persisted
+    /// BEFORE `clear` + `plan`, because [`plan`](Self::plan) re-reads the run row
+    /// and uses `run.goal` (decomposition input), `run.fleet_snapshot` (assignment
+    /// pool) and `run.autonomy` (the post-plan gate). [`clear_run_tasks`] drops the
+    /// old tasks (cascading deps + assignments) so `plan`'s append semantics yield a
+    /// clean re-decomposition rather than a merge. `plan()` itself is unchanged — the
+    /// clear step is the only addition.
+    ///
+    /// `model_range` must already be `single`/`range` — an unexpanded `auto` is a
+    /// `BadRequest` (same contract as `create_adhoc`; the caller expands it). An
+    /// omitted field leaves that column unchanged. `pinned_roles` is accepted for
+    /// forward-compatibility but not yet wired into planning (carry-forward).
+    pub async fn replan(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        req: ReplanRequest,
+    ) -> Result<Run, AppError> {
+        // 404 (missing) / 403 (not owner) BEFORE any mutation — a non-owner must
+        // not clear the plan.
+        self.owned_run(user_id, run_id).await?;
+
+        // Resolve the optional edits into UpdateRunParams fields. `None` = leave the
+        // column unchanged; a blank goal is rejected (NOT NULL, same rule as create
+        // / rename).
+        let goal = match req.goal.as_deref().map(str::trim) {
+            Some("") => {
+                return Err(OrchestratorError::BadRequest("goal must not be empty".into()).into())
+            }
+            Some(g) => Some(g.to_string()),
+            None => None,
+        };
+        // A new model range rebuilds the fleet snapshot (same synthesis as
+        // create_adhoc); `auto` is rejected here just like create.
+        let fleet_snapshot = match &req.model_range {
+            Some(range) => {
+                let members = build_members_from_range(range)?;
+                Some(serde_json::to_string(&members).unwrap_or_else(|_| "[]".to_string()))
+            }
+            None => None,
+        };
+        let autonomy = req.autonomy.clone();
+
+        // Persist the edits FIRST so plan() reads the new goal / snapshot / autonomy.
+        // (When every edit is None, update_run early-returns — a harmless no-op.)
+        if goal.is_some() || autonomy.is_some() || fleet_snapshot.is_some() {
+            self.run_repo
+                .update_run(
+                    run_id,
+                    UpdateRunParams {
+                        status: None,
+                        summary: None,
+                        lead_conv_id: None,
+                        total_tokens: None,
+                        goal,
+                        autonomy,
+                        fleet_snapshot,
+                    },
+                )
+                .await
+                .map_err(OrchestratorError::from)?;
+        }
+
+        // Clear the old plan (cascade drops its deps + assignments), then
+        // re-decompose against the (edited) run inputs via the unchanged plan().
+        self.run_repo
+            .clear_run_tasks(run_id)
+            .await
+            .map_err(OrchestratorError::from)?;
+        self.plan(run_id).await?;
+
+        // Return the re-planned run so the route can read its (possibly switched)
+        // autonomy to decide whether to (re)start the engine — mirrors create /
+        // create_adhoc (which `engine.start` only for non-`interactive` runs).
+        let row = self
+            .run_repo
+            .get_run(run_id)
+            .await
+            .map_err(OrchestratorError::from)?
+            .ok_or_else(|| OrchestratorError::NotFound(format!("run {run_id}")))?;
+        Ok(run_row_to_dto(row))
     }
 
     /// Load a run and enforce caller ownership: a missing run is a clean 404, a
@@ -921,7 +1018,7 @@ mod tests {
     use crate::service::{FleetService, WorkspaceService};
     use nomifun_api_types::{
         CapabilityProfile, CreateAdhocRunRequest, CreateFleetRequest, CreateWorkspaceRequest,
-        FleetMemberInput, ModelRange, ModelRef, PlannedTask, WebSocketMessage,
+        FleetMemberInput, ModelRange, ModelRef, PlannedTask, ReplanRequest, WebSocketMessage,
     };
     use nomifun_db::{
         SqliteFleetRepository, SqliteOrchWorkspaceRepository, SqliteRunRepository,
@@ -2123,6 +2220,308 @@ mod tests {
         assert!(matches!(err, AppError::BadRequest(_)), "empty goal is 400, got: {err:?}");
 
         let err = svc.rename("u1", "run_missing", "x").await.expect_err("missing run must 404");
+        assert!(matches!(err, AppError::NotFound(_)), "got: {err:?}");
+    }
+
+    // -------------------------------------------------------------------------
+    // P1 Task 2: Run replan (clear old plan + re-decompose against a new goal).
+    // -------------------------------------------------------------------------
+
+    /// A planner that, on each `produce` call, returns the dag at the current head
+    /// of a queue (consuming it), so a test can stage DIFFERENT dags for the
+    /// initial plan vs the replan and prove the second plan was re-decomposed
+    /// rather than appended. Once the queue is exhausted it keeps returning the
+    /// last dag (so it never panics if called more than expected).
+    struct QueuedPlanProducer(Mutex<std::collections::VecDeque<PlannedDag>>);
+    impl QueuedPlanProducer {
+        fn new(dags: Vec<PlannedDag>) -> Self {
+            Self(Mutex::new(dags.into_iter().collect()))
+        }
+    }
+    #[async_trait::async_trait]
+    impl PlanProducer for QueuedPlanProducer {
+        async fn produce(
+            &self,
+            _goal: &str,
+            _members: &[FleetMember],
+        ) -> Result<PlannedDag, AppError> {
+            let mut q = self.0.lock().unwrap();
+            if q.len() > 1 {
+                Ok(q.pop_front().unwrap())
+            } else {
+                // Keep the last staged dag available for any extra call.
+                Ok(q.front().cloned().unwrap_or(PlannedDag { tasks: vec![] }))
+            }
+        }
+    }
+
+    /// A multi-task dag with the given titles (each a single independent task,
+    /// pre-assigned to member 0), so a test can count + name the re-decomposed
+    /// tasks after a replan.
+    fn dag_with_titles(titles: &[&str]) -> PlannedDag {
+        PlannedDag {
+            tasks: titles
+                .iter()
+                .map(|t| PlannedTask {
+                    title: (*t).to_string(),
+                    spec: format!("spec-{t}"),
+                    task_profile: None,
+                    depends_on: vec![],
+                    member_index: Some(0),
+                    rationale: None,
+                    role: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Build a RunService whose planner stages `dags` in order (initial plan +
+    /// later replans), seed a workspace + single-member fleet, create a run with
+    /// the given autonomy, and return (svc, run_id). The run is left in `planning`.
+    async fn replan_harness(
+        autonomy: &str,
+        dags: Vec<PlannedDag>,
+    ) -> (RunService, String) {
+        let db = init_database_memory().await.expect("db init");
+        let pool = db.pool().clone();
+        let run_repo = Arc::new(SqliteRunRepository::new(pool.clone()));
+        let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
+        let ws_repo = Arc::new(SqliteOrchWorkspaceRepository::new(pool.clone()));
+        let emitter = OrchestratorRunEventEmitter::new(Arc::new(NoopBroadcaster));
+        let planner: Arc<dyn PlanProducer> = Arc::new(QueuedPlanProducer::new(dags));
+        let svc = RunService::new(run_repo, fleet_repo.clone(), ws_repo.clone(), planner, emitter);
+        let fleet = FleetService::new(fleet_repo)
+            .create(
+                "u1",
+                CreateFleetRequest {
+                    name: "replan fleet".to_string(),
+                    description: None,
+                    max_parallel: None,
+                    members: vec![member_input("agent_a", &["coding"], "high", "standard")],
+                },
+            )
+            .await
+            .expect("fleet create");
+        let ws = WorkspaceService::new(ws_repo)
+            .create(
+                "u1",
+                CreateWorkspaceRequest {
+                    name: "replan ws".to_string(),
+                    default_fleet_id: Some(fleet.id.clone()),
+                    workspace_dir: None,
+                },
+            )
+            .await
+            .expect("ws create");
+        let run = svc
+            .create(
+                "u1",
+                CreateRunRequest {
+                    workspace_id: ws.id,
+                    goal: "do the thing".to_string(),
+                    fleet_id: fleet.id,
+                    autonomy: Some(autonomy.to_string()),
+                    max_parallel: None,
+                },
+            )
+            .await
+            .expect("run create");
+        (svc, run.id)
+    }
+
+    // replan with a NEW goal clears the old plan's tasks and re-decomposes against
+    // the new goal: after replan the run carries ONLY the new dag's tasks (the old
+    // task ids are gone, not appended), the goal is rewritten, and a supervised run
+    // is back to `running`.
+    #[tokio::test]
+    async fn replan_clears_old_tasks_and_redecomposes_against_new_goal() {
+        // Initial plan = 1 task ("旧"); replan = 2 tasks ("新A","新B").
+        let (svc, run_id) = replan_harness(
+            "supervised",
+            vec![dag_with_titles(&["旧"]), dag_with_titles(&["新A", "新B"])],
+        )
+        .await;
+        svc.plan(&run_id).await.expect("first plan");
+        let before = svc.get_detail(&run_id).await.expect("detail");
+        assert_eq!(before.tasks.len(), 1, "initial plan has one task");
+        let old_task_id = before.tasks[0].id.clone();
+
+        svc.replan(
+            "u1",
+            &run_id,
+            ReplanRequest {
+                goal: Some("全新目标".to_string()),
+                model_range: None,
+                autonomy: None,
+                pinned_roles: vec![],
+            },
+        )
+        .await
+        .expect("replan");
+
+        let after = svc.get_detail(&run_id).await.expect("detail");
+        // Only the new dag's tasks remain (old plan cleared, not appended).
+        assert_eq!(after.tasks.len(), 2, "replan re-decomposed to two tasks (no append)");
+        assert!(
+            !after.tasks.iter().any(|t| t.id == old_task_id),
+            "the old plan's task must be cleared, not retained"
+        );
+        let titles: Vec<&str> = after.tasks.iter().map(|t| t.title.as_str()).collect();
+        assert!(titles.contains(&"新A") && titles.contains(&"新B"), "new tasks present: {titles:?}");
+        // The goal was rewritten and a supervised run re-armed to `running`.
+        assert_eq!(after.run.goal, "全新目标", "goal updated by replan");
+        assert_eq!(after.run.status, "running", "supervised replan re-arms to running");
+    }
+
+    // replan of an INTERACTIVE run parks it back at `awaiting_plan_approval` after
+    // re-decomposition (the autonomy gate in plan() applies); old tasks cleared.
+    #[tokio::test]
+    async fn replan_interactive_parks_at_awaiting_plan_approval() {
+        let (svc, run_id) = replan_harness(
+            "interactive",
+            vec![dag_with_titles(&["旧"]), dag_with_titles(&["新"])],
+        )
+        .await;
+        // First plan parks interactive at awaiting_plan_approval.
+        svc.plan(&run_id).await.expect("first plan");
+        assert_eq!(
+            svc.get_detail(&run_id).await.unwrap().run.status,
+            "awaiting_plan_approval"
+        );
+
+        svc.replan(
+            "u1",
+            &run_id,
+            ReplanRequest { goal: None, model_range: None, autonomy: None, pinned_roles: vec![] },
+        )
+        .await
+        .expect("replan");
+
+        let after = svc.get_detail(&run_id).await.expect("detail");
+        assert_eq!(after.tasks.len(), 1, "re-decomposed to the new single task");
+        assert_eq!(after.tasks[0].title, "新", "new dag's task present");
+        assert_eq!(
+            after.run.status, "awaiting_plan_approval",
+            "interactive replan re-parks at the approval gate"
+        );
+    }
+
+    // replan with a NEW autonomy switches the run's gate: a supervised run replanned
+    // with autonomy=interactive must park at awaiting_plan_approval (the persisted
+    // autonomy is updated BEFORE plan() reads it for the gate).
+    #[tokio::test]
+    async fn replan_with_new_autonomy_switches_gate() {
+        let (svc, run_id) = replan_harness(
+            "supervised",
+            vec![dag_with_titles(&["旧"]), dag_with_titles(&["新"])],
+        )
+        .await;
+        svc.plan(&run_id).await.expect("first plan");
+        assert_eq!(svc.get_detail(&run_id).await.unwrap().run.status, "running");
+
+        svc.replan(
+            "u1",
+            &run_id,
+            ReplanRequest {
+                goal: None,
+                model_range: None,
+                autonomy: Some("interactive".to_string()),
+                pinned_roles: vec![],
+            },
+        )
+        .await
+        .expect("replan");
+
+        let after = svc.get_detail(&run_id).await.expect("detail");
+        assert_eq!(after.run.autonomy, "interactive", "autonomy switched by replan");
+        assert_eq!(
+            after.run.status, "awaiting_plan_approval",
+            "the new interactive gate applies after replan"
+        );
+    }
+
+    // replan with a NEW model_range rebuilds the run's fleet snapshot (reusing
+    // build_members_from_range): after replan the snapshot carries exactly the new
+    // range's members. Old tasks are cleared and re-decomposed against the new fleet.
+    #[tokio::test]
+    async fn replan_with_model_range_rebuilds_fleet_snapshot() {
+        let (svc, run_id) = replan_harness(
+            "supervised",
+            vec![dag_with_titles(&["旧"]), dag_with_titles(&["新"])],
+        )
+        .await;
+        svc.plan(&run_id).await.expect("first plan");
+        // The initial snapshot is the seeded single-member fleet.
+        let before = svc.get_detail(&run_id).await.expect("detail");
+        assert_eq!(before.fleet_members.len(), 1, "initial snapshot: one fleet member");
+
+        svc.replan(
+            "u1",
+            &run_id,
+            ReplanRequest {
+                goal: None,
+                model_range: Some(ModelRange::Range {
+                    models: vec![model_ref("p_new1", "m1"), model_ref("p_new2", "m2")],
+                }),
+                autonomy: None,
+                pinned_roles: vec![],
+            },
+        )
+        .await
+        .expect("replan");
+
+        let after = svc.get_detail(&run_id).await.expect("detail");
+        // The snapshot was rebuilt from the new range: two synthetic members.
+        assert_eq!(after.fleet_members.len(), 2, "snapshot rebuilt from new model_range");
+        let providers: Vec<&str> = after
+            .fleet_members
+            .iter()
+            .filter_map(|m| m.provider_id.as_deref())
+            .collect();
+        assert!(providers.contains(&"p_new1") && providers.contains(&"p_new2"), "new providers: {providers:?}");
+    }
+
+    // replan is owner-scoped: a non-owner is rejected (403) and the run's plan is
+    // left intact (old tasks NOT cleared).
+    #[tokio::test]
+    async fn replan_cross_user_is_forbidden() {
+        let (svc, run_id) = replan_harness(
+            "supervised",
+            vec![dag_with_titles(&["旧"]), dag_with_titles(&["新A", "新B"])],
+        )
+        .await;
+        svc.plan(&run_id).await.expect("first plan");
+        let before = svc.get_detail(&run_id).await.expect("detail");
+        assert_eq!(before.tasks.len(), 1);
+
+        let err = svc
+            .replan(
+                "intruder",
+                &run_id,
+                ReplanRequest { goal: Some("盗改".to_string()), model_range: None, autonomy: None, pinned_roles: vec![] },
+            )
+            .await
+            .expect_err("cross-user replan must reject");
+        assert!(matches!(err, AppError::Forbidden(_)), "cross-user replan is 403, got: {err:?}");
+
+        // The run's plan + goal are untouched.
+        let after = svc.get_detail(&run_id).await.expect("detail");
+        assert_eq!(after.tasks.len(), 1, "non-owner replan must not clear the plan");
+        assert_eq!(after.run.goal, "do the thing", "goal unchanged");
+    }
+
+    // replan 404s on a missing run.
+    #[tokio::test]
+    async fn replan_missing_run_is_not_found() {
+        let (svc, _run_id) = replan_harness("supervised", vec![dag_with_titles(&["x"])]).await;
+        let err = svc
+            .replan(
+                "u1",
+                "run_missing",
+                ReplanRequest { goal: None, model_range: None, autonomy: None, pinned_roles: vec![] },
+            )
+            .await
+            .expect_err("missing run must 404");
         assert!(matches!(err, AppError::NotFound(_)), "got: {err:?}");
     }
 }

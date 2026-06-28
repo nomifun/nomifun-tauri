@@ -15,8 +15,8 @@ use axum::routing::{get, post, put};
 
 use nomifun_api_types::{
     ApiResponse, CreateAdhocRunRequest, CreateFleetRequest, CreateRunRequest, CreateWorkspaceRequest,
-    Fleet, OrchWorkspace, ReassignRequest, Run, RunDetail, RunRenameRequest, SteerRequest,
-    UpdateFleetRequest, UpdateWorkspaceRequest,
+    Fleet, OrchWorkspace, ReassignRequest, ReplanRequest, Run, RunDetail, RunRenameRequest,
+    SteerRequest, UpdateFleetRequest, UpdateWorkspaceRequest,
 };
 use nomifun_auth::CurrentUser;
 use nomifun_common::AppError;
@@ -58,6 +58,7 @@ pub fn orchestrator_routes(state: OrchestratorRouterState) -> Router {
             get(get_run).delete(delete_run).patch(rename_run),
         )
         .route("/api/orchestrator/runs/{id}/cancel", post(cancel_run))
+        .route("/api/orchestrator/runs/{id}/replan", post(replan_run))
         .route("/api/orchestrator/runs/{id}/approve", post(approve_run))
         .route("/api/orchestrator/runs/{id}/pause", post(pause_run))
         .route("/api/orchestrator/runs/{id}/resume", post(resume_run))
@@ -296,6 +297,29 @@ async fn rename_run(
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     state.run_service.rename(&user.id, &id, &req.goal).await?;
     Ok(Json(ApiResponse::success()))
+}
+
+/// Re-plan a run in place (owner-scoped). Stop the engine loop FIRST (the old
+/// plan is about to be cleared out from under any live worker — mirrors cancel /
+/// delete's `engine.stop` → service ordering), then re-decompose via the service.
+/// Body is a [`ReplanRequest`] (all fields optional). The service enforces
+/// ownership (404/403) and rejects a blank goal / unexpanded `auto` range (400).
+/// On success the route reads the re-planned run's autonomy and (re)starts the
+/// engine for non-`interactive` runs — exactly like `create_run` / `create_adhoc`
+/// (an `interactive` run parks at `awaiting_plan_approval` and waits for approve).
+async fn replan_run(
+    State(state): State<OrchestratorRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<ReplanRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<Run>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    state.engine.stop(&id);
+    let run = state.run_service.replan(&user.id, &id, req).await?;
+    if run.autonomy != "interactive" {
+        state.engine.start(run.id.clone());
+    }
+    Ok(Json(ApiResponse::ok(run)))
 }
 
 /// Approve an `interactive` run's plan: `awaiting_plan_approval` → `running`,
@@ -838,6 +862,62 @@ mod tests {
                 Request::builder()
                     .method("PATCH")
                     .uri(format!("/api/orchestrator/runs/{run_id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .expect("request");
+        assert_ne!(resp.status(), StatusCode::OK);
+    }
+
+    // -------------------------------------------------------------------------
+    // P1 Task 2: POST /runs/{id}/replan route. Mirrors the seeded-run smoke
+    // pattern: with the CurrentUser layer the owner hits the route end to end
+    // (200/OK), and without the layer the handler cannot run (non-200) — guarding
+    // the replan route was mounted UNDER auth, never as a public route.
+    // -------------------------------------------------------------------------
+
+    /// `POST /api/orchestrator/runs/{id}/replan` with a `ReplanRequest` body
+    /// returns 200 for the owner (auth extract → engine.stop → RunService::replan
+    /// → 200) and confirms the route is mounted (before it existed axum 404s).
+    #[tokio::test]
+    async fn replan_run_returns_ok_with_user() {
+        let (state, run_id) = build_state_with_run().await; // run owned by "u1"
+        let app = orchestrator_routes(state).layer(axum::Extension(CurrentUser {
+            id: "u1".to_string(),
+            username: "tester".to_string(),
+        }));
+
+        let body = serde_json::json!({ "goal": "重新规划的目标" }).to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/orchestrator/runs/{run_id}/replan"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .expect("request");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// `POST /api/orchestrator/runs/{id}/replan` still requires the `CurrentUser`
+    /// extension — without it the handler cannot run (non-200). Guards the replan
+    /// route was not wired as a public route.
+    #[tokio::test]
+    async fn replan_run_without_user_is_not_ok() {
+        let (state, run_id) = build_state_with_run().await;
+        let app = orchestrator_routes(state);
+
+        let body = serde_json::json!({}).to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/orchestrator/runs/{run_id}/replan"))
                     .header("content-type", "application/json")
                     .body(Body::from(body))
                     .unwrap(),

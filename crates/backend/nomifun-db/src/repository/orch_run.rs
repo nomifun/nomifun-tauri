@@ -31,6 +31,12 @@ pub struct UpdateRunParams {
     /// Run goal (rename). `goal` is a plain `NOT NULL` column, so it uses the
     /// single-`Option` skip/set encoding: `None` = skip, `Some(v)` = set `v`.
     pub goal: Option<String>,
+    /// Autonomy (replan may switch the gate). `NOT NULL` column → single-`Option`
+    /// skip/set encoding.
+    pub autonomy: Option<String>,
+    /// Fleet snapshot JSON (replan rebuilds it from a new model range). `NOT NULL`
+    /// column → single-`Option` skip/set encoding.
+    pub fleet_snapshot: Option<String>,
 }
 
 /// Parameters for creating a task within a run. `id` is minted
@@ -128,6 +134,15 @@ pub trait IRunRepository: Send + Sync {
     /// Apply a partial task update (see [`UpdateTaskParams`]). No-op when every
     /// field is `None`. Bumps `updated_at` whenever any column changes.
     async fn update_task(&self, id: &str, p: UpdateTaskParams) -> Result<(), sqlx::Error>;
+
+    /// Delete ALL of a run's tasks (`DELETE FROM orch_run_tasks WHERE run_id = ?`),
+    /// leaving the `orch_runs` row intact. The task-keyed `ON DELETE CASCADE` FKs
+    /// (migration 018) sweep out that run's dependency edges (`orch_run_task_deps`)
+    /// and assignments (`orch_assignments`) with the tasks. This is the replan
+    /// "clear old plan" step: a clean re-decomposition wipes the prior task DAG so
+    /// `plan` (which mints fresh tasks every call) re-plans rather than appends.
+    /// Requires `PRAGMA foreign_keys=ON` on the connection (the project default).
+    async fn clear_run_tasks(&self, run_id: &str) -> Result<(), sqlx::Error>;
 
     // --- deps ---
 

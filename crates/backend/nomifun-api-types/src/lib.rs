@@ -146,7 +146,7 @@ pub use office::{
 pub use orchestrator::{
     Assignment, CapabilityProfile, CreateAdhocRunRequest, CreateFleetRequest, CreateRunRequest,
     CreateWorkspaceRequest, Fleet, FleetMember, FleetMemberInput, MemberConstraints, ModelRange,
-    ModelRef, OrchWorkspace, PlannedDag, PlannedTask, ReassignRequest, Run,
+    ModelRef, OrchWorkspace, PlannedDag, PlannedTask, ReassignRequest, ReplanRequest, Run,
     RunDetail, RunRenameRequest, RunTask, RunTaskDep, SteerRequest, TaskProfile, UpdateFleetRequest,
     UpdateWorkspaceRequest, derive_capability,
 };

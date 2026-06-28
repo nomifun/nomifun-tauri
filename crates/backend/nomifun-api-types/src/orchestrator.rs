@@ -358,6 +358,23 @@ pub struct RunRenameRequest {
     pub goal: String,
 }
 
+/// Re-design a run in place. The body of `POST /api/orchestrator/runs/{id}/replan`.
+/// All fields optional — omitted = keep the run's current value. The service
+/// clears the run's old plan (tasks/deps/assignments) and re-decomposes against
+/// the (optionally) edited goal / model range / autonomy. `model_range` here must
+/// already be `single`/`range` (an unexpanded `auto` is rejected, like create).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplanRequest {
+    #[serde(default)]
+    pub goal: Option<String>,
+    #[serde(default)]
+    pub model_range: Option<ModelRange>,
+    #[serde(default)]
+    pub autonomy: Option<String>,
+    #[serde(default)]
+    pub pinned_roles: Vec<String>,
+}
+
 /// Create (and kick off) an orchestration run within a workspace against a fleet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateRunRequest {
