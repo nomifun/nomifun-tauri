@@ -5,7 +5,9 @@
     "newRun": "New run",
     "listTitle": "My runs",
     "listEmpty": "No runs yet — click “New run” above to start one",
-    "listLoadError": "Failed to load runs"
+    "listLoadError": "Failed to load runs",
+    "collapse": "Collapse list",
+    "expand": "Expand list"
   },
   "empty": {
     "title": "Select a run to begin",
@@ -45,7 +47,11 @@
     },
     "submit": "Start run",
     "cancel": "Cancel",
-    "createError": "Failed to start run: {{error}}"
+    "createError": "Failed to start run: {{error}}",
+    "replanTitle": "Re-plan run",
+    "replanSubtitle": "Edit the goal, models, roles or autonomy and re-decompose the task graph. The old plan (tasks, assignments) is cleared and rebuilt.",
+    "replanSubmit": "Re-plan",
+    "replanError": "Failed to re-plan: {{error}}"
   },
   "roster": {
     "title": "Agent roster",
@@ -68,6 +74,33 @@
     "emptyDesc": "Give a multi-agent team a goal inside a conversation to start a run — it will show up here for review afterwards.",
     "loadError": "Failed to load runs",
     "untitledGoal": "(No goal)",
+    "manage": {
+      "rename": "Rename",
+      "renameError": "Failed to rename: {{error}}",
+      "delete": "Delete",
+      "deleteConfirm": "Delete this run? Its task graph and execution records are removed too.",
+      "deleteConfirmOk": "Delete",
+      "deleteConfirmCancel": "Cancel",
+      "deleteOk": "Run deleted",
+      "deleteError": "Failed to delete: {{error}}"
+    },
+    "progress": {
+      "elapsed": "Elapsed",
+      "tokens": "Tokens",
+      "current": "Now",
+      "summaryTitle": "Summary",
+      "idle": "—"
+    },
+    "timing": {
+      "took": "Took {{value}}",
+      "running": "Running {{value}}"
+    },
+    "workspace": {
+      "title": "Files",
+      "noDir": "This run has no working directory to browse.",
+      "collapse": "Collapse files",
+      "expand": "Show files"
+    },
     "mobile": {
       "tasksLabel": "Tasks",
       "noTasks": "The fleet is breaking the goal into tasks — they will appear here shortly."
@@ -99,6 +132,7 @@
       "resume": "Resume",
       "resumeOk": "Run resumed",
       "resumeError": "Failed to resume run: {{error}}",
+      "replan": "Re-plan",
       "loadError": "Failed to load run detail",
       "planningTitle": "Planning tasks…",
       "planningDesc": "The fleet is breaking the goal into a task graph — nodes will appear shortly.",

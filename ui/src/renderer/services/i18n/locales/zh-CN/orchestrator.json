@@ -5,7 +5,9 @@
     "newRun": "新建 Run",
     "listTitle": "我的 Run",
     "listEmpty": "还没有 Run，点上方「新建 Run」开始吧",
-    "listLoadError": "加载 Run 失败"
+    "listLoadError": "加载 Run 失败",
+    "collapse": "收起列表",
+    "expand": "展开列表"
   },
   "empty": {
     "title": "选择一个 Run 开始",
@@ -45,7 +47,11 @@
     },
     "submit": "发起 Run",
     "cancel": "取消",
-    "createError": "发起 Run 失败：{{error}}"
+    "createError": "发起 Run 失败：{{error}}",
+    "replanTitle": "重新规划 Run",
+    "replanSubtitle": "修改目标、模型、角色或自主级别，重新拆解任务图。旧计划（任务、分派）将被清除并重建。",
+    "replanSubmit": "重新规划",
+    "replanError": "重新规划失败：{{error}}"
   },
   "roster": {
     "title": "agent 花名册",
@@ -68,6 +74,33 @@
     "emptyDesc": "在会话中向多智能体下达目标即可发起一个 Run，之后会在这里留下复盘记录。",
     "loadError": "加载 Run 失败",
     "untitledGoal": "（未填写目标）",
+    "manage": {
+      "rename": "重命名",
+      "renameError": "重命名失败：{{error}}",
+      "delete": "删除",
+      "deleteConfirm": "删除此 Run？其任务图与执行记录将一并移除。",
+      "deleteConfirmOk": "删除",
+      "deleteConfirmCancel": "取消",
+      "deleteOk": "Run 已删除",
+      "deleteError": "删除失败：{{error}}"
+    },
+    "progress": {
+      "elapsed": "耗时",
+      "tokens": "Tokens",
+      "current": "当前",
+      "summaryTitle": "小结",
+      "idle": "—"
+    },
+    "timing": {
+      "took": "用时 {{value}}",
+      "running": "已运行 {{value}}"
+    },
+    "workspace": {
+      "title": "文件",
+      "noDir": "该 Run 没有可浏览的工作目录。",
+      "collapse": "收起文件",
+      "expand": "展开文件"
+    },
     "mobile": {
       "tasksLabel": "任务",
       "noTasks": "编队正在把目标拆解为任务，稍后会显示在这里。"
@@ -99,6 +132,7 @@
       "resume": "继续",
       "resumeOk": "Run 已继续",
       "resumeError": "继续 Run 失败：{{error}}",
+      "replan": "重新规划",
       "loadError": "加载 Run 详情失败",
       "planningTitle": "正在规划任务…",
       "planningDesc": "编队正在拆解目标并生成任务图，稍候即可看到节点。",

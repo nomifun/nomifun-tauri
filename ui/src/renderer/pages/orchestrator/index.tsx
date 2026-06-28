@@ -7,11 +7,13 @@
 import React, { Suspense, useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { Spin } from '@arco-design/web-react';
-import { Comment, Plus, Right, Workbench } from '@icon-park/react';
+import { Input, Popconfirm, Spin } from '@arco-design/web-react';
+import { Comment, Delete, Edit, ExpandLeft, ExpandRight, Plus, Right, Workbench } from '@icon-park/react';
+import { ipcBridge } from '@/common';
 import type { TRun } from '@/common/types/orchestrator/orchestratorTypes';
 import AppLoader from '@/renderer/components/layout/AppLoader';
 import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
+import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 import RunHistory from './RunHistory';
 import NewRunComposer from './NewRunComposer';
 import AgentRoster from './RunDetail/AgentRoster';
@@ -40,20 +42,72 @@ const formatTime = (ms: number): string => new Date(ms).toLocaleString();
 
 /**
  * A single run row in the left master list. Reuses RunHistory's visual language
- * (goal · status dot · timestamp), but instead of a navigation arrow it carries
- * a selected highlight and an optional "open conversation" jump.
+ * (goal · status dot · timestamp), with a selected highlight, an optional "open
+ * conversation" jump, and hover-revealed management actions (rename / delete).
+ * Rename swaps the goal line for an inline input; delete is confirm-guarded.
  */
 const RunListRow: React.FC<{
   run: TRun;
   selected: boolean;
   onSelect: () => void;
   onOpenConversation?: () => void;
-}> = ({ run, selected, onSelect, onOpenConversation }) => {
+  onRename: (goal: string) => Promise<void>;
+  onDelete: () => Promise<void>;
+}> = ({ run, selected, onSelect, onOpenConversation, onRename, onDelete }) => {
   const { t } = useTranslation();
   const meta = STATUS_META[run.status];
   const dotColor = meta?.color ?? 'var(--color-text-3)';
   const statusLabel = t(`orchestrator.run.status.${meta?.key ?? 'unknown'}`);
   const goalText = run.goal.trim() || t('orchestrator.run.untitledGoal');
+
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(run.goal);
+  const [saving, setSaving] = useState(false);
+
+  const beginEdit = useCallback(() => {
+    setDraft(run.goal);
+    setEditing(true);
+  }, [run.goal]);
+
+  const commitEdit = useCallback(async () => {
+    const next = draft.trim();
+    if (!next || next === run.goal.trim()) {
+      setEditing(false);
+      return;
+    }
+    setSaving(true);
+    try {
+      await onRename(next);
+      setEditing(false);
+    } finally {
+      setSaving(false);
+    }
+  }, [draft, run.goal, onRename]);
+
+  // Inline rename mode — replaces the whole row with an input so the user can
+  // retitle without leaving the list. Enter commits, Escape/blur cancels.
+  if (editing) {
+    return (
+      <div className='flex items-center gap-8px rd-10px px-12px py-6px' style={{ border: '1px solid rgb(var(--primary-6))' }}>
+        <Input
+          autoFocus
+          size='small'
+          disabled={saving}
+          value={draft}
+          onChange={setDraft}
+          onPressEnter={() => void commitEdit()}
+          onBlur={() => void commitEdit()}
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') {
+              e.preventDefault();
+              setEditing(false);
+            }
+          }}
+          className='flex-1'
+        />
+      </div>
+    );
+  }
 
   return (
     <div
@@ -88,55 +142,171 @@ const RunListRow: React.FC<{
           <span className='truncate'>{formatTime(run.created_at)}</span>
         </div>
       </div>
+
+      {/* Hover actions: open conversation · rename · delete. */}
       {onOpenConversation && (
-        <div
-          role='button'
-          tabIndex={0}
-          aria-label={t('orchestrator.run.openConversation')}
-          title={t('orchestrator.run.openConversation')}
-          onClick={(e) => {
-            e.stopPropagation();
-            onOpenConversation();
-          }}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault();
-              e.stopPropagation();
-              onOpenConversation();
-            }
-          }}
-          className='flex size-26px shrink-0 items-center justify-center rd-6px text-t-tertiary opacity-0 transition-all hover:bg-fill-2 hover:text-primary-6 group-hover:opacity-100'
+        <RowAction
+          label={t('orchestrator.run.openConversation')}
+          onClick={onOpenConversation}
+          hoverClass='hover:bg-fill-2 hover:text-primary-6'
         >
           <Comment theme='outline' size='14' strokeWidth={3} />
-        </div>
+        </RowAction>
       )}
-      <Right theme='outline' size='14' strokeWidth={3} className='shrink-0 text-t-tertiary' />
+      <RowAction
+        label={t('orchestrator.run.manage.rename')}
+        onClick={beginEdit}
+        hoverClass='hover:bg-fill-2 hover:text-primary-6'
+      >
+        <Edit theme='outline' size='14' strokeWidth={3} />
+      </RowAction>
+      <Popconfirm
+        focusLock
+        title={t('orchestrator.run.manage.deleteConfirm')}
+        okText={t('orchestrator.run.manage.deleteConfirmOk')}
+        cancelText={t('orchestrator.run.manage.deleteConfirmCancel')}
+        onOk={() => void onDelete()}
+      >
+        <RowAction
+          label={t('orchestrator.run.manage.delete')}
+          onClick={(e) => e.stopPropagation()}
+          hoverClass='hover:bg-danger-light-1 hover:text-danger'
+        >
+          <Delete theme='outline' size='14' strokeWidth={3} />
+        </RowAction>
+      </Popconfirm>
+      <Right theme='outline' size='14' strokeWidth={3} className='shrink-0 text-t-tertiary group-hover:hidden' />
     </div>
   );
 };
 
+/** A small hover-revealed icon action inside a run row. Stops click propagation
+ * so activating it never also selects the row (unless the handler opts in). */
+const RowAction: React.FC<{
+  label: string;
+  hoverClass: string;
+  onClick: (e: React.MouseEvent) => void;
+  children: React.ReactNode;
+}> = ({ label, hoverClass, onClick, children }) => (
+  <div
+    role='button'
+    tabIndex={0}
+    aria-label={label}
+    title={label}
+    onClick={(e) => {
+      e.stopPropagation();
+      onClick(e);
+    }}
+    onKeyDown={(e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        e.stopPropagation();
+        onClick(e as unknown as React.MouseEvent);
+      }
+    }}
+    className={`flex size-26px shrink-0 items-center justify-center rd-6px text-t-tertiary opacity-0 transition-all group-hover:opacity-100 ${hoverClass}`}
+  >
+    {children}
+  </div>
+);
+
+/** localStorage key for the run-list rail collapse preference. */
+const RUNLIST_COLLAPSE_KEY = 'orchestrator-runlist-collapsed';
+
 /**
  * RunListRail — the master column: a prominent 「＋ 新建 Run」button atop a
  * scrollable list of the current user's runs (active + history, newest first via
- * {@link useMyRuns}). Selecting a row is the page's primary navigation; the
- * 「新建」button and any open run live in the detail pane on the right.
+ * {@link useMyRuns}). Each row carries rename / delete management actions.
+ * Selecting a row is the page's primary navigation; the 「新建」button and any
+ * open run live in the detail pane on the right. The rail collapses to a slim
+ * strip (preference persisted) to give the canvas + right rail more room.
  */
 const RunListRail: React.FC<{
   selectedRunId: string | undefined;
   composing: boolean;
   onNewRun: () => void;
   onSelectRun: (id: string) => void;
-}> = ({ selectedRunId, composing, onNewRun, onSelectRun }) => {
+  onRunDeleted: (id: string) => void;
+}> = ({ selectedRunId, composing, onNewRun, onSelectRun, onRunDeleted }) => {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const { runs, isLoading, error } = useMyRuns();
+  const { runs, isLoading, error, mutate } = useMyRuns();
+  const [message, msgCtx] = useArcoMessage();
+
+  const [collapsed, setCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(RUNLIST_COLLAPSE_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
+  const toggleCollapsed = useCallback(() => {
+    setCollapsed((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem(RUNLIST_COLLAPSE_KEY, next ? '1' : '0');
+      } catch {
+        /* ignore persistence failures */
+      }
+      return next;
+    });
+  }, []);
+
+  const handleRename = useCallback(
+    async (id: string, goal: string) => {
+      try {
+        await ipcBridge.orchestrator.runs.rename.invoke({ id, goal });
+        mutate();
+      } catch (e) {
+        message.error(t('orchestrator.run.manage.renameError', { error: String(e) }));
+      }
+    },
+    [mutate, message, t]
+  );
+
+  const handleDelete = useCallback(
+    async (id: string) => {
+      try {
+        await ipcBridge.orchestrator.runs.remove.invoke({ id });
+        mutate();
+        onRunDeleted(id);
+        message.success(t('orchestrator.run.manage.deleteOk'));
+      } catch (e) {
+        message.error(t('orchestrator.run.manage.deleteError', { error: String(e) }));
+      }
+    },
+    [mutate, onRunDeleted, message, t]
+  );
+
+  // Collapsed: a slim strip with just the new-run + expand affordances.
+  if (collapsed) {
+    return (
+      <div className='flex h-full w-48px shrink-0 flex-col items-center gap-8px border-r border-r-base bg-1 py-12px'>
+        {msgCtx}
+        <RailIconButton label={t('orchestrator.tab.expand')} onClick={toggleCollapsed}>
+          <ExpandRight theme='outline' size='16' strokeWidth={3} />
+        </RailIconButton>
+        <RailIconButton label={t('orchestrator.tab.newRun')} primary onClick={onNewRun}>
+          <Plus theme='outline' size='16' strokeWidth={4} />
+        </RailIconButton>
+      </div>
+    );
+  }
 
   return (
     <div className='flex h-full min-h-0 w-300px shrink-0 flex-col border-r border-r-base bg-1'>
+      {msgCtx}
       {/* Header + new-run button */}
       <div className='shrink-0 px-16px pt-16px pb-12px'>
-        <div className='text-15px font-600 leading-tight text-t-primary'>{t('orchestrator.title')}</div>
-        <div className='mt-2px text-11px leading-15px text-t-tertiary'>{t('orchestrator.subtitle')}</div>
+        <div className='flex items-start gap-8px'>
+          <div className='min-w-0 flex-1'>
+            <div className='text-15px font-600 leading-tight text-t-primary'>{t('orchestrator.title')}</div>
+            <div className='mt-2px text-11px leading-15px text-t-tertiary'>{t('orchestrator.subtitle')}</div>
+          </div>
+          <RailIconButton label={t('orchestrator.tab.collapse')} onClick={toggleCollapsed}>
+            <ExpandLeft theme='outline' size='15' strokeWidth={3} />
+          </RailIconButton>
+        </div>
         <div
           role='button'
           tabIndex={0}
@@ -189,6 +359,8 @@ const RunListRail: React.FC<{
                 onOpenConversation={
                   run.lead_conv_id != null ? () => void navigate(`/conversation/${run.lead_conv_id}`) : undefined
                 }
+                onRename={(goal) => handleRename(run.id, goal)}
+                onDelete={() => handleDelete(run.id)}
               />
             ))}
           </div>
@@ -197,6 +369,36 @@ const RunListRail: React.FC<{
     </div>
   );
 };
+
+/** A square icon button used in the rail header / collapsed strip. */
+const RailIconButton: React.FC<{
+  label: string;
+  primary?: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}> = ({ label, primary, onClick, children }) => (
+  <div
+    role='button'
+    tabIndex={0}
+    aria-label={label}
+    title={label}
+    onClick={onClick}
+    onKeyDown={(e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        onClick();
+      }
+    }}
+    className={
+      primary
+        ? 'flex size-30px shrink-0 cursor-pointer items-center justify-center rd-8px text-white transition-opacity hover:opacity-90'
+        : 'flex size-26px shrink-0 cursor-pointer items-center justify-center rd-7px text-t-tertiary transition-colors hover:bg-fill-2 hover:text-t-primary'
+    }
+    style={primary ? { background: 'rgb(var(--primary-6))' } : undefined}
+  >
+    {children}
+  </div>
+);
 
 /** The clean empty state shown when nothing is selected and not composing. */
 const EmptyDetail: React.FC = () => {
@@ -282,6 +484,14 @@ const OrchestratorPage: React.FC = () => {
     closeRun();
   }, [closeRun]);
 
+  // A deleted run that's currently open must close (drop `?run=`).
+  const handleRunDeleted = useCallback(
+    (id: string) => {
+      if (selectedRunId === id) closeRun();
+    },
+    [selectedRunId, closeRun]
+  );
+
   // Closing the run (or leaving compose) dismisses any open transcript drawer.
   useEffect(() => {
     if (!selectedRunId) setSelectedTask(null);
@@ -309,6 +519,7 @@ const OrchestratorPage: React.FC = () => {
         composing={composing}
         onNewRun={startComposing}
         onSelectRun={selectRun}
+        onRunDeleted={handleRunDeleted}
       />
 
       {/* Detail pane — three states. */}
