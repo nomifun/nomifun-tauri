@@ -7,6 +7,7 @@
 import { ConversationProvider } from '@/renderer/hooks/context/ConversationContext';
 import FlexFullContainer from '@renderer/components/layout/FlexFullContainer';
 import MessageList from '@renderer/pages/conversation/Messages/MessageList';
+import PinnedPlan from '@renderer/pages/conversation/Messages/components/PinnedPlan';
 import {
   MessageListLoadingProvider,
   MessageListProvider,
@@ -38,6 +39,7 @@ const RemoteChat: React.FC<{
         <FlexFullContainer>
           <MessageList className='flex-1' emptySlot={emptySlot}></MessageList>
         </FlexFullContainer>
+        <PinnedPlan />
         {!hideSendBox && <RemoteSendBox conversation_id={conversation_id} />}
       </div>
     </ConversationProvider>

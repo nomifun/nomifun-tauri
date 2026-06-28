@@ -5,6 +5,7 @@
   "toolDetailLoading": "Loading...",
   "toolDetailLoadFailed": "Failed to load full output",
   "planTodoList": "To do list",
+  "planProgress": "{{done}}/{{total}} done",
   "fileChanges": "File Changes",
   "fileChangesCount": "{{count}} File Changes",
   "conversationInProgress": "A conversation is currently in progress...",

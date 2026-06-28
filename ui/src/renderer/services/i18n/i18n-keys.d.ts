@@ -1564,6 +1564,7 @@ export type I18nKey =
   | 'messages.openLinkFailed'
   | 'messages.option'
   | 'messages.permissionRequest'
+  | 'messages.planProgress'
   | 'messages.planTodoList'
   | 'messages.processing'
   | 'messages.responseSentSuccessfully'

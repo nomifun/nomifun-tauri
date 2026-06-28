@@ -5,6 +5,7 @@
   "toolDetailLoading": "加载中...",
   "toolDetailLoadFailed": "加载完整输出失败",
   "planTodoList": "待办列表",
+  "planProgress": "已完成 {{done}}/{{total}}",
   "fileChanges": "文件变更",
   "fileChangesCount": "{{count}} 个文件变更",
   "conversationInProgress": "当前正在进行对话中...",

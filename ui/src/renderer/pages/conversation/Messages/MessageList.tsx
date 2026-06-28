@@ -27,7 +27,6 @@ import MessageFileChanges, { parseDiff } from './MessageFileChanges';
 import { useConversationArtifacts } from './artifacts';
 import { useMessageList, useMessageListLoading } from './hooks';
 import MessageAgentStatus from './components/MessageAgentStatus';
-import MessagePlan from './components/MessagePlan';
 import MessageTips from './components/MessageTips';
 import MessageToolCall from './components/MessageToolCall';
 import MessageToolGroup from './components/MessageToolGroup';
@@ -220,7 +219,10 @@ const MessageItem: React.FC<{ message: TMessage; highlighted?: boolean }> = Reac
       case 'acp_tool_call':
         return <MessageAcpToolCall message={message}></MessageAcpToolCall>;
       case 'plan':
-        return <MessagePlan message={message}></MessagePlan>;
+        // Plans render in the docked PinnedPlan bar, not inline — they're
+        // filtered out of processedList above. This guard keeps the switch
+        // exhaustive (the `never` default below would otherwise error).
+        return null;
       case 'thinking':
         return <MessageThinking message={message}></MessageThinking>;
       case 'available_commands':
@@ -305,6 +307,9 @@ const MessageList: React.FC<{
       // Skip hidden and available_commands messages
       if (message.hidden) continue;
       if (message.type === 'available_commands') continue;
+      // Plans are no longer rendered inline — they surface in the docked
+      // PinnedPlan bar above the composer, which reads the raw list directly.
+      if (message.type === 'plan') continue;
       // Connection-handshake status banners (connecting/connected/authenticated/
       // session_active) are implementation noise: never render them as chat
       // items, and never let them fragment the tool-execution trace below.
