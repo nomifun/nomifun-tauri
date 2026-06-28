@@ -76,6 +76,7 @@
   },
   "autowork": {
     "label": "AutoWork",
+    "startSession": "Start AutoWork session",
     "hint": "Automatically work through a tag's requirements one by one in this session.",
     "tagLabel": "Tag",
     "selectTag": "Select a tag",

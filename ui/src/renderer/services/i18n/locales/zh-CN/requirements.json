@@ -76,6 +76,7 @@
   },
   "autowork": {
     "label": "自动工作",
+    "startSession": "开始自动工作",
     "hint": "在当前会话中按次序自动完成某个标签下的需求。",
     "tagLabel": "标签",
     "selectTag": "请选择标签",

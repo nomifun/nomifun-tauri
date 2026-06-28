@@ -17,7 +17,7 @@ import type { AvailableAgent } from '../types';
 import type { Assistant } from '@/common/types/agent/assistantTypes';
 import PresetAgentTag, { type AgentSwitcherItem } from './PresetAgentTag';
 import { Button, Checkbox, Dropdown, Menu, Message, Tooltip } from '@arco-design/web-react';
-import { ArrowUp, Plus, Shield, UploadOne } from '@icon-park/react';
+import { ArrowUp, Plus, Robot, Shield, UploadOne } from '@icon-park/react';
 import React, { useCallback, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import styles from '../index.module.css';
@@ -61,6 +61,10 @@ type GuidActionRowProps = {
   isButtonDisabled: boolean;
   speechInputNode?: React.ReactNode;
   onSend: () => void;
+  /** When true the primary button starts an AutoWork session (no chat send):
+   * it shows a robot icon + "Start AutoWork" tooltip. Disabled/onClick are
+   * still driven by the parent. */
+  autoWorkMode?: boolean;
 };
 
 const GuidActionRow: React.FC<GuidActionRowProps> = ({
@@ -87,6 +91,7 @@ const GuidActionRow: React.FC<GuidActionRowProps> = ({
   isButtonDisabled,
   speechInputNode,
   onSend,
+  autoWorkMode = false,
 }) => {
   const { t } = useTranslation();
   const layout = useLayoutContext();
@@ -284,20 +289,28 @@ const GuidActionRow: React.FC<GuidActionRowProps> = ({
         )}
 
         {speechInputNode}
-        <Button
-          shape='circle'
-          type='primary'
-          loading={loading}
-          disabled={isButtonDisabled}
-          className='send-button-custom'
-          style={{
-            backgroundColor: isButtonDisabled ? undefined : '#000000',
-            borderColor: isButtonDisabled ? undefined : '#000000',
-          }}
-          icon={<ArrowUp theme='filled' size='14' fill='white' strokeWidth={5} />}
-          onClick={onSend}
-          data-testid='guid-send-btn'
-        />
+        <Tooltip content={t('requirements.autowork.startSession')} disabled={!autoWorkMode}>
+          <Button
+            shape='circle'
+            type='primary'
+            loading={loading}
+            disabled={isButtonDisabled}
+            className='send-button-custom'
+            style={{
+              backgroundColor: isButtonDisabled ? undefined : '#000000',
+              borderColor: isButtonDisabled ? undefined : '#000000',
+            }}
+            icon={
+              autoWorkMode ? (
+                <Robot theme='filled' size='14' fill='white' strokeWidth={5} />
+              ) : (
+                <ArrowUp theme='filled' size='14' fill='white' strokeWidth={5} />
+              )
+            }
+            onClick={onSend}
+            data-testid='guid-send-btn'
+          />
+        </Tooltip>
       </div>
     </div>
   );

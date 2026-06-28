@@ -2128,6 +2128,7 @@ export type I18nKey =
   | 'requirements.autowork.hint'
   | 'requirements.autowork.label'
   | 'requirements.autowork.selectTag'
+  | 'requirements.autowork.startSession'
   | 'requirements.autowork.state.active'
   | 'requirements.autowork.state.idle'
   | 'requirements.autowork.state.off'

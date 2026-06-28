@@ -16,6 +16,8 @@ import { useCallback, useRef } from 'react';
 import { type TFunction } from 'i18next';
 import type { NavigateFunction } from 'react-router-dom';
 import { getConversationCreateErrorMessage } from '@/renderer/pages/conversation/utils/conversationCreateError';
+import { planGuidEntry } from './autoWorkEntry';
+import type { AutoWorkDraftValue } from '@/renderer/pages/conversation/components/AutoWorkControl';
 import type { AcpModelInfo, AvailableAgent, EffectiveAgentInfo } from '../types';
 
 export type GuidSendDeps = {
@@ -63,6 +65,12 @@ export type GuidSendDeps = {
   /** Applies the Guid page's advanced drafts (knowledge/AutoWork/IDMM) onto the
    * freshly created conversation, before navigation. Never throws. */
   applyAdvancedConfig?: (conversationId: number) => Promise<void>;
+
+  /** Current AutoWork draft. When enabled with a tag, the entry starts an
+   * AutoWork session (no initial message) instead of a normal chat send —
+   * sending a first message would race the AutoWork turn and surface
+   * "conversation N is already running". */
+  autoWork: AutoWorkDraftValue;
 
   // Mention state reset
   setMentionOpen: React.Dispatch<React.SetStateAction<boolean>>;
@@ -114,6 +122,7 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
     currentEffectiveAgentInfo,
     isGoogleAuth,
     applyAdvancedConfig,
+    autoWork,
     setMentionOpen,
     setMentionQuery,
     setMentionSelectorOpen,
@@ -126,6 +135,12 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
   const handleSend = useCallback(async () => {
     const isCustomWorkspace = !!dir;
     const finalWorkspace = dir || '';
+
+    // AutoWork entry (switch on + tag) creates the session and lets the backend
+    // requirement loop drive it — it must NOT also send a first message, which
+    // would start a second turn that races the AutoWork turn and loses with
+    // "conversation N is already running".
+    const entryPlan = planGuidEntry(input, autoWork);
 
     const agentInfo = selectedAgentInfo;
     const is_preset = is_presetAgent;
@@ -165,7 +180,7 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
       const openclawAgentInfo = agentInfo || findAgentByKey(selectedAgentKey);
       const openclawConversationParams = buildAgentConversationParams({
         backend: openclawAgentInfo?.backend || 'openclaw-gateway',
-        name: input,
+        name: entryPlan.conversationName,
         agent_name: openclawAgentInfo?.name,
         preset_assistant_id,
         workspace: finalWorkspace,
@@ -207,7 +222,9 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
           input,
           files: files.length > 0 ? files : undefined,
         };
-        sessionStorage.setItem(`openclaw_initial_message_${conversation.id}`, JSON.stringify(initialMessage));
+        if (entryPlan.sendInitialMessage) {
+          sessionStorage.setItem(`openclaw_initial_message_${conversation.id}`, JSON.stringify(initialMessage));
+        }
 
         await navigate(`/conversation/${conversation.id}`);
       } catch (error: unknown) {
@@ -222,7 +239,7 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
       const nanobotAgentInfo = agentInfo || findAgentByKey(selectedAgentKey);
       const nanobotConversationParams = buildAgentConversationParams({
         backend: nanobotAgentInfo?.backend || 'nanobot',
-        name: input,
+        name: entryPlan.conversationName,
         agent_name: nanobotAgentInfo?.name,
         preset_assistant_id,
         workspace: finalWorkspace,
@@ -255,7 +272,9 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
           input,
           files: files.length > 0 ? files : undefined,
         };
-        sessionStorage.setItem(`nanobot_initial_message_${conversation.id}`, JSON.stringify(initialMessage));
+        if (entryPlan.sendInitialMessage) {
+          sessionStorage.setItem(`nanobot_initial_message_${conversation.id}`, JSON.stringify(initialMessage));
+        }
 
         await navigate(`/conversation/${conversation.id}`);
       } catch (error: unknown) {
@@ -274,7 +293,7 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
       try {
         const conversation = await ipcBridge.conversation.create.invoke({
           type: 'nomi',
-          name: input,
+          name: entryPlan.conversationName,
           model: current_model,
           extra: {
             default_files: files,
@@ -309,7 +328,9 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
           input,
           files: files.length > 0 ? files : undefined,
         };
-        sessionStorage.setItem(`nomi_initial_message_${conversation.id}`, JSON.stringify(initialMessage));
+        if (entryPlan.sendInitialMessage) {
+          sessionStorage.setItem(`nomi_initial_message_${conversation.id}`, JSON.stringify(initialMessage));
+        }
 
         await navigate(`/conversation/${conversation.id}`);
       } catch (error: unknown) {
@@ -342,7 +363,7 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
       const agentBackend = acpBackend || selectedAgent;
       const agentConversationParams = buildAgentConversationParams({
         backend: agentBackend,
-        name: input,
+        name: entryPlan.conversationName,
         // For row-scoped rows (custom ACP / remote) the backend factory
         // needs the actual catalog id — `backend` collapses to the `custom`
         // slot so it cannot discriminate between rows on its own.
@@ -392,7 +413,9 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
           input,
           files: files.length > 0 ? files : undefined,
         };
-        sessionStorage.setItem(`acp_initial_message_${conversation.id}`, JSON.stringify(initialMessage));
+        if (entryPlan.sendInitialMessage) {
+          sessionStorage.setItem(`acp_initial_message_${conversation.id}`, JSON.stringify(initialMessage));
+        }
 
         await navigate(`/conversation/${conversation.id}`);
       } catch (error: unknown) {
@@ -422,6 +445,7 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
     availableMcpServers,
     selectedMcpServerIds,
     applyAdvancedConfig,
+    autoWork,
     navigate,
     t,
   ]);
