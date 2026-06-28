@@ -285,6 +285,10 @@ pub struct RunTask {
     /// for tasks planned before this column existed.
     #[serde(default)]
     pub role: Option<String>,
+    /// Creation / last-update timestamps (epoch ms). Surfaced so the UI can show
+    /// per-task pacing (用时 / 相对时间) in the roster and inspector.
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 /// A blocker→blocked edge in the task DAG. Mirrors `OrchRunTaskDepRow`.

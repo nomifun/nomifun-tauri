@@ -27,6 +27,7 @@ use std::sync::Arc;
 use nomifun_api_types::{
     Assignment, CreateAdhocRunRequest, CreateRunRequest, FleetMember, ModelRange, PlannedDag,
     ReassignRequest, ReplanRequest, Run, RunDetail, RunTask, RunTaskDep, TaskProfile,
+    WorkspaceEntry,
 };
 use nomifun_common::AppError;
 use nomifun_common::generate_prefixed_id;
@@ -746,6 +747,51 @@ impl RunService {
         Ok(row)
     }
 
+    /// List one directory level under a run's working directory (owner-scoped).
+    /// The root is **server-authoritative**: prefer the ad-hoc run's own
+    /// `work_dir`, else fall back to its bound workspace's `workspace_dir`
+    /// (workspace-backed runs). A run with neither is a `BadRequest` (nothing to
+    /// browse). The client supplies only a workspace-relative `path` + optional
+    /// `search`; the `..`-rejection + boundary/depth guards live in
+    /// [`nomifun_file::list_workspace_level`]. The run-history counterpart of
+    /// `ConversationService::browse_workspace` / `TerminalService::browse_workspace`.
+    pub async fn browse_workspace(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        path: &str,
+        search: Option<&str>,
+    ) -> Result<Vec<WorkspaceEntry>, AppError> {
+        let row = self.owned_run(user_id, run_id).await?;
+        let root = self.resolve_run_dir(&row).await?;
+        nomifun_file::list_workspace_level(std::path::Path::new(&root), path, search)
+    }
+
+    /// Resolve a run's working-directory root: prefer `work_dir` (ad-hoc run),
+    /// else the bound workspace's `workspace_dir`. A run with neither a non-blank
+    /// `work_dir` nor a workspace dir is a `BadRequest` — there is nothing to
+    /// browse (e.g. a legacy workspace-backed run whose workspace had no dir).
+    async fn resolve_run_dir(&self, row: &OrchRunRow) -> Result<String, AppError> {
+        if let Some(dir) = row.work_dir.as_ref().filter(|d| !d.trim().is_empty()) {
+            return Ok(dir.clone());
+        }
+        if let Some(ws_id) = row.workspace_id.as_deref() {
+            let ws = self
+                .ws_repo
+                .get(ws_id)
+                .await
+                .map_err(OrchestratorError::from)?;
+            if let Some(dir) = ws.and_then(|w| w.workspace_dir).filter(|d| !d.trim().is_empty()) {
+                return Ok(dir);
+            }
+        }
+        Err(OrchestratorError::BadRequest(format!(
+            "run {} has no working directory to browse",
+            row.id
+        ))
+        .into())
+    }
+
     /// Load the chosen fleet's members as DTOs (decoding JSON columns fail-soft).
     /// A missing fleet is a clean 404.
     async fn load_fleet_members(&self, fleet_id: &str) -> Result<Vec<FleetMember>, AppError> {
@@ -959,6 +1005,8 @@ fn task_row_to_dto(row: OrchRunTaskRow) -> RunTask {
         graph_x: row.graph_x,
         graph_y: row.graph_y,
         role: row.role,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
     }
 }
 
@@ -2523,5 +2571,88 @@ mod tests {
             .await
             .expect_err("missing run must 404");
         assert!(matches!(err, AppError::NotFound(_)), "got: {err:?}");
+    }
+
+    // ── T3: per-task timestamps + run workspace browse ──────────────────────
+
+    // get_detail's RunTask DTOs carry created_at/updated_at (epoch ms) — the
+    // pacing data the roster/inspector surface. A freshly planned task has both
+    // populated (> 0).
+    #[tokio::test]
+    async fn get_detail_tasks_carry_timestamps() {
+        let (svc, run_id) = replan_harness("supervised", vec![dag_with_titles(&["t"])]).await;
+        svc.plan(&run_id).await.expect("plan");
+        let detail = svc.get_detail(&run_id).await.expect("detail");
+        assert_eq!(detail.tasks.len(), 1);
+        assert!(detail.tasks[0].created_at > 0, "created_at populated");
+        assert!(detail.tasks[0].updated_at > 0, "updated_at populated");
+    }
+
+    /// Build an ad-hoc run rooted at `work_dir` (or none) and return (svc, run).
+    async fn adhoc_run_with_dir(work_dir: Option<String>) -> (RunService, Run) {
+        let (svc, _repo) = adhoc_service().await;
+        let req = CreateAdhocRunRequest {
+            goal: "browse run".to_string(),
+            work_dir,
+            model_range: ModelRange::Single { model: model_ref("p", "m") },
+            pinned_roles: vec![],
+            role_members: vec![],
+            autonomy: Some("supervised".to_string()),
+            max_parallel: None,
+            lead_conv_id: None,
+        };
+        let run = svc.create_adhoc("u1", req).await.expect("create_adhoc");
+        (svc, run)
+    }
+
+    // browse_workspace lists one directory level under an ad-hoc run's work_dir
+    // (owner-scoped). Seeds a temp dir with a file and asserts it is listed.
+    #[tokio::test]
+    async fn browse_workspace_lists_files_for_owner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("hello.txt"), b"hi").expect("write file");
+        let (svc, run) = adhoc_run_with_dir(Some(dir.path().to_string_lossy().into_owned())).await;
+
+        let entries = svc.browse_workspace("u1", &run.id, "", None).await.expect("browse");
+        assert!(
+            entries.iter().any(|e| e.name == "hello.txt" && e.entry_type == "file"),
+            "expected hello.txt in {entries:?}"
+        );
+    }
+
+    // browse_workspace is owner-scoped: a non-owner is rejected (403).
+    #[tokio::test]
+    async fn browse_workspace_cross_user_is_forbidden() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (svc, run) = adhoc_run_with_dir(Some(dir.path().to_string_lossy().into_owned())).await;
+        let err = svc
+            .browse_workspace("intruder", &run.id, "", None)
+            .await
+            .expect_err("cross-user browse must reject");
+        assert!(matches!(err, AppError::Forbidden(_)), "got: {err:?}");
+    }
+
+    // browse_workspace 404s on a missing run.
+    #[tokio::test]
+    async fn browse_workspace_missing_run_is_not_found() {
+        let (svc, _repo) = adhoc_service().await;
+        let err = svc
+            .browse_workspace("u1", "run_missing", "", None)
+            .await
+            .expect_err("missing run must 404");
+        assert!(matches!(err, AppError::NotFound(_)), "got: {err:?}");
+    }
+
+    // A run with neither a work_dir nor a workspace dir has nothing to browse →
+    // BadRequest (400). An ad-hoc run with work_dir=None (no bound workspace) is
+    // exactly such a run.
+    #[tokio::test]
+    async fn browse_workspace_without_dir_is_bad_request() {
+        let (svc, run) = adhoc_run_with_dir(None).await;
+        let err = svc
+            .browse_workspace("u1", &run.id, "", None)
+            .await
+            .expect_err("no working dir must reject");
+        assert!(matches!(err, AppError::BadRequest(_)), "got: {err:?}");
     }
 }

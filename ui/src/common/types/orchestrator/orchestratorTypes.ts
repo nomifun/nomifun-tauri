@@ -132,6 +132,10 @@ export type TRun = {
   summary?: string;
   lead_conv_id?: number;
   total_tokens?: number;
+  /** Ad-hoc run's own working directory (absent for workspace-backed runs, which
+   * resolve their dir from the bound workspace). The run-workspace right rail
+   * binds its file tree to this path. Backend `Run` DTO always serializes it. */
+  work_dir?: string;
   created_at: number;
   updated_at: number;
 };
@@ -154,6 +158,10 @@ export type TRunTask = {
   /** Short role the planner named for this task (P5 沉淀捕获, migration 022).
    * Nullable: tasks planned before this column existed read back as absent. */
   role?: string;
+  /** Creation / last-update timestamps (epoch ms). Drive per-task pacing in the
+   * roster + inspector (用时 = updated_at − created_at, 相对时间). */
+  created_at: number;
+  updated_at: number;
 };
 
 /** A dependency edge between two run tasks (blocker → blocked). */

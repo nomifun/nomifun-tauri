@@ -9,19 +9,31 @@
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Extension, Json, Path, State};
+use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post, put};
 
 use nomifun_api_types::{
     ApiResponse, CreateAdhocRunRequest, CreateFleetRequest, CreateRunRequest, CreateWorkspaceRequest,
     Fleet, OrchWorkspace, ReassignRequest, ReplanRequest, Run, RunDetail, RunRenameRequest,
-    SteerRequest, UpdateFleetRequest, UpdateWorkspaceRequest,
+    SteerRequest, UpdateFleetRequest, UpdateWorkspaceRequest, WorkspaceEntry,
 };
 use nomifun_auth::CurrentUser;
 use nomifun_common::AppError;
+use serde::Deserialize;
 
 use crate::state::OrchestratorRouterState;
+
+/// Query for `GET /api/orchestrator/runs/{id}/workspace`. `path` is
+/// workspace-relative (default = the run's working-directory root) + optional
+/// case-insensitive `search`. The root itself is resolved server-side from the
+/// run (`work_dir`, else the bound workspace's dir) and is never accepted here.
+#[derive(Debug, Deserialize)]
+pub struct RunWorkspaceQuery {
+    #[serde(default)]
+    pub path: String,
+    pub search: Option<String>,
+}
 
 pub fn orchestrator_routes(state: OrchestratorRouterState) -> Router {
     Router::new()
@@ -62,6 +74,10 @@ pub fn orchestrator_routes(state: OrchestratorRouterState) -> Router {
         .route("/api/orchestrator/runs/{id}/approve", post(approve_run))
         .route("/api/orchestrator/runs/{id}/pause", post(pause_run))
         .route("/api/orchestrator/runs/{id}/resume", post(resume_run))
+        .route(
+            "/api/orchestrator/runs/{id}/workspace",
+            get(browse_run_workspace),
+        )
         .route(
             "/api/orchestrator/runs/{run_id}/tasks/{task_id}/steer",
             post(steer_task),
@@ -297,6 +313,25 @@ async fn rename_run(
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     state.run_service.rename(&user.id, &id, &req.goal).await?;
     Ok(Json(ApiResponse::success()))
+}
+
+/// List one directory level under a run's working directory (owner-scoped). The
+/// root is server-authoritative (the run's `work_dir`, else its workspace's dir);
+/// the client supplies only a workspace-relative `path` + optional `search`.
+/// Missing/not-owned run → 404/403, a run with no working dir → 400, `..`
+/// traversal → 400 (from the service / `list_workspace_level`). Read-only — the
+/// run-history counterpart of the conversation / terminal workspace-browse routes.
+async fn browse_run_workspace(
+    State(state): State<OrchestratorRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Query(query): Query<RunWorkspaceQuery>,
+) -> Result<Json<ApiResponse<Vec<WorkspaceEntry>>>, AppError> {
+    let entries = state
+        .run_service
+        .browse_workspace(&user.id, &id, &query.path, query.search.as_deref())
+        .await?;
+    Ok(Json(ApiResponse::ok(entries)))
 }
 
 /// Re-plan a run in place (owner-scoped). Stop the engine loop FIRST (the old
@@ -1192,5 +1227,95 @@ mod tests {
             !cancels.contains(&in_flight_conv),
             "resume must NOT cancel the in-flight worker conversation {in_flight_conv}; cancelled={cancels:?}"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // T3: run workspace browse route
+    // -------------------------------------------------------------------------
+
+    /// `GET /api/orchestrator/runs/{id}/workspace` lists the run's working
+    /// directory for the owner: seeds an ad-hoc run rooted at a temp dir with a
+    /// file (via the real `/runs/adhoc` route), then browses it and confirms the
+    /// file is in the response. Exercises the route end to end (auth extract →
+    /// owned_run → dir resolve → list_workspace_level → 200).
+    #[tokio::test]
+    async fn browse_run_workspace_lists_files_for_owner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("readme.md"), b"x").expect("write file");
+        let work_dir = dir.path().to_string_lossy().into_owned();
+
+        let state = build_state().await;
+        let app = orchestrator_routes(state).layer(axum::Extension(CurrentUser {
+            id: "u1".to_string(),
+            username: "tester".to_string(),
+        }));
+
+        // Seed an ad-hoc run rooted at the temp dir through the real create route.
+        let create_body = serde_json::json!({
+            "goal": "browse via route",
+            "work_dir": work_dir,
+            "model_range": { "mode": "single", "model": { "provider_id": "p", "model": "m" } },
+            "autonomy": "supervised"
+        })
+        .to_string();
+        let created = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/orchestrator/runs/adhoc")
+                    .header("content-type", "application/json")
+                    .body(Body::from(create_body))
+                    .unwrap(),
+            )
+            .await
+            .expect("create request");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let bytes = axum::body::to_bytes(created.into_body(), usize::MAX)
+            .await
+            .expect("create body");
+        let api: ApiResponse<Run> = serde_json::from_slice(&bytes).expect("decode Run");
+        let run = api.data.expect("run in response");
+
+        // Browse the run's workspace — the seeded file is listed.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/orchestrator/runs/{}/workspace", run.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("browse request");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("browse body");
+        let api: ApiResponse<Vec<WorkspaceEntry>> =
+            serde_json::from_slice(&bytes).expect("decode entries");
+        let entries = api.data.expect("entries in response");
+        assert!(
+            entries.iter().any(|e| e.name == "readme.md"),
+            "expected readme.md in {entries:?}"
+        );
+    }
+
+    /// `GET /api/orchestrator/runs/{id}/workspace` still requires the
+    /// `CurrentUser` extension — without it the handler cannot run (non-200).
+    /// Guards the browse route was not wired as a public route.
+    #[tokio::test]
+    async fn browse_run_workspace_without_user_is_not_ok() {
+        let (state, run_id) = build_state_with_run().await;
+        let app = orchestrator_routes(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/orchestrator/runs/{run_id}/workspace"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("request");
+        assert_ne!(resp.status(), StatusCode::OK);
     }
 }

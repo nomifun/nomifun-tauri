@@ -2709,6 +2709,20 @@ export const orchestrator = {
       (p) => `/api/orchestrator/runs/${p.run_id}/tasks/${p.task_id}/steer`,
       (p) => p.updates
     ),
+    // List one directory level under a run's working directory (read-only). Root
+    // is the run's `work_dir` (server resolves the actual dir); the client passes
+    // an ABSOLUTE path (root or a node's fullPath) which is mapped to a
+    // workspace-relative `path`. Mirrors terminal/conversation `getWorkspace` so
+    // the shared WorkspaceRailBody tree source consumes it unchanged (IDirOrFile[]).
+    getWorkspace: {
+      provider: () => {},
+      invoke: (async (p: { id: string; work_dir: string; path: string; search?: string }) => {
+        const rel = absoluteToRelativePath(p.path, p.work_dir);
+        const url = `/api/orchestrator/runs/${p.id}/workspace?path=${encodeURIComponent(rel)}${p.search ? `&search=${encodeURIComponent(p.search)}` : ''}`;
+        const raw = await httpRequest<Array<{ name: string; type: string }>>('GET', url);
+        return fromBackendWorkspaceList(raw, p.work_dir, rel);
+      }) as (p: { id: string; work_dir: string; path: string; search?: string }) => Promise<IDirOrFile[]>,
+    },
   },
   // Realtime WS events from the run engine (OrchestratorRunEventEmitter). Wire
   // names verbatim from orchestratorEvents.ts.
