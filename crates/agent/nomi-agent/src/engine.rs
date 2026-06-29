@@ -190,6 +190,11 @@ pub struct AgentEngine {
     /// restart. `None` (the default) = byte-for-byte previous behaviour.
     /// Mirrors `cancel_token`'s shared-handle pattern.
     steering_inbox: Option<Arc<Mutex<std::collections::VecDeque<String>>>>,
+    /// transcript 长度锚点：最近一个 turn 的用户消息 push 之前的 messages.len()。
+    /// 供 rewind_last_turn 把内存历史回退到最后一个用户 turn 之前（编辑最近一条
+    /// 用户消息重跑）。压缩会重写整个 messages 使下标失效，故压缩时清空；
+    /// clear_context 时一并清空。仅内存态，不持久化到 session。
+    last_turn_start_len: Option<usize>,
 }
 
 impl AgentEngine {
@@ -262,6 +267,7 @@ impl AgentEngine {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            last_turn_start_len: None,
         }
     }
 
@@ -337,6 +343,7 @@ impl AgentEngine {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            last_turn_start_len: None,
         }
     }
 
@@ -667,6 +674,8 @@ impl AgentEngine {
 
         self.current_msg_id = msg_id.to_string();
         self.output.emit_stream_start(msg_id);
+        // 记录本 turn 的起始锚点（用户消息 push 之前），供 rewind_last_turn 回退。
+        self.last_turn_start_len = Some(self.messages.len());
         self.messages.push(Message::now(
             Role::User,
             vec![ContentBlock::Text {
@@ -1156,6 +1165,7 @@ impl AgentEngine {
                         result.messages_summarized, result.pre_compact_tokens
                     ));
                     self.messages = result.messages;
+                    self.last_turn_start_len = None;
                     compacted = true;
                 }
                 Err(auto::CompactError::CircuitBroken { .. }) => {
@@ -1304,9 +1314,27 @@ impl AgentEngine {
     /// the conversation keeps its identity; only its contents are emptied.
     pub fn clear_context(&mut self) {
         self.messages.clear();
+        self.last_turn_start_len = None;
         self.compact_state = CompactState::new();
         self.total_usage = TokenUsage::default();
         self.save_session();
+    }
+
+    /// 把内存 transcript 回退到最近一个 turn 的用户消息之前（丢弃最后一个用户
+    /// turn 及其后内容），用于"编辑最近一条用户消息并重跑"。成功返回 true；
+    /// 无有效锚点（如已被压缩清空、或越界）返回 false，调用方应回退处理。
+    pub fn rewind_last_turn(&mut self) -> bool {
+        let Some(start) = self.last_turn_start_len else {
+            return false;
+        };
+        if start > self.messages.len() {
+            self.last_turn_start_len = None;
+            return false;
+        }
+        self.messages.truncate(start);
+        self.last_turn_start_len = None;
+        self.save_session();
+        true
     }
 
     /// Close a partially recorded turn after the host cancels execution.
@@ -1532,6 +1560,7 @@ mod set_config_tests {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            last_turn_start_len: None,
         }
     }
 
@@ -1541,6 +1570,34 @@ mod set_config_tests {
         assert_eq!(engine.context_window(), engine.compact_config.context_window as u64);
         engine.compact_state.last_input_tokens = 12_345;
         assert_eq!(engine.context_tokens(), 12_345);
+    }
+
+    #[test]
+    fn rewind_last_turn_truncates_to_marker() {
+        use nomi_types::message::{ContentBlock, Message, Role};
+        let mut engine = make_engine("rewind");
+        // 既有历史：U0, A0
+        engine.messages.push(Message::now(Role::User, vec![ContentBlock::Text { text: "u0".into() }]));
+        engine.messages.push(Message::now(Role::Assistant, vec![ContentBlock::Text { text: "a0".into() }]));
+        // 标记最后一个 turn 起始 = 当前长度(2)，再 push U1（被中断的 turn）
+        engine.last_turn_start_len = Some(engine.messages.len());
+        engine.messages.push(Message::now(Role::User, vec![ContentBlock::Text { text: "u1".into() }]));
+        assert_eq!(engine.messages.len(), 3);
+
+        assert!(engine.rewind_last_turn());
+        assert_eq!(engine.messages.len(), 2); // U1 被回退
+        assert!(engine.last_turn_start_len.is_none()); // 锚点被消费
+
+        // 再次回退无锚点 → false
+        assert!(!engine.rewind_last_turn());
+    }
+
+    #[test]
+    fn rewind_last_turn_rejects_stale_marker() {
+        let mut engine = make_engine("rewind-stale");
+        // 锚点越界（如压缩后未清理的极端情况）→ 拒绝
+        engine.last_turn_start_len = Some(5);
+        assert!(!engine.rewind_last_turn());
     }
 
     fn make_engine_with_compat(
@@ -1987,6 +2044,7 @@ mod phase6_tests {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            last_turn_start_len: None,
         }
     }
 
@@ -2233,6 +2291,7 @@ mod compact_tests {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            last_turn_start_len: None,
         }
     }
 
@@ -2638,6 +2697,7 @@ mod plan_mode_tests {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            last_turn_start_len: None,
         }
     }
 
@@ -2856,6 +2916,7 @@ mod handle_command_tests {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            last_turn_start_len: None,
         }
     }
 
