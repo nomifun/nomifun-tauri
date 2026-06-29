@@ -920,6 +920,26 @@ impl NomiAgentManager {
         Ok(())
     }
 
+    /// Rewind the last user turn (edit & resubmit the most recent user message):
+    /// stop any in-flight turn, then truncate the engine's in-memory transcript
+    /// back to that turn's start so a fresh send re-runs without the stale turn.
+    /// Returns BadRequest when there is no valid anchor (e.g. context was
+    /// compacted away) so the caller can surface a retriable error.
+    pub async fn rewind_last_turn(&self) -> Result<(), AppError> {
+        info!(
+            conversation_id = %self.runtime.conversation_id(),
+            "Rewinding last Nomi turn"
+        );
+        self.request_stop(None, "rewind_last_turn");
+        let mut engine = self.engine.lock().await;
+        if !engine.rewind_last_turn() {
+            return Err(AppError::BadRequest(
+                "无法回退上一轮（上下文可能已被压缩），请清空上下文后重试".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Test-only accessor for the resolved distillation target directory.
     #[cfg(test)]
     pub(crate) fn distill_dir_for_test(&self) -> Option<&std::path::Path> {
