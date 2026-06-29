@@ -465,6 +465,16 @@ impl AppServices {
         if let Some(cfg) = requirement_mcp_config.clone() {
             terminal_service.with_requirement_mcp_config(cfg);
         }
+        // Wire the auto-title completer: a terminal session's first turn (agent
+        // CLIs) is summarized into a short work-content title via the default
+        // provider/model (same resolution as `LiveKnowledgeCompleter` above).
+        // Shell sessions / no provider fall back to the first input line, so this
+        // is best-effort and never blocks a launch.
+        terminal_service.with_title_completer(Arc::new(nomifun_ai_agent::LiveTerminalTitleCompleter {
+            provider_repo: provider_repo.clone(),
+            encryption_key,
+            workspace: data_dir.clone(),
+        }));
         // Start the terminal lifecycle server (house pattern, 4th instance):
         // native CLI hooks (claude --settings / codex -c hooks) POST turn/tool/
         // notification events to it via the `nomicore terminal-hook` shim, and it

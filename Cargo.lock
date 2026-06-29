@@ -5289,6 +5289,7 @@ dependencies = [
  "nomifun-realtime",
  "nomifun-runtime",
  "nomifun-secret",
+ "nomifun-terminal",
  "regex",
  "rusqlite",
  "serde",

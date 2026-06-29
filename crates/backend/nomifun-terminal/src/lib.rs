@@ -12,6 +12,7 @@ pub mod pty;
 pub mod routes;
 pub mod service;
 pub mod state;
+pub mod title;
 pub mod types;
 
 pub use ansi::{AnsiLineScanner, strip_ansi};
@@ -22,3 +23,4 @@ pub use lifecycle::{LifecycleKind, TerminalLifecycleEvent, TerminalLifecycleServ
 pub use routes::terminal_routes;
 pub use service::{TerminalService, TerminalSupervisionHook};
 pub use state::TerminalRouterState;
+pub use title::{TerminalTitleCompleter, clamp_title, fallback_title, TITLE_MAX_CHARS};

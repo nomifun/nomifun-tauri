@@ -21,6 +21,7 @@ pub mod routes;
 pub(crate) mod services;
 pub mod shared_kernel;
 pub mod task_manager;
+pub mod terminal_title_completer;
 pub mod types;
 
 // ── Agent-layer re-exports (the seam) ──────────────────────────────────────
@@ -51,6 +52,7 @@ pub use browser_fetcher::BrowserFetcher;
 pub use knowledge_completer::LiveKnowledgeCompleter;
 pub use knowledge_retrieval::LiveKnowledgeRetrievalSink;
 pub use knowledge_writeback::LiveKnowledgeWritebackSink;
+pub use terminal_title_completer::LiveTerminalTitleCompleter;
 pub use nomifun_api_types::{
     AcpBuildExtra, AcpModelInfo, NomiBuildExtra, OpenClawBuildExtra, OpenClawGatewayConfig, RemoteBuildExtra,
     SlashCommandItem,

@@ -189,6 +189,29 @@ impl ITerminalRepository for SqliteTerminalRepository {
         Ok(())
     }
 
+    async fn update_command(
+        &self,
+        id: i64,
+        command: &str,
+        args: &str,
+        backend: Option<&str>,
+    ) -> Result<(), DbError> {
+        let result = sqlx::query(
+            "UPDATE terminal_sessions SET command = ?, args = ?, backend = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(command)
+        .bind(args)
+        .bind(backend)
+        .bind(now_ms())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("terminal session '{id}'")));
+        }
+        Ok(())
+    }
+
     async fn update_autowork(&self, id: i64, autowork: Option<&str>) -> Result<(), DbError> {
         let result = sqlx::query("UPDATE terminal_sessions SET autowork = ?, updated_at = ? WHERE id = ?")
             .bind(autowork)
@@ -232,6 +255,13 @@ impl ITerminalRepository for SqliteTerminalRepository {
             return Err(DbError::NotFound(format!("terminal session '{id}'")));
         }
         Ok(())
+    }
+
+    async fn delete_all(&self) -> Result<u64, DbError> {
+        // Whole-table wipe (no WHERE, no NotFound): a clean exit with zero rows
+        // is the normal case. terminal_scrollback is dropped by FK CASCADE.
+        let result = sqlx::query("DELETE FROM terminal_sessions").execute(&self.pool).await?;
+        Ok(result.rows_affected())
     }
 }
 
@@ -370,6 +400,48 @@ mod tests {
         let id = repo.create(&params(SYSTEM_USER_ID)).await.unwrap().id;
         repo.delete(id).await.unwrap();
         assert!(repo.get_by_id(id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_all_clears_rows_and_scrollback_cascade() {
+        let db = init_database_memory().await.unwrap();
+        let repo = SqliteTerminalRepository::new(db.pool().clone());
+        let a = repo.create(&params(SYSTEM_USER_ID)).await.unwrap().id;
+        let b = repo.create(&params(SYSTEM_USER_ID)).await.unwrap().id;
+        repo.save_scrollback(a, b"history-a").await.unwrap();
+        repo.save_scrollback(b, b"history-b").await.unwrap();
+
+        let n = repo.delete_all().await.unwrap();
+        assert_eq!(n, 2, "both session rows must be deleted");
+        assert!(repo.list_by_user(SYSTEM_USER_ID).await.unwrap().is_empty());
+        // FK ON DELETE CASCADE wipes the scrollback rows too.
+        assert!(repo.load_scrollback(a).await.unwrap().is_none());
+        assert!(repo.load_scrollback(b).await.unwrap().is_none());
+
+        // Idempotent: a second wipe on an empty table deletes nothing and is OK.
+        assert_eq!(repo.delete_all().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn update_command_rewrites_launch_identity() {
+        let db = init_database_memory().await.unwrap();
+        let repo = SqliteTerminalRepository::new(db.pool().clone());
+        // Start as an agent CLI, then fall back to a shell in place.
+        let mut p = params(SYSTEM_USER_ID);
+        p.command = "claude".into();
+        p.backend = Some("claude".into());
+        let id = repo.create(&p).await.unwrap().id;
+
+        repo.update_command(id, "$SHELL", "[]", None).await.unwrap();
+        let got = repo.get_by_id(id).await.unwrap().unwrap();
+        assert_eq!(got.command, "$SHELL");
+        assert_eq!(got.args, "[]");
+        assert_eq!(got.backend, None);
+
+        assert!(matches!(
+            repo.update_command(999_999, "$SHELL", "[]", None).await.unwrap_err(),
+            DbError::NotFound(_)
+        ));
     }
 
     #[tokio::test]

@@ -35,6 +35,7 @@ pub fn terminal_routes(state: TerminalRouterState) -> Router {
         .route("/api/terminals/{id}/resize", post(resize_terminal))
         .route("/api/terminals/{id}/kill", post(kill_terminal))
         .route("/api/terminals/{id}/relaunch", post(relaunch_terminal))
+        .route("/api/terminals/{id}/relaunch-shell", post(relaunch_shell_terminal))
         .route("/api/terminals/{id}/workspace", get(browse_workspace))
         .with_state(state)
 }
@@ -112,6 +113,18 @@ async fn relaunch_terminal(
     Path(id): Path<i64>,
 ) -> Result<Json<ApiResponse<TerminalSessionResponse>>, AppError> {
     let resp = state.terminal_service.relaunch(id).await?;
+    Ok(Json(ApiResponse::ok(resp)))
+}
+
+/// Fall back to a clean login shell in place: kill the (possibly wedged) agent
+/// CLI and spawn the platform shell under the SAME session id. The escape hatch
+/// for a garbled/unresponsive claude/codex TUI — see `relaunch_as_shell`.
+async fn relaunch_shell_terminal(
+    State(state): State<TerminalRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(id): Path<i64>,
+) -> Result<Json<ApiResponse<TerminalSessionResponse>>, AppError> {
+    let resp = state.terminal_service.relaunch_as_shell(id).await?;
     Ok(Json(ApiResponse::ok(resp)))
 }
 

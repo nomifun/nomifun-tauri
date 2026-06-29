@@ -119,6 +119,22 @@ pub struct TerminalService {
     terminal_lifecycle: Arc<std::sync::RwLock<Option<Arc<crate::lifecycle::TerminalLifecycleServer>>>>,
     /// Absolute path to the backend binary, used in lifecycle hook commands.
     lifecycle_binary_path: Arc<std::sync::RwLock<Option<String>>>,
+    /// Late-wired LLM completer for auto-titling agent (claude/codex) sessions
+    /// from their first turn. `None` → titles fall back to the user's first input
+    /// line (no LLM); the feature never hard-depends on a provider being wired.
+    title_completer: Arc<std::sync::RwLock<Option<Arc<dyn crate::title::TerminalTitleCompleter>>>>,
+    /// Per-terminal once-guard for auto-titling: a key is claimed by whichever of
+    /// the first-input (shell) / first-TurnEnd (agent) seams fires first, so a
+    /// title is generated at most once per session.
+    titled: Arc<DashMap<i64, ()>>,
+    /// Accumulates the FIRST line of user input per terminal (until newline / a
+    /// 200-char cap) — the fallback title source for shell sessions and for agent
+    /// sessions when the LLM is unavailable. Dropped once a title is set.
+    first_input: Arc<DashMap<i64, String>>,
+    /// Whether a session's live PTY is an agent CLI (claude/codex), decided at
+    /// spawn. Shell/unknown sessions auto-title from their first input line; agent
+    /// sessions wait for the first `TurnEnd` so the LLM summary wins.
+    is_agent: Arc<DashMap<i64, bool>>,
 }
 
 impl TerminalService {
@@ -143,6 +159,10 @@ impl TerminalService {
             mcp_endpoints_path: Arc::new(std::sync::RwLock::new(None)),
             terminal_lifecycle: Arc::new(std::sync::RwLock::new(None)),
             lifecycle_binary_path: Arc::new(std::sync::RwLock::new(None)),
+            title_completer: Arc::new(std::sync::RwLock::new(None)),
+            titled: Arc::new(DashMap::new()),
+            first_input: Arc::new(DashMap::new()),
+            is_agent: Arc::new(DashMap::new()),
         }
     }
 
@@ -254,6 +274,14 @@ impl TerminalService {
             .read()
             .ok()
             .and_then(|g| g.as_ref().map(|s| s.subscribe(terminal_id)))
+    }
+
+    /// Late-wire the auto-title LLM completer (interior mutable, same slot pattern
+    /// as the other `with_*` setters). `None` keeps the fallback-only behaviour.
+    pub fn with_title_completer(&self, completer: Arc<dyn crate::title::TerminalTitleCompleter>) {
+        if let Ok(mut g) = self.title_completer.write() {
+            *g = Some(completer);
+        }
     }
 
     /// Build the launch enhancement for a spawn: knowledge_search MCP when bases
@@ -423,6 +451,17 @@ impl TerminalService {
         backend: Option<&str>,
     ) -> Result<(), TerminalError> {
         let (program, resolved_args) = resolve_command(command, args);
+        // Record whether this PTY is an agent CLI (claude/codex): agent sessions
+        // auto-title from their first `TurnEnd` (LLM summary), shells from their
+        // first input line. Computed from the resolved program/args BEFORE the
+        // enhancement step appends MCP flags.
+        self.is_agent.insert(
+            id,
+            matches!(
+                crate::enhance::resolve_agent_family(&program, &resolved_args, backend),
+                Some(crate::enhance::AgentCli::Claude) | Some(crate::enhance::AgentCli::Codex)
+            ),
+        );
         // Inject platform capabilities (MCP + lifecycle hooks) into the
         // native CLI launch. Unknown CLIs are returned unchanged (honest).
         let (resolved_args, hook_env) = {
@@ -509,15 +548,36 @@ impl TerminalService {
         )?;
         self.live.insert(id, handle);
 
-        // Plan-2 lifecycle consumer (proof of channel): subscribe to this
-        // terminal's lifecycle events and log them. Plan 3/4 will replace this
-        // with real AutoWork/IDMM consumers.
+        // Plan-2 lifecycle consumer: subscribe to this terminal's lifecycle
+        // events. On the FIRST `TurnEnd` of an agent session, auto-title from the
+        // assistant's first message (prefixed with the user's first prompt, if
+        // captured) via the wired LLM completer.
         if let Some(mut rx) = self.subscribe_lifecycle(id) {
+            let svc = self.clone();
             tokio::spawn(async move {
+                let mut titled_fired = false;
                 loop {
                     match rx.recv().await {
                         Ok(ev) => {
                             info!(terminal_id = ev.terminal_id, kind = ?ev.kind, "terminal lifecycle event");
+                            if !titled_fired && ev.kind == crate::lifecycle::LifecycleKind::TurnEnd {
+                                titled_fired = true;
+                                let assistant = ev
+                                    .payload
+                                    .get("last_assistant_message")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_owned();
+                                let prompt = svc.first_input.get(&id).map(|v| v.clone()).unwrap_or_default();
+                                let content = if !assistant.trim().is_empty() && !prompt.trim().is_empty() {
+                                    format!("用户首条输入：{prompt}\n助手回复：{assistant}")
+                                } else if !assistant.trim().is_empty() {
+                                    assistant
+                                } else {
+                                    prompt
+                                };
+                                svc.maybe_autotitle(id, Some(content)).await;
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -752,7 +812,99 @@ impl TerminalService {
         // Re-arm IDMM supervision on user activity (no-op if disabled / already
         // supervising) — covers re-arm after a prior supervisor stood down.
         self.arm_supervision(id);
+        // Capture the first input line for auto-titling (cheap no-op once titled).
+        self.capture_first_input(id, &bytes);
         Ok(())
+    }
+
+    /// Accumulate the first line of user input for a session (the fallback
+    /// title source). On the first newline, a SHELL session auto-titles from
+    /// that line; an AGENT session does not (its first `TurnEnd` produces a
+    /// better LLM title — see the lifecycle consumer in `spawn_pty`). Cheap
+    /// no-op once a title has been claimed.
+    fn capture_first_input(&self, id: i64, bytes: &[u8]) {
+        if self.titled.contains_key(&id) {
+            return;
+        }
+        let text = String::from_utf8_lossy(bytes);
+        let mut had_newline = false;
+        {
+            let mut buf = self.first_input.entry(id).or_default();
+            for ch in text.chars() {
+                if ch == '\r' || ch == '\n' {
+                    had_newline = true;
+                    break;
+                }
+                if buf.chars().count() >= 200 {
+                    break;
+                }
+                buf.push(ch);
+            }
+        }
+        if !had_newline {
+            return;
+        }
+        // First line complete. Only shell/unknown sessions title from input;
+        // agent CLIs wait for TurnEnd. `is_agent` is set at spawn; a missing
+        // entry (shouldn't happen post-spawn) is treated as non-agent.
+        let is_agent = self.is_agent.get(&id).map(|v| *v).unwrap_or(false);
+        if is_agent {
+            return;
+        }
+        let svc = self.clone();
+        tokio::spawn(async move {
+            svc.maybe_autotitle(id, None).await;
+        });
+    }
+
+    /// Generate a session title at most once, without clobbering a manual rename.
+    ///
+    /// `llm_source` is the rich content (agent first-turn text) to summarize via
+    /// the wired completer; `None`, no completer, or a failed/empty completion
+    /// falls back to the captured first input line. Guards: (1) a per-terminal
+    /// once-claim, and (2) the row's name must still equal the mechanical
+    /// `default_name` — if the user (or a prior auto-title) already changed it,
+    /// we never overwrite. Best-effort: every failure path only logs.
+    async fn maybe_autotitle(&self, id: i64, llm_source: Option<String>) {
+        // (1) Atomic once-claim: the first of the input/TurnEnd seams wins.
+        if self.titled.insert(id, ()).is_some() {
+            return;
+        }
+        // (2) Don't clobber a custom name (manual rename, create-time name, or a
+        // command that isn't the mechanical default).
+        let Ok(Some(row)) = self.repo.get_by_id(id).await else {
+            return;
+        };
+        if row.name != default_name(&row.command, row.backend.as_deref()) {
+            self.first_input.remove(&id);
+            return;
+        }
+
+        let completer = self.title_completer.read().ok().and_then(|g| g.clone());
+        let first_input = self.first_input.get(&id).map(|v| v.clone()).unwrap_or_default();
+
+        // Prefer the LLM summary; fall back to the first input line.
+        let mut title = String::new();
+        if let (Some(c), Some(src)) = (completer.as_ref(), llm_source.as_ref()) {
+            let src = src.chars().take(2000).collect::<String>();
+            if !src.trim().is_empty() {
+                match c.summarize(&src).await {
+                    Ok(t) => title = crate::title::clamp_title(&t, crate::title::TITLE_MAX_CHARS),
+                    Err(e) => warn!(terminal_id = id, error = %e, "auto-title LLM failed; using fallback"),
+                }
+            }
+        }
+        if title.is_empty() {
+            title = crate::title::fallback_title(&first_input, crate::title::TITLE_MAX_CHARS);
+        }
+        self.first_input.remove(&id);
+
+        if title.is_empty() || title == row.name {
+            return;
+        }
+        if let Err(e) = self.update_meta(id, Some(title), None).await {
+            warn!(terminal_id = id, error = %e, "failed to persist auto-generated terminal title");
+        }
     }
 
     /// Resize the PTY and persist the new dimensions.
@@ -810,6 +962,10 @@ impl TerminalService {
         // Drop any pending deferred-spawn marker so a never-resized session does
         // not leak (and cannot later spawn against a deleted row).
         self.pending_spawn.remove(&id);
+        // Drop per-session auto-title bookkeeping.
+        self.titled.remove(&id);
+        self.first_input.remove(&id);
+        self.is_agent.remove(&id);
         if let Some((_, handle)) = self.live.remove(&id) {
             let _ = handle.kill();
         }
@@ -901,6 +1057,73 @@ impl TerminalService {
         Ok(resp)
     }
 
+    /// Fall back to a clean login shell **in place**: kill the (possibly wedged)
+    /// current child and spawn the platform shell for the SAME session id, then
+    /// rewrite the stored launch identity to the shell sentinel so the session is
+    /// permanently a shell (a later restart / boot-reconcile relaunches a shell,
+    /// not the dead agent CLI, and the mechanical name becomes `Shell`).
+    ///
+    /// This is the escape hatch for a claude/codex TUI that left the terminal
+    /// garbled and unresponsive: the user can always get back to a usable shell
+    /// without the dead-page/disabled-composer state. Structurally identical to
+    /// [`relaunch`] (same id, fresh epoch, status→running, emit `terminal.updated`
+    /// which re-enables the frontend composer) — only the launch target differs.
+    pub async fn relaunch_as_shell(&self, id: i64) -> Result<TerminalSessionResponse, TerminalError> {
+        let row = self
+            .repo
+            .get_by_id(id)
+            .await?
+            .ok_or_else(|| TerminalError::NotFound(id.to_string()))?;
+
+        // Tear down any still-running (or wedged) PTY for this id first.
+        if let Some((_, handle)) = self.live.remove(&id) {
+            let _ = handle.kill();
+        }
+        self.pending_spawn.remove(&id);
+
+        // Persist the shell identity BEFORE spawning so a crash mid-relaunch (or a
+        // later boot-reconcile) still relaunches a shell, never the dead agent CLI.
+        self.repo
+            .update_command(id, crate::types::SHELL_SENTINEL, "[]", None)
+            .await?;
+
+        // Re-sync knowledge mounts for the cwd (same contract as `relaunch`); a
+        // shell never gets MCP/tool injection (apply_enhancement no-ops for it).
+        let kb_ids = self.sync_knowledge_workspace(id, &row.cwd, crate::types::SHELL_SENTINEL, &[]).await;
+        if let Err(e) = self.spawn_pty(
+            id,
+            crate::types::SHELL_SENTINEL,
+            &[],
+            &row.cwd,
+            None,
+            row.cols as u16,
+            row.rows as u16,
+            kb_ids,
+            None,
+        ) {
+            let _ = self.repo.update_status(id, "exited", None).await;
+            return Err(e);
+        }
+
+        // Fresh process → drop the previous (agent) scrollback so a later restart
+        // doesn't replay it as this shell's history.
+        if let Err(e) = self.repo.clear_scrollback(id).await {
+            warn!(terminal_id = id, error = %e, "failed to clear persisted scrollback on shell fallback");
+        }
+
+        self.repo.update_status(id, "running", None).await?;
+        let updated = self
+            .repo
+            .get_by_id(id)
+            .await?
+            .ok_or_else(|| TerminalError::NotFound(id.to_string()))?;
+        let resp = row_to_response(&updated, None, &self.work_dir);
+        self.emitter.emit_updated(&resp);
+        info!(terminal_id = id, "terminal session fell back to a clean shell in place");
+        self.arm_supervision(id);
+        Ok(resp)
+    }
+
     /// Rename a session and/or toggle its pinned state. Broadcasts the update.
     pub async fn update_meta(
         &self,
@@ -918,6 +1141,30 @@ impl TerminalService {
         let resp = row_to_response(&row, None, &self.work_dir);
         self.emitter.emit_updated(&resp);
         Ok(resp)
+    }
+
+    /// Tear down EVERY terminal session on real app exit: kill all live PTYs and
+    /// delete all session rows (scrollback drops via FK CASCADE). The next launch
+    /// then starts with a clean list instead of a pile of dirty `exited` ghosts.
+    ///
+    /// MUST be called only on a real quit (desktop tray-quit / `RunEvent::Exit`),
+    /// never on close-to-tray — see `apps/desktop/src/main.rs`. Returns the number
+    /// of rows deleted. Best-effort on the PTY kills (a failed kill only warns; the
+    /// OS reaps the tree on process exit anyway).
+    pub async fn shutdown_cleanup(&self) -> Result<u64, TerminalError> {
+        for entry in self.live.iter() {
+            if let Err(e) = entry.value().kill() {
+                warn!(terminal_id = *entry.key(), error = %e, "failed to kill PTY during shutdown cleanup");
+            }
+        }
+        self.live.clear();
+        self.pending_spawn.clear();
+        self.titled.clear();
+        self.first_input.clear();
+        self.is_agent.clear();
+        let n = self.repo.delete_all().await?;
+        info!(deleted = n, "terminal shutdown cleanup: all sessions killed and removed");
+        Ok(n)
     }
 }
 
@@ -1190,6 +1437,29 @@ mod tests {
                 .map(|_| ())
                 .ok_or_else(|| nomifun_db::DbError::NotFound(id.to_string()))
         }
+        async fn delete_all(&self) -> Result<u64, nomifun_db::DbError> {
+            let mut rows = self.rows.lock().unwrap();
+            let n = rows.len() as u64;
+            rows.clear();
+            self.scrollback.lock().unwrap().clear();
+            Ok(n)
+        }
+        async fn update_command(
+            &self,
+            id: i64,
+            command: &str,
+            args: &str,
+            backend: Option<&str>,
+        ) -> Result<(), nomifun_db::DbError> {
+            let mut rows = self.rows.lock().unwrap();
+            let row = rows
+                .get_mut(&id)
+                .ok_or_else(|| nomifun_db::DbError::NotFound(id.to_string()))?;
+            row.command = command.to_owned();
+            row.args = args.to_owned();
+            row.backend = backend.map(|s| s.to_owned());
+            Ok(())
+        }
         async fn update_autowork(&self, id: i64, autowork: Option<&str>) -> Result<(), nomifun_db::DbError> {
             let mut rows = self.rows.lock().unwrap();
             let row = rows
@@ -1244,6 +1514,30 @@ mod tests {
     impl EventBroadcaster for CapturingBroadcaster {
         fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
             self.events.lock().unwrap().push(event);
+        }
+    }
+
+    /// A title completer test double: returns `"{prefix}{n}"`, incrementing `n`
+    /// each call, so a test can prove `summarize` ran exactly once.
+    struct FakeTitler {
+        calls: std::sync::atomic::AtomicUsize,
+        prefix: String,
+    }
+
+    impl FakeTitler {
+        fn new(prefix: &str) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                prefix: prefix.to_owned(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::title::TerminalTitleCompleter for FakeTitler {
+        async fn summarize(&self, _content: &str) -> Result<String, nomifun_common::AppError> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(format!("{}{n}", self.prefix))
         }
     }
 
@@ -1864,6 +2158,110 @@ mod tests {
         // Live without any resize: input succeeds immediately.
         svc.input(id, &BASE64.encode("hi\n")).await.unwrap();
         svc.kill(id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relaunch_as_shell_swaps_command_and_emits_updated() {
+        let (svc, bc) = service();
+        // Start as an "agent" session (backend label set), then fall back to shell.
+        let mut r = req("cat", &[]);
+        r.backend = Some("claude".into());
+        let id = svc.create("u", r).await.unwrap().id;
+        bc.events.lock().unwrap().clear();
+
+        let resp = svc.relaunch_as_shell(id).await.unwrap();
+        assert_eq!(resp.command, crate::types::SHELL_SENTINEL, "command rewritten to the shell sentinel");
+        assert_eq!(resp.backend, None, "agent backend label cleared");
+        assert_eq!(resp.last_status, "running", "fresh shell is running");
+        // The row is persisted as a shell, so its mechanical name is now `Shell`.
+        let row = svc.get(id).await.unwrap();
+        assert_eq!(row.command, crate::types::SHELL_SENTINEL);
+        // A terminal.updated event re-enables the frontend composer.
+        let emitted_updated = bc.events.lock().unwrap().iter().any(|e| e.name == "terminal.updated");
+        assert!(emitted_updated, "relaunch_as_shell must emit terminal.updated");
+
+        svc.kill(id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn shutdown_cleanup_kills_and_deletes_all_sessions() {
+        let (svc, _bc) = service();
+        let a = svc.create("u", req("cat", &[])).await.unwrap().id;
+        let b = svc.create("u", req("cat", &[])).await.unwrap().id;
+        assert!(svc.live.contains_key(&a) && svc.live.contains_key(&b));
+
+        let n = svc.shutdown_cleanup().await.unwrap();
+        assert_eq!(n, 2, "both rows deleted");
+        // Live map drained and rows gone — next launch starts clean.
+        assert!(svc.live.is_empty());
+        assert!(svc.list("u").await.unwrap().is_empty());
+        // Idempotent on an already-empty service.
+        assert_eq!(svc.shutdown_cleanup().await.unwrap(), 0);
+    }
+
+    async fn wait_for_name(svc: &TerminalService, id: i64, expected: &str, ms: u64) -> bool {
+        for _ in 0..(ms / 20).max(1) {
+            if svc.get(id).await.map(|s| s.name == expected).unwrap_or(false) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        svc.get(id).await.map(|s| s.name == expected).unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn shell_session_autotitles_from_first_input_line() {
+        let (svc, _bc) = service();
+        // command "cat", no backend → is_agent=false, mechanical name "cat".
+        let id = svc.create("u", req("cat", &[])).await.unwrap().id;
+        // First input line (ends with CR) → fallback title from that line.
+        svc.input(id, &BASE64.encode("echo hello world\r")).await.unwrap();
+        assert!(
+            wait_for_name(&svc, id, "echo hello world", 4000).await,
+            "shell title should fall back to the first input line, got {:?}",
+            svc.get(id).await.unwrap().name
+        );
+        svc.kill(id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn autotitle_uses_completer_result_for_llm_source() {
+        let (svc, _bc) = service();
+        svc.with_title_completer(Arc::new(FakeTitler::new("title-")));
+        // backend "claude" → mechanical name "claude" (the agent label).
+        let mut r = req("cat", &[]);
+        r.backend = Some("claude".into());
+        let id = svc.create("u", r).await.unwrap().id;
+
+        svc.maybe_autotitle(id, Some("user deployed prod; assistant confirmed".into())).await;
+        assert_eq!(svc.get(id).await.unwrap().name, "title-0", "LLM summary becomes the title");
+        svc.kill(id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn autotitle_skips_when_name_is_custom() {
+        let (svc, _bc) = service();
+        svc.with_title_completer(Arc::new(FakeTitler::new("auto-")));
+        let id = svc.create("u", req("cat", &[])).await.unwrap().id;
+        // A manual rename makes name != default_name → never overwritten.
+        svc.update_meta(id, Some("我的终端".into()), None).await.unwrap();
+        svc.maybe_autotitle(id, Some("content".into())).await;
+        assert_eq!(svc.get(id).await.unwrap().name, "我的终端", "must not clobber a manual rename");
+        svc.kill(id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn autotitle_fires_at_most_once() {
+        let (svc, _bc) = service();
+        svc.with_title_completer(Arc::new(FakeTitler::new("t")));
+        let id = svc.create("u", req("cat", &[])).await.unwrap().id;
+        svc.maybe_autotitle(id, Some("a".into())).await;
+        assert_eq!(svc.get(id).await.unwrap().name, "t0");
+        // Second call is a no-op (once-guard): the completer is NOT called again,
+        // so the name stays "t0" (not "t1").
+        svc.maybe_autotitle(id, Some("b".into())).await;
+        assert_eq!(svc.get(id).await.unwrap().name, "t0");
+        svc.kill(id).await.ok();
     }
 
     #[tokio::test]

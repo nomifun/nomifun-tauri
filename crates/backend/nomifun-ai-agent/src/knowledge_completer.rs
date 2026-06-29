@@ -98,7 +98,7 @@ impl KnowledgeCompleter for LiveKnowledgeCompleter {
 
 /// First entry of the `models` JSON array that the `model_enabled` JSON map
 /// does not disable (absent ⇒ enabled, matching the provider API semantics).
-fn first_enabled_model(models_json: &str, model_enabled_json: Option<&str>) -> Option<String> {
+pub(crate) fn first_enabled_model(models_json: &str, model_enabled_json: Option<&str>) -> Option<String> {
     let models: Vec<String> = serde_json::from_str(models_json).unwrap_or_default();
     let enabled: HashMap<String, bool> = model_enabled_json
         .and_then(|raw| serde_json::from_str(raw).ok())
