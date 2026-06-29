@@ -59,6 +59,84 @@ impl EventBroadcaster for NoopBroadcaster {
     fn broadcast(&self, _event: WebSocketMessage<serde_json::Value>) {}
 }
 
+/// No-op skill resolver for the route state's `ConversationService` (B3): the
+/// orchestrator-route conversation handle only ever serves
+/// `link_orchestrator_run` here, so skill resolution is irrelevant.
+struct NoopSkillResolver;
+#[async_trait]
+impl nomifun_conversation::skill_resolver::SkillResolver for NoopSkillResolver {
+    async fn auto_inject_names(&self) -> Vec<String> {
+        Vec::new()
+    }
+    async fn resolve_skills(
+        &self,
+        _names: &[String],
+    ) -> Vec<nomifun_conversation::skill_resolver::ResolvedAgentSkill> {
+        Vec::new()
+    }
+    async fn link_workspace_skills(
+        &self,
+        _workspace: &std::path::Path,
+        _rel_dirs: &[&str],
+        _skills: &[nomifun_conversation::skill_resolver::ResolvedAgentSkill],
+    ) -> usize {
+        0
+    }
+}
+
+/// No-op worker task manager — the route conversation handle never spawns agents.
+struct NoopTaskManager;
+#[async_trait]
+impl nomifun_ai_agent::IWorkerTaskManager for NoopTaskManager {
+    fn get_task(&self, _: &str) -> Option<nomifun_ai_agent::AgentInstance> {
+        None
+    }
+    async fn get_or_build_task(
+        &self,
+        _: &str,
+        _: nomifun_ai_agent::types::BuildTaskOptions,
+    ) -> Result<nomifun_ai_agent::AgentInstance, AppError> {
+        Err(AppError::Internal("noop".into()))
+    }
+    fn kill(&self, _: &str, _: Option<nomifun_common::AgentKillReason>) -> Result<(), AppError> {
+        Ok(())
+    }
+    fn kill_and_wait(
+        &self,
+        _: &str,
+        _: Option<nomifun_common::AgentKillReason>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(std::future::ready(()))
+    }
+    fn clear(&self) {}
+    fn active_count(&self) -> usize {
+        0
+    }
+    fn collect_idle(&self, _: nomifun_common::TimestampMs) -> Vec<String> {
+        vec![]
+    }
+}
+
+/// Build a `ConversationService` over the given pool for the route state (B3).
+/// Mirrors the conversation crate's own test recipe (no-op resolver/task manager)
+/// — the orchestrator route only uses it for `link_orchestrator_run`.
+fn build_test_conv_service(pool: nomifun_db::SqlitePool) -> nomifun_conversation::ConversationService {
+    let conv_repo = Arc::new(nomifun_db::SqliteConversationRepository::new(pool.clone()));
+    let agent_metadata_repo: Arc<dyn nomifun_db::IAgentMetadataRepository> =
+        Arc::new(nomifun_db::SqliteAgentMetadataRepository::new(pool.clone()));
+    let acp_session_repo: Arc<dyn nomifun_db::IAcpSessionRepository> =
+        Arc::new(nomifun_db::SqliteAcpSessionRepository::new(pool));
+    nomifun_conversation::ConversationService::new(
+        std::env::temp_dir(),
+        Arc::new(NoopBroadcaster),
+        Arc::new(NoopSkillResolver),
+        Arc::new(NoopTaskManager),
+        conv_repo,
+        agent_metadata_repo,
+        acp_session_repo,
+    )
+}
+
 /// A fixed 2-task chain DAG: task0 (no dep) → task1 (depends on 0), both
 /// pre-assigned to member 0 so a single-member fleet suffices. Mirrors the
 /// production `PlanProducer` contract (Task 4) without a live LLM.
@@ -106,7 +184,7 @@ async fn build_run_state() -> OrchestratorRouterState {
     let pool = db.pool().clone();
     let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
     let ws_repo = Arc::new(SqliteOrchWorkspaceRepository::new(pool.clone()));
-    let run_repo = Arc::new(SqliteRunRepository::new(pool));
+    let run_repo = Arc::new(SqliteRunRepository::new(pool.clone()));
 
     let fleet = FleetService::new(fleet_repo.clone());
     let workspace = WorkspaceService::new(ws_repo.clone());
@@ -125,7 +203,13 @@ async fn build_run_state() -> OrchestratorRouterState {
     engine_deps.worker_timeout = Duration::from_secs(5);
     let engine = RunEngine::new(Arc::new(engine_deps));
 
-    OrchestratorRouterState::new(fleet, workspace, run_service, engine)
+    OrchestratorRouterState::new(
+        fleet,
+        workspace,
+        run_service,
+        engine,
+        build_test_conv_service(pool),
+    )
 }
 
 /// Mount `orchestrator_routes` with a `CurrentUser` extension injected exactly as
@@ -458,7 +542,7 @@ async fn build_cancel_state(canceller: Arc<dyn ConversationCanceller>) -> Orches
     let pool = db.pool().clone();
     let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
     let ws_repo = Arc::new(SqliteOrchWorkspaceRepository::new(pool.clone()));
-    let run_repo = Arc::new(SqliteRunRepository::new(pool));
+    let run_repo = Arc::new(SqliteRunRepository::new(pool.clone()));
 
     let fleet = FleetService::new(fleet_repo.clone());
     let workspace = WorkspaceService::new(ws_repo.clone());
@@ -482,7 +566,13 @@ async fn build_cancel_state(canceller: Arc<dyn ConversationCanceller>) -> Orches
     engine_deps.cancel_conversation = canceller;
     let engine = RunEngine::new(Arc::new(engine_deps));
 
-    OrchestratorRouterState::new(fleet, workspace, run_service, engine)
+    OrchestratorRouterState::new(
+        fleet,
+        workspace,
+        run_service,
+        engine,
+        build_test_conv_service(pool),
+    )
 }
 
 /// Seed a single-member fleet + a workspace via the state's services. Returns

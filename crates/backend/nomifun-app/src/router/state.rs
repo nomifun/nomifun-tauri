@@ -974,6 +974,13 @@ pub fn build_orchestrator_state(
             conv: conv_service.clone(),
             task_manager: services.worker_task_manager.clone(),
         });
+    // Path B (B3): the `create_adhoc_run` route associates the originating
+    // conversation as the run's lead (`link_orchestrator_run`) when the request
+    // carries a `lead_conv_id`. Hand it the SAME already-constructed
+    // ConversationService the worker / canceller / steerer share (cheap
+    // `Arc`-internal clone, same DB) — NOT a second instance. Clone BEFORE moving
+    // the original into the worker.
+    let route_conversation = conv_service.clone();
     let worker: Arc<dyn WorkerRunner> = Arc::new(ConversationWorkerRunner::new(
         conv_service,
         services.worker_task_manager.clone(),
@@ -1034,7 +1041,7 @@ pub fn build_orchestrator_state(
     // foreground visit. Detached + best-effort, mirroring the requirement
     // orchestrator's `resume_persisted_bindings`.
     engine.resume_persisted_runs(run_repo);
-    OrchestratorRouterState::new(fleet, workspace, run_service, engine)
+    OrchestratorRouterState::new(fleet, workspace, run_service, engine, route_conversation)
 }
 
 /// **P3-X2**: build the `SecretRouterState` (browser-use credential CRUD).

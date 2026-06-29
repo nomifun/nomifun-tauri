@@ -255,6 +255,29 @@ async fn create_adhoc_run(
         req.autonomy = Some("interactive".to_string());
     }
     let run = state.run_service.create_adhoc(&user.id, req).await?;
+    // Path B (B3): associate the originating conversation as this run's lead.
+    // `create_adhoc` already PERSISTED `lead_conv_id` onto the run row; here we also
+    // write the inverse pointer onto the conversation (`extra.orchestrator_run_id`)
+    // + broadcast `conversation.listChanged` so the FE lights up that conversation's
+    // orchestration canvas entry. A lightweight await BEFORE the optimistic return —
+    // it must NOT move into `spawn_plan_and_start` (that would change the immediate
+    // return timing). Best-effort: the run is already created, so a link failure only
+    // `warn!`s — it never fails creation and never panics. `lead_conv_id: None`
+    // (legacy callers / no originating conversation) skips the call entirely.
+    if let Some(lead_conv_id) = run.lead_conv_id {
+        if let Err(e) = state
+            .conversation_service
+            .link_orchestrator_run(&lead_conv_id.to_string(), &run.id)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                conversation_id = lead_conv_id,
+                run_id = %run.id,
+                "failed to link orchestration run to originating conversation; run still created"
+            );
+        }
+    }
     // Return the `planning`-state run NOW; plan + (conditional) start run in the
     // background so the FE jumps to the run and sees the planning thought stream
     // immediately rather than waiting out the lead completion (the空挡 fix).
@@ -559,6 +582,9 @@ mod tests {
         SqliteFleetRepository, SqliteOrchWorkspaceRepository, SqliteRunRepository,
         init_database_memory,
     };
+    use nomifun_conversation::ConversationService;
+    use nomifun_conversation::skill_resolver::{ResolvedAgentSkill, SkillResolver};
+    use nomifun_ai_agent::IWorkerTaskManager;
     use nomifun_realtime::EventBroadcaster;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -571,6 +597,85 @@ mod tests {
     struct NoopBroadcaster;
     impl EventBroadcaster for NoopBroadcaster {
         fn broadcast(&self, _event: WebSocketMessage<serde_json::Value>) {}
+    }
+
+    /// No-op skill resolver for the route state's `ConversationService` (B3): in
+    /// these route tests the orchestrator conversation handle only ever serves
+    /// `link_orchestrator_run`, so skill resolution is irrelevant.
+    struct NoopSkillResolver;
+    #[async_trait]
+    impl SkillResolver for NoopSkillResolver {
+        async fn auto_inject_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+        async fn resolve_skills(&self, _names: &[String]) -> Vec<ResolvedAgentSkill> {
+            Vec::new()
+        }
+        async fn link_workspace_skills(
+            &self,
+            _workspace: &std::path::Path,
+            _rel_dirs: &[&str],
+            _skills: &[ResolvedAgentSkill],
+        ) -> usize {
+            0
+        }
+    }
+
+    /// No-op worker task manager — the route conversation handle never spawns agents.
+    struct NoopTaskManager;
+    #[async_trait]
+    impl IWorkerTaskManager for NoopTaskManager {
+        fn get_task(&self, _: &str) -> Option<nomifun_ai_agent::AgentInstance> {
+            None
+        }
+        async fn get_or_build_task(
+            &self,
+            _: &str,
+            _: nomifun_ai_agent::types::BuildTaskOptions,
+        ) -> Result<nomifun_ai_agent::AgentInstance, AppError> {
+            Err(AppError::Internal("noop".into()))
+        }
+        fn kill(&self, _: &str, _: Option<nomifun_common::AgentKillReason>) -> Result<(), AppError> {
+            Ok(())
+        }
+        fn kill_and_wait(
+            &self,
+            _: &str,
+            _: Option<nomifun_common::AgentKillReason>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            Box::pin(std::future::ready(()))
+        }
+        fn clear(&self) {}
+        fn active_count(&self) -> usize {
+            0
+        }
+        fn collect_idle(&self, _: nomifun_common::TimestampMs) -> Vec<String> {
+            vec![]
+        }
+    }
+
+    /// Build a `ConversationService` over `pool` for the route state (B3). The
+    /// production `build_orchestrator_state` threads in the worker's
+    /// `ConversationService`; in tests a no-op-backed instance over the SAME pool
+    /// lets the link write `extra.orchestrator_run_id` and the test re-read it.
+    fn build_conv_service(
+        pool: nomifun_db::SqlitePool,
+        broadcaster: Arc<dyn EventBroadcaster>,
+    ) -> ConversationService {
+        let conv_repo = Arc::new(nomifun_db::SqliteConversationRepository::new(pool.clone()));
+        let agent_metadata_repo: Arc<dyn nomifun_db::IAgentMetadataRepository> =
+            Arc::new(nomifun_db::SqliteAgentMetadataRepository::new(pool.clone()));
+        let acp_session_repo: Arc<dyn nomifun_db::IAcpSessionRepository> =
+            Arc::new(nomifun_db::SqliteAcpSessionRepository::new(pool));
+        ConversationService::new(
+            std::env::temp_dir(),
+            broadcaster,
+            Arc::new(NoopSkillResolver),
+            Arc::new(NoopTaskManager),
+            conv_repo,
+            agent_metadata_repo,
+            acp_session_repo,
+        )
     }
 
     /// Records the NAME of every broadcast event so a test can assert a particular
@@ -657,7 +762,7 @@ mod tests {
         let pool = db.pool().clone();
         let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
         let ws_repo = Arc::new(SqliteOrchWorkspaceRepository::new(pool.clone()));
-        let run_repo = Arc::new(SqliteRunRepository::new(pool));
+        let run_repo = Arc::new(SqliteRunRepository::new(pool.clone()));
         let fleet = FleetService::new(fleet_repo.clone());
         let workspace = WorkspaceService::new(ws_repo.clone());
         let emitter = OrchestratorRunEventEmitter::new(Arc::new(NoopBroadcaster));
@@ -718,7 +823,13 @@ mod tests {
             .await
             .expect("seed run");
 
-        let state = OrchestratorRouterState::new(fleet, workspace, run_service, engine);
+        let state = OrchestratorRouterState::new(
+            fleet,
+            workspace,
+            run_service,
+            engine,
+            build_conv_service(pool, Arc::new(NoopBroadcaster)),
+        );
         (state, run.id)
     }
 
@@ -953,7 +1064,7 @@ mod tests {
         let pool = db.pool().clone();
         let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
         let ws_repo = Arc::new(SqliteOrchWorkspaceRepository::new(pool.clone()));
-        let run_repo = Arc::new(SqliteRunRepository::new(pool));
+        let run_repo = Arc::new(SqliteRunRepository::new(pool.clone()));
         let fleet = FleetService::new(fleet_repo.clone());
         let workspace = WorkspaceService::new(ws_repo.clone());
         let bc = Arc::new(NameRecordingBroadcaster::new());
@@ -978,7 +1089,13 @@ mod tests {
             RunEngine::new(Arc::new(RunEngineDeps::new(run_repo, worker, emitter, ws_repo)));
 
         let run_service_for_assert = run_service.clone();
-        let state = OrchestratorRouterState::new(fleet, workspace, run_service, engine);
+        let state = OrchestratorRouterState::new(
+            fleet,
+            workspace,
+            run_service,
+            engine,
+            build_conv_service(pool, Arc::new(NoopBroadcaster)),
+        );
         let app = orchestrator_routes(state).layer(axum::Extension(CurrentUser {
             id: "u1".to_string(),
             username: "tester".to_string(),
@@ -1079,7 +1196,173 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // P1 Task 1: DELETE /runs/{id} (delete) + PATCH /runs/{id} (rename) routes.
+    // B3 (Path B): `create_adhoc_run` associates the ORIGINATING conversation as
+    // the run's lead when the request carries `lead_conv_id`. We build a state
+    // whose route `ConversationService` runs over the SAME in-memory pool (so the
+    // link write is re-readable), seed a conversation, POST adhoc with
+    // `lead_conv_id: Some(conv)`, then assert (a) the returned run carries that
+    // `lead_conv_id` and (b) the conversation got `extra.orchestrator_run_id`
+    // written (the inverse pointer the FE reads to light up the canvas). A second
+    // test proves `lead_conv_id: None` does NOT link (regression — legacy callers).
+    // The link is a synchronous best-effort await BEFORE the optimistic return, so
+    // by the time the response is in hand the link has already run — no planner gate
+    // is needed for these assertions.
+    // -------------------------------------------------------------------------
+
+    /// Build a full state over a fresh in-memory pool, returning the state, the
+    /// route `ConversationService` (same pool, so a test can re-read conversation
+    /// extra), and the `RunService` (so a test can read back the created run).
+    async fn build_state_with_conv() -> (OrchestratorRouterState, ConversationService, Arc<RunService>)
+    {
+        let db = init_database_memory().await.expect("db init");
+        let pool = db.pool().clone();
+        let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
+        let ws_repo = Arc::new(SqliteOrchWorkspaceRepository::new(pool.clone()));
+        let run_repo = Arc::new(SqliteRunRepository::new(pool.clone()));
+        let fleet = FleetService::new(fleet_repo.clone());
+        let workspace = WorkspaceService::new(ws_repo.clone());
+        let emitter = OrchestratorRunEventEmitter::new(Arc::new(NoopBroadcaster));
+        let planner: Arc<dyn PlanProducer> = Arc::new(EmptyPlanProducer);
+        let run_service = Arc::new(RunService::new(
+            run_repo.clone(),
+            fleet_repo,
+            ws_repo.clone(),
+            planner,
+            emitter.clone(),
+        ));
+        let worker: Arc<dyn WorkerRunner> = Arc::new(MockWorkerRunner::with_text(1, "x"));
+        let engine = RunEngine::new(Arc::new(RunEngineDeps::new(run_repo, worker, emitter, ws_repo)));
+        // The route's ConversationService over the SAME pool — the test re-reads the
+        // conversation it seeds to confirm the link write.
+        let conv = build_conv_service(pool, Arc::new(NoopBroadcaster));
+        let state = OrchestratorRouterState::new(
+            fleet,
+            workspace,
+            run_service.clone(),
+            engine,
+            conv.clone(),
+        );
+        (state, conv, run_service)
+    }
+
+    /// Seed a bare conversation and return its integer id (the FE would pass this
+    /// as `lead_conv_id`). Created as the seeded `system_default_user` (the only
+    /// user `init_database_memory` provisions — `conversations.user_id` FKs to it)
+    /// so the insert + a later re-read both succeed. `link_orchestrator_run` itself
+    /// is owner-agnostic (it writes by conversation id), so the run's own owner
+    /// ("u1" from the route's CurrentUser) is irrelevant to the link.
+    async fn seed_conversation(conv: &ConversationService) -> i64 {
+        let req: nomifun_api_types::CreateConversationRequest =
+            serde_json::from_value(serde_json::json!({ "type": "acp", "extra": {} })).expect("conv req");
+        conv.create(nomifun_auth::SYSTEM_USER_ID, req)
+            .await
+            .expect("seed conversation")
+            .id
+    }
+
+    /// `POST /runs/adhoc` with `lead_conv_id: Some(conv)` → the returned run carries
+    /// that lead AND the originating conversation is linked
+    /// (`extra.orchestrator_run_id == run.id`). RED before the route calls
+    /// `link_orchestrator_run`; GREEN after.
+    #[tokio::test]
+    async fn create_adhoc_run_links_originating_conversation() {
+        let (state, conv, _run_service) = build_state_with_conv().await;
+        let conv_id = seed_conversation(&conv).await;
+        let app = orchestrator_routes(state).layer(axum::Extension(CurrentUser {
+            id: "u1".to_string(),
+            username: "tester".to_string(),
+        }));
+
+        let body = serde_json::json!({
+            "goal": "linked goal",
+            "model_range": { "mode": "single", "model": { "provider_id": "p", "model": "m" } },
+            "lead_conv_id": conv_id
+        })
+        .to_string();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/orchestrator/runs/adhoc")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .expect("request");
+        assert_eq!(resp.status(), StatusCode::CREATED, "adhoc create must 201");
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let api: ApiResponse<Run> = serde_json::from_slice(&bytes).expect("decode ApiResponse<Run>");
+        let run = api.data.expect("run in response");
+        assert_eq!(
+            run.lead_conv_id,
+            Some(conv_id),
+            "returned run must carry the originating lead_conv_id"
+        );
+
+        // The link write-back is a synchronous await before the optimistic return,
+        // so the conversation's extra is already updated by now.
+        let fetched = conv.get(nomifun_auth::SYSTEM_USER_ID, &conv_id.to_string()).await.expect("re-read conversation");
+        assert_eq!(
+            fetched.extra["orchestrator_run_id"], run.id,
+            "originating conversation must be linked to the run (extra.orchestrator_run_id)"
+        );
+    }
+
+    /// Regression: `POST /runs/adhoc` WITHOUT `lead_conv_id` (legacy callers / no
+    /// originating conversation) must NOT link any conversation. We seed a
+    /// conversation (which the route never sees) and confirm it gains no
+    /// `orchestrator_run_id` after an unlinked adhoc create.
+    #[tokio::test]
+    async fn create_adhoc_run_without_lead_conv_id_does_not_link() {
+        let (state, conv, _run_service) = build_state_with_conv().await;
+        let conv_id = seed_conversation(&conv).await;
+        let app = orchestrator_routes(state).layer(axum::Extension(CurrentUser {
+            id: "u1".to_string(),
+            username: "tester".to_string(),
+        }));
+
+        // No lead_conv_id in the body — the run is workspace-less + conversation-less.
+        let body = serde_json::json!({
+            "goal": "unlinked goal",
+            "model_range": { "mode": "single", "model": { "provider_id": "p", "model": "m" } }
+        })
+        .to_string();
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/orchestrator/runs/adhoc")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .expect("request");
+        assert_eq!(resp.status(), StatusCode::CREATED, "adhoc create must 201");
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let api: ApiResponse<Run> = serde_json::from_slice(&bytes).expect("decode ApiResponse<Run>");
+        let run = api.data.expect("run in response");
+        assert_eq!(run.lead_conv_id, None, "no lead when lead_conv_id omitted");
+
+        // The seeded conversation was never the lead → it must carry no run link.
+        let fetched = conv.get(nomifun_auth::SYSTEM_USER_ID, &conv_id.to_string()).await.expect("re-read conversation");
+        assert!(
+            fetched.extra.get("orchestrator_run_id").is_none(),
+            "unlinked adhoc create must NOT write orchestrator_run_id; got {:?}",
+            fetched.extra
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // Mirror the seeded-run smoke pattern: with the CurrentUser layer the owner
     // hits the route end to end (200/OK), and without the layer the handler
     // cannot run (axum 0.8 MissingExtension → non-200) — guarding the new routes
@@ -1397,7 +1680,7 @@ mod tests {
         let pool = db.pool().clone();
         let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
         let ws_repo = Arc::new(SqliteOrchWorkspaceRepository::new(pool.clone()));
-        let run_repo = Arc::new(SqliteRunRepository::new(pool));
+        let run_repo = Arc::new(SqliteRunRepository::new(pool.clone()));
         let fleet = FleetService::new(fleet_repo.clone());
         let workspace = WorkspaceService::new(ws_repo.clone());
         let emitter = OrchestratorRunEventEmitter::new(Arc::new(NoopBroadcaster));
@@ -1475,7 +1758,13 @@ mod tests {
         // test can start the loop directly; the router consumes the original into
         // state. Pause/resume are then driven through the REAL route handlers.
         let engine_for_test = engine.clone();
-        let state = OrchestratorRouterState::new(fleet, workspace, run_service.clone(), engine);
+        let state = OrchestratorRouterState::new(
+            fleet,
+            workspace,
+            run_service.clone(),
+            engine,
+            build_conv_service(pool, Arc::new(NoopBroadcaster)),
+        );
         let app = orchestrator_routes(state).layer(axum::Extension(CurrentUser {
             id: "u1".to_string(),
             username: "tester".to_string(),
