@@ -8,7 +8,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { Input, Popconfirm, Spin } from '@arco-design/web-react';
-import { Comment, Delete, Edit, Plus, Right, Workbench } from '@icon-park/react';
+import { Comment, Delete, Edit, Plus, Right } from '@icon-park/react';
 import { ipcBridge } from '@/common';
 import type { TRun } from '@/common/types/orchestrator/orchestratorTypes';
 import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
@@ -21,6 +21,7 @@ import { dispatchWorkspaceAvailabilityEvent } from '@renderer/utils/workspace/wo
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 import RunHistory from './RunHistory';
 import NewRunComposer, { type ReplanInitial } from './NewRunComposer';
+import NewRunIntentBox from './NewRunIntentBox';
 import WorkerTranscriptPanel from './RunDetail/WorkerTranscriptPanel';
 import MobileRunSummary from './RunDetail/MobileRunSummary';
 import RunView from './RunDetail/RunView';
@@ -234,11 +235,11 @@ const RUNLIST_COLLAPSE_KEY = 'nomifun:orchestrator-runlist-collapsed';
  */
 const RunListRail: React.FC<{
   selectedRunId: string | undefined;
-  composing: boolean;
+  newRunActive: boolean;
   onNewRun: () => void;
   onSelectRun: (id: string) => void;
   onRunDeleted: (id: string) => void;
-}> = ({ selectedRunId, composing, onNewRun, onSelectRun, onRunDeleted }) => {
+}> = ({ selectedRunId, newRunActive, onNewRun, onSelectRun, onRunDeleted }) => {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const { runs, isLoading, error, mutate } = useMyRuns();
@@ -282,7 +283,7 @@ const RunListRail: React.FC<{
         <div
           role='button'
           tabIndex={0}
-          aria-pressed={composing}
+          aria-pressed={newRunActive}
           onClick={onNewRun}
           onKeyDown={(e) => {
             if (e.key === 'Enter' || e.key === ' ') {
@@ -293,7 +294,7 @@ const RunListRail: React.FC<{
           className='mt-12px flex h-36px cursor-pointer select-none items-center justify-center gap-6px rd-9px text-13px font-500 text-white transition-opacity hover:opacity-90'
           style={{
             background: 'rgb(var(--primary-6))',
-            boxShadow: composing ? '0 0 0 3px color-mix(in srgb, rgb(var(--primary-6)) 22%, transparent)' : undefined,
+            boxShadow: newRunActive ? '0 0 0 3px color-mix(in srgb, rgb(var(--primary-6)) 22%, transparent)' : undefined,
           }}
         >
           <Plus theme='outline' size='15' strokeWidth={4} />
@@ -326,7 +327,7 @@ const RunListRail: React.FC<{
               <RunListRow
                 key={run.id}
                 run={run}
-                selected={!composing && selectedRunId === run.id}
+                selected={!newRunActive && selectedRunId === run.id}
                 onSelect={() => onSelectRun(run.id)}
                 onOpenConversation={
                   run.lead_conv_id != null ? () => void navigate(`/conversation/${run.lead_conv_id}`) : undefined
@@ -342,34 +343,23 @@ const RunListRail: React.FC<{
   );
 };
 
-/** The clean empty state shown when nothing is selected and not composing. */
-const EmptyDetail: React.FC = () => {
-  const { t } = useTranslation();
-  return (
-    <div className='flex size-full min-h-0 flex-col items-center justify-center gap-14px px-24px text-center'>
-      <span className='flex size-56px items-center justify-center rd-16px bg-fill-2 text-t-tertiary'>
-        <Workbench theme='outline' size='28' strokeWidth={3} />
-      </span>
-      <div className='text-16px font-600 text-t-primary'>{t('orchestrator.empty.title')}</div>
-      <div className='max-w-360px text-12px leading-18px text-t-tertiary'>{t('orchestrator.empty.desc')}</div>
-    </div>
-  );
-};
-
 /**
  * OrchestratorPage (/orchestrator) — 「智能编排」(orchestration), rebuilt as a
  * master-detail workspace. The left rail ({@link RunListRail}) lists the user's
  * runs with a prominent 「＋ 新建 Run」button; the detail pane has three states:
  *
- *  1. **composing** — {@link NewRunComposer} (after pressing 「＋ 新建 Run」).
- *     On `onCreated` we select the new run; on `onCancel` we drop back.
+ *  1. **composing** — the full structured {@link NewRunComposer} (reached from the
+ *     intent box's 「结构化新建」link for advanced control). On `onCreated` we
+ *     select the new run; on `onCancel` we drop back to the intent box.
  *  2. **a run selected** (`?run=<id>`) — the run view: an {@link AgentRoster}
  *     strip atop the interactive {@link DagCanvas} (which itself renders the
  *     run-detail header + status-aware controls + the completed-run role
  *     precipitation panel, and wires cancel/approve/pause/resume internally —
  *     so we don't duplicate those here). Clicking a roster card or a DAG node
  *     opens the {@link WorkerTranscriptPanel} drawer.
- *  3. **nothing selected** — a clean {@link EmptyDetail} prompt.
+ *  3. **nothing selected** — the conversational {@link NewRunIntentBox}: type a
+ *     natural-language intent → a fresh ad-hoc run is planned & selected. This is
+ *     the quick path; 「＋ 新建 Run」simply lands here.
  *
  * `?run=<id>` is kept in the URL (browser-back closes a run / a deep-link
  * selects one on mount). On mobile the interactive canvas is too awkward, so a
@@ -481,6 +471,18 @@ const OrchestratorPage: React.FC = () => {
     );
   }, [setSearchParams]);
 
+  // 「＋ 新建 Run」lands on the conversational intent box (the quick path): just
+  // clear the open run + the composer, so the detail pane falls through to the
+  // NewRunIntentBox default surface.
+  const startNewRun = useCallback(() => {
+    setComposing(false);
+    setReplanning(false);
+    closeRun();
+  }, [closeRun]);
+
+  // Open the full structured composer (advanced control: work_dir / pinned roles
+  // / explicit model range / autonomy) — reached from the intent box's
+  // 「结构化新建」link, layered on top of the conversational entry.
   const startComposing = useCallback(() => {
     setComposing(true);
     setReplanning(false);
@@ -526,8 +528,8 @@ const OrchestratorPage: React.FC = () => {
       {!runListCollapsed && (
         <RunListRail
           selectedRunId={selectedRunId}
-          composing={composing}
-          onNewRun={startComposing}
+          newRunActive={!selectedRunId}
+          onNewRun={startNewRun}
           onSelectRun={selectRun}
           onRunDeleted={handleRunDeleted}
         />
@@ -573,7 +575,7 @@ const OrchestratorPage: React.FC = () => {
             />
           )
         ) : (
-          <EmptyDetail />
+          <NewRunIntentBox onCreated={selectRun} onAdvanced={startComposing} />
         )}
       </div>
 

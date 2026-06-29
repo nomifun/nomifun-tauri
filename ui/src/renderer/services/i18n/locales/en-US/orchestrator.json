@@ -15,6 +15,14 @@
     "title": "Select a run to begin",
     "desc": "Pick a run on the left to see its task graph and execution detail, or click “New run” to kick off a multi-agent orchestration."
   },
+  "start": {
+    "title": "Kick off a multi-agent orchestration",
+    "subtitle": "Describe the task in a sentence — the lead agent plans the task graph and assigns the best-fit agent to each step automatically.",
+    "label": "New orchestration",
+    "placeholder": "Describe the task you want orchestrated — the lead agent will plan it… (e.g. research three competitors and produce a comparison report with pros & cons)",
+    "send": "Start orchestration",
+    "advanced": "Need a work dir, pinned roles or a precise model range? Structured new run"
+  },
   "composer": {
     "title": "New run",
     "subtitle": "Describe the goal, pick the models and roles, and let a multi-agent fleet run it for you.",
