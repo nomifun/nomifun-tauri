@@ -161,11 +161,15 @@ Rules:\n\
     1) N independent SKEPTIC tasks (N usually 3) — each is a normal \"kind\":\"agent\" task that \"depends_on\":[T] and whose \"spec\" instructs it to CRITICALLY and INDEPENDENTLY evaluate T's result and OUTPUT ONLY a strict-JSON verdict: {\\\"pass\\\": true|false, \\\"critique\\\": \\\"<one-line reason>\\\"}. Phrase each skeptic's spec a little differently so they don't all make the same mistake.\n\
     2) ONE \"kind\":\"verify\" task that \"depends_on\" ALL N skeptics. Its \"pattern_config\" carries the vote policy as a JSON string: \"{\\\"vote\\\":\\\"majority\\\"}\" (default — pass iff > half pass), \"{\\\"vote\\\":\\\"unanimous\\\"}\" (pass iff every skeptic passes), or \"{\\\"vote\\\":{\\\"threshold\\\":K}}\" (pass iff at least K pass). The verify task runs NO agent — the engine tallies the skeptics' verdicts itself — so give it an empty/short spec.\n\
     3) The downstream work that must only run on a PASS \"depends_on\" the verify task. On a FAIL verdict the engine SKIPS that downstream automatically (it never runs unvalidated).\n\
+  - \"judge\": a NO-AGENT aggregator that PICKS THE BEST among M candidate results by averaging/ranking the scores of N independent judges. Use it to choose one winner among alternatives (e.g. several candidate designs/drafts/approaches). To set up a judge contest emit:\n\
+    1) M CANDIDATE tasks (usually a fan-out group of \"kind\":\"agent\" siblings) — each produces ONE alternative. Their ORDER matters: candidate i is index i in every judge's ballot.\n\
+    2) N independent JUDGE tasks (N usually 3) — each is a normal \"kind\":\"agent\" task that \"depends_on\" ALL M candidates and whose \"spec\" instructs it to SCORE EVERY candidate (0.0–1.0, higher = better) and OUTPUT ONLY a strict-JSON ballot scoring all M, e.g. {\\\"scores\\\":[0.8,0.3,0.6]} (array indexed by candidate order) or {\\\"scores\\\":{\\\"0\\\":0.8,\\\"1\\\":0.3,\\\"2\\\":0.6}} (object keyed by candidate index). Phrase each judge's spec a little differently so they don't all weigh the same way.\n\
+    3) ONE \"kind\":\"judge\" task that \"depends_on\" ALL N judges. Its \"pattern_config\" carries the aggregation policy as a JSON string: \"{\\\"aggregate\\\":\\\"mean\\\"}\" (default — average each candidate's scores across judges; winner = highest mean) or \"{\\\"aggregate\\\":\\\"borda\\\"}\" (each judge RANKS the candidates by its scores, award M-1…0 Borda points, sum across judges; winner = highest total). Optionally add \"{\\\"candidates\\\":M}\" to pin the candidate count. The judge task runs NO agent — the engine aggregates the ballots itself — so give it an empty/short spec. It REPORTS the winning candidate index in its output (downstream can build on the winner).\n\
 - FAN-OUT (parallel variants / shards) is expressed by PLANNING, NOT a special kind: when a step benefits from doing the same work in parallel (e.g. N independent drafts, N shards of a corpus, N candidate approaches), emit MULTIPLE sibling tasks that all have \"kind\":\"agent\" and SHARE the same \"pattern_config\" group tag — a JSON string like \"{\\\"group\\\":\\\"<label>\\\"}\" (e.g. \"{\\\"group\\\":\\\"drafts\\\"}\"). Then add ONE downstream task (usually \"kind\":\"synthesis\") that \"depends_on\" ALL of those siblings to combine them. The engine runs the siblings in parallel automatically.\n\
-- \"pattern_config\" is a raw JSON STRING (or omit it). It carries the fan-out \"group\" tag OR a verify task's \"vote\" policy (see above); leave it out for ordinary tasks.\n\
+- \"pattern_config\" is a raw JSON STRING (or omit it). It carries the fan-out \"group\" tag, a verify task's \"vote\" policy, OR a judge task's \"aggregate\" policy (see above); leave it out for ordinary tasks.\n\
 - \"task_profile\", \"member_index\" and \"rationale\" are optional.\n\
 - \"title\" is a short imperative label; \"spec\" is the full instruction the worker agent will execute.\n\
-- Keep the plan minimal but complete: one task if the goal is atomic, several with dependencies if it must be staged. Do NOT over-use synthesis/fan-out/verify — reach for them only when the goal genuinely benefits from merging multiple outputs, parallel variants, or validating a result before building on it.\n\
+- Keep the plan minimal but complete: one task if the goal is atomic, several with dependencies if it must be staged. Do NOT over-use synthesis/fan-out/verify/judge — reach for them only when the goal genuinely benefits from merging multiple outputs, parallel variants, validating a result before building on it, or choosing the best among alternatives.\n\
 Output the JSON object and nothing else.";
 
 /// Build the `(provider_id, model) → description` map for the prompt.
@@ -574,6 +578,59 @@ mod tests {
         for kw in ["majority", "unanimous", "threshold"] {
             assert!(PLAN_SYSTEM.contains(kw), "rules must teach vote policy '{kw}': {PLAN_SYSTEM}");
         }
+    }
+
+    // UC-1c: the system prompt must TEACH the judge pattern — the `judge` kind,
+    // the per-candidate `scores` ballot shape, and the mean/borda aggregate
+    // policies — otherwise the lead model never emits a judge contest.
+    #[test]
+    fn plan_system_teaches_judge_pattern() {
+        assert!(PLAN_SYSTEM.contains("judge"), "rules must teach the judge kind: {PLAN_SYSTEM}");
+        assert!(
+            PLAN_SYSTEM.contains("CANDIDATE") || PLAN_SYSTEM.contains("candidate"),
+            "rules must mention candidate tasks: {PLAN_SYSTEM}"
+        );
+        assert!(PLAN_SYSTEM.contains("\\\"scores\\\""), "rules must teach the scores ballot shape: {PLAN_SYSTEM}");
+        assert!(PLAN_SYSTEM.contains("aggregate"), "rules must teach the aggregate policy: {PLAN_SYSTEM}");
+        for kw in ["mean", "borda"] {
+            assert!(PLAN_SYSTEM.contains(kw), "rules must teach aggregate policy '{kw}': {PLAN_SYSTEM}");
+        }
+    }
+
+    // UC-1c: a judge plan — M candidate agent tasks (a fan-out group), N judge
+    // agent tasks each depending on ALL M candidates, and one `judge` aggregator
+    // depending on all N judges with an aggregate policy in pattern_config —
+    // parses, and the judge kind + aggregate policy round-trip. parse_plan stays
+    // fail-soft for the kind (kept as-is; the engine recognizes "judge").
+    #[test]
+    fn parse_plan_accepts_judge_candidates_judges_and_aggregator() {
+        let raw = r#"{"tasks":[
+            {"title":"Candidate A","spec":"design approach A","depends_on":[],"kind":"agent","pattern_config":"{\"group\":\"candidates\"}"},
+            {"title":"Candidate B","spec":"design approach B","depends_on":[],"kind":"agent","pattern_config":"{\"group\":\"candidates\"}"},
+            {"title":"Candidate C","spec":"design approach C","depends_on":[],"kind":"agent","pattern_config":"{\"group\":\"candidates\"}"},
+            {"title":"Judge 1","spec":"score every candidate; output {\"scores\":[..]}","depends_on":[0,1,2],"kind":"agent"},
+            {"title":"Judge 2","spec":"score every candidate; output {\"scores\":[..]}","depends_on":[0,1,2],"kind":"agent"},
+            {"title":"Judge 3","spec":"score every candidate; output {\"scores\":[..]}","depends_on":[0,1,2],"kind":"agent"},
+            {"title":"Pick","spec":"aggregate ballots","depends_on":[3,4,5],"kind":"judge","pattern_config":"{\"aggregate\":\"borda\"}"}
+        ]}"#;
+        let dag = parse_plan(raw, "pick the best design");
+        assert_eq!(dag.tasks.len(), 7);
+        // The three candidates are plain agent tasks sharing the fan-out group.
+        for i in 0..=2 {
+            assert_eq!(dag.tasks[i].kind, "agent", "candidate {i} is an agent task");
+            assert!(dag.tasks[i].depends_on.is_empty(), "candidates are independent");
+        }
+        // The three judges are agent tasks depending on ALL candidates.
+        for i in 3..=5 {
+            assert_eq!(dag.tasks[i].kind, "agent", "judge {i} is an agent task");
+            assert_eq!(dag.tasks[i].depends_on, vec![0, 1, 2], "judge {i} scores all candidates");
+        }
+        // The aggregator is `judge`, depends on all three judges, carries the
+        // aggregate policy in pattern_config.
+        let pick = &dag.tasks[6];
+        assert_eq!(pick.kind, "judge");
+        assert_eq!(pick.depends_on, vec![3, 4, 5]);
+        assert_eq!(pick.pattern_config.as_deref(), Some("{\"aggregate\":\"borda\"}"));
     }
 
     #[test]

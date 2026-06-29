@@ -483,14 +483,15 @@ async fn run_loop(deps: Arc<RunEngineDeps>, run_id: &str, cancelled: Arc<AtomicB
         // (workers may still be running) — log and proceed to the await branch;
         // the next fill retries.
         //
-        // `settled_verify` records whether this fill pass settled a `verify`
-        // aggregator synchronously. A settle is genuine forward progress (a task
-        // went pending→done and may have unblocked downstream), so when it happens
-        // we re-loop to re-fill BEFORE the terminal decision — otherwise a verify
-        // that settles with no worker in flight would be misread as a "stuck"
-        // graph (its downstream is freshly ready but not yet dispatched). This is
-        // NOT a busy-spin: it only re-loops because a task actually transitioned.
-        let mut settled_verify = false;
+        // `settled_sync` records whether this fill pass settled a SYNCHRONOUS
+        // aggregator (a `verify` or `judge` task) NO-LLM. A settle is genuine
+        // forward progress (a task went pending→done and may have unblocked
+        // downstream), so when it happens we re-loop to re-fill BEFORE the
+        // terminal decision — otherwise an aggregator that settles with no worker
+        // in flight would be misread as a "stuck" graph (its downstream is freshly
+        // ready but not yet dispatched). This is NOT a busy-spin: it only re-loops
+        // because a task actually transitioned.
+        let mut settled_sync = false;
         if !paused && inflight.len() < cap {
             match deps.run_repo.list_ready_tasks(run_id).await {
                 Ok(ready) => {
@@ -510,11 +511,27 @@ async fn run_loop(deps: Arc<RunEngineDeps>, run_id: &str, cancelled: Arc<AtomicB
                         // enters the in-flight set (no worker, no spin); because it is
                         // only reached when already in the ready set (all skeptics
                         // `done`), it settles in this single fill pass. We then
-                        // re-loop (settled_verify) to re-fill, observing the verdict
+                        // re-loop (settled_sync) to re-fill, observing the verdict
                         // (downstream proceeds on PASS, is `skipped` on FAIL).
                         if task.kind == "verify" {
                             settle_verify_task(&deps, run_id, &task).await;
-                            settled_verify = true;
+                            settled_sync = true;
+                            continue;
+                        }
+                        // judge 模式 (UC-1c): a `judge` aggregator is settled
+                        // SYNCHRONOUSLY here too — NOT dispatched to a worker. It reads
+                        // its N judge deps' ballots (per-candidate scores), aggregates
+                        // them (mean / borda) to pick a winner candidate, writes the
+                        // WINNER marker + per-candidate aggregates to its
+                        // `output_summary`, and marks itself `done`. No downstream gate
+                        // (a judge picks a winner; it does not fail the run) — so it
+                        // never skips dependents. Like verify it never enters the
+                        // in-flight set and settles in this single fill pass; we
+                        // re-loop (settled_sync) so any consumer of the winner is
+                        // re-filled.
+                        if task.kind == "judge" {
+                            settle_judge_task(&deps, run_id, &task).await;
+                            settled_sync = true;
                             continue;
                         }
                         let fut = dispatch_task(&deps, run_id, task, workspace_dir.clone()).await;
@@ -534,11 +551,12 @@ async fn run_loop(deps: Arc<RunEngineDeps>, run_id: &str, cancelled: Arc<AtomicB
             }
         }
 
-        // A verify settled this pass → re-loop to re-fill on the newly-unblocked
-        // (or freshly-skipped) downstream before any terminal decision. Bounded:
-        // each verify settles exactly once (it is `done` afterward, never returned
-        // by `list_ready_tasks` again), so this cannot loop forever.
-        if settled_verify {
+        // A synchronous aggregator (verify/judge) settled this pass → re-loop to
+        // re-fill on the newly-unblocked (or freshly-skipped) downstream before any
+        // terminal decision. Bounded: each aggregator settles exactly once (it is
+        // `done` afterward, never returned by `list_ready_tasks` again), so this
+        // cannot loop forever.
+        if settled_sync {
             continue;
         }
 
@@ -1250,6 +1268,425 @@ async fn settle_verify_task(deps: &Arc<RunEngineDeps>, run_id: &str, task: &Orch
     if !verdict.pass {
         skip_downstream(deps, run_id, &task.id, &dep_edges).await;
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// judge 模式 (UC-1c): the `judge` aggregator. The lead plans M candidate `agent`
+// tasks (usually a fan-out group producing alternatives) + N judge `agent` tasks
+// (each depends on ALL M candidates and OUTPUTs a JSON ballot scoring every
+// candidate) + ONE `judge` aggregator task depending on all N judges. The engine
+// settles the aggregator NO-LLM in the fill step (`settle_judge_task`): it parses
+// each judge's ballot into M scores, aggregates across judges per candidate by
+// policy (mean | borda), picks the winner (argmax, ties → lowest index), and
+// writes a parseable `WINNER:` marker to its `output_summary`. There is NO
+// downstream gate (a judge picks a winner, it does not fail the run) — the winner
+// is just REPORTED for a downstream consumer/synthesis to use.
+//
+// Like the verify aggregator it is NOT a worker dispatch: it is settled
+// SYNCHRONOUSLY in the run loop's fill step, never enters the in-flight worker
+// set, never spins (settles in one pass once its deps are done), and its
+// `conversation_id` stays None (no worker conversation).
+// ──────────────────────────────────────────────────────────────────────────
+
+/// The aggregation policy for a `judge` aggregator, read from its
+/// `pattern_config` JSON (`{"aggregate": ...}`). Defaults to [`JudgePolicy::Mean`]
+/// when the config is absent, blank, malformed, or carries an unknown
+/// `aggregate` value — fail-soft, matching `VotePolicy::parse`'s tolerance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JudgePolicy {
+    /// Average each candidate's scores across judges; winner = highest mean.
+    Mean,
+    /// Each judge RANKS the M candidates by its scores; award Borda points
+    /// (M-1, M-2, …, 0) summed across judges; winner = highest total.
+    Borda,
+}
+
+impl JudgePolicy {
+    /// Parse the policy from a `judge` task's `pattern_config` raw JSON string.
+    /// Fail-soft: any problem (None / blank / not JSON / unknown shape) yields
+    /// [`JudgePolicy::Mean`], the safe default. Accepted `aggregate` shapes:
+    /// - `"mean"` → Mean
+    /// - `"borda"` → Borda
+    fn parse(pattern_config: Option<&str>) -> Self {
+        let Some(raw) = pattern_config.map(str::trim).filter(|s| !s.is_empty()) else {
+            return JudgePolicy::Mean;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+            return JudgePolicy::Mean;
+        };
+        let Some(agg) = value.get("aggregate").and_then(serde_json::Value::as_str) else {
+            return JudgePolicy::Mean;
+        };
+        match agg.trim().to_ascii_lowercase().as_str() {
+            "borda" => JudgePolicy::Borda,
+            // "mean" and anything unknown both fall to the safe default.
+            _ => JudgePolicy::Mean,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            JudgePolicy::Mean => "mean",
+            JudgePolicy::Borda => "borda",
+        }
+    }
+}
+
+/// Parse a single judge's `output_summary` into a ballot of per-candidate scores.
+///
+/// A ballot is `M` numeric scores, one per candidate, keyed by candidate index.
+/// Two JSON shapes are accepted (the judge prompt asks for either):
+/// - **array**: `{"scores":[0.8,0.3,0.6]}` → index i = candidate i's score.
+/// - **object**: `{"scores":{"0":0.8,"2":0.6}}` → key = candidate index (a
+///   sparse ballot is fine; missing candidates are left as `None`).
+///
+/// Returns a `Vec<Option<f64>>` of length `candidates` (so the matrix is
+/// rectangular across judges): a candidate the judge did not score is `None`.
+///
+/// **Fail-safe: a missing / blank / unparseable ballot, or one with no usable
+/// `scores`, returns `None` — the caller DROPS that judge (it contributes no
+/// scores), never panics.** Out-of-range indices and non-numeric entries are
+/// silently ignored.
+fn parse_judge_ballot(output_summary: Option<&str>, candidates: usize) -> Option<Vec<Option<f64>>> {
+    let text = output_summary.map(str::trim).filter(|s| !s.is_empty())?;
+    // Prefer a JSON object anywhere in the text carrying a `scores` field.
+    let json = first_json_object(text)?;
+    let value = serde_json::from_str::<serde_json::Value>(&json).ok()?;
+    let scores = value.get("scores")?;
+
+    let mut ballot: Vec<Option<f64>> = vec![None; candidates];
+    let mut any = false;
+    match scores {
+        // Array form: positional by candidate index.
+        serde_json::Value::Array(arr) => {
+            for (i, v) in arr.iter().enumerate() {
+                if i >= candidates {
+                    break; // ignore extra entries beyond the candidate count
+                }
+                if let Some(n) = v.as_f64() {
+                    ballot[i] = Some(n);
+                    any = true;
+                }
+            }
+        }
+        // Object form: keyed by candidate index ("0", "1", …).
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let Ok(idx) = k.trim().parse::<usize>() else {
+                    continue; // non-index key → ignore
+                };
+                if idx >= candidates {
+                    continue; // out-of-range index → ignore
+                }
+                if let Some(n) = v.as_f64() {
+                    ballot[idx] = Some(n);
+                    any = true;
+                }
+            }
+        }
+        _ => return None, // scores is neither array nor object → drop
+    }
+
+    // A ballot with no usable scores at all contributes nothing → drop it.
+    if any {
+        Some(ballot)
+    } else {
+        None
+    }
+}
+
+/// Determine the candidate count `M` for a judge aggregator.
+///
+/// Preference order (fail-soft):
+/// 1. An explicit `{"candidates":M}` in the judge task's `pattern_config`.
+/// 2. The max ballot length observed across the judges' parsed score arrays /
+///    the highest object key + 1 (so we size the matrix to what the judges
+///    actually scored).
+///
+/// Returns the resolved `M` (0 when neither source yields a positive count — the
+/// caller then produces an empty result, no winner).
+fn resolve_candidate_count(pattern_config: Option<&str>, judge_outputs: &[Option<&str>]) -> usize {
+    // 1) Explicit pin in pattern_config.
+    if let Some(raw) = pattern_config.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
+            if let Some(m) = value.get("candidates").and_then(serde_json::Value::as_u64) {
+                return m as usize;
+            }
+        }
+    }
+    // 2) Infer from the judges' ballots: the widest array / highest object key.
+    let mut max_m = 0usize;
+    for out in judge_outputs {
+        let Some(text) = out.map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let Some(json) = first_json_object(text) else { continue };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) else { continue };
+        let Some(scores) = value.get("scores") else { continue };
+        match scores {
+            serde_json::Value::Array(arr) => max_m = max_m.max(arr.len()),
+            serde_json::Value::Object(map) => {
+                for k in map.keys() {
+                    if let Ok(idx) = k.trim().parse::<usize>() {
+                        max_m = max_m.max(idx + 1);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    max_m
+}
+
+/// The computed result of a `judge` aggregator over its judge dependencies.
+struct JudgeResult {
+    /// Winning candidate index (argmax of `aggregate`, ties → lowest index), or
+    /// `None` when there is nothing to pick (no candidates or no usable ballots).
+    winner: Option<usize>,
+    /// Per-candidate aggregate score (mean of scores, or summed Borda points),
+    /// indexed by candidate. Length `M`.
+    aggregate: Vec<f64>,
+    /// How many judges contributed a usable ballot (dropped judges excluded).
+    judges_counted: usize,
+    /// Total judge dependencies seen (including dropped ones).
+    judges_total: usize,
+}
+
+/// Aggregate `N` judge ballots (`ballots[judge][candidate]`, each a sparse
+/// `Vec<Option<f64>>` of length `M`) into a per-candidate aggregate + winner,
+/// under `policy`. Pure (no I/O) so it is unit-testable in isolation.
+///
+/// - **Mean**: per candidate, average the scores from the judges that scored it
+///   (a candidate no judge scored gets `0.0`, so it can never win over a scored
+///   one). Winner = argmax.
+/// - **Borda**: per judge, rank the candidates it scored by descending score and
+///   award `(count-1, count-2, …, 0)` points (ties within a judge share the
+///   average of their contested point block, kept deterministic by stable
+///   ordering on candidate index); sum across judges. Winner = argmax.
+///
+/// **Determinism**: ties in the final aggregate are broken by LOWEST candidate
+/// index (the first argmax wins). Within a single judge's Borda ranking, equal
+/// scores are ordered by candidate index so the same ballots always yield the
+/// same points.
+fn aggregate_judge(ballots: &[Vec<Option<f64>>], candidates: usize, policy: JudgePolicy) -> JudgeResult {
+    let judges_total = ballots.len();
+    // (ballots passed in are already the usable ones; `judges_counted` == len)
+    let judges_counted = ballots.len();
+
+    if candidates == 0 {
+        return JudgeResult {
+            winner: None,
+            aggregate: Vec::new(),
+            judges_counted,
+            judges_total,
+        };
+    }
+
+    let mut aggregate = vec![0.0f64; candidates];
+
+    match policy {
+        JudgePolicy::Mean => {
+            // Sum + count per candidate across the judges that scored it.
+            let mut sums = vec![0.0f64; candidates];
+            let mut counts = vec![0usize; candidates];
+            for ballot in ballots {
+                for (c, score) in ballot.iter().enumerate().take(candidates) {
+                    if let Some(s) = score {
+                        sums[c] += *s;
+                        counts[c] += 1;
+                    }
+                }
+            }
+            for c in 0..candidates {
+                aggregate[c] = if counts[c] > 0 {
+                    sums[c] / counts[c] as f64
+                } else {
+                    0.0
+                };
+            }
+        }
+        JudgePolicy::Borda => {
+            // Each judge ranks the candidates it scored; award M'-1 … 0 points
+            // where M' is how many candidates that judge scored. Ties within a
+            // judge share the average of the contested points (deterministic via
+            // stable ordering on candidate index).
+            for ballot in ballots {
+                // (candidate_index, score) for candidates this judge scored.
+                let mut scored: Vec<(usize, f64)> = ballot
+                    .iter()
+                    .enumerate()
+                    .take(candidates)
+                    .filter_map(|(c, s)| s.map(|v| (c, v)))
+                    .collect();
+                let m = scored.len();
+                if m == 0 {
+                    continue;
+                }
+                // Sort by descending score; ties broken by ASCENDING candidate
+                // index so the ordering is deterministic.
+                scored.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.0.cmp(&b.0))
+                });
+                // Award points, splitting ties evenly across the contested block
+                // so two candidates with the same score get the same points.
+                let mut i = 0usize;
+                while i < m {
+                    let mut j = i + 1;
+                    while j < m && (scored[j].1 - scored[i].1).abs() < f64::EPSILON {
+                        j += 1;
+                    }
+                    // Candidates scored[i..j] are tied. Points for ranks i..j are
+                    // (m-1-i), (m-1-(i+1)), …; share their average.
+                    let block = j - i;
+                    let mut block_points = 0.0f64;
+                    for rank in i..j {
+                        block_points += (m - 1 - rank) as f64;
+                    }
+                    let per = block_points / block as f64;
+                    for (c, _) in &scored[i..j] {
+                        aggregate[*c] += per;
+                    }
+                    i = j;
+                }
+            }
+        }
+    }
+
+    // Winner = argmax with ties → lowest candidate index. Only meaningful when at
+    // least one judge contributed (otherwise every aggregate is 0 and we report
+    // no winner so a downstream consumer can tell nothing was judged).
+    let winner = if judges_counted == 0 {
+        None
+    } else {
+        let mut best_idx = 0usize;
+        let mut best_val = aggregate[0];
+        for (c, v) in aggregate.iter().enumerate().skip(1) {
+            if *v > best_val {
+                best_val = *v;
+                best_idx = c;
+            }
+        }
+        Some(best_idx)
+    };
+
+    JudgeResult {
+        winner,
+        aggregate,
+        judges_counted,
+        judges_total,
+    }
+}
+
+/// Render a `judge` result into the aggregator task's `output_summary` — a
+/// machine-leading line (`WINNER: candidate K (aggregate=mean|borda, scores=[…],
+/// judges=c/n)`) so both a downstream consumer and the UI can parse the winner.
+/// When there is no winner (no candidates / no usable ballots) it leads with
+/// `WINNER: none`.
+fn render_judge_summary(result: &JudgeResult, policy: JudgePolicy) -> String {
+    let scores_csv = result
+        .aggregate
+        .iter()
+        .map(|v| format!("{v:.3}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match result.winner {
+        Some(k) => format!(
+            "WINNER: candidate {k} (aggregate={}, scores=[{}], judges={}/{})",
+            policy.label(),
+            scores_csv,
+            result.judges_counted,
+            result.judges_total,
+        ),
+        None => format!(
+            "WINNER: none (aggregate={}, scores=[{}], judges={}/{})",
+            policy.label(),
+            scores_csv,
+            result.judges_counted,
+            result.judges_total,
+        ),
+    }
+}
+
+/// Settle a ready `judge` aggregator task SYNCHRONOUSLY (no worker dispatch):
+/// read its N judge dependency outputs, parse each as a ballot of M per-candidate
+/// scores (fail-safe — an unparseable judge is DROPPED), aggregate across judges
+/// by the task's policy (mean / borda), pick the winning candidate index (argmax,
+/// ties → lowest index), write the `WINNER:` marker + per-candidate aggregates to
+/// the task's `output_summary`, and mark it `done`.
+///
+/// **No downstream gate:** unlike `verify`, a judge does NOT skip its dependents —
+/// it picks a winner, it does not fail the run. The winner is REPORTED in the
+/// `output_summary` for a downstream synthesis/consumer to use.
+///
+/// Bounded + no spin: the deps are read once, aggregated once, and the task is
+/// transitioned once. It is invoked only when the task is already in the ready
+/// set (all judges `done`), so it settles in a single fill pass.
+async fn settle_judge_task(deps: &Arc<RunEngineDeps>, run_id: &str, task: &OrchRunTaskRow) {
+    // Resolve the judge dependencies (this task's blockers), in task order, so the
+    // aggregate + summary are deterministic.
+    let dep_edges = deps.run_repo.list_deps(run_id).await.unwrap_or_default();
+    let blocker_ids: HashSet<String> = dep_edges
+        .iter()
+        .filter(|d| d.blocked_task_id == task.id)
+        .map(|d| d.blocker_task_id.clone())
+        .collect();
+    let all_tasks = deps.run_repo.list_tasks(run_id).await.unwrap_or_default();
+    let judges: Vec<OrchRunTaskRow> = all_tasks
+        .iter()
+        .filter(|t| blocker_ids.contains(&t.id))
+        .cloned()
+        .collect();
+
+    let policy = JudgePolicy::parse(task.pattern_config.as_deref());
+    let judge_outputs: Vec<Option<&str>> =
+        judges.iter().map(|j| j.output_summary.as_deref()).collect();
+    let candidates = resolve_candidate_count(task.pattern_config.as_deref(), &judge_outputs);
+
+    // Parse each judge's ballot; DROP the unparseable ones (fail-safe).
+    let judges_total = judges.len();
+    let ballots: Vec<Vec<Option<f64>>> = judge_outputs
+        .iter()
+        .filter_map(|out| parse_judge_ballot(*out, candidates))
+        .collect();
+
+    let mut result = aggregate_judge(&ballots, candidates, policy);
+    // `aggregate_judge` was handed only the usable ballots, so it reports
+    // `judges_total == usable`. Surface the TRUE total (including dropped) so the
+    // summary's `judges=c/n` reflects how many were dropped.
+    result.judges_total = judges_total;
+    let summary = render_judge_summary(&result, policy);
+
+    // Persist the result + mark the aggregator `done` (conversation_id stays None
+    // — there is no worker conversation for a judge task).
+    let _ = deps
+        .run_repo
+        .update_task(
+            &task.id,
+            UpdateTaskParams {
+                status: Some("done".to_string()),
+                conversation_id: None,
+                output_summary: Some(Some(summary)),
+                output_files: None,
+                attempt: None,
+                tokens: None,
+                graph_x: None,
+                graph_y: None,
+            },
+        )
+        .await;
+    deps.emitter.emit_task_status(run_id, &task.id, "done");
+    info!(
+        run_id,
+        task_id = %task.id,
+        winner = ?result.winner,
+        candidates,
+        judges_counted = result.judges_counted,
+        judges_total = result.judges_total,
+        "judge aggregator settled"
+    );
+    // NOTE: no downstream gate — a judge reports a winner, it does not skip work.
 }
 
 /// Mark every task transitively downstream of `from_task_id` (its dependents,
@@ -2106,6 +2543,238 @@ mod tests {
         assert!(s.contains("S1 → PASS"), "skeptic verdict surfaced: {s}");
         assert!(s.contains("S2 → FAIL"), "skeptic verdict surfaced: {s}");
         assert!(s.contains("边界未处理"), "critique text collected: {s}");
+    }
+
+    // ── judge 模式 (UC-1c): policy parse, ballot parse (fail-safe), mean/borda ──
+
+    #[test]
+    fn judge_policy_parse_is_fail_soft_to_mean() {
+        // Explicit shapes.
+        assert_eq!(JudgePolicy::parse(Some(r#"{"aggregate":"mean"}"#)), JudgePolicy::Mean);
+        assert_eq!(JudgePolicy::parse(Some(r#"{"aggregate":"borda"}"#)), JudgePolicy::Borda);
+        assert_eq!(JudgePolicy::parse(Some(r#"{"aggregate":"BORDA"}"#)), JudgePolicy::Borda);
+        // candidates pin alongside the policy still resolves the policy.
+        assert_eq!(
+            JudgePolicy::parse(Some(r#"{"aggregate":"borda","candidates":3}"#)),
+            JudgePolicy::Borda
+        );
+        // Fail-soft: absent / blank / not-JSON / no `aggregate` / unknown → Mean.
+        assert_eq!(JudgePolicy::parse(None), JudgePolicy::Mean);
+        assert_eq!(JudgePolicy::parse(Some("   ")), JudgePolicy::Mean);
+        assert_eq!(JudgePolicy::parse(Some("not json")), JudgePolicy::Mean);
+        assert_eq!(JudgePolicy::parse(Some(r#"{"group":"x"}"#)), JudgePolicy::Mean);
+        assert_eq!(JudgePolicy::parse(Some(r#"{"aggregate":"weird"}"#)), JudgePolicy::Mean);
+    }
+
+    #[test]
+    fn parse_judge_ballot_array_and_object_forms() {
+        // Array form: positional by candidate index.
+        let arr = parse_judge_ballot(Some(r#"{"scores":[0.8,0.3,0.6]}"#), 3).expect("array ballot");
+        assert_eq!(arr, vec![Some(0.8), Some(0.3), Some(0.6)]);
+
+        // Object form: keyed by candidate index (sparse OK — missing → None).
+        let obj = parse_judge_ballot(Some(r#"{"scores":{"0":0.8,"2":0.6}}"#), 3).expect("object ballot");
+        assert_eq!(obj, vec![Some(0.8), None, Some(0.6)]);
+
+        // Embedded in prose still found.
+        let prose = parse_judge_ballot(
+            Some("After review: {\"scores\":[0.1,0.9]} done."),
+            2,
+        )
+        .expect("prose-embedded ballot");
+        assert_eq!(prose, vec![Some(0.1), Some(0.9)]);
+
+        // Extra array entries beyond M are ignored; the ballot is sized to M.
+        let extra = parse_judge_ballot(Some(r#"{"scores":[0.1,0.2,0.3,0.4]}"#), 2).expect("extra");
+        assert_eq!(extra, vec![Some(0.1), Some(0.2)]);
+
+        // Out-of-range / non-index object keys are ignored.
+        let oor = parse_judge_ballot(Some(r#"{"scores":{"0":0.5,"9":0.9,"x":0.1}}"#), 2).expect("oor");
+        assert_eq!(oor, vec![Some(0.5), None]);
+    }
+
+    #[test]
+    fn parse_judge_ballot_unparseable_is_dropped_no_panic() {
+        // The fail-safe invariant: missing / blank / unparseable / no usable
+        // scores → None (the judge is DROPPED), never a panic.
+        assert!(parse_judge_ballot(None, 3).is_none(), "missing output → dropped");
+        assert!(parse_judge_ballot(Some("   "), 3).is_none(), "blank output → dropped");
+        assert!(parse_judge_ballot(Some("no json here"), 3).is_none(), "no JSON → dropped");
+        assert!(parse_judge_ballot(Some(r#"{"scor: ["#), 3).is_none(), "broken JSON → dropped");
+        assert!(
+            parse_judge_ballot(Some(r#"{"verdict":"good"}"#), 3).is_none(),
+            "no scores field → dropped"
+        );
+        assert!(
+            parse_judge_ballot(Some(r#"{"scores":"not-a-list"}"#), 3).is_none(),
+            "scores not array/object → dropped"
+        );
+        // An object whose only keys are out-of-range → no usable scores → dropped.
+        assert!(
+            parse_judge_ballot(Some(r#"{"scores":{"9":0.9}}"#), 2).is_none(),
+            "all out-of-range → dropped"
+        );
+        // An empty scores array → no usable scores → dropped (not a panic).
+        assert!(parse_judge_ballot(Some(r#"{"scores":[]}"#), 3).is_none(), "empty array → dropped");
+    }
+
+    #[test]
+    fn aggregate_judge_mean_picks_highest_average() {
+        // 3 candidates, 2 judges. Means: c0=(0.9+0.7)/2=0.8, c1=(0.2+0.4)/2=0.3,
+        // c2=(0.5+0.6)/2=0.55 → winner c0.
+        let ballots = vec![
+            vec![Some(0.9), Some(0.2), Some(0.5)],
+            vec![Some(0.7), Some(0.4), Some(0.6)],
+        ];
+        let r = aggregate_judge(&ballots, 3, JudgePolicy::Mean);
+        assert_eq!(r.winner, Some(0), "c0 has the highest mean");
+        assert_eq!(r.judges_counted, 2);
+        assert!((r.aggregate[0] - 0.8).abs() < 1e-9, "mean c0: {:?}", r.aggregate);
+        assert!((r.aggregate[2] - 0.55).abs() < 1e-9, "mean c2: {:?}", r.aggregate);
+    }
+
+    #[test]
+    fn aggregate_judge_mean_order_independent() {
+        // Permuting the judges' order must not change the mean aggregate / winner.
+        let a = vec![
+            vec![Some(0.1), Some(0.9), Some(0.4)],
+            vec![Some(0.2), Some(0.8), Some(0.3)],
+            vec![Some(0.3), Some(0.7), Some(0.5)],
+        ];
+        let b = vec![
+            vec![Some(0.3), Some(0.7), Some(0.5)],
+            vec![Some(0.1), Some(0.9), Some(0.4)],
+            vec![Some(0.2), Some(0.8), Some(0.3)],
+        ];
+        let ra = aggregate_judge(&a, 3, JudgePolicy::Mean);
+        let rb = aggregate_judge(&b, 3, JudgePolicy::Mean);
+        assert_eq!(ra.winner, Some(1), "c1 wins by mean");
+        assert_eq!(ra.winner, rb.winner, "permutation-independent winner");
+        for c in 0..3 {
+            assert!((ra.aggregate[c] - rb.aggregate[c]).abs() < 1e-9, "candidate {c} aggregate stable");
+        }
+    }
+
+    #[test]
+    fn aggregate_judge_borda_picks_highest_rank_sum() {
+        // 3 candidates, 2 judges (M=3 → points 2,1,0 per judge).
+        // Judge0 ranks: c0(0.9) > c2(0.6) > c1(0.2) → c0=2,c2=1,c1=0.
+        // Judge1 ranks: c2(0.8) > c0(0.7) > c1(0.1) → c2=2,c0=1,c1=0.
+        // Totals: c0=3, c1=0, c2=3 → TIE c0/c2 → lowest index c0 wins.
+        let ballots = vec![
+            vec![Some(0.9), Some(0.2), Some(0.6)],
+            vec![Some(0.7), Some(0.1), Some(0.8)],
+        ];
+        let r = aggregate_judge(&ballots, 3, JudgePolicy::Borda);
+        assert!((r.aggregate[0] - 3.0).abs() < 1e-9, "c0 borda=3: {:?}", r.aggregate);
+        assert!((r.aggregate[1] - 0.0).abs() < 1e-9, "c1 borda=0: {:?}", r.aggregate);
+        assert!((r.aggregate[2] - 3.0).abs() < 1e-9, "c2 borda=3: {:?}", r.aggregate);
+        assert_eq!(r.winner, Some(0), "tie c0/c2 broken to lowest index c0");
+    }
+
+    #[test]
+    fn aggregate_judge_borda_clear_winner_and_order_independent() {
+        // Judge0: c1(0.9)>c0(0.5)>c2(0.1) → c1=2,c0=1,c2=0.
+        // Judge1: c1(0.8)>c2(0.6)>c0(0.2) → c1=2,c2=1,c0=0.
+        // Totals: c0=1, c1=4, c2=1 → c1 clear winner.
+        let a = vec![
+            vec![Some(0.5), Some(0.9), Some(0.1)],
+            vec![Some(0.2), Some(0.8), Some(0.6)],
+        ];
+        let r = aggregate_judge(&a, 3, JudgePolicy::Borda);
+        assert_eq!(r.winner, Some(1), "c1 is the clear borda winner");
+        assert!((r.aggregate[1] - 4.0).abs() < 1e-9, "c1 borda=4: {:?}", r.aggregate);
+
+        // Order independence: reverse the ballots → same winner + same totals.
+        let b = vec![a[1].clone(), a[0].clone()];
+        let rb = aggregate_judge(&b, 3, JudgePolicy::Borda);
+        assert_eq!(rb.winner, Some(1));
+        for c in 0..3 {
+            assert!((r.aggregate[c] - rb.aggregate[c]).abs() < 1e-9, "candidate {c} borda stable");
+        }
+    }
+
+    #[test]
+    fn aggregate_judge_borda_ties_within_a_judge_share_points() {
+        // One judge, 3 candidates, c0 and c1 TIED at 0.5, c2 at 0.1.
+        // Ranks for points 2,1,0: the tied block {c0,c1} occupies ranks 0,1 →
+        // share (2+1)/2 = 1.5 each; c2 gets 0. Deterministic (no index drift).
+        let ballots = vec![vec![Some(0.5), Some(0.5), Some(0.1)]];
+        let r = aggregate_judge(&ballots, 3, JudgePolicy::Borda);
+        assert!((r.aggregate[0] - 1.5).abs() < 1e-9, "c0 shares tie: {:?}", r.aggregate);
+        assert!((r.aggregate[1] - 1.5).abs() < 1e-9, "c1 shares tie: {:?}", r.aggregate);
+        assert!((r.aggregate[2] - 0.0).abs() < 1e-9, "c2 last: {:?}", r.aggregate);
+        // Final tie c0/c1 → lowest index wins.
+        assert_eq!(r.winner, Some(0));
+    }
+
+    #[test]
+    fn settle_judge_drops_missing_ballot_fail_safe() {
+        // Two usable judges + one dropped (unparseable). The drop must not crash;
+        // the winner is computed from the two usable ballots only.
+        let candidates = 2;
+        let raw = vec![
+            Some(r#"{"scores":[0.9,0.1]}"#),       // c0 strong
+            Some("worker timed out, no ballot"),   // unparseable → dropped
+            Some(r#"{"scores":[0.8,0.2]}"#),       // c0 strong
+        ];
+        let ballots: Vec<Vec<Option<f64>>> = raw
+            .iter()
+            .filter_map(|o| parse_judge_ballot(*o, candidates))
+            .collect();
+        assert_eq!(ballots.len(), 2, "the unparseable judge is dropped");
+        let mut r = aggregate_judge(&ballots, candidates, JudgePolicy::Mean);
+        r.judges_total = raw.len();
+        assert_eq!(r.winner, Some(0), "c0 wins from the two usable ballots");
+        assert_eq!(r.judges_counted, 2);
+        assert_eq!(r.judges_total, 3, "total reflects the dropped judge");
+    }
+
+    #[test]
+    fn aggregate_judge_no_usable_ballots_reports_no_winner() {
+        // Every judge was dropped → no winner (downstream can tell nothing judged).
+        let r = aggregate_judge(&[], 3, JudgePolicy::Mean);
+        assert_eq!(r.winner, None, "no ballots → no winner");
+        assert_eq!(r.judges_counted, 0);
+        // Zero candidates → no winner regardless of ballots.
+        let r0 = aggregate_judge(&[vec![]], 0, JudgePolicy::Borda);
+        assert_eq!(r0.winner, None, "no candidates → no winner");
+    }
+
+    #[test]
+    fn resolve_candidate_count_pin_then_infer() {
+        // Explicit pin wins.
+        assert_eq!(
+            resolve_candidate_count(Some(r#"{"aggregate":"mean","candidates":4}"#), &[]),
+            4
+        );
+        // No pin → infer the widest ballot across judges (array len / max key+1).
+        let outs = vec![Some(r#"{"scores":[0.1,0.2]}"#), Some(r#"{"scores":{"3":0.9}}"#)];
+        assert_eq!(
+            resolve_candidate_count(Some(r#"{"aggregate":"borda"}"#), &outs),
+            4,
+            "max(2, key3+1=4) = 4"
+        );
+        // Nothing to infer from → 0.
+        assert_eq!(resolve_candidate_count(None, &[Some("garbage")]), 0);
+    }
+
+    #[test]
+    fn render_judge_summary_leads_with_parseable_winner_marker() {
+        let r = aggregate_judge(
+            &[vec![Some(0.9), Some(0.2), Some(0.5)], vec![Some(0.7), Some(0.4), Some(0.6)]],
+            3,
+            JudgePolicy::Mean,
+        );
+        let s = render_judge_summary(&r, JudgePolicy::Mean);
+        assert!(s.starts_with("WINNER: candidate 0"), "summary leads with the winner: {s}");
+        assert!(s.contains("aggregate=mean"), "policy surfaced: {s}");
+        assert!(s.contains("scores=["), "per-candidate aggregates surfaced: {s}");
+        assert!(s.contains("judges=2/2"), "judge count surfaced: {s}");
+
+        // No winner → leads with `WINNER: none`.
+        let none = render_judge_summary(&aggregate_judge(&[], 3, JudgePolicy::Mean), JudgePolicy::Mean);
+        assert!(none.starts_with("WINNER: none"), "no-winner marker: {none}");
     }
 
     // -------------------------------------------------------------------------
@@ -3413,6 +4082,313 @@ mod tests {
         for t in &detail.tasks {
             assert_eq!(t.status, "done", "task {} done", t.title);
             assert_eq!(t.kind, "agent", "no verify kind injected");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // judge 模式 (UC-1c): end-to-end engine drive. A judge aggregator settles in
+    // the FILL step (no worker dispatch, no in-flight slot), parses its N judges'
+    // ballots, aggregates them (mean/borda) to pick a winner, and writes a
+    // parseable WINNER marker. NO downstream gate — it reports the winner.
+    // -------------------------------------------------------------------------
+
+    /// A worker whose output is keyed by the task SPEC so a test can make a judge
+    /// emit a specific ballot deterministically. Convention:
+    /// - spec contains "BALLOT:<json>" → output the `<json>` after the marker
+    ///   (lets a test inject `{"scores":[..]}` verbatim, or garbage to be dropped);
+    /// - otherwise → a plain "did <spec>" output (a normal candidate worker).
+    ///
+    /// Records its per-task start order + seen specs so the test can assert the
+    /// judge aggregator NEVER reached a worker (no spin, no dispatch).
+    struct BallotWorkerRunner {
+        start_order: Mutex<Vec<String>>,
+        seen_specs: Mutex<Vec<String>>,
+    }
+    impl BallotWorkerRunner {
+        fn new() -> Self {
+            Self { start_order: Mutex::new(vec![]), seen_specs: Mutex::new(vec![]) }
+        }
+    }
+    #[async_trait]
+    impl WorkerRunner for BallotWorkerRunner {
+        async fn run(
+            &self,
+            _member: &FleetMember,
+            _workspace_dir: Option<&str>,
+            _run_id: &str,
+            task_id: &str,
+            _brief: &str,
+            task_spec: &str,
+            _timeout: Duration,
+            on_started: Box<dyn FnOnce(i64) + Send>,
+        ) -> Result<WorkerOutcome, AppError> {
+            self.start_order.lock().unwrap().push(task_id.to_string());
+            self.seen_specs.lock().unwrap().push(task_spec.to_string());
+            on_started(900);
+            let text = if let Some(idx) = task_spec.find("BALLOT:") {
+                task_spec[idx + "BALLOT:".len()..].trim().to_string()
+            } else {
+                format!("did {task_spec}")
+            };
+            Ok(WorkerOutcome { conversation_id: 900, text: Some(text), ok: true })
+        }
+    }
+
+    /// Plan: M candidate agent tasks (0..M) → N judge agent tasks (each dep on ALL
+    /// candidates, emitting `judge_ballots[j]` as its BALLOT) → one `judge`
+    /// aggregator (dep on all judges) → one downstream Consumer agent (dep on the
+    /// judge, to prove no gate / downstream proceeds). `aggregate_config` is the
+    /// judge task's raw pattern_config (or None for the default mean).
+    struct JudgePlanProducer {
+        candidates: usize,
+        judge_ballots: Vec<String>,
+        aggregate_config: Option<String>,
+    }
+    #[async_trait]
+    impl PlanProducer for JudgePlanProducer {
+        async fn produce(
+            &self,
+            _goal: &str,
+            _members: &[FleetMember],
+        ) -> Result<PlannedDag, AppError> {
+            let mut tasks = vec![];
+            // M candidate tasks (independent, share a fan-out group tag).
+            let mut candidate_indices = vec![];
+            for c in 0..self.candidates {
+                candidate_indices.push(tasks.len());
+                tasks.push(PlannedTask {
+                    title: format!("Candidate {c}"),
+                    spec: format!("produce alternative {c}"),
+                    task_profile: None,
+                    depends_on: vec![],
+                    member_index: Some(0),
+                    rationale: None,
+                    role: None,
+                    kind: "agent".to_string(),
+                    pattern_config: Some("{\"group\":\"candidates\"}".to_string()),
+                });
+            }
+            // N judge tasks, each depending on ALL candidates, emitting its ballot.
+            let mut judge_indices = vec![];
+            for (j, ballot) in self.judge_ballots.iter().enumerate() {
+                judge_indices.push(tasks.len());
+                tasks.push(PlannedTask {
+                    title: format!("Judge {}", j + 1),
+                    spec: format!("score every candidate. BALLOT:{ballot}"),
+                    task_profile: None,
+                    depends_on: candidate_indices.clone(),
+                    member_index: Some(0),
+                    rationale: None,
+                    role: None,
+                    kind: "agent".to_string(),
+                    pattern_config: None,
+                });
+            }
+            // The judge aggregator depending on every judge.
+            let judge_idx = tasks.len();
+            tasks.push(PlannedTask {
+                title: "Pick".to_string(),
+                spec: "aggregate judge ballots".to_string(),
+                task_profile: None,
+                depends_on: judge_indices,
+                member_index: Some(0),
+                rationale: None,
+                role: None,
+                kind: "judge".to_string(),
+                pattern_config: self.aggregate_config.clone(),
+            });
+            // Downstream consumer depending on the judge (proves NO gate).
+            tasks.push(PlannedTask {
+                title: "Consumer".to_string(),
+                spec: "build on the winning candidate".to_string(),
+                task_profile: None,
+                depends_on: vec![judge_idx],
+                member_index: Some(0),
+                rationale: None,
+                role: None,
+                kind: "agent".to_string(),
+                pattern_config: None,
+            });
+            Ok(PlannedDag { tasks })
+        }
+    }
+
+    /// Seed + plan a judge run over a single-member fleet. Returns
+    /// (RunService, RunEngine, the ballot worker, run id).
+    async fn judge_harness(
+        candidates: usize,
+        judge_ballots: Vec<&str>,
+        aggregate_config: Option<&str>,
+    ) -> (RunService, RunEngine, Arc<BallotWorkerRunner>, String) {
+        let db = init_database_memory().await.expect("db init");
+        let pool = db.pool().clone();
+        let run_repo = Arc::new(SqliteRunRepository::new(pool.clone()));
+        let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
+        let ws_repo = Arc::new(SqliteOrchWorkspaceRepository::new(pool.clone()));
+        let emitter = OrchestratorRunEventEmitter::new(Arc::new(RecordingBroadcaster::new()));
+        let planner: Arc<dyn PlanProducer> = Arc::new(JudgePlanProducer {
+            candidates,
+            judge_ballots: judge_ballots.iter().map(|s| s.to_string()).collect(),
+            aggregate_config: aggregate_config.map(str::to_string),
+        });
+        let run_service = RunService::new(
+            run_repo.clone(),
+            fleet_repo.clone(),
+            ws_repo.clone(),
+            planner,
+            emitter.clone(),
+        );
+        let worker = Arc::new(BallotWorkerRunner::new());
+        let worker_dyn: Arc<dyn WorkerRunner> = worker.clone();
+        let mut engine_deps =
+            RunEngineDeps::new(run_repo.clone(), worker_dyn, emitter, ws_repo.clone());
+        engine_deps.worker_timeout = Duration::from_secs(10);
+        engine_deps.default_max_parallel = 4;
+        let engine = RunEngine::new(Arc::new(engine_deps));
+
+        let fleet = crate::service::FleetService::new(fleet_repo)
+            .create(
+                "u1",
+                CreateFleetRequest {
+                    name: "judge fleet".to_string(),
+                    description: None,
+                    max_parallel: None,
+                    members: vec![sample_member("agent_a")],
+                },
+            )
+            .await
+            .expect("fleet");
+        let ws = crate::service::WorkspaceService::new(ws_repo)
+            .create(
+                "u1",
+                CreateWorkspaceRequest {
+                    name: "judge ws".to_string(),
+                    default_fleet_id: Some(fleet.id.clone()),
+                    workspace_dir: None,
+                },
+            )
+            .await
+            .expect("ws");
+        let run = run_service
+            .create(
+                "u1",
+                CreateRunRequest {
+                    workspace_id: ws.id,
+                    goal: "generate candidates, judge, pick".to_string(),
+                    fleet_id: fleet.id,
+                    autonomy: None,
+                    max_parallel: Some(4),
+                },
+            )
+            .await
+            .expect("run");
+        run_service.plan(&run.id).await.expect("plan");
+        (run_service, engine, worker, run.id)
+    }
+
+    #[tokio::test]
+    async fn judge_mean_picks_winner_and_downstream_proceeds() {
+        // 3 candidates, 2 judges. Means: c0=0.8, c1=0.3, c2=0.55 → winner c0.
+        let (svc, engine, worker, run_id) = judge_harness(
+            3,
+            vec![r#"{"scores":[0.9,0.2,0.5]}"#, r#"{"scores":[0.7,0.4,0.6]}"#],
+            Some(r#"{"aggregate":"mean"}"#),
+        )
+        .await;
+        engine.start(run_id.clone());
+        let detail = drive_to_completion(&svc, &run_id).await;
+        assert_eq!(detail.run.status, "completed", "judge run completes");
+
+        let by_title = |t: &str| detail.tasks.iter().find(|x| x.title == t).cloned().unwrap();
+        let pick = by_title("Pick");
+        // The judge aggregator is `done` with a parseable WINNER marker, no conv.
+        assert_eq!(pick.kind, "judge");
+        assert_eq!(pick.status, "done", "judge settled done");
+        assert_eq!(pick.conversation_id, None, "judge has no worker conversation");
+        let pick_summary = pick.output_summary.as_deref().unwrap_or("");
+        assert!(
+            pick_summary.starts_with("WINNER: candidate 0"),
+            "mean winner is c0: {pick_summary}"
+        );
+        assert!(pick_summary.contains("aggregate=mean"), "policy surfaced: {pick_summary}");
+        assert!(pick_summary.contains("judges=2/2"), "both judges counted: {pick_summary}");
+
+        // Downstream Consumer actually ran (NO gate — judge reports, doesn't skip).
+        let consumer = by_title("Consumer");
+        assert_eq!(consumer.status, "done", "downstream proceeds after a judge");
+
+        // The judge task NEVER reached a worker (no dispatch / no spin): the worker
+        // saw 3 candidates + 2 judges + 1 consumer = 6 tasks, never "Pick".
+        let started = worker.start_order.lock().unwrap().clone();
+        assert_eq!(started.len(), 6, "worker ran 6 tasks (judge excluded): {started:?}");
+        let specs = worker.seen_specs.lock().unwrap().clone();
+        assert!(
+            !specs.iter().any(|s| s.contains("aggregate judge ballots")),
+            "the judge task's spec must never reach a worker: {specs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn judge_borda_picks_winner() {
+        // 3 candidates, 2 judges, borda:
+        // J1: c1(0.9)>c0(0.5)>c2(0.1) → c1=2,c0=1,c2=0.
+        // J2: c1(0.8)>c2(0.6)>c0(0.2) → c1=2,c2=1,c0=0.
+        // Totals: c0=1,c1=4,c2=1 → winner c1.
+        let (svc, engine, _w, run_id) = judge_harness(
+            3,
+            vec![r#"{"scores":[0.5,0.9,0.1]}"#, r#"{"scores":[0.2,0.8,0.6]}"#],
+            Some(r#"{"aggregate":"borda"}"#),
+        )
+        .await;
+        engine.start(run_id.clone());
+        let detail = drive_to_completion(&svc, &run_id).await;
+        assert_eq!(detail.run.status, "completed");
+        let pick = detail.tasks.iter().find(|t| t.title == "Pick").unwrap();
+        let summary = pick.output_summary.as_deref().unwrap_or("");
+        assert!(summary.starts_with("WINNER: candidate 1"), "borda winner is c1: {summary}");
+        assert!(summary.contains("aggregate=borda"), "policy surfaced: {summary}");
+    }
+
+    #[tokio::test]
+    async fn judge_drops_unparseable_ballot_and_still_picks() {
+        // 2 candidates, 3 judges; the middle judge emits garbage → dropped. The
+        // two usable judges both favor c0 → winner c0, judges=2/3 in the summary.
+        let (svc, engine, _w, run_id) = judge_harness(
+            2,
+            vec![
+                r#"{"scores":[0.9,0.1]}"#,
+                "the worker crashed, no ballot here",
+                r#"{"scores":[0.8,0.2]}"#,
+            ],
+            None, // default mean
+        )
+        .await;
+        engine.start(run_id.clone());
+        let detail = drive_to_completion(&svc, &run_id).await;
+        assert_eq!(detail.run.status, "completed", "run completes despite a dropped judge");
+        let pick = detail.tasks.iter().find(|t| t.title == "Pick").unwrap();
+        let summary = pick.output_summary.as_deref().unwrap_or("");
+        assert!(summary.starts_with("WINNER: candidate 0"), "c0 from 2 usable ballots: {summary}");
+        assert!(summary.contains("judges=2/3"), "one judge dropped fail-safe: {summary}");
+        // Downstream still ran (no gate).
+        let consumer = detail.tasks.iter().find(|t| t.title == "Consumer").unwrap();
+        assert_eq!(consumer.status, "done");
+    }
+
+    #[tokio::test]
+    async fn judge_zero_regression_plain_agent_chain_still_runs() {
+        // ZERO-REGRESSION: a plain agent chain (no judge task) drives to
+        // completion exactly as before — the judge branch must not perturb the
+        // ordinary path.
+        let h = harness().await;
+        let run_id = seed_run(&h).await;
+        h.run_service.plan(&run_id).await.expect("plan");
+        h.engine.start(run_id.clone());
+        let detail = drive_to_completion(&h.run_service, &run_id).await;
+        assert_eq!(detail.run.status, "completed", "plain agent chain unaffected");
+        for t in &detail.tasks {
+            assert_eq!(t.status, "done", "task {} done", t.title);
+            assert_eq!(t.kind, "agent", "no judge kind injected");
         }
     }
 }
