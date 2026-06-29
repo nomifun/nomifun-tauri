@@ -81,7 +81,7 @@
 <div align="center">
 
 <p>
-  🎬 <b>宣传视频：</b><a href="https://youtu.be/gEDo5H0H0Pg">https://youtu.be/gEDo5H0H0Pg</a>
+  🎬 <b>宣传视频：</b><a href="https://www.youtube.com/watch?v=Z28XyhvNh_E">https://www.youtube.com/watch?v=Z28XyhvNh_E</a>
 </p>
 
 <p>

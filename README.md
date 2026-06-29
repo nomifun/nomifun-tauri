@@ -81,7 +81,7 @@ See [`SECURITY.md`](SECURITY.md) for the deployment threat model and responsible
 <div align="center">
 
 <p>
-  🎬 <b>Intro video:</b> <a href="https://youtu.be/gEDo5H0H0Pg">https://youtu.be/gEDo5H0H0Pg</a>
+  🎬 <b>Intro video:</b> <a href="https://www.youtube.com/watch?v=Z28XyhvNh_E">https://www.youtube.com/watch?v=Z28XyhvNh_E</a>
 </p>
 
 <p>
