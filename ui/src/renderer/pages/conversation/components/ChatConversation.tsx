@@ -31,6 +31,7 @@ import NomiChat from '../platforms/nomi/NomiChat';
 import { useNomiModelSelection } from '../platforms/nomi/useNomiModelSelection';
 import { OrchestrationProvider } from '../orchestration/OrchestrationContext';
 import OrchestrationCanvasOverlay from '../orchestration/OrchestrationCanvasOverlay';
+import ConversationContentSwitcher from '../orchestration/ConversationContentSwitcher';
 import StarOfficeMonitorCard from '../platforms/openclaw/StarOfficeMonitorCard.tsx';
 // import SkillRuleGenerator from './components/SkillRuleGenerator'; // Temporarily hidden
 
@@ -186,19 +187,27 @@ const NomiConversationPanel: React.FC<{ conversation: NomiConversation; sliderTi
   return (
     <OrchestrationProvider conversation={conversation}>
       <ChatLayout {...chatLayoutProps} conversation_id={conversation.id}>
-        <NomiChat
-          conversation_id={conversation.id}
-          workspace={conversation.extra.workspace}
-          modelSelection={modelSelection}
-          session_mode={conversation.extra?.session_mode}
-          cron_job_id={(conversation.extra as { cron_job_id?: string })?.cron_job_id}
-          loadedSkills={(conversation.extra as { skills?: string[] } | undefined)?.skills}
-          loadedMcpServers={(conversation.extra as { mcp_servers?: string[] } | undefined)?.mcp_servers}
-          loadedMcpStatuses={
-            (conversation.extra as { mcp_statuses?: IConversationMcpStatus[] } | undefined)?.mcp_statuses
-          }
-          agent_name={presetAssistantInfo?.name}
-        />
+        {/* Content-area projection (会话原生编排 v2, F7): keeps NomiChat ALWAYS
+            mounted and just toggles its visibility, overlaying a clicked DAG
+            worker node's read-only transcript when a node is projected. Outside
+            an OrchestrationProvider it would passthrough — here it is always
+            inside one, so projection works while the main conversation's scroll
+            + input draft survive the round-trip. */}
+        <ConversationContentSwitcher>
+          <NomiChat
+            conversation_id={conversation.id}
+            workspace={conversation.extra.workspace}
+            modelSelection={modelSelection}
+            session_mode={conversation.extra?.session_mode}
+            cron_job_id={(conversation.extra as { cron_job_id?: string })?.cron_job_id}
+            loadedSkills={(conversation.extra as { skills?: string[] } | undefined)?.skills}
+            loadedMcpServers={(conversation.extra as { mcp_servers?: string[] } | undefined)?.mcp_servers}
+            loadedMcpStatuses={
+              (conversation.extra as { mcp_statuses?: IConversationMcpStatus[] } | undefined)?.mcp_statuses
+            }
+            agent_name={presetAssistantInfo?.name}
+          />
+        </ConversationContentSwitcher>
       </ChatLayout>
       {/* Floating agent canvas (会话原生编排 v2). A sibling of ChatLayout inside the
           OrchestrationProvider — it self-gates on canvasOpen / runId, so it costs
