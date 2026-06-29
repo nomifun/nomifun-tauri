@@ -113,6 +113,9 @@
       "tokens": "Tokens",
       "current": "Now"
     },
+    "node": {
+      "tokens": "tok"
+    },
     "timing": {
       "took": "Took {{value}}",
       "running": "Running {{value}}"

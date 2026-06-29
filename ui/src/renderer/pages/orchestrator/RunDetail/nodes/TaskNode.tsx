@@ -6,7 +6,7 @@
 
 import React from 'react';
 import { Handle, Position, type Node, type NodeProps } from '@xyflow/react';
-import { Branch, CheckOne, CloseOne, Gavel, Lock, Merge, Refresh, Shield, Trophy } from '@icon-park/react';
+import { Branch, CheckOne, CloseOne, Gavel, Lightning, Lock, Merge, Refresh, Shield, Trophy } from '@icon-park/react';
 
 /** Task status → theme-var color + a slow-pulse hint for the running state. */
 export interface TaskStatusMeta {
@@ -199,6 +199,12 @@ export interface TaskNodeData extends Record<string, unknown> {
   attempt: number;
   /** Whether this assignment is locked (pinned against auto-routing). */
   locked?: boolean;
+  /** Per-task token usage off the wire (`TRunTask.tokens`). Rendered as a compact
+   * chip ONLY when it's a positive number; null / 0 / not-yet-run → no chip. */
+  tokens?: number | null;
+  /** Localized terse "tok" label for the token chip (computed in DagCanvas so the
+   * node stays free of i18n wiring). */
+  tokensLabel?: string;
   /** Click handler — opens the task inspector / transcript panel. */
   onOpen: () => void;
 }
@@ -488,6 +494,16 @@ function TaskNodeImpl({ data, selected }: NodeProps<TaskFlowNode>) {
           >
             <Branch theme='outline' size='10' strokeWidth={4} className='shrink-0 line-height-0' />
             <span className='truncate'>{data.groupChipLabel}</span>
+          </span>
+        )}
+        {typeof data.tokens === 'number' && data.tokens > 0 && (
+          <span
+            className='inline-flex shrink-0 items-center gap-3px rd-100px px-6px py-2px text-10px leading-none tabular-nums text-t-tertiary'
+            style={{ background: 'var(--fill-0)', border: '1px solid var(--border-light)' }}
+            title={`${data.tokens.toLocaleString()} ${data.tokensLabel ?? ''}`.trim()}
+          >
+            <Lightning theme='outline' size='10' strokeWidth={4} className='shrink-0 line-height-0' />
+            <span className='truncate'>{data.tokens.toLocaleString()}</span>
           </span>
         )}
       </div>

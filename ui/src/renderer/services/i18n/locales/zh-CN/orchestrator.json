@@ -113,6 +113,9 @@
       "tokens": "Tokens",
       "current": "当前"
     },
+    "node": {
+      "tokens": "tok"
+    },
     "timing": {
       "took": "用时 {{value}}",
       "running": "已运行 {{value}}"

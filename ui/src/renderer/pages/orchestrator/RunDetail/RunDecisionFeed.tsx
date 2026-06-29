@@ -6,7 +6,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Branch, Comment, Down, Gavel, Lock, Merge, Refresh, Robot, Shield } from '@icon-park/react';
+import { Branch, Comment, Down, Gavel, Lightning, Lock, Merge, Refresh, Robot, Shield } from '@icon-park/react';
 // The decision feed is the DEFAULT (对话) view, where the DAG canvas/roster (which
 // own dag-canvas.css, incl. the `nomi-dag-pulse` running-dot animation) are NOT
 // mounted — import the stylesheet here so the feed's status pulse works standalone.
@@ -193,6 +193,15 @@ const DecisionTaskRow: React.FC<{
         <span className='text-10px font-500 leading-none' style={{ color: meta.color }}>
           {statusText}
         </span>
+        {typeof task.tokens === 'number' && task.tokens > 0 && (
+          <span
+            className='inline-flex shrink-0 items-center gap-3px text-10px leading-none tabular-nums text-t-tertiary'
+            title={`${task.tokens.toLocaleString()} ${t('orchestrator.run.progress.tokens')}`}
+          >
+            <Lightning theme='outline' size='10' strokeWidth={4} className='shrink-0 line-height-0' />
+            {task.tokens.toLocaleString()}
+          </span>
+        )}
         {groupColor && (
           <span
             className='size-7px shrink-0 rd-full'

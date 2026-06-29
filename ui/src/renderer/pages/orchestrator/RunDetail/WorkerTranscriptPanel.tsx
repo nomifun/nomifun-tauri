@@ -7,7 +7,7 @@
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button, Drawer, Input, Popconfirm, Select, Spin, Switch, Tooltip } from '@arco-design/web-react';
-import { Comment, Redo, Send } from '@icon-park/react';
+import { Comment, Lightning, Redo, Send } from '@icon-park/react';
 import { ipcBridge } from '@/common';
 import type { TChatConversation } from '@/common/config/storage';
 import type { TAssignment, TFleetMember } from '@/common/types/orchestrator/orchestratorTypes';
@@ -366,6 +366,16 @@ const WorkerTranscriptPanel: React.FC<WorkerTranscriptPanelProps> = ({ open, onC
                         : 'orchestrator.run.timing.took',
                       { value: formatDuration(task.updated_at - task.created_at) }
                     )}
+                  </span>
+                </ConfigRow>
+              )}
+
+              {/* Tokens — per-task usage, only once the worker has produced turns */}
+              {task && typeof task.tokens === 'number' && task.tokens > 0 && (
+                <ConfigRow label={t('orchestrator.run.progress.tokens')}>
+                  <span className='inline-flex items-center gap-4px tabular-nums text-t-secondary'>
+                    <Lightning theme='outline' size='12' strokeWidth={3} className='shrink-0 text-t-tertiary' />
+                    {task.tokens.toLocaleString()}
                   </span>
                 </ConfigRow>
               )}

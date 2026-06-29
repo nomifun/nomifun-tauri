@@ -465,6 +465,8 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onBack, onOpenTask, embedd
           memberLogo: memberLogo(member),
           locked: assignment?.locked ?? false,
           attempt: task.attempt,
+          tokens: task.tokens,
+          tokensLabel: t('orchestrator.run.node.tokens'),
           onOpen: () => handleOpenTask(task),
         },
       };

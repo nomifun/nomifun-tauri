@@ -2098,6 +2098,7 @@ export type I18nKey =
   | 'orchestrator.run.manage.renameError'
   | 'orchestrator.run.mobile.noTasks'
   | 'orchestrator.run.mobile.tasksLabel'
+  | 'orchestrator.run.node.tokens'
   | 'orchestrator.run.openConversation'
   | 'orchestrator.run.precipitate.exists'
   | 'orchestrator.run.precipitate.modelsLabel'
