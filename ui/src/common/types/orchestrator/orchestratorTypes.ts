@@ -243,6 +243,12 @@ export type TCreateAdhocRun = {
   pinned_roles?: string[];
   autonomy?: string;
   max_parallel?: number;
+  /** Originating conversation id to link this run to (会话原生编排 v2, Path B).
+   * Lets the right-rail empty-state (Task F5) launch a run straight from the
+   * current conversation so the backend writes `extra.orchestrator_run_id` back
+   * onto it. Left unset by the「智能编排」Tab. The backend `lead_conv_id` is i64,
+   * arriving as a plain `number` over JSON. */
+  lead_conv_id?: number;
 };
 
 /** Body for `POST /api/orchestrator/runs/{id}/replan`. Re-plans a run IN PLACE:

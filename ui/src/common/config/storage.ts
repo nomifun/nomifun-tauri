@@ -457,6 +457,16 @@ export type TChatConversation =
         last_token_usage?: TokenUsageData;
         /** Cron job ID that spawned this conversation */
         cron_job_id?: string;
+        /** Orchestration run linked to this conversation (会话原生编排 v2).
+         * Written by the backend (Tasks B1–B3) onto the originating conversation
+         * and refreshed via `conversation.listChanged`; the single source of truth
+         * for "does this conversation have a run". `useConversationRun` derives its
+         * `runId` from here. Absent for conversations with no orchestration run. */
+        orchestrator_run_id?: string;
+        /** The specific run task this conversation backs, when the conversation was
+         * created as a worker for an orchestration run task (vs. the run's lead
+         * conversation). Absent for the lead conversation and non-orchestration ones. */
+        orchestrator_task_id?: string;
       }
     >;
 
