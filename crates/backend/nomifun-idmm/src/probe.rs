@@ -1978,6 +1978,30 @@ mod tests {
     }
 
     #[test]
+    fn pending_signal_multi_question_design_prompt_is_open_question() {
+        // REGRESSION (会话 27「中途开启智能决策不生效、完全没有决策记录」): the agent ended
+        // its turn on a multi-part design questionnaire — several NUMBERED TOPICS,
+        // some with bullet sub-options, closing on "请告诉我你的偏好…。". It is not a
+        // pick-one menu (no 回复编号/选择 intent), so it must surface as an on-arm
+        // OpenQuestion (the model tier answers it) — NOT fall through to `None`,
+        // which left IDMM silent. `desktopGateway:true` mirrors the real conv-27
+        // extra (a plain desktop conversation, not routed).
+        let multi_q = "好的！先问你几个基础设计问题：\n\n\
+                       1. **技术栈偏好**：你想用什么来写？\n   - 推荐：HTML5 + JS\n   - 或 Python\n\n\
+                       2. **界面风格**：\n   - 复古像素风\n   - 现代简约风\n\n\
+                       3. **核心规则**：撞墙死，还是穿墙继续？\n\n\
+                       请告诉我你的偏好，我们一个一个敲定，然后我再开始写代码。";
+        let msgs = vec![msg_row("left", false, "text", multi_q)];
+        match pending_signal_from_page(r#"{"desktopGateway":true,"workspace":"/p"}"#, &msgs) {
+            Some((SessionSignal::Decision(dp), _at)) => {
+                assert_eq!(dp.kind, DecisionKind::OpenQuestion, "a multi-question prompt is an open question");
+                assert!(dp.options.is_empty(), "an open question carries no enumerable options");
+            }
+            other => panic!("expected an OpenQuestion Decision, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn pending_signal_plain_desktop_with_gateway_flag_is_decision() {
         // REGRESSION (智能决策完全不可用): the capability-bus super-gateway grants
         // `desktopGateway:true` to EVERY locally-trusted desktop conversation, so

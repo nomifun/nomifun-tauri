@@ -318,21 +318,34 @@ pub fn detect_chat_decision(text: &str) -> Option<DecisionPrompt> {
 /// guesses an open answer (spec §5.4).
 ///
 /// Conservative by design: requires an interrogative cue (`?`/`？` or a
-/// question/select intent word) AND the absence of an options menu (no ≥2
-/// numbered options, no inline `(1/2)` token). Plain prose with no question,
-/// a numbered menu (that's an `Options` decision, not an open question), and the
-/// agent announcing its own next step all return `None`. The caller gates on
-/// `work_in_progress` (only an open question DURING an unfinished turn is a
-/// stall worth answering).
+/// question/select intent word) AND the absence of an INLINE discrete-choice
+/// token (`(1/2)` / `（1/2）`). Plain prose with no question, a genuine pick-one
+/// numbered menu (that's an `Options` decision — already caught by
+/// [`detect_chat_decision`] above), and the agent announcing its own next step
+/// all return `None`. A multi-part question prompt whose numbered lines are
+/// TOPICS rather than mutually-exclusive options IS an open question (the model
+/// answers all parts in free text). The caller gates on `work_in_progress` (only
+/// an open question DURING an unfinished turn is a stall worth answering).
 pub fn detect_chat_open_question(text: &str) -> Option<DecisionPrompt> {
     // If it parses as a discrete-options decision, it is NOT an open question.
     if detect_chat_decision(text).is_some() {
         return None;
     }
     let low = text.to_lowercase();
-    let options_present =
-        text.lines().filter(|l| is_numbered_option(l)).count() >= 2 || has_numeric_choice(&low);
-    if options_present {
+    // An INLINE discrete-choice token like `(1/2)` / `（1/2）` is an unambiguous
+    // pick-one menu marker → not an open question.
+    //
+    // Do NOT additionally disqualify on the COUNT of numbered lines. A multi-part
+    // design prompt — "先问你几个基础设计问题：1. 技术栈偏好… 2. 界面风格… 请告诉我你的
+    // 偏好。" — has several numbered TOPICS (each its own question), NOT mutually-
+    // exclusive options. The old `numbered_lines >= 2` guard mis-read those as a
+    // menu, so the turn matched NEITHER detector: `detect_chat_decision` declined
+    // it (no pick-one selection intent) and this returned `None` on the count, so
+    // IDMM never saw the pending question and stayed silent (会话 27「中途开启
+    // 智能决策不生效」, no decision record at all). A genuine pick-one numbered menu
+    // is already excluded by the `detect_chat_decision` check above (it carries the
+    // selection intent this multi-question prompt lacks).
+    if has_numeric_choice(&low) {
         return None;
     }
     let has_question = low.contains('?') || low.contains('？');
@@ -713,6 +726,56 @@ mod tests {
         // The agent announcing its own next step is not an open question.
         assert!(detect_chat_open_question("好的，我先去实现这个功能。").is_none());
         assert!(detect_chat_open_question("我会用 Canvas 来实现，现在开始。").is_none());
+    }
+
+    #[test]
+    fn open_question_multi_part_design_prompt_is_open_question() {
+        // REGRESSION (会话 27「中途开启智能决策不生效 / 完全没有决策记录」): a multi-part
+        // design questionnaire — several NUMBERED TOPICS (each a question, some with
+        // suggested bullet sub-options) ending on an open-intent statement — is an
+        // OPEN QUESTION the model tier should answer in free text. It is NOT a
+        // pick-one menu: there is no "回复编号"/选择 intent, so detect_chat_decision
+        // declines it. The old `numbered_lines >= 2` guard here mis-read the topic
+        // numbers as a menu and returned None, so the turn matched NEITHER detector
+        // and IDMM stayed silent. It must now classify as OpenQuestion.
+        let text = "好的！我会一步步和你确认设计，然后写出贪吃蛇游戏。\n\n\
+                    先问你几个基础设计问题，我们再往下细化：\n\n\
+                    1. **技术栈偏好**：你想用什么来写？\n\
+                    \u{20}  - 推荐：**HTML5 + JavaScript**\n\
+                    \u{20}  - 或 **Python + Pygame**\n\n\
+                    2. **界面风格**：\n\
+                    \u{20}  - 复古像素风\n\
+                    \u{20}  - 现代简约风\n\n\
+                    3. **核心规则**：\n\
+                    \u{20}  - 撞墙死，还是穿墙继续？\n\
+                    \u{20}  - 是否显示分数和最高分？\n\n\
+                    请告诉我你的偏好，我们一个一个敲定，然后我再开始写代码。";
+        assert!(
+            detect_chat_decision(text).is_none(),
+            "a multi-question design prompt has no pick-one selection intent → not an Options decision"
+        );
+        let dp = detect_chat_open_question(text).expect("a multi-part design prompt is an open question");
+        assert_eq!(dp.kind, DecisionKind::OpenQuestion);
+        assert!(dp.options.is_empty(), "an open question carries no enumerable options");
+        assert!(dp.permission.is_none());
+        assert_eq!(dp.source, DecisionSource::TextScan);
+    }
+
+    #[test]
+    fn open_question_multi_part_without_question_mark_via_open_intent() {
+        // The same shape but with NO `？` anywhere — the trailing "请告诉我你…" /
+        // "你希望…" open-intent cue must still classify it as an open question
+        // (numbered topics must not disqualify it).
+        let text = "我们先定几个方向：\n\
+                    1. 配色\n\
+                    2. 字体\n\
+                    3. 布局\n\
+                    告诉我你的偏好，我再继续。";
+        assert!(detect_chat_decision(text).is_none());
+        assert!(
+            detect_chat_open_question(text).is_some(),
+            "numbered TOPICS + an open-intent trailing line is an open question, not a menu"
+        );
     }
 
     // ── Chinese-convention menu formats (REGRESSION GUARD) ──
