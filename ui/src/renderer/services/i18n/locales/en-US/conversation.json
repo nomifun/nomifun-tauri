@@ -20,6 +20,7 @@
     "skillsMarketDetails": "View More >>"
   },
   "orchestration": {
+    "tab": "Orchestration",
     "startTitle": "Start orchestration",
     "startSubtitle": "Hand this conversation to a team of agents working together — watch their progress here in real time.",
     "startPlaceholder": "Describe the goal you want the agent team to accomplish…",

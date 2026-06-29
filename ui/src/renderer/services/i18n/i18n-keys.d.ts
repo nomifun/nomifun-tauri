@@ -546,6 +546,7 @@ export type I18nKey =
   | 'conversation.orchestration.startSubtitle'
   | 'conversation.orchestration.startSuccess'
   | 'conversation.orchestration.startTitle'
+  | 'conversation.orchestration.tab'
   | 'conversation.orchestration.unavailable'
   | 'conversation.sendbox.hint'
   | 'conversation.sessionMetrics.cacheHitCaption'
