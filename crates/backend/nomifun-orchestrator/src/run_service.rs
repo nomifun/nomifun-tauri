@@ -264,6 +264,14 @@ impl RunService {
 
         let members: Vec<FleetMember> = decode_fleet_snapshot(run_id, &run.fleet_snapshot);
 
+        // B3: phase narration — a deterministic, provider-independent progress
+        // narrative so the frontend can show "正在规划…" even when no reasoning
+        // stream is available. The `content` is a SEMANTIC KEY (the i18n copy lives
+        // in the frontend); the backend NEVER ships prose. `planning_started` fires
+        // BEFORE the lead call (the long silent gap the user complained about).
+        self.emitter
+            .emit_lead_thinking(run_id, "plan", "phase", None, Some("planning_started"), false);
+
         // B2: stream the lead's planning thought (reasoning + draft) over WS while
         // the one-shot completion runs. This path holds NO per-run lock (planning
         // happens before `engine.start`), so streaming is safe here. The throttle
@@ -275,6 +283,11 @@ impl RunService {
         let produced = self.planner.produce(&run.goal, &members, Some(&sink)).await;
         throttle.flush();
         let mut dag: PlannedDag = produced?;
+
+        // B3: the lead produced a DAG — narrate the decomposition phase before we
+        // persist the tasks/edges (still a semantic key, no prose).
+        self.emitter
+            .emit_lead_thinking(run_id, "plan", "phase", None, Some("decomposing"), false);
 
         // CYCLE GUARD (symmetric with `adjust`'s `reconcile_plan_has_cycle`): the
         // planner's `depends_on` indices are range-validated when wiring edges below,
@@ -368,6 +381,9 @@ impl RunService {
         //    and (b) supplying the fallback ordering when the planner abstains or its
         //    pick is vetoed. (The retired top-K rule predates per-model descriptions
         //    and would wrongly override a deliberate-but-not-top-scored pick.)
+        // B3: narrate the assignment phase before routing each task to a member.
+        self.emitter
+            .emit_lead_thinking(run_id, "plan", "phase", None, Some("assigning"), false);
         for (idx, planned) in dag.tasks.iter().enumerate() {
             let task_id = &task_ids[idx];
 
@@ -1458,6 +1474,51 @@ impl RunService {
     }
 }
 
+/// **Optimistic create (B3): background plan + engine start.** Spawn the run's
+/// planning (and, for non-`interactive` autonomy, the engine loop) onto a detached
+/// `tokio` task so the HTTP handler can return the freshly-created `planning`-state
+/// run IMMEDIATELY — closing the long "submit → blank wait" gap (the lead's
+/// planning thought then streams in over `leadThinking` while the FE shows the run).
+///
+/// Used by BOTH front doors so they stay consistent:
+/// - the Tab route [`create_adhoc_run`](crate::routes) (the空挡 complaint's source), and
+/// - the MCP/caps front door (`caps_orchestrator::create`).
+///
+/// **Fail-soft (no panic):** [`RunService::plan`] is itself fail-soft for a bad
+/// plan (it degrades a cyclic/garbled DAG to the degenerate single-task plan via
+/// `degenerate_plan`/`fallback_dag`), so the only `Err` it returns is a genuine
+/// infrastructure failure (DB / provider-config). We LOG that and leave the run in
+/// `planning` (re-plannable) — we never `unwrap`/panic in the detached task. On a
+/// successful plan the autonomy gate inside `plan` already set the run to
+/// `running` (non-interactive) or `awaiting_plan_approval` (interactive); we then
+/// start the engine for non-interactive runs (an interactive run waits for
+/// `approve`). `start` is synchronous (it spawns its own loop) — safe in the task.
+pub fn spawn_plan_and_start(
+    run_service: Arc<RunService>,
+    engine: crate::engine::RunEngine,
+    run_id: String,
+    autonomy: String,
+) {
+    tokio::spawn(async move {
+        if let Err(err) = run_service.plan(&run_id).await {
+            // Fail-soft: a bad plan already degraded inside `plan`; an Err here is a
+            // real infra failure. The run stays `planning` (re-plannable) — never
+            // panic the detached task.
+            tracing::warn!(
+                run_id = %run_id,
+                error = %err,
+                "background planning failed; run left in `planning` (re-plannable)"
+            );
+            return;
+        }
+        // `interactive` parks at `awaiting_plan_approval` — do NOT start the engine
+        // until the plan is approved. All other autonomy levels start immediately.
+        if autonomy != "interactive" {
+            engine.start(run_id);
+        }
+    });
+}
+
 /// Resolve a planned `member_index` to a fleet-snapshot member, defaulting to
 /// member 0 when the index is unset or out of range. Returns `None` only when
 /// the snapshot is empty.
@@ -2093,6 +2154,112 @@ mod tests {
                 pattern_config: None,
             }],
         }
+    }
+
+    // ── B3: plan() phase-narration leadThinking events ───────────────────────
+    //
+    // A broadcaster that records the ORDERED `content` key of every leadThinking
+    // `kind:"phase"` frame so a test can assert the deterministic phase narration
+    // `plan()` emits (planning_started → decomposing → assigning). The content is a
+    // SEMANTIC KEY (the frontend owns the i18n copy); the backend never sends prose.
+    #[derive(Clone)]
+    struct PhaseRecordingBroadcaster {
+        phases: Arc<Mutex<Vec<String>>>,
+    }
+    impl PhaseRecordingBroadcaster {
+        fn new() -> Self {
+            Self { phases: Arc::new(Mutex::new(Vec::new())) }
+        }
+        fn phase_keys(&self) -> Vec<String> {
+            self.phases.lock().unwrap().clone()
+        }
+    }
+    impl EventBroadcaster for PhaseRecordingBroadcaster {
+        fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
+            if event.name == "orchestrator.run.leadThinking"
+                && event.data.get("kind").and_then(|v| v.as_str()) == Some("phase")
+            {
+                if let Some(key) = event.data.get("content").and_then(|v| v.as_str()) {
+                    self.phases.lock().unwrap().push(key.to_string());
+                }
+            }
+        }
+    }
+
+    /// `plan()` emits an ORDERED sequence of `kind:"phase"` leadThinking events at
+    /// its key milestones — planning_started (before the lead call), decomposing
+    /// (after a DAG is in hand, before persisting tasks), assigning (before routing
+    /// assignments) — so the frontend has a deterministic, provider-independent
+    /// progress narrative even when no reasoning stream is available. The content
+    /// is a SEMANTIC KEY, never prose (i18n lives in the frontend).
+    #[tokio::test]
+    async fn plan_emits_ordered_phase_narration_events() {
+        let db = init_database_memory().await.expect("db init");
+        let pool = db.pool().clone();
+        let run_repo = Arc::new(SqliteRunRepository::new(pool.clone()));
+        let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
+        let ws_repo = Arc::new(SqliteOrchWorkspaceRepository::new(pool.clone()));
+        let bc = Arc::new(PhaseRecordingBroadcaster::new());
+        let emitter = OrchestratorRunEventEmitter::new(bc.clone());
+        let planner: Arc<dyn PlanProducer> =
+            Arc::new(FixedPlanProducer::new(single_task_dag(Some(0), None)));
+        let run_service = RunService::new(
+            run_repo.clone(),
+            fleet_repo.clone(),
+            ws_repo.clone(),
+            planner,
+            emitter,
+        );
+
+        let fleet = FleetService::new(fleet_repo)
+            .create(
+                "u1",
+                CreateFleetRequest {
+                    name: "phase fleet".to_string(),
+                    description: None,
+                    max_parallel: None,
+                    members: vec![member_input("agent_a", &[], "medium", "standard")],
+                },
+            )
+            .await
+            .expect("fleet create");
+        let ws = WorkspaceService::new(ws_repo)
+            .create(
+                "u1",
+                CreateWorkspaceRequest {
+                    name: "phase ws".to_string(),
+                    default_fleet_id: Some(fleet.id.clone()),
+                    workspace_dir: None,
+                },
+            )
+            .await
+            .expect("ws create");
+        let run = run_service
+            .create(
+                "u1",
+                CreateRunRequest {
+                    workspace_id: ws.id,
+                    goal: "do the thing".to_string(),
+                    fleet_id: fleet.id,
+                    autonomy: None,
+                    max_parallel: None,
+                },
+            )
+            .await
+            .expect("run create");
+
+        run_service.plan(&run.id).await.expect("plan");
+
+        // The three deterministic phase keys, IN ORDER.
+        assert_eq!(
+            bc.phase_keys(),
+            vec![
+                "planning_started".to_string(),
+                "decomposing".to_string(),
+                "assigning".to_string(),
+            ],
+            "plan() must emit planning_started → decomposing → assigning phase narration"
+        );
     }
 
     // (a) plan picks the Router's top member when it is clearly more capable than

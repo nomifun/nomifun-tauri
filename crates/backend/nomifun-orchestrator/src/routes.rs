@@ -224,14 +224,23 @@ async fn create_run(
 /// pre-built fleet — the fleet is synthesized from the request's `model_range`),
 /// then plan it and apply the same autonomy gate as [`create_run`].
 ///
+/// **Optimistic create (B3):** `create_adhoc` persists the run in `planning` and we
+/// return it IMMEDIATELY; planning (`plan`) + the conditional `engine.start` run in
+/// a detached background task ([`spawn_plan_and_start`]). This closes the long
+/// "submit → blank wait" gap — the FE jumps straight to the planning-state run and
+/// watches the lead's planning thought stream in over `leadThinking`, instead of
+/// blocking on the ~4096-token structured completion before any response. The
+/// returned run is `planning` with 0 tasks (the FE has a planning empty-state); for
+/// an `interactive` run the background plan parks it at `awaiting_plan_approval`.
+///
 /// **Default autonomy is `interactive`** (the Tab's approval门): unlike the
 /// workspace path's `create`, an ad-hoc run launched from the Tab should park at
 /// `awaiting_plan_approval` for a human to confirm the plan before any worker
 /// dispatches. The default is injected onto the REQUEST here — BEFORE
-/// `create_adhoc` persists it — so `plan` (which re-reads the persisted autonomy)
-/// applies the gate, and the `engine.start` decision below reads the same value.
-/// (The MCP/caps front door, by contrast, defaults to `supervised` — it has no
-/// Tab to approve through. See `caps_orchestrator`.)
+/// `create_adhoc` persists it — so the background `plan` (which re-reads the
+/// persisted autonomy) applies the gate, and the background `engine.start` decision
+/// reads the same value. (The MCP/caps front door, by contrast, defaults to
+/// `supervised` — it has no Tab to approve through. See `caps_orchestrator`.)
 async fn create_adhoc_run(
     State(state): State<OrchestratorRouterState>,
     Extension(user): Extension<CurrentUser>,
@@ -240,18 +249,21 @@ async fn create_adhoc_run(
     let Json(mut req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     // Tab default: park at the plan-approval gate unless the form picks another
     // level. Applied to the request so the value is what `create_adhoc` PERSISTS
-    // and `plan` re-reads for the autonomy gate (an empty string is treated as
-    // absent — same rule as RunService).
+    // and the background `plan` re-reads for the autonomy gate (an empty string is
+    // treated as absent — same rule as RunService).
     if req.autonomy.as_deref().map(str::trim).unwrap_or("").is_empty() {
         req.autonomy = Some("interactive".to_string());
     }
     let run = state.run_service.create_adhoc(&user.id, req).await?;
-    state.run_service.plan(&run.id).await?;
-    // `interactive` parks at `awaiting_plan_approval` — do NOT start the engine
-    // until the plan is approved. All other autonomy levels start immediately.
-    if run.autonomy != "interactive" {
-        state.engine.start(run.id.clone());
-    }
+    // Return the `planning`-state run NOW; plan + (conditional) start run in the
+    // background so the FE jumps to the run and sees the planning thought stream
+    // immediately rather than waiting out the lead completion (the空挡 fix).
+    crate::run_service::spawn_plan_and_start(
+        state.run_service.clone(),
+        state.engine.clone(),
+        run.id.clone(),
+        run.autonomy.clone(),
+    );
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(run))))
 }
 /// workspaces AND ad-hoc (workspace-less) runs. This is the read path for the
@@ -561,6 +573,62 @@ mod tests {
         fn broadcast(&self, _event: WebSocketMessage<serde_json::Value>) {}
     }
 
+    /// Records the NAME of every broadcast event so a test can assert a particular
+    /// event (e.g. `orchestrator.run.planUpdated`) eventually fired — used by the
+    /// optimistic-create test to confirm the background plan task completed.
+    #[derive(Clone)]
+    struct NameRecordingBroadcaster {
+        names: Arc<Mutex<Vec<String>>>,
+    }
+    impl NameRecordingBroadcaster {
+        fn new() -> Self {
+            Self { names: Arc::new(Mutex::new(Vec::new())) }
+        }
+        fn names(&self) -> Vec<String> {
+            self.names.lock().unwrap().clone()
+        }
+    }
+    impl EventBroadcaster for NameRecordingBroadcaster {
+        fn broadcast(&self, event: WebSocketMessage<serde_json::Value>) {
+            self.names.lock().unwrap().push(event.name.clone());
+        }
+    }
+
+    /// A planner that BLOCKS in `produce` until a shared gate is released, after
+    /// signalling that it was entered. This lets the optimistic-create test prove
+    /// the route returns the planning-state run BEFORE planning finishes (the
+    /// background spawn is still parked in `produce`).
+    struct GatedPlanProducer {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl PlanProducer for GatedPlanProducer {
+        async fn produce(
+            &self,
+            _goal: &str,
+            _members: &[FleetMember],
+            _sink: Option<&crate::plan::LeadThinkingSink>,
+        ) -> Result<PlannedDag, AppError> {
+            // Tell the test we are inside produce, then block until released.
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(PlannedDag {
+                tasks: vec![PlannedTask {
+                    title: "planned after release".to_string(),
+                    spec: "do it".to_string(),
+                    task_profile: None,
+                    depends_on: vec![],
+                    member_index: Some(0),
+                    rationale: None,
+                    role: None,
+                    kind: "agent".to_string(),
+                    pattern_config: None,
+                }],
+            })
+        }
+    }
+
     /// Minimal planner so a RunService can be constructed for the state.
     struct EmptyPlanProducer;
     #[async_trait::async_trait]
@@ -845,8 +913,11 @@ mod tests {
             "ad-hoc create must 201 CREATED"
         );
 
-        // Parse the returned Run and confirm the interactive-default autonomy
-        // parked it at `awaiting_plan_approval` after plan (engine NOT started).
+        // Parse the returned Run and confirm the interactive-default autonomy was
+        // PERSISTED on the request. With optimistic create the route returns in the
+        // `planning` state and the autonomy gate is applied by the BACKGROUND plan,
+        // so we poll for the eventual `awaiting_plan_approval` (the engine is NOT
+        // started for an interactive run).
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .expect("body bytes");
@@ -854,10 +925,120 @@ mod tests {
         let run = api.data.expect("run in response");
         assert_eq!(run.autonomy, "interactive", "ad-hoc default autonomy");
 
-        let detail = run_service.get_detail(&run.id).await.expect("detail");
+        let mut status = String::new();
+        for _ in 0..200 {
+            status = run_service.get_detail(&run.id).await.expect("detail").run.status;
+            if status == "awaiting_plan_approval" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(
-            detail.run.status, "awaiting_plan_approval",
-            "interactive ad-hoc run must park at awaiting_plan_approval after plan"
+            status, "awaiting_plan_approval",
+            "interactive ad-hoc run must park at awaiting_plan_approval after background plan"
+        );
+    }
+
+    /// **Optimistic create (B3):** `POST /api/orchestrator/runs/adhoc` returns the
+    /// run IMMEDIATELY in the `planning` state with ZERO tasks — planning runs in a
+    /// background `tokio::spawn`, NOT inline. We prove it with a planner that BLOCKS
+    /// in `produce` until the test releases it: with the optimistic change the route
+    /// responds (201, planning, 0 tasks) while the planner is still parked; the
+    /// pre-fix inline route would be stuck inside `produce` and the bounded `timeout`
+    /// below would elapse (RED). After releasing the gate, the background plan
+    /// completes and emits `planUpdated`.
+    #[tokio::test]
+    async fn create_adhoc_run_returns_planning_before_plan_completes() {
+        let db = init_database_memory().await.expect("db init");
+        let pool = db.pool().clone();
+        let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
+        let ws_repo = Arc::new(SqliteOrchWorkspaceRepository::new(pool.clone()));
+        let run_repo = Arc::new(SqliteRunRepository::new(pool));
+        let fleet = FleetService::new(fleet_repo.clone());
+        let workspace = WorkspaceService::new(ws_repo.clone());
+        let bc = Arc::new(NameRecordingBroadcaster::new());
+        let emitter = OrchestratorRunEventEmitter::new(bc.clone());
+
+        // A planner gated on two Notifys: signal-on-entry + block-until-released.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let planner: Arc<dyn PlanProducer> = Arc::new(GatedPlanProducer {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let run_service = Arc::new(RunService::new(
+            run_repo.clone(),
+            fleet_repo,
+            ws_repo.clone(),
+            planner,
+            emitter.clone(),
+        ));
+        let worker: Arc<dyn WorkerRunner> = Arc::new(MockWorkerRunner::with_text(1, "x"));
+        let engine =
+            RunEngine::new(Arc::new(RunEngineDeps::new(run_repo, worker, emitter, ws_repo)));
+
+        let run_service_for_assert = run_service.clone();
+        let state = OrchestratorRouterState::new(fleet, workspace, run_service, engine);
+        let app = orchestrator_routes(state).layer(axum::Extension(CurrentUser {
+            id: "u1".to_string(),
+            username: "tester".to_string(),
+        }));
+
+        let body = serde_json::json!({
+            "goal": "optimistic goal",
+            "model_range": { "mode": "single", "model": { "provider_id": "p", "model": "m" } }
+        })
+        .to_string();
+
+        // The route MUST return without waiting on the (still-gated) planner. Bound
+        // it with a timeout so the pre-fix inline route fails loudly (RED) rather
+        // than hanging the test.
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/orchestrator/runs/adhoc")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("route must return before planning completes (optimistic create)")
+        .expect("request");
+        assert_eq!(resp.status(), StatusCode::CREATED, "optimistic create must 201");
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let api: ApiResponse<Run> = serde_json::from_slice(&bytes).expect("decode ApiResponse<Run>");
+        let run = api.data.expect("run in response");
+
+        // At return time the run is still `planning` with NO tasks (the gated
+        // planner has not produced a DAG yet) — confirm the background plan really
+        // is still parked by waiting for it to ENTER `produce`.
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("background plan task must reach produce()");
+        let detail = run_service_for_assert.get_detail(&run.id).await.expect("detail");
+        assert_eq!(detail.run.status, "planning", "run returned in planning state");
+        assert_eq!(detail.tasks.len(), 0, "no tasks persisted before plan completes");
+
+        // Release the gate; the background plan finishes and emits planUpdated.
+        release.notify_one();
+        let mut saw_plan_updated = false;
+        for _ in 0..200 {
+            if bc.names().iter().any(|n| n == "orchestrator.run.planUpdated") {
+                saw_plan_updated = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            saw_plan_updated,
+            "background planning must complete and emit planUpdated after release; saw {:?}",
+            bc.names()
         );
     }
 

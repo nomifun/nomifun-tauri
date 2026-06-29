@@ -168,6 +168,17 @@ async fn create(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: RunCreat
     // 5. Plan: decompose the goal → task DAG + assignments, then apply the
     //    autonomy gate. An `interactive` run parks at `awaiting_plan_approval`;
     //    every other level (incl. the supervised default) flips to `running`.
+    //
+    //    **DELIBERATELY SYNCHRONOUS — divergence from the Tab front door (B3).**
+    //    The Tab route (`routes::create_adhoc_run`) is OPTIMISTIC: it returns the
+    //    `planning`-state run immediately and runs `plan` in a background task
+    //    (`run_service::spawn_plan_and_start`) so the Tab UI sees the planning
+    //    thought stream over WS without waiting. This MCP/caps front door does NOT
+    //    have a WS subscription — it is a ONE-SHOT tool call whose RESULT must carry
+    //    the post-plan status + planned `task_count` (and, for an interactive run,
+    //    the 主管 relay message naming that count, built at step 8). Backgrounding
+    //    the plan here would return an empty/meaningless result to the calling
+    //    agent, so this path keeps the create → plan → start choreography INLINE.
     if let Err(e) = deps.orchestrator_run_service.plan(&run.id).await {
         return json!({ "error": format!("run {} created but planning failed: {e}", run.id) });
     }
