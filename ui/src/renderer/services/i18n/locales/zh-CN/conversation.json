@@ -19,6 +19,17 @@
     "skillsMarketDesc": "按需搜索并调用社区 Skills，一次配置，所有Agent通用。",
     "skillsMarketDetails": "详情 >>"
   },
+  "orchestration": {
+    "startTitle": "发起智能编排",
+    "startSubtitle": "把当前会话交给多个 agent 协作完成，过程可在此实时查看。",
+    "startPlaceholder": "描述你想让 agent 团队完成的目标…",
+    "startLabel": "发起编排",
+    "startSuccess": "已发起编排，正在规划…",
+    "unavailable": "此会话不支持智能编排",
+    "planning": "规划中…",
+    "expand": "展开画布",
+    "awaitingPlan": "正在生成任务编排…"
+  },
   "history": {
     "noHistory": "暂无对话历史",
     "deleteTitle": "删除",

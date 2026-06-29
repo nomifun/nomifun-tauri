@@ -64,6 +64,12 @@
     "roleUnknown": "待分派",
     "modelUnknown": "未指定模型"
   },
+  "canvas": {
+    "entryLabel": "画布",
+    "title": "Agent 画布",
+    "openCanvas": "展开 agent 画布",
+    "collapse": "收起"
+  },
   "run": {
     "role": {
       "planner": "规划",
@@ -158,6 +164,7 @@
       "resumeOk": "Run 已继续",
       "resumeError": "继续 Run 失败：{{error}}",
       "replan": "重新规划",
+      "replanOk": "已重新规划",
       "loadError": "加载 Run 详情失败",
       "planningTitle": "正在规划任务…",
       "planningDesc": "编队正在拆解目标并生成任务图，稍候即可看到节点。",
@@ -228,8 +235,13 @@
       "hint": "向正在执行该任务的 worker 实时插入一条引导消息。",
       "placeholder": "输入要插入的引导内容…",
       "send": "发送",
+      "open": "转向…",
       "sent": "已发送引导消息",
       "error": "发送引导消息失败：{{error}}"
+    },
+    "project": {
+      "viewing": "查看",
+      "returnMain": "返回 main"
     },
     "intent": {
       "label": "调整编排",

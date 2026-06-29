@@ -137,19 +137,6 @@
   color: var(--text-primary);
 }
 
-/* The 「画布」glyph badge that leads the chip, primary-tinted. */
-.chipBadge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  flex-shrink: 0;
-  border-radius: 7px;
-  color: #fff;
-  background: rgb(var(--primary-6));
-}
-
 /* The planning pulse ring around the status dot (mirrors the header indicator). */
 .chipPulse {
   position: relative;

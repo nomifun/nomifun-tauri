@@ -19,6 +19,17 @@
     "skillsMarketDesc": "Search and activate community Skills on demand. Configure once, available for all agents.",
     "skillsMarketDetails": "View More >>"
   },
+  "orchestration": {
+    "startTitle": "Start orchestration",
+    "startSubtitle": "Hand this conversation to a team of agents working together — watch their progress here in real time.",
+    "startPlaceholder": "Describe the goal you want the agent team to accomplish…",
+    "startLabel": "Start orchestration",
+    "startSuccess": "Orchestration started — planning…",
+    "unavailable": "This conversation doesn't support orchestration",
+    "planning": "Planning…",
+    "expand": "Expand canvas",
+    "awaitingPlan": "Generating the task orchestration…"
+  },
   "history": {
     "noHistory": "No chat history",
     "deleteTitle": "Delete",

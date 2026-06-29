@@ -6,9 +6,6 @@
     "tools": "增强工具",
     "settings": "设置"
   },
-  "siderNav": {
-    "orchestrator": "智能编排"
-  },
   "send": "发送",
   "cancel": "取消",
   "save": "保存",

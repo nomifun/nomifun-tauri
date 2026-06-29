@@ -6,9 +6,6 @@
     "tools": "Tools",
     "settings": "Settings"
   },
-  "siderNav": {
-    "orchestrator": "Orchestration"
-  },
   "send": "Send",
   "cancel": "Cancel",
   "save": "Save",

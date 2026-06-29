@@ -64,6 +64,12 @@
     "roleUnknown": "Unassigned",
     "modelUnknown": "No model set"
   },
+  "canvas": {
+    "entryLabel": "Canvas",
+    "title": "Agent canvas",
+    "openCanvas": "Expand agent canvas",
+    "collapse": "Collapse"
+  },
   "run": {
     "role": {
       "planner": "Planner",
@@ -158,6 +164,7 @@
       "resumeOk": "Run resumed",
       "resumeError": "Failed to resume run: {{error}}",
       "replan": "Re-plan",
+      "replanOk": "Re-planned",
       "loadError": "Failed to load run detail",
       "planningTitle": "Planning tasks…",
       "planningDesc": "The fleet is breaking the goal into a task graph — nodes will appear shortly.",
@@ -228,8 +235,13 @@
       "hint": "Inject a steering message into the worker currently running this task.",
       "placeholder": "Type a steering message to inject…",
       "send": "Send",
+      "open": "Steer…",
       "sent": "Steering message sent",
       "error": "Failed to send steering message: {{error}}"
+    },
+    "project": {
+      "viewing": "Viewing",
+      "returnMain": "Back to main"
     },
     "intent": {
       "label": "Adjust orchestration",

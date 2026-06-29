@@ -145,16 +145,12 @@ const Layout: React.FC<{
   const navigate = useNavigate();
   useConversationShortcuts({ navigate });
   const location = useLocation();
-  // The titlebar workspace toggle drives the right rail on the conversation,
-  // terminal, and orchestrator (run-workspace) session pages (all render a
-  // workspace rail via the shared useWorkspaceCollapse + WORKSPACE_TOGGLE_EVENT
-  // protocol). On /orchestrator the rail only exists when the selected run has
-  // a work_dir, so the page additionally broadcasts a WORKSPACE_AVAILABILITY_
-  // EVENT the titlebar honors to hide its button when no rail is present.
+  // The titlebar workspace toggle drives the right rail on the conversation and
+  // terminal session pages (both render a workspace rail via the shared
+  // useWorkspaceCollapse + WORKSPACE_TOGGLE_EVENT protocol).
   const workspaceAvailable =
     location.pathname.startsWith('/conversation/') ||
-    location.pathname.startsWith('/terminal/') ||
-    location.pathname.startsWith('/orchestrator');
+    location.pathname.startsWith('/terminal/');
   const collapsedRef = useRef(collapsed);
   const railWidthRef = useRef(railWidth);
   const lastCssRef = useRef('');
