@@ -10,6 +10,7 @@ import { useNavigate } from 'react-router-dom';
 import { Button, Dropdown, Menu } from '@arco-design/web-react';
 import { Brain, Down, Plus } from '@icon-park/react';
 import { configService } from '@/common/config/configService';
+import { useConfig } from '@/renderer/hooks/config/useConfig';
 import { iconColors } from '@/renderer/styles/colors';
 import { useModelProviderList } from '@/renderer/hooks/agent/useModelProviderList';
 import { useProvidersQuery } from '@/renderer/hooks/agent/useModelProviderList';
@@ -33,7 +34,11 @@ const STORAGE_KEY = 'knowledge.autogenModel';
 export function useKnowledgeAutogenModel() {
   const { providers, getAvailableModels } = useModelProviderList();
 
-  const stored = configService.get(STORAGE_KEY);
+  // Read reactively (useSyncExternalStore subscription), NOT a one-shot
+  // configService.get(): setChoice writes via set/remove, which notify
+  // subscribers — without subscribing, the selector kept showing the old label
+  // ("默认模型") until the modal remounted ("点击切换模型没有任何反应").
+  const [stored] = useConfig(STORAGE_KEY);
 
   // A stored pair is only honoured while the provider is still enabled and the
   // model still available; otherwise we fall back to the backend default so a
