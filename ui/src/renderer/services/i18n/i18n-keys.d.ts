@@ -944,6 +944,8 @@ export type I18nKey =
   | 'idmm.hint'
   | 'idmm.interventions'
   | 'idmm.label'
+  | 'idmm.locked.badge'
+  | 'idmm.locked.notice'
   | 'idmm.log.action'
   | 'idmm.log.actionValue.answer_choice'
   | 'idmm.log.actionValue.confirm'
