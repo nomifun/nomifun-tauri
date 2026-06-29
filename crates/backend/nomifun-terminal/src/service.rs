@@ -742,7 +742,6 @@ impl TerminalService {
     /// rather than writing to a dead handle. Call once at boot, before cron
     /// init. Returns the number of rows reconciled.
     pub async fn reconcile_on_boot(&self) -> Result<u64, TerminalError> {
-        eprintln!("[autotitle-diag] nomifun-terminal auto-title build ACTIVE (boot reconcile)");
         let n = self.repo.mark_all_running_exited().await?;
         if n > 0 {
             info!(reconciled = n, "terminal boot reconciliation: ghost 'running' sessions marked exited");
@@ -788,9 +787,6 @@ impl TerminalService {
         let bytes = BASE64
             .decode(data_b64)
             .map_err(|e| TerminalError::InvalidInput(format!("base64: {e}")))?;
-        if !self.titled.contains_key(&id) {
-            eprintln!("[autotitle-diag] input id={id} bytes={} (pre-title)", bytes.len());
-        }
         let handle = self
             .live
             .get(&id)
@@ -815,13 +811,17 @@ impl TerminalService {
         if self.titled.contains_key(&id) {
             return;
         }
-        let text = String::from_utf8_lossy(bytes);
-        let mut had_newline = false;
+        // Enter is detected on the RAW bytes (a TUI submits with \r, which
+        // strip_ansi drops). The captured TEXT is strip_ansi'd so the mouse
+        // reports / focus events / cursor-key sequences a TUI like claude makes
+        // xterm send are never accumulated — they are not typed text. strip_ansi
+        // keeps \n + printable and removes \r and all other C0 controls.
+        let had_newline = bytes.iter().any(|&b| b == b'\r' || b == b'\n');
+        let cleaned = crate::ansi::strip_ansi(bytes);
         {
             let mut buf = self.first_input.entry(id).or_default();
-            for ch in text.chars() {
-                if ch == '\r' || ch == '\n' {
-                    had_newline = true;
+            for ch in cleaned.chars() {
+                if ch == '\n' {
                     break;
                 }
                 if buf.chars().count() >= 200 {
@@ -840,14 +840,9 @@ impl TerminalService {
             .get(&id)
             .map(|v| v.trim().is_empty())
             .unwrap_or(true);
-        eprintln!(
-            "[autotitle-diag] capture id={id} newline=true first_input={:?} empty={first_line_empty}",
-            self.first_input.get(&id).map(|v| v.clone()).unwrap_or_default()
-        );
         if first_line_empty {
             return;
         }
-        eprintln!("[autotitle-diag] capture id={id} -> firing maybe_autotitle");
         let svc = self.clone();
         tokio::spawn(async move {
             svc.maybe_autotitle(id, None).await;
@@ -865,22 +860,14 @@ impl TerminalService {
     async fn maybe_autotitle(&self, id: i64, llm_source: Option<String>) {
         // (1) Atomic once-claim: the first of the input/TurnEnd seams wins.
         if self.titled.insert(id, ()).is_some() {
-            eprintln!("[autotitle-diag] maybe id={id} already claimed -> skip");
             return;
         }
         // (2) Don't clobber a custom name (manual rename, create-time name, or a
         // command that isn't the mechanical default).
         let Ok(Some(row)) = self.repo.get_by_id(id).await else {
-            eprintln!("[autotitle-diag] maybe id={id} get_by_id failed -> skip");
             return;
         };
-        let dn = default_name(&row.command, row.backend.as_deref());
-        eprintln!(
-            "[autotitle-diag] maybe id={id} name={:?} command={:?} backend={:?} default_name={:?}",
-            row.name, row.command, row.backend, dn
-        );
-        if row.name != dn {
-            eprintln!("[autotitle-diag] maybe id={id} name-guard skip (name already custom)");
+        if row.name != default_name(&row.command, row.backend.as_deref()) {
             self.first_input.remove(&id);
             return;
         }
@@ -903,7 +890,6 @@ impl TerminalService {
             title = crate::title::fallback_title(&first_input, crate::title::TITLE_MAX_CHARS);
         }
         self.first_input.remove(&id);
-        eprintln!("[autotitle-diag] maybe id={id} computed title={:?} (from first_input={:?})", title, first_input);
 
         if title.is_empty() {
             // Nothing usable yet — release the once-guard so a later, real input
@@ -2249,6 +2235,23 @@ mod tests {
         assert!(
             wait_for_name(&svc, id, "你好", 4000).await,
             "agent session should title from first input, got {:?}",
+            svc.get(id).await.unwrap().name
+        );
+        svc.kill(id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn autotitle_strips_tui_mouse_and_focus_sequences() {
+        // A claude-style TUI enables mouse tracking + focus reporting, so xterm
+        // sends focus events (CSI I) and SGR mouse reports (CSI < … M) into the
+        // PTY before the user's typed text. These must be stripped, not titled.
+        let (svc, _bc) = service();
+        let id = svc.create("u", req("cat", &[])).await.unwrap().id;
+        let noisy = "\u{1b}[I\u{1b}[<35;29;26M\u{1b}[<0;30;25m你好\r";
+        svc.input(id, &BASE64.encode(noisy)).await.unwrap();
+        assert!(
+            wait_for_name(&svc, id, "你好", 4000).await,
+            "TUI control sequences must be stripped from the title, got {:?}",
             svc.get(id).await.unwrap().name
         );
         svc.kill(id).await.ok();
