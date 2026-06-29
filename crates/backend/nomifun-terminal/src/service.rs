@@ -896,6 +896,7 @@ impl TerminalService {
         if title == row.name {
             return;
         }
+        info!(terminal_id = id, title = %title, "auto-title: setting terminal session title");
         if let Err(e) = self.update_meta(id, Some(title), None).await {
             warn!(terminal_id = id, error = %e, "failed to persist auto-generated terminal title");
         }
