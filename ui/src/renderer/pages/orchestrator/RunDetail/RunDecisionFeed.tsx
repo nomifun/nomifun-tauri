@@ -117,7 +117,7 @@ const DecisionTaskRow: React.FC<{
   const statusText = t(`orchestrator.run.task.status.${task.status}` as 'orchestrator.run.task.status.pending', {
     defaultValue: t('orchestrator.run.status.unknown'),
   });
-  const rationale = assignment?.rationale?.trim() || t('orchestrator.feed.rationaleFallback');
+  const rationale = assignment?.rationale?.trim() || t('orchestrator.run.feed.rationaleFallback');
   const snippet = task.status === 'done' || task.status === 'completed' ? outputSnippet(task.output_summary) : null;
 
   return (
@@ -133,7 +133,7 @@ const DecisionTaskRow: React.FC<{
           onOpen();
         }
       }}
-      title={t('orchestrator.feed.openTask')}
+      title={t('orchestrator.run.feed.openTask')}
       className='group/row flex cursor-pointer select-none flex-col gap-6px rd-10px px-12px py-10px outline-none transition-all duration-150'
       style={{
         background: selected ? 'color-mix(in srgb, rgb(var(--primary-6)) 8%, var(--bg-1))' : 'var(--bg-1)',
@@ -203,7 +203,7 @@ const DecisionTaskRow: React.FC<{
       {/* Output snippet — only once the task settled with a summary. */}
       {snippet && (
         <div className='pl-22px text-11px leading-16px text-t-tertiary'>
-          <span className='font-600'>{t('orchestrator.feed.outputLabel')}: </span>
+          <span className='font-600'>{t('orchestrator.run.feed.outputLabel')}: </span>
           {snippet}
         </div>
       )}
@@ -357,7 +357,7 @@ const RunDecisionFeed: React.FC<RunDecisionFeedProps> = ({ detail, turns, onSele
             key={`group-${group}-${members[0].id}`}
             accent={groupColor}
             Glyph={Branch}
-            label={t('orchestrator.feed.groupFanout', { label: group })}
+            label={t('orchestrator.run.feed.groupFanout', { label: group })}
           >
             {members.map((m) => {
               step += 1;
@@ -441,7 +441,7 @@ const RunDecisionFeed: React.FC<RunDecisionFeedProps> = ({ detail, turns, onSele
               >
                 <Robot theme='outline' size='15' strokeWidth={3} />
               </span>
-              <span className='text-12px font-600 text-t-secondary'>{t('orchestrator.feed.agentName')}</span>
+              <span className='text-12px font-600 text-t-secondary'>{t('orchestrator.run.feed.agentName')}</span>
             </div>
             <div
               className='w-full rd-12px p-12px'
@@ -450,18 +450,18 @@ const RunDecisionFeed: React.FC<RunDecisionFeedProps> = ({ detail, turns, onSele
               {decisionEmpty ? (
                 <div className='flex items-center gap-8px py-4px text-12px leading-18px text-t-tertiary'>
                   <Comment theme='outline' size='15' strokeWidth={3} className='shrink-0' />
-                  <span>{t('orchestrator.feed.empty')}</span>
+                  <span>{t('orchestrator.run.feed.empty')}</span>
                 </div>
               ) : (
                 <>
                   <div className='mb-4px flex items-baseline gap-8px'>
-                    <span className='text-13px font-700 text-t-primary'>{t('orchestrator.feed.decisionTitle')}</span>
+                    <span className='text-13px font-700 text-t-primary'>{t('orchestrator.run.feed.decisionTitle')}</span>
                     <span className='text-11px text-t-tertiary'>
-                      {t('orchestrator.feed.decisionSubtitle', { count: orderedTasks.length })}
+                      {t('orchestrator.run.feed.decisionSubtitle', { count: orderedTasks.length })}
                     </span>
                   </div>
                   <div className='mb-10px text-12px leading-18px text-t-secondary'>
-                    {t('orchestrator.feed.decisionIntro')}
+                    {t('orchestrator.run.feed.decisionIntro')}
                   </div>
                   <div className='flex flex-col gap-8px'>{decisionBody}</div>
                 </>
@@ -495,13 +495,13 @@ const RunDecisionFeed: React.FC<RunDecisionFeedProps> = ({ detail, turns, onSele
                   >
                     <Robot theme='outline' size='15' strokeWidth={3} />
                   </span>
-                  <span className='text-12px font-600 text-t-secondary'>{t('orchestrator.feed.agentName')}</span>
+                  <span className='text-12px font-600 text-t-secondary'>{t('orchestrator.run.feed.agentName')}</span>
                 </div>
                 <div
                   className='max-w-[80%] px-12px py-8px text-13px leading-18px text-t-primary'
                   style={{ background: 'var(--bg-2)', border: '1px solid var(--border-base)', borderRadius: '4px 12px 12px 12px' }}
                 >
-                  {t('orchestrator.feed.intentReply', {
+                  {t('orchestrator.run.feed.intentReply', {
                     kept: turn.summary.kept,
                     added: turn.summary.added,
                     removed: turn.summary.removed,
@@ -518,8 +518,8 @@ const RunDecisionFeed: React.FC<RunDecisionFeedProps> = ({ detail, turns, onSele
         <div
           role='button'
           tabIndex={0}
-          aria-label={t('orchestrator.feed.scrollLatest')}
-          title={t('orchestrator.feed.scrollLatest')}
+          aria-label={t('orchestrator.run.feed.scrollLatest')}
+          title={t('orchestrator.run.feed.scrollLatest')}
           onClick={scrollToBottom}
           onKeyDown={(e) => {
             if (e.key === 'Enter' || e.key === ' ') {
