@@ -1989,6 +1989,7 @@ export type I18nKey =
   | 'orchestrator.composer.model.auto'
   | 'orchestrator.composer.model.autoHint'
   | 'orchestrator.composer.model.range'
+  | 'orchestrator.composer.model.rangeCount'
   | 'orchestrator.composer.model.rangePlaceholder'
   | 'orchestrator.composer.model.single'
   | 'orchestrator.composer.model.singlePlaceholder'

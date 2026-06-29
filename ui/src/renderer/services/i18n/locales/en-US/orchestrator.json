@@ -36,7 +36,8 @@
       "range": "Range",
       "singlePlaceholder": "Pick a model",
       "rangePlaceholder": "Pick multiple models",
-      "autoHint": "Will use all {{count}} enabled model(s), one member synthesized per model."
+      "autoHint": "Will use all {{count}} enabled model(s), one member synthesized per model.",
+      "rangeCount": "{{count}} model(s)"
     },
     "rolesLabel": "Pinned roles",
     "rolesHint": "Optional · leave empty to let the fleet assemble itself",

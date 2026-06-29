@@ -36,7 +36,8 @@
       "range": "范围",
       "singlePlaceholder": "选择一个模型",
       "rangePlaceholder": "选择多个模型",
-      "autoHint": "将使用全部 {{count}} 个已启用模型，每个模型生成一名成员。"
+      "autoHint": "将使用全部 {{count}} 个已启用模型，每个模型生成一名成员。",
+      "rangeCount": "{{count}} 个模型"
     },
     "rolesLabel": "钉选角色",
     "rolesHint": "可选 · 留空则由编队自动组建",
