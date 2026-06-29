@@ -450,6 +450,8 @@ export type I18nKey =
   | 'conversation.createFailed'
   | 'conversation.dropdown.cliAgents'
   | 'conversation.dropdown.presetAssistants'
+  | 'conversation.editMessage.action'
+  | 'conversation.editMessage.banner'
   | 'conversation.emptyCards.docsAction'
   | 'conversation.emptyCards.docsDescription'
   | 'conversation.emptyCards.docsTitle'

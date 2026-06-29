@@ -544,6 +544,10 @@
     "button": "立刻发送（插入正在生成的回复）",
     "fallbackQueued": "该引擎不支持回复中插话，已改为加入队列。"
   },
+  "editMessage": {
+    "action": "编辑",
+    "banner": "正在编辑消息——发送后将从这里重新生成"
+  },
   "clearContext": {
     "description": "清空会话上下文",
     "success": "上下文已清空",

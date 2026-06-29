@@ -544,6 +544,10 @@
     "button": "Send now (interject into the running reply)",
     "fallbackQueued": "This engine can't interject mid-reply — added to the queue instead."
   },
+  "editMessage": {
+    "action": "Edit",
+    "banner": "Editing message — sending will re-run from here"
+  },
   "clearContext": {
     "description": "Clear conversation context",
     "success": "Context cleared",

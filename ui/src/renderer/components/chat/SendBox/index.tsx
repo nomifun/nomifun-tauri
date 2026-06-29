@@ -165,6 +165,10 @@ const SendBox: React.FC<{
   onSteer?: (message: string) => Promise<void>;
   /** Gate the steer affordance (e.g. only for the Nomi native engine). */
   steerAvailable?: boolean;
+  /** When provided (Nomi only), enables "edit a sent message" mode: the message text is
+   *  recalled into the composer via the `sendbox.edit` event and submitting calls this
+   *  instead of onSend, which truncates the conversation and re-runs from that message. */
+  onEditResubmit?: (msgId: string, message: string) => Promise<void>;
   /** Clear the agent's conversation context (release model context). When set, a `/clear` builtin appears. */
   onClearContext?: () => void | Promise<void>;
   disabled?: boolean;
@@ -199,6 +203,7 @@ const SendBox: React.FC<{
   onStop,
   onSteer,
   steerAvailable,
+  onEditResubmit,
   onClearContext,
   prefix,
   className,
@@ -252,6 +257,8 @@ const SendBox: React.FC<{
   const [historyNavigationIndex, setHistoryNavigationIndex] = useState<number | null>(null);
   const historyDraftRef = useRef<string | null>(null);
   const [replyQuote, setReplyQuote] = useState<ReplyQuote | null>(null);
+  const [editingMsgId, setEditingMsgId] = useState<string | null>(null);
+  const editPrevDraftRef = useRef<string | null>(null);
   const [caretPosition, setCaretPosition] = useState(0);
   const [workspaceMentionItems, setWorkspaceMentionItems] = useState<FileOrFolderItem[]>([]);
   const [workspaceMentionLoading, setWorkspaceMentionLoading] = useState(false);
@@ -268,6 +275,27 @@ const SendBox: React.FC<{
   // Listen for reply events from message actions
   useAddEventListener('sendbox.reply', (quote) => setReplyQuote(quote), []);
   useAddEventListener('sendbox.reply.clear', () => setReplyQuote(null), []);
+
+  // 编辑已发送消息：把原文回填输入框，进入"编辑模式"，提交即截断重跑（仅 Nomi 提供 onEditResubmit）
+  useAddEventListener(
+    'sendbox.edit',
+    (payload) => {
+      if (!onEditResubmit) return;
+      editPrevDraftRef.current = latestInputRef.current;
+      setEditingMsgId(payload.msgId);
+      setReplyQuote(null);
+      setInputRef.current(payload.content);
+      requestAnimationFrame(() => {
+        const textarea = containerRef.current?.querySelector('textarea');
+        if (textarea instanceof HTMLTextAreaElement) {
+          textarea.focus();
+          const caret = textarea.value.length;
+          textarea.setSelectionRange(caret, caret);
+        }
+      });
+    },
+    [onEditResubmit]
+  );
 
   // 集成预览面板的"添加到聊天"功能 / Integrate preview panel's "Add to chat" functionality
   const { setSendBoxHandler, domSnippets, removeDomSnippet, clearDomSnippets } = usePreviewContext();
@@ -1234,8 +1262,31 @@ const SendBox: React.FC<{
     return finalMessage;
   };
 
+  const cancelEdit = () => {
+    setEditingMsgId(null);
+    const prev = editPrevDraftRef.current ?? '';
+    editPrevDraftRef.current = null;
+    setInput(prev);
+  };
+
   const sendMessageHandler = () => {
     if (isUploading) return;
+    // 编辑模式：提交走截断重跑而非普通发送。
+    if (editingMsgId && onEditResubmit) {
+      if (!input.trim()) return;
+      const finalMessage = input;
+      const targetId = editingMsgId;
+      setEditingMsgId(null);
+      editPrevDraftRef.current = null;
+      setInput('');
+      setIsLoading(true);
+      onEditResubmit(targetId, finalMessage)
+        .catch(() => {})
+        .finally(() => {
+          setIsLoading(false);
+        });
+      return;
+    }
     // Cancel any pending warmup: once the user actually submits, the
     // forthcoming /messages request will build the agent on its own.
     // Without this, a focus-triggered warmup timer still fires ~1s later
@@ -1560,6 +1611,19 @@ const SendBox: React.FC<{
         <div style={{ width: '100%' }}>
           {prefix}
           {context}
+          {/* 编辑消息提示条 / Editing message banner */}
+          {editingMsgId && (
+            <div className='flex items-center gap-10px mb-8px px-12px py-8px rd-10px bg-fill-1 b-1 b-solid b-border-2'>
+              <span className='text-13px text-t-primary'>{t('conversation.editMessage.banner')}</span>
+              <div
+                className='ml-auto flex-shrink-0 p-2px rd-full cursor-pointer hover:bg-fill-3 transition-colors'
+                onClick={cancelEdit}
+                style={{ lineHeight: 0 }}
+              >
+                <CloseSmall theme='outline' size='14' />
+              </div>
+            </div>
+          )}
           {/* Reply quote preview */}
           {replyQuote && (
             <div className='flex items-start gap-10px mb-8px px-12px py-10px rd-10px bg-fill-1 b-1 b-solid b-border-2'>
