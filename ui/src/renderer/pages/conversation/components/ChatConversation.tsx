@@ -30,6 +30,7 @@ import { getConversationCreateErrorMessage } from '@/renderer/pages/conversation
 import NomiChat from '../platforms/nomi/NomiChat';
 import { useNomiModelSelection } from '../platforms/nomi/useNomiModelSelection';
 import { OrchestrationProvider } from '../orchestration/OrchestrationContext';
+import CanvasEntryPill from '../orchestration/CanvasEntryPill';
 import OrchestrationCanvasOverlay from '../orchestration/OrchestrationCanvasOverlay';
 import ConversationContentSwitcher from '../orchestration/ConversationContentSwitcher';
 import StarOfficeMonitorCard from '../platforms/openclaw/StarOfficeMonitorCard.tsx';
@@ -169,6 +170,11 @@ const NomiConversationPanel: React.FC<{ conversation: NomiConversation; sliderTi
     sider: <ChatSlider conversation={conversation} />,
     headerExtra: (
       <div className='flex items-center gap-8px'>
+        {/* 会话原生编排 v2 (F8): when the conversation is linked to a run, a status
+            pill opens the floating agent canvas (F6). Self-gates to `null` when
+            there's no run, so the header stays clean otherwise. Merged ALONGSIDE
+            the existing extra (CronJobManager) — not replacing it. */}
+        <CanvasEntryPill />
         <CronJobManager
           conversation_id={conversation.id}
           cron_job_id={conversation.extra?.cron_job_id as string | undefined}
