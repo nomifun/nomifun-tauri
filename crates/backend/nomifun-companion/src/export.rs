@@ -730,6 +730,8 @@ mod tests {
             created_at: 1_111,
             updated_at: 2_222,
             last_reinforced_at: 3_333,
+            scope_kind: "user".into(),
+            scope_companion_id: String::new(),
         }
     }
 

@@ -30,6 +30,34 @@ fn half_life_days(kind: &str) -> Option<f64> {
 /// Below this strength a memory is auto-archived (still restorable in the UI).
 const ARCHIVE_THRESHOLD: f64 = 0.05;
 
+/// serde default for [`CompanionMemory::scope_kind`] so legacy export bundles
+/// (written before scope existed) deserialize as the shared/global default.
+fn default_scope_kind() -> String {
+    "user".to_string()
+}
+
+/// Visibility of a companion memory. Mirrors the companion-skills scoping
+/// (`scope_kind` `'user'`=shared / `'companion'`=private + `scope_companion_id`
+/// `''`=shared). Shared memories inject/recall for every companion; private
+/// memories only for their owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemoryScope {
+    /// Cross-companion: visible to every companion (legacy default).
+    Shared,
+    /// Owned by one companion: visible only to it.
+    Companion(String),
+}
+
+impl MemoryScope {
+    /// `(scope_kind, scope_companion_id)` column values.
+    pub fn columns(&self) -> (&'static str, String) {
+        match self {
+            MemoryScope::Shared => ("user", String::new()),
+            MemoryScope::Companion(id) => ("companion", id.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompanionMemory {
     pub id: String,
@@ -44,6 +72,12 @@ pub struct CompanionMemory {
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
     pub last_reinforced_at: TimestampMs,
+    /// `'user'` = shared (all companions) / `'companion'` = private to one.
+    #[serde(default = "default_scope_kind")]
+    pub scope_kind: String,
+    /// Owning companion id when private; `''` when shared.
+    #[serde(default)]
+    pub scope_companion_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +126,10 @@ pub struct MemoryFilter {
     pub kind: Option<String>,
     pub q: Option<String>,
     pub status: Option<String>,
+    /// When set, return only memories visible to this companion: shared
+    /// (`scope_kind='user'`) plus the companion's own private ones. `None`
+    /// returns every memory regardless of scope (cross-companion "all" view).
+    pub scope_companion_id: Option<String>,
     pub limit: i64,
     pub offset: i64,
 }
@@ -540,6 +578,12 @@ fn row_to_memory(row: &sqlx::sqlite::SqliteRow) -> CompanionMemory {
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         last_reinforced_at: row.get("last_reinforced_at"),
+        // scope_kind is NOT NULL DEFAULT 'user'; scope_companion_id is nullable
+        // on memories — normalize NULL/absent to '' so the shared/private query
+        // (`scope_kind='user' OR scope_companion_id=?`) and the wire shape are
+        // uniform with skills.
+        scope_kind: row.try_get::<String, _>("scope_kind").unwrap_or_else(|_| "user".to_string()),
+        scope_companion_id: row.try_get::<Option<String>, _>("scope_companion_id").ok().flatten().unwrap_or_default(),
     }
 }
 
@@ -767,11 +811,27 @@ impl CompanionStore {
         importance: f64,
         source: &str,
     ) -> Result<CompanionMemory, AppError> {
+        // Backward-compatible shared insert (the learner hub + legacy callers).
+        self.insert_memory_scoped(kind, content, tags, importance, source, MemoryScope::Shared).await
+    }
+
+    /// Insert a memory with an explicit [`MemoryScope`]. Chat saves attribute to
+    /// the owning companion (private); the learner and manual adds default shared.
+    pub async fn insert_memory_scoped(
+        &self,
+        kind: &str,
+        content: &str,
+        tags: &[String],
+        importance: f64,
+        source: &str,
+        scope: MemoryScope,
+    ) -> Result<CompanionMemory, AppError> {
         // Best-effort redaction before any secret reaches durable storage.
         // Covers both write paths (manual save_memory and the distill learner),
         // which both funnel through here.
         let content = nomi_redact::redact_secrets(content);
         let now = now_ms();
+        let (scope_kind, scope_companion_id) = scope.columns();
         let mem = CompanionMemory {
             id: generate_prefixed_id("mem"),
             kind: kind.to_owned(),
@@ -785,10 +845,12 @@ impl CompanionStore {
             created_at: now,
             updated_at: now,
             last_reinforced_at: now,
+            scope_kind: scope_kind.to_owned(),
+            scope_companion_id,
         };
         sqlx::query(
-            "INSERT INTO companion_memories(id, kind, content, tags, importance, strength, pinned, source, status, created_at, updated_at, last_reinforced_at)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO companion_memories(id, kind, content, tags, importance, strength, pinned, source, status, created_at, updated_at, last_reinforced_at, scope_kind, scope_companion_id)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )
         .bind(&mem.id)
         .bind(&mem.kind)
@@ -802,6 +864,8 @@ impl CompanionStore {
         .bind(mem.created_at)
         .bind(mem.updated_at)
         .bind(mem.last_reinforced_at)
+        .bind(&mem.scope_kind)
+        .bind(&mem.scope_companion_id)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -851,6 +915,10 @@ impl CompanionStore {
         if filter.status.is_some() {
             sql.push_str(" AND status = ?");
         }
+        if filter.scope_companion_id.is_some() {
+            // Shared (all companions) + this companion's own private memories.
+            sql.push_str(" AND (scope_kind = 'user' OR scope_companion_id = ?)");
+        }
         sql.push_str(" ORDER BY pinned DESC, strength DESC, updated_at DESC LIMIT ? OFFSET ?");
         let mut query = sqlx::query(&sql);
         if let Some(kind) = &filter.kind {
@@ -861,6 +929,9 @@ impl CompanionStore {
         }
         if let Some(status) = &filter.status {
             query = query.bind(status);
+        }
+        if let Some(cid) = &filter.scope_companion_id {
+            query = query.bind(cid);
         }
         let limit = if filter.limit <= 0 { 100 } else { filter.limit.min(500) };
         query = query.bind(limit).bind(filter.offset.max(0));
@@ -883,19 +954,44 @@ impl CompanionStore {
         content: Option<&str>,
         pinned: Option<bool>,
         status: Option<&str>,
+        scope: Option<MemoryScope>,
     ) -> Result<(), AppError> {
+        // Validate + redact edited content symmetrically with insert_memory_scoped:
+        // a user/agent edit must not bypass the empty-content guard or secret
+        // redaction that the insert path enforces.
+        let redacted: Option<String> = match content {
+            Some(c) => {
+                let trimmed = c.trim();
+                if trimmed.is_empty() {
+                    return Err(AppError::BadRequest("memory content is empty".into()));
+                }
+                Some(nomi_redact::redact_secrets(trimmed).into_owned())
+            }
+            None => None,
+        };
+        let (scope_kind, scope_companion_id) = match &scope {
+            Some(s) => {
+                let (k, c) = s.columns();
+                (Some(k.to_owned()), Some(c))
+            }
+            None => (None, None),
+        };
         let now = now_ms();
         let result = sqlx::query(
             "UPDATE companion_memories SET
                content = COALESCE(?, content),
                pinned = COALESCE(?, pinned),
                status = COALESCE(?, status),
+               scope_kind = COALESCE(?, scope_kind),
+               scope_companion_id = COALESCE(?, scope_companion_id),
                updated_at = ?
              WHERE id = ?",
         )
-        .bind(content)
+        .bind(redacted.as_deref())
         .bind(pinned.map(|p| p as i64))
         .bind(status)
+        .bind(scope_kind)
+        .bind(scope_companion_id)
         .bind(now)
         .bind(id)
         .execute(&self.pool)
@@ -988,19 +1084,25 @@ impl CompanionStore {
     }
 
     /// Top memories for prompt injection: all pinned + per-kind top-N by
-    /// strength, within a rough char budget.
-    pub async fn memories_for_injection(&self, per_kind: i64, char_budget: usize) -> Result<Vec<CompanionMemory>, AppError> {
+    /// strength, within a rough char budget. Scoped to `companion_id`: shared
+    /// memories plus that companion's own private ones (others' private are
+    /// never injected into this companion's prompt).
+    pub async fn memories_for_injection(&self, companion_id: &str, per_kind: i64, char_budget: usize) -> Result<Vec<CompanionMemory>, AppError> {
         let mut picked: Vec<CompanionMemory> = Vec::new();
-        let pinned = sqlx::query("SELECT * FROM companion_memories WHERE status = 'active' AND pinned = 1 ORDER BY strength DESC")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(db_err)?;
+        let pinned = sqlx::query(
+            "SELECT * FROM companion_memories WHERE status = 'active' AND pinned = 1 AND (scope_kind = 'user' OR scope_companion_id = ?) ORDER BY strength DESC",
+        )
+        .bind(companion_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
         picked.extend(pinned.iter().map(row_to_memory));
         for kind in MEMORY_KINDS {
             let rows = sqlx::query(
-                "SELECT * FROM companion_memories WHERE status = 'active' AND pinned = 0 AND kind = ? ORDER BY strength DESC LIMIT ?",
+                "SELECT * FROM companion_memories WHERE status = 'active' AND pinned = 0 AND kind = ? AND (scope_kind = 'user' OR scope_companion_id = ?) ORDER BY strength DESC LIMIT ?",
             )
             .bind(kind)
+            .bind(companion_id)
             .bind(per_kind)
             .fetch_all(&self.pool)
             .await
@@ -1267,8 +1369,8 @@ impl CompanionStore {
     /// responsible for id-collision handling (see `export::import_bundle`).
     pub async fn insert_memory_raw(&self, mem: &CompanionMemory) -> Result<(), AppError> {
         sqlx::query(
-            "INSERT INTO companion_memories(id, kind, content, tags, importance, strength, pinned, source, status, created_at, updated_at, last_reinforced_at)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO companion_memories(id, kind, content, tags, importance, strength, pinned, source, status, created_at, updated_at, last_reinforced_at, scope_kind, scope_companion_id)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )
         .bind(&mem.id)
         .bind(&mem.kind)
@@ -1282,6 +1384,8 @@ impl CompanionStore {
         .bind(mem.created_at)
         .bind(mem.updated_at)
         .bind(mem.last_reinforced_at)
+        .bind(&mem.scope_kind)
+        .bind(&mem.scope_companion_id)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -2069,6 +2173,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn private_memory_injects_only_for_owner() {
+        let store = CompanionStore::open_memory().await.unwrap();
+        store.insert_memory("knowledge", "shared fact", &[], 0.9, "learn").await.unwrap();
+        store
+            .insert_memory_scoped("preference", "c1 likes tea", &[], 0.9, "chat", MemoryScope::Companion("c1".into()))
+            .await
+            .unwrap();
+        store
+            .insert_memory_scoped("preference", "c2 likes coffee", &[], 0.9, "chat", MemoryScope::Companion("c2".into()))
+            .await
+            .unwrap();
+
+        let c1 = store.memories_for_injection("c1", 10, 100_000).await.unwrap();
+        let texts: Vec<&str> = c1.iter().map(|m| m.content.as_str()).collect();
+        assert!(texts.contains(&"shared fact"), "owner sees shared: {texts:?}");
+        assert!(texts.contains(&"c1 likes tea"), "owner sees own private: {texts:?}");
+        assert!(!texts.contains(&"c2 likes coffee"), "owner must NOT see another companion's private: {texts:?}");
+    }
+
+    #[tokio::test]
+    async fn list_memories_scope_filter_excludes_other_private() {
+        let store = CompanionStore::open_memory().await.unwrap();
+        store.insert_memory("knowledge", "shared fact", &[], 0.9, "learn").await.unwrap();
+        store
+            .insert_memory_scoped("knowledge", "c1 private", &[], 0.9, "chat", MemoryScope::Companion("c1".into()))
+            .await
+            .unwrap();
+        store
+            .insert_memory_scoped("knowledge", "c2 private", &[], 0.9, "chat", MemoryScope::Companion("c2".into()))
+            .await
+            .unwrap();
+        let filter = MemoryFilter { scope_companion_id: Some("c1".into()), ..Default::default() };
+        let listed = store.list_memories(&filter).await.unwrap();
+        let texts: Vec<&str> = listed.iter().map(|m| m.content.as_str()).collect();
+        assert!(texts.contains(&"shared fact"));
+        assert!(texts.contains(&"c1 private"));
+        assert!(!texts.contains(&"c2 private"));
+        // No scope filter → cross-companion "all" view sees everything.
+        let all = store.list_memories(&MemoryFilter::default()).await.unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn update_memory_redacts_secret_and_rejects_empty() {
+        let store = CompanionStore::open_memory().await.unwrap();
+        let m = store.insert_memory("knowledge", "original", &[], 0.8, "manual").await.unwrap();
+        store
+            .update_memory(&m.id, Some("新 key sk-ABCDEFGHIJ0123456789xyz 收好"), None, None, None)
+            .await
+            .unwrap();
+        let got = store.get_memory(&m.id).await.unwrap().unwrap();
+        assert!(got.content.contains("[REDACTED_SECRET]"), "edited content must be redacted: {}", got.content);
+        assert!(!got.content.contains("sk-ABCDEFGHIJ"));
+        // Empty/whitespace edits are rejected (parity with insert).
+        assert!(store.update_memory(&m.id, Some("   "), None, None, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn update_memory_can_change_scope_shared_to_private() {
+        let store = CompanionStore::open_memory().await.unwrap();
+        let m = store.insert_memory("preference", "fact", &[], 0.8, "manual").await.unwrap();
+        assert_eq!(m.scope_kind, "user");
+        assert_eq!(m.scope_companion_id, "");
+        store
+            .update_memory(&m.id, None, None, None, Some(MemoryScope::Companion("c1".into())))
+            .await
+            .unwrap();
+        let got = store.get_memory(&m.id).await.unwrap().unwrap();
+        assert_eq!(got.scope_kind, "companion");
+        assert_eq!(got.scope_companion_id, "c1");
+        // And back to shared.
+        store.update_memory(&m.id, None, None, None, Some(MemoryScope::Shared)).await.unwrap();
+        let back = store.get_memory(&m.id).await.unwrap().unwrap();
+        assert_eq!(back.scope_kind, "user");
+        assert_eq!(back.scope_companion_id, "");
+    }
+
+    #[tokio::test]
     async fn decay_archives_stale_episodes() {
         let store = CompanionStore::open_memory().await.unwrap();
         let m = store
@@ -2598,6 +2780,8 @@ mod tests {
             created_at: 1_111,
             updated_at: 2_222,
             last_reinforced_at: 3_333,
+            scope_kind: "companion".into(),
+            scope_companion_id: "c-raw".into(),
         }
     }
 

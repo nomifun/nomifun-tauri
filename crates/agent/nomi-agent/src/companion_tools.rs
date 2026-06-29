@@ -20,8 +20,10 @@ pub const COMPANION_MEMORY_KINDS: [&str; 6] = ["profile", "preference", "knowled
 #[async_trait]
 pub trait CompanionMemorySink: Send + Sync {
     /// Search memories by keyword (optionally by kind / incl. archived).
-    /// Returns a human-readable digest the model can quote.
-    async fn recall(&self, query: &str, kind: Option<&str>, include_archived: bool) -> Result<String, String>;
+    /// `conversation_id` scopes the search to the owning companion (shared +
+    /// its own private memories), so one companion never recalls another's
+    /// private memories. Returns a human-readable digest the model can quote.
+    async fn recall(&self, conversation_id: &str, query: &str, kind: Option<&str>, include_archived: bool) -> Result<String, String>;
 
     /// Persist one memory; implementations dedup. Returns a confirmation line.
     /// `conversation_id` identifies the session the save came from, so the
@@ -35,11 +37,17 @@ pub trait CompanionMemorySink: Send + Sync {
 /// `recall_memories` — search the companion's full memory store.
 pub struct RecallMemoriesTool {
     sink: Arc<dyn CompanionMemorySink>,
+    /// The conversation this tool instance serves — passed to the sink so the
+    /// backend can scope recall to the owning companion (shared + own private).
+    conversation_id: String,
 }
 
 impl RecallMemoriesTool {
-    pub fn new(sink: Arc<dyn CompanionMemorySink>) -> Self {
-        Self { sink }
+    pub fn new(sink: Arc<dyn CompanionMemorySink>, conversation_id: impl Into<String>) -> Self {
+        Self {
+            sink,
+            conversation_id: conversation_id.into(),
+        }
     }
 }
 
@@ -84,7 +92,7 @@ impl Tool for RecallMemoriesTool {
             .and_then(|v| v.as_str())
             .filter(|k| COMPANION_MEMORY_KINDS.contains(k));
         let include_archived = input.get("include_archived").and_then(|v| v.as_bool()).unwrap_or(false);
-        match self.sink.recall(query, kind, include_archived).await {
+        match self.sink.recall(&self.conversation_id, query, kind, include_archived).await {
             Ok(out) => ToolResult {
                 content: out,
                 is_error: false,
@@ -383,7 +391,7 @@ mod tests {
 
     #[async_trait]
     impl CompanionMemorySink for RecordingSink {
-        async fn recall(&self, query: &str, kind: Option<&str>, _archived: bool) -> Result<String, String> {
+        async fn recall(&self, _conversation_id: &str, query: &str, kind: Option<&str>, _archived: bool) -> Result<String, String> {
             Ok(format!("hits for {query} kind={kind:?}"))
         }
         async fn save(&self, conversation_id: &str, kind: &str, content: &str, _tags: &[String]) -> Result<String, String> {
@@ -406,7 +414,7 @@ mod tests {
 
     #[tokio::test]
     async fn recall_requires_query_and_filters_kind() {
-        let tool = RecallMemoriesTool::new(sink());
+        let tool = RecallMemoriesTool::new(sink(), "conv_t");
         let bad = tool.execute(json!({})).await;
         assert!(bad.is_error);
         let ok = tool.execute(json!({"query": "结论", "kind": "preference"})).await;

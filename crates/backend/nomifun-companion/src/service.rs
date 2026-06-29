@@ -18,7 +18,7 @@ use crate::learner::{Learner, CompanionCompleter};
 use crate::profile::{CompanionProfileConfig, SharedCompanionConfig};
 use crate::registry::{CompanionRegistry, json_merge_patch};
 use crate::skill_sink::CompanionSkillStoreSink;
-use crate::store::{CompanionThread, MemoryFilter, CompanionLearnRun, CompanionMemory, CompanionSkill, CompanionStore, CompanionSuggestion};
+use crate::store::{CompanionThread, MemoryFilter, MemoryScope, CompanionLearnRun, CompanionMemory, CompanionSkill, CompanionStore, CompanionSuggestion};
 use nomifun_extension::skill_service::{self, SkillPaths, SkillScope};
 use nomifun_extension::constants::SKILL_MANIFEST_FILE;
 
@@ -850,7 +850,7 @@ impl CompanionService {
         self.store.list_memories(filter).await
     }
 
-    pub async fn add_memory(&self, kind: &str, content: &str, tags: &[String]) -> Result<CompanionMemory, AppError> {
+    pub async fn add_memory(&self, kind: &str, content: &str, tags: &[String], scope: MemoryScope) -> Result<CompanionMemory, AppError> {
         if !crate::store::MEMORY_KINDS.contains(&kind) {
             return Err(AppError::BadRequest(format!("invalid memory kind '{kind}'")));
         }
@@ -862,13 +862,19 @@ impl CompanionService {
         // similar active memory is reinforced and returned instead of
         // inserting a near-duplicate. This guards the gateway
         // `nomi_memory_save` path, which previously inserted blindly.
-        if let Some(id) = self.store.find_similar_active(kind, content).await? {
-            self.store.reinforce_memories(std::slice::from_ref(&id)).await?;
-            if let Some(existing) = self.store.get_memory(&id).await? {
-                return Ok(existing);
+        // Only for shared adds — a private add must not be silently folded into
+        // an existing (possibly shared, or another companion's) memory.
+        if scope == MemoryScope::Shared {
+            if let Some(id) = self.store.find_similar_active(kind, content).await? {
+                self.store.reinforce_memories(std::slice::from_ref(&id)).await?;
+                if let Some(existing) = self.store.get_memory(&id).await? {
+                    return Ok(existing);
+                }
             }
         }
-        self.store.insert_memory(kind, content, tags, 0.8, "manual").await
+        let mem = self.store.insert_memory_scoped(kind, content, tags, 0.8, "manual", scope).await?;
+        self.emitter.emit_memory_created(&mem);
+        Ok(mem)
     }
 
     pub async fn update_memory(
@@ -877,17 +883,26 @@ impl CompanionService {
         content: Option<&str>,
         pinned: Option<bool>,
         status: Option<&str>,
+        scope: Option<MemoryScope>,
     ) -> Result<(), AppError> {
         if let Some(status) = status {
             if status != "active" && status != "archived" {
                 return Err(AppError::BadRequest(format!("invalid memory status '{status}'")));
             }
         }
-        self.store.update_memory(id, content, pinned, status).await
+        self.store.update_memory(id, content, pinned, status, scope).await?;
+        // Notify open surfaces with the post-edit row (best-effort; a missing
+        // row already errored above).
+        if let Ok(Some(updated)) = self.store.get_memory(id).await {
+            self.emitter.emit_memory_updated(&updated);
+        }
+        Ok(())
     }
 
     pub async fn delete_memory(&self, id: &str) -> Result<(), AppError> {
-        self.store.delete_memory(id).await
+        self.store.delete_memory(id).await?;
+        self.emitter.emit_memory_deleted(id);
+        Ok(())
     }
 
     // ----- suggestions -----
@@ -1879,25 +1894,25 @@ mod tests {
         let svc = service(dir.path()).await;
 
         let first = svc
-            .add_memory("preference", "主人喜欢深色主题", &["ui".into()])
+            .add_memory("preference", "主人喜欢深色主题", &["ui".into()], MemoryScope::Shared)
             .await
             .unwrap();
         assert_eq!(svc.store.count_memories("active").await.unwrap(), 1);
 
         // Same content (modulo case/whitespace) merges: reinforced, no new row.
-        let again = svc.add_memory("preference", " 主人喜欢深色主题 ", &[]).await.unwrap();
+        let again = svc.add_memory("preference", " 主人喜欢深色主题 ", &[], MemoryScope::Shared).await.unwrap();
         assert_eq!(again.id, first.id);
         assert_eq!(svc.store.count_memories("active").await.unwrap(), 1);
         assert!(again.strength > first.strength, "dedup hit must reinforce the existing memory");
 
         // Genuinely different content still inserts.
-        let other = svc.add_memory("preference", "主人喜欢浅色代码字体", &[]).await.unwrap();
+        let other = svc.add_memory("preference", "主人喜欢浅色代码字体", &[], MemoryScope::Shared).await.unwrap();
         assert_ne!(other.id, first.id);
         assert_eq!(svc.store.count_memories("active").await.unwrap(), 2);
 
         // Validation untouched.
-        assert!(svc.add_memory("bogus", "x", &[]).await.is_err());
-        assert!(svc.add_memory("task", "   ", &[]).await.is_err());
+        assert!(svc.add_memory("bogus", "x", &[], MemoryScope::Shared).await.is_err());
+        assert!(svc.add_memory("task", "   ", &[], MemoryScope::Shared).await.is_err());
     }
 
     #[tokio::test]

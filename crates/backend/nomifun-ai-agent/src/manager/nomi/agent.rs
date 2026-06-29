@@ -364,7 +364,7 @@ impl NomiAgentManager {
         if let Some(sink) = companion_sink {
             engine
                 .registry_mut()
-                .register(Box::new(RecallMemoriesTool::new(sink.clone())));
+                .register(Box::new(RecallMemoriesTool::new(sink.clone(), conversation_id.clone())));
             engine
                 .registry_mut()
                 .register(Box::new(SaveMemoryTool::new(sink.clone(), conversation_id.clone())));
@@ -1003,7 +1003,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl nomi_agent::companion_tools::CompanionMemorySink for StubCompanionSink {
-        async fn recall(&self, _q: &str, _kind: Option<&str>, _archived: bool) -> Result<String, String> {
+        async fn recall(&self, _conv: &str, _q: &str, _kind: Option<&str>, _archived: bool) -> Result<String, String> {
             Ok(String::new())
         }
         async fn save(&self, _conv: &str, _kind: &str, _content: &str, _tags: &[String]) -> Result<String, String> {

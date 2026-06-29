@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use nomifun_companion::store::MemoryFilter;
+use nomifun_companion::store::{MemoryFilter, MemoryScope};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -81,6 +81,8 @@ async fn list(deps: Arc<GatewayDeps>, p: MemoryListParams) -> Value {
         } else {
             Some("active".to_owned())
         },
+        // Master-agent view spans every companion's memories.
+        scope_companion_id: None,
         limit: p.limit.unwrap_or(DEFAULT_LIST_LIMIT).clamp(1, 200),
         offset: p.offset.unwrap_or(0).max(0),
     };
@@ -97,7 +99,7 @@ async fn save(deps: Arc<GatewayDeps>, p: MemorySaveParams) -> Value {
     }
     let kind = p.kind.unwrap_or_else(|| "knowledge".to_owned());
     let tags = p.tags.unwrap_or_default();
-    match deps.companion_service.add_memory(&kind, content, &tags).await {
+    match deps.companion_service.add_memory(&kind, content, &tags, MemoryScope::Shared).await {
         Ok(memory) => ok(memory),
         Err(e) => json!({ "error": e.to_string() }),
     }
@@ -109,7 +111,7 @@ async fn update(deps: Arc<GatewayDeps>, p: MemoryUpdateParams) -> Value {
     }
     match deps
         .companion_service
-        .update_memory(&p.id, p.content.as_deref(), p.pinned, p.status.as_deref())
+        .update_memory(&p.id, p.content.as_deref(), p.pinned, p.status.as_deref(), None)
         .await
     {
         Ok(()) => json!({ "result": format!("memory {} updated", p.id) }),

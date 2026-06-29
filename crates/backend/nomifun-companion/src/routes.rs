@@ -16,7 +16,7 @@ use serde::Deserialize;
 use crate::profile::{HeadBox, CompanionProfileConfig, SharedCompanionConfig};
 use crate::service::{CompanionSkillContent, CompanionSkillView, CompanionStatus, CompanionWeeklyDigest, SourceStats};
 use crate::state::CompanionRouterState;
-use crate::store::{MemoryFilter, CompanionLearnRun, CompanionMemory, CompanionSkill, CompanionSuggestion};
+use crate::store::{MemoryFilter, MemoryScope, CompanionLearnRun, CompanionMemory, CompanionSkill, CompanionSuggestion};
 
 pub fn companion_routes(state: CompanionRouterState) -> Router {
     Router::new()
@@ -124,11 +124,28 @@ async fn status(
     Ok(Json(ApiResponse::ok(state.service.status().await?)))
 }
 
+/// Build an optional [`MemoryScope`] from wire parts.
+/// - `scope_kind = Some("companion")` with a non-empty id → private to it.
+/// - `scope_kind = Some(_other)` → Shared.
+/// - `scope_kind = None` → `None` (leave unchanged on update / default on add).
+fn scope_from_parts(scope_kind: Option<&str>, scope_companion_id: Option<&str>) -> Option<MemoryScope> {
+    let kind = scope_kind?;
+    let cid = scope_companion_id.unwrap_or("").trim();
+    if kind == "companion" && !cid.is_empty() {
+        Some(MemoryScope::Companion(cid.to_owned()))
+    } else {
+        Some(MemoryScope::Shared)
+    }
+}
+
 #[derive(Deserialize)]
 struct ListMemoriesQuery {
     kind: Option<String>,
     q: Option<String>,
     status: Option<String>,
+    /// When set, scope the list to memories visible to this companion (shared +
+    /// its own private). Empty/absent = cross-companion "all" view.
+    scope_companion_id: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
@@ -142,6 +159,7 @@ async fn list_memories(
         kind: query.kind.filter(|k| !k.is_empty()),
         q: query.q.filter(|q| !q.is_empty()),
         status: Some(query.status.filter(|s| !s.is_empty()).unwrap_or_else(|| "active".into())),
+        scope_companion_id: query.scope_companion_id.filter(|s| !s.is_empty()),
         limit: query.limit.unwrap_or(100),
         offset: query.offset.unwrap_or(0),
     };
@@ -154,6 +172,9 @@ struct AddMemoryRequest {
     content: String,
     #[serde(default)]
     tags: Vec<String>,
+    /// Owning companion for a private memory; empty/absent = shared.
+    #[serde(default)]
+    scope_companion_id: Option<String>,
 }
 
 async fn add_memory(
@@ -162,8 +183,9 @@ async fn add_memory(
     body: Result<Json<AddMemoryRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<CompanionMemory>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let scope = scope_from_parts(Some("companion"), req.scope_companion_id.as_deref()).unwrap_or(MemoryScope::Shared);
     Ok(Json(ApiResponse::ok(
-        state.service.add_memory(&req.kind, &req.content, &req.tags).await?,
+        state.service.add_memory(&req.kind, &req.content, &req.tags, scope).await?,
     )))
 }
 
@@ -172,6 +194,10 @@ struct UpdateMemoryRequest {
     content: Option<String>,
     pinned: Option<bool>,
     status: Option<String>,
+    /// `'user'` (shared) or `'companion'` (private). Present together with
+    /// `scope_companion_id` to re-home a memory; both absent = scope unchanged.
+    scope_kind: Option<String>,
+    scope_companion_id: Option<String>,
 }
 
 async fn update_memory(
@@ -181,9 +207,10 @@ async fn update_memory(
     body: Result<Json<UpdateMemoryRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let scope = scope_from_parts(req.scope_kind.as_deref(), req.scope_companion_id.as_deref());
     state
         .service
-        .update_memory(&id, req.content.as_deref(), req.pinned, req.status.as_deref())
+        .update_memory(&id, req.content.as_deref(), req.pinned, req.status.as_deref(), scope)
         .await?;
     Ok(Json(ApiResponse::ok(())))
 }

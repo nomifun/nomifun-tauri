@@ -115,6 +115,19 @@ impl CompanionEventEmitter {
         self.broadcast("companion.memory-created", memory);
     }
 
+    /// A memory's content/scope/pin/status was edited. Lets every open surface
+    /// (memories tab, desktop bubble, second window) reflect the edit live
+    /// instead of holding a stale snapshot.
+    pub fn emit_memory_updated(&self, memory: &crate::store::CompanionMemory) {
+        self.broadcast("companion.memory-updated", memory);
+    }
+
+    /// A memory was hard-deleted. Payload carries the `id` so listeners can drop
+    /// the row without a refetch.
+    pub fn emit_memory_deleted(&self, id: &str) {
+        self.broadcast("companion.memory-deleted", &serde_json::json!({ "id": id }));
+    }
+
     /// A skill draft was auto-generated and is awaiting review.
     pub fn emit_skill_drafted(&self, companion_id: &str, skill_name: &str) {
         self.broadcast(

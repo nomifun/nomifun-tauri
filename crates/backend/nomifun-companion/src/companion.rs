@@ -22,7 +22,7 @@ use crate::collector::{self, SharedConfig};
 use crate::events::CompanionEventEmitter;
 use crate::profile::CompanionProfileConfig;
 use crate::registry::CompanionRegistry;
-use crate::store::{CompanionThread, MEMORY_KINDS, MemoryFilter, CompanionStore};
+use crate::store::{CompanionThread, MEMORY_KINDS, MemoryFilter, MemoryScope, CompanionStore};
 
 /// All companion conversations are owned by the local default user (the
 /// desktop --local single-user model; same constant the cron executor uses).
@@ -72,7 +72,7 @@ pub async fn build_companion_system_prompt(
     channel_platform: Option<&str>,
 ) -> String {
     let memories = store
-        .memories_for_injection(MEMORY_PER_KIND, MEMORY_CHAR_BUDGET)
+        .memories_for_injection(&profile.id, MEMORY_PER_KIND, MEMORY_CHAR_BUDGET)
         .await
         .unwrap_or_default();
 
@@ -722,11 +722,16 @@ fn mirror_memory_to_nomi(dir: &std::path::Path, kind: &str, content: &str) -> st
 
 #[async_trait]
 impl CompanionMemorySink for CompanionStoreSink {
-    async fn recall(&self, query: &str, kind: Option<&str>, include_archived: bool) -> Result<String, String> {
+    async fn recall(&self, conversation_id: &str, query: &str, kind: Option<&str>, include_archived: bool) -> Result<String, String> {
+        // Scope recall to the owning companion: shared memories + this
+        // companion's own private ones. Mirrors the prompt-injection scope so a
+        // companion never recalls another's private memories.
+        let scope_companion_id = self.xp_target(conversation_id).await;
         let filter = MemoryFilter {
             kind: kind.map(str::to_owned),
             q: Some(query.to_owned()),
             status: if include_archived { None } else { Some("active".into()) },
+            scope_companion_id,
             limit: 20,
             offset: 0,
         };
@@ -761,15 +766,20 @@ impl CompanionMemorySink for CompanionStoreSink {
             Ok(None) => {}
             Err(e) => return Err(e.to_string()),
         }
+        // The companion that owns this chat owns the memory. Chat-saved memories
+        // are PRIVATE to that companion; if no owner resolves, fall back to shared.
+        let owner = self.xp_target(conversation_id).await;
+        let scope = owner.clone().map(MemoryScope::Companion).unwrap_or(MemoryScope::Shared);
         let mem = self
             .store
-            .insert_memory(kind, content, tags, 0.8, "chat")
+            .insert_memory_scoped(kind, content, tags, 0.8, "chat", scope)
             .await
             .map_err(|e| e.to_string())?;
         // Exclusive-interaction XP: credit the owning companion only (spec ruling
-        // 2); shared memory itself is companion-agnostic.
-        if let Some(companion_id) = self.xp_target(conversation_id).await {
-            let _ = self.store.add_companion_xp(&companion_id, 5).await;
+        // 2). Chat-saved memories are PRIVATE to that companion; the learner hub
+        // still writes shared memory.
+        if let Some(companion_id) = &owner {
+            let _ = self.store.add_companion_xp(companion_id, 5).await;
         }
         self.emitter.emit_memory_created(&mem);
         // §3.4 bridge (opt-in): mirror the save into the nomi agent's file-memory
@@ -885,9 +895,9 @@ mod tests {
         assert!(other.contains("已保存"));
         assert_eq!(store.get_companion_state_i64("companion_def", "xp").await.unwrap(), 5);
 
-        let hits = s.recall("结论", None, false).await.unwrap();
+        let hits = s.recall("conv_owned", "结论", None, false).await.unwrap();
         assert!(hits.contains("先结论后细节"));
-        let miss = s.recall("不存在xyz", None, false).await.unwrap();
+        let miss = s.recall("conv_owned", "不存在xyz", None, false).await.unwrap();
         assert!(miss.contains("没有找到"));
 
         assert!(s.save("conv_owned", "bogus", "x", &[]).await.is_err());
@@ -1050,7 +1060,7 @@ mod tests {
             .await
             .unwrap();
         let s = sink(dir.path(), store, SharedCompanionConfig::default());
-        let hits = s.recall("导出", None, false).await.unwrap();
+        let hits = s.recall("conv_x", "导出", None, false).await.unwrap();
         let today = format_date(nomifun_common::now_ms());
         assert!(hits.contains(&format!("[{today}|task|")), "recall lines must be dated: {hits}");
     }
