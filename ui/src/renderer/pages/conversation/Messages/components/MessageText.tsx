@@ -11,11 +11,13 @@ import { useConversationContextSafe } from '@/renderer/hooks/context/Conversatio
 import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
 import { iconColors } from '@/renderer/styles/colors';
 import { Alert, Message, Tooltip } from '@arco-design/web-react';
-import { Copy } from '@icon-park/react';
+import { Copy, Edit } from '@icon-park/react';
 import classNames from 'classnames';
 import React, { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { copyText } from '@/renderer/utils/ui/clipboard';
+import { emitter } from '@/renderer/utils/emitter';
+import { useMessageList, useRemoveMessagesFrom } from '../hooks';
 import CollapsibleContent from '@renderer/components/chat/CollapsibleContent';
 import FilePreview from '@renderer/components/media/FilePreview';
 import HorizontalFileList from '@renderer/components/media/HorizontalFileList';
@@ -128,6 +130,15 @@ const MessageText: React.FC<{ message: IMessageText }> = ({ message }) => {
     [conversationContext?.workspace, files]
   );
 
+  // 仅 Nomi、且为最近一条用户文本消息时可编辑（与后端"仅最近一条"对齐）。
+  const messageList = useMessageList();
+  const removeMessagesFrom = useRemoveMessagesFrom();
+  const isLatestUserMessage = useMemo(() => {
+    if (!isUserMessage) return false;
+    const lastRight = [...messageList].reverse().find((m) => m.position === 'right' && m.type === 'text');
+    return lastRight?.msg_id != null && lastRight.msg_id === message.msg_id;
+  }, [isUserMessage, messageList, message.msg_id]);
+
   // 过滤空内容，避免渲染空DOM
   if (!message.content.content || (typeof message.content.content === 'string' && !message.content.content.trim())) {
     return null;
@@ -158,6 +169,29 @@ const MessageText: React.FC<{ message: IMessageText }> = ({ message }) => {
       </div>
     </Tooltip>
   );
+
+  // 编辑（仅 Nomi 原生、且为最近一条用户文本消息）：把原文回填输入框并截断本地后续消息。
+  const canEdit = conversationContext?.type === 'nomi' && isUserMessage && message.type === 'text' && isLatestUserMessage;
+
+  const handleEdit = () => {
+    if (!message.msg_id || !message.created_at) return;
+    const rawContent = typeof message.content?.content === 'string' ? message.content.content : '';
+    const { text: editText } = parseFileMarker(rawContent);
+    removeMessagesFrom(message.created_at);
+    emitter.emit('sendbox.edit', { msgId: message.msg_id, createdAt: message.created_at, content: editText });
+  };
+
+  const editButton = canEdit ? (
+    <Tooltip content={t('conversation.editMessage.action', { defaultValue: 'Edit' })}>
+      <div
+        className='p-4px rd-4px cursor-pointer hover:bg-3 transition-colors opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto focus-within:opacity-100 focus-within:pointer-events-auto'
+        onClick={handleEdit}
+        style={{ lineHeight: 0 }}
+      >
+        <Edit theme='outline' size='16' fill={iconColors.secondary} />
+      </div>
+    </Tooltip>
+  ) : null;
 
   const cronMeta = message.content.cronMeta;
   const senderName = message.content.senderName;
@@ -236,6 +270,7 @@ const MessageText: React.FC<{ message: IMessageText }> = ({ message }) => {
             })}
           >
             {copyButton}
+            {editButton}
             {message.created_at && (
               <span className='text-12px text-t-secondary opacity-0 group-hover:opacity-100 transition-opacity select-none'>
                 {formatMessageTime(message.created_at)}
