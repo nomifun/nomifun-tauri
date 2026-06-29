@@ -244,6 +244,17 @@
       "renamePlaceholder": "输入编排目标…",
       "planning": "规划中"
     },
+    "thinking": {
+      "title": "编排思考",
+      "drafting": "拟稿中…",
+      "done": "已完成规划",
+      "phase": {
+        "planningStarted": "正在理解目标…",
+        "decomposing": "正在拆解任务…",
+        "assigning": "正在分派 agent…",
+        "planReady": "正在生成计划…"
+      }
+    },
     "view": {
       "conversation": "对话",
       "canvas": "编排画布",

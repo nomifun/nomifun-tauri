@@ -244,6 +244,17 @@
       "renamePlaceholder": "Enter the orchestration goal…",
       "planning": "Planning"
     },
+    "thinking": {
+      "title": "Orchestration thinking",
+      "drafting": "Drafting…",
+      "done": "Planning complete",
+      "phase": {
+        "planningStarted": "Understanding the goal…",
+        "decomposing": "Breaking down tasks…",
+        "assigning": "Assigning agents…",
+        "planReady": "Generating the plan…"
+      }
+    },
     "view": {
       "conversation": "Dialogue",
       "canvas": "Canvas",

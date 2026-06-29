@@ -6,7 +6,9 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Branch, Comment, Down, Gavel, Lightning, Lock, Merge, Refresh, Robot, Shield } from '@icon-park/react';
+import { Spin } from '@arco-design/web-react';
+import { Branch, Brain, Comment, Down, Gavel, Lightning, Lock, Merge, Refresh, Right, Robot, Shield } from '@icon-park/react';
+import { useLeadThinking, type LeadThinkingState } from '../useLeadThinking';
 // The decision feed is the DEFAULT (对话) view, where the DAG canvas/roster (which
 // own dag-canvas.css, incl. the `nomi-dag-pulse` running-dot animation) are NOT
 // mounted — import the stylesheet here so the feed's status pulse works standalone.
@@ -244,6 +246,161 @@ const DecisionGroup: React.FC<{ accent: string; Glyph: typeof Merge; label: stri
   </div>
 );
 
+/** The lead-agent avatar + name header shared by every lead-side message in the
+ * feed (the decision card, each adjust reply, and the streaming thinking bubble)
+ * so they read as one consistent speaker. */
+const LeadSpeaker: React.FC = () => {
+  const { t } = useTranslation();
+  return (
+    <div className='flex items-center gap-7px'>
+      <span
+        className='flex size-24px shrink-0 items-center justify-center rd-8px text-white'
+        style={{ background: 'rgb(var(--primary-6))' }}
+      >
+        <Robot theme='outline' size='15' strokeWidth={3} />
+      </span>
+      <span className='text-12px font-600 text-t-secondary'>{t('orchestrator.run.feed.agentName')}</span>
+    </div>
+  );
+};
+
+/** Map a backend phase-narration key (snake_case wire value, e.g. `planning_started`)
+ * to its orchestrator i18n copy. Unknown keys fall back to the raw key (never throws),
+ * so a future backend phase still renders *something* legible rather than blanking. */
+function phaseNarration(t: ReturnType<typeof useTranslation>['t'], key: string): string {
+  switch (key) {
+    case 'planning_started':
+      return t('orchestrator.run.thinking.phase.planningStarted');
+    case 'decomposing':
+      return t('orchestrator.run.thinking.phase.decomposing');
+    case 'assigning':
+      return t('orchestrator.run.thinking.phase.assigning');
+    case 'plan_ready':
+      return t('orchestrator.run.thinking.phase.planReady');
+    default:
+      return key;
+  }
+}
+
+/**
+ * LeadThinkingBubble — the live 编排思考 bubble at the TOP of the decision feed,
+ * rendering the main agent's planning thought stream from {@link useLeadThinking}.
+ * Modeled on the conversation page's {@link MessageThinking} collapsible-thought
+ * card (spinner/brain icon + summary line + chevron + soft expandable body), but
+ * built inline with theme tokens since MessageThinking is coupled to the chat
+ * IMessageThinking shape. Content priority (NEVER raw JSON):
+ *   1. reasoning text (provider exposed readable reasoning) — shown verbatim;
+ *   2. else the latest phase narration (planning_started → decomposing → assigning
+ *      → plan_ready, mapped to i18n) — a deterministic, provider-agnostic progress;
+ *   3. else, when only draft `text` deltas have arrived, a 「拟稿中…」 heartbeat —
+ *      the draft plan JSON itself is never stored or shown (only `textHeartbeat`).
+ * While `active`, the card auto-expands and shows an elapsed timer + spinner. On
+ * settle (done / planUpdated), it auto-collapses to a 「已完成规划」 summary, leaving
+ * the derived 「编排决策」 card below to carry the result. Renders nothing until the
+ * stream has produced anything (so an idle run shows only the decision card).
+ */
+const LeadThinkingBubble: React.FC<{ state: LeadThinkingState }> = ({ state }) => {
+  const { t } = useTranslation();
+  const { active, reasoning, phaseKeys, textHeartbeat } = state;
+
+  // The freshest deterministic narration: the last phase key received.
+  const latestPhaseKey = phaseKeys.length > 0 ? phaseKeys[phaseKeys.length - 1] : null;
+
+  // Body content, in priority order. Reasoning wins; phase narration is the
+  // provider-agnostic fallback; the draft heartbeat is the last resort — JSON
+  // draft content is NEVER surfaced (only its heartbeat reaches here).
+  const reasoningText = reasoning.trim();
+  const body: string = reasoningText
+    ? reasoningText
+    : latestPhaseKey
+      ? phaseNarration(t, latestPhaseKey)
+      : textHeartbeat
+        ? t('orchestrator.run.thinking.drafting')
+        : '';
+
+  const hasContent = body.length > 0 || phaseKeys.length > 0 || reasoningText.length > 0;
+  // Nothing streamed yet and the stream is idle → don't mount the bubble at all.
+  const visible = active || hasContent;
+
+  // Auto-expand while live; auto-collapse once the stream settles (mirrors
+  // MessageThinking's done-collapse), while still letting the user re-open it.
+  const [expanded, setExpanded] = useState(true);
+  useEffect(() => {
+    if (!active) setExpanded(false);
+  }, [active]);
+
+  // Elapsed timer for the live summary line (parity with MessageThinking).
+  const startRef = useRef<number>(Date.now());
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (!active) return undefined;
+    startRef.current = Date.now();
+    setElapsed(0);
+    const timer = setInterval(() => setElapsed(Math.floor((Date.now() - startRef.current) / 1000)), 1000);
+    return () => clearInterval(timer);
+  }, [active]);
+
+  // Pin the expandable body to the bottom while reasoning streams in.
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (active && expanded && bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
+  }, [body, active, expanded]);
+
+  if (!visible) return null;
+
+  const summary = active
+    ? `${t('orchestrator.run.thinking.title')} · ${elapsed}${t('common.unit.second_short', { defaultValue: 's' })}`
+    : t('orchestrator.run.thinking.done');
+
+  return (
+    <div className='flex flex-col items-start gap-6px'>
+      <LeadSpeaker />
+      <div
+        className='w-full rd-12px p-12px'
+        style={{ background: 'var(--bg-2)', border: '1px solid var(--border-base)', borderRadius: '4px 12px 12px 12px' }}
+      >
+        {/* Collapsible header — spinner while live, brain glyph once settled. */}
+        <div
+          role='button'
+          tabIndex={0}
+          aria-expanded={expanded}
+          aria-label={summary}
+          onClick={() => setExpanded((v) => !v)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              setExpanded((v) => !v);
+            }
+          }}
+          className='flex cursor-pointer select-none items-center gap-6px text-13px leading-none text-t-secondary outline-none transition-colors hover:text-t-primary'
+        >
+          <span className='inline-flex size-14px shrink-0 items-center justify-center'>
+            {active ? <Spin size={12} /> : <Brain theme='outline' size='14' strokeWidth={3} />}
+          </span>
+          <span className='whitespace-nowrap font-500'>{summary}</span>
+          <span
+            className='inline-flex shrink-0 items-center text-t-tertiary transition-transform duration-200'
+            style={{ transform: expanded ? 'rotate(90deg)' : undefined }}
+          >
+            <Right theme='outline' size='12' strokeWidth={3} />
+          </span>
+        </div>
+
+        {/* Expandable body — reasoning / phase narration / draft heartbeat. */}
+        {expanded && body && (
+          <div
+            ref={bodyRef}
+            className='mt-8px max-h-220px overflow-y-auto whitespace-pre-wrap break-words rd-8px px-12px py-10px text-12px leading-relaxed text-t-tertiary'
+            style={{ background: 'color-mix(in srgb, var(--bg-1) 60%, transparent)' }}
+          >
+            {body}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
 /**
  * RunDecisionFeed — the 对话 (decision dialogue) view of 「智能编排」: a clean,
  * chat-styled thread that makes the main agent's orchestration decisions legible
@@ -269,6 +426,12 @@ const DecisionGroup: React.FC<{ accent: string; Glyph: typeof Merge; label: stri
  */
 const RunDecisionFeed: React.FC<RunDecisionFeedProps> = ({ detail, turns, onSelectTask, selectedTaskId, refetch }) => {
   const { t } = useTranslation();
+
+  // Live lead-agent planning thought stream for THIS run — independently
+  // subscribed (never refetches the detail), rendered as the streaming 编排思考
+  // bubble at the top of the feed. The decision card below derives from `detail`
+  // and surfaces once the plan lands.
+  const leadThinking = useLeadThinking(detail.run.id);
 
   const assignmentByTask = useMemo(() => {
     const map = new Map<string, TAssignment>();
@@ -447,51 +610,54 @@ const RunDecisionFeed: React.FC<RunDecisionFeedProps> = ({ detail, turns, onSele
     if (!pinned) return;
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-    // Re-pin on any live change (new turn, refetched decision) while at bottom.
-  }, [pinned, turns.length, detail.tasks, detail.assignments]);
+    // Re-pin on any live change (new turn, refetched decision, streaming thought)
+    // while at bottom.
+  }, [pinned, turns.length, detail.tasks, detail.assignments, leadThinking.reasoning, leadThinking.phaseKeys, leadThinking.active]);
 
   const decisionEmpty = orderedTasks.length === 0;
+  // While the lead is actively thinking and no plan exists yet, the streaming
+  // bubble already conveys "working on it" — suppress the static empty-decision
+  // placeholder so the feed doesn't show two "forming…" messages at once.
+  const suppressEmptyCard = decisionEmpty && leadThinking.active;
 
   return (
     <div className='relative flex size-full min-h-0 flex-col'>
       <div ref={scrollRef} onScroll={onScroll} className='min-h-0 flex-1 overflow-y-auto px-16px py-16px'>
         <div className='mx-auto flex w-full max-w-820px flex-col gap-16px'>
-          {/* ── Lead-agent decision message (always present) ───────────────── */}
-          <div className='flex flex-col items-start gap-6px'>
-            <div className='flex items-center gap-7px'>
-              <span
-                className='flex size-24px shrink-0 items-center justify-center rd-8px text-white'
-                style={{ background: 'rgb(var(--primary-6))' }}
+          {/* ── Live 编排思考 bubble (streaming, top of thread) ──────────────── */}
+          <LeadThinkingBubble state={leadThinking} />
+
+          {/* ── Lead-agent decision message (always present unless the live
+              thinking bubble is already carrying the "forming…" state) ─────── */}
+          {!suppressEmptyCard && (
+            <div className='flex flex-col items-start gap-6px'>
+              <LeadSpeaker />
+              <div
+                className='w-full rd-12px p-12px'
+                style={{ background: 'var(--bg-2)', border: '1px solid var(--border-base)', borderRadius: '4px 12px 12px 12px' }}
               >
-                <Robot theme='outline' size='15' strokeWidth={3} />
-              </span>
-              <span className='text-12px font-600 text-t-secondary'>{t('orchestrator.run.feed.agentName')}</span>
-            </div>
-            <div
-              className='w-full rd-12px p-12px'
-              style={{ background: 'var(--bg-2)', border: '1px solid var(--border-base)', borderRadius: '4px 12px 12px 12px' }}
-            >
-              {decisionEmpty ? (
-                <div className='flex items-center gap-8px py-4px text-12px leading-18px text-t-tertiary'>
-                  <Comment theme='outline' size='15' strokeWidth={3} className='shrink-0' />
-                  <span>{t('orchestrator.run.feed.empty')}</span>
-                </div>
-              ) : (
-                <>
-                  <div className='mb-4px flex items-baseline gap-8px'>
-                    <span className='text-13px font-700 text-t-primary'>{t('orchestrator.run.feed.decisionTitle')}</span>
-                    <span className='text-11px text-t-tertiary'>
-                      {t('orchestrator.run.feed.decisionSubtitle', { count: orderedTasks.length })}
-                    </span>
+                {decisionEmpty ? (
+                  <div className='flex items-center gap-8px py-4px text-12px leading-18px text-t-tertiary'>
+                    <Comment theme='outline' size='15' strokeWidth={3} className='shrink-0' />
+                    <span>{t('orchestrator.run.feed.empty')}</span>
                   </div>
-                  <div className='mb-10px text-12px leading-18px text-t-secondary'>
-                    {t('orchestrator.run.feed.decisionIntro')}
-                  </div>
-                  <div className='flex flex-col gap-8px'>{decisionBody}</div>
-                </>
-              )}
+                ) : (
+                  <>
+                    <div className='mb-4px flex items-baseline gap-8px'>
+                      <span className='text-13px font-700 text-t-primary'>{t('orchestrator.run.feed.decisionTitle')}</span>
+                      <span className='text-11px text-t-tertiary'>
+                        {t('orchestrator.run.feed.decisionSubtitle', { count: orderedTasks.length })}
+                      </span>
+                    </div>
+                    <div className='mb-10px text-12px leading-18px text-t-secondary'>
+                      {t('orchestrator.run.feed.decisionIntro')}
+                    </div>
+                    <div className='flex flex-col gap-8px'>{decisionBody}</div>
+                  </>
+                )}
+              </div>
             </div>
-          </div>
+          )}
 
           {/* ── Intent-exchange turns (this session) ───────────────────────── */}
           {turns.map((turn) => (
@@ -512,15 +678,7 @@ const RunDecisionFeed: React.FC<RunDecisionFeedProps> = ({ detail, turns, onSele
 
               {/* Lead-agent diff reply — small avatar + a soft card. */}
               <div className='flex flex-col items-start gap-4px'>
-                <div className='flex items-center gap-7px'>
-                  <span
-                    className='flex size-24px shrink-0 items-center justify-center rd-8px text-white'
-                    style={{ background: 'rgb(var(--primary-6))' }}
-                  >
-                    <Robot theme='outline' size='15' strokeWidth={3} />
-                  </span>
-                  <span className='text-12px font-600 text-t-secondary'>{t('orchestrator.run.feed.agentName')}</span>
-                </div>
+                <LeadSpeaker />
                 <div
                   className='max-w-[80%] px-12px py-8px text-13px leading-18px text-t-primary'
                   style={{ background: 'var(--bg-2)', border: '1px solid var(--border-base)', borderRadius: '4px 12px 12px 12px' }}

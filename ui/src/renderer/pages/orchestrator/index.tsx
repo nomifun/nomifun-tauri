@@ -8,7 +8,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { Input, Popconfirm, Spin } from '@arco-design/web-react';
-import { Comment, Delete, Edit, Plus, Right } from '@icon-park/react';
+import { Comment, Delete, Edit, Plus, Right, Robot } from '@icon-park/react';
 import { ipcBridge } from '@/common';
 import type { TRun } from '@/common/types/orchestrator/orchestratorTypes';
 import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
@@ -19,6 +19,10 @@ import {
 } from '@renderer/utils/workspace/sessionSiderEvents';
 import { dispatchWorkspaceAvailabilityEvent } from '@renderer/utils/workspace/workspaceEvents';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
+// The run-list rows show a status pulse on the leading avatar's corner badge for
+// running runs (the `nomi-dag-pulse` keyframes live in dag-canvas.css). Import it
+// here so the rail's pulse works even before any run view / decision feed mounts.
+import './RunDetail/dag-canvas.css';
 import RunHistory from './RunHistory';
 import NewRunComposer, { type ReplanInitial } from './NewRunComposer';
 import NewRunIntentBox from './NewRunIntentBox';
@@ -130,10 +134,28 @@ const RunListRow: React.FC<{
         boxShadow: selected ? '0 0 0 3px color-mix(in srgb, rgb(var(--primary-6)) 16%, transparent)' : undefined,
       }}
     >
-      <span
-        className='size-7px shrink-0 rd-full'
-        style={{ background: dotColor, boxShadow: `0 0 0 2px color-mix(in srgb, ${dotColor} 22%, transparent)` }}
-      />
+      {/* Leading avatar — a lead-agent glyph (orchestration is lead-driven) in a
+          soft tinted square, mirroring the conversation session-row's leading
+          icon, with a small status-colored corner badge so status stays legible
+          at a glance (pulses while running). */}
+      <span className='relative size-26px shrink-0'>
+        <span
+          className='flex size-26px items-center justify-center rd-8px'
+          style={{
+            color: 'rgb(var(--primary-6))',
+            background: 'color-mix(in srgb, rgb(var(--primary-6)) 12%, transparent)',
+          }}
+        >
+          <Robot theme='outline' size='15' strokeWidth={3} />
+        </span>
+        <span
+          className={`absolute -bottom-1px -right-1px size-9px rd-full ${meta?.key === 'running' ? 'nomi-dag-pulse' : ''}`}
+          style={{
+            background: dotColor,
+            boxShadow: '0 0 0 2px var(--bg-1), 0 0 0 3px color-mix(in srgb, ' + dotColor + ' 30%, transparent)',
+          }}
+        />
+      </span>
       <div className='min-w-0 flex-1'>
         <div className='truncate text-13px font-600 leading-tight text-t-primary'>{goalText}</div>
         <div className='mt-3px flex items-center gap-6px truncate text-11px text-t-tertiary'>
