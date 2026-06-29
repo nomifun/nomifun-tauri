@@ -48,6 +48,18 @@ const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
 /// own escalating backoff this is several minutes of grace, then a hard fail.
 const MAX_RECOVERY_WAITS: u32 = 5;
 
+/// Max consecutive decision-ending turns AutoWork will YIELD to IDMM within one
+/// requirement turn before finalizing it itself (bounds a runaway question loop).
+const MAX_DECISION_WAITS: u32 = 12;
+
+/// How long AutoWork waits for IDMM to START answering a pending decision (i.e.
+/// drive a follow-up turn) before giving up the yield and finalizing the turn
+/// as-is. Must comfortably exceed IDMM's first decision backoff (~10s) plus a
+/// sidecar model call, so the model tier reliably wins; a rule-tier watch that
+/// cannot auto-answer simply falls back to finalize after this window (no hang).
+const DECISION_YIELD_WINDOW: Duration = Duration::from_secs(90);
+
+
 /// Shared dependencies for all autowork loops.
 pub struct OrchestratorDeps {
     pub service: Arc<RequirementService>,
@@ -734,34 +746,91 @@ async fn wait_for_terminal_with_renewal(
     let mut note_buf = String::new();
     // Count of retryable errors we've waited through (letting IDMM recover).
     let mut recovery_waits = 0u32;
+    // Count of decision-ending turns we've YIELDED to IDMM this requirement turn.
+    let mut decision_waits = 0u32;
+    // When riding an IDMM-owned decision turn-end: the instant by which IDMM must
+    // have STARTED answering (driven a follow-up turn). If no activity arrives by
+    // then, IDMM cannot / will not answer (e.g. a rule-tier watch) → stop yielding
+    // and finalize the decision-ending turn as-is. Cleared on any activity.
+    let mut decision_ride_until: Option<tokio::time::Instant> = None;
 
     let fut = async {
         loop {
+            // Copy the deadline out for the watchdog branch (Option<Instant> is
+            // Copy) so its future never borrows the state the rx handler mutates.
+            let ride_until = decision_ride_until;
             tokio::select! {
                 _ = renew.tick() => {
                     if let Err(e) = deps.service.renew_lease(req_id, conv_id, DEFAULT_LEASE_MS).await {
                         warn!(conversation_id, requirement_id = req_id, error = %e, "Lease renewal failed");
                     }
                 }
+                // Decision-yield watchdog: armed only while riding (ride_until Some).
+                // Fires when IDMM did not start answering within DECISION_YIELD_WINDOW
+                // → fall back to finalizing the decision-ending turn instead of hanging.
+                () = async move {
+                    match ride_until {
+                        Some(until) => tokio::time::sleep_until(until).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    info!(
+                        conversation_id,
+                        requirement_id = req_id,
+                        "AutoWork decision-yield window elapsed without IDMM answering — finalizing turn"
+                    );
+                    return TurnEnd::Clean;
+                }
                 ev = rx.recv() => {
                     match ev {
                         // Capture the agent's prose; on a clean finish this is the
                         // completion note for tool-free engines (ACP/codex/gemini).
-                        Ok(AgentStreamEvent::Text(t)) => append_bounded(&mut note_buf, &t.content),
-                        // Finish is NOT unconditionally success: a turn can end with
-                        // a refusal / token-or-turn truncation while still having
-                        // produced prose (no Error event). Consult the stop_reason so
-                        // a failed-but-non-empty turn is recorded as failed, not done
-                        // — and so a user cancel is read as an interrupt, not a failure.
-                        Ok(AgentStreamEvent::Finish(d)) => return turn_end_from(&d.stop_reason),
+                        // Any activity also means IDMM's follow-up turn has started,
+                        // so the decision-yield watchdog stands down.
+                        Ok(AgentStreamEvent::Text(t)) => {
+                            decision_ride_until = None;
+                            append_bounded(&mut note_buf, &t.content);
+                        }
+                        // A clean Finish is NOT necessarily the requirement's terminal
+                        // state: the agent may have ended its turn on a 选择题/开放式提问.
+                        // When IDMM is supervising and a pending decision exists, IDMM
+                        // will answer it — so YIELD instead of finalizing here (which
+                        // would park the requirement needs_review, burn an attempt, and
+                        // let run_loop race a fresh requirement into the session,
+                        // stomping IDMM's pending answer — the 代码乱套). Keep waiting on
+                        // the SAME broadcast (without holding the turn claim) until the
+                        // work reaches a real terminal Finish. A refusal/truncation
+                        // (Errored) or user cancel (Cancelled) is never yielded — those
+                        // are genuine terminal ends.
+                        Ok(AgentStreamEvent::Finish(d)) => {
+                            let end = turn_end_from(&d.stop_reason);
+                            let yield_to_idmm = if let Some(idmm) = deps.idmm.as_ref() {
+                                should_wait_for_decision(
+                                    end,
+                                    idmm.is_supervising(AutoWorkTargetKind::Conversation, conversation_id),
+                                    decision_waits,
+                                ) && idmm
+                                    .has_pending_decision(AutoWorkTargetKind::Conversation, conversation_id)
+                                    .await
+                            } else {
+                                false
+                            };
+                            if yield_to_idmm {
+                                decision_waits += 1;
+                                decision_ride_until = Some(tokio::time::Instant::now() + DECISION_YIELD_WINDOW);
+                                continue;
+                            }
+                            return end;
+                        }
                         // On an error, defer to IDMM when it is supervising: a
-                        // retryable provider fault is IDMM's job to recover in-turn
-                        // (retry / sidecar). Failing the turn here would abandon it
-                        // and race a fresh requirement into the same session while
-                        // IDMM is mid-retry — the historical "代码乱套". Wait through
-                        // up to MAX_RECOVERY_WAITS such errors for the retry's Finish;
-                        // otherwise (non-retryable, no IDMM, or grace exhausted) fail.
+                        // retryable provider fault is IDMM's job to recover (retry /
+                        // sidecar via a fresh turn). Failing the turn here would
+                        // abandon it and race a fresh requirement into the same
+                        // session — the historical "代码乱套". Wait through up to
+                        // MAX_RECOVERY_WAITS such errors; otherwise (non-retryable, no
+                        // IDMM, or grace exhausted) fail.
                         Ok(AgentStreamEvent::Error(d)) => {
+                            decision_ride_until = None;
                             let retryable = matches!(d.retryable, Some(true));
                             let idmm_supervising = deps
                                 .idmm
@@ -774,7 +843,10 @@ async fn wait_for_terminal_with_renewal(
                             }
                             return TurnEnd::Errored;
                         }
-                        Ok(_) => continue,
+                        Ok(_) => {
+                            decision_ride_until = None;
+                            continue;
+                        }
                         // A closed channel means the agent task was torn down
                         // (eviction on terminal error, process death, dropped
                         // connection) — the turn did NOT finish cleanly. Treat as
@@ -841,6 +913,17 @@ fn failure_backoff(consecutive: u32) -> Duration {
 /// When IDMM is not supervising, the turn fails on the first error (legacy).
 fn should_wait_for_recovery(retryable: bool, idmm_supervising: bool, waits_so_far: u32) -> bool {
     retryable && idmm_supervising && waits_so_far < MAX_RECOVERY_WAITS
+}
+
+/// Decide whether AutoWork should YIELD a clean-finish turn to IDMM rather than
+/// finalize it as the requirement's terminal state. We yield only on a CLEAN
+/// finish (a refusal/truncation Errored or a user Cancelled is a real terminal
+/// end) AND when IDMM is supervising (it owns answering 选择题/开放式提问), bounded by
+/// `MAX_DECISION_WAITS` so a runaway question loop can't ride forever. The caller
+/// additionally confirms (async) that a pending decision actually exists before
+/// yielding, and arms a watchdog so a non-answering IDMM falls back to finalize.
+fn should_wait_for_decision(end: TurnEnd, idmm_supervising: bool, waits_so_far: u32) -> bool {
+    end == TurnEnd::Clean && idmm_supervising && waits_so_far < MAX_DECISION_WAITS
 }
 
 /// Trim + tail-truncate the accumulated agent text into a completion note.
@@ -1084,6 +1167,21 @@ mod tests {
         assert!(!should_wait_for_recovery(false, true, 0));
         // IDMM not supervising → legacy: fail on first error.
         assert!(!should_wait_for_recovery(true, false, 0));
+    }
+
+    #[test]
+    fn should_wait_for_decision_only_when_clean_idmm_and_under_cap() {
+        // Yield a clean decision-ending finish to IDMM while it supervises, under cap.
+        assert!(should_wait_for_decision(TurnEnd::Clean, true, 0));
+        assert!(should_wait_for_decision(TurnEnd::Clean, true, MAX_DECISION_WAITS - 1));
+        // Cap reached → finalize ourselves (stop riding).
+        assert!(!should_wait_for_decision(TurnEnd::Clean, true, MAX_DECISION_WAITS));
+        // IDMM not supervising → legacy: a clean finish ends the turn immediately.
+        assert!(!should_wait_for_decision(TurnEnd::Clean, false, 0));
+        // A real terminal end is never yielded: an errored (refusal/truncation)
+        // or user-cancelled finish must finalize, not wait for IDMM.
+        assert!(!should_wait_for_decision(TurnEnd::Errored, true, 0));
+        assert!(!should_wait_for_decision(TurnEnd::Cancelled, true, 0));
     }
 
     #[test]
