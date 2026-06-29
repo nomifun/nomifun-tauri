@@ -534,6 +534,23 @@ async fn run_loop(deps: Arc<RunEngineDeps>, run_id: &str, cancelled: Arc<AtomicB
                             settled_sync = true;
                             continue;
                         }
+                        // loop 模式 (UC-1d): a `loop` controller is settled
+                        // SYNCHRONOUSLY here too — NOT dispatched to a worker. When it
+                        // is in the ready set its body dep is `done`, so it evaluates
+                        // the stop decision over the body's output + iteration count
+                        // (`settle_loop_task`): STOP → mark itself `done` with the
+                        // final result; CONTINUE → RESET the body to re-run in place
+                        // (pending, clear output, attempt+1) and stay `pending`. A
+                        // CONTINUE un-`done`s its only blocker, so it leaves the ready
+                        // set until the body re-completes — bounded by the HARD
+                        // max_iter cap (no spin). Like verify/judge it never enters the
+                        // in-flight set; we re-loop (settled_sync) so the reset body /
+                        // a freshly-`done` loop's downstream is re-filled.
+                        if task.kind == "loop" {
+                            settle_loop_task(&deps, run_id, &task).await;
+                            settled_sync = true;
+                            continue;
+                        }
                         let fut = dispatch_task(&deps, run_id, task, workspace_dir.clone()).await;
                         if let Some((task_id, fut)) = fut {
                             in_progress.insert(task_id);
@@ -551,11 +568,50 @@ async fn run_loop(deps: Arc<RunEngineDeps>, run_id: &str, cancelled: Arc<AtomicB
             }
         }
 
+        // loop 模式 (UC-1d) failed-body branch: a `loop` controller whose body dep
+        // FAILED never appears in `list_ready_tasks` (its only blocker is not
+        // `done`), so it would otherwise hang `pending` while the run wedges. Scan
+        // for such controllers and settle them (`settle_loop_task` STOPs the loop
+        // `failed` + gates downstream — a failing body never iterates). Skipped
+        // while paused (a paused run does not iterate / settle). Bounded: each loop
+        // settles at most once (it becomes terminal `failed`, never re-matched), so
+        // this cannot spin. Only when this pass dispatched/settled nothing else do
+        // we even need it (a freshly-failed body is observed on the NEXT fill pass).
+        if !paused && !settled_sync {
+            if let Ok(all) = deps.run_repo.list_tasks(run_id).await {
+                let dep_edges = deps.run_repo.list_deps(run_id).await.unwrap_or_default();
+                // Stalled loop controllers: still `pending`, with a `failed` body
+                // blocker. (A `done` body is handled by the ready-set branch above.)
+                let stalled: Vec<OrchRunTaskRow> = all
+                    .iter()
+                    .filter(|t| t.kind == "loop" && t.status == "pending")
+                    .filter(|t| {
+                        dep_edges
+                            .iter()
+                            .filter(|d| d.blocked_task_id == t.id)
+                            .any(|d| {
+                                all.iter().any(|b| {
+                                    b.id == d.blocker_task_id && b.status == "failed"
+                                })
+                            })
+                    })
+                    .cloned()
+                    .collect();
+                for ctrl in stalled {
+                    settle_loop_task(&deps, run_id, &ctrl).await;
+                    settled_sync = true;
+                }
+            }
+        }
+
         // A synchronous aggregator (verify/judge) settled this pass → re-loop to
         // re-fill on the newly-unblocked (or freshly-skipped) downstream before any
         // terminal decision. Bounded: each aggregator settles exactly once (it is
         // `done` afterward, never returned by `list_ready_tasks` again), so this
-        // cannot loop forever.
+        // cannot loop forever. A `loop` controller CONTINUE is also bounded: it
+        // resets the body (un-`done`s its blocker) so the controller is not re-ready
+        // until a REAL body worker round completes, and the body's `attempt` is hard-
+        // capped by `max_iter` — there is no path past the cap (no spin).
         if settled_sync {
             continue;
         }
@@ -1687,6 +1743,483 @@ async fn settle_judge_task(deps: &Arc<RunEngineDeps>, run_id: &str, task: &OrchR
         "judge aggregator settled"
     );
     // NOTE: no downstream gate — a judge reports a winner, it does not skip work.
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// loop 模式 (UC-1d): the `loop` controller. The lead plans ONE BODY `agent` task
+// + ONE `loop` controller task that `depends_on` the body. The controller is
+// settled NO-LLM in the fill step (`settle_loop_task`) every time the body
+// reaches `done`: it evaluates a stop criterion over the body's `output_summary`
+// + iteration count and either
+//   - STOPs (criterion met OR the HARD `max_iter` cap reached): marks itself
+//     `done`, writing the final body output + iteration count to its summary; or
+//   - CONTINUEs (criterion not met AND under the cap): RESETS the body in place
+//     (status→`pending`, clear output_summary/conversation_id, attempt+1) and
+//     leaves itself `pending`. The body re-enters the normal ready→dispatch→
+//     worker→done path; when it completes the controller fires again.
+//
+// NO-SPIN (the critical invariant): the loop ALWAYS terminates. The HARD
+// `max_iter` cap is the backstop — `iterations_done + 1 >= max_iter` forces STOP
+// even if the criterion never fires. Each CONTINUE requires a REAL body worker
+// run (a `done`→`pending`→worker→`done` cycle = one unit of monotonic progress,
+// counted by the body's `attempt`), and `attempt` is strictly bounded by
+// `max_iter`. The controller settle is a one-shot per body-completion: after a
+// CONTINUE the body is `pending` (un-`done`), so the controller's only blocker is
+// no longer `done` and `list_ready_tasks` does NOT return the controller again
+// until the body re-completes — there is no path where the controller re-settles
+// without the body having re-run, and no path past the cap.
+//
+// A body that FAILS mid-loop never reaches `done`, so the controller never
+// becomes ready by the normal path. `settle_loop_task` is therefore also invoked
+// when the body is `failed` (see the fill step's loop branch): it STOPs the loop
+// as `failed` and gates (skips) downstream, so a failing body never iterates and
+// the run still reaches a clean terminal state.
+//
+// Like verify/judge the controller is NOT a worker dispatch: it is settled
+// SYNCHRONOUSLY in the fill step, never enters the in-flight worker set, and its
+// `conversation_id` stays None (there is no worker conversation).
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Default hard iteration cap when a `loop` task's `pattern_config` omits (or
+/// fail-soft-loses) `max_iter`. Small by design — the cap is the no-spin backstop.
+const DEFAULT_LOOP_MAX_ITER: u64 = 5;
+
+/// A `loop` controller's stop criterion, parsed from its `pattern_config`
+/// (`{"max_iter":N,"stop":{...}}`). The HARD `max_iter` cap is held separately on
+/// [`LoopConfig`]; this enum is only the EARLY-stop test. Fail-soft: an unknown /
+/// missing `stop` degrades to [`StopCriteria::MaxIter`] (cap-only — the loop runs
+/// to the cap, never unbounded).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StopCriteria {
+    /// Stop only when the hard `max_iter` cap is reached (no early stop).
+    MaxIter,
+    /// Stop early once the body output contains `done_marker` (or strict JSON
+    /// `{"done":true}`).
+    Predicate { done_marker: String },
+    /// Stop early once `quiet_rounds` consecutive rounds produced the SAME body
+    /// output (no further change). `quiet_rounds` is clamped to >= 1.
+    Dry { quiet_rounds: usize },
+}
+
+/// A parsed `loop` controller config: the HARD cap + the early-stop criterion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoopConfig {
+    /// HARD upper bound on iterations (>= 1). The no-spin backstop — the loop
+    /// ALWAYS stops once this many body rounds have completed, criterion or not.
+    max_iter: u64,
+    stop: StopCriteria,
+}
+
+impl LoopConfig {
+    /// Parse from a `loop` task's `pattern_config` raw JSON string. Fail-soft:
+    /// any problem (None / blank / not JSON / missing fields / unknown stop kind)
+    /// degrades to a bounded cap-only loop (`max_iter` default
+    /// [`DEFAULT_LOOP_MAX_ITER`], `stop` = [`StopCriteria::MaxIter`]) — there is
+    /// NEVER an unbounded path.
+    fn parse(pattern_config: Option<&str>) -> Self {
+        let default = LoopConfig {
+            max_iter: DEFAULT_LOOP_MAX_ITER,
+            stop: StopCriteria::MaxIter,
+        };
+        let Some(raw) = pattern_config.map(str::trim).filter(|s| !s.is_empty()) else {
+            return default;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+            return default;
+        };
+
+        // max_iter: REQUIRED hard cap — default when absent/invalid, clamped >= 1.
+        let max_iter = value
+            .get("max_iter")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|n| *n >= 1)
+            .unwrap_or(DEFAULT_LOOP_MAX_ITER);
+
+        // stop: fail-soft to MaxIter (cap-only) on anything unrecognized.
+        let stop = match value.get("stop") {
+            Some(stop_val) => Self::parse_stop(stop_val),
+            None => StopCriteria::MaxIter,
+        };
+
+        LoopConfig { max_iter, stop }
+    }
+
+    /// Parse the `stop` object fail-soft. Unknown `kind` (or a non-object) →
+    /// [`StopCriteria::MaxIter`].
+    fn parse_stop(stop: &serde_json::Value) -> StopCriteria {
+        let kind = stop.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
+        match kind.trim().to_ascii_lowercase().as_str() {
+            "predicate" => {
+                // The marker is required for a useful predicate; an absent/blank
+                // marker degrades to cap-only (it could never fire).
+                let marker = stop
+                    .get("done_marker")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                match marker {
+                    Some(m) => StopCriteria::Predicate { done_marker: m.to_string() },
+                    None => StopCriteria::MaxIter,
+                }
+            }
+            "dry" => {
+                // quiet_rounds clamped to >= 1 (1 = "stop as soon as one round
+                // repeats the previous one").
+                let k = stop
+                    .get("quiet_rounds")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(1)
+                    .max(1) as usize;
+                StopCriteria::Dry { quiet_rounds: k }
+            }
+            // "max_iter" and anything unknown both fall to the safe cap-only stop.
+            _ => StopCriteria::MaxIter,
+        }
+    }
+}
+
+/// Does the body's latest output satisfy a `predicate` stop? True when the text
+/// contains the `done_marker` (case-sensitive substring) OR a strict JSON object
+/// anywhere in it carries `"done": true`.
+fn predicate_done(body_output: Option<&str>, done_marker: &str) -> bool {
+    let Some(text) = body_output.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    if !done_marker.is_empty() && text.contains(done_marker) {
+        return true;
+    }
+    if let Some(json) = first_json_object(text) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json) {
+            if value.get("done").and_then(serde_json::Value::as_bool) == Some(true) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// A stable, collision-resistant-enough content key for a body output round,
+/// used by the `dry` criterion to detect unchanged rounds. Trims surrounding
+/// whitespace (so trivial reformatting is not the signal) then hashes. An absent
+/// output hashes the empty string (distinct rounds with no output are "equal").
+fn round_hash(body_output: Option<&str>) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let normalized = body_output.map(str::trim).unwrap_or("");
+    let mut hasher = DefaultHasher::new();
+    normalized.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The decision `settle_loop_task` makes after one body completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoopDecision {
+    /// Stop the loop `done` — criterion met or the hard cap reached. Carries the
+    /// human-readable stop reason for the summary.
+    Stop { reason: &'static str },
+    /// Re-run the body for another round (criterion not met AND under the cap).
+    Continue,
+}
+
+/// Decide STOP vs CONTINUE for a `loop` controller after the body finished a
+/// round, GIVEN the parsed config, the iteration count just completed
+/// (`iterations_done` = body `attempt` + 1), the body's current output, and the
+/// recorded hashes of every PRIOR round's output (oldest→newest, NOT including
+/// this round). Pure (no I/O) so the no-spin termination is unit-testable.
+///
+/// **HARD cap wins:** the very first check is `iterations_done >= max_iter` → STOP
+/// (reason `max_iter`). This is the backstop: regardless of the criterion, the
+/// loop can never run more than `max_iter` body rounds. Only when UNDER the cap is
+/// the early-stop criterion consulted.
+fn decide_loop(
+    config: &LoopConfig,
+    iterations_done: u64,
+    body_output: Option<&str>,
+    prior_hashes: &[u64],
+) -> LoopDecision {
+    // (1) HARD cap — ALWAYS wins. Once this many rounds have completed, stop no
+    // matter what. iterations_done is body.attempt + 1, so attempt+1 >= max_iter.
+    if iterations_done >= config.max_iter {
+        return LoopDecision::Stop { reason: "max_iter" };
+    }
+
+    // (2) Under the cap → consult the early-stop criterion.
+    match &config.stop {
+        StopCriteria::MaxIter => LoopDecision::Continue, // cap-only: keep going
+        StopCriteria::Predicate { done_marker } => {
+            if predicate_done(body_output, done_marker) {
+                LoopDecision::Stop { reason: "predicate" }
+            } else {
+                LoopDecision::Continue
+            }
+        }
+        StopCriteria::Dry { quiet_rounds } => {
+            // The last `quiet_rounds` rounds (this round + the prior ones) must
+            // all share the same hash. With this round's hash appended, we need
+            // `quiet_rounds` consecutive equal hashes at the tail.
+            let this_hash = round_hash(body_output);
+            // Need at least `quiet_rounds` rounds total to have that many equal.
+            if *quiet_rounds <= 1 {
+                // quiet_rounds==1 means "stop the moment a round equals the prior
+                // one" → need at least one prior hash equal to this one.
+                if prior_hashes.last() == Some(&this_hash) {
+                    return LoopDecision::Stop { reason: "dry" };
+                }
+                return LoopDecision::Continue;
+            }
+            // We need the last (quiet_rounds-1) PRIOR hashes plus this one to all
+            // be equal to this_hash.
+            let need_prior = quiet_rounds - 1;
+            if prior_hashes.len() >= need_prior
+                && prior_hashes[prior_hashes.len() - need_prior..]
+                    .iter()
+                    .all(|h| *h == this_hash)
+            {
+                LoopDecision::Stop { reason: "dry" }
+            } else {
+                LoopDecision::Continue
+            }
+        }
+    }
+}
+
+/// Machine-readable prefix the controller writes to its OWN `output_summary`
+/// while iterating, so the next settle can recover the round hashes (the body's
+/// own output is cleared on reset, so the controller is the only place to keep
+/// the `dry` history). Format (single line): `LOOP-STATE: hashes=h1,h2,...`.
+const LOOP_STATE_PREFIX: &str = "LOOP-STATE: hashes=";
+
+/// Recover the recorded prior-round hashes from the controller's persisted
+/// `output_summary` (the `LOOP-STATE:` line). Returns an empty vec when absent or
+/// unparseable (fail-soft — a lost history just makes `dry` conservative, never
+/// unbounded: the hard cap still terminates).
+fn parse_loop_state_hashes(controller_summary: Option<&str>) -> Vec<u64> {
+    let Some(text) = controller_summary else {
+        return vec![];
+    };
+    let Some(line) = text.lines().find(|l| l.trim_start().starts_with(LOOP_STATE_PREFIX)) else {
+        return vec![];
+    };
+    let after = line.trim_start().trim_start_matches(LOOP_STATE_PREFIX).trim();
+    if after.is_empty() {
+        return vec![];
+    }
+    after
+        .split(',')
+        .filter_map(|s| s.trim().parse::<u64>().ok())
+        .collect()
+}
+
+/// Render the controller's iterating-state `output_summary`: just the machine
+/// `LOOP-STATE:` line carrying the running round-hash history. Overwritten each
+/// CONTINUE settle; replaced wholesale by [`render_loop_final`] on STOP.
+fn render_loop_state(hashes: &[u64]) -> String {
+    let csv = hashes.iter().map(|h| h.to_string()).collect::<Vec<_>>().join(",");
+    format!("{LOOP_STATE_PREFIX}{csv}")
+}
+
+/// Render the controller's FINAL `output_summary` on STOP — a machine-leading
+/// marker (`LOOP: STOPPED (reason=..., iterations=N, max_iter=M)`) followed by the
+/// body's last output (the loop's result), so both a downstream consumer and the
+/// UI can parse the outcome + read the final result. `outcome` is `done` or
+/// `failed` (a failing body stops the loop as failed).
+fn render_loop_final(
+    outcome: &str,
+    reason: &str,
+    iterations: u64,
+    max_iter: u64,
+    body_output: Option<&str>,
+) -> String {
+    let mut out = format!(
+        "LOOP: {} (reason={reason}, iterations={iterations}, max_iter={max_iter})\n",
+        outcome.to_ascii_uppercase()
+    );
+    if let Some(body) = body_output.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push('\n');
+        out.push_str(body);
+        out.push('\n');
+    }
+    out
+}
+
+/// Settle a `loop` controller task SYNCHRONOUSLY (no worker dispatch). Invoked in
+/// the fill step when EITHER the controller is ready (its body dep is `done`) OR
+/// its body dep is `failed` (the dedicated failed-body branch). Resolves the
+/// body, then:
+///   - body `failed` → STOP the loop `failed`, write the failed marker, GATE
+///     (skip) downstream so a failing body never iterates;
+///   - body `done` → [`decide_loop`]:
+///     - STOP → mark the controller `done`, write the final marker + the body's
+///       last output;
+///     - CONTINUE → RESET the body (`pending`, clear output_summary +
+///       conversation_id, `attempt`+1) and persist the updated round-hash history
+///       to the controller's `output_summary` (controller stays `pending`).
+///
+/// Bounded + no spin: a CONTINUE un-`done`s the body, so the controller leaves
+/// the ready set until the body re-completes (a real worker round); the body's
+/// `attempt` is strictly bounded by `max_iter` (the hard cap is checked FIRST in
+/// `decide_loop`). The controller transitions at most once per body completion.
+async fn settle_loop_task(deps: &Arc<RunEngineDeps>, run_id: &str, task: &OrchRunTaskRow) {
+    // Resolve the loop's body dependency. A well-formed loop has exactly ONE
+    // blocker (the body); if the planner emitted more, we use the first blocker
+    // by task order (deterministic) and ignore the rest — fail-soft.
+    let dep_edges = deps.run_repo.list_deps(run_id).await.unwrap_or_default();
+    let blocker_ids: HashSet<String> = dep_edges
+        .iter()
+        .filter(|d| d.blocked_task_id == task.id)
+        .map(|d| d.blocker_task_id.clone())
+        .collect();
+    let all_tasks = deps.run_repo.list_tasks(run_id).await.unwrap_or_default();
+    let body = all_tasks
+        .iter()
+        .filter(|t| blocker_ids.contains(&t.id))
+        .min_by_key(|t| t.created_at)
+        .cloned();
+
+    let config = LoopConfig::parse(task.pattern_config.as_deref());
+
+    let Some(body) = body else {
+        // No body dependency at all → nothing to iterate. Settle `done` with a
+        // degenerate marker (never spin / never wait forever).
+        let summary = render_loop_final("done", "no_body", 0, config.max_iter, None);
+        finish_loop_controller(deps, run_id, &task.id, "done", summary).await;
+        return;
+    };
+
+    // FAILED body → stop the loop failed + gate downstream (never iterate a
+    // failing body). Reached via the fill step's failed-body branch.
+    if body.status == "failed" {
+        let iterations = body.attempt.max(0) as u64 + 1; // rounds attempted
+        let summary = render_loop_final(
+            "failed",
+            "body_failed",
+            iterations,
+            config.max_iter,
+            body.output_summary.as_deref(),
+        );
+        finish_loop_controller(deps, run_id, &task.id, "failed", summary).await;
+        // Gate downstream: a failing loop must not let its consumers run.
+        skip_downstream(deps, run_id, &task.id, &dep_edges).await;
+        info!(run_id, task_id = %task.id, "loop controller stopped: body failed");
+        return;
+    }
+
+    // DONE body → evaluate the stop decision over this completed round.
+    // body.attempt is the 0-based round index just completed → iterations_done is
+    // attempt + 1.
+    let iterations_done = body.attempt.max(0) as u64 + 1;
+    let prior_hashes = parse_loop_state_hashes(task.output_summary.as_deref());
+    let decision = decide_loop(
+        &config,
+        iterations_done,
+        body.output_summary.as_deref(),
+        &prior_hashes,
+    );
+
+    match decision {
+        LoopDecision::Stop { reason } => {
+            let summary = render_loop_final(
+                "done",
+                reason,
+                iterations_done,
+                config.max_iter,
+                body.output_summary.as_deref(),
+            );
+            finish_loop_controller(deps, run_id, &task.id, "done", summary).await;
+            info!(
+                run_id,
+                task_id = %task.id,
+                reason,
+                iterations = iterations_done,
+                max_iter = config.max_iter,
+                "loop controller stopped"
+            );
+        }
+        LoopDecision::Continue => {
+            // Record this round's hash in the controller's running history so the
+            // next settle can evaluate `dry`. Then RESET the body in place.
+            let mut hashes = prior_hashes;
+            hashes.push(round_hash(body.output_summary.as_deref()));
+            let state_summary = render_loop_state(&hashes);
+            // Persist the controller's history (controller STAYS pending — no
+            // status change; its blocker is about to become un-done).
+            let _ = deps
+                .run_repo
+                .update_task(
+                    &task.id,
+                    UpdateTaskParams {
+                        status: None,
+                        conversation_id: None,
+                        output_summary: Some(Some(state_summary)),
+                        output_files: None,
+                        attempt: None,
+                        tokens: None,
+                        graph_x: None,
+                        graph_y: None,
+                    },
+                )
+                .await;
+            // RESET the body: pending + clear output_summary/conversation_id +
+            // attempt+1. This un-`done`s the controller's only blocker, so the
+            // controller leaves the ready set until the body re-completes (a real
+            // worker round) — the monotonic progress that bounds the loop.
+            let _ = deps
+                .run_repo
+                .update_task(
+                    &body.id,
+                    UpdateTaskParams {
+                        status: Some("pending".to_string()),
+                        conversation_id: Some(None), // clear the prior round's conv
+                        output_summary: Some(None),  // clear the prior round's output
+                        output_files: Some(None),
+                        attempt: Some(body.attempt + 1),
+                        tokens: None,
+                        graph_x: None,
+                        graph_y: None,
+                    },
+                )
+                .await;
+            deps.emitter.emit_task_status(run_id, &body.id, "pending");
+            info!(
+                run_id,
+                task_id = %task.id,
+                body_id = %body.id,
+                next_attempt = body.attempt + 1,
+                iterations_done,
+                max_iter = config.max_iter,
+                "loop controller continues: body reset for another round"
+            );
+        }
+    }
+}
+
+/// Mark a `loop` controller terminal (`done`/`failed`) with the given final
+/// `output_summary`. The controller has NO worker conversation (conversation_id
+/// stays None). Shared by every STOP path in [`settle_loop_task`].
+async fn finish_loop_controller(
+    deps: &Arc<RunEngineDeps>,
+    run_id: &str,
+    task_id: &str,
+    status: &str,
+    summary: String,
+) {
+    let _ = deps
+        .run_repo
+        .update_task(
+            task_id,
+            UpdateTaskParams {
+                status: Some(status.to_string()),
+                conversation_id: None,
+                output_summary: Some(Some(summary)),
+                output_files: None,
+                attempt: None,
+                tokens: None,
+                graph_x: None,
+                graph_y: None,
+            },
+        )
+        .await;
+    deps.emitter.emit_task_status(run_id, task_id, status);
 }
 
 /// Mark every task transitively downstream of `from_task_id` (its dependents,
@@ -4389,6 +4922,537 @@ mod tests {
         for t in &detail.tasks {
             assert_eq!(t.status, "done", "task {} done", t.title);
             assert_eq!(t.kind, "agent", "no judge kind injected");
+        }
+    }
+
+    // ── loop 模式 (UC-1d): config parse, stop decision (HARD cap wins), dry state ──
+
+    #[test]
+    fn loop_config_parse_is_fail_soft_and_always_bounded() {
+        // Explicit shapes.
+        let c = LoopConfig::parse(Some(r#"{"max_iter":3,"stop":{"kind":"max_iter"}}"#));
+        assert_eq!(c.max_iter, 3);
+        assert_eq!(c.stop, StopCriteria::MaxIter);
+
+        let c = LoopConfig::parse(Some(
+            r#"{"max_iter":4,"stop":{"kind":"predicate","done_marker":"DONE"}}"#,
+        ));
+        assert_eq!(c.max_iter, 4);
+        assert_eq!(c.stop, StopCriteria::Predicate { done_marker: "DONE".to_string() });
+
+        let c = LoopConfig::parse(Some(r#"{"max_iter":6,"stop":{"kind":"dry","quiet_rounds":2}}"#));
+        assert_eq!(c.max_iter, 6);
+        assert_eq!(c.stop, StopCriteria::Dry { quiet_rounds: 2 });
+
+        // Fail-soft: absent / blank / not-JSON → DEFAULT cap-only (bounded, never
+        // unbounded). The default max_iter is the small backstop.
+        for raw in [None, Some("   "), Some("not json"), Some(r#"{"foo":1}"#)] {
+            let c = LoopConfig::parse(raw);
+            assert_eq!(c.max_iter, DEFAULT_LOOP_MAX_ITER, "fail-soft cap for {raw:?}");
+            assert_eq!(c.stop, StopCriteria::MaxIter, "fail-soft stop for {raw:?}");
+        }
+
+        // Unknown stop kind → cap-only (still bounded).
+        let c = LoopConfig::parse(Some(r#"{"max_iter":2,"stop":{"kind":"weird"}}"#));
+        assert_eq!(c.max_iter, 2);
+        assert_eq!(c.stop, StopCriteria::MaxIter);
+
+        // max_iter omitted → default; max_iter=0 (invalid) → clamped to default
+        // (NEVER 0 → never an unbounded/zero loop).
+        assert_eq!(LoopConfig::parse(Some(r#"{"stop":{"kind":"max_iter"}}"#)).max_iter, DEFAULT_LOOP_MAX_ITER);
+        assert_eq!(LoopConfig::parse(Some(r#"{"max_iter":0}"#)).max_iter, DEFAULT_LOOP_MAX_ITER);
+
+        // predicate with NO marker → degrades to cap-only (a marker-less predicate
+        // could never fire, so the cap is the only stop → still bounded).
+        let c = LoopConfig::parse(Some(r#"{"max_iter":3,"stop":{"kind":"predicate"}}"#));
+        assert_eq!(c.stop, StopCriteria::MaxIter);
+
+        // dry quiet_rounds omitted → defaults to 1 (clamped >= 1).
+        let c = LoopConfig::parse(Some(r#"{"max_iter":3,"stop":{"kind":"dry"}}"#));
+        assert_eq!(c.stop, StopCriteria::Dry { quiet_rounds: 1 });
+    }
+
+    #[test]
+    fn predicate_done_marker_and_json() {
+        assert!(predicate_done(Some("all polished. DONE"), "DONE"));
+        assert!(!predicate_done(Some("still working"), "DONE"));
+        // JSON {"done":true} anywhere triggers regardless of the text marker.
+        assert!(predicate_done(Some(r#"result: {"done":true,"note":"ok"}"#), "DONE"));
+        assert!(!predicate_done(Some(r#"{"done":false}"#), "DONE"));
+        // Missing / blank → not done.
+        assert!(!predicate_done(None, "DONE"));
+        assert!(!predicate_done(Some("   "), "DONE"));
+    }
+
+    #[test]
+    fn decide_loop_hard_cap_always_wins_even_when_criterion_never_fires() {
+        // The no-spin backstop: with a predicate that NEVER matches, the loop must
+        // STOP exactly at the cap. max_iter=3 → iterations_done 1,2 CONTINUE; 3 STOP.
+        let cfg = LoopConfig {
+            max_iter: 3,
+            stop: StopCriteria::Predicate { done_marker: "NEVER".to_string() },
+        };
+        assert_eq!(decide_loop(&cfg, 1, Some("nope"), &[]), LoopDecision::Continue);
+        assert_eq!(decide_loop(&cfg, 2, Some("nope"), &[]), LoopDecision::Continue);
+        assert_eq!(
+            decide_loop(&cfg, 3, Some("nope"), &[]),
+            LoopDecision::Stop { reason: "max_iter" },
+            "HARD cap forces STOP at max_iter regardless of the criterion"
+        );
+        // And it can NEVER exceed the cap (defensive: iterations_done > max_iter).
+        assert_eq!(decide_loop(&cfg, 99, Some("nope"), &[]), LoopDecision::Stop { reason: "max_iter" });
+    }
+
+    #[test]
+    fn decide_loop_predicate_stops_early_under_the_cap() {
+        let cfg = LoopConfig {
+            max_iter: 10,
+            stop: StopCriteria::Predicate { done_marker: "DONE".to_string() },
+        };
+        // Under the cap, no marker → CONTINUE.
+        assert_eq!(decide_loop(&cfg, 1, Some("round 1"), &[]), LoopDecision::Continue);
+        // Marker present (still under the cap) → STOP early (reason predicate).
+        assert_eq!(
+            decide_loop(&cfg, 2, Some("round 2 DONE"), &[]),
+            LoopDecision::Stop { reason: "predicate" }
+        );
+    }
+
+    #[test]
+    fn decide_loop_dry_stops_after_k_unchanged_rounds() {
+        // quiet_rounds=2: STOP once 2 consecutive rounds are identical (this round
+        // equals the single prior one). Hash the same output to simulate "no change".
+        let cfg = LoopConfig {
+            max_iter: 10,
+            stop: StopCriteria::Dry { quiet_rounds: 2 },
+        };
+        let h_a = round_hash(Some("draft A"));
+        let h_b = round_hash(Some("draft B"));
+        // Round 1: no prior → CONTINUE.
+        assert_eq!(decide_loop(&cfg, 1, Some("draft A"), &[]), LoopDecision::Continue);
+        // Round 2 produced a DIFFERENT output than round 1 → CONTINUE.
+        assert_eq!(decide_loop(&cfg, 2, Some("draft B"), &[h_a]), LoopDecision::Continue);
+        // Round 3 repeats round 2's output → 2 consecutive equal (rounds 2,3) → STOP.
+        assert_eq!(
+            decide_loop(&cfg, 3, Some("draft B"), &[h_a, h_b]),
+            LoopDecision::Stop { reason: "dry" }
+        );
+
+        // quiet_rounds=3 over the SAME history needs 3 consecutive equal; rounds 2,3
+        // equal is only 2 → still CONTINUE.
+        let cfg3 = LoopConfig { max_iter: 10, stop: StopCriteria::Dry { quiet_rounds: 3 } };
+        assert_eq!(decide_loop(&cfg3, 3, Some("draft B"), &[h_a, h_b]), LoopDecision::Continue);
+        // A 4th identical round (history h_a,h_b,h_b, this=h_b) → rounds 2,3,4 equal → STOP.
+        assert_eq!(
+            decide_loop(&cfg3, 4, Some("draft B"), &[h_a, h_b, h_b]),
+            LoopDecision::Stop { reason: "dry" }
+        );
+    }
+
+    #[test]
+    fn loop_state_hashes_round_trip() {
+        let hashes = vec![111u64, 222u64, 333u64];
+        let rendered = render_loop_state(&hashes);
+        assert!(rendered.starts_with(LOOP_STATE_PREFIX), "machine prefix present: {rendered}");
+        let parsed = parse_loop_state_hashes(Some(&rendered));
+        assert_eq!(parsed, hashes, "hashes survive a render→parse round-trip");
+        // Absent / no LOOP-STATE line → empty (fail-soft).
+        assert!(parse_loop_state_hashes(None).is_empty());
+        assert!(parse_loop_state_hashes(Some("some unrelated text")).is_empty());
+    }
+
+    #[test]
+    fn render_loop_final_leads_with_parseable_marker() {
+        let s = render_loop_final("done", "predicate", 2, 5, Some("the final polished draft"));
+        assert!(s.starts_with("LOOP: DONE"), "machine marker leads: {s}");
+        assert!(s.contains("reason=predicate"), "reason surfaced: {s}");
+        assert!(s.contains("iterations=2"), "iteration count surfaced: {s}");
+        assert!(s.contains("max_iter=5"), "cap surfaced: {s}");
+        assert!(s.contains("the final polished draft"), "final body output carried: {s}");
+
+        let f = render_loop_final("failed", "body_failed", 1, 3, None);
+        assert!(f.starts_with("LOOP: FAILED"), "failed marker: {f}");
+        assert!(f.contains("reason=body_failed"), "failure reason: {f}");
+    }
+
+    // -------------------------------------------------------------------------
+    // loop 模式 (UC-1d): end-to-end engine drive. A loop controller settles in the
+    // FILL step (no worker dispatch). On CONTINUE it RESETS the body to re-run in
+    // place (attempt++); the HARD max_iter cap guarantees termination.
+    // -------------------------------------------------------------------------
+
+    /// A worker that drives the loop BODY deterministically by counting how many
+    /// times each task id has run (the re-run count tracks the loop iteration).
+    /// The body's per-round output is taken from `rounds` by run order (round n →
+    /// `rounds[n-1]`, the last entry repeats so `dry` can be exercised). The body
+    /// is recognized by its title appearing in the brief (`compose_brief` leads
+    /// with `TASK: <title>`). Non-body tasks (the downstream) emit a plain
+    /// "did <spec>".
+    ///
+    /// Records the per-task start order so a test can assert the body ran exactly N
+    /// times (the iteration count) and the loop controller NEVER reached a worker.
+    struct LoopBodyWorkerRunner {
+        /// task_id → how many times it has run so far.
+        run_counts: Mutex<std::collections::HashMap<String, usize>>,
+        start_order: Mutex<Vec<String>>,
+        seen_specs: Mutex<Vec<String>>,
+        /// Body title to recognize (the body is identified by title here).
+        body_title: String,
+        /// Per-ROUND outputs for the body, applied by run order (round n = index n-1).
+        rounds: Vec<String>,
+        /// If set, the body FAILS (returns ok:false) on the given round number.
+        fail_on_round: Option<usize>,
+    }
+    impl LoopBodyWorkerRunner {
+        fn new(body_title: &str, rounds: Vec<&str>, fail_on_round: Option<usize>) -> Self {
+            Self {
+                run_counts: Mutex::new(std::collections::HashMap::new()),
+                start_order: Mutex::new(vec![]),
+                seen_specs: Mutex::new(vec![]),
+                body_title: body_title.to_string(),
+                rounds: rounds.into_iter().map(str::to_string).collect(),
+                fail_on_round,
+            }
+        }
+    }
+    #[async_trait]
+    impl WorkerRunner for LoopBodyWorkerRunner {
+        async fn run(
+            &self,
+            _member: &FleetMember,
+            _workspace_dir: Option<&str>,
+            _run_id: &str,
+            task_id: &str,
+            brief: &str,
+            task_spec: &str,
+            _timeout: Duration,
+            on_started: Box<dyn FnOnce(i64) + Send>,
+        ) -> Result<WorkerOutcome, AppError> {
+            self.start_order.lock().unwrap().push(task_id.to_string());
+            self.seen_specs.lock().unwrap().push(task_spec.to_string());
+            on_started(900);
+            // The brief identifies the task by title (compose_brief leads with TASK:).
+            let is_body = brief.contains(&format!("TASK: {}", self.body_title));
+            if is_body {
+                let round = {
+                    let mut counts = self.run_counts.lock().unwrap();
+                    let n = counts.entry(task_id.to_string()).or_insert(0);
+                    *n += 1;
+                    *n
+                };
+                if self.fail_on_round == Some(round) {
+                    // Body fails this round → ok:false (no final text).
+                    return Ok(WorkerOutcome { conversation_id: 900, text: None, ok: false });
+                }
+                let idx = round.saturating_sub(1).min(self.rounds.len().saturating_sub(1));
+                let text = self.rounds.get(idx).cloned().unwrap_or_else(|| "body output".to_string());
+                Ok(WorkerOutcome { conversation_id: 900, text: Some(text), ok: true })
+            } else {
+                Ok(WorkerOutcome {
+                    conversation_id: 900,
+                    text: Some(format!("did {task_spec}")),
+                    ok: true,
+                })
+            }
+        }
+    }
+
+    /// Plan: BODY(0, agent) → Loop(1, loop, depends_on [0], pattern_config) →
+    /// Publish(2, agent, depends_on [1] — gated on the LOOP, not the body). The
+    /// loop's pattern_config is `loop_config` raw JSON.
+    struct LoopPlanProducer {
+        loop_config: String,
+    }
+    #[async_trait]
+    impl PlanProducer for LoopPlanProducer {
+        async fn produce(
+            &self,
+            _goal: &str,
+            _members: &[FleetMember],
+        ) -> Result<PlannedDag, AppError> {
+            Ok(PlannedDag {
+                tasks: vec![
+                    PlannedTask {
+                        title: "Refine".to_string(),
+                        spec: "refine one round".to_string(),
+                        task_profile: None,
+                        depends_on: vec![],
+                        member_index: Some(0),
+                        rationale: None,
+                        role: None,
+                        kind: "agent".to_string(),
+                        pattern_config: None,
+                    },
+                    PlannedTask {
+                        title: "Loop".to_string(),
+                        spec: "iterate".to_string(),
+                        task_profile: None,
+                        depends_on: vec![0],
+                        member_index: Some(0),
+                        rationale: None,
+                        role: None,
+                        kind: "loop".to_string(),
+                        pattern_config: Some(self.loop_config.clone()),
+                    },
+                    PlannedTask {
+                        title: "Publish".to_string(),
+                        spec: "publish the refined result".to_string(),
+                        task_profile: None,
+                        depends_on: vec![1],
+                        member_index: Some(0),
+                        rationale: None,
+                        role: None,
+                        kind: "agent".to_string(),
+                        pattern_config: None,
+                    },
+                ],
+            })
+        }
+    }
+
+    /// Seed + plan a loop run over a single-member fleet. Returns
+    /// (RunService, RunEngine, the loop-body worker, run id).
+    async fn loop_harness(
+        loop_config: &str,
+        rounds: Vec<&str>,
+        fail_on_round: Option<usize>,
+    ) -> (RunService, RunEngine, Arc<LoopBodyWorkerRunner>, String) {
+        let db = init_database_memory().await.expect("db init");
+        let pool = db.pool().clone();
+        let run_repo = Arc::new(SqliteRunRepository::new(pool.clone()));
+        let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
+        let ws_repo = Arc::new(SqliteOrchWorkspaceRepository::new(pool.clone()));
+        let emitter = OrchestratorRunEventEmitter::new(Arc::new(RecordingBroadcaster::new()));
+        let planner: Arc<dyn PlanProducer> = Arc::new(LoopPlanProducer {
+            loop_config: loop_config.to_string(),
+        });
+        let run_service = RunService::new(
+            run_repo.clone(),
+            fleet_repo.clone(),
+            ws_repo.clone(),
+            planner,
+            emitter.clone(),
+        );
+        let worker = Arc::new(LoopBodyWorkerRunner::new("Refine", rounds, fail_on_round));
+        let worker_dyn: Arc<dyn WorkerRunner> = worker.clone();
+        let mut engine_deps =
+            RunEngineDeps::new(run_repo.clone(), worker_dyn, emitter, ws_repo.clone());
+        engine_deps.worker_timeout = Duration::from_secs(10);
+        engine_deps.default_max_parallel = 4;
+        let engine = RunEngine::new(Arc::new(engine_deps));
+
+        let fleet = crate::service::FleetService::new(fleet_repo)
+            .create(
+                "u1",
+                CreateFleetRequest {
+                    name: "loop fleet".to_string(),
+                    description: None,
+                    max_parallel: None,
+                    members: vec![sample_member("agent_a")],
+                },
+            )
+            .await
+            .expect("fleet");
+        let ws = crate::service::WorkspaceService::new(ws_repo)
+            .create(
+                "u1",
+                CreateWorkspaceRequest {
+                    name: "loop ws".to_string(),
+                    default_fleet_id: Some(fleet.id.clone()),
+                    workspace_dir: None,
+                },
+            )
+            .await
+            .expect("ws");
+        let run = run_service
+            .create(
+                "u1",
+                CreateRunRequest {
+                    workspace_id: ws.id,
+                    goal: "iteratively refine then publish".to_string(),
+                    fleet_id: fleet.id,
+                    autonomy: None,
+                    max_parallel: Some(4),
+                },
+            )
+            .await
+            .expect("run");
+        run_service.plan(&run.id).await.expect("plan");
+        (run_service, engine, worker, run.id)
+    }
+
+    /// Count how many times the BODY (title "Refine") ran in the worker's start
+    /// order — each entry is a task id, and the body is the only task that re-runs.
+    /// The body's task id is the one that appears MORE THAN ONCE (or the single one
+    /// whose detail title is Refine). We pass the run detail to resolve the title.
+    fn body_run_count(worker: &LoopBodyWorkerRunner, detail: &nomifun_api_types::RunDetail) -> usize {
+        let body_id = detail
+            .tasks
+            .iter()
+            .find(|t| t.title == "Refine")
+            .map(|t| t.id.clone())
+            .unwrap_or_default();
+        worker.start_order.lock().unwrap().iter().filter(|id| **id == body_id).count()
+    }
+
+    #[tokio::test]
+    async fn loop_max_iter_hard_cap_stops_after_exactly_n_iterations() {
+        // NO-SPIN BACKSTOP: a predicate that NEVER fires + max_iter=3. The loop must
+        // drive to completion in bounded passes, running the body EXACTLY 3 times,
+        // then STOP at the cap. This is the termination guarantee.
+        let (svc, engine, worker, run_id) = loop_harness(
+            r#"{"max_iter":3,"stop":{"kind":"predicate","done_marker":"NEVER-EMITTED"}}"#,
+            vec!["round1", "round2", "round3", "round4-should-not-happen"],
+            None,
+        )
+        .await;
+        engine.start(run_id.clone());
+        let detail = drive_to_completion(&svc, &run_id).await;
+        assert_eq!(detail.run.status, "completed", "bounded loop drives to completion");
+
+        let by_title = |t: &str| detail.tasks.iter().find(|x| x.title == t).cloned().unwrap();
+        let body = by_title("Refine");
+        let ctrl = by_title("Loop");
+        // The body ran EXACTLY 3 times (the cap), tracked by attempt (0-based: the
+        // last completed round is attempt 2 → 3 iterations).
+        assert_eq!(body_run_count(&worker, &detail), 3, "body ran exactly max_iter=3 times");
+        assert_eq!(body.attempt, 2, "body attempt is 2 (3rd round, 0-based) at the cap");
+        // The controller is done with the max_iter STOP marker + no worker conv.
+        assert_eq!(ctrl.kind, "loop");
+        assert_eq!(ctrl.status, "done", "loop controller settled done at the cap");
+        assert_eq!(ctrl.conversation_id, None, "loop controller has no worker conversation");
+        let summary = ctrl.output_summary.as_deref().unwrap_or("");
+        assert!(summary.starts_with("LOOP: DONE"), "machine marker leads: {summary}");
+        assert!(summary.contains("reason=max_iter"), "hard cap reason: {summary}");
+        assert!(summary.contains("iterations=3"), "3 iterations: {summary}");
+        assert!(summary.contains("round3"), "final body output carried: {summary}");
+        // Downstream ran AFTER the loop finished (gated on the loop, not the body).
+        assert_eq!(by_title("Publish").status, "done", "downstream runs after the loop");
+
+        // The loop controller NEVER reached a worker (no dispatch / no spin).
+        let specs = worker.seen_specs.lock().unwrap().clone();
+        assert!(
+            !specs.iter().any(|s| s == "iterate"),
+            "the loop controller spec must never reach a worker: {specs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_predicate_stops_early_when_body_emits_marker() {
+        // The body emits DONE on round 2 → the loop stops EARLY (before the cap of
+        // 5). Body runs exactly 2 times.
+        let (svc, engine, worker, run_id) = loop_harness(
+            r#"{"max_iter":5,"stop":{"kind":"predicate","done_marker":"DONE"}}"#,
+            vec!["still working", "polished now DONE", "round3-should-not-happen"],
+            None,
+        )
+        .await;
+        engine.start(run_id.clone());
+        let detail = drive_to_completion(&svc, &run_id).await;
+        assert_eq!(detail.run.status, "completed");
+
+        let by_title = |t: &str| detail.tasks.iter().find(|x| x.title == t).cloned().unwrap();
+        assert_eq!(body_run_count(&worker, &detail), 2, "predicate stops early after 2 rounds");
+        let ctrl = by_title("Loop");
+        let summary = ctrl.output_summary.as_deref().unwrap_or("");
+        assert!(summary.contains("reason=predicate"), "early predicate stop: {summary}");
+        assert!(summary.contains("iterations=2"), "2 iterations: {summary}");
+        assert_eq!(by_title("Publish").status, "done", "downstream runs after the loop");
+    }
+
+    #[tokio::test]
+    async fn loop_dry_stops_after_k_unchanged_rounds() {
+        // quiet_rounds=2 + max_iter=5. The body emits a CHANGING output for 2 rounds
+        // then the SAME output → 2 consecutive identical rounds → dry STOP. Outputs:
+        // r1="a", r2="b", r3="b" → rounds 2,3 identical → stop after round 3.
+        let (svc, engine, worker, run_id) = loop_harness(
+            r#"{"max_iter":5,"stop":{"kind":"dry","quiet_rounds":2}}"#,
+            vec!["a", "b", "b", "b-should-not-happen"],
+            None,
+        )
+        .await;
+        engine.start(run_id.clone());
+        let detail = drive_to_completion(&svc, &run_id).await;
+        assert_eq!(detail.run.status, "completed");
+
+        let by_title = |t: &str| detail.tasks.iter().find(|x| x.title == t).cloned().unwrap();
+        assert_eq!(body_run_count(&worker, &detail), 3, "dry stops after 3 rounds (r2==r3)");
+        let ctrl = by_title("Loop");
+        let summary = ctrl.output_summary.as_deref().unwrap_or("");
+        assert!(summary.contains("reason=dry"), "dry stop reason: {summary}");
+        assert!(summary.contains("iterations=3"), "3 iterations: {summary}");
+        assert_eq!(by_title("Publish").status, "done", "downstream runs after the loop");
+    }
+
+    #[tokio::test]
+    async fn loop_body_attempt_increments_per_iteration() {
+        // The body's `attempt` must increment per loop iteration (drives the UI
+        // iteration/retry badge). With max_iter=4 and a never-firing predicate, the
+        // body's final attempt is 3 (0-based: rounds 1..4 → attempts 0..3).
+        let (svc, engine, worker, run_id) = loop_harness(
+            r#"{"max_iter":4,"stop":{"kind":"max_iter"}}"#,
+            vec!["r1", "r2", "r3", "r4"],
+            None,
+        )
+        .await;
+        engine.start(run_id.clone());
+        let detail = drive_to_completion(&svc, &run_id).await;
+        assert_eq!(detail.run.status, "completed");
+        let body = detail.tasks.iter().find(|t| t.title == "Refine").unwrap();
+        assert_eq!(body.attempt, 3, "body attempt increments per iteration (0-based, 4 rounds)");
+        assert_eq!(body_run_count(&worker, &detail), 4, "body ran 4 times");
+    }
+
+    #[tokio::test]
+    async fn loop_failing_body_stops_loop_and_gates_downstream_no_infinite_iterate() {
+        // A body that FAILS on round 2 must STOP the loop (failed) and gate the
+        // downstream — never iterate a failing body forever. max_iter=5, but the
+        // body fails on round 2 so it runs only twice (round 1 ok, round 2 fails).
+        let (svc, engine, worker, run_id) = loop_harness(
+            r#"{"max_iter":5,"stop":{"kind":"max_iter"}}"#,
+            vec!["round1-ok", "round2-will-fail"],
+            Some(2),
+        )
+        .await;
+        engine.start(run_id.clone());
+        let detail = drive_to_completion(&svc, &run_id).await;
+        // The run is `failed` (the body failed). The loop controller stopped failed,
+        // the downstream was gated (skipped).
+        assert_eq!(detail.run.status, "failed", "a failing body fails the run");
+
+        let by_title = |t: &str| detail.tasks.iter().find(|x| x.title == t).cloned().unwrap();
+        let body = by_title("Refine");
+        let ctrl = by_title("Loop");
+        assert_eq!(body.status, "failed", "the body is failed");
+        // The body ran only twice (round1 ok → continue → round2 fails) — it did NOT
+        // iterate forever on the failure.
+        assert_eq!(body_run_count(&worker, &detail), 2, "failing body did not iterate forever");
+        assert_eq!(ctrl.status, "failed", "loop controller stops failed on a failing body");
+        let summary = ctrl.output_summary.as_deref().unwrap_or("");
+        assert!(summary.starts_with("LOOP: FAILED"), "failed marker: {summary}");
+        assert!(summary.contains("reason=body_failed"), "body-failed reason: {summary}");
+        // Downstream Publish was GATED → skipped (never ran on a failing loop).
+        assert_eq!(by_title("Publish").status, "skipped", "downstream gated on a failing loop");
+        let specs = worker.seen_specs.lock().unwrap().clone();
+        assert!(
+            !specs.iter().any(|s| s == "publish the refined result"),
+            "gated downstream must never reach a worker: {specs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_zero_regression_plain_agent_chain_still_runs() {
+        // ZERO-REGRESSION: a plain agent chain (no loop task) drives to completion
+        // exactly as before — the loop branch must not perturb the ordinary path.
+        let h = harness().await;
+        let run_id = seed_run(&h).await;
+        h.run_service.plan(&run_id).await.expect("plan");
+        h.engine.start(run_id.clone());
+        let detail = drive_to_completion(&h.run_service, &run_id).await;
+        assert_eq!(detail.run.status, "completed", "plain agent chain unaffected");
+        for t in &detail.tasks {
+            assert_eq!(t.status, "done", "task {} done", t.title);
+            assert_eq!(t.kind, "agent", "no loop kind injected");
         }
     }
 }
