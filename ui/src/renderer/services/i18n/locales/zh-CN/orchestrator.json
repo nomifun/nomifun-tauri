@@ -210,6 +210,11 @@
       "ok": "已发起重跑",
       "error": "重跑失败：{{error}}"
     },
+    "adopt": {
+      "button": "采用为该节点产出",
+      "ok": "已采用为该节点产出",
+      "error": "采用失败：{{error}}"
+    },
     "task": {
       "status": {
         "pending": "待开始",

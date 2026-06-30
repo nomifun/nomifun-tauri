@@ -800,6 +800,137 @@ impl RunService {
         Ok(run_row_to_dto(row))
     }
 
+    /// **UC-2c — "采用为该节点产出" (adopt task result).** Pull the CURRENT final
+    /// output of a node's worker conversation back into the orchestration node, then
+    /// re-activate the run so the engine drives any now-unblocked downstream.
+    ///
+    /// This closes the gap created by the conversation-native worker projection: a
+    /// user can keep chatting with a *failed* / *stuck* worker (a normal turn in the
+    /// worker conversation) to push it toward a good answer, but those turns are NOT
+    /// observed by the engine, so the node never updates on its own. Adopt is the
+    /// explicit "I'm happy with what the worker produced — make it the node's output"
+    /// action: it reads the worker's latest assistant text (via the engine's
+    /// `WorkerRunner`), writes the node `done` + `output_summary`, and re-activates a
+    /// terminal run so its loop unblocks the downstream and re-settles.
+    ///
+    /// Runs **only through** [`RunEngine::adopt_task_result`](crate::engine::RunEngine::adopt_task_result),
+    /// NOT directly — so the write + re-activation are serialized under the per-run
+    /// lock with the run-loop's terminal-check-and-finish (same invariant as
+    /// [`rerun_task`](Self::rerun_task); the re-activation re-reads the run status
+    /// FRESH rather than trusting the top-of-method snapshot).
+    ///
+    /// Owner-scoped (404/403). REJECTS when the RUN is `running` (the engine loop is
+    /// live and WILL settle the node itself — a manual adopt would race it); allows
+    /// any non-running run (cancelled / failed / completed / paused / awaiting),
+    /// which is exactly the state a stuck/continued node sits in. Note this guards on
+    /// the RUN, not the TASK: a task stuck `running` inside a CANCELLED run (the loop
+    /// stopped mid-flight) is the canonical adopt target and must be allowed.
+    pub async fn adopt_task_result(
+        &self,
+        worker: &Arc<dyn crate::worker::WorkerRunner>,
+        user_id: &str,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<Run, AppError> {
+        let run = self.owned_run(user_id, run_id).await?;
+
+        // The task must exist and belong to this run.
+        let task = self
+            .run_repo
+            .get_task(task_id)
+            .await
+            .map_err(OrchestratorError::from)?
+            .ok_or_else(|| OrchestratorError::NotFound(format!("task {task_id}")))?;
+        if task.run_id != run_id {
+            return Err(OrchestratorError::NotFound(format!("task {task_id} in run {run_id}")).into());
+        }
+
+        // A LIVE run's loop owns settlement — manual adopt would race the loop's
+        // own `done` write. The user pauses/stops (→ non-running) first. (Guards on
+        // the RUN status, not the task: a task left `running` by a cancelled loop is
+        // a valid adopt target.)
+        if run.status == "running" {
+            return Err(OrchestratorError::BadRequest(
+                "run 运行中，引擎会自动结算该节点，无需手动采用".into(),
+            )
+            .into());
+        }
+
+        // The node must have a worker conversation to read from.
+        let Some(conv_id) = task.conversation_id else {
+            return Err(OrchestratorError::BadRequest("该节点尚无 worker 会话，无法采用产出".into()).into());
+        };
+
+        // Read the worker conversation's CURRENT final assistant text. `None` →
+        // nothing to adopt yet (the worker has produced no assistant message); ask
+        // the user to wait for a reply rather than marking the node done with empty
+        // output.
+        let Some(output) = worker.read_final_output(&conv_id.to_string()).await else {
+            return Err(OrchestratorError::BadRequest(
+                "worker 会话暂无最终产出，请等其回复完成后再采用".into(),
+            )
+            .into());
+        };
+
+        // ADOPT: mark the node `done` and write the worker's text as its output (the
+        // same shape the engine's `settle_task_outcome` writes on a normal finish).
+        self.run_repo
+            .update_task(
+                task_id,
+                UpdateTaskParams {
+                    status: Some("done".to_string()),
+                    output_summary: Some(Some(output)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(OrchestratorError::from)?;
+        self.emitter.emit_task_status(run_id, task_id, "done");
+
+        // RE-ACTIVATE a terminal run so the engine loop (the route then starts) has a
+        // live run to drive the now-unblocked downstream. Re-read the status FRESH
+        // (same reasoning as `rerun_task`): under the per-run lock the loop's
+        // terminal-finish is mutually exclusive with this block, but may have
+        // committed `completed`/`failed` just before we acquired the lock — the fresh
+        // read sees it so a now-terminal run is correctly re-activated. A `paused`
+        // run is deliberately left paused (the user resumes it explicitly).
+        let current_status = self
+            .run_repo
+            .get_run(run_id)
+            .await
+            .map_err(OrchestratorError::from)?
+            .map(|r| r.status)
+            .unwrap_or_else(|| run.status.clone());
+        if matches!(current_status.as_str(), "completed" | "failed" | "cancelled") {
+            self.run_repo
+                .update_run(
+                    run_id,
+                    UpdateRunParams {
+                        status: Some("running".to_string()),
+                        summary: None,
+                        lead_conv_id: None,
+                        total_tokens: None,
+                        goal: None,
+                        autonomy: None,
+                        fleet_snapshot: None,
+                    },
+                )
+                .await
+                .map_err(OrchestratorError::from)?;
+            self.emitter.emit_run_status(run_id, "running");
+        }
+
+        // Return the (possibly re-activated) run so the route can decide whether to
+        // (re)start the engine loop.
+        let row = self
+            .run_repo
+            .get_run(run_id)
+            .await
+            .map_err(OrchestratorError::from)?
+            .ok_or_else(|| OrchestratorError::NotFound(format!("run {run_id}")))?;
+        Ok(run_row_to_dto(row))
+    }
+
     /// Fine-tune a node's intent/prompt (UC-2a, "意图/prompt 微调"): replace the
     /// task's `spec` (the field the worker brief is built from). Owner-scoped
     /// (404/403). A subsequent [`rerun_task`](Self::rerun_task) re-executes the node

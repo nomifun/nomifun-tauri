@@ -85,6 +85,20 @@ pub trait WorkerRunner: Send + Sync {
         timeout: Duration,
         on_started: Box<dyn FnOnce(i64) + Send>,
     ) -> Result<WorkerOutcome, AppError>;
+
+    /// Read the worker conversation's CURRENT final assistant text, if any.
+    ///
+    /// Used by the **"采用为该节点产出" (adopt task result)** path
+    /// ([`RunService::adopt_task_result`](crate::run_service::RunService::adopt_task_result)):
+    /// after a user keeps chatting with a failed/stuck worker in the conversation
+    /// content area, this pulls the worker's latest output back into the
+    /// orchestration node on demand. The default returns `None` (test/mock runners
+    /// have no live conversation store); the production
+    /// [`ConversationWorkerRunner`] overrides it to read the conversation's latest
+    /// assistant message via its inherent `read_final_text`.
+    async fn read_final_output(&self, _conversation_id: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Production [`WorkerRunner`]: runs the task on a real nomi conversation via
@@ -107,6 +121,14 @@ impl ConversationWorkerRunner {
 
 #[async_trait]
 impl WorkerRunner for ConversationWorkerRunner {
+    /// Production override of [`WorkerRunner::read_final_output`]: delegate to the
+    /// inherent `read_final_text` (the same helper the engine uses to settle a
+    /// finished worker turn), so an adopted node carries the worker conversation's
+    /// real latest assistant text.
+    async fn read_final_output(&self, conversation_id: &str) -> Option<String> {
+        self.read_final_text(conversation_id).await
+    }
+
     async fn run(
         &self,
         member: &FleetMember,

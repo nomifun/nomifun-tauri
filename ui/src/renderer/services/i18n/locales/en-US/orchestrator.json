@@ -210,6 +210,11 @@
       "ok": "Rerun started",
       "error": "Rerun failed: {{error}}"
     },
+    "adopt": {
+      "button": "Adopt as node output",
+      "ok": "Adopted as the node's output",
+      "error": "Adopt failed: {{error}}"
+    },
     "task": {
       "status": {
         "pending": "Pending",

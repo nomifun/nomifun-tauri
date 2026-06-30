@@ -2791,6 +2791,16 @@ export const orchestrator = {
       (p) => `/api/orchestrator/runs/${p.run_id}/tasks/${p.task_id}/rerun`,
       () => undefined
     ),
+    // Adopt the node's worker conversation's CURRENT output as the node's product
+    // (UC-2c「采用为该节点产出」): reads the worker's latest assistant text into the
+    // node, marks it done, and re-activates a terminal run so downstream unblocks.
+    // For a failed/stuck node the user kept chatting in the content area. Rejected
+    // (400) if the run is running, or the node has no worker conversation / no
+    // output yet.
+    adoptTaskResult: httpPost<void, { run_id: string; task_id: string }>(
+      (p) => `/api/orchestrator/runs/${p.run_id}/tasks/${p.task_id}/adopt`,
+      () => undefined
+    ),
     // Fine-tune a node's intent/prompt (UC-2a): replace the task's spec. Rejected
     // (400) for a blank spec or a running task; a later rerun uses the new spec.
     updateTaskSpec: httpPatch<void, { run_id: string; task_id: string; updates: TTaskSpecUpdate }>(

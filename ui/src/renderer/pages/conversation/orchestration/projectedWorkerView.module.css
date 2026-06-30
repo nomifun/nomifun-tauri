@@ -135,6 +135,21 @@
   border-color: color-mix(in srgb, rgb(var(--primary-6)) 88%, #000);
 }
 
+/* The "采用为该节点产出" action — a primary-tinted (light-filled) pill so it reads as
+ * the recommended hand-off when reviewing a continued worker, without competing
+ * with the filled「返回 main」exit. */
+.actionAdopt {
+  color: rgb(var(--primary-6));
+  border-color: color-mix(in srgb, rgb(var(--primary-6)) 38%, var(--border-base));
+  background: color-mix(in srgb, rgb(var(--primary-6)) 10%, transparent);
+}
+
+.actionAdopt:hover {
+  color: rgb(var(--primary-6));
+  border-color: color-mix(in srgb, rgb(var(--primary-6)) 60%, var(--border-base));
+  background: color-mix(in srgb, rgb(var(--primary-6)) 16%, transparent);
+}
+
 /* ── Body ────────────────────────────────────────────────────────────────────
  * Fills the remaining height; the ReadOnlyConversationView owns its own scroll.
  * min-height:0 so the flex child can shrink and scroll internally. */

@@ -496,6 +496,30 @@ impl RunEngine {
         run_service.rerun_task(user_id, run_id, task_id).await
     }
 
+    /// UC-2c — **"采用为该节点产出" (adopt task result)**. The engine-side entry the
+    /// route calls instead of [`RunService::adopt_task_result`] directly, so the
+    /// service's node-write + terminal-run re-activation run UNDER the per-run lock
+    /// (the SAME lock the run-loop's terminal-check-and-finish holds) — closing the
+    /// re-activation race exactly as [`rerun_task`](Self::rerun_task) does. The lock
+    /// is released before the route's engine-lifecycle decision (`start` only when
+    /// the loop is not already running). The worker handle the service needs to read
+    /// the conversation's final output is the engine's own `deps.worker` — the same
+    /// runner that produced the node — so the read goes through the production
+    /// `ConversationWorkerRunner` (the mock's default returns `None`).
+    pub async fn adopt_task_result(
+        &self,
+        run_service: &crate::run_service::RunService,
+        user_id: &str,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<nomifun_api_types::Run, AppError> {
+        let lock = self.deps.run_locks.for_run(run_id);
+        let _adopt_guard = lock.lock().await;
+        run_service
+            .adopt_task_result(&self.deps.worker, user_id, run_id, task_id)
+            .await
+    }
+
     /// UC-3a — **conversation-driven intelligent re-adjust** with the loop-vs-
     /// reconcile race CLOSED **and the lead LLM call moved OUT of the per-run lock
     /// (B4)**. The engine-side entry the route calls instead of

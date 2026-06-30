@@ -7,7 +7,7 @@
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Spin } from '@arco-design/web-react';
-import { Comment, Left, Redo } from '@icon-park/react';
+import { Comment, Left, Redo, CheckOne } from '@icon-park/react';
 import { ipcBridge } from '@/common';
 import type { TChatConversation } from '@/common/config/storage';
 import type { OpenTaskPayload } from '@/renderer/pages/orchestrator/RunDetail/DagCanvas';
@@ -29,7 +29,7 @@ type ProjectedWorkerViewProps = {
  * it, and rerun it — then return to the main agent.
  *
  * Layout:
- *  - a thin banner (left「查看:<title>」; right [重跑] / [← 返回 main]);
+ *  - a thin banner (left「查看:<title>」; right [采用为该节点产出] / [重跑] / [← 返回 main]);
  *  - the worker conversation, rendered via {@link ReadOnlyConversationView}
  *    WITHOUT `hideSendBox` — so the worker's OWN full composer (NomiChat →
  *    NomiSendBox) is reused: current-model pill, `+` attachments, @-file mentions,
@@ -37,6 +37,11 @@ type ProjectedWorkerViewProps = {
  *    types a 局部调整 by talking to the worker directly (a normal turn in the
  *    worker's conversation) — the fullest, most familiar input surface, instead of
  *    a bespoke steer box. 「尚未开始」/ loader states cover the not-started case.
+ *
+ * Because that continued chat is a plain worker turn the engine does NOT observe,
+ * [采用为该节点产出] is the explicit hand-off back into the DAG: it asks the backend
+ * to re-read the worker's latest output, mark this node done, and re-activate the
+ * run so downstream unblocks (UC-2c). [重跑] resets + re-runs the node from scratch.
  *
  * `TRunTask.conversation_id` is already the backend INTEGER id — passed straight
  * through with no conversion.
@@ -53,6 +58,8 @@ const ProjectedWorkerView: React.FC<ProjectedWorkerViewProps> = ({ payload }) =>
   const [loading, setLoading] = useState(false);
   // Guards the rerun trigger against a double-click while the request is in flight.
   const [rerunning, setRerunning] = useState(false);
+  // Guards the「采用为该节点产出」trigger against a double-click while in flight.
+  const [adopting, setAdopting] = useState(false);
 
   // Resolve the worker conversation off `task.conversation_id` (mirrors
   // WorkerTranscriptPanel). Undefined → no conversation yet (「尚未开始」state).
@@ -96,6 +103,26 @@ const ProjectedWorkerView: React.FC<ProjectedWorkerViewProps> = ({ payload }) =>
     }
   };
 
+  // Adopt the worker conversation's CURRENT output as this node's product
+  // (UC-2c「采用为该节点产出」). After the user kept chatting with a failed/stuck
+  // worker (a normal turn in its conversation, NOT observed by the engine), this is
+  // the explicit hand-off: the engine re-reads the worker's latest output, marks the
+  // node done, and re-activates the run so downstream unblocks. On success we refetch
+  // so the canvas reflects the now-completed node + re-drive.
+  const doAdopt = async () => {
+    if (adopting) return;
+    setAdopting(true);
+    try {
+      await ipcBridge.orchestrator.runs.adoptTaskResult.invoke({ run_id: runId, task_id: task.id });
+      message.success(t('orchestrator.run.adopt.ok', { defaultValue: '已采用为该节点产出' }));
+      await payload.refetch();
+    } catch (e) {
+      message.error(t('orchestrator.run.adopt.error', { defaultValue: '采用失败:{{error}}', error: String(e) }));
+    } finally {
+      setAdopting(false);
+    }
+  };
+
   return (
     <div className={styles.root}>
       {msgCtx}
@@ -113,6 +140,27 @@ const ProjectedWorkerView: React.FC<ProjectedWorkerViewProps> = ({ payload }) =>
         </div>
 
         <div className={styles.bannerActions}>
+          {/* 采用为该节点产出 — only when a worker conversation exists to read from. */}
+          {conversationId !== undefined ? (
+            <div
+              role='button'
+              tabIndex={0}
+              aria-label={t('orchestrator.run.adopt.button', { defaultValue: '采用为该节点产出' })}
+              aria-disabled={adopting}
+              className={`${styles.action} ${styles.actionAdopt}`}
+              onClick={adopting ? undefined : () => void doAdopt()}
+              onKeyDown={(e) => {
+                if ((e.key === 'Enter' || e.key === ' ') && !adopting) {
+                  e.preventDefault();
+                  void doAdopt();
+                }
+              }}
+            >
+              <CheckOne theme='outline' size='13' strokeWidth={3} />
+              <span>{t('orchestrator.run.adopt.button', { defaultValue: '采用为该节点产出' })}</span>
+            </div>
+          ) : null}
+
           {/* 重跑 */}
           <div
             role='button'

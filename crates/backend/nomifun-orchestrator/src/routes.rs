@@ -93,6 +93,10 @@ pub fn orchestrator_routes(state: OrchestratorRouterState) -> Router {
             post(rerun_task),
         )
         .route(
+            "/api/orchestrator/runs/{run_id}/tasks/{task_id}/adopt",
+            post(adopt_task_result),
+        )
+        .route(
             "/api/orchestrator/runs/{run_id}/tasks/{task_id}/spec",
             patch(update_task_spec),
         )
@@ -543,7 +547,29 @@ async fn rerun_task(
     Ok(Json(ApiResponse::success()))
 }
 
-/// Fine-tune a node's intent/prompt (UC-2a, owner-scoped). Body is a
+/// "采用为该节点产出" (adopt task result, UC-2c, owner-scoped). Pulls the node's
+/// worker conversation's CURRENT final output into the orchestration node, marks it
+/// `done`, and re-activates a terminal run. Goes through
+/// [`RunEngine::adopt_task_result`](crate::engine::RunEngine::adopt_task_result) so
+/// the write + re-activation run under the per-run lock; the route then (re)starts
+/// the loop only when a re-activated run is `running` and no loop is already alive
+/// (mirrors `rerun_task` — an unconditional start would `stop()` an already-running
+/// run's in-flight work). The service rejects a `running` RUN (the loop settles the
+/// node itself) and a node with no worker conversation / no output yet (400).
+async fn adopt_task_result(
+    State(state): State<OrchestratorRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((run_id, task_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    let run = state
+        .engine
+        .adopt_task_result(&state.run_service, &user.id, &run_id, &task_id)
+        .await?;
+    if run.status == "running" && !state.engine.is_running(&run_id) {
+        state.engine.start(run_id);
+    }
+    Ok(Json(ApiResponse::success()))
+}
 /// [`TaskSpecUpdateRequest`]; the service rejects a blank spec / a `running` task
 /// (400) and updates the task's `spec`. No engine call — this only amends the
 /// node; a subsequent `rerun` re-executes it with the new spec.
