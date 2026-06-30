@@ -12,6 +12,8 @@ interface WireCustomFigure {
   aspect?: number;
   head_box?: { x?: number; y?: number; w?: number; h?: number };
   size_tier?: string;
+  /** Per-companion continuous figure-height override (logical px); supersedes size_tier. */
+  size_px?: number | null;
   /** Library figure id (`figure_…`); when present the image is served from the library. */
   figure_id?: string | null;
 }
@@ -41,8 +43,9 @@ export function customFigureMetaOf(profile?: ProfileLike | null): CustomFigureMe
   // whose height as an image-height fraction is `w * aspect`.
   const h = isFiniteNumber(hb.h) && hb.h > 0 ? hb.h : hb.w * cf.aspect;
   const sizeTier = cf.size_tier === 's' || cf.size_tier === 'l' ? cf.size_tier : 'm';
+  const sizePx = isFiniteNumber(cf.size_px) && cf.size_px > 0 ? cf.size_px : undefined;
   const figureId = typeof cf.figure_id === 'string' && cf.figure_id ? cf.figure_id : undefined;
-  return { aspect: cf.aspect, headBox: { x: hb.x, y: hb.y, w: hb.w, h }, sizeTier, figureId };
+  return { aspect: cf.aspect, headBox: { x: hb.x, y: hb.y, w: hb.w, h }, sizeTier, sizePx, figureId };
 }
 
 /**

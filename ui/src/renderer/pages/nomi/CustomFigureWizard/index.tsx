@@ -107,7 +107,9 @@ const CustomFigureWizard: React.FC<CustomFigureWizardProps> = ({ open, onClose, 
   const [result, setResult] = useState<MatteOutcome | null>(null);
   const [tolerance, setTolerance] = useState(DEFAULT_TOLERANCE);
   const [headBox, setHeadBox] = useState<HeadBox>({ x: 0.35, y: 0, w: 0.3, h: 0.3 });
-  const [sizeTier, setSizeTier] = useState<'s' | 'm' | 'l'>('m');
+  // Default to the smallest tier: a desktop pet should start compact and not
+  // hog the desktop; the user can size up to 中/大 in the picker if they want.
+  const [sizeTier, setSizeTier] = useState<'s' | 'm' | 'l'>('s');
   const [name, setName] = useState('');
   const [frameError, setFrameError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);

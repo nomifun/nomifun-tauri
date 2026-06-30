@@ -2017,6 +2017,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_figure_preserves_per_companion_size_px_override() {
+        // The 总览 size slider writes a per-companion `size_px` override onto the
+        // companion's custom_figure. Editing the LIBRARY figure (head_box/tier)
+        // fans out via sync_figure_to_active_companions, whose RFC 7396 patch never
+        // mentions size_px — so the per-companion override must survive the sync.
+        let dir = tempfile::tempdir().unwrap();
+        let upload = upload_scratch();
+        let svc = service(dir.path()).await;
+
+        let fig = svc
+            .create_figure(
+                webp_source(&upload, "sized.webp").to_str().unwrap(),
+                "旧形象",
+                0.7,
+                crate::profile::HeadBox { x: 0.3, y: 0.0, w: 0.4, h: 0.4 },
+                "m",
+            )
+            .await
+            .unwrap();
+        let companion = svc.create_companion("可可", "custom").await.unwrap();
+        svc.patch_companion(&companion.id, link_patch(&fig)).await.unwrap();
+        // Slider sets a per-companion override (merge-patch, like the UI does).
+        svc.patch_companion(
+            &companion.id,
+            serde_json::json!({"appearance": {"custom_figure": {"size_px": 333.0}}}),
+        )
+        .await
+        .unwrap();
+
+        // Editing the library figure's tier fans out to the companion.
+        svc.update_figure(
+            &fig.id,
+            crate::figures::FigureUpdate { name: None, head_box: None, size_tier: Some("l".to_owned()) },
+        )
+        .await
+        .unwrap();
+
+        let synced = svc.get_companion(&companion.id).await.unwrap();
+        let custom = synced.appearance.custom_figure.unwrap();
+        assert_eq!(custom.size_tier, "l"); // library tier change applied
+        assert_eq!(custom.size_px, Some(333.0)); // per-companion override preserved
+    }
+
+    #[tokio::test]
     async fn delete_figure_refuses_while_a_companion_uses_it() {
         let dir = tempfile::tempdir().unwrap();
         let upload = upload_scratch();

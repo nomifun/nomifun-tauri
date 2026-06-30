@@ -4,14 +4,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Alert, Button, Message, Modal, Progress, Spin, Switch, Tag } from '@arco-design/web-react';
+import { Alert, Button, Message, Modal, Progress, Slider, Spin, Switch, Tag } from '@arco-design/web-react';
 import { IconEdit } from '@arco-design/web-react/icon';
 import { ipcBridge } from '@/common';
 import type { ICompanionLearnRun, ICompanionWeeklyDigest } from '@/common/adapter/ipcBridge';
 import CompanionAvatar from '@renderer/pages/companion/CompanionAvatar';
 import { customFigureMetaOf } from '@renderer/pages/companion/characters/customMeta';
+import { FIGURE_HEIGHTS, SIZE_MIN, SIZE_MAX } from '@renderer/pages/companion/characters/customDesk';
 import { CUSTOM_CHARACTER_ID } from '@renderer/pages/companion/characters';
 import type { CompanionMood } from '@renderer/pages/companion/characters';
 import CharacterPicker from '../CharacterPicker';
@@ -88,6 +89,46 @@ const OverviewTab: React.FC<Props> = ({ companion, onGoTab }) => {
       .then(setDigest)
       .catch(() => {});
   }, [companion.profile?.id, status?.last_learn?.id]);
+
+  // ── 自定义形象尺寸滑块（仅 custom 形象）──
+  // cf 从 profile 解析（profile 可能为 null，customFigureMetaOf 已防御 → null）。
+  const cf = customFigureMetaOf(profile);
+  const effectiveFigureHeight = cf ? (cf.sizePx ?? FIGURE_HEIGHTS[cf.sizeTier]) : FIGURE_HEIGHTS.m;
+  const [sizeDraft, setSizeDraft] = useState<number>(effectiveFigureHeight);
+  // 持久值（或所选伙伴/形象）变化时，把滑块同步回真实值。
+  useEffect(() => {
+    setSizeDraft(effectiveFigureHeight);
+  }, [effectiveFigureHeight]);
+  const sizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (sizeTimerRef.current) clearTimeout(sizeTimerRef.current);
+    },
+    []
+  );
+  // RFC 7396 合并补丁：在既有 wire custom_figure 上覆盖 size_px（数字=设值，null=清除回档位）。
+  // 落库后 patch_companion 广播 companion.config-updated → 桌宠窗口 applyDeskSize 实时缩放。
+  const commitFigureSize = useCallback(
+    (size_px: number | null) => {
+      const base = profile?.appearance.custom_figure;
+      if (!base) return;
+      void patchCompanion({ appearance: { custom_figure: { ...base, size_px } } });
+    },
+    [patchCompanion, profile]
+  );
+  const onFigureSizeChange = useCallback(
+    (v: number | number[]) => {
+      const next = Array.isArray(v) ? v[0] : v;
+      setSizeDraft(next);
+      if (sizeTimerRef.current) clearTimeout(sizeTimerRef.current);
+      sizeTimerRef.current = setTimeout(() => commitFigureSize(next), 400);
+    },
+    [commitFigureSize]
+  );
+  const onFigureSizeReset = useCallback(() => {
+    if (sizeTimerRef.current) clearTimeout(sizeTimerRef.current);
+    commitFigureSize(null);
+  }, [commitFigureSize]);
 
   if (loading || !status || !profile) {
     return (
@@ -184,7 +225,7 @@ const OverviewTab: React.FC<Props> = ({ companion, onGoTab }) => {
             <CompanionAvatar
               character={profile.character}
               companionId={profile.id}
-              customFigure={customFigureMetaOf(profile)}
+              customFigure={cf}
               mood={(status.mood as CompanionMood) || 'content'}
               activity='idle'
               size={120}
@@ -223,6 +264,29 @@ const OverviewTab: React.FC<Props> = ({ companion, onGoTab }) => {
           </div>
         </div>
       </div>
+      {cf && (
+        <div className='flex items-center gap-12px bg-fill-2 rd-10px px-14px py-12px flex-wrap'>
+          <span className='text-13px text-t-secondary shrink-0'>{t('nomi.customFigure.sizeLabel')}</span>
+          <span className='text-12px text-t-tertiary shrink-0'>{t('nomi.customFigure.sizeS')}</span>
+          <Slider
+            className='flex-1 min-w-160px'
+            min={SIZE_MIN}
+            max={SIZE_MAX}
+            step={4}
+            value={sizeDraft}
+            onChange={onFigureSizeChange}
+          />
+          <span className='text-12px text-t-tertiary shrink-0'>{t('nomi.customFigure.sizeL')}</span>
+          <span className='text-12px text-t-primary text-right shrink-0' style={{ width: 46 }}>
+            {sizeDraft}px
+          </span>
+          {cf.sizePx != null && (
+            <Button size='mini' type='text' onClick={onFigureSizeReset}>
+              {t('nomi.customFigure.sizeReset')}
+            </Button>
+          )}
+        </div>
+      )}
       {digest && (digest.skills_learned > 0 || digest.memories_added > 0 || digest.learn_runs > 0) && (
         <div className='bg-fill-2 rd-10px px-14px py-12px'>
           <div className='text-14px text-t-primary font-500 mb-6px'>
@@ -284,7 +348,7 @@ const OverviewTab: React.FC<Props> = ({ companion, onGoTab }) => {
           <span className='text-12px text-t-tertiary'>{t('nomi.settings.characterHint')}</span>
           <CharacterPicker
             value={profile.character || 'mochi'}
-            figureId={customFigureMetaOf(profile)?.figureId}
+            figureId={cf?.figureId}
             onSelectCharacter={(character) => void patchCompanion({ character, appearance: { custom_figure: null } })}
             onSelectFigure={(fig) =>
               void patchCompanion({

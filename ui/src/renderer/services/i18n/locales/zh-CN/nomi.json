@@ -404,6 +404,7 @@
     "sizeS": "小",
     "sizeM": "中",
     "sizeL": "大",
+    "sizeReset": "复位",
     "confirm": "确认生成",
     "uploading": "上传中…",
     "matting": "正在抠图…",

@@ -58,6 +58,13 @@ pub struct CustomFigureMeta {
     pub head_box: HeadBox,
     /// Desk size tier: "s" | "m" | "l".
     pub size_tier: String,
+    /// Per-companion continuous figure-height override (logical px). When set it
+    /// supersedes `size_tier` for THIS companion's desktop window (the 总览 size
+    /// slider writes it); absent ⇒ fall back to the tier's height. The frontend
+    /// clamps it to its [SIZE_MIN, SIZE_MAX] range. `skip_serializing_if` keeps
+    /// pre-slider configs byte-identical (no migration), like `figure_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_px: Option<f32>,
     /// Library figure this companion draws from (`figure_…`). When set, the image is
     /// served from the shared figure library (`/api/companion/figures/{id}/image`),
     /// so one figure can back many companions. Absent for legacy per-companion figures
@@ -290,28 +297,34 @@ mod tests {
             aspect: 0.9444,
             head_box: HeadBox { x: 0.321, y: 0.0, w: 0.281, h: 0.3 },
             size_tier: "m".into(),
+            size_px: None,
             figure_id: None,
         });
         profile.save(dir.path()).unwrap();
-        // A None figure_id must not appear in the JSON (old configs stay byte-clean).
+        // A None figure_id / size_px must not appear in the JSON (old configs stay byte-clean).
         let raw_none = std::fs::read_to_string(CompanionProfileConfig::config_path(dir.path())).unwrap();
         assert!(!raw_none.contains("figure_id"));
+        assert!(!raw_none.contains("size_px"));
         let again = CompanionProfileConfig::load(dir.path());
         assert_eq!(again, profile);
         let meta = again.appearance.custom_figure.unwrap();
         assert_eq!(meta.size_tier, "m");
+        assert_eq!(meta.size_px, None);
         assert!((meta.head_box.w - 0.281).abs() < f32::EPSILON);
 
-        // A library-linked figure_id round-trips.
+        // A library-linked figure_id + a per-companion size_px override round-trip.
         profile.appearance.custom_figure = Some(CustomFigureMeta {
             aspect: 0.9444,
             head_box: HeadBox { x: 0.321, y: 0.0, w: 0.281, h: 0.3 },
             size_tier: "m".into(),
+            size_px: Some(333.0),
             figure_id: Some("figure_abc".into()),
         });
         profile.save(dir.path()).unwrap();
         let linked = CompanionProfileConfig::load(dir.path());
-        assert_eq!(linked.appearance.custom_figure.unwrap().figure_id.as_deref(), Some("figure_abc"));
+        let linked_cf = linked.appearance.custom_figure.unwrap();
+        assert_eq!(linked_cf.figure_id.as_deref(), Some("figure_abc"));
+        assert_eq!(linked_cf.size_px, Some(333.0));
     }
 
     #[test]

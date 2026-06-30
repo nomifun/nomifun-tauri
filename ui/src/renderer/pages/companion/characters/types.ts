@@ -37,6 +37,10 @@ export interface CustomFigureMeta {
   headBox: { x: number; y: number; w: number; h: number };
   /** Desk size tier. */
   sizeTier: 's' | 'm' | 'l';
+  /** Per-companion continuous figure-height override (logical px). When set it
+   *  supersedes `sizeTier` in `customDeskSpec` (the 总览 size slider writes it);
+   *  absent ⇒ fall back to the tier height. Clamped to [SIZE_MIN, SIZE_MAX]. */
+  sizePx?: number;
   /** Library figure backing this companion (`figure_…`). When set, the image comes
    *  from the shared figure library; absent for legacy per-companion figures. */
   figureId?: string;

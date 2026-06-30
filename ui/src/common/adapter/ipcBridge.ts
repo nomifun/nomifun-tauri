@@ -2996,6 +2996,10 @@ export interface ICompanionWindowConfig {
     aspect: number;
     head_box: { x: number; y: number; w: number; h?: number };
     size_tier: 's' | 'm' | 'l';
+    /** Per-companion continuous figure-height override (logical px); supersedes `size_tier`
+     *  for this companion's desktop window. Absent ⇒ fall back to the tier. `null` in a patch
+     *  clears it (RFC 7396) — used by the 总览 size slider's reset. */
+    size_px?: number | null;
     /** Library figure id (`figure_…`) backing this companion; absent for legacy per-companion figures. */
     figure_id?: string;
   } | null;

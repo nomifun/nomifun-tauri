@@ -126,12 +126,15 @@ export function useFiguresInUse(): Set<string> {
   }, [companions]);
 }
 
-/** `appearance.custom_figure` patch that links a companion to a library figure. */
+/** `appearance.custom_figure` patch that links a companion to a library figure.
+ *  `size_px: null` resets any prior per-companion size override (RFC 7396 delete),
+ *  so a freshly (re)assigned figure starts at its tier's default height. */
 export const figureToCustomPatch = (
   f: IFigureMeta
-): { figure_id: string; aspect: number; head_box: { x: number; y: number; w: number; h?: number }; size_tier: 's' | 'm' | 'l' } => ({
+): { figure_id: string; aspect: number; head_box: { x: number; y: number; w: number; h?: number }; size_tier: 's' | 'm' | 'l'; size_px: number | null } => ({
   figure_id: f.id,
   aspect: f.aspect,
   head_box: f.head_box,
   size_tier: f.size_tier,
+  size_px: null,
 });

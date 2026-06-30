@@ -404,6 +404,7 @@
     "sizeS": "S",
     "sizeM": "M",
     "sizeL": "L",
+    "sizeReset": "Reset",
     "confirm": "Create figure",
     "uploading": "Uploading…",
     "matting": "Cutting out…",
