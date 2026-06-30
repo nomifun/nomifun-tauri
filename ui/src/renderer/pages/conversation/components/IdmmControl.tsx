@@ -32,6 +32,7 @@ import { renderIdmmCapabilityIcon } from '@/renderer/components/capability/idmmC
 import { applyIdmmStateToSessionCapabilities } from '@/renderer/pages/conversation/SessionList/hooks/useSessionCapabilities';
 import { useProvidersQuery } from '@renderer/hooks/agent/useModelProviderList';
 import IdmmInterventionRow from './IdmmInterventionRow';
+import { isLiveEventForTarget } from './liveEventMatch';
 import {
   getWatchBackupValidationErrorKey,
   type IdmmBackupValidationKey,
@@ -220,7 +221,7 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
   useEffect(() => {
     if (isDraft || !kind || !id) return;
     const unsub = ipcBridge.idmm.onStatus.on((s) => {
-      if (s.kind === kind && s.target_id === id) {
+      if (isLiveEventForTarget(s.kind, s.target_id, kind, id)) {
         setState(s);
         applyIdmmStateToSessionCapabilities(s);
       }

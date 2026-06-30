@@ -13,6 +13,7 @@ import { ipcBridge } from '@/common';
 import type { AutoWorkRunState, AutoWorkTargetKind, IAutoWorkState } from '@/common/adapter/ipcBridge';
 import { CAPABILITY_COLORS } from '@/renderer/components/capability/CapabilityIcon';
 import { AUTOWORK_STATUS_COLOR } from '@/renderer/components/capability/capabilityStatusColors';
+import { isLiveEventForTarget } from './liveEventMatch';
 import { useRequirementTags } from '@renderer/pages/requirements/useRequirements';
 
 export interface AutoWorkTarget {
@@ -81,7 +82,7 @@ const AutoWorkControl: React.FC<AutoWorkControlProps> = ({ target, draft, disabl
   useEffect(() => {
     if (draft || !kind || !id) return;
     const unsub = ipcBridge.requirements.onAutoWork.on((s) => {
-      if (s.kind === kind && s.target_id === id) {
+      if (isLiveEventForTarget(s.kind, s.target_id, kind, id)) {
         setState(s);
         setPersistedTag(s.tag);
       }
