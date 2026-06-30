@@ -301,7 +301,7 @@ const WorkpathDrawer: React.FC<WorkpathDrawerProps> = ({
             <span className='shrink-0 flex items-center'>
               <CapabilityIcon
                 icon={<BookOne theme='outline' size={13} fill='currentColor' />}
-                color={CAPABILITY_COLORS.brand}
+                color={CAPABILITY_COLORS.primary}
                 title={t('knowledge.title')}
                 size={13}
               />

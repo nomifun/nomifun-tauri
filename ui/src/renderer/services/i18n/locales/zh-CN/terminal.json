@@ -23,6 +23,9 @@
   "batchDeleteContent": "确认删除 {{count}} 个终端会话？运行中的进程将被终止。",
   "batchDeleteDone": "已删除 {{count}} 个终端",
   "relaunch": "重新启动",
+  "fallbackShell": "回退 Shell",
+  "fallbackShellTip": "结束卡住的 Claude / Codex，原地回到一个干净的 Shell（连续按 Ctrl+C 也会触发）",
+  "fallbackShellDone": "已回退到 Shell",
   "statusExited": "已退出（{{code}}）",
   "composerPlaceholder": "输入命令，点击发送即可在终端中执行",
   "quickCommand": {

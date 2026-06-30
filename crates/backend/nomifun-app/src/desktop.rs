@@ -104,6 +104,10 @@ pub struct DesktopServer {
     dev_frontend_url: Option<Arc<str>>,
     /// Backend runtime handle, so Tauri command threads can drive async work.
     runtime: Handle,
+    /// The singleton terminal service (live PTY map + session repo). Held here so
+    /// the Tauri main thread can trigger a synchronous cleanup of all terminal
+    /// sessions on real app exit (see [`shutdown_terminals_blocking`]).
+    terminal_service: Arc<nomifun_terminal::TerminalService>,
     /// For the pre-LAN safety gate (refuse to expose before an admin exists).
     user_repo: Arc<dyn IUserRepository>,
     lan: Mutex<Option<LanListener>>,
@@ -154,6 +158,7 @@ impl DesktopServer {
         let database = bootstrap::init_data_layer(&config).await?;
         let services = AppServices::from_config(database, &config).await?;
         let user_repo = services.user_repo.clone();
+        let terminal_service = services.terminal_service.clone();
         let router = create_router(&services).await;
 
         // Permanent loopback listener on an ephemeral port (today's behavior).
@@ -190,6 +195,7 @@ impl DesktopServer {
             spa_dir,
             dev_frontend_url: dev_frontend_url.map(|u| Arc::from(u.trim_end_matches('/'))),
             runtime: Handle::current(),
+            terminal_service,
             user_repo,
             lan: Mutex::new(None),
             status_tx,
@@ -385,6 +391,31 @@ impl DesktopServer {
         };
         let _ = self.status_tx.send(status.clone());
         status
+    }
+
+    /// Synchronously kill all live PTYs and delete all terminal session rows on
+    /// real app exit. Called from the Tauri main thread (which is NOT a Tokio
+    /// runtime thread) right before the process tears down, so the work must run
+    /// on the backend runtime and this thread must block until it finishes.
+    ///
+    /// Uses a one-shot `std::sync::mpsc` channel rather than `Handle::block_on`
+    /// (which panics inside some contexts): we spawn the async cleanup on the
+    /// backend runtime and wait on the channel with a hard cap so a hung kill or
+    /// DB write can never wedge the quit. Failures only warn — a best-effort wipe
+    /// is acceptable (the OS reaps the process tree on exit either way).
+    pub fn shutdown_terminals_blocking(&self) {
+        let ts = self.terminal_service.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.runtime.spawn(async move {
+            let r = tokio::time::timeout(std::time::Duration::from_secs(3), ts.shutdown_cleanup()).await;
+            let _ = tx.send(r);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(4)) {
+            Ok(Ok(Ok(n))) => tracing::info!(deleted = n, "terminal sessions cleaned up on exit"),
+            Ok(Ok(Err(e))) => tracing::warn!(error = %e, "terminal exit cleanup failed"),
+            Ok(Err(_)) => tracing::warn!("terminal exit cleanup timed out (3s) — proceeding with quit"),
+            Err(e) => tracing::warn!(error = %e, "terminal exit cleanup did not report back — proceeding with quit"),
+        }
     }
 }
 

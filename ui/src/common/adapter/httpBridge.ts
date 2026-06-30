@@ -481,7 +481,26 @@ function ensureWs(): void {
 
   current.addEventListener('open', () => {
     console.debug('[ensureWs] CONNECTED');
+    // A non-zero attempt counter means we got here by reconnecting (the socket
+    // had dropped and `scheduleWsReconnect` ran). Notify local listeners so a
+    // live view can resync: the server only does a live fan-out with no replay,
+    // so every frame emitted while the socket was down was lost. Dispatch BEFORE
+    // resetting the counter. `ws.reconnected` is a synthetic local event name,
+    // never sent by the server.
+    const wasReconnect = wsReconnectAttempt > 0;
     wsReconnectAttempt = 0;
+    if (wasReconnect) {
+      const handlers = wsListeners.get('ws.reconnected');
+      if (handlers) {
+        for (const h of [...handlers]) {
+          try {
+            h(undefined);
+          } catch {
+            /* never crash listener */
+          }
+        }
+      }
+    }
   });
 
   current.addEventListener('close', (e) => {

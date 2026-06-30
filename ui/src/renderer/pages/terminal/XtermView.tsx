@@ -12,6 +12,7 @@ import { WebglAddon } from '@xterm/addon-webgl';
 import '@xterm/xterm/css/xterm.css';
 import { ipcBridge } from '@/common';
 import { createStreamingDecoder, encodeStringToBase64 } from './terminalEncoding';
+import { bumpCtrlC, createCtrlCState, isCtrlC, type CtrlCState } from './ctrlCEscalation';
 import { TERMINAL_THEME, TERMINAL_TYPOGRAPHY } from './terminalTheme';
 import styles from './XtermView.module.css';
 
@@ -47,6 +48,13 @@ export interface XtermViewHandle {
   isBracketedPaste: () => boolean;
   /** Clear the visible terminal. */
   clear: () => void;
+  /**
+   * Full soft reset: exit the alternate screen buffer, reset modes, and clear.
+   * Unlike `clear` (which only clears the normal-buffer scrollback) this recovers
+   * a grid left garbled by a wedged full-screen TUI (claude/codex). Used by the
+   * "fall back to shell" affordance and after a WS reconnect.
+   */
+  reset: () => void;
   focus: () => void;
 }
 
@@ -54,10 +62,18 @@ interface XtermViewProps {
   sessionId: number;
   className?: string;
   apiRef?: React.MutableRefObject<XtermViewHandle | null>;
+  /**
+   * Called when the user mashes Ctrl+C (a burst within ~1.5s) — the instinct to
+   * escape a wedged TUI. The page wires this to the shell-fallback action.
+   */
+  onEscalateShell?: () => void;
 }
 
-const XtermView: React.FC<XtermViewProps> = ({ sessionId, className, apiRef }) => {
+const XtermView: React.FC<XtermViewProps> = ({ sessionId, className, apiRef, onEscalateShell }) => {
   const containerRef = useRef<HTMLDivElement>(null);
+  // Keep the latest escalation callback without re-running the mount effect.
+  const onEscalateShellRef = useRef(onEscalateShell);
+  onEscalateShellRef.current = onEscalateShell;
 
   useEffect(() => {
     const container = containerRef.current;
@@ -127,8 +143,18 @@ const XtermView: React.FC<XtermViewProps> = ({ sessionId, className, apiRef }) =
       void ipcBridge.terminal.input.invoke({ id: sessionId, data_b64: encodeStringToBase64(text) });
     };
 
-    // Raw keystrokes → PTY.
-    const dataDisposable = term.onData(sendInput);
+    // Raw keystrokes → PTY. Also watch for a Ctrl+C burst: when a TUI wedges the
+    // terminal, mashing Ctrl+C is the user's escape instinct, so a rapid burst
+    // triggers the shell-fallback affordance (the single Ctrl+C is still sent).
+    let ctrlCState: CtrlCState = createCtrlCState();
+    const dataDisposable = term.onData((data) => {
+      sendInput(data);
+      if (isCtrlC(data)) {
+        const r = bumpCtrlC(ctrlCState, Date.now(), 1500, 3);
+        ctrlCState = r.state;
+        if (r.escalate) onEscalateShellRef.current?.();
+      }
+    });
 
     // Shift+Enter inserts a newline instead of submitting. xterm sends CR (\r)
     // for BOTH Enter and Shift+Enter by default, so raw-mode agents (claude,
@@ -162,29 +188,47 @@ const XtermView: React.FC<XtermViewProps> = ({ sessionId, className, apiRef }) =
         writeToPty: sendInput,
         isBracketedPaste: () => term.modes.bracketedPasteMode,
         clear: () => term.clear(),
+        reset: () => term.reset(),
         focus: focusTerminal,
       };
     }
 
     // One decoder for this session: scrollback replay first (a complete buffer),
     // then live chunks continue on the same decoder so a multibyte char split
-    // across WS messages is buffered, not corrupted into U+FFFD.
-    const decodeStream = createStreamingDecoder();
+    // across WS messages is buffered, not corrupted into U+FFFD. Reassignable so
+    // a reconnect can start a fresh decoder for the re-replay (see below).
+    let decodeStream = createStreamingDecoder();
+
+    // Fetch the current scrollback snapshot and write it through `decodeStream`.
+    const replayScrollback = () => {
+      void ipcBridge.terminal.get
+        .invoke({ id: sessionId })
+        .then((session) => {
+          if (disposed || !session?.scrollback_b64) return;
+          term.write(decodeStream(session.scrollback_b64));
+        })
+        .catch(() => {
+          /* session may have been removed; ignore */
+        });
+    };
 
     // Replay scrollback, then subscribe to live output.
-    void ipcBridge.terminal.get
-      .invoke({ id: sessionId })
-      .then((session) => {
-        if (disposed || !session?.scrollback_b64) return;
-        term.write(decodeStream(session.scrollback_b64));
-      })
-      .catch(() => {
-        /* session may have been removed; ignore */
-      });
+    replayScrollback();
 
     const unsubscribeOutput = ipcBridge.terminal.onOutput.on((evt) => {
       if (disposed || evt.id !== sessionId) return;
       term.write(decodeStream(evt.data_b64));
+    });
+
+    // On WS reconnect the server does NOT replay the frames emitted while the
+    // socket was down, so a TUI's redraws are lost and the grid is left garbled.
+    // Full-reset the emulator (exit alt-screen / clear) and re-replay the current
+    // scrollback through a fresh decoder to resync.
+    const unsubscribeReconnected = ipcBridge.terminal.onReconnected.on(() => {
+      if (disposed) return;
+      term.reset();
+      decodeStream = createStreamingDecoder();
+      replayScrollback();
     });
 
     const unsubscribeExit = ipcBridge.terminal.onExit.on((evt) => {
@@ -216,6 +260,7 @@ const XtermView: React.FC<XtermViewProps> = ({ sessionId, className, apiRef }) =
       document.removeEventListener('visibilitychange', onVisibility);
       dataDisposable.dispose();
       unsubscribeOutput();
+      unsubscribeReconnected();
       unsubscribeExit();
       resizeObserver.disconnect();
       term.dispose();

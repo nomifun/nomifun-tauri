@@ -27,10 +27,12 @@ import type {
 } from '@/common/adapter/ipcBridge';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 import { CAPABILITY_COLORS } from '@/renderer/components/capability/CapabilityIcon';
+import { IDMM_STATUS_COLOR } from '@/renderer/components/capability/capabilityStatusColors';
 import { renderIdmmCapabilityIcon } from '@/renderer/components/capability/idmmCapabilityIcon';
 import { applyIdmmStateToSessionCapabilities } from '@/renderer/pages/conversation/SessionList/hooks/useSessionCapabilities';
 import { useProvidersQuery } from '@renderer/hooks/agent/useModelProviderList';
 import IdmmInterventionRow from './IdmmInterventionRow';
+import { isLiveEventForTarget } from './liveEventMatch';
 import {
   getWatchBackupValidationErrorKey,
   type IdmmBackupValidationKey,
@@ -62,12 +64,6 @@ type IdmmControlProps = {
   applyNote?: string;
 };
 
-/** Tri-state status dot colour — shared capability palette (CAPABILITY_COLORS). */
-const DOT_COLOR: Record<IdmmRunState, string> = {
-  off: CAPABILITY_COLORS.off,
-  armed: CAPABILITY_COLORS.armed,
-  intervening: CAPABILITY_COLORS.active,
-};
 
 /** Shared watch-base defaults (mirrors `WatchBase::default()` on the backend). */
 const defaultWatchBase = (): IIdmmWatchBase => ({
@@ -225,7 +221,7 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
   useEffect(() => {
     if (isDraft || !kind || !id) return;
     const unsub = ipcBridge.idmm.onStatus.on((s) => {
-      if (s.kind === kind && s.target_id === id) {
+      if (isLiveEventForTarget(s.kind, s.target_id, kind, id)) {
         setState(s);
         applyIdmmStateToSessionCapabilities(s);
       }
@@ -290,7 +286,7 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
   const faultBackupErrorKey = watchBackupErrorKey(cfg.fault_watch);
   const decisionBackupErrorKey = watchBackupErrorKey(cfg.decision_watch);
 
-  const dotColor = draft ? (enabled ? CAPABILITY_COLORS.primary : CAPABILITY_COLORS.off) : DOT_COLOR[runState];
+  const dotColor = draft ? (enabled ? CAPABILITY_COLORS.primary : CAPABILITY_COLORS.off) : IDMM_STATUS_COLOR[runState];
   const statusText = draft
     ? enabled
       ? t('guid.advanced.draftOn')
@@ -552,6 +548,18 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
   const optionModeKey = cats.option_decision.mode === 'ask_first' ? 'askFirst' : cats.option_decision.mode;
   const strategySummary = `${t(`idmm.tendency.${strat.tendency}`)} · ${t(`idmm.onBlocked.${blockedKey}`)} · ${t(`idmm.categoryMode.${optionModeKey}`)}`;
 
+  // When a watch is running its config is read-only — changing the tier
+  // (规则 / 旁路模型) or strategy mid-run could mis-steer the live supervisor.
+  // The controls are already `disabled`; this banner surfaces WHY and how to
+  // edit (turn the watch off first), so users don't think it's broken
+  // (防止用户改错乱). Draft mode never locks (still pre-creation configuration).
+  const lockedNotice = (
+    <div className='flex items-start gap-6px rounded-8px bg-fill-1 px-9px py-7px text-t-tertiary text-11px leading-15px'>
+      <span aria-hidden className='shrink-0 leading-15px'>🔒</span>
+      <span>{t('idmm.locked.notice')}</span>
+    </div>
+  );
+
   const categoryBlock = (
     label: string,
     mode: IdmmCategoryMode,
@@ -594,6 +602,12 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
         <span className='min-w-0 flex flex-col gap-2px'>
           <span className='min-w-0 flex items-center gap-6px'>
             <span className='truncate text-t-primary text-13px font-600'>{t(titleKey)}</span>
+            {watchEnabled && !isDraft ? (
+              <span className='inline-flex shrink-0 items-center gap-3px rounded-full bg-fill-2 px-6px py-1px text-10px leading-none text-t-tertiary'>
+                <span aria-hidden>🔒</span>
+                {t('idmm.locked.badge')}
+              </span>
+            ) : null}
             <span className='inline-flex shrink-0 items-center gap-4px text-t-tertiary text-10px leading-none'>
               <span>{open ? '▼' : '▶'}</span>
               <span className='text-11px leading-14px'>{t(open ? 'idmm.collapseConfig' : 'idmm.expandConfig')}</span>
@@ -645,6 +659,7 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
           )}
           {faultOpen ? (
             <div className='flex flex-col gap-8px'>
+              {faultLocked ? lockedNotice : null}
               {renderBase(
                 cfg.fault_watch,
                 (u) => updateFault((w) => ({ ...w, ...u(w) })),
@@ -669,6 +684,7 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
           )}
           {decisionOpen ? (
             <div className='flex flex-col gap-9px'>
+              {decisionLocked ? lockedNotice : null}
               {renderBase(
                 cfg.decision_watch,
                 (u) => updateDecision((w) => ({ ...w, ...u(w) })),
@@ -1010,14 +1026,17 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
     <Button
       size='mini'
       shape='round'
-      type={enabled ? 'primary' : 'secondary'}
+      type='secondary'
       disabled={!!disabledReason}
       className='shrink-0'
     >
       <span className='inline-flex items-center gap-6px leading-none'>
-        {renderIdmmCapabilityIcon({ size: 14, spinning: runState === 'intervening' })}
+        {/* Icon tinted by run-state (same hue as the session-list IDMM icon); the
+            status used to live on a separate dot beside a primary-blue button. */}
+        <span className='inline-flex' style={{ color: dotColor, lineHeight: 0 }}>
+          {renderIdmmCapabilityIcon({ size: 14, spinning: runState === 'intervening' })}
+        </span>
         <span className='text-12px'>{t('idmm.label')}</span>
-        <span className='inline-block w-6px h-6px rounded-full' style={{ backgroundColor: dotColor }} />
       </span>
     </Button>
   );

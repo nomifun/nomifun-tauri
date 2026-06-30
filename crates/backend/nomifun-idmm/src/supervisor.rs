@@ -815,6 +815,23 @@ impl IdmmInner {
             .unwrap_or(false)
     }
 
+    /// Whether `turn_text` (the just-finished turn's assistant text) is a pending
+    /// decision the DECISION watch will answer — reuses the probe's
+    /// `decision_in_text` (detects from the text itself, no persisted-row race),
+    /// gated on the decision watch being enabled. Lets AutoWork yield a
+    /// decision-ending turn to IDMM. False when the decision watch is off, the
+    /// target is not buildable, or the text is not a decision.
+    async fn has_pending_decision(&self, kind: IdmmTargetKind, target_id: &str, turn_text: &str) -> bool {
+        let cfg = self.config_reader.read(kind, target_id).await;
+        if !cfg.decision_watch.base.enabled {
+            return false;
+        }
+        match self.factory.build(kind, target_id) {
+            Some(probe) => probe.decision_in_text(turn_text).await,
+            None => false,
+        }
+    }
+
     async fn ensure(&self, kind: IdmmTargetKind, target_id: &str) {
         if self.is_supervising(kind, target_id) {
             return;
@@ -911,6 +928,7 @@ impl IdmmManager {
 
 /// AutoWork → IDMM seam. Sync method spawns the async `ensure` on a detached
 /// task (AutoWork's loop must not block on it).
+#[async_trait::async_trait]
 impl nomifun_requirement::IdmmHandle for IdmmManager {
     fn ensure_supervising(&self, kind: AutoWorkTargetKind, target_id: &str) {
         let inner = self.inner.clone();
@@ -923,6 +941,12 @@ impl nomifun_requirement::IdmmHandle for IdmmManager {
 
     fn is_supervising(&self, kind: AutoWorkTargetKind, target_id: &str) -> bool {
         self.inner.is_supervising(from_autowork_kind(kind), target_id)
+    }
+
+    async fn has_pending_decision(&self, kind: AutoWorkTargetKind, target_id: &str, turn_text: &str) -> bool {
+        self.inner
+            .has_pending_decision(from_autowork_kind(kind), target_id, turn_text)
+            .await
     }
 }
 
@@ -1059,6 +1083,11 @@ mod tests {
         }
         async fn pending_signal(&self) -> Option<SessionSignal> {
             self.pending.lock().unwrap().pop_front().flatten()
+        }
+        async fn decision_in_text(&self, turn_text: &str) -> bool {
+            // Mirror ConversationProbe: a numbered menu or an open question (no DB).
+            crate::detector::detect_chat_decision(turn_text).is_some()
+                || crate::detector::detect_chat_open_question(turn_text).is_some()
         }
     }
 
@@ -1853,6 +1882,57 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&conv_shared, &term_shared),
             "conv#5 and term#5 must NOT share one SupervisorShared cell"
+        );
+    }
+
+    // ── AutoWork↔IDMM seam: has_pending_decision lets AutoWork yield a
+    //    decision-ending turn to IDMM instead of finalizing/racing it. ──
+
+    #[tokio::test]
+    async fn has_pending_decision_true_when_decision_watch_on_and_text_is_decision() {
+        use nomifun_requirement::IdmmHandle;
+        // decision watch enabled + the just-finished turn TEXT is a 选择题 → AutoWork
+        // should yield (IDMM will answer it). Detection is from the text itself, so
+        // there is no race with the relay's message-status persistence.
+        let (probe, _injected) = MockProbe::new(vec![]);
+        let manager = IdmmManager::new(
+            deps_with(vec![]),
+            Arc::new(FixedProbeFactory(probe)),
+            Arc::new(EnabledConfigReader(rule_cfg())),
+        );
+        let menu = "1) 方案A\n2) 方案B\n请回复编号告诉我你的选择。";
+        assert!(
+            manager
+                .has_pending_decision(AutoWorkTargetKind::Conversation, "t1", menu)
+                .await
+        );
+        // …and plain prose with no question/menu is NOT a pending decision.
+        assert!(
+            !manager
+                .has_pending_decision(AutoWorkTargetKind::Conversation, "t1", "好的，已经实现完成。")
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn has_pending_decision_false_when_decision_watch_off() {
+        use nomifun_requirement::IdmmHandle;
+        // Fault-only config (decision watch disabled): even a 选择题 turn text must
+        // report no pending decision — AutoWork must NOT yield to an IDMM that will
+        // not answer questions (else it would needlessly wait the watchdog out).
+        let (probe, _injected) = MockProbe::new(vec![]);
+        let mut cfg = rule_cfg();
+        cfg.decision_watch.base.enabled = false;
+        let manager = IdmmManager::new(
+            deps_with(vec![]),
+            Arc::new(FixedProbeFactory(probe)),
+            Arc::new(EnabledConfigReader(cfg)),
+        );
+        let menu = "1) 方案A\n2) 方案B\n请回复编号告诉我你的选择。";
+        assert!(
+            !manager
+                .has_pending_decision(AutoWorkTargetKind::Conversation, "t1", menu)
+                .await
         );
     }
 }

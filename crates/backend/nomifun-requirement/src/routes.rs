@@ -272,6 +272,14 @@ async fn set_autowork(
     // Start/stop the live loop.
     if req.enabled {
         if let Some(tag) = req.tag.clone() {
+            // An explicit enable resumes a tag a prior failure left paused, so
+            // toggling 自动工作 on actually RUNS instead of silently inheriting the
+            // paused state (which blocks every conversation bound to the tag —
+            // the recurring "彻底不工作" trap). Best-effort: a resume failure must
+            // not block enabling.
+            if let Err(e) = state.requirement_service.resume_tag_for_enable(&tag).await {
+                tracing::warn!(tag, error = %e, "auto-resume on autowork enable failed (non-fatal)");
+            }
             state
                 .orchestrator
                 .start(req.kind, req.target_id.clone(), tag, req.max_requirements);

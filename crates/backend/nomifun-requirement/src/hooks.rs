@@ -15,6 +15,7 @@ use nomifun_api_types::AutoWorkTargetKind;
 /// turn executes. The implementation resolves the session owner and config
 /// internally; this call is cheap and a no-op when IDMM is disabled or already
 /// supervising the target.
+#[async_trait::async_trait]
 pub trait IdmmHandle: Send + Sync {
     fn ensure_supervising(&self, kind: AutoWorkTargetKind, target_id: &str);
 
@@ -29,4 +30,19 @@ pub trait IdmmHandle: Send + Sync {
     /// numeric `target_id`, so supervision state is keyed by `(kind, target_id)`
     /// (spec §2.2 C3).
     fn is_supervising(&self, kind: AutoWorkTargetKind, target_id: &str) -> bool;
+
+    /// Whether `turn_text` (the just-finished turn's assistant text, which the
+    /// caller already holds in memory) is a PENDING DECISION the agent is waiting
+    /// on — it ended its turn on a 选择题/开放式提问 that IDMM's DECISION watch will
+    /// answer. Detects from the text itself (no persisted-message read), so the
+    /// caller does not race the stream relay's status-flip write.
+    ///
+    /// AutoWork uses this to YIELD on a decision-ending turn: rather than treating
+    /// the question as the requirement's terminal state (parking it `needs_review`
+    /// + burning an attempt) and racing a fresh requirement into the session, it
+    /// waits for IDMM to answer and the work to continue. Returns false when IDMM
+    /// is disabled / not supervising / the decision watch is off / the text is not
+    /// a decision — then AutoWork keeps its legacy "a clean finish ends the turn"
+    /// behavior.
+    async fn has_pending_decision(&self, kind: AutoWorkTargetKind, target_id: &str, turn_text: &str) -> bool;
 }

@@ -316,19 +316,28 @@ fn should_show_main_window_for_macos_reopen(_has_visible_windows: bool) -> bool 
 }
 
 fn handle_run_event(app: &tauri::AppHandle, event: tauri::RunEvent) {
-    #[cfg(target_os = "macos")]
-    if let tauri::RunEvent::Reopen {
-        has_visible_windows,
-        ..
-    } = event
-    {
-        if should_show_main_window_for_macos_reopen(has_visible_windows) {
-            show_main_window(app);
+    match event {
+        // Real app exit: tray-quit's `app.exit(0)`, the `Destroyed`→`exit(0)`
+        // path, macOS Cmd-Q, and last-window-closed all surface here. Close-to-tray
+        // uses `api.prevent_close()` in the `CloseRequested` handler so the window
+        // is merely hidden and this event NEVER fires for it — which makes it safe
+        // to wipe every terminal session here (kill PTYs + delete rows) with no
+        // QuitFlag guard. Blocks briefly (≤3s) so the wipe finishes before exit.
+        tauri::RunEvent::ExitRequested { .. } => {
+            if let Some(server) = app.try_state::<Arc<DesktopServer>>() {
+                server.shutdown_terminals_blocking();
+            }
+        }
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen { has_visible_windows, .. } => {
+            if should_show_main_window_for_macos_reopen(has_visible_windows) {
+                show_main_window(app);
+            }
+        }
+        _ => {
+            let _ = app;
         }
     }
-
-    #[cfg(not(target_os = "macos"))]
-    let _ = (app, event);
 }
 
 /// 本地化原生托盘菜单。渲染层在挂载时及语言切换时调用,传入翻译后的 `tray.showWindow` /

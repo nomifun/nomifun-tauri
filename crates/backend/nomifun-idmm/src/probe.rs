@@ -58,6 +58,15 @@ pub trait SessionProbe: Send + Sync {
     async fn pending_signal(&self) -> Option<SessionSignal> {
         None
     }
+    /// Whether `turn_text` (the just-finished turn's assistant text, held IN
+    /// MEMORY by the caller) is a pending decision IDMM's decision watch would
+    /// answer — gated to plain-desktop. Unlike [`Self::pending_signal`] this reads
+    /// NO persisted message rows, so a caller (AutoWork's decision-yield) can
+    /// decide without racing the stream relay's status-flip write. Default false;
+    /// only ConversationProbe overrides (terminal/mock have no chat-text turns).
+    async fn decision_in_text(&self, _turn_text: &str) -> bool {
+        false
+    }
 }
 
 /// Pure mapping of one agent event to an optional signal. Unit-tested directly
@@ -684,6 +693,26 @@ impl SessionProbe for ConversationProbe {
             return None;
         }
         Some(sig)
+    }
+
+    async fn decision_in_text(&self, turn_text: &str) -> bool {
+        if turn_text.trim().is_empty() {
+            return false;
+        }
+        let Ok(conv_id) = self.conversation_id.parse::<i64>() else {
+            return false;
+        };
+        // Plain-desktop gate (same as observe/pending_signal): routed channel /
+        // companion conversations send menus to a remote human → never auto-answer.
+        let Ok(Some(row)) = self.conversation_repo.get(conv_id).await else {
+            return false;
+        };
+        if conversation_is_routed(&row.extra, row.channel_chat_id.as_deref()) {
+            return false;
+        }
+        // Detect from the turn text itself (no persisted-row status dependency, so
+        // no race with the relay): a numbered-option menu OR an open question.
+        detect_chat_decision(turn_text).is_some() || detect_chat_open_question(turn_text).is_some()
     }
 }
 
@@ -1974,6 +2003,30 @@ mod tests {
                 assert_eq!(dp.options.len(), 2);
             }
             other => panic!("expected an options Decision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_signal_multi_question_design_prompt_is_open_question() {
+        // REGRESSION (会话 27「中途开启智能决策不生效、完全没有决策记录」): the agent ended
+        // its turn on a multi-part design questionnaire — several NUMBERED TOPICS,
+        // some with bullet sub-options, closing on "请告诉我你的偏好…。". It is not a
+        // pick-one menu (no 回复编号/选择 intent), so it must surface as an on-arm
+        // OpenQuestion (the model tier answers it) — NOT fall through to `None`,
+        // which left IDMM silent. `desktopGateway:true` mirrors the real conv-27
+        // extra (a plain desktop conversation, not routed).
+        let multi_q = "好的！先问你几个基础设计问题：\n\n\
+                       1. **技术栈偏好**：你想用什么来写？\n   - 推荐：HTML5 + JS\n   - 或 Python\n\n\
+                       2. **界面风格**：\n   - 复古像素风\n   - 现代简约风\n\n\
+                       3. **核心规则**：撞墙死，还是穿墙继续？\n\n\
+                       请告诉我你的偏好，我们一个一个敲定，然后我再开始写代码。";
+        let msgs = vec![msg_row("left", false, "text", multi_q)];
+        match pending_signal_from_page(r#"{"desktopGateway":true,"workspace":"/p"}"#, &msgs) {
+            Some((SessionSignal::Decision(dp), _at)) => {
+                assert_eq!(dp.kind, DecisionKind::OpenQuestion, "a multi-question prompt is an open question");
+                assert!(dp.options.is_empty(), "an open question carries no enumerable options");
+            }
+            other => panic!("expected an OpenQuestion Decision, got {other:?}"),
         }
     }
 

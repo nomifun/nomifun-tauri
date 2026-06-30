@@ -17,7 +17,7 @@ const BrowserUseSettingsContent: React.FC = () => {
   const { t } = useTranslation();
   const viewMode = useSettingsViewMode();
   const isPageMode = viewMode === 'page';
-  const [browserUse, setBrowserUse] = useState(true);
+  const [browserUse, setBrowserUse] = useState(false);
   const [persistentLogin, setPersistentLogin] = useState(true);
   const [fullPower, setFullPower] = useState(false);
   const [siteMemory, setSiteMemory] = useState(false);
@@ -28,7 +28,7 @@ const BrowserUseSettingsContent: React.FC = () => {
     const storedPersistentLogin = configService.get('agent.browserUse.persistentLogin') ?? true;
     const storedFullPower = configService.get('agent.browserUse.fullPower') ?? false;
 
-    setBrowserUse(configService.get('agent.browserUse') ?? true);
+    setBrowserUse(configService.get('agent.browserUse') ?? false);
     setPersistentLogin(storedPersistentLogin);
     setFullPower(storedPersistentLogin ? false : storedFullPower);
     setSiteMemory(configService.get('agent.browserUse.siteMemory') ?? false);

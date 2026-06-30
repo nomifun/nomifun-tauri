@@ -7,6 +7,7 @@
 import type { AutoWorkRunState, IdmmRunState } from '@/common/adapter/ipcBridge';
 import type { CapabilityIconItem } from '@/renderer/components/capability/CapabilityIcon';
 import { CAPABILITY_COLORS } from '@/renderer/components/capability/CapabilityIcon';
+import { AUTOWORK_STATUS_COLOR, IDMM_STATUS_COLOR } from '@/renderer/components/capability/capabilityStatusColors';
 import { renderIdmmCapabilityIcon } from '@/renderer/components/capability/idmmCapabilityIcon';
 import { AlarmClock, Robot } from '@icon-park/react';
 import type { TFunction } from 'i18next';
@@ -52,12 +53,7 @@ export const buildSessionCapabilityItems = (
     items.push({
       key: 'autowork',
       icon: <Robot theme='outline' size={CAPABILITY_ICON_SIZE} fill='currentColor' />,
-      color:
-        autoworkState === 'active'
-          ? CAPABILITY_COLORS.active
-          : autoworkState === 'idle'
-            ? CAPABILITY_COLORS.idle
-            : CAPABILITY_COLORS.off,
+      color: AUTOWORK_STATUS_COLOR[autoworkState],
       title: `${t('requirements.autowork.label')} · ${t(`requirements.autowork.state.${autoworkState}`)}`,
     });
   }
@@ -65,13 +61,11 @@ export const buildSessionCapabilityItems = (
   if (idmmState) {
     items.push({
       key: 'idmm',
-      icon: renderIdmmCapabilityIcon({ size: CAPABILITY_ICON_SIZE }),
-      color:
-        idmmState === 'intervening'
-          ? CAPABILITY_COLORS.active
-          : idmmState === 'armed'
-            ? CAPABILITY_COLORS.armed
-            : CAPABILITY_COLORS.primary,
+      // Spin while intervening — same animation the per-session control shows —
+      // so the session row visibly reflects an in-flight IDMM intervention, not
+      // just a colour change (which is brief for rule-tier answers).
+      icon: renderIdmmCapabilityIcon({ size: CAPABILITY_ICON_SIZE, spinning: idmmState === 'intervening' }),
+      color: IDMM_STATUS_COLOR[idmmState],
       title: `${t('idmm.label')} · ${t(`idmm.state.${idmmState}`)}`,
     });
   }

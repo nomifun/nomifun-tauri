@@ -23,6 +23,9 @@
   "batchDeleteContent": "Delete {{count}} terminal session(s)? Running processes will be terminated.",
   "batchDeleteDone": "Deleted {{count}} terminal(s)",
   "relaunch": "Relaunch",
+  "fallbackShell": "Fall back to Shell",
+  "fallbackShellTip": "Kill a stuck Claude / Codex and drop back to a clean shell in place (mashing Ctrl+C also triggers this)",
+  "fallbackShellDone": "Fell back to a shell",
   "statusExited": "exited ({{code}})",
   "composerPlaceholder": "Type a command, then Send to run it in the terminal",
   "quickCommand": {

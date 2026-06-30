@@ -9,7 +9,7 @@ use nomifun_ai_agent::TurnStopReason;
 use nomifun_ai_agent::registry::AgentRegistry;
 use nomifun_ai_agent::task_manager::IWorkerTaskManager;
 use nomifun_ai_agent::types::BuildTaskOptions;
-use nomifun_api_types::{AutoWorkTargetKind, Requirement, RequirementStatus, SendMessageRequest};
+use nomifun_api_types::{AutoWorkState, AutoWorkTargetKind, Requirement, RequirementStatus, SendMessageRequest};
 use nomifun_common::AppError;
 use nomifun_conversation::ConversationService;
 use nomifun_db::{IConversationRepository, IUserRepository};
@@ -47,6 +47,18 @@ const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
 /// worst-case hang when IDMM supervises but cannot recover. Combined with IDMM's
 /// own escalating backoff this is several minutes of grace, then a hard fail.
 const MAX_RECOVERY_WAITS: u32 = 5;
+
+/// Max consecutive decision-ending turns AutoWork will YIELD to IDMM within one
+/// requirement turn before finalizing it itself (bounds a runaway question loop).
+const MAX_DECISION_WAITS: u32 = 12;
+
+/// How long AutoWork waits for IDMM to START answering a pending decision (i.e.
+/// drive a follow-up turn) before giving up the yield and finalizing the turn
+/// as-is. Must comfortably exceed IDMM's first decision backoff (~10s) plus a
+/// sidecar model call, so the model tier reliably wins; a rule-tier watch that
+/// cannot auto-answer simply falls back to finalize after this window (no hang).
+const DECISION_YIELD_WINDOW: Duration = Duration::from_secs(90);
+
 
 /// Shared dependencies for all autowork loops.
 pub struct OrchestratorDeps {
@@ -401,6 +413,34 @@ enum TurnEnd {
     Cancelled,
 }
 
+/// Broadcast this loop target's live AutoWork run-state so EVERY surface stays in
+/// sync across idle↔active transitions. The per-session control GETs fresh state
+/// on open, but the session-list capability icon updates ONLY from this event (no
+/// per-row GET); without an emit on claim/finish it kept the run-state from its
+/// initial bulk load and showed a stale colour — active/green in the header but
+/// idle/orange in the sidebar for the same session. `enabled=false` is emitted
+/// when the max-requirements cap just disabled the binding so the icon drops off.
+fn emit_autowork_progress(
+    deps: &OrchestratorDeps,
+    kind: AutoWorkTargetKind,
+    target_id: &str,
+    tag: &str,
+    progress: &LiveProgress,
+    enabled: bool,
+) {
+    let current_requirement_id = progress.current().map(|id| id.to_string());
+    deps.service.emit_autowork_state(&AutoWorkState {
+        kind,
+        target_id: target_id.to_string(),
+        enabled,
+        tag: Some(tag.to_string()),
+        running: enabled,
+        run_state: AutoWorkState::run_state(enabled, current_requirement_id.as_deref()),
+        current_requirement_id,
+        completed_count: progress.completed(),
+    });
+}
+
 async fn run_loop(
     deps: Arc<OrchestratorDeps>,
     target_id: &str,
@@ -428,12 +468,13 @@ async fn run_loop(
             break;
         }
 
-        // Ensure IDMM is supervising this target while the turn runs (idempotent,
-        // no-op when IDMM is disabled for the target). Lets provider faults /
-        // decision stalls be auto-handled so the turn reaches a terminal state.
-        if let Some(idmm) = &deps.idmm {
-            idmm.ensure_supervising(kind, target_id);
-        }
+        // NOTE: IDMM is armed PER TURN inside `inject_and_wait` /
+        // `inject_and_wait_terminal` (right after the task/PTY exists), NOT here.
+        // Arming at the loop top fired on every idle poll too — and since an idle
+        // conversation has no live agent task, IDMM's probe.observe() got a closed
+        // channel and the supervisor died instantly, only to be re-armed 10s later:
+        // a runaway "IDMM supervisor armed" churn that did no work. Arming once the
+        // turn's task is built makes the supervisor actually attach to the turn.
 
         // Terminal target whose PTY is not live: distinguish "deleted" (stop for
         // good) from "exited but relaunch-able" (idle and re-check, so the user
@@ -482,6 +523,9 @@ async fn run_loop(
         let req_id = claimed.id;
         progress.set_current(Some(req_id));
         info!(target_id, tag, requirement_id = req_id, "AutoWork claimed requirement");
+        // active: a requirement is now in flight → broadcast so the session-list
+        // icon turns active-coloured in step with the per-session control.
+        emit_autowork_progress(&deps, kind, target_id, tag, &progress, true);
 
         // 2. Inject + wait for the turn to finish (per target kind).
         let result = match kind {
@@ -545,6 +589,25 @@ async fn run_loop(
                         }
                         TurnResult::Busy
                     }
+                    // The session backing this loop is GONE (deleted mid-flight →
+                    // inject_and_wait's conversation_repo.get returns NotFound). This
+                    // is NOT the requirement's fault: revert the claim WITHOUT
+                    // consuming an attempt (so a deleted session can't burn a
+                    // requirement's retries and PAUSE the whole tag for sibling
+                    // conversations bound to it — the observed "delete conv 29 →
+                    // tag test stuck" cascade), then STOP this loop (no target left
+                    // to drive).
+                    Err(AppError::NotFound(_)) => {
+                        warn!(
+                            target_id,
+                            requirement_id = req_id,
+                            "AutoWork target conversation is gone — unclaiming (no attempt) and stopping loop"
+                        );
+                        if let Err(e) = deps.service.unclaim_busy(req_id, owner_id).await {
+                            error!(target_id, requirement_id = req_id, error = %e, "AutoWork unclaim_busy failed");
+                        }
+                        break;
+                    }
                     Err(e) => {
                         error!(target_id, requirement_id = req_id, error = %e, "AutoWork inject failed");
                         // errored turn → expects_verdict is irrelevant (re-pend / fail).
@@ -601,9 +664,16 @@ async fn run_loop(
                 {
                     warn!(target_id, tag, error = %e, "Failed to persist autowork disable on max");
                 }
+                // off: the cap disabled the binding → drop the session-list icon.
+                emit_autowork_progress(&deps, kind, target_id, tag, &progress, false);
                 break;
             }
         }
+
+        // idle: the turn finished and no requirement is in flight → broadcast so
+        // the session-list icon returns to the idle colour in step with the
+        // per-session control (which only looks fresh because it re-GETs on open).
+        emit_autowork_progress(&deps, kind, target_id, tag, &progress, true);
 
         // 4. Failure backoff: a failed or busy turn inserts a bounded, escalating
         // delay before the next claim so a deterministic failure cannot spin the
@@ -686,6 +756,13 @@ async fn inject_and_wait(
     };
 
     let agent = deps.task_manager.get_or_build_task(conversation_id, options).await?;
+    // Arm IDMM now that THIS turn's task exists (so its probe.observe() attaches
+    // to this turn's event stream), and ONLY now — never on an idle poll. Mirrors
+    // the user-driven path's `on_turn_start` hook (which also arms right after
+    // get_or_build_task). Idempotent + no-op when IDMM is disabled for the target.
+    if let Some(idmm) = &deps.idmm {
+        idmm.ensure_supervising(AutoWorkTargetKind::Conversation, conversation_id);
+    }
     let rx = agent.subscribe();
 
     // Stage attachments only AFTER the task is built: staging implicitly
@@ -732,36 +809,108 @@ async fn wait_for_terminal_with_renewal(
     let mut renew = interval(LEASE_RENEW_INTERVAL);
     renew.tick().await; // consume the immediate first tick
     let mut note_buf = String::new();
+    // The CURRENT turn's assistant text, reset at each turn boundary. Used to
+    // decide the decision-yield from the text we already have IN MEMORY — never
+    // racing the stream relay's persisted message-status write (which `pending_signal`
+    // would). The decision (menu / question) lives at the turn's tail, which
+    // `append_bounded` keeps.
+    let mut turn_text = String::new();
     // Count of retryable errors we've waited through (letting IDMM recover).
     let mut recovery_waits = 0u32;
+    // Count of decision-ending turns we've YIELDED to IDMM this requirement turn.
+    let mut decision_waits = 0u32;
+    // When riding an IDMM-owned decision turn-end: the instant by which IDMM must
+    // have STARTED answering (driven a follow-up turn). If no activity arrives by
+    // then, IDMM cannot / will not answer (e.g. a rule-tier watch) → stop yielding
+    // and finalize the decision-ending turn as-is. Cleared on any activity.
+    let mut decision_ride_until: Option<tokio::time::Instant> = None;
 
     let fut = async {
         loop {
+            // Copy the deadline out for the watchdog branch (Option<Instant> is
+            // Copy) so its future never borrows the state the rx handler mutates.
+            let ride_until = decision_ride_until;
             tokio::select! {
                 _ = renew.tick() => {
                     if let Err(e) = deps.service.renew_lease(req_id, conv_id, DEFAULT_LEASE_MS).await {
                         warn!(conversation_id, requirement_id = req_id, error = %e, "Lease renewal failed");
                     }
                 }
+                // Decision-yield watchdog: armed only while riding (ride_until Some).
+                // Fires when IDMM did not start answering within DECISION_YIELD_WINDOW
+                // → fall back to finalizing the decision-ending turn instead of hanging.
+                () = async move {
+                    match ride_until {
+                        Some(until) => tokio::time::sleep_until(until).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    info!(
+                        conversation_id,
+                        requirement_id = req_id,
+                        "AutoWork decision-yield window elapsed without IDMM answering — finalizing turn"
+                    );
+                    return TurnEnd::Clean;
+                }
                 ev = rx.recv() => {
                     match ev {
                         // Capture the agent's prose; on a clean finish this is the
                         // completion note for tool-free engines (ACP/codex/gemini).
-                        Ok(AgentStreamEvent::Text(t)) => append_bounded(&mut note_buf, &t.content),
-                        // Finish is NOT unconditionally success: a turn can end with
-                        // a refusal / token-or-turn truncation while still having
-                        // produced prose (no Error event). Consult the stop_reason so
-                        // a failed-but-non-empty turn is recorded as failed, not done
-                        // — and so a user cancel is read as an interrupt, not a failure.
-                        Ok(AgentStreamEvent::Finish(d)) => return turn_end_from(&d.stop_reason),
+                        // Any activity also means IDMM's follow-up turn has started,
+                        // so the decision-yield watchdog stands down.
+                        Ok(AgentStreamEvent::Text(t)) => {
+                            decision_ride_until = None;
+                            append_bounded(&mut note_buf, &t.content);
+                            append_bounded(&mut turn_text, &t.content);
+                        }
+                        // A clean Finish is NOT necessarily the requirement's terminal
+                        // state: the agent may have ended its turn on a 选择题/开放式提问.
+                        // When IDMM is supervising and a pending decision exists, IDMM
+                        // will answer it — so YIELD instead of finalizing here (which
+                        // would park the requirement needs_review, burn an attempt, and
+                        // let run_loop race a fresh requirement into the session,
+                        // stomping IDMM's pending answer — the 代码乱套). Keep waiting on
+                        // the SAME broadcast (without holding the turn claim) until the
+                        // work reaches a real terminal Finish. A refusal/truncation
+                        // (Errored) or user cancel (Cancelled) is never yielded — those
+                        // are genuine terminal ends.
+                        Ok(AgentStreamEvent::Finish(d)) => {
+                            let end = turn_end_from(&d.stop_reason);
+                            let yield_to_idmm = if let Some(idmm) = deps.idmm.as_ref() {
+                                should_wait_for_decision(
+                                    end,
+                                    idmm.is_supervising(AutoWorkTargetKind::Conversation, conversation_id),
+                                    decision_waits,
+                                ) && idmm
+                                    .has_pending_decision(
+                                        AutoWorkTargetKind::Conversation,
+                                        conversation_id,
+                                        &turn_text,
+                                    )
+                                    .await
+                            } else {
+                                false
+                            };
+                            // This turn ended; the next (IDMM-driven) turn accumulates
+                            // its own text.
+                            turn_text.clear();
+                            if yield_to_idmm {
+                                decision_waits += 1;
+                                decision_ride_until = Some(tokio::time::Instant::now() + DECISION_YIELD_WINDOW);
+                                continue;
+                            }
+                            return end;
+                        }
                         // On an error, defer to IDMM when it is supervising: a
-                        // retryable provider fault is IDMM's job to recover in-turn
-                        // (retry / sidecar). Failing the turn here would abandon it
-                        // and race a fresh requirement into the same session while
-                        // IDMM is mid-retry — the historical "代码乱套". Wait through
-                        // up to MAX_RECOVERY_WAITS such errors for the retry's Finish;
-                        // otherwise (non-retryable, no IDMM, or grace exhausted) fail.
+                        // retryable provider fault is IDMM's job to recover (retry /
+                        // sidecar via a fresh turn). Failing the turn here would
+                        // abandon it and race a fresh requirement into the same
+                        // session — the historical "代码乱套". Wait through up to
+                        // MAX_RECOVERY_WAITS such errors; otherwise (non-retryable, no
+                        // IDMM, or grace exhausted) fail.
                         Ok(AgentStreamEvent::Error(d)) => {
+                            decision_ride_until = None;
+                            turn_text.clear();
                             let retryable = matches!(d.retryable, Some(true));
                             let idmm_supervising = deps
                                 .idmm
@@ -774,7 +923,10 @@ async fn wait_for_terminal_with_renewal(
                             }
                             return TurnEnd::Errored;
                         }
-                        Ok(_) => continue,
+                        Ok(_) => {
+                            decision_ride_until = None;
+                            continue;
+                        }
                         // A closed channel means the agent task was torn down
                         // (eviction on terminal error, process death, dropped
                         // connection) — the turn did NOT finish cleanly. Treat as
@@ -841,6 +993,17 @@ fn failure_backoff(consecutive: u32) -> Duration {
 /// When IDMM is not supervising, the turn fails on the first error (legacy).
 fn should_wait_for_recovery(retryable: bool, idmm_supervising: bool, waits_so_far: u32) -> bool {
     retryable && idmm_supervising && waits_so_far < MAX_RECOVERY_WAITS
+}
+
+/// Decide whether AutoWork should YIELD a clean-finish turn to IDMM rather than
+/// finalize it as the requirement's terminal state. We yield only on a CLEAN
+/// finish (a refusal/truncation Errored or a user Cancelled is a real terminal
+/// end) AND when IDMM is supervising (it owns answering 选择题/开放式提问), bounded by
+/// `MAX_DECISION_WAITS` so a runaway question loop can't ride forever. The caller
+/// additionally confirms (async) that a pending decision actually exists before
+/// yielding, and arms a watchdog so a non-answering IDMM falls back to finalize.
+fn should_wait_for_decision(end: TurnEnd, idmm_supervising: bool, waits_so_far: u32) -> bool {
+    end == TurnEnd::Clean && idmm_supervising && waits_so_far < MAX_DECISION_WAITS
 }
 
 /// Trim + tail-truncate the accumulated agent text into a completion note.
@@ -934,6 +1097,14 @@ async fn inject_and_wait_terminal(
     // go out as SEPARATE writes (see `submit_terminal_prompt`) so the CR is not
     // swallowed by the target CLI's paste-burst detection.
     submit_terminal_prompt(driver, terminal_id, &prompt).await?;
+
+    // Arm IDMM for THIS terminal turn (its probe subscribes to the durable PTY
+    // output/lifecycle, so it attaches regardless of task state). Per-turn, not on
+    // every idle poll — same churn fix as the conversation path. Idempotent + a
+    // no-op when IDMM is disabled for the terminal.
+    if let Some(idmm) = &deps.idmm {
+        idmm.ensure_supervising(AutoWorkTargetKind::Terminal, &terminal_id.to_string());
+    }
 
     // Subscribe to lifecycle AFTER injecting (the hook fires on the NEXT
     // turn-end, not the injection itself).
@@ -1084,6 +1255,21 @@ mod tests {
         assert!(!should_wait_for_recovery(false, true, 0));
         // IDMM not supervising → legacy: fail on first error.
         assert!(!should_wait_for_recovery(true, false, 0));
+    }
+
+    #[test]
+    fn should_wait_for_decision_only_when_clean_idmm_and_under_cap() {
+        // Yield a clean decision-ending finish to IDMM while it supervises, under cap.
+        assert!(should_wait_for_decision(TurnEnd::Clean, true, 0));
+        assert!(should_wait_for_decision(TurnEnd::Clean, true, MAX_DECISION_WAITS - 1));
+        // Cap reached → finalize ourselves (stop riding).
+        assert!(!should_wait_for_decision(TurnEnd::Clean, true, MAX_DECISION_WAITS));
+        // IDMM not supervising → legacy: a clean finish ends the turn immediately.
+        assert!(!should_wait_for_decision(TurnEnd::Clean, false, 0));
+        // A real terminal end is never yielded: an errored (refusal/truncation)
+        // or user-cancelled finish must finalize, not wait for IDMM.
+        assert!(!should_wait_for_decision(TurnEnd::Errored, true, 0));
+        assert!(!should_wait_for_decision(TurnEnd::Cancelled, true, 0));
     }
 
     #[test]

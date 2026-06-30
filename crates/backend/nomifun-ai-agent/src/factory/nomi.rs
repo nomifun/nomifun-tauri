@@ -283,10 +283,10 @@ pub(super) async fn build(
     )
     .await;
     // browser-use has no cargo-feature gate (native CDP engine works on every
-    // build), so its host default is unconditionally ON — the user pref toggle
-    // is the only off-switch. (Was `true || env_flag(...)`, whose env arm was
-    // dead code: `true || _` is always true — clippy::overly_complex_bool_expr.)
-    let browser_use_default = read_bool_pref(&deps, PREF_BROWSER_USE, true).await;
+    // build), but its host default is OFF: driving a browser is intrusive enough
+    // (spawns Chromium, takes over pages) that it hurts UX as an always-on default.
+    // Opt-in only — the user enables it via the `agent.browserUse` pref toggle.
+    let browser_use_default = read_bool_pref(&deps, PREF_BROWSER_USE, false).await;
     // F1-sec: evaluate「全权模式」LIVE 值（裁决⑨，default-deny）。用户在 System Settings 显式 opt-in
     // 的 `agent.browserUse.fullPower` 开关，每会话构造时 LIVE 读（read_bool_pref 范式，与上面的启用开关
     // 同源），灌进 BrowserConfig.full_power → BrowserTool::with_policy → 引擎 evaluate gate。默认 OFF

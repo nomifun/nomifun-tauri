@@ -70,6 +70,20 @@ pub trait ITerminalRepository: Send + Sync {
     /// unchanged; setting `pinned` also stamps/clears `pinned_at`.
     async fn update_meta(&self, id: i64, name: Option<&str>, pinned: Option<bool>) -> Result<(), DbError>;
 
+    /// Rewrite the launch identity (command/args/backend) of a session in place.
+    /// Used by the "fall back to a plain shell" path: the session keeps its id
+    /// but its stored process becomes the login shell, so a later restart /
+    /// boot-reconcile relaunches a shell (not the dead agent CLI) and the
+    /// mechanical `default_name` becomes `Shell`. `args` is a JSON array string.
+    /// Returns `DbError::NotFound` if absent.
+    async fn update_command(
+        &self,
+        id: i64,
+        command: &str,
+        args: &str,
+        backend: Option<&str>,
+    ) -> Result<(), DbError>;
+
     /// Writes (or clears with `None`) the AutoWork config JSON blob for a session.
     /// Returns `DbError::NotFound` if absent.
     async fn update_autowork(&self, id: i64, autowork: Option<&str>) -> Result<(), DbError>;
@@ -84,4 +98,12 @@ pub trait ITerminalRepository: Send + Sync {
 
     /// Deletes a session row. Returns `DbError::NotFound` if absent.
     async fn delete(&self, id: i64) -> Result<(), DbError>;
+
+    /// Deletes EVERY terminal session row (whole table). The
+    /// `terminal_scrollback` rows are dropped by the FK `ON DELETE CASCADE`, so
+    /// no second call is needed. Returns the number of rows deleted. Used only on
+    /// real app exit (desktop quit) to wipe the dirty sessions a crashed/closed
+    /// run would otherwise leave behind — never on close-to-tray. A clean exit
+    /// with zero rows is normal and must NOT error.
+    async fn delete_all(&self) -> Result<u64, DbError>;
 }

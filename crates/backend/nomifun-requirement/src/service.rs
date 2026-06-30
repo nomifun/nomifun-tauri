@@ -912,7 +912,46 @@ impl RequirementService {
         Ok(())
     }
 
-    /// Revert a claim that could not be injected because the session was busy,
+    /// Resume a tag because AutoWork was explicitly (re-)ENABLED on a session
+    /// bound to it. A paused tag (prior `requirement_failed`, or a deleted-session
+    /// cascade) otherwise silently blocks EVERY conversation bound to the same tag
+    /// — the user toggles 自动工作 on and nothing happens, with no per-conversation
+    /// indication that the shared tag is paused (the recurring "彻底不工作" trap).
+    ///
+    /// An explicit enable is a clear "run this" signal, so: unpause the tag and
+    /// give its STUCK requirements (`failed` / `pending` / stale `in_progress`) a
+    /// fresh attempt budget (re-pend, clear owner, reset attempt_count). Rows the
+    /// user deliberately parked for review (`needs_review`) and terminal rows
+    /// (`done` / `cancelled`) are left untouched. No-op when the tag is not paused.
+    pub async fn resume_tag_for_enable(&self, tag: &str) -> Result<(), AppError> {
+        if !self.repo.is_tag_paused(tag).await? {
+            return Ok(());
+        }
+        self.repo.resume_tag(tag).await?;
+        for row in self.repo.list_by_tag(tag).await? {
+            if !matches!(row.status.as_str(), "failed" | "pending" | "in_progress") {
+                continue;
+            }
+            let params = RequirementRowUpdate {
+                status: Some("pending".to_string()),
+                completion_note: Some(None),
+                owner_session_id: Some(None),
+                owner_kind: Some(None),
+                claimed_at: Some(None),
+                lease_expires_at: Some(None),
+                attempt_count: Some(0),
+                ..Default::default()
+            };
+            self.repo.update(row.id, &params).await?;
+            if let Some(updated) = self.repo.get_by_id(row.id).await? {
+                self.emitter.emit_status_changed(&row_to_dto(&updated));
+            }
+        }
+        self.wake_autowork();
+        Ok(())
+    }
+
+
     /// WITHOUT consuming an attempt (the turn never ran). Wakes loops to retry.
     pub async fn unclaim_busy(&self, id: i64, conversation_id: i64) -> Result<(), AppError> {
         if self.repo.unclaim(id, conversation_id).await? {
@@ -1772,6 +1811,68 @@ mod tests {
         // And it is claimable again now the tag is resumed.
         let claimed = s.claim_next("auto", 1, AutoWorkTargetKind::Conversation, 60_000).await.unwrap();
         assert_eq!(claimed.expect("claimable after resume").id, r.id);
+    }
+
+    #[tokio::test]
+    async fn resume_tag_for_enable_unpauses_and_refreshes_stuck_requirement() {
+        // The recurring "彻底不工作" trap: a tag paused by a prior failure blocks
+        // every conversation bound to it. Re-enabling AutoWork must auto-resume it
+        // AND give the stuck requirement a fresh attempt budget — without the
+        // caller passing explicit ids.
+        let s = svc().await;
+        let r = s
+            .create(CreateRequirementRequest {
+                title: "T".into(),
+                content: String::new(),
+                tag: "auto".into(),
+                order_key: Some("1".into()),
+                status: None,
+                created_by: None,
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+        for _ in 0..3 {
+            s.claim_next("auto", 1, AutoWorkTargetKind::Conversation, 60_000).await.unwrap().unwrap();
+            s.finalize_if_needed(r.id, true, None, false).await.unwrap();
+        }
+        assert!(s.is_tag_paused("auto").await.unwrap(), "3 failures pause the tag");
+
+        // Enabling AutoWork on a conversation bound to this tag auto-resumes it.
+        s.resume_tag_for_enable("auto").await.unwrap();
+        assert!(!s.is_tag_paused("auto").await.unwrap(), "enable must unpause the tag");
+        let row = s.get(r.id).await.unwrap();
+        assert_eq!(row.status, RequirementStatus::Pending, "stuck requirement re-pended");
+        assert_eq!(row.attempt_count, 0, "fresh attempt budget on enable");
+        // Claimable again.
+        let claimed = s.claim_next("auto", 1, AutoWorkTargetKind::Conversation, 60_000).await.unwrap();
+        assert_eq!(claimed.expect("claimable after enable-resume").id, r.id);
+    }
+
+    #[tokio::test]
+    async fn resume_tag_for_enable_is_noop_when_not_paused() {
+        // Must NOT disturb a healthy tag: no pause → no requeue, no attempt reset.
+        let s = svc().await;
+        let r = s
+            .create(CreateRequirementRequest {
+                title: "T".into(),
+                content: String::new(),
+                tag: "auto".into(),
+                order_key: Some("1".into()),
+                status: None,
+                created_by: None,
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+        // Consume one attempt but do NOT exhaust (tag stays active).
+        s.claim_next("auto", 1, AutoWorkTargetKind::Conversation, 60_000).await.unwrap().unwrap();
+        s.finalize_if_needed(r.id, true, None, false).await.unwrap(); // re-pended, attempt_count=1
+        assert!(!s.is_tag_paused("auto").await.unwrap());
+
+        s.resume_tag_for_enable("auto").await.unwrap();
+        let row = s.get(r.id).await.unwrap();
+        assert_eq!(row.attempt_count, 1, "an unpaused tag must not be reset by enable");
     }
 
     #[tokio::test]

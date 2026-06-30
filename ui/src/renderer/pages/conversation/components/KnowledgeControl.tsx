@@ -614,14 +614,15 @@ const KnowledgeControl: React.FC<KnowledgeControlProps> = ({ target, draft, disa
     <Button
       size='mini'
       shape='round'
-      type={binding.enabled ? 'primary' : 'secondary'}
+      type='secondary'
       disabled={!!disabledReason}
       className='shrink-0'
     >
       <span className='inline-flex items-center gap-6px leading-none'>
-        <BookOne theme='outline' size='14' fill='currentColor' className='block' style={{ lineHeight: 0 }} />
+        {/* Icon tinted by enabled-state (primary when mounted, gray off) — the
+            status used to live on a separate dot beside a primary-blue button. */}
+        <BookOne theme='outline' size='14' fill={dotColor} className='block' style={{ lineHeight: 0 }} />
         <span className='text-12px'>{t('knowledge.control.label')}</span>
-        <span className='inline-block w-6px h-6px rounded-full' style={{ backgroundColor: dotColor }} />
       </span>
     </Button>
   );

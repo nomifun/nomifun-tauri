@@ -1633,6 +1633,8 @@ export const terminal = {
   ),
   kill: httpPost<void, { id: number }>((p) => `/api/terminals/${p.id}/kill`),
   relaunch: httpPost<ITerminalSession, { id: number }>((p) => `/api/terminals/${p.id}/relaunch`),
+  /** 把会话原地回退为干净的登录 shell(杀掉卡死的 claude/codex 并以 $SHELL 重启同一会话) / Fall back to a clean login shell in place. */
+  relaunchShell: httpPost<ITerminalSession, { id: number }>((p) => `/api/terminals/${p.id}/relaunch-shell`),
   update: httpPatch<ITerminalSession, { id: number; name?: string; pinned?: boolean }>(
     (p) => `/api/terminals/${p.id}`,
     (p) => ({ name: p.name, pinned: p.pinned })
@@ -1643,6 +1645,10 @@ export const terminal = {
   onCreated: wsEmitter<ITerminalSession>('terminal.created'),
   onUpdated: wsEmitter<ITerminalSession>('terminal.updated'),
   onRemoved: wsEmitter<{ id: number }>('terminal.removed'),
+  /** 在 WebSocket 断线重连成功后触发(本地合成事件,非服务端推送)。XtermView 借此 reset
+   *  并重放 scrollback,修复断线期间丢失的重绘帧造成的乱码 / Fires after the WS reconnects
+   *  (local synthetic event) so a view can reset + replay the scrollback it missed. */
+  onReconnected: wsEmitter<undefined>('ws.reconnected'),
   // Uses httpRequest directly (instead of httpGet + withResponseMap) because the
   // response mapper needs `cwd` from params to build fullPath/relativePath, and
   // withResponseMap's map function does not receive the original params. Treats

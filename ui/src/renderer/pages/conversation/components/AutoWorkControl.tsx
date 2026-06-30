@@ -12,6 +12,8 @@ import classNames from 'classnames';
 import { ipcBridge } from '@/common';
 import type { AutoWorkRunState, AutoWorkTargetKind, IAutoWorkState } from '@/common/adapter/ipcBridge';
 import { CAPABILITY_COLORS } from '@/renderer/components/capability/CapabilityIcon';
+import { AUTOWORK_STATUS_COLOR } from '@/renderer/components/capability/capabilityStatusColors';
+import { isLiveEventForTarget } from './liveEventMatch';
 import { useRequirementTags } from '@renderer/pages/requirements/useRequirements';
 
 export interface AutoWorkTarget {
@@ -43,13 +45,6 @@ interface AutoWorkControlProps {
   /** When the config takes effect, shown at the panel bottom (draft mode). */
   applyNote?: string;
 }
-
-/** Tri-state status dot colour — shared capability palette (CAPABILITY_COLORS). */
-const DOT_COLOR: Record<AutoWorkRunState, string> = {
-  off: CAPABILITY_COLORS.off,
-  idle: CAPABILITY_COLORS.idle,
-  active: CAPABILITY_COLORS.active,
-};
 
 /**
  * Per-session AutoWork control. Rendered in a conversation header (kind
@@ -87,7 +82,7 @@ const AutoWorkControl: React.FC<AutoWorkControlProps> = ({ target, draft, disabl
   useEffect(() => {
     if (draft || !kind || !id) return;
     const unsub = ipcBridge.requirements.onAutoWork.on((s) => {
-      if (s.kind === kind && s.target_id === id) {
+      if (isLiveEventForTarget(s.kind, s.target_id, kind, id)) {
         setState(s);
         setPersistedTag(s.tag);
       }
@@ -102,7 +97,7 @@ const AutoWorkControl: React.FC<AutoWorkControlProps> = ({ target, draft, disabl
   // Draft mode shows "preset" wording with a neutral/primary dot — the live
   // run-state palette (idle orange / active green) is reserved for a running
   // session.
-  const dotColor = draft ? (enabled ? CAPABILITY_COLORS.primary : CAPABILITY_COLORS.off) : DOT_COLOR[runState];
+  const dotColor = draft ? (enabled ? CAPABILITY_COLORS.primary : CAPABILITY_COLORS.off) : AUTOWORK_STATUS_COLOR[runState];
   const statusText = draft
     ? enabled
       ? t('guid.advanced.draftOn')
@@ -164,14 +159,15 @@ const AutoWorkControl: React.FC<AutoWorkControlProps> = ({ target, draft, disabl
     </div>
   );
 
-  // Icon + label + status dot share one flex baseline — this is the alignment fix
-  // (the old control wrapped the icon in a Badge inside the Button's icon slot,
-  // which knocked it out of vertical centering).
+  // Icon (tinted by run-state, matching the sidebar capability icon) + label
+  // share one flex baseline. The status used to be a separate 6px dot beside a
+  // primary-blue button; the icon itself now carries the status colour so the
+  // header marker and the session-list icon are the same hue for every state.
   const button = (
     <Button
       size='mini'
       shape='round'
-      type={enabled ? 'primary' : 'secondary'}
+      type='secondary'
       disabled={!!disabledReason}
       className='shrink-0'
     >
@@ -179,12 +175,11 @@ const AutoWorkControl: React.FC<AutoWorkControlProps> = ({ target, draft, disabl
         <Robot
           theme='outline'
           size='14'
-          fill='currentColor'
+          fill={dotColor}
           className={classNames('block', runState === 'active' && 'autowork-spin')}
           style={{ lineHeight: 0 }}
         />
         <span className='text-12px'>{t('requirements.autowork.label')}</span>
-        <span className='inline-block w-6px h-6px rounded-full' style={{ backgroundColor: dotColor }} />
       </span>
     </Button>
   );

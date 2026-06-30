@@ -7,7 +7,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { Button, Input, Message } from '@arco-design/web-react';
-import { Refresh, EditOne } from '@icon-park/react';
+import { Refresh, EditOne, Terminal } from '@icon-park/react';
 import { useTranslation } from 'react-i18next';
 import { ipcBridge } from '@/common';
 import type { ITerminalSession } from '@/common/adapter/ipcBridge';
@@ -178,6 +178,8 @@ const TerminalSessionPage: React.FC = () => {
   const { t } = useTranslation();
   const [session, setSession] = useState<ITerminalSession | null>(null);
   const [relaunching, setRelaunching] = useState(false);
+  const [fallingBack, setFallingBack] = useState(false);
+  const fallingBackRef = useRef(false);
   const xtermApi = useRef<XtermViewHandle | null>(null);
   // Inline title editing in the header.
   const [editingName, setEditingName] = useState(false);
@@ -235,6 +237,29 @@ const TerminalSessionPage: React.FC = () => {
       setRelaunching(false);
     }
   }, [session]);
+
+  // Fall back to a clean login shell in place: the escape hatch for a wedged,
+  // garbled claude/codex TUI. Kills the agent and respawns the platform shell
+  // under the SAME session id, then full-resets the xterm grid (exits alt-screen
+  // / clears the garble). Wired to both the header button and the rapid-Ctrl+C
+  // escalation. Guarded so a Ctrl+C burst + a button click cannot double-fire.
+  const handleFallbackShell = useCallback(async () => {
+    if (!session || fallingBackRef.current) return;
+    fallingBackRef.current = true;
+    setFallingBack(true);
+    try {
+      const updated = await ipcBridge.terminal.relaunchShell.invoke({ id: session.id });
+      xtermApi.current?.reset();
+      xtermApi.current?.focus();
+      setSession(updated);
+      Message.success(t('terminal.fallbackShellDone'));
+    } catch (err) {
+      Message.error(err instanceof Error ? err.message : String(err));
+    } finally {
+      fallingBackRef.current = false;
+      setFallingBack(false);
+    }
+  }, [session, t]);
 
   const startEditName = useCallback(() => {
     if (!session) return;
@@ -381,6 +406,21 @@ const TerminalSessionPage: React.FC = () => {
               safetyHint={autoWorkSafetyHint}
             />
             <IdmmControl target={{ kind: 'terminal', id: sessionId }} />
+            {/* Escape hatch for a wedged/garbled claude/codex TUI: always
+                available (NOT gated on isExited) for agent sessions. After a
+                fallback the session is a plain shell, so isAgentCli flips false
+                and this button disappears. */}
+            {isAgentCli && (
+              <Button
+                size='small'
+                loading={fallingBack}
+                icon={<Terminal size='14' />}
+                onClick={handleFallbackShell}
+                title={t('terminal.fallbackShellTip')}
+              >
+                {t('terminal.fallbackShell')}
+              </Button>
+            )}
             {isExited && (
               <Button
                 type='primary'
@@ -397,7 +437,12 @@ const TerminalSessionPage: React.FC = () => {
 
         {/* Terminal output */}
         <div className='flex-1 min-h-0 px-12px pt-12px'>
-          <XtermView sessionId={sessionId} apiRef={xtermApi} className='h-full' />
+          <XtermView
+            sessionId={sessionId}
+            apiRef={xtermApi}
+            className='h-full'
+            onEscalateShell={isAgentCli ? handleFallbackShell : undefined}
+          />
         </div>
 
         {/* Enhanced composer */}
