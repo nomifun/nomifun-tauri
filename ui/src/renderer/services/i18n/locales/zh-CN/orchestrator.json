@@ -1,0 +1,304 @@
+{
+  "title": "智能编排",
+  "subtitle": "发起并编排多智能体，可视化跟进每个 agent 的工作与状态",
+  "tab": {
+    "newRun": "新建 Run",
+    "listTitle": "我的 Run",
+    "listEmpty": "还没有 Run，点上方「新建 Run」开始吧",
+    "listLoadError": "加载 Run 失败",
+    "titlebarShowList": "展开 Run 列表",
+    "titlebarHideList": "收起 Run 列表"
+  },
+  "start": {
+    "title": "发起一次多智能体编排",
+    "subtitle": "用一句话描述你想完成的任务，主管 agent 会自动规划任务图并分派最合适的 agent。",
+    "label": "新建编排",
+    "placeholder": "描述你想编排的任务，主管 agent 会自动规划…（如：调研三家竞品并产出对比报告，附带优劣势分析）",
+    "send": "发起编排",
+    "advanced": "需要工作目录、钉选角色或精细模型范围？结构化新建"
+  },
+  "composer": {
+    "title": "新建 Run",
+    "subtitle": "描述目标，挑选模型与角色，让多智能体编队替你执行。",
+    "goalLabel": "需求",
+    "goalPlaceholder": "想让编队完成什么？尽量写清目标、范围与验收标准…",
+    "goalRequired": "请先填写需求",
+    "workDirLabel": "工作路径",
+    "workDirHint": "可选 · 留空使用默认工作区",
+    "workDirBrowse": "选择文件夹",
+    "workDirClear": "清除工作路径",
+    "modelLabel": "模型范围",
+    "modelRequired": "请至少选择一个模型",
+    "noModels": "尚未配置可用模型 · 请先到模型管理添加并启用模型。",
+    "model": {
+      "single": "单一",
+      "auto": "自动",
+      "range": "范围",
+      "singlePlaceholder": "选择一个模型",
+      "rangePlaceholder": "选择多个模型",
+      "autoHint": "将使用全部 {{count}} 个已启用模型，每个模型生成一名成员。",
+      "rangeCount": "{{count}} 个模型"
+    },
+    "rolesLabel": "钉选角色",
+    "rolesHint": "可选 · 留空则由编队自动组建",
+    "rolesPlaceholder": "从已启用助手中选择角色",
+    "rolesEmpty": "暂无可用助手",
+    "autonomyLabel": "自主级别",
+    "autonomy": {
+      "interactive": "先审批",
+      "supervised": "直跑",
+      "interactiveHint": "编队拟定计划后暂停，待你批准再执行。",
+      "supervisedHint": "批准后自动执行，期间仍可介入。"
+    },
+    "submit": "发起 Run",
+    "cancel": "取消",
+    "createError": "发起 Run 失败：{{error}}",
+    "replanTitle": "重新规划 Run",
+    "replanSubtitle": "修改目标、模型、角色或自主级别，重新拆解任务图。旧计划（任务、分派）将被清除并重建。",
+    "replanSubmit": "重新规划",
+    "replanError": "重新规划失败：{{error}}"
+  },
+  "roster": {
+    "title": "agent 花名册",
+    "count": "{{count}} 个任务",
+    "roleUnknown": "待分派",
+    "modelUnknown": "未指定模型"
+  },
+  "run": {
+    "role": {
+      "planner": "规划",
+      "coder": "编码",
+      "reviewer": "评审",
+      "researcher": "调研",
+      "tester": "测试"
+    },
+    "kind": {
+      "synthesis": "汇总",
+      "verify": "校验",
+      "judge": "评审",
+      "loop": "循环",
+      "fanout": "扇出 · {{label}}"
+    },
+    "verdict": {
+      "pass": "通过",
+      "fail": "未通过",
+      "pending": "校验中…"
+    },
+    "judge": {
+      "winner": "优胜",
+      "none": "无优胜",
+      "pending": "评审中…"
+    },
+    "loop": {
+      "done": "完成",
+      "failed": "失败",
+      "iterating": "迭代中…"
+    },
+    "title": "Run 历史",
+    "subtitle": "查看你发起过的全部编排 Run，点击任意一条复盘其任务图",
+    "openConversation": "打开会话",
+    "emptyTitle": "还没有 Run",
+    "emptyDesc": "在会话中向多智能体下达目标即可发起一个 Run，之后会在这里留下复盘记录。",
+    "loadError": "加载 Run 失败",
+    "untitledGoal": "（未填写目标）",
+    "manage": {
+      "rename": "重命名",
+      "renameError": "重命名失败：{{error}}",
+      "delete": "删除",
+      "deleteConfirm": "删除此 Run？其任务图与执行记录将一并移除。",
+      "deleteConfirmOk": "删除",
+      "deleteConfirmCancel": "取消",
+      "deleteOk": "Run 已删除",
+      "deleteError": "删除失败：{{error}}"
+    },
+    "progress": {
+      "elapsed": "耗时",
+      "tokens": "Tokens",
+      "current": "当前"
+    },
+    "node": {
+      "tokens": "tok"
+    },
+    "canvas": {
+      "mainNode": "main · 主 agent"
+    },
+    "timing": {
+      "took": "用时 {{value}}",
+      "running": "已运行 {{value}}"
+    },
+    "workspace": {
+      "title": "文件"
+    },
+    "mobile": {
+      "tasksLabel": "任务",
+      "noTasks": "编队正在把目标拆解为任务，稍后会显示在这里。"
+    },
+    "status": {
+      "planning": "规划中",
+      "running": "执行中",
+      "completed": "已完成",
+      "failed": "已失败",
+      "cancelled": "已取消",
+      "paused": "已暂停",
+      "awaiting_plan_approval": "待批准计划",
+      "unknown": "未知"
+    },
+    "detail": {
+      "back": "返回",
+      "cancel": "终止 Run",
+      "cancelConfirm": "确定终止这个 Run 吗？正在执行的任务会被取消。",
+      "cancelConfirmOk": "终止",
+      "cancelConfirmCancel": "取消",
+      "cancelOk": "Run 已终止",
+      "cancelError": "终止 Run 失败：{{error}}",
+      "approvePlan": "批准计划",
+      "approveOk": "计划已批准，开始执行",
+      "approveError": "批准计划失败：{{error}}",
+      "pause": "暂停",
+      "pauseOk": "Run 已暂停",
+      "pauseError": "暂停 Run 失败：{{error}}",
+      "resume": "继续",
+      "resumeOk": "Run 已继续",
+      "resumeError": "继续 Run 失败：{{error}}",
+      "replan": "重新规划",
+      "replanOk": "已重新规划",
+      "loadError": "加载 Run 详情失败",
+      "planningTitle": "正在规划任务…",
+      "planningDesc": "编队正在拆解目标并生成任务图，稍候即可看到节点。",
+      "untitledTask": "（未命名任务）",
+      "assigned": "已分派",
+      "config": {
+        "title": "配置",
+        "role": "角色",
+        "model": "模型",
+        "modelNone": "未指定模型",
+        "persona": "人设",
+        "skills": "技能",
+        "skillsNone": "无附加技能",
+        "disabledBuiltin": "已禁用 {{count}} 项内置技能",
+        "status": "状态",
+        "empty": "—"
+      }
+    },
+    "assign": {
+      "rationaleTitle": "为何分派给它",
+      "noRationale": "暂无分派说明。",
+      "score": "匹配度 {{score}}",
+      "reassign": "改派给其他成员",
+      "reassignSuccess": "已更新分派",
+      "reassignError": "更新分派失败：{{error}}",
+      "locked": "锁定分派",
+      "lockedHint": "锁定后，编排器不会在后续重新规划时自动改派该任务。"
+    },
+    "spec": {
+      "title": "意图 / Prompt",
+      "placeholder": "描述该节点要做什么…",
+      "save": "保存",
+      "saving": "保存中…",
+      "dirtyHint": "保存后点「重跑」以应用新的意图。",
+      "runningHint": "任务运行中，暂停后方可编辑。",
+      "empty": "（暂无意图）",
+      "saveOk": "已保存节点意图",
+      "saveError": "保存失败：{{error}}"
+    },
+    "rerun": {
+      "button": "重跑",
+      "running": "任务运行中，请先暂停",
+      "confirm": "重跑将重置此节点及其下游并重新执行，确定？",
+      "confirmOk": "重跑",
+      "confirmCancel": "取消",
+      "ok": "已发起重跑",
+      "error": "重跑失败：{{error}}"
+    },
+    "adopt": {
+      "button": "采用为该节点产出",
+      "ok": "已采用为该节点产出",
+      "error": "采用失败：{{error}}"
+    },
+    "task": {
+      "status": {
+        "pending": "待开始",
+        "running": "执行中",
+        "done": "已完成",
+        "completed": "已完成",
+        "failed": "已失败",
+        "needs_review": "待评审",
+        "skipped": "已跳过",
+        "blocked": "受阻",
+        "cancelled": "已取消"
+      }
+    },
+    "transcript": {
+      "notStarted": "该任务尚未开始",
+      "noConversation": "暂无对话记录，待有 worker 接手该任务后将在此处实时显示。"
+    },
+    "steer": {
+      "label": "局部调整",
+      "placeholder": "输入对当前节点的局部调整方向…",
+      "submit": "提交",
+      "sent": "已提交局部调整",
+      "error": "局部调整失败：{{error}}"
+    },
+    "project": {
+      "viewing": "查看",
+      "returnMain": "返回 main"
+    },
+    "intent": {
+      "label": "调整编排",
+      "placeholder": "描述你想如何调整编排（如：研究太浅，加一道校验和第二个研究员）",
+      "send": "发送调整意图",
+      "summary": "已调整：保留 {{kept}} · 新增 {{added}} · 移除 {{removed}}",
+      "lastApplied": "上次意图：{{intent}}",
+      "error": "调整编排失败：{{error}}"
+    },
+    "header": {
+      "rename": "点击重命名编排目标",
+      "renamePlaceholder": "输入编排目标…",
+      "planning": "规划中"
+    },
+    "thinking": {
+      "title": "编排思考",
+      "drafting": "拟稿中…",
+      "done": "已完成规划",
+      "phase": {
+        "planningStarted": "正在理解目标…",
+        "decomposing": "正在拆解任务…",
+        "assigning": "正在分派 agent…",
+        "planReady": "正在生成计划…"
+      }
+    },
+    "view": {
+      "conversation": "对话",
+      "canvas": "编排画布",
+      "conversationHint": "查看主 agent 的编排决策与你的调整对话",
+      "canvasHint": "查看完整任务图结构"
+    },
+    "feed": {
+      "agentName": "编排主 Agent",
+      "decisionTitle": "编排决策",
+      "decisionSubtitle": "已规划 {{count}} 个任务",
+      "decisionIntro": "我已把目标拆解为以下任务编排，并为每个任务分派了最合适的 agent：",
+      "intentReply": "已按你的意图重新调整编排：保留 {{kept}} · 新增 {{added}} · 移除 {{removed}}。",
+      "rationaleFallback": "按强项与负载自动分派",
+      "outputLabel": "产出",
+      "openTask": "查看该任务的 worker 记录",
+      "groupFanout": "并行扇出 · {{label}}",
+      "empty": "编队正在拟定编排决策，稍候即可看到主 agent 的拆解与分派。",
+      "scrollLatest": "回到最新"
+    },
+    "precipitate": {
+      "title": "沉淀为助手",
+      "subtitle": "这个 Run 里有 {{count}} 个角色可一键保存为助手，下次直接复用",
+      "modelsLabel": "模型",
+      "skillsLabel": "{{count}} 项技能",
+      "saveAsAssistant": "保存为助手",
+      "saved": "已保存",
+      "exists": "已存在同名助手",
+      "saveOk": "已将「{{name}}」保存为助手",
+      "saveError": "保存助手失败：{{error}}",
+      "synthDesc": "「{{role}}」角色，负责：{{tasks}}",
+      "synthDescBare": "从 Run 沉淀的「{{role}}」角色",
+      "taskSep": "、"
+    }
+  }
+}

@@ -78,6 +78,7 @@ const WorkspaceRailBody: React.FC<{ source: WorkspaceSource; messageApi?: Messag
   // made before the tab is opened into the baseline so they'd never show.
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('files');
   const [changesTabEverOpened, setChangesTabEverOpened] = useState(false);
+
   const fileChangesEnabled = source.lazyChanges ? changesTabEverOpened : true;
   const fileChangesHook = useFileChanges({ workspace, enabled: fileChangesEnabled });
 

@@ -117,6 +117,21 @@ pub async fn resolve_provider_config(
     Ok(config)
 }
 
+/// Which stream channel a delta came from, so callers can route reasoning
+/// (thinking) deltas separately from the visible text answer.
+///
+/// Used by [`streaming_completion_kinded`]: `Text` = `LlmEvent::TextDelta`
+/// (the visible answer — what the final assembled string is built from);
+/// `Reasoning` = `LlmEvent::ThinkingDelta` (the model's readable reasoning,
+/// fanned out for observability but NOT part of the returned text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaKind {
+    /// A `TextDelta` — the visible answer text (assembled into the return value).
+    Text,
+    /// A `ThinkingDelta` — the model's reasoning (forwarded, not assembled).
+    Reasoning,
+}
+
 /// Perform a single-turn LLM completion and return the assembled text response.
 ///
 /// Builds an `LlmRequest` from the given config, streams events from the
@@ -158,6 +173,39 @@ pub async fn streaming_completion(
     drain_text_response_with(rx, on_delta).await
 }
 
+/// Like [`streaming_completion`] but the `on_delta` callback ALSO receives a
+/// [`DeltaKind`] so a caller can fan out the model's reasoning (`ThinkingDelta`)
+/// separately from the visible answer (`TextDelta`).
+///
+/// The returned String is built from `TextDelta` events ONLY — exactly the same
+/// bytes [`streaming_completion`] / [`one_shot_completion`] return. `ThinkingDelta`
+/// events are forwarded to `on_delta` with [`DeltaKind::Reasoning`] but never
+/// appended to the result, so the assembled text stays identical to the one-shot
+/// path (a caller that ignores the reasoning gets byte-for-byte the same answer).
+pub async fn streaming_completion_kinded(
+    cfg: &Config,
+    system: &str,
+    messages: Vec<Message>,
+    max_tokens: u32,
+    on_delta: impl FnMut(DeltaKind, &str) + Send,
+) -> Result<String, AppError> {
+    let provider: Arc<dyn LlmProvider> = create_provider(cfg);
+
+    let request = LlmRequest {
+        model: cfg.model.clone(),
+        system: system.to_owned(),
+        messages,
+        tools: vec![],
+        max_tokens,
+        thinking: None,
+        reasoning_effort: None,
+    };
+
+    let rx = provider.stream(&request).await.map_err(provider_error_to_app_error)?;
+
+    drain_text_response_kinded(rx, on_delta).await
+}
+
 /// Convenience constructor for a user-role `Message` with a single text block.
 pub fn user_message(text: impl Into<String>) -> Message {
     Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }])
@@ -188,6 +236,46 @@ async fn drain_text_response_with(
                 return Err(AppError::BadGateway(format!("LLM stream error: {msg}")));
             }
             // Ignore thinking deltas, tool use, and signatures for one-shot
+            _ => {}
+        }
+    }
+
+    // Channel closed without a Done event
+    if output.is_empty() {
+        Err(AppError::BadGateway(
+            "LLM stream ended without producing a response".into(),
+        ))
+    } else {
+        Ok(output)
+    }
+}
+
+/// Drain variant that surfaces BOTH text and thinking deltas to `on_delta`,
+/// tagged with their [`DeltaKind`]. Only `TextDelta` payloads are appended to the
+/// returned String (so it equals the one-shot answer); `ThinkingDelta` payloads
+/// are forwarded as [`DeltaKind::Reasoning`] for observability but never assembled.
+async fn drain_text_response_kinded(
+    mut rx: tokio::sync::mpsc::Receiver<LlmEvent>,
+    mut on_delta: impl FnMut(DeltaKind, &str) + Send,
+) -> Result<String, AppError> {
+    let mut output = String::new();
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            LlmEvent::TextDelta(delta) => {
+                on_delta(DeltaKind::Text, &delta);
+                output.push_str(&delta);
+            }
+            LlmEvent::ThinkingDelta(delta) => {
+                // Forward reasoning for fan-out, but DO NOT append it — the
+                // returned text must stay identical to the one-shot answer.
+                on_delta(DeltaKind::Reasoning, &delta);
+            }
+            LlmEvent::Done { .. } => return Ok(output),
+            LlmEvent::Error(msg) => {
+                return Err(AppError::BadGateway(format!("LLM stream error: {msg}")));
+            }
+            // Ignore tool use and thinking signatures.
             _ => {}
         }
     }
@@ -283,5 +371,72 @@ mod tests {
     fn provider_error_maps_to_bad_gateway() {
         let err = provider_error_to_app_error(ProviderError::Connection("timeout".into()));
         assert!(matches!(err, AppError::BadGateway(_)));
+    }
+
+    // The kinded drain forwards TextDelta as DeltaKind::Text and ThinkingDelta as
+    // DeltaKind::Reasoning, but the RETURNED text is built from TextDelta ONLY —
+    // byte-for-byte identical to the one-shot answer (reasoning is observability,
+    // not part of the answer).
+    #[tokio::test]
+    async fn drain_kinded_routes_by_kind_and_text_equals_one_shot() {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tx.send(LlmEvent::ThinkingDelta("let me ".into())).await.unwrap();
+        tx.send(LlmEvent::TextDelta("Hello".into())).await.unwrap();
+        tx.send(LlmEvent::ThinkingDelta("think…".into())).await.unwrap();
+        tx.send(LlmEvent::TextDelta(", world!".into())).await.unwrap();
+        tx.send(LlmEvent::Done {
+            stop_reason: nomi_types::message::StopReason::EndTurn,
+            usage: nomi_types::message::TokenUsage::default(),
+        })
+        .await
+        .unwrap();
+
+        let mut text_chunks: Vec<String> = Vec::new();
+        let mut reasoning_chunks: Vec<String> = Vec::new();
+        let result = drain_text_response_kinded(rx, |kind, delta| match kind {
+            DeltaKind::Text => text_chunks.push(delta.to_string()),
+            DeltaKind::Reasoning => reasoning_chunks.push(delta.to_string()),
+        })
+        .await
+        .unwrap();
+
+        // Reasoning deltas were forwarded separately…
+        assert_eq!(reasoning_chunks, vec!["let me ", "think…"]);
+        // …text deltas were forwarded as Text…
+        assert_eq!(text_chunks, vec!["Hello", ", world!"]);
+        // …and the assembled answer == ONLY the TextDelta concat (one-shot equiv).
+        assert_eq!(result, "Hello, world!");
+    }
+
+    // The kinded drain surfaces a stream Error as BadGateway, exactly like the
+    // text-only drain.
+    #[tokio::test]
+    async fn drain_kinded_errors_on_llm_error_event() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(LlmEvent::TextDelta("partial".into())).await.unwrap();
+        tx.send(LlmEvent::Error("rate limited".into())).await.unwrap();
+
+        let result = drain_text_response_kinded(rx, |_, _| {}).await;
+        assert!(matches!(result.unwrap_err(), AppError::BadGateway(_)));
+    }
+
+    // A reasoning-only stream (no TextDelta) still ends without a visible answer →
+    // the empty-channel-close contract (BadGateway), matching one_shot semantics
+    // (thinking alone is not an answer).
+    #[tokio::test]
+    async fn drain_kinded_reasoning_only_close_errors_empty() {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(LlmEvent::ThinkingDelta("only thinking".into())).await.unwrap();
+        drop(tx); // close without Done and without any TextDelta
+
+        let mut saw_reasoning = false;
+        let result = drain_text_response_kinded(rx, |kind, _| {
+            if kind == DeltaKind::Reasoning {
+                saw_reasoning = true;
+            }
+        })
+        .await;
+        assert!(saw_reasoning, "reasoning still forwarded");
+        assert!(result.is_err(), "no TextDelta → no answer → error on empty close");
     }
 }

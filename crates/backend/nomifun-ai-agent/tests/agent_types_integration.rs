@@ -112,6 +112,7 @@ fn make_nomi_config() -> NomiResolvedConfig {
         browser_visual_fallback: false,
         goal: None,
         browser_secret_vault: None,
+        owner_token: None,
     }
 }
 
@@ -182,6 +183,7 @@ async fn collect_idle_ignores_non_acp_agent_types() {
             use_model: None,
         },
         conversation_id: id.into(),
+        conversation_created_at: None,
         extra: json!(null),
     };
 

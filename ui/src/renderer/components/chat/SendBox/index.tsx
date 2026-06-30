@@ -14,7 +14,6 @@ import { useBtwCommand } from '@/renderer/components/chat/BtwOverlay/useBtwComma
 import { useSlashCommandController } from '@/renderer/hooks/chat/useSlashCommandController';
 import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
 import { useConversationContextSafe } from '@/renderer/hooks/context/ConversationContext';
-import { useTeamPermission } from '@/renderer/pages/conversation/components/multiAgent/hooks/TeamPermissionContext';
 import { usePreviewContext } from '@/renderer/pages/conversation/Preview';
 import { warmupConversation } from '@/renderer/pages/conversation/utils/warmupConversation';
 import { buildAtFileInsertion, getActiveAtFileQuery, getAllAtFileQueries } from '@/renderer/utils/chat/atFileQuery';
@@ -238,7 +237,6 @@ const SendBox: React.FC<{
   const effectiveLockMultiLine = lockMultiLine && !isMobileCompact;
   const effectiveDefaultMultiLine = defaultMultiLine && !isMobileCompact;
   const conversationContext = useConversationContextSafe();
-  const teamPermission = useTeamPermission();
   const { t, i18n } = useTranslation();
   const [isLoading, setIsLoading] = useState(false);
   const [isSingleLine, setIsSingleLine] = useState(!effectiveDefaultMultiLine);
@@ -1062,9 +1060,8 @@ const SendBox: React.FC<{
 
     // Pre-warm worker bootstrap after focus stays for 1s (debounce).
     // Avoids triggering warmup for every conversation during rapid switching.
-    // In team mode, warmup is deferred to first user input via TeamPermissionContext.
     const cid = conversationContext?.conversation_id;
-    if (cid && !teamPermission && warmedConversationRef.current !== cid) {
+    if (cid && warmedConversationRef.current !== cid) {
       if (warmupTimerRef.current) clearTimeout(warmupTimerRef.current);
       warmupTimerRef.current = setTimeout(() => {
         warmedConversationRef.current = cid;

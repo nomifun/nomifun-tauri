@@ -7,7 +7,6 @@ import ChatTitleEditor from '@/renderer/pages/conversation/components/ChatTitleE
 import AutoWorkControl from '@/renderer/pages/conversation/components/AutoWorkControl';
 import IdmmControl from '@/renderer/pages/conversation/components/IdmmControl';
 import KnowledgeControl from '@/renderer/pages/conversation/components/KnowledgeControl';
-import AgentStatusStrip from '@/renderer/pages/conversation/components/multiAgent/AgentStatusStrip';
 import MobileWorkspaceOverlay from './MobileWorkspaceOverlay';
 import WorkspacePanelHeader, { DesktopWorkspaceToggle } from './WorkspacePanelHeader';
 import { useContainerWidth } from '@/renderer/pages/conversation/hooks/useContainerWidth';
@@ -46,7 +45,7 @@ interface ChatLayoutProps {
   headerExtra?: React.ReactNode;
   /**
    * Hide the session-capability controls baked into the header
-   * (AutoWork / IDMM / Knowledge) and the bottom AgentStatusStrip.
+   * (AutoWork / IDMM / Knowledge).
    * Used by surfaces that deliberately offer a reduced feature set — e.g. the
    * desktop companion chat tab. Defaults to false (full conversation page).
    */
@@ -74,8 +73,7 @@ interface ChatLayoutProps {
   isTemporaryWorkspace?: boolean;
   /**
    * Stable key for persisting the workspace collapse preference. Defaults to
-   * `conversation_id` for single chats; team mode passes `team_id` so the
-   * preference survives agent-tab switches.
+   * `conversation_id` for single chats.
    */
   workspacePreferenceKey?: string;
   /** Custom rename handler; when provided, replaces the default conversation.update rename flow */
@@ -320,13 +318,6 @@ const ChatLayoutInner: React.FC<ChatLayoutProps> = (props) => {
               <ArcoLayout.Content className='flex flex-col flex-1 bg-1 overflow-hidden'>
                 {props.children}
               </ArcoLayout.Content>
-              {/* Multi-agent subagent status strip (spec §6). Self-gates on the
-                  conversation's `extra.multi_agent.enabled` + `team_id`; renders
-                  nothing otherwise. Docked at the bottom of the chat column.
-                  Also suppressed wholesale when advanced controls are hidden. */}
-              {!props.hideAdvancedControls && conversation_id && (
-                <AgentStatusStrip conversation_id={conversation_id} />
-              )}
             </div>
             {/* Preview panel - conditionally rendered */}
             {isPreviewOpen && (

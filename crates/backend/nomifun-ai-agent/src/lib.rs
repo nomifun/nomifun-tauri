@@ -44,7 +44,10 @@ pub use capability::skill_manager::{
     build_system_instructions_with_skills_index, detect_skill_load_request, prepare_first_message,
     prepare_first_message_with_skills_index,
 };
-pub use factory::provider_config::{one_shot_completion, resolve_provider_config, streaming_completion, user_message};
+pub use factory::provider_config::{
+    one_shot_completion, resolve_provider_config, streaming_completion, streaming_completion_kinded,
+    user_message, DeltaKind,
+};
 pub use factory::{AgentFactoryDeps, CompanionPromptProvider, build_agent_factory};
 pub use idle_scanner::start_idle_scanner;
 #[cfg(feature = "browser-use")]

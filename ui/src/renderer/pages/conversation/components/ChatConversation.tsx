@@ -29,6 +29,9 @@ import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conve
 import { getConversationCreateErrorMessage } from '@/renderer/pages/conversation/utils/conversationCreateError';
 import NomiChat from '../platforms/nomi/NomiChat';
 import { useNomiModelSelection } from '../platforms/nomi/useNomiModelSelection';
+import { OrchestrationProvider } from '../orchestration/OrchestrationContext';
+import OrchestrationTopPanel from '../orchestration/OrchestrationTopPanel';
+import ConversationContentSwitcher from '../orchestration/ConversationContentSwitcher';
 import StarOfficeMonitorCard from '../platforms/openclaw/StarOfficeMonitorCard.tsx';
 // import SkillRuleGenerator from './components/SkillRuleGenerator'; // Temporarily hidden
 
@@ -160,12 +163,17 @@ const NomiConversationPanel: React.FC<{ conversation: NomiConversation; sliderTi
   const workspaceEnabled = Boolean(conversation.extra?.workspace);
   const { info: presetAssistantInfo } = usePresetAssistantInfo(conversation);
   const nomiAssistantId = resolveAssistantConfigId(conversation) ?? undefined;
+
   const chatLayoutProps = {
     title: conversation.name,
     siderTitle: sliderTitle,
     sider: <ChatSlider conversation={conversation} />,
     headerExtra: (
       <div className='flex items-center gap-8px'>
+        {/* 编排画布 (Option B): the orchestration canvas + run controls live in a
+            collapsible panel pinned to the TOP of the content area (no floating
+            overlay, no right-rail tab). The header keeps just the existing
+            capability controls (CronJobManager). */}
         <CronJobManager
           conversation_id={conversation.id}
           cron_job_id={conversation.extra?.cron_job_id as string | undefined}
@@ -182,21 +190,39 @@ const NomiConversationPanel: React.FC<{ conversation: NomiConversation; sliderTi
   };
 
   return (
-    <ChatLayout {...chatLayoutProps} conversation_id={conversation.id}>
-      <NomiChat
-        conversation_id={conversation.id}
-        workspace={conversation.extra.workspace}
-        modelSelection={modelSelection}
-        session_mode={conversation.extra?.session_mode}
-        cron_job_id={(conversation.extra as { cron_job_id?: string })?.cron_job_id}
-        loadedSkills={(conversation.extra as { skills?: string[] } | undefined)?.skills}
-        loadedMcpServers={(conversation.extra as { mcp_servers?: string[] } | undefined)?.mcp_servers}
-        loadedMcpStatuses={
-          (conversation.extra as { mcp_statuses?: IConversationMcpStatus[] } | undefined)?.mcp_statuses
-        }
-        agent_name={presetAssistantInfo?.name}
-      />
-    </ChatLayout>
+    <OrchestrationProvider conversation={conversation}>
+      <ChatLayout {...chatLayoutProps} conversation_id={conversation.id}>
+        {/* 编排画布:左右分屏 —— 主 agent 聊天在左(flex-1),编排画布作为右侧
+            可拖拽改宽 / 可收起的侧栏。OrchestrationTopPanel 在 run 不存在时渲染
+            null,普通会话看起来与从前一致。点右侧画布节点把 worker 转录投射进
+            左侧聊天区(默认 main)。 */}
+        <div className='flex flex-row flex-1 min-h-0'>
+          <div className='flex-1 min-h-0 flex flex-col'>
+            {/* Content-area projection (会话原生编排, F7): keeps NomiChat ALWAYS
+                mounted and just toggles its visibility, overlaying a clicked DAG
+                worker node's read-only transcript when a node is projected. Node
+                clicks in the right canvas pane project the worker transcript into
+                this chat region; default main. */}
+            <ConversationContentSwitcher>
+              <NomiChat
+                conversation_id={conversation.id}
+                workspace={conversation.extra.workspace}
+                modelSelection={modelSelection}
+                session_mode={conversation.extra?.session_mode}
+                cron_job_id={(conversation.extra as { cron_job_id?: string })?.cron_job_id}
+                loadedSkills={(conversation.extra as { skills?: string[] } | undefined)?.skills}
+                loadedMcpServers={(conversation.extra as { mcp_servers?: string[] } | undefined)?.mcp_servers}
+                loadedMcpStatuses={
+                  (conversation.extra as { mcp_statuses?: IConversationMcpStatus[] } | undefined)?.mcp_statuses
+                }
+                agent_name={presetAssistantInfo?.name}
+              />
+            </ConversationContentSwitcher>
+          </div>
+          <OrchestrationTopPanel />
+        </div>
+      </ChatLayout>
+    </OrchestrationProvider>
   );
 };
 

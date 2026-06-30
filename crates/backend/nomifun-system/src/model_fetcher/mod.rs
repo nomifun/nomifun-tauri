@@ -157,6 +157,7 @@ mod tests {
                 capabilities: "[]",
                 context_limit: None,
                 model_protocols: None,
+                model_descriptions: None,
                 model_enabled: None,
                 model_health: None,
                 bedrock_config: None,

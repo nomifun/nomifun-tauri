@@ -15,13 +15,13 @@ mod knowledge;
 mod mcp_server;
 mod message;
 mod oauth_token;
+mod orchestrator;
 mod provider;
 mod remote_agent;
 mod requirement;
 mod skill_tag;
 mod system_settings;
 mod tag_setting;
-mod team;
 mod terminal_session;
 mod user;
 mod webhook;
@@ -50,13 +50,16 @@ pub use knowledge::{
 pub use mcp_server::McpServerRow;
 pub use message::MessageRow;
 pub use oauth_token::OAuthTokenRow;
+pub use orchestrator::{
+    FleetMemberRow, FleetRow, OrchAssignmentRow, OrchRunRow, OrchRunTaskDepRow, OrchRunTaskRow,
+    OrchWorkspaceRow,
+};
 pub use provider::Provider;
 pub use remote_agent::RemoteAgentRow;
 pub use requirement::{RequirementRow, RequirementRowUpdate, RequirementTagRow};
 pub use skill_tag::{SkillTagRow, UpsertSkillTagParams};
 pub use system_settings::SystemSettings;
 pub use tag_setting::TagSettingRow;
-pub use team::{MailboxMessageRow, TeamAgentRow, TeamRow, TeamTaskDepRow, TeamTaskRow};
 pub use terminal_session::TerminalSessionRow;
 pub use user::User;
 pub use webhook::WebhookRow;

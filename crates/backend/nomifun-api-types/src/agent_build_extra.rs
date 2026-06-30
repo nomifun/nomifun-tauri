@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use crate::{
     BrowserMcpConfig, GatewayMcpConfig, GuideMcpConfig, KnowledgeMcpConfig, KnowledgeMountInfo,
     OpenMcpConfig, RequirementMcpConfig, ComputerMcpConfig,
-    TeamMcpStdioConfig,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,8 +66,6 @@ pub struct AcpBuildExtra {
     pub current_model_id: Option<String>,
     #[serde(default)]
     pub cron_job_id: Option<String>,
-    #[serde(default)]
-    pub team_mcp_stdio_config: Option<TeamMcpStdioConfig>,
     #[serde(default)]
     pub guide_mcp_config: Option<GuideMcpConfig>,
     /// Requirement MCP stdio bridge config. When `Some`, the ACP assembler
@@ -235,8 +232,6 @@ pub struct NomiBuildExtra {
     #[serde(default)]
     pub session_mode: Option<String>,
     #[serde(default)]
-    pub team_mcp_stdio_config: Option<TeamMcpStdioConfig>,
-    #[serde(default)]
     pub guide_mcp_config: Option<GuideMcpConfig>,
     #[serde(default)]
     pub mcp_server_ids: Option<Vec<String>>,
@@ -307,6 +302,17 @@ pub struct NomiBuildExtra {
     /// `AcpBuildExtra::knowledge_writeback_eagerness`.
     #[serde(default)]
     pub knowledge_writeback_eagerness: Option<String>,
+    /// Orchestration role marker. When `"lead"`, the conversation was created
+    /// from the 会话 entry with "auto/range" models selected: the nomi factory
+    /// injects a server-authored 编排主管 (orchestration lead) system prompt so
+    /// the conversation knows to decompose complex requirements via the
+    /// `nomi_run_create` tool. Client-supplied (the WebUI sets it on the new
+    /// conversation's extra); it ONLY composes a system prompt and never
+    /// self-authorizes tool access — the orchestration tools ride the
+    /// independently-gated desktop gateway. Any other value (or `None`, the
+    /// default for every existing conversation) is a no-op.
+    #[serde(default)]
+    pub orchestrator_role: Option<String>,
 }
 
 fn default_nomi_max_tokens() -> u32 {
@@ -365,5 +371,24 @@ mod tests {
     fn acp_build_extra_browser_mcp_config_defaults_none() {
         let extra = AcpBuildExtra::default();
         assert!(extra.browser_mcp_config.is_none());
+    }
+
+    /// Task 4: a conversation marked as the orchestration lead carries
+    /// `extra.orchestrator_role = "lead"`, which must deserialize onto
+    /// `NomiBuildExtra` so the nomi factory can inject the 主管 system prompt.
+    #[test]
+    fn nomi_build_extra_deserializes_orchestrator_role_lead() {
+        let extra: NomiBuildExtra =
+            serde_json::from_value(serde_json::json!({ "orchestrator_role": "lead" })).unwrap();
+        assert_eq!(extra.orchestrator_role.as_deref(), Some("lead"));
+    }
+
+    /// Absence of the marker (every existing conversation) leaves the field
+    /// `None`, so no 主管 prompt is injected — the field is purely additive.
+    #[test]
+    fn nomi_build_extra_orchestrator_role_defaults_none() {
+        let extra: NomiBuildExtra = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(extra.orchestrator_role.is_none());
+        assert!(NomiBuildExtra::default().orchestrator_role.is_none());
     }
 }

@@ -19,6 +19,14 @@
     "skillsMarketDesc": "按需搜索并调用社区 Skills，一次配置，所有Agent通用。",
     "skillsMarketDetails": "详情 >>"
   },
+  "orchestration": {
+    "panelTitle": "编排画布",
+    "startTitle": "发起智能编排",
+    "planning": "规划中…",
+    "collapseCanvas": "收起编排画布",
+    "expandCanvas": "展开编排画布",
+    "resizeCanvas": "调整画布宽度"
+  },
   "history": {
     "noHistory": "暂无对话历史",
     "deleteTitle": "删除",

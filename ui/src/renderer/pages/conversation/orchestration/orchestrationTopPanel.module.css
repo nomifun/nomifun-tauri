@@ -1,0 +1,113 @@
+/**
+ * @license
+ * Copyright 2025-2026 NomiFun (nomifun.com)
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * OrchestrationTopPanel — the orchestration canvas as a 左右分屏 RIGHT pane
+ * (设计稿:内容区 | 画布展开区 | 右侧边栏). Resizable width, collapsible to a thin
+ * strip. All colors go through CSS variables to protect the themes.
+ */
+
+/* The expanded canvas column ("画布展开区"). Sits to the right of the chat, left of
+ * the 项目 rail; width is set inline (resizable) and the column fills the content
+ * area height. The left border reads as the seam between chat and canvas. */
+.panel {
+  position: relative;
+  border-left: 1px solid var(--bg-3);
+  background: var(--bg-1);
+}
+
+/* Left-edge drag handle — straddles the seam; widens/narrows the pane. A hairline
+ * appears on hover/active so the affordance is discoverable without being noisy. */
+.resizeHandle {
+  position: absolute;
+  left: -3px;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  z-index: 2;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.resizeHandle::after {
+  content: '';
+  position: absolute;
+  left: 2px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: transparent;
+  transition: background 0.15s ease;
+}
+
+.resizeHandle:hover::after,
+.resizeHandle:active::after {
+  background: color-mix(in srgb, rgb(var(--primary-6)) 55%, transparent);
+}
+
+/* Header strip — always visible while expanded. */
+.header {
+  flex-shrink: 0;
+  padding: 8px 16px;
+  background: color-mix(in srgb, var(--bg-2) 60%, transparent);
+}
+
+/* Collapse toggle hit area. */
+.toggle {
+  color: var(--color-text-2);
+  border-radius: 8px;
+  padding: 2px 4px;
+  transition: color 0.15s ease;
+}
+
+.toggle:hover {
+  color: rgb(var(--primary-6));
+}
+
+/* Canvas body — fills the remaining column height so react-flow lays out and
+ * draws its own minimap; the chat column keeps `flex-1` on the left. */
+.body {
+  overflow: hidden;
+  border-top: 1px solid var(--bg-3);
+}
+
+/* Collapsed: a thin vertical strip on the right edge that reclaims the chat width.
+ * Click anywhere to re-expand; shows a chevron, a status dot, and a vertical title. */
+.collapsedStrip {
+  position: relative;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  width: 40px;
+  padding: 12px 0;
+  border-left: 1px solid var(--bg-3);
+  background: color-mix(in srgb, var(--bg-2) 60%, transparent);
+  color: var(--color-text-2);
+  cursor: pointer;
+  outline: none;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.collapsedStrip:hover {
+  color: rgb(var(--primary-6));
+  background: color-mix(in srgb, rgb(var(--primary-6)) 8%, var(--bg-1));
+}
+
+.collapsedDot {
+  width: 7px;
+  height: 7px;
+  border-radius: 9999px;
+  flex-shrink: 0;
+}
+
+.collapsedLabel {
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 2px;
+  color: var(--color-text-2);
+}

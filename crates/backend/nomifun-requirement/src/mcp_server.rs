@@ -12,8 +12,6 @@
 //! orchestrator can park an un-declared clean turn as `needs_review` instead of
 //! assuming success (`expects_verdict`).
 //!
-//! ## Shape (mirrors `nomifun-team::guide::GuideMcpServer`)
-//!
 //! This is the in-process HTTP half. ACP CLIs spawn a SEPARATE stdio process
 //! (`nomicore mcp-requirement-stdio`) that cannot share this process's
 //! `RequirementService`; it forwards each tool call back here as an

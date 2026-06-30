@@ -7,7 +7,6 @@
 
 import type { IConversationMcpStatus } from '@/common/config/storage';
 import { ConversationProvider } from '@/renderer/hooks/context/ConversationContext';
-import { useTeamPermission } from '@/renderer/pages/conversation/components/multiAgent/hooks/TeamPermissionContext';
 import FlexFullContainer from '@renderer/components/layout/FlexFullContainer';
 import MessageList from '@renderer/pages/conversation/Messages/MessageList';
 import PinnedPlan from '@renderer/pages/conversation/Messages/components/PinnedPlan';
@@ -56,10 +55,9 @@ const AcpChat: React.FC<{
 }) => {
   useMessageLstCache(conversation_id);
   usePendingConfirmationsRecovery(conversation_id);
-  const teamPermission = useTeamPermission();
   const { checkAndUpdateTitle } = useAutoTitle();
   const addOrUpdateMessage = useAddOrUpdateMessage();
-  const messageState = useAcpMessage(conversation_id, { skipWarmup: Boolean(teamPermission) });
+  const messageState = useAcpMessage(conversation_id, { skipWarmup: false });
   useAcpInitialMessage({
     conversation_id,
     backend,

@@ -29,8 +29,8 @@ interface Props {
  * 斜杠命令 / 命令队列 / 停止 / 清空上下文；右侧工作区文件树；按需文档预览），
  * 但针对桌面伙伴做三处约束（不污染共享会话页，靠既有 props 开关达成）：
  *
- *  1) 隐藏高级功能：AutoWork / IDMM / 知识库 / 多智能体协同
- *     —— ChatLayout 的 `hideAdvancedControls`（连带头部四控件 + 底部 AgentStatusStrip）。
+ *  1) 隐藏高级功能：AutoWork / IDMM / 知识库
+ *     —— ChatLayout 的 `hideAdvancedControls`（连带头部高级控件）。
  *  2) 锁定模型：不渲染会话页的 NomiModelSelector；`modelSelection` 锁定到会话行的模型
  *     —— 后端 `patch_companion` 已把会话行模型同步成 `profile.model`（唯一事实源），
  *     `onSelectModel` 空操作禁止 per-conversation 改写。模型配置入口仅保留头部

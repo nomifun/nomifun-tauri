@@ -72,6 +72,17 @@ export type GuidSendDeps = {
    * "conversation N is already running". */
   autoWork: AutoWorkDraftValue;
 
+  /** When true the homepage 智能编排 strip creates an orchestration LEAD nomi
+   * conversation (`extra.orchestrator_role: 'lead'` → backend
+   * LEAD_ORCHESTRATOR_PROMPT), stashes the goal as the first message, and
+   * navigates immediately. On landing the lead agent natively thinks and calls
+   * `nomi_run_create`, which links a multi-agent run back to this conversation
+   * (writing `extra.orchestrator_run_id` + broadcasting) so `useConversationRun`
+   * lights up the top-panel DAG. No FE adhoc-run creation, no blank wait.
+   * Mutually exclusive with AutoWork / preset-agent flows (the homepage strip
+   * enforces this). */
+  orchestrationMode: boolean;
+
   // Mention state reset
   setMentionOpen: React.Dispatch<React.SetStateAction<boolean>>;
   setMentionQuery: React.Dispatch<React.SetStateAction<string | null>>;
@@ -123,6 +134,7 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
     isGoogleAuth,
     applyAdvancedConfig,
     autoWork,
+    orchestrationMode,
     setMentionOpen,
     setMentionQuery,
     setMentionSelectorOpen,
@@ -135,6 +147,51 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
   const handleSend = useCallback(async () => {
     const isCustomWorkspace = !!dir;
     const finalWorkspace = dir || '';
+
+    // 智能编排(首页模式条)Direction B — create a nomi conversation set up as an
+    // ORCHESTRATION LEAD (`extra.orchestrator_role: 'lead'` → server-authored
+    // LEAD_ORCHESTRATOR_PROMPT), stash the user's goal as the first message, and
+    // navigate IMMEDIATELY. On landing the lead agent thinks natively (thinking
+    // bubbles), calls `nomi_run_create` (visible「查看步骤」tool card) to decompose
+    // the goal into a multi-agent run, and narrates — the whole startup/
+    // orchestration process is live in the native chat (no silent await, no blank
+    // wait). That tool call links the run to THIS conversation (lead_conv_id +
+    // extra.orchestrator_run_id + broadcast), so `useConversationRun` lights up the
+    // top-panel DAG on its own. No FE adhoc-run creation here.
+    if (orchestrationMode) {
+      const goal = input.trim();
+      if (!goal) return;
+      if (!current_model) {
+        Message.error(t('guid.modelRequired', { defaultValue: '请先选择模型' }));
+        return;
+      }
+      const conversation = await ipcBridge.conversation.create.invoke({
+        type: 'nomi',
+        name: goal.slice(0, 60),
+        model: current_model,
+        extra: {
+          workspace: finalWorkspace,
+          custom_workspace: isCustomWorkspace,
+          orchestrator_role: 'lead',
+          session_mode: selectedMode,
+        },
+      });
+      if (!conversation?.id) {
+        Message.error(t('conversation.createFailed', { defaultValue: '创建会话失败' }));
+        return;
+      }
+      await applyAdvancedConfig?.(conversation.id);
+      // Send the goal as the first turn — NomiSendBox consumes this on mount and
+      // starts a native turn. The lead agent then thinks + orchestrates natively;
+      // the live turn IS the visible startup process.
+      sessionStorage.setItem(
+        `nomi_initial_message_${conversation.id}`,
+        JSON.stringify({ input: goal, files: files.length > 0 ? files : undefined }),
+      );
+      emitter.emit('chat.history.refresh');
+      await navigate(`/conversation/${conversation.id}`);
+      return;
+    }
 
     // AutoWork entry (switch on + tag) creates the session and lets the backend
     // requirement loop drive it — it must NOT also send a first message, which
@@ -290,6 +347,7 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
         Message.warning(t('conversation.noModelConfigured'));
         return;
       }
+
       try {
         const conversation = await ipcBridge.conversation.create.invoke({
           type: 'nomi',
@@ -446,6 +504,7 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
     selectedMcpServerIds,
     applyAdvancedConfig,
     autoWork,
+    orchestrationMode,
     navigate,
     t,
   ]);

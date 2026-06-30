@@ -38,7 +38,6 @@ import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conve
 import { getConversationRuntimeWorkspaceErrorMessage } from '@/renderer/pages/conversation/utils/conversationCreateError';
 import { warmupConversation } from '@/renderer/pages/conversation/utils/warmupConversation';
 import { usePreviewContext } from '@/renderer/pages/conversation/Preview';
-import { useTeamPermission } from '@/renderer/pages/conversation/components/multiAgent/hooks/TeamPermissionContext';
 import { allSupportedExts } from '@/renderer/services/FileService';
 import { iconColors } from '@/renderer/styles/colors';
 import { emitter, useAddEventListener } from '@/renderer/utils/emitter';
@@ -128,8 +127,6 @@ const NomiSendBox: React.FC<{
   const { t } = useTranslation();
   const { checkAndUpdateTitle } = useAutoTitle();
   const { current_model } = modelSelection;
-  const teamPermission = useTeamPermission();
-  const propagateMode = teamPermission?.propagateMode;
 
   const { thought, running, hasHydratedRunningState, tokenUsage, setActiveMsgId, setWaitingResponse, resetState } =
     useNomiMessage(conversation_id, {
@@ -145,19 +142,15 @@ const NomiSendBox: React.FC<{
 
   const handleContentChange = useCallback(
     (val: string) => {
-      if (val && teamPermission) teamPermission.warmupSession();
       setContent(val);
     },
-    [teamPermission, setContent]
+    [setContent]
   );
 
   const [agentWarmed, setAgentWarmed] = useState(false);
   const prepareRuntimeSync = useCallback(async () => {
-    if (teamPermission) {
-      await teamPermission.warmupSession();
-    }
     await warmupConversation(conversation_id);
-  }, [conversation_id, teamPermission]);
+  }, [conversation_id]);
 
   useEffect(() => {
     void getConversationOrNull(conversation_id).then((res) => {
@@ -223,7 +216,6 @@ const NomiSendBox: React.FC<{
 
   const executeCommand = useCallback(
     async ({ input, files }: Pick<ConversationCommandQueueItem, 'input' | 'files'>) => {
-      if (teamPermission) await teamPermission.warmupSession();
       if (!current_model?.use_model) {
         Message.warning(t('conversation.chat.noModelSelected'));
         throw new Error('No model selected');
@@ -501,14 +493,13 @@ const NomiSendBox: React.FC<{
         await ipcBridge.acpConversation.setMode.invoke({ conversation_id, mode });
         setCurrentMode(mode);
         void savePreferredMode('nomi', mode);
-        propagateMode?.(mode);
         Message.success(t('agentMode.switchSuccess'));
       } catch (error) {
         console.error('[NomiSendBox] Failed to switch mode via sheet:', error);
         Message.error(t('agentMode.switchFailed'));
       }
     },
-    [conversation_id, currentMode, prepareRuntimeSync, propagateMode, t]
+    [conversation_id, currentMode, prepareRuntimeSync, t]
   );
 
   // Sync currentMode from backend when the sheet first opens / conversation switches
@@ -799,7 +790,6 @@ const NomiSendBox: React.FC<{
                 modeLabelFormatter={(mode) => t(`agentMode.${mode.value}`, { defaultValue: mode.label })}
                 compactLabelPrefix={t('agentMode.permission')}
                 hideCompactLabelPrefixOnMobile
-                onModeChanged={propagateMode}
                 beforeRuntimeSync={prepareRuntimeSync}
               />
             </div>

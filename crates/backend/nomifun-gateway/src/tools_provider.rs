@@ -21,6 +21,13 @@ pub(crate) struct ProviderSummary {
     /// Effective model ids: the `models` JSON array filtered by the
     /// per-model `model_enabled` map (absent entry = enabled).
     pub models: Vec<String>,
+    /// User-authored per-model descriptions (`model_id → description`), decoded
+    /// from the provider's `model_descriptions` JSON. Used by the
+    /// caps_orchestrator layer to (a) map an assistant's preferred model NAME to
+    /// a `(provider_id, model)` in range and (b) fill `FleetMember::description`
+    /// on the bare model-range members so the planner sees a description for
+    /// both kinds of member. Empty when none are configured.
+    pub model_descriptions: std::collections::HashMap<String, String>,
 }
 
 pub(crate) fn summarize_provider(row: &nomifun_db::models::Provider) -> ProviderSummary {
@@ -34,12 +41,20 @@ pub(crate) fn summarize_provider(row: &nomifun_db::models::Provider) -> Provider
         .into_iter()
         .filter(|m| enabled_map.get(m).and_then(Value::as_bool).unwrap_or(true))
         .collect();
+    // Decode the user-authored per-model descriptions fail-soft (the column is
+    // NOT NULL DEFAULT '{}'; a malformed value degrades to no descriptions).
+    let model_descriptions: std::collections::HashMap<String, String> = row
+        .model_descriptions
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
     ProviderSummary {
         id: row.id.clone(),
         name: row.name.clone(),
         platform: row.platform.clone(),
         enabled: row.enabled,
         models,
+        model_descriptions,
     }
 }
 
@@ -233,6 +248,7 @@ mod tests {
             platform: "openai".to_owned(),
             enabled,
             models: models.iter().map(|m| m.to_string()).collect(),
+            model_descriptions: std::collections::HashMap::new(),
         }
     }
 
@@ -325,6 +341,7 @@ mod tests {
             capabilities: "[]".into(),
             context_limit: None,
             model_protocols: None,
+            model_descriptions: None,
             model_enabled: Some(r#"{"b": false}"#.into()),
             model_health: None,
             bedrock_config: None,

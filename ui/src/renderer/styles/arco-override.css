@@ -334,6 +334,17 @@ body[arco-theme='dark'] .sider-soft-popover .arco-popover-arrow {
   transform: translateY(-50%);
 }
 
+/* Click-through confirmation toast. Arco's `.arco-message-wrapper` is already
+   `pointer-events: none` (the full-width top strip passes clicks through), but
+   each `.arco-message` box re-enables `pointer-events: auto`. For toasts that can
+   overlap actionable UI — e.g. the orchestration node banner's 重跑 / 采用 /
+   返回 main buttons — we re-disable it on the box so the visual feedback stays
+   but the buttons behind remain clickable while it is on screen. Compound
+   selector (both classes on the same node) beats Arco's `.arco-message`. */
+.nomifun-message-passthrough.arco-message {
+  pointer-events: none !important;
+}
+
 /* Light mode */
 .arco-message-success {
   background: linear-gradient(270deg, #f9fff2 0%, #d2ffd9 100%) !important;

@@ -36,7 +36,6 @@ import {
 import { usePreviewContext } from '@/renderer/pages/conversation/Preview';
 import { getConversationRuntimeWorkspaceErrorMessage } from '@/renderer/pages/conversation/utils/conversationCreateError';
 import { warmupConversation } from '@/renderer/pages/conversation/utils/warmupConversation';
-import { useTeamPermission } from '@/renderer/pages/conversation/components/multiAgent/hooks/TeamPermissionContext';
 import { allSupportedExts } from '@/renderer/services/FileService';
 import { iconColors } from '@/renderer/styles/colors';
 import { emitter, useAddEventListener } from '@/renderer/utils/emitter';
@@ -108,7 +107,6 @@ const AcpSendBox: React.FC<{
     resetState,
     hasThinkingMessage,
     slashCommands,
-    fetchSlashCommands,
     processingStartedAt: turnProcessingStartedAt,
   } = messageState;
   // ThoughtDisplay only stands in while there is no inline thinking bubble yet.
@@ -116,10 +114,7 @@ const AcpSendBox: React.FC<{
   const hydratedProcessingStartedAt = useProcessingStartedAt(conversation_id, thoughtRunning);
   const processingStartedAt = turnProcessingStartedAt ?? hydratedProcessingStartedAt;
   const { t } = useTranslation();
-  const teamPermission = useTeamPermission();
-  // In team mode, all agents show the permission mode selector (members don't propagate)
   const showModeSelector = true;
-  const isLeaderInTeam = teamPermission && conversation_id === Number(teamPermission.leaderConversationId);
   const { checkAndUpdateTitle } = useAutoTitle();
   const { atPath, uploadFile, setAtPath, setUploadFile, content, setContent } = useSendBoxDraft(conversation_id);
   const layout = useLayoutContext();
@@ -136,11 +131,8 @@ const AcpSendBox: React.FC<{
   const [isMobileSheetOpen, setIsMobileSheetOpen] = useState(false);
   const [currentMode, setCurrentMode] = useState<string | undefined>(session_mode);
   const prepareRuntimeSync = useCallback(async () => {
-    if (teamPermission) {
-      await teamPermission.warmupSession();
-    }
     await warmupConversation(conversation_id);
-  }, [conversation_id, teamPermission]);
+  }, [conversation_id]);
 
   // Drive the mobile sheet's model entry off the same source AcpModelSelector uses
   const {
@@ -184,36 +176,20 @@ const AcpSendBox: React.FC<{
         await ipcBridge.acpConversation.setMode.invoke({ conversation_id, mode });
         setCurrentMode(mode);
         if (backend) void savePreferredMode(backend, mode);
-        if (isLeaderInTeam) teamPermission?.propagateMode?.(mode);
         Message.success(t('agentMode.switchSuccess'));
       } catch (error) {
         console.error('[AcpSendBox] Failed to switch mode via sheet:', error);
         Message.error(t('agentMode.switchFailed'));
       }
     },
-    [backend, conversation_id, currentMode, isLeaderInTeam, prepareRuntimeSync, t, teamPermission]
+    [backend, conversation_id, currentMode, prepareRuntimeSync, t]
   );
-
-  // In team mode, warmup the agent then fetch slash commands
-  useEffect(() => {
-    if (!teamPermission) return;
-    void teamPermission
-      .warmupSession()
-      .then(() => warmupConversation(conversation_id))
-      .then(() => {
-        fetchSlashCommands();
-      })
-      .catch((error) => {
-        Message.error(getConversationRuntimeWorkspaceErrorMessage(error, t));
-      });
-  }, [teamPermission, conversation_id, fetchSlashCommands, t]);
 
   const handleContentChange = useCallback(
     (val: string) => {
-      if (val && teamPermission) teamPermission.warmupSession();
       setContent(val);
     },
-    [teamPermission, setContent]
+    [setContent]
   );
   const { setSendBoxHandler } = usePreviewContext();
 
@@ -256,7 +232,6 @@ const AcpSendBox: React.FC<{
 
   const executeCommand = useCallback(
     async ({ input, files }: Pick<ConversationCommandQueueItem, 'input' | 'files'>) => {
-      if (teamPermission) await teamPermission.warmupSession();
       const displayMessage = buildDisplayMessage(input, files, workspacePath || '');
 
       setAiProcessing(true);
@@ -653,7 +628,6 @@ Please check your local CLI tool authentication status`,
                 modeLabelFormatter={(mode) => t(`agentMode.${mode.value}`, { defaultValue: mode.label })}
                 compactLabelPrefix={t('agentMode.permission')}
                 hideCompactLabelPrefixOnMobile
-                onModeChanged={isLeaderInTeam ? teamPermission?.propagateMode : undefined}
                 beforeRuntimeSync={prepareRuntimeSync}
               />
             )}

@@ -9,6 +9,7 @@
   "selectAssistantHint": "选择一位助手开始任务",
   "agentSwitcherLabel": "Agent",
   "switchedToAgent": "已切换到 {{agent}}",
+  "modelRequired": "请先选择模型",
   "workspace": {
     "workInProject": "在项目中工作",
     "optional": "可选",
@@ -37,6 +38,7 @@
   "entry": {
     "free": "自由发挥",
     "summon": "召唤助手",
+    "orchestrate": "智能编排",
     "skills": "使用 Skills",
     "skillsActive": "使用 Skills · 已启用",
     "skillsAdjustAria": "调整本次会话已启用的 {{count}} 个 Skills",

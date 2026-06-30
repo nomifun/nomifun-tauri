@@ -89,91 +89,94 @@ const GuidModelSelector: React.FC<GuidModelSelectorProps> = ({
   }, [acpSelectedLabel, currentAcpCachedModelInfo?.current_model_id, defaultModelLabel, selectedAcpModel]);
 
   if (isGeminiMode) {
+    const hasModels = !!enabledModelList && enabledModelList.length > 0;
+
+    // Per-model health dot color.
+    const healthDotColor = (providerId: string, modelName: string): string | null => {
+      const matchedProvider = modelConfig?.find((p) => p.id === providerId);
+      const healthStatus = matchedProvider?.model_health?.[modelName]?.status || 'unknown';
+      if (healthStatus === 'unknown') return null;
+      return healthStatus === 'healthy' ? 'bg-green-500' : healthStatus === 'unhealthy' ? 'bg-red-500' : 'bg-gray-400';
+    };
+
+    const addModelRow = (
+      <div
+        role='button'
+        tabIndex={0}
+        className='flex items-center gap-6px px-12px py-8px text-12px text-t-secondary cursor-pointer hover:bg-2 rounded-4px'
+        onClick={() => navigate('/settings/model')}
+      >
+        <Plus theme='outline' size='12' />
+        <span>{t('settings.addModel')}</span>
+      </div>
+    );
+
+    // Single-select model menu — provider-grouped.
+    const singleSelectMenu = (
+      <Menu selectedKeys={current_model ? [current_model.id + current_model.use_model] : []}>
+        {[
+          ...enabledModelList.map((provider) => {
+            const available_models = getAvailableModels(provider);
+            if (available_models.length === 0) return null;
+            return (
+              <Menu.ItemGroup title={provider.name} key={provider.id}>
+                {available_models.map((modelName) => {
+                  const dot = healthDotColor(provider.id, modelName);
+                  return (
+                    <Menu.Item
+                      key={provider.id + modelName}
+                      className={
+                        (current_model?.id ?? '') + (current_model?.use_model ?? '') === provider.id + modelName
+                          ? '!bg-2'
+                          : ''
+                      }
+                      onClick={() => {
+                        setCurrentModel({ ...provider, use_model: modelName }).catch((error) => {
+                          console.error('Failed to set current model:', error);
+                        });
+                      }}
+                    >
+                      <div className='flex items-center gap-8px w-full'>
+                        {dot && <div className={`w-6px h-6px rounded-full shrink-0 ${dot}`} />}
+                        <span>{modelName}</span>
+                      </div>
+                    </Menu.Item>
+                  );
+                })}
+              </Menu.ItemGroup>
+            );
+          }),
+          <Menu.Item key='add-model' className='text-12px text-t-secondary' onClick={() => navigate('/settings/model')}>
+            <Plus theme='outline' size='12' />
+            {t('settings.addModel')}
+          </Menu.Item>,
+        ]}
+      </Menu>
+    );
+
+    const body: React.ReactNode = !hasModels ? (
+      // No models configured — empty + add-model affordance.
+      <div className='py-4px'>
+        <div className='px-12px py-12px text-t-secondary text-14px text-center'>{t('settings.noAvailableModels')}</div>
+        {addModelRow}
+      </div>
+    ) : (
+      singleSelectMenu
+    );
+
     return (
       <Dropdown
-        trigger='hover'
+        trigger='click'
         droplist={
-          <Menu selectedKeys={current_model ? [current_model.id + current_model.use_model] : []}>
-            {!enabledModelList || enabledModelList.length === 0
-              ? [
-                  <Menu.Item
-                    key='no-models'
-                    className='px-12px py-12px text-t-secondary text-14px text-center flex justify-center items-center'
-                    disabled
-                  >
-                    {t('settings.noAvailableModels')}
-                  </Menu.Item>,
-                  <Menu.Item
-                    key='add-model'
-                    className='text-12px text-t-secondary'
-                    onClick={() => navigate('/settings/model')}
-                  >
-                    <Plus theme='outline' size='12' />
-                    {t('settings.addModel')}
-                  </Menu.Item>,
-                ]
-              : [
-                  ...(enabledModelList || []).map((provider) => {
-                    const available_models = getAvailableModels(provider);
-                    if (available_models.length === 0) return null;
-                    return (
-                      <Menu.ItemGroup title={provider.name} key={provider.id}>
-                        {available_models.map((modelName) => {
-                          // 获取模型健康状态
-                          const matchedProvider = modelConfig?.find((p) => p.id === provider.id);
-                          const healthStatus = matchedProvider?.model_health?.[modelName]?.status || 'unknown';
-                          const healthColor =
-                            healthStatus === 'healthy'
-                              ? 'bg-green-500'
-                              : healthStatus === 'unhealthy'
-                                ? 'bg-red-500'
-                                : 'bg-gray-400';
-
-                          return (
-                            <Menu.Item
-                              key={provider.id + modelName}
-                              className={
-                                (current_model?.id ?? '') + (current_model?.use_model ?? '') === provider.id + modelName ? '!bg-2' : ''
-                              }
-                              onClick={() => {
-                                setCurrentModel({ ...provider, use_model: modelName }).catch((error) => {
-                                  console.error('Failed to set current model:', error);
-                                });
-                              }}
-                            >
-                              <div className='flex items-center gap-8px w-full'>
-                                {healthStatus !== 'unknown' && (
-                                  <div className={`w-6px h-6px rounded-full shrink-0 ${healthColor}`} />
-                                )}
-                                <span>{modelName}</span>
-                              </div>
-                            </Menu.Item>
-                          );
-                        })}
-                      </Menu.ItemGroup>
-                    );
-                  }),
-                  <Menu.Item
-                    key='add-model'
-                    className='text-12px text-t-secondary'
-                    onClick={() => navigate('/settings/model')}
-                  >
-                    <Plus theme='outline' size='12' />
-                    {t('settings.addModel')}
-                  </Menu.Item>,
-                ]}
-          </Menu>
+          <div className='min-w-260px max-w-340px bg-1 rounded-8px overflow-hidden'>
+            {body}
+          </div>
         }
       >
-        <Button
-          className={'sendbox-model-btn guid-config-btn'}
-          shape='round'
-          size='small'
-          data-testid='guid-model-selector'
-        >
+        <Button className={'sendbox-model-btn guid-config-btn'} shape='round' size='small' data-testid='guid-model-selector'>
           <span className='flex items-center gap-6px min-w-0'>
             <Brain theme='outline' size='14' fill={iconColors.secondary} className='shrink-0' />
-            <span>{geminiButtonLabel}</span>
+            <span className='truncate'>{geminiButtonLabel}</span>
             <Down theme='outline' size='12' fill={iconColors.secondary} className='shrink-0' />
           </span>
         </Button>

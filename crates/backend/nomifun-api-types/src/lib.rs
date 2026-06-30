@@ -19,6 +19,7 @@ mod knowledge;
 mod lifecycle;
 mod mcp;
 mod office;
+mod orchestrator;
 mod provider;
 mod remote_agent;
 mod requirement;
@@ -28,7 +29,6 @@ mod serde_util;
 mod shell;
 mod skill;
 mod system;
-mod team;
 mod team_mcp;
 mod terminal;
 mod webhook;
@@ -143,6 +143,14 @@ pub use office::{
     PreviewUrlResponse, SaveSnapshotRequest, SnapshotContentResponse, StarOfficeDetectResponse,
     StartPreviewRequest, StopPreviewRequest,
 };
+pub use orchestrator::{
+    Assignment, CapabilityProfile, CreateAdhocRunRequest, CreateFleetRequest, CreateRunRequest,
+    CreateWorkspaceRequest, Fleet, FleetMember, FleetMemberInput, MemberConstraints, ModelRange,
+    ModelRef, OrchWorkspace, PlannedDag, PlannedTask, ReassignRequest, ReplanRequest, Run,
+    RunDetail, RunRenameRequest, RunTask, RunTaskDep, SteerRequest, TaskProfile,
+    TaskSpecUpdateRequest, UpdateFleetRequest, UpdateWorkspaceRequest, derive_capability,
+};
+pub use orchestrator::AdjustRunRequest;
 pub use provider::{
     BedrockAuthMethod, BedrockConfig, CreateProviderRequest, DetectProtocolRequest,
     DetectedProtocol, DetectionSuggestion, FetchModelsAnonymousRequest, FetchModelsRequest,
@@ -183,16 +191,9 @@ pub use system::{
     ClientPreferencesResponse, SystemSettingsResponse, UpdateClientPreferencesRequest,
     UpdateSettingsRequest,
 };
-pub use team::{
-    AddAgentRequest, CreateTeamRequest, RenameAgentRequest, RenameTeamRequest,
-    SendAgentMessageRequest, SendTeamMessageRequest, TeamAgentInput, TeamAgentRemovedPayload,
-    TeamAgentRenamedPayload, TeamAgentResponse, TeamAgentShutdownPayload, TeamAgentSpawnedPayload,
-    TeamAgentStatusPayload, TeamListResponse, TeamMcpPhase, TeamMcpStatusPayload, TeamResponse,
-    TeammateMessagePayload,
-};
 pub use team_mcp::{
     BrowserMcpConfig, ComputerMcpConfig, GatewayMcpConfig, GuideMcpConfig, KnowledgeMcpConfig,
-    OpenMcpConfig, RequirementMcpConfig, TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig,
+    OpenMcpConfig, RequirementMcpConfig,
 };
 pub use terminal::{
     CreateTerminalRequest, TerminalExitEvent, TerminalInputRequest, TerminalOutputEvent,

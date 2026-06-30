@@ -232,6 +232,7 @@ mod tests {
             capabilities: "[]".into(),
             context_limit: None,
             model_protocols: None,
+            model_descriptions: None,
             model_enabled: if enabled_map.is_empty() {
                 None
             } else {

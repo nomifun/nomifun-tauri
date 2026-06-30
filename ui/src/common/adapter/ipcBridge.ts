@@ -74,16 +74,23 @@ import type {
 } from '../types/provider/providerApi';
 import type { SpeechToTextRequest, SpeechToTextResult } from '../types/provider/speech';
 import type {
-  ITeamAgentRemovedEvent,
-  ITeamAgentRenamedEvent,
-  ITeamAgentSpawnedEvent,
-  ITeamAgentStatusEvent,
-  ITeamCreatedEvent,
-  ITeamListChangedEvent,
-  ITeamTeammateMessageEvent,
-  TTeam,
-  TeamAgent,
-} from '../types/team/teamTypes';
+  TAdjustRunRequest,
+  TCreateAdhocRun,
+  TReassign,
+  TReplanRequest,
+  TRun,
+  TRunDetail,
+  TSteer,
+  TTaskSpecUpdate,
+} from '../types/orchestrator/orchestratorTypes';
+import type {
+  TOrchRunCompletedEvent,
+  TOrchRunLeadThinkingEvent,
+  TOrchRunPlanUpdatedEvent,
+  TOrchRunStatusEvent,
+  TOrchTaskAssignedEvent,
+  TOrchTaskStatusEvent,
+} from '../types/orchestrator/orchestratorEvents';
 import type {
   AutoUpdateStatus,
   UpdateCheckRequest,
@@ -107,14 +114,6 @@ import {
   wsMappedEmitter,
 } from './httpBridge';
 import { fromApiSearchResult, type ApiMessageSearchItem } from './searchMapper';
-import type { IAddTeamAgentParams, ICreateTeamParams } from './teamMapper';
-import {
-  fromBackendAgent,
-  fromBackendTeam,
-  fromBackendTeamList,
-  fromBackendTeamOptional,
-  toBackendAgent,
-} from './teamMapper';
 import { fromBackendCompareResult, type RawCompareResult } from './fileSnapshotMapper';
 import {
   absoluteToRelativePath,
@@ -1722,6 +1721,10 @@ export interface ICreateConversationParams {
     context?: string;
     context_file_name?: string;
     preset_rules?: string;
+    /** Orchestration lead role. When `'lead'`, the backend composes the
+     *  LEAD_ORCHESTRATOR_PROMPT so the agent decomposes complex goals via
+     *  `nomi_run_create` (homepage 智能编排 entry). Prompt-only; never grants tools. */
+    orchestrator_role?: string;
     /** Transient: preset opt-in skills. Consumed by backend create handler
      *  and stripped before persistence. */
     preset_enabled_skills?: string[];
@@ -2208,63 +2211,6 @@ export const hub = {
   checkUpdates: httpPost<{ name: string }[], void>('/api/hub/check-updates'),
   update: httpPost<void, { name: string }>('/api/hub/update'),
   onStateChanged: wsEmitter<{ name: string; status: HubExtensionStatus; error?: string }>('hub.state-changed'),
-};
-
-// ---------------------------------------------------------------------------
-// Team Mode API — routed to /api/teams/*
-// ---------------------------------------------------------------------------
-
-export type { IAddTeamAgentParams, ICreateTeamParams } from './teamMapper';
-
-export const team = {
-  create: withResponseMap(
-    httpPost<TTeam, ICreateTeamParams>('/api/teams', (p) => ({
-      name: p.name,
-      agents: p.agents.map(toBackendAgent),
-      ...(p.workspace ? { workspace: p.workspace } : {}),
-    })),
-    fromBackendTeam
-  ),
-  list: withResponseMap(
-    httpGet<TTeam[], { user_id: string }>((p) => `/api/teams?user_id=${encodeURIComponent(p.user_id)}`),
-    fromBackendTeamList
-  ),
-  get: withResponseMap(
-    httpGet<TTeam | null, { id: string }>((p) => `/api/teams/${p.id}`),
-    fromBackendTeamOptional
-  ),
-  remove: httpDelete<void, { id: string }>((p) => `/api/teams/${p.id}`),
-  addAgent: withResponseMap(
-    httpPost<TeamAgent, IAddTeamAgentParams>(
-      (p) => `/api/teams/${p.team_id}/agents`,
-      (p) => toBackendAgent(p.agent)
-    ),
-    fromBackendAgent
-  ),
-  removeAgent: httpDelete<void, { team_id: string; slot_id: string }>(
-    (p) => `/api/teams/${p.team_id}/agents/${p.slot_id}`
-  ),
-  stop: httpDelete<void, { team_id: string }>((p) => `/api/teams/${p.team_id}/session`),
-  ensureSession: httpPost<void, { team_id: string }>((p) => `/api/teams/${p.team_id}/session`),
-  renameAgent: httpPatch<void, { team_id: string; slot_id: string; new_name: string }>(
-    (p) => `/api/teams/${p.team_id}/agents/${p.slot_id}/name`,
-    (p) => ({ name: p.new_name })
-  ),
-  renameTeam: httpPatch<void, { id: string; name: string }>(
-    (p) => `/api/teams/${p.id}/name`,
-    (p) => ({ name: p.name })
-  ),
-  setSessionMode: httpPost<void, { team_id: string; session_mode: string }>(
-    (p) => `/api/teams/${p.team_id}/session-mode`,
-    (p) => ({ session_mode: p.session_mode })
-  ),
-  agentStatusChanged: wsEmitter<ITeamAgentStatusEvent>('team.agent.status'),
-  agentSpawned: wsEmitter<ITeamAgentSpawnedEvent>('team.agent.spawned'),
-  agentRemoved: wsEmitter<ITeamAgentRemovedEvent>('team.agent.removed'),
-  agentRenamed: wsEmitter<ITeamAgentRenamedEvent>('team.agent.renamed'),
-  listChanged: wsEmitter<ITeamListChangedEvent>('team.list-changed'),
-  created: wsEmitter<ITeamCreatedEvent>('team.created'),
-  teammateMessage: wsEmitter<ITeamTeammateMessageEvent>('team.teammate.message'),
 };
 
 // ── Requirements Platform (需求平台) ─────────────────────────────────
@@ -2763,6 +2709,129 @@ export const webhook = {
     (p) => `/api/tags/${encodeURIComponent(p.tag)}/settings`,
     (p) => p.updates
   ),
+};
+
+// ─────────────────────────── 智能编排 (Orchestration) ───────────────────────────
+// REST client for fleets + orchestration workspaces, routed to
+// /api/orchestrator/*. Mirrors the plain-REST webhook block above; IDs are
+// strings (`fleet_…` / `ows_…`).
+
+export const orchestrator = {
+  runs: {
+    // Every run owned by the current user (all workspaces + ad-hoc/workspace-less
+    // runs), newest first — the read path for the read-only Run-history library.
+    listMine: httpGet<TRun[], void>('/api/orchestrator/runs'),
+    // Create an ad-hoc run straight from the「智能编排」Tab's structured form
+    // (no workspace / pre-built fleet — the fleet is synthesized from
+    // `model_range`). Backend defaults autonomy to `interactive`, so the run
+    // parks at `awaiting_plan_approval` until approved. Body matches the wire
+    // shape verbatim, so no mapBody is needed.
+    createAdhoc: httpPost<TRun, TCreateAdhocRun>('/api/orchestrator/runs/adhoc'),
+    get: httpGet<TRunDetail, { id: string }>((p) => `/api/orchestrator/runs/${p.id}`),
+    // Delete a run (owner-scoped). The backend stops any live engine loop first,
+    // then deletes the row — the schema's ON DELETE CASCADE FKs sweep out the
+    // run's tasks/deps/assignments. 403 if the run is owned by another user.
+    remove: httpDelete<void, { id: string }>((p) => `/api/orchestrator/runs/${p.id}`),
+    // Rename a run = change its goal (owner-scoped, PATCH). Body is { goal }.
+    rename: httpPatch<void, { id: string; goal: string }>(
+      (p) => `/api/orchestrator/runs/${p.id}`,
+      (p) => ({ goal: p.goal })
+    ),
+    // Re-plan a run IN PLACE (owner-scoped, POST). Clears the run's old task graph
+    // and re-decomposes against the (optionally) edited goal / model_range /
+    // autonomy / pinned_roles — every edit field is optional (omitted = keep
+    // current). Returns the re-planned run. The backend stops any live engine
+    // loop, applies the edits, clears the old plan, then re-plans + re-arms the
+    // engine for non-`interactive` runs (`interactive` re-parks at approval).
+    replan: httpPost<TRun, { id: string } & TReplanRequest>(
+      (p) => `/api/orchestrator/runs/${p.id}/replan`,
+      ({ id: _id, ...body }) => body
+    ),
+    // Conversation-driven intelligent re-adjust IN PLACE (owner-scoped, POST):
+    // the lead model judges, per task, whether to KEEP the completed work or
+    // re-decompose, and the backend RECONCILEs the run to the result — preserving
+    // the kept tasks + their output (unlike `replan`, which wipes the whole plan),
+    // dropping the un-kept ones, inserting + routing the new tasks, and rebuilding
+    // the deps. Returns the (re-activated) run. Rejected (400) for a blank intent
+    // or a run with any running task (pause first). The backend runs the whole
+    // reconcile + terminal re-activation under the run's per-run lock and re-arms
+    // the engine for a re-activated run, mirroring `rerunTask`.
+    adjustRun: httpPost<TRun, { run_id: string } & TAdjustRunRequest>(
+      (p) => `/api/orchestrator/runs/${p.run_id}/adjust`,
+      ({ run_id: _run_id, ...body }) => body
+    ),
+    cancel: httpPost<void, { id: string }>(
+      (p) => `/api/orchestrator/runs/${p.id}/cancel`,
+      () => undefined
+    ),
+    approve: httpPost<void, { id: string }>(
+      (p) => `/api/orchestrator/runs/${p.id}/approve`,
+      () => undefined
+    ),
+    pause: httpPost<void, { id: string }>(
+      (p) => `/api/orchestrator/runs/${p.id}/pause`,
+      () => undefined
+    ),
+    resume: httpPost<void, { id: string }>(
+      (p) => `/api/orchestrator/runs/${p.id}/resume`,
+      () => undefined
+    ),
+    reassign: httpPut<void, { run_id: string; task_id: string; updates: TReassign }>(
+      (p) => `/api/orchestrator/runs/${p.run_id}/tasks/${p.task_id}/assignment`,
+      (p) => p.updates
+    ),
+    steer: httpPost<void, { run_id: string; task_id: string; updates: TSteer }>(
+      (p) => `/api/orchestrator/runs/${p.run_id}/tasks/${p.task_id}/steer`,
+      (p) => p.updates
+    ),
+    // Re-execute a single node (UC-2a): resets the task + its settled downstream
+    // dependents to pending and re-activates a terminal run, so the engine re-drives
+    // it. Rejected (400) if the task is currently running (pause/stop first).
+    rerunTask: httpPost<void, { run_id: string; task_id: string }>(
+      (p) => `/api/orchestrator/runs/${p.run_id}/tasks/${p.task_id}/rerun`,
+      () => undefined
+    ),
+    // Adopt the node's worker conversation's CURRENT output as the node's product
+    // (UC-2c「采用为该节点产出」): reads the worker's latest assistant text into the
+    // node, marks it done, and re-activates a terminal run so downstream unblocks.
+    // For a failed/stuck node the user kept chatting in the content area. Rejected
+    // (400) if the run is running, or the node has no worker conversation / no
+    // output yet.
+    adoptTaskResult: httpPost<void, { run_id: string; task_id: string }>(
+      (p) => `/api/orchestrator/runs/${p.run_id}/tasks/${p.task_id}/adopt`,
+      () => undefined
+    ),
+    // Fine-tune a node's intent/prompt (UC-2a): replace the task's spec. Rejected
+    // (400) for a blank spec or a running task; a later rerun uses the new spec.
+    updateTaskSpec: httpPatch<void, { run_id: string; task_id: string; updates: TTaskSpecUpdate }>(
+      (p) => `/api/orchestrator/runs/${p.run_id}/tasks/${p.task_id}/spec`,
+      (p) => p.updates
+    ),
+    // List one directory level under a run's working directory (read-only). Root
+    // is the run's `work_dir` (server resolves the actual dir); the client passes
+    // an ABSOLUTE path (root or a node's fullPath) which is mapped to a
+    // workspace-relative `path`. Mirrors terminal/conversation `getWorkspace` so
+    // the shared WorkspaceRailBody tree source consumes it unchanged (IDirOrFile[]).
+    getWorkspace: {
+      provider: () => {},
+      invoke: (async (p: { id: string; work_dir: string; path: string; search?: string }) => {
+        const rel = absoluteToRelativePath(p.path, p.work_dir);
+        const url = `/api/orchestrator/runs/${p.id}/workspace?path=${encodeURIComponent(rel)}${p.search ? `&search=${encodeURIComponent(p.search)}` : ''}`;
+        const raw = await httpRequest<Array<{ name: string; type: string }>>('GET', url);
+        return fromBackendWorkspaceList(raw, p.work_dir, rel);
+      }) as (p: { id: string; work_dir: string; path: string; search?: string }) => Promise<IDirOrFile[]>,
+    },
+  },
+  // Realtime WS events from the run engine (OrchestratorRunEventEmitter). Wire
+  // names verbatim from orchestratorEvents.ts.
+  runEvents: {
+    statusChanged: wsEmitter<TOrchRunStatusEvent>('orchestrator.run.statusChanged'),
+    planUpdated: wsEmitter<TOrchRunPlanUpdatedEvent>('orchestrator.run.planUpdated'),
+    completed: wsEmitter<TOrchRunCompletedEvent>('orchestrator.run.completed'),
+    taskStatusChanged: wsEmitter<TOrchTaskStatusEvent>('orchestrator.task.statusChanged'),
+    taskAssigned: wsEmitter<TOrchTaskAssignedEvent>('orchestrator.task.assigned'),
+    leadThinking: wsEmitter<TOrchRunLeadThinkingEvent>('orchestrator.run.leadThinking'),
+  },
 };
 
 // ─────────────────────────── Companion (nomi 桌面伙伴) ───────────────────────────

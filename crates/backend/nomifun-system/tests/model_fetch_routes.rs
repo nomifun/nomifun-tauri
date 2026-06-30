@@ -64,6 +64,7 @@ async fn create_provider(db: &nomifun_db::Database, platform: &str, base_url: &s
             capabilities: "[]",
             context_limit: None,
             model_protocols: None,
+            model_descriptions: None,
             model_enabled: None,
             model_health: None,
             bedrock_config: None,

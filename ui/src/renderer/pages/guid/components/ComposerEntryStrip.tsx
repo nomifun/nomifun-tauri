@@ -5,7 +5,7 @@
  */
 
 import { Trigger } from '@arco-design/web-react';
-import { Lightning, Robot, Star } from '@icon-park/react';
+import { Lightning, Robot, Star, Workbench } from '@icon-park/react';
 import React, { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import styles from '../index.module.css';
@@ -23,6 +23,8 @@ export interface ComposerEntryStripProps {
   onSummon: () => void;
   onAdjustSkills: () => void;
   onFree: () => void;
+  onOrchestrate: () => void;
+  isOrchestrationMode?: boolean;
   activeSkillCount?: number;
   activeSkills?: GuidActiveSkill[];
 }
@@ -41,6 +43,8 @@ const ComposerEntryStrip: React.FC<ComposerEntryStripProps> = ({
   onSummon,
   onAdjustSkills,
   onFree,
+  onOrchestrate,
+  isOrchestrationMode = false,
   activeSkillCount,
   activeSkills = [],
 }) => {
@@ -245,6 +249,16 @@ const ComposerEntryStrip: React.FC<ComposerEntryStripProps> = ({
       >
         <Robot theme='outline' size={15} fill='currentColor' />
         <span className={styles.entryButtonText}>{t('guid.entry.summon', { defaultValue: '召唤助手' })}</span>
+      </button>
+
+      {/* Orchestration mode (always visible — homepage on-ramp) */}
+      <button
+        type='button'
+        className={`${styles.entryButton} ${styles.entryButtonInteractive} ${isOrchestrationMode ? styles.entryButtonActive : ''}`}
+        onClick={onOrchestrate}
+      >
+        <Workbench theme='outline' size={15} fill='currentColor' />
+        <span className={styles.entryButtonText}>{t('guid.entry.orchestrate', { defaultValue: '智能编排' })}</span>
       </button>
 
       {/* Skills */}

@@ -173,33 +173,6 @@ mod tests {
     }
 
     #[test]
-    fn acp_build_extra_missing_team_mcp_stdio_config_is_none() {
-        let legacy = r#"{"backend":"claude","skills":["cron"]}"#;
-        let parsed: AcpBuildExtra = serde_json::from_str(legacy).unwrap();
-        assert!(parsed.team_mcp_stdio_config.is_none());
-    }
-
-    #[test]
-    fn acp_build_extra_parses_team_mcp_stdio_config() {
-        let with_cfg = r#"{
-            "backend":"claude",
-            "team_mcp_stdio_config":{
-                "team_id":"team-42",
-                "port":54321,
-                "token":"tok-abc",
-                "slot_id":"slot-lead",
-                "binary_path":"/bin/backend"
-            }
-        }"#;
-        let parsed: AcpBuildExtra = serde_json::from_str(with_cfg).unwrap();
-        let cfg = parsed.team_mcp_stdio_config.expect("config present");
-        assert_eq!(cfg.team_id, "team-42");
-        assert_eq!(cfg.port, 54321);
-        assert_eq!(cfg.token, "tok-abc");
-        assert_eq!(cfg.slot_id, "slot-lead");
-    }
-
-    #[test]
     fn send_message_data_serde_roundtrip() {
         let data = SendMessageData {
             content: "Hello".into(),

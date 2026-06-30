@@ -297,6 +297,17 @@ impl ConversationService {
         self.runtime_state.clone()
     }
 
+    /// Read AND remove the conversation's accumulated token total (`input +
+    /// output` summed across the turns the stream relay saw complete). Returns
+    /// `None` when nothing was recorded — e.g. a turn that errored before
+    /// completing, a non-nomi engine that emits no `TurnCompleted`, or a relay
+    /// not wired with the runtime state (every non-orchestrator conversation).
+    /// The orchestrator worker calls this exactly once, after its turn settles,
+    /// to fill `orch_run_tasks.tokens`. Removing the entry keeps the map bounded.
+    pub fn take_turn_tokens(&self, conversation_id: &str) -> Option<i64> {
+        self.runtime_state.take_turn_tokens(conversation_id)
+    }
+
     pub(crate) fn task(&self, conversation_id: &str) -> Result<AgentInstance, AppError> {
         self.task_manager
             .get_task(conversation_id)
@@ -1037,6 +1048,28 @@ impl ConversationService {
         Ok(())
     }
 
+    /// Link an orchestrator run to its originating conversation.
+    ///
+    /// Merges `extra.orchestrator_run_id` (only touching `extra` — never
+    /// model/name/pinned, never killing the agent task) so the frontend can
+    /// light up the canvas entry, then broadcasts `conversation.listChanged`
+    /// so the conversation list subscription re-fetches. This is the single
+    /// shared link-write point for both orchestrator launch paths (caps and
+    /// route), keeping the write DRY.
+    ///
+    /// An empty `conversation_id` (MCP / no-session callers) is a silent
+    /// no-op: returns `Ok(())` and broadcasts nothing.
+    #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id, run_id = %run_id))]
+    pub async fn link_orchestrator_run(&self, conversation_id: &str, run_id: &str) -> Result<(), AppError> {
+        if conversation_id.is_empty() {
+            return Ok(());
+        }
+        self.update_extra(conversation_id, serde_json::json!({ "orchestrator_run_id": run_id }))
+            .await?;
+        self.broadcast_list_changed(conversation_id, "updated", None);
+        Ok(())
+    }
+
     pub async fn save_acp_runtime_mode(&self, conversation_id: &str, mode: &str) -> Result<(), AppError> {
         let params = SaveRuntimeStateParams {
             current_mode_id: Some(Some(mode)),
@@ -1091,6 +1124,11 @@ impl ConversationService {
         // Drop the in-memory knowledge signature so the map does not retain
         // entries for deleted conversations across a long-lived process.
         self.runtime_state.clear_knowledge_signature(&conv_id.to_string());
+        // Likewise drop any accumulated token total — an orchestrator worker
+        // conversation that errored before the worker `take`d it would otherwise
+        // linger here until process restart (a small in-memory leak). No-op for the
+        // common chat/companion conversation (which never records a token total).
+        self.runtime_state.clear_turn_tokens(&conv_id.to_string());
 
         info!("Conversation deleted");
         self.broadcast_list_changed(id, "deleted", source.as_ref());
@@ -1661,6 +1699,23 @@ impl ConversationService {
         let user_id_owned = user_id.to_owned();
         let service = self.clone();
         let task_manager = Arc::clone(task_manager);
+        // Orchestrator-driven worker conversations carry `orchestrator_run_id` in
+        // their `extra` (stamped by `build_worker_extra`). For those — and ONLY
+        // those — hand the relay a clone of the runtime state so it accumulates
+        // each turn's `TurnCompleted` token usage into the conversation's running
+        // total (read back by the worker after the turn settles to fill
+        // `orch_run_tasks.tokens`). Gating on this key keeps the common chat /
+        // companion path free of any per-turn map entry (no growth, no behaviour
+        // change) — those conversations never read the total, so accumulating it
+        // would only leak across a long-lived process.
+        let token_runtime_state: Option<Arc<ConversationRuntimeStateService>> =
+            serde_json::from_str::<serde_json::Value>(&row.extra)
+                .ok()
+                .as_ref()
+                .and_then(|extra| extra.get("orchestrator_run_id"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(|_| Arc::clone(&self.runtime_state));
         // Phase 3 (plan D3): the conversation's `extra` JSON drives the failover
         // config resolution (session-level `extra.model_failover` override else
         // global). Captured once at turn start — the config does not change
@@ -1788,6 +1843,13 @@ impl ConversationService {
                 .with_companion_context(companion, companion_id.clone())
                 .with_origin(origin.clone())
                 .with_channel_platform(channel_platform.clone());
+
+                // Orchestrator worker turns: let the relay accumulate this turn's
+                // token usage into the conversation's running total (read back by
+                // the worker after settle). No-op for every other conversation.
+                if let Some(state) = token_runtime_state.clone() {
+                    relay = relay.with_runtime_state(state);
+                }
 
                 // review #1/#5: when failover is live AND this turn is still
                 // within the switch bound, install the suppressor so the relay

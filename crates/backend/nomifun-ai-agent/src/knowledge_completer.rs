@@ -127,6 +127,7 @@ mod tests {
             capabilities: "[]".into(),
             context_limit: None,
             model_protocols: None,
+            model_descriptions: None,
             model_enabled: model_enabled.map(str::to_owned),
             model_health: None,
             bedrock_config: None,

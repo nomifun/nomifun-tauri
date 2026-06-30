@@ -85,7 +85,6 @@ pub async fn assemble_acp_params(
         compose_preset_context(
             config.preset_context.as_deref(),
             config.backend.as_deref(),
-            config.team_mcp_stdio_config.is_some(),
         ),
         config.open_mcp_config.is_some(),
         config.computer_mcp_config.is_some(),
@@ -168,12 +167,10 @@ fn resolve_mcp_servers(
     servers
 }
 
-/// Compose first-message preset context. Team Guide context is intentionally not
-/// appended because Team is not surfaced in the product.
+/// Compose first-message preset context.
 fn compose_preset_context(
     base_preset_context: Option<&str>,
     _backend: Option<&str>,
-    _has_team_session: bool,
 ) -> Option<String> {
     base_preset_context
         .map(str::trim)
@@ -459,35 +456,35 @@ fn gateway_mcp_server(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nomifun_api_types::{GuideMcpConfig, TeamMcpStdioConfig};
+    use nomifun_api_types::GuideMcpConfig;
 
     #[test]
-    fn compose_preset_context_no_team_no_backend() {
-        let result = compose_preset_context(Some("hello"), None, false);
+    fn compose_preset_context_passes_through_base_context() {
+        let result = compose_preset_context(Some("hello"), None);
         assert_eq!(result, Some("hello".to_owned()));
     }
 
     #[test]
-    fn compose_preset_context_team_session_skips_guide() {
-        let result = compose_preset_context(Some("hello"), Some("claude"), true);
+    fn compose_preset_context_ignores_backend() {
+        let result = compose_preset_context(Some("hello"), Some("claude"));
         assert_eq!(result, Some("hello".to_owned()));
     }
 
     #[test]
-    fn compose_preset_context_non_team_capable_backend() {
-        let result = compose_preset_context(Some("hello"), Some("unknown"), false);
+    fn compose_preset_context_unknown_backend() {
+        let result = compose_preset_context(Some("hello"), Some("unknown"));
         assert_eq!(result, Some("hello".to_owned()));
     }
 
     #[test]
-    fn compose_preset_context_team_capable_backend_does_not_append_guide() {
-        let result = compose_preset_context(None, Some("claude"), false);
+    fn compose_preset_context_none_base_stays_none() {
+        let result = compose_preset_context(None, Some("claude"));
         assert_eq!(result, None);
     }
 
     #[test]
     fn compose_preset_context_empty_string_treated_as_none() {
-        let result = compose_preset_context(Some("  "), Some("unknown"), false);
+        let result = compose_preset_context(Some("  "), Some("unknown"));
         assert_eq!(result, None);
     }
 
@@ -780,13 +777,6 @@ mod tests {
             session_mode: None,
             current_model_id: None,
             cron_job_id: None,
-            team_mcp_stdio_config: Some(TeamMcpStdioConfig {
-                team_id: "team-1".into(),
-                port: 9999,
-                token: "tok".into(),
-                slot_id: "slot-lead".into(),
-                binary_path: "/bin/backend".into(),
-            }),
             guide_mcp_config: Some(GuideMcpConfig {
                 port: 8888,
                 token: "guide-tok".into(),
@@ -827,7 +817,6 @@ mod tests {
             session_mode: None,
             current_model_id: None,
             cron_job_id: None,
-            team_mcp_stdio_config: None,
             guide_mcp_config: Some(GuideMcpConfig {
                 port: 8888,
                 token: "guide-tok".into(),
@@ -868,7 +857,6 @@ mod tests {
             session_mode: None,
             current_model_id: None,
             cron_job_id: None,
-            team_mcp_stdio_config: None,
             guide_mcp_config: Some(GuideMcpConfig {
                 port: 8888,
                 token: "guide-tok".into(),
@@ -914,7 +902,6 @@ mod tests {
             session_mode: None,
             current_model_id: None,
             cron_job_id: None,
-            team_mcp_stdio_config: None,
             guide_mcp_config: None,
             requirement_mcp_config: None,
             knowledge_mcp_config: None,
@@ -961,13 +948,6 @@ mod tests {
             session_mode: None,
             current_model_id: None,
             cron_job_id: None,
-            team_mcp_stdio_config: Some(TeamMcpStdioConfig {
-                team_id: "team-1".into(),
-                port: 9999,
-                token: "tok".into(),
-                slot_id: "slot-lead".into(),
-                binary_path: "/bin/backend".into(),
-            }),
             guide_mcp_config: None,
             requirement_mcp_config: None,
             knowledge_mcp_config: None,
@@ -1010,7 +990,6 @@ mod tests {
             session_mode: None,
             current_model_id: None,
             cron_job_id: None,
-            team_mcp_stdio_config: None,
             guide_mcp_config: Some(GuideMcpConfig {
                 port: 8888,
                 token: "guide-tok".into(),
@@ -1059,7 +1038,6 @@ mod tests {
             session_mode: None,
             current_model_id: None,
             cron_job_id: None,
-            team_mcp_stdio_config: None,
             guide_mcp_config: None,
             requirement_mcp_config: None,
             knowledge_mcp_config: None,

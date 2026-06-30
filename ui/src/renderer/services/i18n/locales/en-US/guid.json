@@ -9,6 +9,7 @@
   "selectAssistantHint": "Select an assistant to start a task",
   "agentSwitcherLabel": "Agent",
   "switchedToAgent": "Switched to {{agent}}",
+  "modelRequired": "Select a model first",
   "workspace": {
     "workInProject": "Work in a project",
     "optional": "Optional",
@@ -37,6 +38,7 @@
   "entry": {
     "free": "Free-form",
     "summon": "Summon assistant",
+    "orchestrate": "Orchestrate",
     "skills": "Use Skills",
     "skillsActive": "Use Skills · Enabled",
     "skillsAdjustAria": "Adjust the {{count}} Skills enabled for this chat",

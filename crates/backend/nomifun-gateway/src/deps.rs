@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use nomifun_ai_agent::IWorkerTaskManager;
+use nomifun_assistant::AssistantService;
 use nomifun_companion::CompanionService;
 use nomifun_conversation::ConversationService;
 use nomifun_cron::service::CronService;
@@ -78,6 +79,25 @@ pub struct GatewayDeps {
     pub remote_agent_service: std::sync::Arc<nomifun_ai_agent::RemoteAgentService>,
     /// Client-preference repo backing the global model-failover config.
     pub client_pref_repo: std::sync::Arc<dyn nomifun_db::IClientPreferenceRepository>,
+    /// 智能编排 Run control-plane: creates/plans/inspects orchestration runs.
+    /// MUST be the router-state instance (`states.orchestrator.run_service` — the
+    /// same `Arc<RunService>` the REST routes + the [`RunEngine`] loop share), so a
+    /// gateway-created run and a UI-created run act on identical state.
+    pub orchestrator_run_service: Arc<nomifun_orchestrator::RunService>,
+    /// 智能编排 Run engine: the serial execution loop driver. MUST be the
+    /// router-state instance (`states.orchestrator.engine` — `RunEngine` is itself
+    /// `Clone` with `Arc` internals, so this `Arc` wraps that one live instance;
+    /// `start()` must register against the SAME in-memory handle map the boot
+    /// resume + REST cancel use, or a gateway-started run would not be cancellable).
+    pub orchestrator_run_engine: Arc<nomifun_orchestrator::RunEngine>,
+    /// 助手 (assistants) service — the SAME instance the `/api/assistants` routes
+    /// use (`states.assistant.service`). The caps_orchestrator layer (P4 Task 2)
+    /// reads the ENABLED assistants here and folds each one's persona/skills/model
+    /// into an enriched [`nomifun_api_types::FleetMember`] when creating an ad-hoc
+    /// run, so the orchestrator engine/worker can read a self-contained snapshot
+    /// without an assistant-crate dependency. Dependency direction: gateway →
+    /// nomifun-assistant (nomifun-assistant does NOT depend on gateway — no cycle).
+    pub assistant_service: Arc<AssistantService>,
     /// **P3-GW1 (route A)**: per-companion browser tool registry, living in the
     /// main process. `Some` only when the `browser-use` feature is on and the
     /// app wired it; `None` (or the field absent without the feature) → the

@@ -32,6 +32,7 @@ export interface CreateProviderRequest {
   capabilities?: ModelCapability[];
   context_limit?: number;
   model_protocols?: Record<string, string>;
+  model_descriptions?: Record<string, string>;
   model_enabled?: Record<string, boolean>;
   model_health?: IProvider['model_health'];
   bedrock_config?: IProvider['bedrock_config'];
@@ -52,6 +53,7 @@ export interface UpdateProviderRequest {
   capabilities?: ModelCapability[];
   context_limit?: number;
   model_protocols?: Record<string, string>;
+  model_descriptions?: Record<string, string>;
   model_enabled?: Record<string, boolean>;
   model_health?: IProvider['model_health'];
   bedrock_config?: IProvider['bedrock_config'];

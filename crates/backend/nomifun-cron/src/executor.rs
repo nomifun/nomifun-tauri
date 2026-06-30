@@ -1171,8 +1171,7 @@ async fn inject_agent_identity(
 /// deliberately returns `None` for them. They pick up their model from the
 /// session `extra` carrying `current_model_id`, which the `AcpAgentManager`
 /// seeds into its desired model and reconciles via `session/set_model` once
-/// the session advertises its model catalog. This mirrors the multi-agent
-/// team path (`nomifun-team::service`).
+/// the session advertises its model catalog.
 ///
 /// nomi is excluded: it resolves its model through the top-level
 /// `CreateConversationRequest.model` provider path instead, so emitting

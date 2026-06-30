@@ -884,3 +884,54 @@ async fn create_acp_skips_seed_when_extra_has_empty_runtime_fields() {
         "empty runtime fields should not produce a seed: got {runtime:?}"
     );
 }
+
+// ── link_orchestrator_run: merge extra.orchestrator_run_id + broadcast ──
+
+#[tokio::test]
+async fn link_orchestrator_run_merges_run_id_and_broadcasts() {
+    let (svc, broadcaster, _task_mgr) = setup().await;
+
+    // Seed a conversation with a pre-existing extra key (workspace) so we can
+    // prove the link MERGES rather than replaces extra.
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": "/home/user/project" }
+    }))
+    .unwrap();
+    let conv = svc.create(USER_ID, req).await.unwrap();
+    // Discard the create broadcast so we only observe the link event.
+    broadcaster.take_events();
+
+    svc.link_orchestrator_run(&conv.id.to_string(), "run_abc").await.unwrap();
+
+    // Re-read the conversation: the run id is written and workspace survives.
+    let fetched = svc.get(USER_ID, &conv.id.to_string()).await.unwrap();
+    assert_eq!(
+        fetched.extra["orchestrator_run_id"], "run_abc",
+        "link must write extra.orchestrator_run_id"
+    );
+    assert_eq!(
+        fetched.extra["workspace"], "/home/user/project",
+        "link must merge (not replace) extra — workspace must survive"
+    );
+
+    // Exactly one conversation.listChanged(updated) for this conversation.
+    let events = broadcaster.take_events();
+    assert_eq!(events.len(), 1, "link must broadcast exactly one event");
+    assert_eq!(events[0].name, "conversation.listChanged");
+    assert_eq!(events[0].data["action"], "updated");
+    assert_eq!(events[0].data["conversation_id"], conv.id);
+}
+
+#[tokio::test]
+async fn link_orchestrator_run_empty_conversation_id_is_noop() {
+    let (svc, broadcaster, _task_mgr) = setup().await;
+
+    // Empty conversation_id (MCP / no-session callers) must be a silent no-op:
+    // Ok(()) and zero broadcasts.
+    let result = svc.link_orchestrator_run("", "run_x").await;
+    assert!(result.is_ok(), "empty conversation_id must return Ok(()): {result:?}");
+
+    let events = broadcaster.take_events();
+    assert!(events.is_empty(), "empty conversation_id must broadcast nothing, got {events:?}");
+}

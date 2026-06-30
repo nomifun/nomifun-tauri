@@ -267,8 +267,13 @@ async fn creates_parent_directories() {
 // The 2026-06-12 clean-baseline refactor squashed migrations 001–021 into a
 // single 001_baseline.sql, resetting the migration chain. A dev database
 // carrying the old `_sqlx_migrations` history (mismatched checksum on
-// version 1, applied versions 2–21 missing from the resolved set) must be
+// version 1, applied versions 2–N missing from the resolved set) must be
 // renamed to `*.pre-baseline.bak` and rebuilt empty instead of failing fast.
+//
+// The forged "extra applied version" below must stay ONE PAST the highest
+// real migration on disk so it represents a version absent from the resolved
+// set (a real version would collide with the already-applied row). Bump it
+// whenever a new migration lands.
 
 #[tokio::test]
 async fn pre_baseline_database_is_renamed_and_rebuilt() {
@@ -284,7 +289,7 @@ async fn pre_baseline_database_is_renamed_and_rebuilt() {
         .unwrap();
     sqlx::query(
         "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
-         VALUES (21, 'entity seq', TRUE, X'00', 0)",
+         VALUES (24, 'entity seq', TRUE, X'00', 0)",
     )
     .execute(db.pool())
     .await

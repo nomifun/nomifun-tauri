@@ -53,7 +53,6 @@ async fn fixture_params(
         session_mode: None,
         current_model_id: None,
         cron_job_id: None,
-        team_mcp_stdio_config: None,
         guide_mcp_config: None,
         requirement_mcp_config: None,
         knowledge_mcp_config: None,

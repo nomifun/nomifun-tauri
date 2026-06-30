@@ -1,0 +1,304 @@
+{
+  "title": "Orchestration",
+  "subtitle": "Launch and orchestrate multi-agent runs — track each agent's work and status",
+  "tab": {
+    "newRun": "New run",
+    "listTitle": "My runs",
+    "listEmpty": "No runs yet — click “New run” above to start one",
+    "listLoadError": "Failed to load runs",
+    "titlebarShowList": "Show runs",
+    "titlebarHideList": "Hide runs"
+  },
+  "start": {
+    "title": "Kick off a multi-agent orchestration",
+    "subtitle": "Describe the task in a sentence — the lead agent plans the task graph and assigns the best-fit agent to each step automatically.",
+    "label": "New orchestration",
+    "placeholder": "Describe the task you want orchestrated — the lead agent will plan it… (e.g. research three competitors and produce a comparison report with pros & cons)",
+    "send": "Start orchestration",
+    "advanced": "Need a work dir, pinned roles or a precise model range? Structured new run"
+  },
+  "composer": {
+    "title": "New run",
+    "subtitle": "Describe the goal, pick the models and roles, and let a multi-agent fleet run it for you.",
+    "goalLabel": "Requirement",
+    "goalPlaceholder": "What should the fleet accomplish? Spell out the goal, scope and acceptance criteria…",
+    "goalRequired": "Please enter a requirement first",
+    "workDirLabel": "Work path",
+    "workDirHint": "Optional · leave empty to use the default workspace",
+    "workDirBrowse": "Choose folder",
+    "workDirClear": "Clear work path",
+    "modelLabel": "Model range",
+    "modelRequired": "Please select at least one model",
+    "noModels": "No usable model configured · add and enable a model in Model management first.",
+    "model": {
+      "single": "Single",
+      "auto": "Auto",
+      "range": "Range",
+      "singlePlaceholder": "Pick a model",
+      "rangePlaceholder": "Pick multiple models",
+      "autoHint": "Will use all {{count}} enabled model(s), one member synthesized per model.",
+      "rangeCount": "{{count}} model(s)"
+    },
+    "rolesLabel": "Pinned roles",
+    "rolesHint": "Optional · leave empty to let the fleet assemble itself",
+    "rolesPlaceholder": "Pick roles from enabled assistants",
+    "rolesEmpty": "No assistants available",
+    "autonomyLabel": "Autonomy",
+    "autonomy": {
+      "interactive": "Review first",
+      "supervised": "Run directly",
+      "interactiveHint": "The fleet pauses after planning and waits for your approval before executing.",
+      "supervisedHint": "Executes automatically once approved — you can still step in."
+    },
+    "submit": "Start run",
+    "cancel": "Cancel",
+    "createError": "Failed to start run: {{error}}",
+    "replanTitle": "Re-plan run",
+    "replanSubtitle": "Edit the goal, models, roles or autonomy and re-decompose the task graph. The old plan (tasks, assignments) is cleared and rebuilt.",
+    "replanSubmit": "Re-plan",
+    "replanError": "Failed to re-plan: {{error}}"
+  },
+  "roster": {
+    "title": "Agent roster",
+    "count": "{{count}} task(s)",
+    "roleUnknown": "Unassigned",
+    "modelUnknown": "No model set"
+  },
+  "run": {
+    "role": {
+      "planner": "Planner",
+      "coder": "Coder",
+      "reviewer": "Reviewer",
+      "researcher": "Researcher",
+      "tester": "Tester"
+    },
+    "kind": {
+      "synthesis": "Synthesis",
+      "verify": "Verify",
+      "judge": "Judge",
+      "loop": "Loop",
+      "fanout": "Fan-out · {{label}}"
+    },
+    "verdict": {
+      "pass": "Pass",
+      "fail": "Fail",
+      "pending": "Verifying…"
+    },
+    "judge": {
+      "winner": "Winner",
+      "none": "No winner",
+      "pending": "Judging…"
+    },
+    "loop": {
+      "done": "Done",
+      "failed": "Failed",
+      "iterating": "Iterating…"
+    },
+    "title": "Run History",
+    "subtitle": "Browse every orchestration run you started — click any one to replay its task graph",
+    "openConversation": "Open conversation",
+    "emptyTitle": "No runs yet",
+    "emptyDesc": "Give a multi-agent team a goal inside a conversation to start a run — it will show up here for review afterwards.",
+    "loadError": "Failed to load runs",
+    "untitledGoal": "(No goal)",
+    "manage": {
+      "rename": "Rename",
+      "renameError": "Failed to rename: {{error}}",
+      "delete": "Delete",
+      "deleteConfirm": "Delete this run? Its task graph and execution records are removed too.",
+      "deleteConfirmOk": "Delete",
+      "deleteConfirmCancel": "Cancel",
+      "deleteOk": "Run deleted",
+      "deleteError": "Failed to delete: {{error}}"
+    },
+    "progress": {
+      "elapsed": "Elapsed",
+      "tokens": "Tokens",
+      "current": "Now"
+    },
+    "node": {
+      "tokens": "tok"
+    },
+    "canvas": {
+      "mainNode": "main · lead agent"
+    },
+    "timing": {
+      "took": "Took {{value}}",
+      "running": "Running {{value}}"
+    },
+    "workspace": {
+      "title": "Files"
+    },
+    "mobile": {
+      "tasksLabel": "Tasks",
+      "noTasks": "The fleet is breaking the goal into tasks — they will appear here shortly."
+    },
+    "status": {
+      "planning": "Planning",
+      "running": "Running",
+      "completed": "Completed",
+      "failed": "Failed",
+      "cancelled": "Cancelled",
+      "paused": "Paused",
+      "awaiting_plan_approval": "Awaiting plan approval",
+      "unknown": "Unknown"
+    },
+    "detail": {
+      "back": "Back",
+      "cancel": "Stop run",
+      "cancelConfirm": "Stop this run? Tasks still executing will be cancelled.",
+      "cancelConfirmOk": "Stop",
+      "cancelConfirmCancel": "Keep running",
+      "cancelOk": "Run stopped",
+      "cancelError": "Failed to stop run: {{error}}",
+      "approvePlan": "Approve plan",
+      "approveOk": "Plan approved — execution started",
+      "approveError": "Failed to approve plan: {{error}}",
+      "pause": "Pause",
+      "pauseOk": "Run paused",
+      "pauseError": "Failed to pause run: {{error}}",
+      "resume": "Resume",
+      "resumeOk": "Run resumed",
+      "resumeError": "Failed to resume run: {{error}}",
+      "replan": "Re-plan",
+      "replanOk": "Re-planned",
+      "loadError": "Failed to load run detail",
+      "planningTitle": "Planning tasks…",
+      "planningDesc": "The fleet is breaking the goal into a task graph — nodes will appear shortly.",
+      "untitledTask": "(Untitled task)",
+      "assigned": "Assigned",
+      "config": {
+        "title": "Configuration",
+        "role": "Role",
+        "model": "Model",
+        "modelNone": "No model set",
+        "persona": "Persona",
+        "skills": "Skills",
+        "skillsNone": "No extra skills",
+        "disabledBuiltin": "{{count}} built-in skill(s) disabled",
+        "status": "Status",
+        "empty": "—"
+      }
+    },
+    "assign": {
+      "rationaleTitle": "Why this member",
+      "noRationale": "No assignment rationale yet.",
+      "score": "Match {{score}}",
+      "reassign": "Reassign to another member",
+      "reassignSuccess": "Assignment updated",
+      "reassignError": "Failed to update assignment: {{error}}",
+      "locked": "Lock assignment",
+      "lockedHint": "When locked, the orchestrator won't auto-reassign this task on the next planning pass."
+    },
+    "spec": {
+      "title": "Intent / prompt",
+      "placeholder": "Describe what this node should do…",
+      "save": "Save",
+      "saving": "Saving…",
+      "dirtyHint": "Click Rerun after saving to apply the new intent.",
+      "runningHint": "Task is running — pause it to edit.",
+      "empty": "(no intent yet)",
+      "saveOk": "Node intent saved",
+      "saveError": "Failed to save: {{error}}"
+    },
+    "rerun": {
+      "button": "Rerun",
+      "running": "Task is running — pause it first",
+      "confirm": "Rerun will reset this node and its downstream, then re-execute. Continue?",
+      "confirmOk": "Rerun",
+      "confirmCancel": "Cancel",
+      "ok": "Rerun started",
+      "error": "Rerun failed: {{error}}"
+    },
+    "adopt": {
+      "button": "Adopt as node output",
+      "ok": "Adopted as the node's output",
+      "error": "Adopt failed: {{error}}"
+    },
+    "task": {
+      "status": {
+        "pending": "Pending",
+        "running": "Running",
+        "done": "Done",
+        "completed": "Done",
+        "failed": "Failed",
+        "needs_review": "Needs review",
+        "skipped": "Skipped",
+        "blocked": "Blocked",
+        "cancelled": "Cancelled"
+      }
+    },
+    "transcript": {
+      "notStarted": "This task hasn’t started yet",
+      "noConversation": "There’s no transcript to show — it will appear here once a worker picks up this task."
+    },
+    "steer": {
+      "label": "Local adjustment",
+      "placeholder": "Describe a local adjustment for this node…",
+      "submit": "Submit",
+      "sent": "Adjustment submitted",
+      "error": "Local adjustment failed: {{error}}"
+    },
+    "project": {
+      "viewing": "Viewing",
+      "returnMain": "Back to main"
+    },
+    "intent": {
+      "label": "Adjust orchestration",
+      "placeholder": "Describe how you'd like the orchestration changed (e.g. research is too shallow, add a verify pass and a second researcher)",
+      "send": "Send adjustment intent",
+      "summary": "Adjusted: kept {{kept}} · added {{added}} · removed {{removed}}",
+      "lastApplied": "Last intent: {{intent}}",
+      "error": "Failed to adjust orchestration: {{error}}"
+    },
+    "header": {
+      "rename": "Click to rename the orchestration goal",
+      "renamePlaceholder": "Enter the orchestration goal…",
+      "planning": "Planning"
+    },
+    "thinking": {
+      "title": "Orchestration thinking",
+      "drafting": "Drafting…",
+      "done": "Planning complete",
+      "phase": {
+        "planningStarted": "Understanding the goal…",
+        "decomposing": "Breaking down tasks…",
+        "assigning": "Assigning agents…",
+        "planReady": "Generating the plan…"
+      }
+    },
+    "view": {
+      "conversation": "Dialogue",
+      "canvas": "Canvas",
+      "conversationHint": "See the lead agent's orchestration decisions and your adjustment dialogue",
+      "canvasHint": "See the full task-graph structure"
+    },
+    "feed": {
+      "agentName": "Lead orchestrator",
+      "decisionTitle": "Orchestration decision",
+      "decisionSubtitle": "{{count}} task(s) planned",
+      "decisionIntro": "I broke the goal down into the orchestration below and assigned the best-fit agent to each task:",
+      "intentReply": "Re-adjusted the orchestration per your intent: kept {{kept}} · added {{added}} · removed {{removed}}.",
+      "rationaleFallback": "Auto-assigned by strengths and load",
+      "outputLabel": "Output",
+      "openTask": "Open this task's worker transcript",
+      "groupFanout": "Parallel fan-out · {{label}}",
+      "empty": "The fleet is forming its orchestration decision — the lead agent's breakdown and assignments will appear here shortly.",
+      "scrollLatest": "Jump to latest"
+    },
+    "precipitate": {
+      "title": "Save roles as assistants",
+      "subtitle": "{{count}} role(s) from this run can be saved as assistants for reuse",
+      "modelsLabel": "Models",
+      "skillsLabel": "{{count}} skill(s)",
+      "saveAsAssistant": "Save as assistant",
+      "saved": "Saved",
+      "exists": "An assistant with this name already exists",
+      "saveOk": "Saved “{{name}}” as an assistant",
+      "saveError": "Failed to save assistant: {{error}}",
+      "synthDesc": "“{{role}}” role — handled: {{tasks}}",
+      "synthDescBare": "“{{role}}” role precipitated from a run",
+      "taskSep": ", "
+    }
+  }
+}

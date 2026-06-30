@@ -329,8 +329,8 @@ const KnowledgeControl: React.FC<KnowledgeControlProps> = ({ target, draft, disa
   }, [bases, searchQuery, kindLabelsByKind, tagLabelsByKey]);
 
   // ─── Derived status (shared by trigger button + panel header pill) ─────────
-  // Knowledge has no live run-state — the dot is a binary enabled/off marker,
-  // matching MultiAgentControl (primary when mounted, gray otherwise).
+  // Knowledge has no live run-state — the dot is a binary enabled/off marker
+  // (primary when mounted, gray otherwise).
   const dotColor = binding.enabled ? CAPABILITY_COLORS.primary : CAPABILITY_COLORS.off;
   const statusText = draft
     ? binding.enabled

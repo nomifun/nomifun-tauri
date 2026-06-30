@@ -51,6 +51,10 @@ export const useAssistantEditor = ({
   const [editAvatar, setEditAvatar] = useState('');
   // editAgent holds a backend ID (e.g. "claude", "goose") or an extension adapter ID (e.g. "ext-buddy")
   const [editAgent, setEditAgent] = useState<string>('claude');
+  // editModels is a flat list of preferred model NAMES (no provider qualifier).
+  // Orchestration treats the assistant as a role and prefers these models within
+  // the user's configured model range; empty means "no preference".
+  const [editModels, setEditModels] = useState<string[]>([]);
   const [editSkills, setEditSkills] = useState('');
   const [isCreating, setIsCreating] = useState(false);
   const [deleteConfirmVisible, setDeleteConfirmVisible] = useState(false);
@@ -107,6 +111,7 @@ export const useAssistantEditor = ({
     setEditDescription(assistant.description || '');
     setEditAvatar(assistant.avatar || '');
     setEditAgent(assistant.preset_agent_type || 'claude');
+    setEditModels(assistant.models ?? []);
     setEditAudienceTags(assistant.audience_tags ?? []);
     setEditScenarioTags(assistant.scenario_tags ?? []);
     setPendingSkills([]);
@@ -169,6 +174,7 @@ export const useAssistantEditor = ({
     setEditContext('');
     setEditAvatar('\u{1F916}');
     setEditAgent('claude');
+    setEditModels([]);
     setEditSkills('');
     setSelectedSkills([]);
     setCustomSkills([]);
@@ -201,6 +207,7 @@ export const useAssistantEditor = ({
     setEditDescription(assistant.description_i18n?.[localeKey] || assistant.description || '');
     setEditAvatar(assistant.avatar || '\u{1F916}');
     setEditAgent(assistant.preset_agent_type || 'claude');
+    setEditModels(assistant.models ?? []);
     setEditAudienceTags(assistant.audience_tags ?? []);
     setEditScenarioTags(assistant.scenario_tags ?? []);
     setPromptViewMode('edit');
@@ -288,6 +295,7 @@ export const useAssistantEditor = ({
           disabled_builtin_skills: disabledBuiltinSkills.length > 0 ? disabledBuiltinSkills : undefined,
           audience_tags: editAudienceTags,
           scenario_tags: editScenarioTags,
+          models: editModels,
         };
         const created = await ipcBridge.assistants.create.invoke(createRequest);
 
@@ -323,6 +331,7 @@ export const useAssistantEditor = ({
               disabled_builtin_skills: disabledBuiltinSkills.length > 0 ? disabledBuiltinSkills : undefined,
               audience_tags: editAudienceTags,
               scenario_tags: editScenarioTags,
+              models: editModels,
             };
         await ipcBridge.assistants.update.invoke(updateRequest);
 
@@ -467,6 +476,8 @@ export const useAssistantEditor = ({
     setEditAvatar,
     editAgent,
     setEditAgent,
+    editModels,
+    setEditModels,
     editSkills,
     setEditSkills,
     isCreating,

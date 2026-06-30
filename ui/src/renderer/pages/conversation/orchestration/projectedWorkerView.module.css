@@ -1,0 +1,199 @@
+/**
+ * @license
+ * Copyright 2025-2026 NomiFun (nomifun.com)
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/* ProjectedWorkerView — the content-area projection of a clicked DAG node
+ * (「会话原生编排 v2」F7). A thin banner over a read-only worker transcript that
+ * fills the content region. All colors flow through CSS variables so the view
+ * honors every one of the 5 themes; it overlays the (display:none) main NomiChat
+ * without unmounting it, so returning to main preserves scroll + input state. */
+
+/* The projection fills the content region and stacks: banner (fixed height) on
+ * top of a transcript body that owns its own scroll. */
+.root {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--bg-1);
+}
+
+/* ── Banner ──────────────────────────────────────────────────────────────────
+ * A thin glass-ish strip: left = 「查看:<title>」 context, right = the three
+ * node actions (rerun / steer / return). A subtle primary-tinted underline hints
+ * "you are projecting a worker, not the main agent". */
+.banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  flex-shrink: 0;
+  min-height: 44px;
+  padding: 6px 12px 6px 16px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--border-base);
+}
+
+/* Left side — the "viewing" label + worker title (truncates). */
+.bannerLead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.bannerBadge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  border-radius: 7px;
+  color: rgb(var(--primary-6));
+  background: color-mix(in srgb, rgb(var(--primary-6)) 12%, transparent);
+}
+
+.bannerEyebrow {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-tertiary);
+}
+
+.bannerTitle {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* Right side — the three action controls. */
+.bannerActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* A single banner action pill (rerun / steer trigger / return). Rendered as a
+ * <div role="button"> per project convention (bare <button> shows a WebView2
+ * focus box). The "return" variant is primary-tinted to read as the way out. */
+.action {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border-base);
+  background: var(--bg-1);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+  user-select: none;
+  transition:
+    color 0.16s ease,
+    border-color 0.16s ease,
+    background 0.16s ease,
+    opacity 0.16s ease;
+}
+
+.action:hover {
+  color: rgb(var(--primary-6));
+  border-color: color-mix(in srgb, rgb(var(--primary-6)) 50%, var(--border-base));
+}
+
+.action[aria-disabled='true'] {
+  opacity: 0.5;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+/* The primary "return to main" action — filled so it reads as the exit. */
+.actionPrimary {
+  color: #fff;
+  background: rgb(var(--primary-6));
+  border-color: rgb(var(--primary-6));
+}
+
+.actionPrimary:hover {
+  color: #fff;
+  background: color-mix(in srgb, rgb(var(--primary-6)) 88%, #000);
+  border-color: color-mix(in srgb, rgb(var(--primary-6)) 88%, #000);
+}
+
+/* The "采用为该节点产出" action — a primary-tinted (light-filled) pill so it reads as
+ * the recommended hand-off when reviewing a continued worker, without competing
+ * with the filled「返回 main」exit. */
+.actionAdopt {
+  color: rgb(var(--primary-6));
+  border-color: color-mix(in srgb, rgb(var(--primary-6)) 38%, var(--border-base));
+  background: color-mix(in srgb, rgb(var(--primary-6)) 10%, transparent);
+}
+
+.actionAdopt:hover {
+  color: rgb(var(--primary-6));
+  border-color: color-mix(in srgb, rgb(var(--primary-6)) 60%, var(--border-base));
+  background: color-mix(in srgb, rgb(var(--primary-6)) 16%, transparent);
+}
+
+/* ── Body ────────────────────────────────────────────────────────────────────
+ * Fills the remaining height; the ReadOnlyConversationView owns its own scroll.
+ * min-height:0 so the flex child can shrink and scroll internally. */
+.body {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Centered states (loading / not-started) inside the body. */
+.center {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 24px;
+  text-align: center;
+}
+
+.emptyIcon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 52px;
+  height: 52px;
+  border-radius: 16px;
+  background: var(--fill-2);
+  color: var(--text-tertiary);
+}
+
+.emptyTitle {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.emptyHint {
+  max-width: 320px;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--text-tertiary);
+}

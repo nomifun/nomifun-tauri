@@ -1,0 +1,29 @@
+[package]
+name = "nomifun-orchestrator"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nomifun-common.workspace = true
+nomifun-db.workspace = true
+nomifun-api-types.workspace = true
+nomifun-auth.workspace = true
+nomifun-file.workspace = true
+nomifun-realtime.workspace = true
+nomifun-ai-agent.workspace = true
+nomifun-conversation.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+sqlx = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+tempfile = { workspace = true }

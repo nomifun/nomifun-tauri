@@ -11,9 +11,11 @@ import AgentSkillImportDrawer from '@/renderer/pages/settings/skill/AgentSkillIm
 import AssistantTagPicker from './AssistantTagPicker';
 import EmojiPicker from '@/renderer/components/chat/EmojiPicker';
 import MarkdownView from '@/renderer/components/Markdown';
+import NomiSelect from '@/renderer/components/base/NomiSelect';
+import { useModelProviderList } from '@/renderer/hooks/agent/useModelProviderList';
 import { Avatar, Button, Checkbox, Collapse, Drawer, Input, Select, Tag, Typography } from '@arco-design/web-react';
 import { Close, Delete, Info, Plus, Robot } from '@icon-park/react';
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 
@@ -33,6 +35,9 @@ type AssistantEditDrawerProps = {
   editAvatarImage: string | undefined;
   editAgent: string;
   setEditAgent: (v: string) => void;
+  /** Preferred model NAMES for orchestration (assistant-as-role). Optional. */
+  editModels: string[];
+  setEditModels: (v: string[]) => void;
 
   // Rules / prompt
   editContext: string;
@@ -96,6 +101,8 @@ const AssistantEditDrawer: React.FC<AssistantEditDrawerProps> = ({
   editAvatarImage,
   editAgent,
   setEditAgent,
+  editModels,
+  setEditModels,
   editContext,
   setEditContext,
   promptViewMode,
@@ -166,6 +173,26 @@ const AssistantEditDrawer: React.FC<AssistantEditDrawerProps> = ({
   const showSkills = isCreating || (activeAssistant !== null && activeAssistant.source !== 'extension');
 
   const agentOptions = availableBackends;
+
+  // Preferred-model options: flatten every enabled provider's available models
+  // into a de-duplicated, sorted list of model NAMES. The assistant `models`
+  // field is a flat string[] of names (no provider qualifier), so a name-level
+  // multi-select is the right shape for orchestration role preferences.
+  const { providers, getAvailableModels } = useModelProviderList();
+  const availableModelNames = useMemo(() => {
+    const names = new Set<string>();
+    for (const provider of providers) {
+      for (const modelName of getAvailableModels(provider)) {
+        names.add(modelName);
+      }
+    }
+    // Keep any already-selected names even if their provider is currently
+    // unavailable, so editing never silently drops a saved preference.
+    for (const modelName of editModels) {
+      names.add(modelName);
+    }
+    return Array.from(names).sort((a, b) => a.localeCompare(b));
+  }, [providers, getAvailableModels, editModels]);
 
   const customSkillItems = availableSkills.filter((skill) => skill.source === 'custom');
   const builtinSkillItems = availableSkills.filter((skill) => skill.source === 'builtin');
@@ -389,6 +416,40 @@ const AssistantEditDrawer: React.FC<AssistantEditDrawerProps> = ({
                 </Select.Option>
               ))}
             </Select>
+          </div>
+
+          {/* Preferred models — orchestration treats the assistant as a role and
+              prefers these models within the user's configured range. Optional;
+              empty means no preference. Built-in assistants only persist their
+              Main Agent override, so this picker renders read-only for them. */}
+          <div className='flex-shrink-0'>
+            <Typography.Text bold>
+              {t('settings.assistantPreferredModels', { defaultValue: '偏好模型（可选）' })}
+            </Typography.Text>
+            <NomiSelect
+              mode='multiple'
+              className='mt-10px w-full'
+              value={editModels}
+              onChange={(value) => setEditModels(value as string[])}
+              disabled={isBuiltin}
+              allowClear
+              showSearch
+              placeholder={t('settings.assistantPreferredModelsPlaceholder', {
+                defaultValue: '该角色编排时优先在范围内选用的模型',
+              })}
+              notFoundContent={
+                <div className='text-center text-t-secondary text-12px py-8px'>
+                  {t('settings.noAvailableModels', { defaultValue: 'No available models' })}
+                </div>
+              }
+              data-testid='select-assistant-preferred-models'
+            >
+              {availableModelNames.map((modelName) => (
+                <NomiSelect.Option key={modelName} value={modelName}>
+                  {modelName}
+                </NomiSelect.Option>
+              ))}
+            </NomiSelect>
           </div>
 
           {/* Summary */}

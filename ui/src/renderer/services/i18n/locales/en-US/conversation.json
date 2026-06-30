@@ -19,6 +19,14 @@
     "skillsMarketDesc": "Search and activate community Skills on demand. Configure once, available for all agents.",
     "skillsMarketDetails": "View More >>"
   },
+  "orchestration": {
+    "panelTitle": "Orchestration",
+    "startTitle": "Start orchestration",
+    "planning": "Planning…",
+    "collapseCanvas": "Collapse orchestration canvas",
+    "expandCanvas": "Expand orchestration canvas",
+    "resizeCanvas": "Resize canvas"
+  },
   "history": {
     "noHistory": "No chat history",
     "deleteTitle": "Delete",

@@ -63,6 +63,12 @@ const GuidPage: React.FC = () => {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerMode, setDrawerMode] = useState<'assistant' | 'skills'>('assistant');
 
+  // --- Orchestration mode (homepage 智能编排 on-ramp) ---
+  // When on, the composer's send button starts a conversation-hosted
+  // orchestration run instead of a normal chat send. Mutually exclusive with
+  // the「召唤助手」preset-agent flow (toggling one resets the other).
+  const [orchestrationMode, setOrchestrationMode] = useState(false);
+
   // --- Skills state ---
   // All available skills (builtin auto-injected + user-imported custom) merged
   // into one catalog for the action-row menu. Auto-injected skills default to
@@ -193,6 +199,9 @@ const GuidPage: React.FC = () => {
     applyAdvancedConfig: advancedConfig.applyToConversation,
     autoWork: advancedConfig.autoWork,
 
+    // Orchestration entry
+    orchestrationMode,
+
     // Mention state reset
     setMentionOpen: mention.setMentionOpen,
     setMentionQuery: mention.setMentionQuery,
@@ -301,6 +310,7 @@ const GuidPage: React.FC = () => {
 
   const handleSelectAgentFromPillBar = useCallback(
     (key: string) => {
+      setOrchestrationMode(false);
       agentSelection.setSelectedAgentKey(key);
       mention.setMentionOpen(false);
       mention.setMentionQuery(null);
@@ -318,6 +328,7 @@ const GuidPage: React.FC = () => {
 
   const handleSelectAssistant = useCallback(
     (assistantId: string) => {
+      setOrchestrationMode(false);
       agentSelection.setSelectedAgentKey(assistantId);
       mention.setMentionOpen(false);
       mention.setMentionQuery(null);
@@ -391,6 +402,7 @@ const GuidPage: React.FC = () => {
     guidInput.setInput('');
     guidInput.setFiles([]);
     guidInput.setLoading(false);
+    setOrchestrationMode(false);
     if (!(location.state as { workspace?: string } | null)?.workspace) {
       guidInput.setDir('');
     }
@@ -518,7 +530,7 @@ const GuidPage: React.FC = () => {
     />
   );
 
-  // Build the model selector node
+  // Build the model selector node — a plain single-select model picker.
   const modelSelectorNode = (
     <GuidModelSelector
       isGeminiMode={isGeminiMode}
@@ -585,9 +597,14 @@ const GuidPage: React.FC = () => {
       onToggleMcpServer={handleToggleMcpServer}
       hidePresetTag
       loading={guidInput.loading}
-      autoWorkMode={isAutoWorkMode}
+      autoWorkMode={isAutoWorkMode && !orchestrationMode}
+      orchestrationMode={orchestrationMode}
       isButtonDisabled={
-        isAutoWorkMode ? autoWorkStartDisabled(guidInput.loading, advancedConfig.autoWork) : send.isButtonDisabled
+        // 智能编排 takes precedence over AutoWork: orchestration needs a typed goal,
+        // so it always uses the normal send-disabled (typed-input) predicate.
+        isAutoWorkMode && !orchestrationMode
+          ? autoWorkStartDisabled(guidInput.loading, advancedConfig.autoWork)
+          : send.isButtonDisabled
       }
       onSend={send.sendMessageHandler}
     />
@@ -675,9 +692,19 @@ const GuidPage: React.FC = () => {
                   isPresetAgent={agentSelection.is_presetAgent}
                   assistantLabel={heroTitle !== t('conversation.welcome.title') ? heroTitle : undefined}
                   assistantAvatar={selectedAssistantAvatar ?? undefined}
-                  onSummon={() => { setDrawerMode('assistant'); setDrawerOpen(true); }}
+                  onSummon={() => { setOrchestrationMode(false); setDrawerMode('assistant'); setDrawerOpen(true); }}
                   onAdjustSkills={handleOpenSkillsDrawer}
-                  onFree={() => agentSelection.setSelectedAgentKey(agentSelection.defaultAgentKey)}
+                  onFree={() => { setOrchestrationMode(false); agentSelection.setSelectedAgentKey(agentSelection.defaultAgentKey); }}
+                  onOrchestrate={() =>
+                    setOrchestrationMode((prev) => {
+                      const next = !prev;
+                      // Mutually exclusive with the summon flow — drop back to the
+                      // default (free) agent when entering orchestration mode.
+                      if (next) agentSelection.setSelectedAgentKey(agentSelection.defaultAgentKey);
+                      return next;
+                    })
+                  }
+                  isOrchestrationMode={orchestrationMode}
                   activeSkillCount={activeSkillCount}
                   activeSkills={activeSkills}
                 />
@@ -713,7 +740,7 @@ const GuidPage: React.FC = () => {
           assistants={agentSelection.assistants}
           localeKey={localeKey}
           onSelectAssistant={(id) => { handleSelectAssistant(`custom:${id}`); setDrawerOpen(false); }}
-          onFree={() => { agentSelection.setSelectedAgentKey(agentSelection.defaultAgentKey); setDrawerOpen(false); }}
+          onFree={() => { setOrchestrationMode(false); agentSelection.setSelectedAgentKey(agentSelection.defaultAgentKey); setDrawerOpen(false); }}
           allSkills={allSkills}
           enabledSkills={guidEnabledSkills ?? []}
           disabledBuiltinSkills={guidDisabledBuiltinSkills ?? []}

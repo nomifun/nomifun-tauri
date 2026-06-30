@@ -5356,6 +5356,7 @@ dependencies = [
  "nomifun-mcp",
  "nomifun-net",
  "nomifun-office",
+ "nomifun-orchestrator",
  "nomifun-public",
  "nomifun-realtime",
  "nomifun-requirement",
@@ -5363,7 +5364,6 @@ dependencies = [
  "nomifun-secret",
  "nomifun-shell",
  "nomifun-system",
- "nomifun-team",
  "nomifun-terminal",
  "nomifun-webhook",
  "reqwest 0.12.28",
@@ -5684,6 +5684,7 @@ dependencies = [
  "nomi-types",
  "nomifun-ai-agent",
  "nomifun-api-types",
+ "nomifun-assistant",
  "nomifun-channel",
  "nomifun-common",
  "nomifun-companion",
@@ -5695,6 +5696,7 @@ dependencies = [
  "nomifun-idmm",
  "nomifun-knowledge",
  "nomifun-mcp",
+ "nomifun-orchestrator",
  "nomifun-requirement",
  "nomifun-secret",
  "nomifun-shell",
@@ -5820,6 +5822,32 @@ dependencies = [
  "tokio",
  "tracing",
  "which 7.0.3",
+]
+
+[[package]]
+name = "nomifun-orchestrator"
+version = "0.1.10"
+dependencies = [
+ "async-trait",
+ "axum",
+ "dashmap",
+ "futures",
+ "nomifun-ai-agent",
+ "nomifun-api-types",
+ "nomifun-auth",
+ "nomifun-common",
+ "nomifun-conversation",
+ "nomifun-db",
+ "nomifun-file",
+ "nomifun-realtime",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]
@@ -5968,32 +5996,6 @@ dependencies = [
  "tower",
  "tracing",
  "wiremock",
-]
-
-[[package]]
-name = "nomifun-team"
-version = "0.1.10"
-dependencies = [
- "agent-client-protocol",
- "async-trait",
- "axum",
- "dashmap",
- "futures-util",
- "nomifun-ai-agent",
- "nomifun-api-types",
- "nomifun-auth",
- "nomifun-common",
- "nomifun-conversation",
- "nomifun-db",
- "nomifun-realtime",
- "regex",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sqlx",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
 ]
 
 [[package]]

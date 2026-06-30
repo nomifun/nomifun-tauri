@@ -30,6 +30,13 @@ nomifun-db.workspace = true
 nomifun-terminal.workspace = true
 nomifun-idmm.workspace = true
 nomifun-knowledge.workspace = true
+# 助手 (assistants) service: caps_orchestrator folds each ENABLED assistant's
+# persona/skills/model into the run's fleet snapshot (P4 Task 2). Dependency
+# direction gateway → nomifun-assistant only (no cycle — assistant does not dep gateway).
+nomifun-assistant.workspace = true
+# 智能编排 (orchestration) Run control-plane: RunService (create/plan/inspect/cancel)
+# + RunEngine (serial execution loop) backing the caps_orchestrator gateway tools.
+nomifun-orchestrator.workspace = true
 # System domain capabilities (settings / client preferences / providers / model fetch).
 nomifun-system.workspace = true
 # Channel domain capabilities (IM bot plugins / pairing / users / companion binding).

@@ -1,0 +1,182 @@
+/**
+ * @license
+ * Copyright 2025-2026 NomiFun (nomifun.com)
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/* OrchestratorComposer — chat-style composer aligned with the conversation
+ * page's GuidInputCard. Tokens mirror guid/index.module.css's `.guidLayout`
+ * (800px centered) + `.guidInputInner` (rd-24 inner card) + `.actionSubmit`
+ * (transparent sendbox-model-btn pills). All colors go through CSS variables
+ * to protect the 5 themes. */
+
+/* 800px centered column — mirrors `.guidLayout`. */
+.composerLayout {
+  width: clamp(var(--app-min-width, 360px), calc(100% - 32px), 800px);
+  max-width: 100%;
+  margin: 0 auto;
+  box-sizing: border-box;
+}
+
+/* Fluid variant — drops the 800px centered clamp so the composer fills its
+ * container width. Used by the narrow conversation right-rail (F5 编排 tab),
+ * where the centered column would overflow / waste the ~300-360px rail. Opt-in
+ * via the `fluid` prop; the default (`.composerLayout` only) is unchanged. */
+.composerLayoutFluid {
+  width: 100%;
+  margin: 0;
+}
+
+/* Outer wrap — the `--bg-2` tinted shell around the inner card (mirrors
+ * `.guidInputCardWrap`). */
+.composerWrap {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg-2);
+  border-radius: 24px;
+  transition: box-shadow 0.25s ease;
+}
+
+/* Inner card — the rd-24 white card (mirrors `.guidInputInner`): bg-base +
+ * 1px border-3, focus border/shadow driven by useInputFocusRing inline. */
+.composerInner {
+  background: var(--bg-base, #fff);
+  border: 1px solid var(--color-border-3);
+  border-radius: 24px;
+  box-sizing: border-box;
+  transition:
+    box-shadow 0.25s ease,
+    border-color 0.25s ease;
+}
+
+:global([data-theme='dark']) .composerInner {
+  background: #262626;
+  border-color: #3a3a3a;
+}
+
+/* Small primary-tinted label strip at the top of the inner card (e.g. 「新建
+ * 编排」/「调整编排」). */
+.composerLabel {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: rgb(var(--primary-6));
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+/* TextArea — transparent, borderless, no resize (autoSize handles growth). */
+.composerTextarea {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  resize: none !important;
+  padding: 0 4px !important;
+  font-size: 14px;
+}
+
+.composerTextarea :global(textarea::placeholder) {
+  color: #b4b5bc !important;
+  opacity: 1 !important;
+}
+
+/* Bottom toolbar — model/autonomy pills on the right, send button at the far
+ * right (mirrors `.actionRow` / `.actionSubmit`). */
+.composerToolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  width: 100%;
+}
+
+/* Pills blend into the card surface, exactly like `.actionSubmit
+ * .sendbox-model-btn` on the home composer. */
+.composerToolbar :global(.sendbox-model-btn),
+.composerToolbar :global(.sendbox-model-btn:hover),
+.composerToolbar :global(.sendbox-model-btn:active),
+.composerToolbar :global(.sendbox-model-btn:focus),
+.composerToolbar :global(.sendbox-model-btn:focus-visible) {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  color: var(--text-secondary) !important;
+}
+
+.composerToolbar :global(.sendbox-model-btn:hover),
+.composerToolbar :global(.sendbox-model-btn:active),
+.composerToolbar :global(.sendbox-model-btn:focus),
+.composerToolbar :global(.sendbox-model-btn:focus-visible) {
+  color: var(--text-primary) !important;
+}
+
+/* Popover panel for the model-range + autonomy pickers — rounded card on
+ * bg-base, mirroring the home model dropdown's `min-w-260px bg-1 rounded-8px`. */
+.composerPopover {
+  width: min(320px, calc(100vw - 32px));
+  box-sizing: border-box;
+  border-radius: 12px;
+  background: var(--bg-base, #fff);
+  border: 1px solid var(--color-border-2);
+  box-shadow:
+    0 10px 32px rgba(0, 0, 0, 0.1),
+    0 2px 6px rgba(0, 0, 0, 0.06);
+  padding: 12px;
+  overflow: hidden;
+}
+
+:global([data-theme='dark']) .composerPopover {
+  background: #262626;
+  border-color: #3a3a3a;
+}
+
+.composerPopoverTitle {
+  color: var(--color-text-1);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+/* Segmented mode track (auto/single/range, interactive/supervised) — mirrors
+ * KnowledgeControl's tinted track + primary active pill. */
+.composerSegment {
+  display: inline-flex;
+  width: fit-content;
+  gap: 2px;
+  border-radius: 8px;
+  padding: 2px;
+  background: var(--color-fill-2);
+}
+
+.composerSegmentItem {
+  border-radius: 6px;
+  padding: 4px 10px;
+  border: 1px solid transparent;
+  color: var(--color-text-1);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.composerSegmentItem:hover {
+  background: var(--color-fill-3);
+}
+
+.composerSegmentItemActive,
+.composerSegmentItemActive:hover {
+  color: rgb(var(--primary-6));
+  font-weight: 600;
+  background: color-mix(in srgb, rgb(var(--primary-6)) 12%, transparent);
+  border-color: color-mix(in srgb, rgb(var(--primary-6)) 28%, transparent);
+}
+
+.composerHint {
+  color: var(--color-text-2);
+  font-size: 11px;
+  line-height: 16px;
+}

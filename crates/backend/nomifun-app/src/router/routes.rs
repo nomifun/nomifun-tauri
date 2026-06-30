@@ -27,11 +27,11 @@ use nomifun_idmm::idmm_routes;
 use nomifun_knowledge::knowledge_routes;
 use nomifun_mcp::mcp_routes;
 use nomifun_office::{office_proxy_routes, office_routes};
+use nomifun_orchestrator::orchestrator_routes;
 use nomifun_realtime::{WsHandlerState, ws_upgrade_handler};
 use nomifun_requirement::requirement_routes;
 use nomifun_shell::shell_routes;
 use nomifun_system::{connection_test_routes, system_routes};
-use nomifun_team::team_routes;
 use nomifun_terminal::terminal_routes;
 use nomifun_webhook::webhook_routes;
 
@@ -123,6 +123,19 @@ pub async fn create_router(services: &AppServices) -> Router {
         client_pref_repo: Arc::new(nomifun_db::SqliteClientPreferenceRepository::new(
             services.database.pool().clone(),
         )),
+        // 智能编排 Run control-plane: the SAME router-state instances the REST
+        // routes + the boot-resume use, so a gateway-created run and a UI-created
+        // run act on identical state and the gateway's `start()` registers against
+        // the same in-memory handle map the REST cancel/boot-resume drive.
+        // `RunEngine` is value-Clone (Arc internals); wrap in Arc per Task 7's
+        // field type so the gateway holds the one live instance.
+        orchestrator_run_service: states.orchestrator.run_service.clone(),
+        orchestrator_run_engine: Arc::new(states.orchestrator.engine.clone()),
+        // 助手 (assistants): the SAME service instance the `/api/assistants` routes
+        // use, so the caps_orchestrator layer reads the exact assistants (+ their
+        // enabled/override state) the UI shows when folding them into a run's fleet
+        // snapshot (P4 Task 2).
+        assistant_service: states.assistant.service.clone(),
         // P3-GW1 (route A): per-companion browser tool registry, lives in this
         // (main) process. Feature-gated — `None` would mean "browser tools not
         // available", but when the feature is on we always wire it so remote
@@ -340,10 +353,6 @@ pub fn create_router_with_all_state(
     let channel_authenticated = channel_routes(states.channel)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
-    // Team routes protected by auth middleware
-    let team_authenticated = team_routes(states.team)
-        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
-
     // Cron routes protected by auth middleware
     let cron_authenticated = cron_routes(states.cron)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -366,6 +375,10 @@ pub fn create_router_with_all_state(
 
     // Webhook + tag-settings routes protected by auth middleware
     let webhook_authenticated = webhook_routes(states.webhook)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
+    // 智能编排 (orchestration) fleet + workspace CRUD routes protected by auth middleware
+    let orchestrator_authenticated = orchestrator_routes(states.orchestrator)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // P3-X2: per-pet browser-use credential secret routes protected by auth middleware
@@ -477,13 +490,13 @@ pub fn create_router_with_all_state(
         .merge(hub_authenticated)
         .merge(skill_authenticated)
         .merge(channel_authenticated)
-        .merge(team_authenticated)
         .merge(cron_authenticated)
         .merge(requirement_authenticated)
         .merge(idmm_authenticated)
         .merge(companion_authenticated)
         .merge(knowledge_authenticated)
         .merge(webhook_authenticated)
+        .merge(orchestrator_authenticated)
         .merge(secret_authenticated)
         .merge(terminal_authenticated)
         .merge(office_authenticated)

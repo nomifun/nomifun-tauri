@@ -64,12 +64,9 @@ pub struct RelocationMarker {
 }
 
 /// Text columns rewritten with plain prefix replacement.
-const TEXT_COLUMN_REWRITES: [(&str, &str); 3] = [
+const TEXT_COLUMN_REWRITES: [(&str, &str); 2] = [
     ("knowledge_bases", "root_path"),
     ("terminal_sessions", "cwd"),
-    // Team shared-workspace directory (001_initial_schema.sql `teams`),
-    // stores an absolute path under `{data_dir}/conversations/...`.
-    ("teams", "workspace"),
 ];
 
 /// One-shot, idempotent, never-fails-the-boot. See module docs.
@@ -296,23 +293,6 @@ mod tests {
             .unwrap()
     }
 
-    async fn insert_team(pool: &nomifun_db::SqlitePool, id: &str, workspace: &str) {
-        sqlx::query("INSERT INTO teams (id, name, workspace, created_at, updated_at) VALUES (?, 't', ?, 0, 0)")
-            .bind(id)
-            .bind(workspace)
-            .execute(pool)
-            .await
-            .unwrap();
-    }
-
-    async fn team_workspace(pool: &nomifun_db::SqlitePool, id: &str) -> String {
-        sqlx::query_scalar("SELECT workspace FROM teams WHERE id = ?")
-            .bind(id)
-            .fetch_one(pool)
-            .await
-            .unwrap()
-    }
-
     #[tokio::test]
     async fn rewrites_both_separator_spellings_without_collateral() {
         let db = nomifun_db::init_database_memory().await.unwrap();
@@ -371,24 +351,6 @@ mod tests {
 
         assert_eq!(terminal_cwd(pool, 1).await, format!(r"{NEW}\conversations\conv_9"));
         assert_eq!(terminal_cwd(pool, 2).await, r"C:\repos\work");
-    }
-
-    /// P6: `teams.workspace` stores the team's shared-workspace absolute path
-    /// and must relocate with everything else.
-    #[tokio::test]
-    async fn rewrites_team_workspace() {
-        let db = nomifun_db::init_database_memory().await.unwrap();
-        let pool = db.pool();
-
-        insert_team(pool, "team_1", &format!(r"{OLD}\conversations\team_ws")).await;
-        insert_team(pool, "team_keep", r"D:\projects\elsewhere").await;
-        insert_team(pool, "team_empty", "").await;
-
-        rewrite_path_prefixes(pool, OLD, NEW).await.unwrap();
-
-        assert_eq!(team_workspace(pool, "team_1").await, format!(r"{NEW}\conversations\team_ws"));
-        assert_eq!(team_workspace(pool, "team_keep").await, r"D:\projects\elsewhere");
-        assert_eq!(team_workspace(pool, "team_empty").await, "");
     }
 
     /// P4: Windows paths are case-insensitive — a row whose stored prefix

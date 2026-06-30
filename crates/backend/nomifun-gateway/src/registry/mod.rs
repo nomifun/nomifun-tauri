@@ -60,6 +60,7 @@ impl Registry {
         //      wire it in nomifun-app/src/router/routes.rs::inject_gateway_deps.
         // Adding a tool to an EXISTING domain is just one more `out.push(...)` — no wiring.
         crate::caps_memory::register(&mut caps);
+        crate::caps_orchestrator::register(&mut caps);
         crate::caps_confirmation::register(&mut caps);
         crate::caps_conversation::register(&mut caps);
         crate::caps_provider::register(&mut caps);
@@ -284,8 +285,8 @@ mod tests {
     fn registry_capability_count_floor() {
         let n = Registry::global().len();
         assert!(
-            n >= 132,
-            "capability count fell to {n} (floor 132) — a caps_* module may have lost its \
+            n >= 135,
+            "capability count fell to {n} (floor 135) — a caps_* module may have lost its \
              register() call in Registry::build(), or a domain was removed. If intentional, lower the floor."
         );
     }

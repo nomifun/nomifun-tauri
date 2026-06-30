@@ -132,6 +132,18 @@ pub(super) async fn build(
         knowledge_write_enabled,
     );
 
+    // Orchestration lead (会话 entry "auto/range" models → extra.orchestrator_role
+    // == "lead"): prepend the server-authored 编排主管 system prompt so the
+    // conversation decomposes complex requirements via `nomi_run_create`. Composed
+    // LAST so the 主管 prompt leads, with the full preset/persona/knowledge prompt
+    // preserved after the separator. Tool availability is NOT granted here — the
+    // orchestration tools ride the independently-gated desktop gateway; a
+    // client-supplied role can only shape the prompt, never self-authorize tools.
+    overrides.system_prompt = compose_lead_prompt(
+        overrides.system_prompt.take(),
+        overrides.orchestrator_role.as_deref(),
+    );
+
     // Companion-owned sessions (local 桌面伙伴 chat + IM channel master) must
     // reply in the app's UI language, not a hardcoded one. The companion persona
     // prompt no longer forces a language (see
@@ -343,20 +355,22 @@ pub(super) async fn build(
         context_limit: fields.context_limit.map(|v| v as u64),
         compat_overrides: fields.compat_overrides,
         session_directory,
-        // Companion-owned sessions (local 桌面伙伴 chat + IM channel master) have NO
-        // interactive approval UI: the companion chat panel deliberately omits the
-        // permission/confirmation flow and remote channel users can't confirm either.
-        // Under SessionMode::Default the first gateway/file/bash tool call parks on
-        // rx.await forever → the turn never emits finish/error → 聊天永久「思考中」.
-        // So pin "yolo" ONLY for those UI-less surfaces (companion thread or channel
-        // master). A PLAIN desktop conversation that carries the gateway keeps its
-        // normal approval mode — it has an approval UI, and the gateway's own
-        // danger-tier × surface confirm-gate guards destructive/sensitive ops there.
-        // An explicit extra.session_mode still wins. (Decoupled from `desktop_gateway`
-        // so "any session is a super-gateway" does not also mean "any session is yolo".)
-        session_mode: overrides.session_mode.clone().or_else(|| {
-            (overrides.companion || overrides.channel_platform.is_some()).then(|| "yolo".to_owned())
-        }),
+        // 默认授权模式 = 全自动（yolo）。产品决策：所有 nomi 会话默认自动批准
+        // 标准工具类别（info/edit/exec/mcp —— 文件编辑 / Shell / 标准工具 & MCP），
+        // 不再反复弹授权框。理由：
+        //  - companion / IM channel master 本就无审批 UI（其首个 gateway/file/bash
+        //    工具调用会 park 在 rx.await，turn 永不 finish → 聊天永久「思考中」），
+        //    所以它们历来必须 yolo；现在把这一默认推广到普通桌面会话。
+        //  - **显式 `extra.session_mode` 仍胜出**：用户在权限选择器里手动降级为
+        //    `default` / `auto_edit` 会写偏好并经 extra 传入，这里的 `.or_else` 让显式值
+        //    优先，降级正常生效。
+        //  - 高危逃生舱（browser full-power 跨域 / takeover / 跨域 POST 审批 /
+        //    computer-use 桌面控制）各自读 `read_bool_pref`、**绝不看 session_mode**
+        //    （不变量⑧），与本默认正交、保持原状 —— yolo 不会放开它们。
+        session_mode: overrides
+            .session_mode
+            .clone()
+            .or_else(|| Some("yolo".to_owned())),
         extra_mcp_servers,
         bedrock_config: fields.bedrock_config,
         computer_use: overrides.computer_use.unwrap_or(computer_use_default),
@@ -573,6 +587,36 @@ fn append_knowledge_context(
         (base, None) => base,
         (None, section) => section,
     }
+}
+
+/// Server-authored 编排主管 (orchestration lead) system prompt. Injected when a
+/// conversation carries `extra.orchestrator_role == "lead"` (会话 entry with
+/// "auto/range" models selected). The available-model range and working
+/// directory are supplied to the orchestration tools at runtime, so the prompt
+/// instructs the lead not to ask for them. Kept as a `const` so the composition
+/// is unit-testable without standing up the async factory.
+pub(crate) const LEAD_ORCHESTRATOR_PROMPT: &str = "你是 NomiFun 的编排主管。用户已在本会话限定可用模型范围（见运行上下文）。对简单或单步需求：直接作答。对复杂、可拆分为多个并行/有依赖子任务的需求：调用工具 `nomi_run_create(goal)` 把需求拆成任务 DAG 并行执行（模型范围与工作目录会自动取用），随后用 `nomi_run_status`/`nomi_run_result` 跟进并向用户汇报进展与产出。不要询问 workspace 或 fleet——它们已不存在。";
+
+/// Compose the 主管 system prompt onto whatever base prompt the assembly has
+/// produced (preset rules + companion persona + knowledge context), when the
+/// conversation is the orchestration lead.
+///
+/// - `role == Some("lead")`: prepend [`LEAD_ORCHESTRATOR_PROMPT`], then the base
+///   (if any) after a blank-line separator. Composition, NOT replacement — no
+///   preset/persona/knowledge content is discarded.
+/// - any other role (or `None`): return `base` unchanged (no 主管 injection).
+///
+/// Pure and side-effect-free so the lead path is testable in isolation.
+pub(crate) fn compose_lead_prompt(base: Option<String>, role: Option<&str>) -> Option<String> {
+    if role != Some("lead") {
+        return base;
+    }
+    Some(match base {
+        Some(existing) if !existing.is_empty() => {
+            format!("{LEAD_ORCHESTRATOR_PROMPT}\n\n{existing}")
+        }
+        _ => LEAD_ORCHESTRATOR_PROMPT.to_owned(),
+    })
 }
 
 /// Map Nomi DB platform name to the nomi provider identifier.
@@ -1013,7 +1057,7 @@ fn gateway_mcp_to_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nomifun_api_types::{GuideMcpConfig, TeamMcpStdioConfig};
+    use nomifun_api_types::GuideMcpConfig;
 
     // ----- companion reply-language directive (the 用中文 bug fix) -----
 
@@ -1380,15 +1424,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_mcp_servers_ignores_team_and_guide_configs() {
+    fn resolve_mcp_servers_ignores_guide_configs() {
         let overrides = NomiBuildExtra {
-            team_mcp_stdio_config: Some(TeamMcpStdioConfig {
-                team_id: "team-42".into(),
-                port: 9000,
-                token: "tok".into(),
-                slot_id: "slot-1".into(),
-                binary_path: "/usr/bin/backend".into(),
-            }),
             guide_mcp_config: Some(GuideMcpConfig {
                 port: 8000,
                 token: "guide-tok".into(),
@@ -1593,6 +1630,56 @@ mod tests {
         }
 
         assert_eq!(overrides.system_prompt.as_deref(), Some("Be concise."));
+    }
+
+    #[test]
+    fn compose_lead_prompt_prepends_supervisor_prompt_for_lead() {
+        // lead role → 主管 prompt is prepended and composed with the existing
+        // base (preset/persona/knowledge), not discarded.
+        let composed =
+            compose_lead_prompt(Some("Be concise.".to_owned()), Some("lead")).expect("some prompt");
+        assert!(
+            composed.contains("编排主管"),
+            "lead prompt must carry the distinctive 主管 marker: {composed}"
+        );
+        assert!(
+            composed.contains("nomi_run_create"),
+            "lead prompt must name the orchestration tool: {composed}"
+        );
+        // Composition, not replacement: the provided base survives.
+        assert!(
+            composed.contains("Be concise."),
+            "existing base prompt must be preserved: {composed}"
+        );
+        // The 主管 prompt comes first, then the base after a separator.
+        let idx_lead = composed.find("编排主管").unwrap();
+        let idx_base = composed.find("Be concise.").unwrap();
+        assert!(idx_lead < idx_base, "主管 prompt must precede the base");
+    }
+
+    #[test]
+    fn compose_lead_prompt_with_no_base_is_just_supervisor_prompt() {
+        let composed = compose_lead_prompt(None, Some("lead")).expect("some prompt");
+        assert!(composed.contains("编排主管"));
+        assert_eq!(composed, LEAD_ORCHESTRATOR_PROMPT);
+    }
+
+    #[test]
+    fn compose_lead_prompt_non_lead_is_passthrough() {
+        // Non-lead role (None / other) returns the base verbatim — no 主管 prompt.
+        assert_eq!(
+            compose_lead_prompt(Some("Be concise.".to_owned()), None),
+            Some("Be concise.".to_owned())
+        );
+        let other = compose_lead_prompt(Some("Be concise.".to_owned()), Some("member"));
+        assert_eq!(other.as_deref(), Some("Be concise."));
+        assert!(
+            !other.unwrap().contains("编排主管"),
+            "non-lead must NOT carry the 主管 prompt"
+        );
+        // Non-lead with no base stays None (no injection).
+        assert_eq!(compose_lead_prompt(None, None), None);
+        assert_eq!(compose_lead_prompt(None, Some("member")), None);
     }
 
     #[test]

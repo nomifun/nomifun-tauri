@@ -319,4 +319,21 @@ fn remote_surface_projection_is_correct() {
         !channel.contains(&"nomi_delete_conversation"),
         "Destructive tools are hard-denied (hidden) on the Channel surface"
     );
+
+    // Orchestration is a DESKTOP master-agent feature (the lead conversation runs
+    // on a trusted desktop session). Its tools must be DESKTOP-only: visible there
+    // (the lead's nomi_run_create must keep working) but ABSENT from the external
+    // Remote front door (a Remote companion is never a lead, and the run reads take
+    // a bare run_id with no ownership predicate). Hard-denied on Remote via
+    // `deny_on(Surface::Remote)`, so they are neither advertised nor dispatchable.
+    for name in ["nomi_run_create", "nomi_run_status", "nomi_run_result"] {
+        assert!(
+            desktop.contains(&name),
+            "orchestrator tool '{name}' must remain visible on the Desktop surface (the lead)"
+        );
+        assert!(
+            !remote.contains(&name),
+            "orchestrator tool '{name}' must NOT be exposed on the external Remote surface"
+        );
+    }
 }

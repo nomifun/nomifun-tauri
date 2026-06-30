@@ -413,6 +413,9 @@ mod tests {
         assert!(names.contains(&"nomi_cron_create"));
         assert!(names.contains(&"nomi_requirement_create"));
         assert!(names.contains(&"nomi_knowledge_list_bases"));
+        // The desktop default (work) profile must expose orchestration so the
+        // lead/main agent can spin up multi-agent runs (Direction B: 智能编排).
+        assert!(names.contains(&"nomi_run_create"));
         assert!(!names.contains(&"nomi_system_update_settings"));
         assert!(!names.contains(&"nomi_mcp_add_server"));
     }

@@ -26,7 +26,6 @@ nomifun-mcp = { path = "crates/backend/nomifun-mcp" }
 nomifun-conversation = { path = "crates/backend/nomifun-conversation" }
 nomifun-extension = { path = "crates/backend/nomifun-extension" }
 nomifun-channel = { path = "crates/backend/nomifun-channel" }
-nomifun-team = { path = "crates/backend/nomifun-team" }
 nomifun-cron = { path = "crates/backend/nomifun-cron" }
 nomifun-requirement = { path = "crates/backend/nomifun-requirement" }
 nomifun-idmm = { path = "crates/backend/nomifun-idmm" }
@@ -35,6 +34,7 @@ nomifun-companion = { path = "crates/backend/nomifun-companion" }
 nomifun-gateway = { path = "crates/backend/nomifun-gateway" }
 nomifun-public = { path = "crates/backend/nomifun-public" }
 nomifun-webhook = { path = "crates/backend/nomifun-webhook" }
+nomifun-orchestrator = { path = "crates/backend/nomifun-orchestrator" }
 nomifun-terminal = { path = "crates/backend/nomifun-terminal" }
 nomifun-assistant = { path = "crates/backend/nomifun-assistant" }
 nomifun-secret = { path = "crates/backend/nomifun-secret" }

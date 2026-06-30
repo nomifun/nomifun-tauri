@@ -37,6 +37,7 @@ impl ProviderService {
         let models_json = serialize_json(&req.models, "models")?;
         let capabilities_json = serialize_json(&req.capabilities, "capabilities")?;
         let model_protocols_json = serialize_opt(&req.model_protocols, "model_protocols")?;
+        let model_descriptions_json = serialize_opt(&req.model_descriptions, "model_descriptions")?;
         let model_enabled_json = serialize_opt(&req.model_enabled, "model_enabled")?;
         let model_health_json = serialize_opt(&req.model_health, "model_health")?;
         let bedrock_json = serialize_opt(&req.bedrock_config, "bedrock_config")?;
@@ -53,6 +54,7 @@ impl ProviderService {
             capabilities: &capabilities_json,
             context_limit: req.context_limit,
             model_protocols: model_protocols_json.as_deref(),
+            model_descriptions: model_descriptions_json.as_deref(),
             model_enabled: model_enabled_json.as_deref(),
             model_health: model_health_json.as_deref(),
             bedrock_config: bedrock_json.as_deref(),
@@ -75,6 +77,7 @@ impl ProviderService {
         let models_json = serialize_opt(&req.models, "models")?;
         let capabilities_json = serialize_opt(&req.capabilities, "capabilities")?;
         let model_protocols_json = serialize_opt(&req.model_protocols, "model_protocols")?;
+        let model_descriptions_json = serialize_opt(&req.model_descriptions, "model_descriptions")?;
         let model_enabled_json = serialize_opt(&req.model_enabled, "model_enabled")?;
         let model_health_json = serialize_opt(&req.model_health, "model_health")?;
         let bedrock_json = serialize_opt(&req.bedrock_config, "bedrock_config")?;
@@ -89,6 +92,7 @@ impl ProviderService {
             capabilities: capabilities_json.as_deref(),
             context_limit: req.context_limit.map(Some),
             model_protocols: model_protocols_json.as_ref().map(|s| Some(s.as_str())),
+            model_descriptions: model_descriptions_json.as_ref().map(|s| Some(s.as_str())),
             model_enabled: model_enabled_json.as_ref().map(|s| Some(s.as_str())),
             model_health: model_health_json.as_ref().map(|s| Some(s.as_str())),
             bedrock_config: bedrock_json.as_ref().map(|s| Some(s.as_str())),
@@ -124,6 +128,8 @@ impl ProviderService {
             .map_err(|e| AppError::Internal(format!("Failed to parse capabilities JSON: {e}")))?;
         let model_protocols: Option<HashMap<String, String>> =
             deserialize_opt(&row.model_protocols, "model_protocols")?;
+        let model_descriptions: Option<HashMap<String, String>> =
+            deserialize_opt(&row.model_descriptions, "model_descriptions")?;
         let model_enabled: Option<HashMap<String, bool>> = deserialize_opt(&row.model_enabled, "model_enabled")?;
         let model_health = deserialize_opt(&row.model_health, "model_health")?;
         let bedrock_config = deserialize_opt(&row.bedrock_config, "bedrock_config")?;
@@ -139,6 +145,7 @@ impl ProviderService {
             capabilities,
             context_limit: row.context_limit,
             model_protocols,
+            model_descriptions,
             model_enabled,
             model_health,
             bedrock_config,
@@ -290,6 +297,7 @@ mod tests {
             capabilities: vec![],
             context_limit: None,
             model_protocols: None,
+            model_descriptions: None,
             model_enabled: None,
             model_health: None,
             bedrock_config: None,
@@ -557,6 +565,46 @@ mod tests {
         // And persist through a fresh read.
         let all = svc.list().await.unwrap();
         assert_eq!(all[0].model_enabled.as_ref().and_then(|m| m.get("gpt-4")), Some(&true));
+    }
+
+    #[tokio::test]
+    async fn create_and_update_round_trips_model_descriptions() {
+        use std::collections::HashMap;
+        let svc = setup().await;
+
+        // create with a model description map
+        let req = CreateProviderRequest {
+            model_descriptions: Some(HashMap::from([("m1".into(), "擅长前端".into())])),
+            ..sample_create_request()
+        };
+        let created = svc.create(req).await.unwrap();
+        assert_eq!(
+            created.model_descriptions.as_ref().and_then(|m| m.get("m1")),
+            Some(&"擅长前端".to_string())
+        );
+
+        // persists through a fresh read (row_to_response decode path)
+        let all = svc.list().await.unwrap();
+        assert_eq!(
+            all[0].model_descriptions.as_ref().and_then(|m| m.get("m1")),
+            Some(&"擅长前端".to_string())
+        );
+
+        // update changes the description
+        let updated = svc
+            .update(
+                &created.id,
+                UpdateProviderRequest {
+                    model_descriptions: Some(HashMap::from([("m1".into(), "擅长后端".into())])),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            updated.model_descriptions.as_ref().and_then(|m| m.get("m1")),
+            Some(&"擅长后端".to_string())
+        );
     }
 
     #[tokio::test]

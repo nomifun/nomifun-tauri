@@ -30,7 +30,6 @@ import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conve
 import { getConversationRuntimeWorkspaceErrorMessage } from '@/renderer/pages/conversation/utils/conversationCreateError';
 import { isConversationProcessing } from '@/renderer/pages/conversation/utils/conversationRuntime';
 import { usePreviewContext } from '@/renderer/pages/conversation/Preview';
-import { useTeamPermission } from '@/renderer/pages/conversation/components/multiAgent/hooks/TeamPermissionContext';
 import { allSupportedExts, type FileMetadata } from '@/renderer/services/FileService';
 import { emitter, useAddEventListener } from '@/renderer/utils/emitter';
 import { mergeFileSelectionItems } from '@/renderer/utils/file/fileSelection';
@@ -59,7 +58,6 @@ const EMPTY_UPLOAD_FILES: string[] = [];
 const NanobotSendBox: React.FC<{ conversation_id: number }> = ({ conversation_id }) => {
   const [workspacePath, setWorkspacePath] = useState('');
   const { t } = useTranslation();
-  const teamPermission = useTeamPermission();
   const { checkAndUpdateTitle } = useAutoTitle();
   const slash_commands = useSlashCommands(conversation_id);
   const addOrUpdateMessage = useAddOrUpdateMessage();
@@ -144,10 +142,9 @@ const NanobotSendBox: React.FC<{ conversation_id: number }> = ({ conversation_id
 
   const handleContentChange = useCallback(
     (val: string) => {
-      if (val && teamPermission) teamPermission.warmupSession();
       setContent(val);
     },
-    [teamPermission, setContent]
+    [setContent]
   );
 
   const setContentRef = useLatestRef(setContent);
@@ -250,7 +247,6 @@ const NanobotSendBox: React.FC<{ conversation_id: number }> = ({ conversation_id
 
   const executeCommand = useCallback(
     async ({ input, files }: Pick<ConversationCommandQueueItem, 'input' | 'files'>) => {
-      if (teamPermission) await teamPermission.warmupSession();
       const displayMessage = buildDisplayMessage(input, files, workspacePath);
 
       setAiProcessing(true);

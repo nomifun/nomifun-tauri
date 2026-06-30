@@ -3494,6 +3494,7 @@ fn test_provider(id: &str, models: &[&str]) -> Provider {
         capabilities: "[]".into(),
         context_limit: None,
         model_protocols: None,
+        model_descriptions: None,
         model_enabled: None,
         model_health: None,
         bedrock_config: None,

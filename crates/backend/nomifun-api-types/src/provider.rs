@@ -136,6 +136,8 @@ pub struct ProviderResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_protocols: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_descriptions: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model_enabled: Option<HashMap<String, bool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_health: Option<HashMap<String, ModelHealthStatus>>,
@@ -171,6 +173,8 @@ pub struct CreateProviderRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_protocols: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_descriptions: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_enabled: Option<HashMap<String, bool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_health: Option<HashMap<String, ModelHealthStatus>>,
@@ -198,6 +202,7 @@ pub struct UpdateProviderRequest {
     pub capabilities: Option<Vec<ModelCapability>>,
     pub context_limit: Option<i64>,
     pub model_protocols: Option<HashMap<String, String>>,
+    pub model_descriptions: Option<HashMap<String, String>>,
     pub model_enabled: Option<HashMap<String, bool>>,
     pub model_health: Option<HashMap<String, ModelHealthStatus>>,
     pub bedrock_config: Option<BedrockConfig>,
@@ -480,6 +485,7 @@ mod tests {
             }],
             context_limit: None,
             model_protocols: None,
+            model_descriptions: None,
             model_enabled: Some(HashMap::from([("claude-sonnet-4-20250514".into(), true)])),
             model_health: None,
             bedrock_config: None,
@@ -513,6 +519,7 @@ mod tests {
             capabilities: vec![],
             context_limit: None,
             model_protocols: None,
+            model_descriptions: None,
             model_enabled: None,
             model_health: None,
             bedrock_config: None,
@@ -634,6 +641,7 @@ mod tests {
             capabilities: vec![],
             context_limit: None,
             model_protocols: None,
+            model_descriptions: None,
             model_enabled: None,
             model_health: None,
             bedrock_config: None,

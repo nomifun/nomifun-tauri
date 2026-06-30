@@ -1,0 +1,11 @@
+-- 迁移 022：为 orch_run_tasks 增加 `role`(规划为任务命名的角色)。
+--
+-- P5 沉淀捕获：主管规划阶段为每个任务命名一个简短中文角色(如 规划/前端/
+-- 后端/测试/设计/文档),持久到任务行上,供后续 UI 把一次 Run 用到的角色提炼
+-- 成可复用的助手。
+--
+-- 纯 ADD COLUMN:可空、无默认、不触发表重建(SQLite ADD COLUMN 是 O(1) 元数据
+-- 操作)。`role` 可空 —— 旧任务行没有 role 读回即 NULL,不报错。与 019/020 约定
+-- 一致:迁移运行器(database.rs::run_migrations)在事务外层统管 PRAGMA,本文件
+-- 不写任何 PRAGMA。
+ALTER TABLE orch_run_tasks ADD COLUMN role TEXT;

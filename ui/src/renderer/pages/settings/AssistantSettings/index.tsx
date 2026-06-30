@@ -186,6 +186,8 @@ const AssistantSettings: React.FC = () => {
           editAvatarImage={editAvatarImage}
           editAgent={editor.editAgent}
           setEditAgent={editor.setEditAgent}
+          editModels={editor.editModels}
+          setEditModels={editor.setEditModels}
           editContext={editor.editContext}
           setEditContext={editor.setEditContext}
           promptViewMode={editor.promptViewMode}

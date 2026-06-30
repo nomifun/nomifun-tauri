@@ -6,7 +6,6 @@
  */
 
 import type { SpeechToTextConfig } from '@/common/types/provider/speech';
-import type { TMultiAgentConfig } from '@/renderer/pages/conversation/components/multiAgent/multiAgentConfig';
 import { storage } from '@/platform';
 
 // 系统配置存储
@@ -265,9 +264,6 @@ export type TChatConversation =
           is_health_check?: boolean;
           /** Cron job ID that spawned this conversation */
           cron_job_id?: string;
-          /** Session-level multi-agent collaboration config (spec §6). Config
-           * only — the runtime team-ensure is gated elsewhere. */
-          multi_agent?: TMultiAgentConfig;
         }
       >,
       'model'
@@ -298,8 +294,6 @@ export type TChatConversation =
           is_health_check?: boolean;
           /** Cron job ID that spawned this conversation */
           cron_job_id?: string;
-          /** Session-level multi-agent collaboration config (spec §6). */
-          multi_agent?: TMultiAgentConfig;
         }
       >,
       'model'
@@ -346,8 +340,6 @@ export type TChatConversation =
           is_health_check?: boolean;
           /** Cron job ID that spawned this conversation */
           cron_job_id?: string;
-          /** Session-level multi-agent collaboration config (spec §6). */
-          multi_agent?: TMultiAgentConfig;
         }
       >,
       'model'
@@ -397,8 +389,6 @@ export type TChatConversation =
           is_health_check?: boolean;
           /** Cron job ID that spawned this conversation */
           cron_job_id?: string;
-          /** Session-level multi-agent collaboration config (spec §6). */
-          multi_agent?: TMultiAgentConfig;
         }
       >,
       'model'
@@ -426,8 +416,6 @@ export type TChatConversation =
           is_health_check?: boolean;
           /** Cron job ID that spawned this conversation */
           cron_job_id?: string;
-          /** Session-level multi-agent collaboration config (spec §6). */
-          multi_agent?: TMultiAgentConfig;
         }
       >,
       'model'
@@ -469,8 +457,22 @@ export type TChatConversation =
         last_token_usage?: TokenUsageData;
         /** Cron job ID that spawned this conversation */
         cron_job_id?: string;
-        /** Session-level multi-agent collaboration config (spec §6). */
-        multi_agent?: TMultiAgentConfig;
+        /** Orchestration run linked to this conversation (会话原生编排 v2).
+         * Written by the backend (Tasks B1–B3) onto the originating conversation
+         * and refreshed via `conversation.listChanged`; the single source of truth
+         * for "does this conversation have a run". `useConversationRun` derives its
+         * `runId` from here. Absent for conversations with no orchestration run. */
+        orchestrator_run_id?: string;
+        /** The specific run task this conversation backs, when the conversation was
+         * created as a worker for an orchestration run task (vs. the run's lead
+         * conversation). Absent for the lead conversation and non-orchestration ones. */
+        orchestrator_task_id?: string;
+        /** Marks this nomi conversation as an orchestration LEAD (homepage 智能编排
+         * on-ramp). When set to 'lead' the backend injects the LEAD_ORCHESTRATOR_PROMPT
+         * so the agent natively thinks → calls `nomi_run_create(goal)` to fan out a
+         * multi-agent run (which then writes `orchestrator_run_id` back here). Absent
+         * for normal nomi conversations. */
+        orchestrator_role?: string;
       }
     >;
 
@@ -521,6 +523,14 @@ export interface IProvider {
    * e.g. { "gemini-2.5-pro": "gemini", "claude-sonnet-4": "anthropic", "gpt-4o": "openai" }
    */
   model_protocols?: Record<string, string>;
+  /**
+   * 每个模型的用户撰写描述。映射模型名称到描述文本。
+   * 供编排器按描述自动择优模型。
+   * Per-model user-authored descriptions. Maps model name to description text.
+   * Consumed by the orchestrator to auto-pick models by description.
+   * e.g. { "gpt-4o": "擅长前端与多模态", "claude-sonnet-4": "长上下文推理" }
+   */
+  model_descriptions?: Record<string, string>;
   /**
    * AWS Bedrock specific configuration
    * Only used when platform is 'bedrock'

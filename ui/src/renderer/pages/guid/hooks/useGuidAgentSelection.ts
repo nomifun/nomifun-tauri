@@ -19,7 +19,7 @@ import {
   type AgentMetadata,
   type AgentSource,
 } from '@/renderer/utils/model/agentTypes';
-import { getAgentModes } from '@/renderer/utils/model/agentModes';
+import { getAgentModes, getFullAutoMode } from '@/renderer/utils/model/agentModes';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import useSWR from 'swr';
 import { savePreferredMode, savePreferredModelId, getAgentKey as getAgentKeyUtil } from './agentSelectionUtils';
@@ -445,9 +445,22 @@ export const useGuidAgentSelection = ({
     // For preset agents, use the effective backend type for config lookup and mode saving
     const configKey = is_presetAgent ? currentEffectiveAgentInfo.agent_type : selectedAgent;
     selectedAgentRef.current = configKey;
-    // Reset to the backend's actual default (from handshake.available_modes),
-    // not the literal 'default' — codex/opencode/cursor don't have that value.
-    const fallbackMode = resolveDefaultMode(configKey, availableAgentsData as unknown as AgentMetadata[] | undefined);
+    // Default authorization mode = full-auto (产品决策:开箱即用全自动,不再反复弹授权).
+    // Use the backend's full-auto value (`getFullAutoMode`) when it is a mode the
+    // backend actually offers (handshake available_modes for ACP engines, else the
+    // static AGENT_MODES table); otherwise fall back to the backend's natural
+    // default via `resolveDefaultMode` — safe for engines without a yolo-equivalent.
+    // A saved `preferredMode` (explicit user choice, incl. a downgrade) still wins
+    // below.
+    const fullAutoMode = getFullAutoMode(configKey);
+    const handshakeModes = (availableAgentsData as unknown as AgentMetadata[] | undefined)?.find(
+      (a) => (a.backend ?? a.agent_type) === configKey
+    )?.handshake?.available_modes as AcpSessionModes | undefined;
+    const availableModeIds = handshakeModes?.available_modes?.map((m) => m.id) ??
+      getAgentModes(configKey).map((m) => m.value);
+    const fallbackMode = availableModeIds.includes(fullAutoMode)
+      ? fullAutoMode
+      : resolveDefaultMode(configKey, availableAgentsData as unknown as AgentMetadata[] | undefined);
     _setSelectedMode(fallbackMode);
     if (!configKey) return;
 
