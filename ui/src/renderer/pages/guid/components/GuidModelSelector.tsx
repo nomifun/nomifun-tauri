@@ -99,78 +99,66 @@ const GuidModelSelector: React.FC<GuidModelSelectorProps> = ({
       return healthStatus === 'healthy' ? 'bg-green-500' : healthStatus === 'unhealthy' ? 'bg-red-500' : 'bg-gray-400';
     };
 
-    const addModelRow = (
-      <div
-        role='button'
-        tabIndex={0}
-        className='flex items-center gap-6px px-12px py-8px text-12px text-t-secondary cursor-pointer hover:bg-2 rounded-4px'
-        onClick={() => navigate('/models?section=models')}
-      >
-        <Plus theme='outline' size='12' />
-        <span>{t('settings.addModel')}</span>
-      </div>
-    );
-
-    // Single-select model menu — provider-grouped.
-    const singleSelectMenu = (
-      <Menu selectedKeys={current_model ? [current_model.id + current_model.use_model] : []}>
-        {[
-          ...enabledModelList.map((provider) => {
-            const available_models = getAvailableModels(provider);
-            if (available_models.length === 0) return null;
-            return (
-              <Menu.ItemGroup title={provider.name} key={provider.id}>
-                {available_models.map((modelName) => {
-                  const dot = healthDotColor(provider.id, modelName);
-                  return (
-                    <Menu.Item
-                      key={provider.id + modelName}
-                      className={
-                        (current_model?.id ?? '') + (current_model?.use_model ?? '') === provider.id + modelName
-                          ? '!bg-2'
-                          : ''
-                      }
-                      onClick={() => {
-                        setCurrentModel({ ...provider, use_model: modelName }).catch((error) => {
-                          console.error('Failed to set current model:', error);
-                        });
-                      }}
-                    >
-                      <div className='flex items-center gap-8px w-full'>
-                        {dot && <div className={`w-6px h-6px rounded-full shrink-0 ${dot}`} />}
-                        <span>{modelName}</span>
-                      </div>
-                    </Menu.Item>
-                  );
-                })}
-              </Menu.ItemGroup>
-            );
-          }),
-          <Menu.Item key='add-model' className='text-12px text-t-secondary' onClick={() => navigate('/models?section=models')}>
-            <Plus theme='outline' size='12' />
-            {t('settings.addModel')}
-          </Menu.Item>,
-        ]}
-      </Menu>
-    );
-
-    const body: React.ReactNode = !hasModels ? (
-      // No models configured — empty + add-model affordance.
-      <div className='py-4px'>
-        <div className='px-12px py-12px text-t-secondary text-14px text-center'>{t('settings.noAvailableModels')}</div>
-        {addModelRow}
-      </div>
-    ) : (
-      singleSelectMenu
-    );
-
+    // Mirror the ACP selector exactly: the droplist is the bare <Menu> (no wrapper
+    // box, no forced min-width), so Arco's native popup styling keeps it as smooth
+    // as the ACP agent dropdown.
     return (
       <Dropdown
         trigger='click'
         droplist={
-          <div className='min-w-260px max-w-340px bg-1 rounded-8px overflow-hidden'>
-            {body}
-          </div>
+          <Menu selectedKeys={current_model ? [current_model.id + current_model.use_model] : []}>
+            {!hasModels
+              ? [
+                  <Menu.Item
+                    key='no-models'
+                    className='px-12px py-12px text-t-secondary text-14px text-center flex justify-center items-center'
+                    disabled
+                  >
+                    {t('settings.noAvailableModels')}
+                  </Menu.Item>,
+                  <Menu.Item key='add-model' className='text-12px text-t-secondary' onClick={() => navigate('/models?section=models')}>
+                    <Plus theme='outline' size='12' />
+                    {t('settings.addModel')}
+                  </Menu.Item>,
+                ]
+              : [
+                  ...enabledModelList.map((provider) => {
+                    const available_models = getAvailableModels(provider);
+                    if (available_models.length === 0) return null;
+                    return (
+                      <Menu.ItemGroup title={provider.name} key={provider.id}>
+                        {available_models.map((modelName) => {
+                          const dot = healthDotColor(provider.id, modelName);
+                          return (
+                            <Menu.Item
+                              key={provider.id + modelName}
+                              className={
+                                (current_model?.id ?? '') + (current_model?.use_model ?? '') === provider.id + modelName
+                                  ? '!bg-2'
+                                  : ''
+                              }
+                              onClick={() => {
+                                setCurrentModel({ ...provider, use_model: modelName }).catch((error) => {
+                                  console.error('Failed to set current model:', error);
+                                });
+                              }}
+                            >
+                              <div className='flex items-center gap-8px w-full'>
+                                {dot && <div className={`w-6px h-6px rounded-full shrink-0 ${dot}`} />}
+                                <span>{modelName}</span>
+                              </div>
+                            </Menu.Item>
+                          );
+                        })}
+                      </Menu.ItemGroup>
+                    );
+                  }),
+                  <Menu.Item key='add-model' className='text-12px text-t-secondary' onClick={() => navigate('/models?section=models')}>
+                    <Plus theme='outline' size='12' />
+                    {t('settings.addModel')}
+                  </Menu.Item>,
+                ]}
+          </Menu>
         }
       >
         <Button className={'sendbox-model-btn guid-config-btn'} shape='round' size='small' data-testid='guid-model-selector'>
