@@ -350,8 +350,10 @@ pub fn detect_chat_open_question(text: &str) -> Option<DecisionPrompt> {
     }
     let has_question = low.contains('?') || low.contains('？');
     // An interrogative cue: an explicit question mark, OR an asking-intent word
-    // (covers "你希望…", "需要我…", "should I…" phrasings that may omit the mark).
-    if !(has_question || has_open_intent(&low)) {
+    // (covers "你希望…", "需要我…", "should I…" phrasings that may omit the mark),
+    // OR an explicit "reply with your choice/preference" instruction that trails a
+    // non-numbered (table / lettered / circled) 选择菜单 (会话 33).
+    if !(has_question || has_open_intent(&low) || has_choice_reply_intent(&low)) {
         return None;
     }
     // The trailing non-empty line is the question prompt.
@@ -408,6 +410,32 @@ pub(crate) fn has_open_intent(low: &str) -> bool {
         "can you tell me",
         "let me know what",
         "what should",
+    ];
+    SIGS.iter().any(|s| low.contains(s))
+}
+
+/// Asking-for-choice wording where the agent ends a turn having LISTED options in
+/// a non-numbered form (markdown table / lettered `A1·B1` / circled `①②`) and
+/// asks the user to reply with their selection(s). Such a 选择菜单 is NOT a
+/// single pick-one numbered list (so [`detect_chat_decision`] declines it) and
+/// may carry no `?`, so [`detect_chat_open_question`] would otherwise miss it and
+/// the turn would match NEITHER detector (会话 33「同时开启 AutoWork+IDMM,只能决策
+/// 一次」: the 2nd decision was a 6-part table menu and IDMM stayed silent on it).
+/// The model tier answers all parts in free text. High-precision phrases only —
+/// each pairs an ask verb (回复/给出/告诉我) with 你的 + a choice noun — so the
+/// agent STATING a choice ("已保存你的选择") never matches.
+fn has_choice_reply_intent(low: &str) -> bool {
+    const SIGS: &[&str] = &[
+        "回复你的选择",
+        "回复你的倾向",
+        "回复你的偏好",
+        "回复你的答案",
+        "给出你的选择",
+        "给出你的倾向",
+        "给出你的偏好",
+        "告诉我你的选择",
+        "告诉我你的倾向",
+        "告诉我你的偏好",
     ];
     SIGS.iter().any(|s| low.contains(s))
 }
@@ -777,6 +805,46 @@ mod tests {
             "numbered TOPICS + an open-intent trailing line is an open question, not a menu"
         );
     }
+
+    #[test]
+    fn open_question_table_menu_reply_with_choice_is_open_question() {
+        // REGRESSION (会话 33「同时开启 AutoWork+IDMM,只能决策一次」): the SECOND
+        // decision was a multi-part 选择菜单 whose options live in MARKDOWN TABLES
+        // (`| **A1** | … |`, lettered A1/A2/B1…) across circled sub-questions
+        // (①②③), ending on "请逐条给出你的倾向 … 请直接回复你的选择,例如:① A1 ② B1".
+        // Its options are NOT numbered list lines, there is NO `(1/2)` token and NO
+        // `?`, so detect_chat_decision declines it; and its asking cue
+        // ("回复你的选择"/"给出你的倾向") is a SELECT phrase that was absent from the
+        // open-question intent set, so this returned None too → the turn matched
+        // NEITHER detector. Both IDMM's turn-end lane AND AutoWork's decision-yield
+        // gate saw a clean Done, so neither acted and IDMM "只决策了一次". It must
+        // classify as an OpenQuestion (the model tier answers all parts in free text).
+        let text = "## 第二步：核心玩法与规则\n\n\
+                    以下是几个关键规则，请逐条给出你的倾向：\n\n\
+                    ### ① 地图与网格\n| 选项 | 说明 |\n|------|------|\n\
+                    | **A1** | 固定大小 20×20 |\n| **A2** | 30×30 |\n\n\
+                    ### ② 蛇的初始长度\n| 选项 | 说明 |\n\
+                    | **B1** | 3 格 |\n| **B2** | 5 格 |\n\n\
+                    **请直接回复你的选择**，例如：\n> ① A1 ② B1\n\n\
+                    或者告诉我哪些想改、哪些随我来定。";
+        assert!(
+            detect_chat_decision(text).is_none(),
+            "a table-based multi-part menu has no pick-one numbered selection → not an Options decision"
+        );
+        let dp = detect_chat_open_question(text)
+            .expect("a reply-with-your-choice table menu must be an open question (model answers in free text)");
+        assert_eq!(dp.kind, DecisionKind::OpenQuestion);
+        assert!(dp.options.is_empty(), "an open question carries no enumerable options");
+        assert!(dp.permission.is_none());
+    }
+
+    #[test]
+    fn open_question_agent_stating_saved_choice_is_none() {
+        // False-positive guard for the reply-with-choice cue: the agent ANNOUNCING
+        // it stored a choice ("已保存你的选择") is not a question awaiting input.
+        assert!(detect_chat_open_question("好的，已保存你的选择，我现在开始实现。").is_none());
+    }
+
 
     // ── Chinese-convention menu formats (REGRESSION GUARD) ──
     // Chinese LLM output overwhelmingly uses the enumeration comma "1、" and
