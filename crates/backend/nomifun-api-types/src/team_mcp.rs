@@ -152,6 +152,10 @@ impl GatewayMcpConfig {
         "files",
         "knowledge",
         "idmm",
+        // The desktop default profile: the lead/main agent must be able to spin
+        // up & track multi-agent orchestration runs (nomi_run_create/status/result).
+        // Desktop-only domain (caps_orchestrator denies Remote), so safe here.
+        "orchestrator",
     ];
     pub const DESKTOP_DOMAINS: &'static [&'static str] = &[
         "conversation",
@@ -161,6 +165,7 @@ impl GatewayMcpConfig {
         "files",
         "browser",
         "computer",
+        "orchestrator",
     ];
     pub const ADMIN_DOMAINS: &'static [&'static str] = &[
         "system",
