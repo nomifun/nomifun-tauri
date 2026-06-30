@@ -440,12 +440,13 @@ async fn run_loop(
             break;
         }
 
-        // Ensure IDMM is supervising this target while the turn runs (idempotent,
-        // no-op when IDMM is disabled for the target). Lets provider faults /
-        // decision stalls be auto-handled so the turn reaches a terminal state.
-        if let Some(idmm) = &deps.idmm {
-            idmm.ensure_supervising(kind, target_id);
-        }
+        // NOTE: IDMM is armed PER TURN inside `inject_and_wait` /
+        // `inject_and_wait_terminal` (right after the task/PTY exists), NOT here.
+        // Arming at the loop top fired on every idle poll too — and since an idle
+        // conversation has no live agent task, IDMM's probe.observe() got a closed
+        // channel and the supervisor died instantly, only to be re-armed 10s later:
+        // a runaway "IDMM supervisor armed" churn that did no work. Arming once the
+        // turn's task is built makes the supervisor actually attach to the turn.
 
         // Terminal target whose PTY is not live: distinguish "deleted" (stop for
         // good) from "exited but relaunch-able" (idle and re-check, so the user
@@ -698,6 +699,13 @@ async fn inject_and_wait(
     };
 
     let agent = deps.task_manager.get_or_build_task(conversation_id, options).await?;
+    // Arm IDMM now that THIS turn's task exists (so its probe.observe() attaches
+    // to this turn's event stream), and ONLY now — never on an idle poll. Mirrors
+    // the user-driven path's `on_turn_start` hook (which also arms right after
+    // get_or_build_task). Idempotent + no-op when IDMM is disabled for the target.
+    if let Some(idmm) = &deps.idmm {
+        idmm.ensure_supervising(AutoWorkTargetKind::Conversation, conversation_id);
+    }
     let rx = agent.subscribe();
 
     // Stage attachments only AFTER the task is built: staging implicitly
@@ -1017,6 +1025,14 @@ async fn inject_and_wait_terminal(
     // go out as SEPARATE writes (see `submit_terminal_prompt`) so the CR is not
     // swallowed by the target CLI's paste-burst detection.
     submit_terminal_prompt(driver, terminal_id, &prompt).await?;
+
+    // Arm IDMM for THIS terminal turn (its probe subscribes to the durable PTY
+    // output/lifecycle, so it attaches regardless of task state). Per-turn, not on
+    // every idle poll — same churn fix as the conversation path. Idempotent + a
+    // no-op when IDMM is disabled for the terminal.
+    if let Some(idmm) = &deps.idmm {
+        idmm.ensure_supervising(AutoWorkTargetKind::Terminal, &terminal_id.to_string());
+    }
 
     // Subscribe to lifecycle AFTER injecting (the hook fires on the NEXT
     // turn-end, not the injection itself).
