@@ -182,7 +182,7 @@ const PanelRoute: React.FC<{ layout: React.ReactElement }> = ({ layout }) => {
             <Route path='/terminal/:id' element={withRouteFallback(TerminalSessionPage)} />
           </Route>
           {/* Relocated to the homepage: Agents/Models → /models, Capabilities → Assistant & Skill / MCP */}
-          <Route path='/settings/model' element={<Navigate to='/models' replace />} />
+          <Route path='/settings/model' element={<Navigate to='/models?section=models' replace />} />
           <Route path='/settings/agent' element={<Navigate to='/models?section=agents' replace />} />
           <Route path='/settings/capabilities' element={<Navigate to='/assistants?tab=skills' replace />} />
           <Route path='/settings/skills-hub' element={<Navigate to='/assistants?tab=skills' replace />} />

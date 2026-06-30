@@ -100,7 +100,7 @@ const KnowledgeModelSelector: React.FC<KnowledgeModelSelectorProps> = ({
             <Menu.Item
               key='add-model'
               className='text-12px text-t-secondary'
-              onClick={() => navigate('/settings/model')}
+              onClick={() => navigate('/models?section=models')}
             >
               <Plus theme='outline' size='12' />
               {t('settings.addModel')}

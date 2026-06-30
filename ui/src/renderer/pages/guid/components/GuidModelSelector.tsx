@@ -104,7 +104,7 @@ const GuidModelSelector: React.FC<GuidModelSelectorProps> = ({
         role='button'
         tabIndex={0}
         className='flex items-center gap-6px px-12px py-8px text-12px text-t-secondary cursor-pointer hover:bg-2 rounded-4px'
-        onClick={() => navigate('/settings/model')}
+        onClick={() => navigate('/models?section=models')}
       >
         <Plus theme='outline' size='12' />
         <span>{t('settings.addModel')}</span>
@@ -146,7 +146,7 @@ const GuidModelSelector: React.FC<GuidModelSelectorProps> = ({
               </Menu.ItemGroup>
             );
           }),
-          <Menu.Item key='add-model' className='text-12px text-t-secondary' onClick={() => navigate('/settings/model')}>
+          <Menu.Item key='add-model' className='text-12px text-t-secondary' onClick={() => navigate('/models?section=models')}>
             <Plus theme='outline' size='12' />
             {t('settings.addModel')}
           </Menu.Item>,
