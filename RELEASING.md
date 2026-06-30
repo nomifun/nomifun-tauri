@@ -2,6 +2,24 @@
 
 This checklist is for maintainers preparing a public release.
 
+## Versioning (single source of truth)
+
+The release version lives in **one** place: the root `Cargo.toml`
+`[workspace.package].version`. The backend's `CARGO_PKG_VERSION` / `app_version`
+follows it, and `apps/desktop/tauri.conf.json` inherits it (it has no `version`
+field of its own — Tauri reads it from the workspace), so the installer filename
+and updater version stay in sync automatically.
+
+Bump everything with one command:
+
+```bash
+bun run bump 1.2.3            # writes the version + syncs Cargo.lock + package.json/ui
+bun run bump 1.2.3 --tag      # also: git commit + git tag v1.2.3 (needs a clean tree)
+```
+
+Tags use the `vX.Y.Z` form. The decorative `package.json` / `ui/package.json`
+versions are kept in sync by the script but are not read by any build.
+
 ## Before Tagging
 
 1. Update `CHANGELOG.md`.

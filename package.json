@@ -1,7 +1,7 @@
 {
   "name": "nomifun-tauri",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.10",
   "license": "Apache-2.0",
   "workspaces": ["ui"],
   "scripts": {
@@ -27,6 +27,7 @@
     "gen:i18n": "bun scripts/generate-i18n-types.mjs",
     "clean": "bun scripts/prune-build.mjs --release",
     "seed:dev": "bun scripts/seed-dev-from-prod.mjs",
+    "bump": "bun scripts/bump-version.mjs",
     "help": "bun scripts/help.mjs"
   },
   "devDependencies": {

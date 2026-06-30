@@ -4,9 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-# NOTE: this crate is EXCLUDED from the root workspace (see root Cargo.toml)
-# until P2 wires the Tauri toolchain. It is the scaffold/target for the
-# "Tauri shell embeds the backend in-process" spike.
+# The Tauri desktop shell: links the unified backend (nomifun-app) in-process.
+# It is a member of the root workspace and inherits the workspace version
+# (`version.workspace = true` above) — so `bun run bump` / the workspace version
+# is the single source the packaged app version derives from.
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

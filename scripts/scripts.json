@@ -14,6 +14,9 @@
     "dev:web":       { "group": "dev",   "desc": "启动 Web 全栈开发（后端 API + 前端 vite）" },
     "dev:ui":        { "group": "dev",   "desc": "仅启动前端开发服务器（纯 vite，无后端）" },
     "build":         { "group": "build", "desc": "为当前操作系统打桌面安装包" },
+    "build:win":     { "group": "build", "desc": "打 Windows 安装包（NSIS），汇总到 dist/desktop/" },
+    "build:mac":     { "group": "build", "desc": "打 macOS 安装包（.dmg），汇总到 dist/desktop/" },
+    "build:linux":   { "group": "build", "desc": "打 Linux 安装包（.deb/.AppImage/.rpm），汇总到 dist/desktop/" },
     "build:signed":  { "group": "build", "desc": "打桌面包并签名+公证（仅 macOS）" },
     "build:updater": { "group": "build", "desc": "打桌面包并产出自更新 .sig 制品" },
     "build:ui":      { "group": "build", "desc": "前端生产构建 → ui/dist" },
@@ -29,6 +32,7 @@
     "gen:i18n":      { "group": "gen",   "desc": "由 locale 重新生成 i18n 类型声明" },
     "clean":         { "group": "maint", "desc": "深度回收构建空间（debug 产物 + flycheck + 旧安装包）" },
     "seed:dev":      { "group": "maint", "desc": "用生产数据目录播种 dev 数据目录" },
+    "bump":          { "group": "maint", "desc": "统一改版本号：根 Cargo.toml(真源) + package.json + ui + Cargo.lock，可选 --tag 提交并打 tag" },
     "help":          { "group": "maint", "desc": "打印脚本目录（--check 校验登记 / --readme 生成 README 表）" }
   }
 }
