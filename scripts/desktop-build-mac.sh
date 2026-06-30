@@ -6,8 +6,10 @@
 #   bun run build:mac --signed        # 默认 Universal,带 Developer ID 签名 + 公证
 #   bun run build:mac arm intel       # 显式指定架构(可多选,空格分隔)
 #   bun run build:mac --signed intel  # 只打 Intel,且签名+公证
-#   bun run build:mac -- --config '{"bundle":{"createUpdaterArtifacts":true}}'
-#                                     # `--` 之后的参数原样透传给 tauri build
+#   bun run build:mac --config '{"bundle":{"createUpdaterArtifacts":true}}'
+#                                     # 未知 --xxx 选项会原样透传给 tauri build
+#   bun run build:mac arm --config '{"bundle":{"createUpdaterArtifacts":true}}'
+#                                     # 架构参数仍放在 tauri build 参数之前
 #
 # 架构别名:
 #   arm / aarch64 / silicon  -> aarch64-apple-darwin   (Apple Silicon 原生)
@@ -38,7 +40,7 @@ CONF="apps/desktop/tauri.conf.json"
 DIST="$ROOT/dist/desktop"
 ENV_FILE="$ROOT/apps/desktop/signing/.env.signing"
 
-# ── 解析参数:`--` 之前是架构选择/开关,之后原样透传给 tauri build ────────────
+# ── 解析参数:架构选择/开关归本脚本,未知 --xxx 起原样透传给 tauri build ─────
 SELECT=()
 PASSTHRU=()
 SIGNED=0
@@ -50,6 +52,9 @@ for arg in "$@"; do
     seen_dashdash=1
   elif [[ "$arg" == "--signed" ]]; then
     SIGNED=1
+  elif [[ "$arg" == --* ]]; then
+    PASSTHRU+=("$arg")
+    seen_dashdash=1
   else
     SELECT+=("$arg")
   fi

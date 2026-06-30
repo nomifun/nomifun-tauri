@@ -167,7 +167,7 @@ for (const { dir, triple } of bundleDirs) {
 const foundKeys = Object.keys(collected);
 if (foundKeys.length === 0) {
   console.error('✗ 在 target/ 下没找到任何更新产物（*.sig）。先构建带更新签名的产物：');
-  console.error('    macOS:   bun run build:mac -- --config \'{"bundle":{"createUpdaterArtifacts":true}}\'');
+  console.error('    macOS:   bun run build:mac --config \'{"bundle":{"createUpdaterArtifacts":true}}\'');
   console.error('    Windows: bun run build:updater   （需先设 TAURI_SIGNING_PRIVATE_KEY）');
   process.exit(1);
 }

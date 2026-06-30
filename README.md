@@ -309,6 +309,8 @@ bun run build:<os> [arch ...] [--signed] [-- <args passed straight to `tauri bui
 - **`--signed`** — sign (and, on macOS, notarize). Requires local signing config; see each OS.
 - **`-- …`** — everything after `--` is forwarded verbatim to `tauri build`
   (e.g. `-- --bundles nsis`, `-- --config '{"bundle":{"createUpdaterArtifacts":true}}'`).
+  `build:mac` also forwards unknown `--xxx` options directly, so updater builds can use
+  `bun run build:mac --config '{"bundle":{"createUpdaterArtifacts":true}}'`.
 
 **macOS — `build:mac`** (produces `.dmg`; default arch: `universal`)
 

@@ -65,7 +65,7 @@ export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""   # empty for the default key
 bun run build:updater
 
 # macOS (Universal .app.tar.gz + .sig — one artifact serves both darwin chips):
-bun run build:mac -- --config '{"bundle":{"createUpdaterArtifacts":true}}'
+bun run build:mac --config '{"bundle":{"createUpdaterArtifacts":true}}'
 
 # Linux (AppImage + .sig):
 bun run build:updater   # on a Linux machine

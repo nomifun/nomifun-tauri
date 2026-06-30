@@ -47,7 +47,7 @@ platform on its own machine.
    export TAURI_SIGNING_PRIVATE_KEY="$(cat apps/desktop/signing/nomifun-updater.key)"
    export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
    bun run build:updater                                              # Windows / Linux
-   bun run build:mac -- --config '{"bundle":{"createUpdaterArtifacts":true}}'   # macOS (Universal)
+   bun run build:mac --config '{"bundle":{"createUpdaterArtifacts":true}}'      # macOS (Universal)
    ```
 
 4. **Build the manifest:** `bun run make:latest` on each build machine scans its

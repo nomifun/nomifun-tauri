@@ -1,19 +1,15 @@
 {
-  "version": "0.0.0",
-  "notes": "占位模板 — 真实清单由 `bun run make:latest` 在各平台构建机上扫描更新产物自动生成/合并。带 << >> 占位签名或 REPLACE-WITH 占位 URL 的条目会被脚本视为空并替换。",
-  "pub_date": "1970-01-01T00:00:00Z",
+  "version": "0.1.11",
+  "notes": "- Documentation overhaul for public website and open-source preparation.\n- Clarified desktop, web, remote access, AutoWork, scheduled tasks, and\n  packaging documentation.\n- Removed proprietary PDF skill assets from the bundled built-in skills.",
+  "pub_date": "2026-06-30T17:18:02.454Z",
   "platforms": {
-    "windows-x86_64": {
-      "signature": "<<NomiFun_<ver>_x64-setup.exe.sig 的内容>>",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v<ver>/NomiFun_<ver>_x64-setup.exe"
+    "darwin-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODUyOGZOZkJtU3NZQzhEOUs3bEozbjRiN2o1cS9jQTlyc2R1YVMvNlNsaGZOUDljYVRDT2M1ZHYxS0VoWlhkVVhkbDI3K0d2MGF0MlQ3RGRYR295N2djPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyODM5ODcwCWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6Ck42eHdpT1R0eWZKYWxPR0cxVlhUaTQzMEprZGNFTXYzNGxTUE5TbnAzVW5ienFEbzNqb21zUGhpbkhua1ozUng3c2U5Z0h4c0g3MUJmZWNEU0VhU0RRPT0K",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.1.11/NomiFun.app.tar.gz"
     },
     "darwin-aarch64": {
-      "signature": "<<NomiFun_<ver>_aarch64.app.tar.gz.sig 的内容>>",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v<ver>/NomiFun_<ver>_aarch64.app.tar.gz"
-    },
-    "darwin-x86_64": {
-      "signature": "<<NomiFun_<ver>_x64.app.tar.gz.sig 的内容>>",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v<ver>/NomiFun_<ver>_x64.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODUyOGZOZkJtU3NZQzhEOUs3bEozbjRiN2o1cS9jQTlyc2R1YVMvNlNsaGZOUDljYVRDT2M1ZHYxS0VoWlhkVVhkbDI3K0d2MGF0MlQ3RGRYR295N2djPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyODM5ODcwCWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6Ck42eHdpT1R0eWZKYWxPR0cxVlhUaTQzMEprZGNFTXYzNGxTUE5TbnAzVW5ienFEbzNqb21zUGhpbkhua1ozUng3c2U5Z0h4c0g3MUJmZWNEU0VhU0RRPT0K",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.1.11/NomiFun.app.tar.gz"
     }
   }
 }
