@@ -58,6 +58,15 @@ pub trait SessionProbe: Send + Sync {
     async fn pending_signal(&self) -> Option<SessionSignal> {
         None
     }
+    /// Whether `turn_text` (the just-finished turn's assistant text, held IN
+    /// MEMORY by the caller) is a pending decision IDMM's decision watch would
+    /// answer — gated to plain-desktop. Unlike [`Self::pending_signal`] this reads
+    /// NO persisted message rows, so a caller (AutoWork's decision-yield) can
+    /// decide without racing the stream relay's status-flip write. Default false;
+    /// only ConversationProbe overrides (terminal/mock have no chat-text turns).
+    async fn decision_in_text(&self, _turn_text: &str) -> bool {
+        false
+    }
 }
 
 /// Pure mapping of one agent event to an optional signal. Unit-tested directly
@@ -684,6 +693,26 @@ impl SessionProbe for ConversationProbe {
             return None;
         }
         Some(sig)
+    }
+
+    async fn decision_in_text(&self, turn_text: &str) -> bool {
+        if turn_text.trim().is_empty() {
+            return false;
+        }
+        let Ok(conv_id) = self.conversation_id.parse::<i64>() else {
+            return false;
+        };
+        // Plain-desktop gate (same as observe/pending_signal): routed channel /
+        // companion conversations send menus to a remote human → never auto-answer.
+        let Ok(Some(row)) = self.conversation_repo.get(conv_id).await else {
+            return false;
+        };
+        if conversation_is_routed(&row.extra, row.channel_chat_id.as_deref()) {
+            return false;
+        }
+        // Detect from the turn text itself (no persisted-row status dependency, so
+        // no race with the relay): a numbered-option menu OR an open question.
+        detect_chat_decision(turn_text).is_some() || detect_chat_open_question(turn_text).is_some()
     }
 }
 

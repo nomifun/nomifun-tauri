@@ -752,6 +752,12 @@ async fn wait_for_terminal_with_renewal(
     let mut renew = interval(LEASE_RENEW_INTERVAL);
     renew.tick().await; // consume the immediate first tick
     let mut note_buf = String::new();
+    // The CURRENT turn's assistant text, reset at each turn boundary. Used to
+    // decide the decision-yield from the text we already have IN MEMORY — never
+    // racing the stream relay's persisted message-status write (which `pending_signal`
+    // would). The decision (menu / question) lives at the turn's tail, which
+    // `append_bounded` keeps.
+    let mut turn_text = String::new();
     // Count of retryable errors we've waited through (letting IDMM recover).
     let mut recovery_waits = 0u32;
     // Count of decision-ending turns we've YIELDED to IDMM this requirement turn.
@@ -798,6 +804,7 @@ async fn wait_for_terminal_with_renewal(
                         Ok(AgentStreamEvent::Text(t)) => {
                             decision_ride_until = None;
                             append_bounded(&mut note_buf, &t.content);
+                            append_bounded(&mut turn_text, &t.content);
                         }
                         // A clean Finish is NOT necessarily the requirement's terminal
                         // state: the agent may have ended its turn on a 选择题/开放式提问.
@@ -818,11 +825,18 @@ async fn wait_for_terminal_with_renewal(
                                     idmm.is_supervising(AutoWorkTargetKind::Conversation, conversation_id),
                                     decision_waits,
                                 ) && idmm
-                                    .has_pending_decision(AutoWorkTargetKind::Conversation, conversation_id)
+                                    .has_pending_decision(
+                                        AutoWorkTargetKind::Conversation,
+                                        conversation_id,
+                                        &turn_text,
+                                    )
                                     .await
                             } else {
                                 false
                             };
+                            // This turn ended; the next (IDMM-driven) turn accumulates
+                            // its own text.
+                            turn_text.clear();
                             if yield_to_idmm {
                                 decision_waits += 1;
                                 decision_ride_until = Some(tokio::time::Instant::now() + DECISION_YIELD_WINDOW);
@@ -839,6 +853,7 @@ async fn wait_for_terminal_with_renewal(
                         // IDMM, or grace exhausted) fail.
                         Ok(AgentStreamEvent::Error(d)) => {
                             decision_ride_until = None;
+                            turn_text.clear();
                             let retryable = matches!(d.retryable, Some(true));
                             let idmm_supervising = deps
                                 .idmm
