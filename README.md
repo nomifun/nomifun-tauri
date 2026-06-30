@@ -292,6 +292,67 @@ bun run test       # Rust tests (use test:fast for nextest)
 
 Prefer the scripted entry points over plain `cargo`/`vite` — they include build-dir pruning and consistency checks. New to the codebase? Read [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`docs/contributing/development.md`](docs/contributing/development.md).
 
+### 📦 Desktop packaging
+
+Each OS has its own command, and **a package can only be built on its matching OS** —
+macOS bundles must be signed/notarized on macOS, Windows installers built on Windows,
+Linux packages on Linux. There is no cross-OS build. All artifacts are collected into
+`dist/desktop/`.
+
+Common argument shape for all three:
+
+```
+bun run build:<os> [arch ...] [--signed] [-- <args passed straight to `tauri build`>]
+```
+
+- **arch** — zero or more architectures. Omit to use the per-OS default below.
+- **`--signed`** — sign (and, on macOS, notarize). Requires local signing config; see each OS.
+- **`-- …`** — everything after `--` is forwarded verbatim to `tauri build`
+  (e.g. `-- --bundles nsis`, `-- --config '{"bundle":{"createUpdaterArtifacts":true}}'`).
+
+**macOS — `build:mac`** (produces `.dmg`; default arch: `universal`)
+
+| Goal | Command |
+| --- | --- |
+| Universal (Intel + Apple Silicon, one fat package) | `bun run build:mac` |
+| Universal, signed + notarized | `bun run build:mac --signed` |
+| Apple Silicon only | `bun run build:mac arm` |
+| Intel only | `bun run build:mac intel` |
+| Intel only, signed + notarized | `bun run build:mac --signed intel` |
+| All three separately (ARM + Intel + Universal) | `bun run build:mac arm intel universal` |
+
+Arch aliases: `arm`/`aarch64`/`silicon`, `intel`/`x64`/`x86_64`, `universal`/`all-arch`.
+Signing reads `apps/desktop/signing/.env.signing` (gitignored); missing → it errors with setup hints.
+
+**Windows — `build:win`** (produces `.msi` + `.exe`/NSIS; default arch: the host's, usually `x64`)
+
+| Goal | Command |
+| --- | --- |
+| Current arch | `bun run build:win` |
+| x64 only | `bun run build:win x64` |
+| ARM64 only | `bun run build:win arm64` |
+| Both | `bun run build:win x64 arm64` |
+| Signed (Authenticode) | `bun run build:win --signed` |
+
+Arch aliases: `x64`/`x86_64`, `arm64`/`aarch64`/`arm`. `--signed` reads the cert thumbprint from
+`WINDOWS_CERTIFICATE_THUMBPRINT` (no “notarization” concept on Windows).
+
+**Linux — `build:linux`** (produces `.deb` / `.AppImage` / `.rpm`; default arch: the host's)
+
+| Goal | Command |
+| --- | --- |
+| Current arch | `bun run build:linux` |
+| x64 only | `bun run build:linux x64` |
+| ARM64 only | `bun run build:linux arm64` |
+| Both | `bun run build:linux x64 arm64` |
+
+Arch aliases: `x64`/`x86_64`, `arm64`/`aarch64`/`arm`. Linux has no signing/notarization step.
+⚠️ Cross-arch (e.g. building arm64 on an x64 host) needs the target's sysroot/toolchain and often
+fails on the webkit2gtk link — build on the target architecture's machine/container instead.
+
+> `bun run build` stays as the simple "just build for whatever OS I'm on" shortcut; the
+> `build:<os>` commands above add explicit arch selection, signing, and `dist/desktop/` collection.
+
 <details>
 <summary><b>Full script catalog</b></summary>
 
@@ -305,6 +366,9 @@ Prefer the scripted entry points over plain `cargo`/`vite` — they include buil
 | `bun run dev:ui` | 仅启动前端开发服务器（纯 vite，无后端） |
 | **构建（出制品）** | |
 | `bun run build` | 为当前操作系统打桌面安装包 |
+| `bun run build:win` | 打 Windows 安装包（NSIS），汇总到 dist/desktop/ |
+| `bun run build:mac` | 打 macOS 安装包（.dmg），汇总到 dist/desktop/ |
+| `bun run build:linux` | 打 Linux 安装包（.deb/.AppImage/.rpm），汇总到 dist/desktop/ |
 | `bun run build:signed` | 打桌面包并签名+公证（仅 macOS） |
 | `bun run build:updater` | 打桌面包并产出自更新 .sig 制品 |
 | `bun run build:ui` | 前端生产构建 → ui/dist |
@@ -326,6 +390,7 @@ Prefer the scripted entry points over plain `cargo`/`vite` — they include buil
 | **维护 / 工具** | |
 | `bun run clean` | 深度回收构建空间（debug 产物 + flycheck + 旧安装包） |
 | `bun run seed:dev` | 用生产数据目录播种 dev 数据目录 |
+| `bun run bump` | 统一改版本号：根 Cargo.toml(真源) + package.json + ui + Cargo.lock，可选 --tag 提交并打 tag |
 | `bun run help` | 打印脚本目录（--check 校验登记 / --readme 生成 README 表） |
 
 <!-- END GENERATED SCRIPTS -->
