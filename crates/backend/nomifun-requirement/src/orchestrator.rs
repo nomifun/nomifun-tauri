@@ -558,6 +558,25 @@ async fn run_loop(
                         }
                         TurnResult::Busy
                     }
+                    // The session backing this loop is GONE (deleted mid-flight →
+                    // inject_and_wait's conversation_repo.get returns NotFound). This
+                    // is NOT the requirement's fault: revert the claim WITHOUT
+                    // consuming an attempt (so a deleted session can't burn a
+                    // requirement's retries and PAUSE the whole tag for sibling
+                    // conversations bound to it — the observed "delete conv 29 →
+                    // tag test stuck" cascade), then STOP this loop (no target left
+                    // to drive).
+                    Err(AppError::NotFound(_)) => {
+                        warn!(
+                            target_id,
+                            requirement_id = req_id,
+                            "AutoWork target conversation is gone — unclaiming (no attempt) and stopping loop"
+                        );
+                        if let Err(e) = deps.service.unclaim_busy(req_id, owner_id).await {
+                            error!(target_id, requirement_id = req_id, error = %e, "AutoWork unclaim_busy failed");
+                        }
+                        break;
+                    }
                     Err(e) => {
                         error!(target_id, requirement_id = req_id, error = %e, "AutoWork inject failed");
                         // errored turn → expects_verdict is irrelevant (re-pend / fail).
