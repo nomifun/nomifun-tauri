@@ -62,17 +62,30 @@ export TAURI_SIGNING_PRIVATE_KEY="$(cat apps/desktop/signing/nomifun-updater.key
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""   # empty for the default key
 
 # Windows (NSIS .exe + .sig):
-bun run build:updater
+bun run build:win -- --config '{"bundle":{"createUpdaterArtifacts":true}}'
 
 # macOS (Universal .app.tar.gz + .sig — one artifact serves both darwin chips):
 bun run build:mac --config '{"bundle":{"createUpdaterArtifacts":true}}'
 
 # Linux (AppImage + .sig):
-bun run build:updater   # on a Linux machine
+bun run build:linux -- --config '{"bundle":{"createUpdaterArtifacts":true}}'
 ```
 
 You **cannot cross-compile**: build Windows on Windows, macOS on macOS, Linux on
 Linux. Each platform's artifacts land under `target/**/release/bundle/`.
+
+Windows note: the command above signs the updater package with the Tauri updater
+key, but it does **not** Authenticode-sign the Windows installer. That is enough
+for updater verification, but manual downloads can still show SmartScreen /
+unknown-publisher warnings. When a Windows certificate is available, set
+`WINDOWS_CERTIFICATE_THUMBPRINT` and run:
+
+```powershell
+$env:TAURI_SIGNING_PRIVATE_KEY = Get-Content apps/desktop/signing/nomifun-updater.key -Raw
+$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""
+$env:WINDOWS_CERTIFICATE_THUMBPRINT = "A1B2C3..."
+bun run build:win --signed -- --config '{"bundle":{"createUpdaterArtifacts":true}}'
+```
 
 ## Generating `latest.json`
 
@@ -96,7 +109,13 @@ users silently get no update**, so make sure every platform you ship has one.
 1. Build signed updater artifacts on each platform (above).
 2. `bun run make:latest` on each, merging into one `latest.json`.
 3. Create a GitHub Release tagged `v<version>`.
-4. Upload **all** installers + their `.sig` files + `latest.json` as release assets.
+4. Upload **all** manual installers, updater packages, updater `.sig` files, and
+   `latest.json` as release assets. For macOS this means both:
+   - `dist/desktop/NomiFun_<version>_universal.dmg` for manual install.
+   - `target/universal-apple-darwin/release/bundle/macos/NomiFun.app.tar.gz`
+     plus `NomiFun.app.tar.gz.sig` for auto-update.
+   For Windows, the updater `.exe` is also the normal manual installer; upload
+   any `.msi` only if the build generated one.
 5. The endpoint `releases/latest/download/latest.json` resolves to the newest
    release automatically — clients pick up the update on their next check.
 

@@ -32,34 +32,180 @@ versions are kept in sync by the script but are not read by any build.
 
 ## Desktop Release
 
-Installers are unsigned-OS by default; in-app auto-update uses the Tauri updater
-key (separate from OS code signing). You **cannot cross-compile** — build each
-platform on its own machine.
+Desktop releases have two asset groups:
 
-1. Build unsigned bundles with `bun run build` (or `build:mac` / `build:win` /
-   `build:linux`).
-2. For macOS public distribution, use `bun run build:signed` with the
-   release-owner Developer ID credentials.
-3. **Updater artifacts (per platform):** export the updater private key, then
-   build with updater signing on. The signed `.sig` lands next to each bundle.
+- **Manual installers**: files users download directly, such as macOS `.dmg`,
+  Windows `.exe` / `.msi`, and Linux `.AppImage` / `.deb` / `.rpm`.
+- **Updater assets**: the Tauri updater package, its `.sig`, and the merged
+  `latest.json`. The updater package may also be a manual installer on Windows,
+  but macOS still needs a separate `.dmg` for manual install.
+
+Updater signing and OS code signing are separate. The updater private key proves
+that an update package is ours; OS code signing controls Gatekeeper / SmartScreen
+trust for people launching a manually downloaded app. You **cannot cross-compile**
+reliable desktop installers — build each platform on its own machine.
+
+### Standard Release Runbook
+
+Use this order for every desktop release.
+
+1. **Pick and bump the version.**
+
+   ```bash
+   VERSION=1.2.3
+   bun run bump "$VERSION"
+   ```
+
+2. **Build macOS on a Mac.** The command below emits both the manual `.dmg` and
+   the updater `.app.tar.gz` + `.sig`.
 
    ```bash
    export TAURI_SIGNING_PRIVATE_KEY="$(cat apps/desktop/signing/nomifun-updater.key)"
    export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
-   bun run build:updater                                              # Windows / Linux
-   bun run build:mac --config '{"bundle":{"createUpdaterArtifacts":true}}'      # macOS (Universal)
+   bun run build:mac --config '{"bundle":{"createUpdaterArtifacts":true}}'
+   bun run make:latest
    ```
 
-4. **Build the manifest:** `bun run make:latest` on each build machine scans its
-   updater artifacts and **merges** the `<os>-<arch>` entries into
-   `apps/desktop/updater/latest.json`. Carry that file between machines so the
-   merged manifest covers every shipped platform/chip (the report flags missing
-   ones — a missing entry = those users silently get no update).
-5. **Publish to GitHub Releases:** create a release tagged `v<version>` and upload
-   every installer + its `.sig` + the merged `latest.json`. The configured
-   endpoint (`releases/latest/download/latest.json`) then serves the newest release.
+   For public macOS distribution, configure `apps/desktop/signing/.env.signing`
+   and use `--signed` so the `.app` / `.dmg` are Developer ID signed and
+   notarized:
 
-Updater signing and OS code signing are separate. See:
+   ```bash
+   bun run build:mac --signed --config '{"bundle":{"createUpdaterArtifacts":true}}'
+   ```
+
+3. **Build Windows on a Windows machine.** Use the same updater private key.
+   If you do not yet have Authenticode signing, omit `--signed`; the Tauri updater
+   signature still works, but the manual installer can show Windows SmartScreen /
+   unknown-publisher warnings.
+
+   ```powershell
+   $env:TAURI_SIGNING_PRIVATE_KEY = Get-Content apps/desktop/signing/nomifun-updater.key -Raw
+   $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""
+   bun run build:win -- --config '{"bundle":{"createUpdaterArtifacts":true}}'
+   bun run make:latest
+   ```
+
+   Once a Windows code-signing certificate is available, import it into the
+   current user's certificate store and build with Authenticode signing:
+
+   ```powershell
+   $env:WINDOWS_CERTIFICATE_THUMBPRINT = "A1B2C3..."
+   bun run build:win --signed -- --config '{"bundle":{"createUpdaterArtifacts":true}}'
+   ```
+
+4. **Build Linux on Linux** if that platform is part of the release.
+
+   ```bash
+   export TAURI_SIGNING_PRIVATE_KEY="$(cat apps/desktop/signing/nomifun-updater.key)"
+   export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
+   bun run build:linux -- --config '{"bundle":{"createUpdaterArtifacts":true}}'
+   bun run make:latest
+   ```
+
+5. **Merge `latest.json` before publishing.** `bun run make:latest` preserves
+   existing real platform entries and fills the entries for the current build
+   machine. If platforms are built on different machines, carry the newest
+   `apps/desktop/updater/latest.json` to the next machine before running
+   `make:latest`, or replace the Release asset later with `--clobber`.
+
+6. **Commit and tag the release state.**
+
+   ```bash
+   git add Cargo.toml Cargo.lock package.json ui/package.json apps/desktop/updater/latest.json
+   git commit -m "chore(release): v$VERSION"
+   git tag "v$VERSION"
+   git push origin main "v$VERSION"
+   ```
+
+7. **Create or update the GitHub Release.** Upload updater assets, `latest.json`,
+   and manual installers.
+
+   ```bash
+   gh release create "v$VERSION" \
+     target/universal-apple-darwin/release/bundle/macos/NomiFun.app.tar.gz \
+     target/universal-apple-darwin/release/bundle/macos/NomiFun.app.tar.gz.sig \
+     dist/desktop/NomiFun_${VERSION}_universal.dmg \
+     apps/desktop/updater/latest.json \
+     --title "v$VERSION" \
+     --notes "Release notes"
+   ```
+
+   If the Release already exists, upload more platform assets instead:
+
+   ```bash
+   gh release upload "v$VERSION" <new-assets...>
+   gh release upload "v$VERSION" apps/desktop/updater/latest.json --clobber
+   ```
+
+   On Windows, upload the files printed by `bun run make:latest`; those are the
+   updater package, its `.sig`, and the current `latest.json`. Also upload any
+   manual-only installer from `dist/desktop/` that was not already uploaded, such
+   as an `.msi` if one was generated.
+
+8. **Verify the published Release.**
+
+   ```bash
+   gh release view "v$VERSION" --json tagName,assets,url
+   curl -fsSL https://github.com/nomifun/nomifun-tauri/releases/latest/download/latest.json
+   ```
+
+   Confirm the downloaded manifest version is `VERSION`, every shipped platform
+   has a `platforms[...]` entry, and all URLs point to the same `v$VERSION`
+   Release.
+
+### Adding Windows After macOS Was Already Published
+
+Use this when a macOS Release already exists and you later continue from a
+Windows build machine.
+
+1. Pull the release commit/tag and confirm the same version.
+
+   ```powershell
+   git pull
+   git checkout main
+   git describe --tags --exact-match  # should print v<version> only if you checked out the tag
+   ```
+
+   If you stay on `main`, confirm `Cargo.toml` still has the same version as the
+   existing Release.
+
+2. Build Windows updater artifacts with the same updater private key.
+
+   ```powershell
+   $env:TAURI_SIGNING_PRIVATE_KEY = Get-Content apps/desktop/signing/nomifun-updater.key -Raw
+   $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""
+   bun run build:win -- --config '{"bundle":{"createUpdaterArtifacts":true}}'
+   bun run make:latest
+   ```
+
+3. Upload the Windows assets printed by `bun run make:latest`, then replace the
+   Release `latest.json` so it includes both macOS and Windows platform entries.
+
+   ```powershell
+   gh release upload v<version> <windows-updater-package> <windows-updater-package>.sig
+   gh release upload v<version> apps/desktop/updater/latest.json --clobber
+   ```
+
+   Upload any additional manual-only Windows installer from `dist/desktop/` if
+   the build produced one and it was not already the updater package.
+
+4. Commit and push the updated `latest.json` back to `main` so the repository
+   matches the Release asset.
+
+   ```powershell
+   git add apps/desktop/updater/latest.json
+   git commit -m "chore(release): add Windows assets to v<version>"
+   git push origin main
+   ```
+
+Windows without Authenticode signing is acceptable for internal updater testing:
+the Tauri updater `.sig` still protects the automatic update package. It is not
+equivalent to a trusted public Windows installer. For public distribution, obtain
+a Windows code-signing certificate, set `WINDOWS_CERTIFICATE_THUMBPRINT`, and
+rerun `build:win --signed -- --config ...` before publishing the Windows assets.
+
+See:
 
 - `apps/desktop/updater/README.md`  (full updater flow + signing keys)
 - `apps/desktop/signing/README.md`  (macOS Developer ID / notarization)
