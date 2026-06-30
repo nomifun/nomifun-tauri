@@ -504,10 +504,15 @@ export const application = {
     })
   ),
   getPath: shellProvider<string, { name: 'desktop' | 'home' | 'downloads' }>(({ name }) => tauriGetPath(name), ''),
-  // DEGRADE_STUB: changing the work/cache dir requires setting NOMIFUN_*_DIR env
-  // BEFORE the in-process backend boots; under Tauri the backend is already up,
-  // so this needs a Rust pre-boot config store + restart (see electron-removal-plan C5).
-  updateSystemInfo: stubShellProvider<void, { cacheDir: string; workDir: string }>(undefined),
+  // Persist the user-chosen work dir to a pre-boot config file that the next
+  // boot reads before resolving work_dir (Rust `nomifun_common::dir_config`).
+  // The caller restarts right after this resolves; the new dir applies then.
+  // `cacheDir` is accepted for back-compat but ignored — it is no longer
+  // user-editable (removed from the settings UI), only `workDir` is sent.
+  updateSystemInfo: httpPost<void, { cacheDir: string; workDir: string }>(
+    '/api/system/work-dir',
+    ({ workDir }) => ({ work_dir: workDir })
+  ),
   getZoomFactor: shellProvider<number, void>(async () => tauriGetZoom(), 1),
   setZoomFactor: shellProvider<number, { factor: number }>(({ factor }) => tauriSetZoom(factor), 1),
   applyKeepAwake: shellProvider<void, { enabled: boolean }>(({ enabled }) => tauriSetKeepAwake(enabled), undefined),

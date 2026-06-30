@@ -173,6 +173,20 @@ pub fn apply_pending_reset(data_dir: &Path, work_dir: &Path) -> Result<bool, App
         }
     }
 
+    // 2b. The persisted work-dir override (dir-config.json) is a user preference,
+    // not regenerable data, so it is not in DERIVED_DIRS — but a true factory
+    // reset must drop it too, or work_dir would stay pointed at the custom
+    // location next boot instead of returning to the default. Best-effort.
+    let dir_config = data_dir.join(crate::dir_config::DIR_CONFIG_FILE);
+    if let Err(e) = remove_path_with_retry(&dir_config) {
+        tracing::warn!(
+            target: "factory_reset",
+            path = %dir_config.display(),
+            error = %e,
+            "factory reset: could not remove dir-config override (continuing)"
+        );
+    }
+
     // 3. Clear the marker so the next boot is normal.
     clear_marker(data_dir);
     tracing::warn!(target: "factory_reset", "factory reset complete — a fresh database will be created");
@@ -280,6 +294,23 @@ mod tests {
         assert_eq!(apply_pending_reset(&dir, &dir).unwrap(), true);
         assert!(!dir.join("nomifun-backend.db").exists());
         assert!(!dir.join(RESET_MARKER_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_reset_clears_dir_config_override() {
+        let dir = std::env::temp_dir().join(format!("nomifun-fr-dircfg-{}", now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A persisted work-dir override must not survive a "reset to defaults".
+        std::fs::write(dir.join(crate::dir_config::DIR_CONFIG_FILE), br#"{"work_dir":"/custom/ws"}"#).unwrap();
+        write_marker(&dir, &ResetMarker::new(ResetScope::Full)).unwrap();
+
+        assert_eq!(apply_pending_reset(&dir, &dir).unwrap(), true);
+        assert!(
+            !dir.join(crate::dir_config::DIR_CONFIG_FILE).exists(),
+            "dir-config override must be cleared on factory reset"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

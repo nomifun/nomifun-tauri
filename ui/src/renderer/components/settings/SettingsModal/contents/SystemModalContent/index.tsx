@@ -309,16 +309,32 @@ const SystemModalContent: React.FC = () => {
       savingRef.current = true;
       setError(null);
       try {
-        await saveDirConfigValidate({ workDir });
-        // Pass systemInfo.cacheDir as-is: cacheDir is no longer user-editable
-        // (removed from UI), but the backend IPC interface still expects it.
-        // Passing the current value ensures existing custom paths are preserved.
-        await ipcBridge.application.updateSystemInfo.invoke({ cacheDir: systemInfo.cacheDir, workDir });
-        await ipcBridge.application.restart.invoke();
-      } catch (caughtError: unknown) {
-        form.setFieldValue('workDir', systemInfo.workDir);
-        if (caughtError) {
-          setError(caughtError instanceof Error ? caughtError.message : String(caughtError));
+        // Confirm, then persist. A failure (or cancel) here means nothing was
+        // written, so reverting the field to the current value is correct.
+        try {
+          await saveDirConfigValidate({ workDir });
+          // Pass systemInfo.cacheDir as-is: cacheDir is no longer user-editable
+          // (removed from UI), but the backend IPC interface still expects it.
+          // Passing the current value ensures existing custom paths are preserved.
+          await ipcBridge.application.updateSystemInfo.invoke({ cacheDir: systemInfo.cacheDir, workDir });
+        } catch (persistError: unknown) {
+          form.setFieldValue('workDir', systemInfo.workDir);
+          if (persistError) {
+            setError(persistError instanceof Error ? persistError.message : String(persistError));
+          }
+          return;
+        }
+        // Persisted: the new dir is now authoritative and applies on the next
+        // boot. Relaunch applies it immediately (and never returns). If relaunch
+        // instead throws, do NOT revert the field — the on-disk config already
+        // holds the new dir, so reverting would make the UI contradict reality;
+        // surface the error and let the user restart manually.
+        try {
+          await ipcBridge.application.restart.invoke();
+        } catch (restartError: unknown) {
+          if (restartError) {
+            setError(restartError instanceof Error ? restartError.message : String(restartError));
+          }
         }
       } finally {
         savingRef.current = false;

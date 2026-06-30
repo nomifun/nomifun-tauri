@@ -4,6 +4,7 @@ pub mod constants;
 
 mod case_convert;
 mod crypto;
+pub mod dir_config;
 mod enums;
 mod error;
 pub mod factory_reset;

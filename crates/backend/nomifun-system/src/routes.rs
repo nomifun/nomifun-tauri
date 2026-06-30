@@ -9,7 +9,7 @@ use nomifun_api_types::{
     ApiResponse, ClientPreferencesResponse, CreateProviderRequest, DetectProtocolRequest, FetchModelsAnonymousRequest,
     FetchModelsRequest, FetchModelsResponse, ProtocolDetectionResponse, ProviderResponse, SystemInfoResponse,
     SystemSettingsResponse, UpdateCheckRequest, UpdateCheckResult, UpdateClientPreferencesRequest,
-    UpdateProviderRequest, UpdateSettingsRequest,
+    UpdateProviderRequest, UpdateSettingsRequest, UpdateWorkDirRequest,
 };
 use nomifun_common::AppError;
 
@@ -53,6 +53,7 @@ pub struct SystemRouterState {
 /// - `GET  /api/system/info`                 — system directory & platform info
 /// - `POST /api/system/check-update`         — check GitHub for new versions
 /// - `POST /api/system/factory-reset`        — arm a factory reset (wipes on next boot)
+/// - `POST /api/system/work-dir`             — persist the work dir (applies on next restart)
 pub fn system_routes(state: SystemRouterState) -> Router {
     Router::new()
         .route("/api/settings", get(get_settings).patch(update_settings))
@@ -71,6 +72,7 @@ pub fn system_routes(state: SystemRouterState) -> Router {
         .route("/api/system/info", get(get_system_info))
         .route("/api/system/check-update", post(check_update))
         .route("/api/system/factory-reset", post(factory_reset))
+        .route("/api/system/work-dir", post(set_work_dir))
         .with_state(state)
 }
 
@@ -231,5 +233,60 @@ async fn factory_reset(State(state): State<SystemRouterState>) -> Result<Json<Ap
     let marker = nomifun_common::factory_reset::ResetMarker::new(nomifun_common::factory_reset::ResetScope::Full);
     nomifun_common::factory_reset::write_marker(&state.data_dir, &marker)?;
     tracing::warn!(target: "factory_reset", "factory reset armed — will wipe database and derived data on next restart");
+    Ok(Json(ApiResponse::success()))
+}
+
+// ===========================================================================
+// Work directory handler
+// ===========================================================================
+
+/// Persist the user-chosen working directory. Like factory reset, this only
+/// takes effect on the *next* boot: the backend resolves `work_dir` (and injects
+/// it into every service) before the HTTP server even exists, so the value
+/// cannot change in the running process. The stored path is read early next boot
+/// by `bootstrap::work_dir::resolve_work_dir` (see `nomifun_common::dir_config`).
+/// The client should restart the app right after this returns.
+///
+/// The new path is validated to be a non-empty, absolute, creatable directory so
+/// the next boot does not fail on an unusable value.
+async fn set_work_dir(
+    State(state): State<SystemRouterState>,
+    body: Result<Json<UpdateWorkDirRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+
+    let trimmed = req.work_dir.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::BadRequest("work_dir must not be empty".into()));
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err(AppError::BadRequest(format!("work_dir must be an absolute path: {trimmed}")));
+    }
+    // Reject paths with a leading/trailing-whitespace segment up front, with the
+    // same dedicated error the conversation layer raises (service.rs) — otherwise
+    // such a work_dir is accepted here only to make every later workspace
+    // creation fail, and create_dir_all's behavior on these names is OS-specific.
+    if nomifun_common::workspace_path_has_edge_whitespace_segment(&path) {
+        return Err(AppError::WorkspacePathEdgeWhitespace(path.display().to_string()));
+    }
+    // Create it now so we (a) confirm the location is writable and (b) reject a
+    // path that collides with an existing file — both would otherwise surface as
+    // a confusing failure on the next boot.
+    std::fs::create_dir_all(&path)
+        .map_err(|e| AppError::BadRequest(format!("cannot use work_dir {}: {e}", path.display())))?;
+    if !path.is_dir() {
+        return Err(AppError::BadRequest(format!(
+            "work_dir is not a directory: {}",
+            path.display()
+        )));
+    }
+
+    nomifun_common::dir_config::set_work_dir(&state.data_dir, &path)?;
+    tracing::info!(
+        target: "system",
+        work_dir = %path.display(),
+        "work dir override persisted — applies on next restart"
+    );
     Ok(Json(ApiResponse::success()))
 }

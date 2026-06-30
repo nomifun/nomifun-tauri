@@ -21,6 +21,14 @@ pub struct UpdateCheckRequest {
     pub repo: Option<String>,
 }
 
+/// Request body for `POST /api/system/work-dir`: persist the user-chosen
+/// conversation workspace root. Applied on the next boot (the backend resolves
+/// `work_dir` before any service starts), so the client restarts after this.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateWorkDirRequest {
+    pub work_dir: String,
+}
+
 /// Response for `POST /api/system/check-update`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UpdateCheckResult {
@@ -118,6 +126,15 @@ mod tests {
         let req: UpdateCheckRequest = serde_json::from_value(raw).unwrap();
         assert!(req.include_prerelease);
         assert_eq!(req.repo.as_deref(), Some("nomifun/nomifun-app"));
+    }
+
+    // -- UpdateWorkDirRequest --
+
+    #[test]
+    fn test_update_work_dir_request_deserializes_snake_case() {
+        let raw = json!({ "work_dir": "/Users/me/Workspaces/nomi" });
+        let req: UpdateWorkDirRequest = serde_json::from_value(raw).unwrap();
+        assert_eq!(req.work_dir, "/Users/me/Workspaces/nomi");
     }
 
     // -- UpdateCheckResult --

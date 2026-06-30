@@ -126,7 +126,7 @@ pub use knowledge::{
 };
 pub use lifecycle::{
     GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult,
-    UpdateReleaseInfo,
+    UpdateReleaseInfo, UpdateWorkDirRequest,
 };
 pub use mcp::{
     BatchImportMcpServersRequest, CreateMcpServerRequest, DetectedMcpServerEntry,
