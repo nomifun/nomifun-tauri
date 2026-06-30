@@ -35,8 +35,8 @@
   flex-shrink: 0;
   min-height: 44px;
   padding: 6px 12px 6px 16px;
-  background: color-mix(in srgb, rgb(var(--primary-6)) 5%, var(--bg-1));
-  border-bottom: 1px solid color-mix(in srgb, rgb(var(--primary-6)) 22%, var(--border-base));
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--border-base);
 }
 
 /* Left side — the "viewing" label + worker title (truncates). */
@@ -56,8 +56,8 @@
   height: 22px;
   flex-shrink: 0;
   border-radius: 7px;
-  color: #fff;
-  background: rgb(var(--primary-6));
+  color: rgb(var(--primary-6));
+  background: color-mix(in srgb, rgb(var(--primary-6)) 12%, transparent);
 }
 
 .bannerEyebrow {
@@ -185,15 +185,16 @@
 
 /* ── 局部调整 composer (docked at the BOTTOM of the projected worker view) ──────
  * A labeled input + submit so the user can type a local adjustment for this node
- * and submit it (runs.steer) without leaving the content area. */
+ * and submit it (runs.steer) without leaving the content area. Neutral surface —
+ * the input keeps Arco's clean default; the bar adds no tint of its own. */
 .steerBar {
   flex-shrink: 0;
   display: flex;
-  align-items: flex-end;
-  gap: 8px;
-  padding: 10px 16px;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px 12px;
   border-top: 1px solid var(--border-base);
-  background: color-mix(in srgb, rgb(var(--primary-6)) 4%, var(--bg-1));
+  background: var(--bg-1);
 }
 
 .steerLabel {
@@ -201,10 +202,9 @@
   align-items: center;
   gap: 5px;
   flex-shrink: 0;
-  padding-bottom: 7px;
   font-size: 12px;
-  font-weight: 600;
-  color: var(--text-secondary);
+  font-weight: 500;
+  color: var(--text-tertiary);
 }
 
 .steerInput {

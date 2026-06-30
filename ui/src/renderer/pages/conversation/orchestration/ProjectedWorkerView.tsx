@@ -6,7 +6,7 @@
 
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Input, Spin } from '@arco-design/web-react';
+import { Button, Input, Spin } from '@arco-design/web-react';
 import { Comment, Left, Redo, Send } from '@icon-park/react';
 import { ipcBridge } from '@/common';
 import type { TChatConversation } from '@/common/config/storage';
@@ -233,22 +233,15 @@ const ProjectedWorkerView: React.FC<ProjectedWorkerViewProps> = ({ payload }) =>
               }
             }}
           />
-          <div
-            role='button'
-            tabIndex={0}
-            aria-label={t('orchestrator.run.steer.submit', { defaultValue: '提交' })}
-            aria-disabled={adjustDisabled}
-            className={`${styles.action} ${styles.actionPrimary}`}
-            onClick={adjustDisabled ? undefined : () => void submitAdjust()}
-            onKeyDown={(e) => {
-              if ((e.key === 'Enter' || e.key === ' ') && !adjustDisabled) {
-                e.preventDefault();
-                void submitAdjust();
-              }
-            }}
+          <Button
+            type='primary'
+            size='small'
+            loading={adjusting}
+            disabled={adjustText.trim().length === 0}
+            onClick={() => void submitAdjust()}
           >
-            <span>{t('orchestrator.run.steer.submit', { defaultValue: '提交' })}</span>
-          </div>
+            {t('orchestrator.run.steer.submit', { defaultValue: '提交' })}
+          </Button>
         </div>
       )}
     </div>
