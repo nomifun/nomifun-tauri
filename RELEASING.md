@@ -1,5 +1,7 @@
 # Releasing NomiFun
 
+中文发版手册见 `RELEASING.zh-CN.md`.
+
 This checklist is for maintainers preparing a public release.
 
 ## Versioning (single source of truth)

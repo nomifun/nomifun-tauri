@@ -1,5 +1,7 @@
 # NomiFun Desktop Updater
 
+中文说明见 `apps/desktop/updater/README.zh-CN.md`.
+
 In-app auto-update for `nomifun-desktop`, built on **Tauri's native updater**
 (`tauri-plugin-updater` + minisign signatures + a `latest.json` manifest hosted
 on GitHub Releases). The app checks → downloads → verifies → installs → relaunches.
