@@ -355,20 +355,22 @@ pub(super) async fn build(
         context_limit: fields.context_limit.map(|v| v as u64),
         compat_overrides: fields.compat_overrides,
         session_directory,
-        // Companion-owned sessions (local 桌面伙伴 chat + IM channel master) have NO
-        // interactive approval UI: the companion chat panel deliberately omits the
-        // permission/confirmation flow and remote channel users can't confirm either.
-        // Under SessionMode::Default the first gateway/file/bash tool call parks on
-        // rx.await forever → the turn never emits finish/error → 聊天永久「思考中」.
-        // So pin "yolo" ONLY for those UI-less surfaces (companion thread or channel
-        // master). A PLAIN desktop conversation that carries the gateway keeps its
-        // normal approval mode — it has an approval UI, and the gateway's own
-        // danger-tier × surface confirm-gate guards destructive/sensitive ops there.
-        // An explicit extra.session_mode still wins. (Decoupled from `desktop_gateway`
-        // so "any session is a super-gateway" does not also mean "any session is yolo".)
-        session_mode: overrides.session_mode.clone().or_else(|| {
-            (overrides.companion || overrides.channel_platform.is_some()).then(|| "yolo".to_owned())
-        }),
+        // 默认授权模式 = 全自动（yolo）。产品决策：所有 nomi 会话默认自动批准
+        // 标准工具类别（info/edit/exec/mcp —— 文件编辑 / Shell / 标准工具 & MCP），
+        // 不再反复弹授权框。理由：
+        //  - companion / IM channel master 本就无审批 UI（其首个 gateway/file/bash
+        //    工具调用会 park 在 rx.await，turn 永不 finish → 聊天永久「思考中」），
+        //    所以它们历来必须 yolo；现在把这一默认推广到普通桌面会话。
+        //  - **显式 `extra.session_mode` 仍胜出**：用户在权限选择器里手动降级为
+        //    `default` / `auto_edit` 会写偏好并经 extra 传入，这里的 `.or_else` 让显式值
+        //    优先，降级正常生效。
+        //  - 高危逃生舱（browser full-power 跨域 / takeover / 跨域 POST 审批 /
+        //    computer-use 桌面控制）各自读 `read_bool_pref`、**绝不看 session_mode**
+        //    （不变量⑧），与本默认正交、保持原状 —— yolo 不会放开它们。
+        session_mode: overrides
+            .session_mode
+            .clone()
+            .or_else(|| Some("yolo".to_owned())),
         extra_mcp_servers,
         bedrock_config: fields.bedrock_config,
         computer_use: overrides.computer_use.unwrap_or(computer_use_default),

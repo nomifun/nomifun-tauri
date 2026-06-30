@@ -169,7 +169,12 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
         type: 'nomi',
         name: goal.slice(0, 60),
         model: current_model,
-        extra: { workspace: finalWorkspace, custom_workspace: isCustomWorkspace, orchestrator_role: 'lead' },
+        extra: {
+          workspace: finalWorkspace,
+          custom_workspace: isCustomWorkspace,
+          orchestrator_role: 'lead',
+          session_mode: selectedMode,
+        },
       });
       if (!conversation?.id) {
         Message.error(t('conversation.createFailed', { defaultValue: '创建会话失败' }));
