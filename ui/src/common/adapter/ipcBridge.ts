@@ -3018,6 +3018,26 @@ export interface ICompanionSourceStats {
   total: number;
 }
 
+/** One archived session-window day-digest (伙伴会话归档回看). */
+export interface ICompanionDayDigest {
+  id: string;
+  companion_id: string;
+  conversation_id: string;
+  /** Local start day, `YYYYMMDD`. */
+  session_day: string;
+  started_at: number;
+  last_activity_at: number;
+  closed_at: number | null;
+  status: string;
+  message_count: number;
+  boundary_ts: number;
+  /** The compressed narrative summary (markdown). */
+  digest: string | null;
+  /** JSON string: `{topics,decisions,todos,mood}`. */
+  highlights: string | null;
+  token_estimate: number;
+}
+
 /** 伙伴的唯一专属会话 — 一条真实的 `type='nomi'` 会话。每个伙伴生命周期内恒一条。 */
 export interface ICompanionThread {
   conversation_id: number;
@@ -3104,6 +3124,14 @@ export interface ICompanionEvolveConfig {
   auto_threshold: number;
 }
 
+/** Shared session-window archiving settings (伙伴会话窗口归档). Default OFF (opt-in). */
+export interface ICompanionArchiveConfig {
+  enabled: boolean;
+  idle_minutes: number;
+  min_chars: number;
+  inject_recent_days: number;
+}
+
 /** Shared (cross-companion) config — `shared/config.json`, served by /api/companion/config. */
 export interface ICompanionSharedConfig {
   collect: ICompanionCollectConfig;
@@ -3113,6 +3141,10 @@ export interface ICompanionSharedConfig {
     model: ICompanionModelRef;
   };
   evolve: ICompanionEvolveConfig;
+  /** Session-window archiving (伙伴会话归档). */
+  archive: ICompanionArchiveConfig;
+  /** 智能编排：开启后本地伙伴会话可用 nomi_run_create 把复杂大任务拆给子 agent。 */
+  smart_orchestration: boolean;
   /** Empty when no companion exists yet (zero-companion state is allowed). */
   default_companion_id: string | null;
 }
@@ -3137,6 +3169,8 @@ export type ICompanionSharedConfigPatch = {
     model: ICompanionModelRef;
   }>;
   evolve?: Partial<ICompanionEvolveConfig>;
+  archive?: Partial<ICompanionArchiveConfig>;
+  smart_orchestration?: boolean;
 };
 
 /** Export endpoint result — backend echoes the resolved destination path
@@ -3233,6 +3267,19 @@ export const companion = {
   weeklyDigest: httpGet<ICompanionWeeklyDigest, { companion_id: string; days?: number }>(
     (p) => `/api/companion/companions/${p.companion_id}/weekly-digest${p.days ? `?days=${p.days}` : ''}`
   ),
+  /** Archived session-window day-digests (伙伴会话归档回看时间线 / 去年今日). */
+  listDayDigests: httpGet<
+    ICompanionDayDigest[],
+    { companion_id: string; since?: string; until?: string; on_day?: string; limit?: number }
+  >((p) => {
+    const q = new URLSearchParams();
+    if (p.since) q.set('since', p.since);
+    if (p.until) q.set('until', p.until);
+    if (p.on_day) q.set('on_day', p.on_day);
+    if (p.limit) q.set('limit', String(p.limit));
+    const qs = q.toString();
+    return `/api/companion/companions/${p.companion_id}/digests${qs ? `?${qs}` : ''}`;
+  }),
   /** Learn-by-demonstration: draft a skill from a work session's tool sequence. Returns the name. */
   draftFromSession: httpPost<string | null, { companion_id: string; conversation_id: string }>(
     (p) => `/api/companion/companions/${p.companion_id}/skills/from-session`,

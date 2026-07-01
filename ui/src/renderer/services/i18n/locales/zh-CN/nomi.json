@@ -5,6 +5,7 @@
   "tabs": {
     "overview": "总览",
     "memories": "记忆",
+    "review": "会话回顾",
     "collect": "数据采集",
     "learn": "知识共享交流",
     "suggestions": "建议",
@@ -222,6 +223,21 @@
     "reflectHint": "复杂任务完成后也反思是否值得固化",
     "autoActivate": "高置信自动生效",
     "autoActivateHint": "多次重复的高置信技能直接启用（仍可在技能页撤销）"
+  },
+  "archive": {
+    "title": "会话归档",
+    "hint": "伙伴聊太久，上下文会越攒越大、成本越来越贵。开启后，会话空闲一段时间就把这段聊天压缩成按天归档的日记，并重置对话上下文，让伙伴保持清爽、也能承担更密集的任务。",
+    "enabled": "开启会话归档",
+    "idleMinutes": "空闲归档阈值",
+    "reviewTitle": "会话回顾（按天）",
+    "reviewEmpty": "还没有归档的会话日记。开启会话归档后，空闲的聊天会在这里按天沉淀。",
+    "onThisDay": "去年今日",
+    "onThisDayEmpty": "往年的今天还没有记录～"
+  },
+  "orchestration": {
+    "title": "智能编排",
+    "hint": "开启后，遇到复杂、多步骤的大任务时，伙伴会用「子 agent」把活拆开并行处理，自己只负责调度和汇总，保持对话上下文清爽。简单的事仍然直接自己做。",
+    "enabled": "开启智能编排"
   },
   "learn": {
     "enabled": "定时学习",
