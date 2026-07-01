@@ -100,6 +100,19 @@ pub struct OrchRunTaskRow {
     /// `pending` for another attempt. `list_ready_tasks` excludes a task whose
     /// `next_retry_at` is still in the future; a `NULL` is always ready.
     pub next_retry_at: Option<i64>,
+    /// Per-task model override (迁移 025, nullable). When BOTH are set, the engine
+    /// dispatches this node with this provider×model (any available model, not
+    /// limited to the run's frozen fleet), overwriting the resolved member's
+    /// provider/model while keeping its role/persona. `None` = follow auto-routing.
+    #[serde(default)]
+    pub override_provider_id: Option<String>,
+    #[serde(default)]
+    pub override_model: Option<String>,
+    /// User "预置要求" appended as its own section to this node's worker brief
+    /// (迁移 025, nullable), separate from the planner-written `spec`. `None`/blank
+    /// = no extra requirement.
+    #[serde(default)]
+    pub preset_prompt: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }

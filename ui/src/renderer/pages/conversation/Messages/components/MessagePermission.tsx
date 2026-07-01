@@ -7,7 +7,7 @@
 
 import type { IMessagePermission } from '@/common/chat/chatLib';
 import { ipcBridge } from '@/common';
-import { Button, Card, Radio, Typography } from '@arco-design/web-react';
+import { Button, Card, Image, Radio, Typography } from '@arco-design/web-react';
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -26,7 +26,7 @@ const actionIcons: Record<string, string> = {
 
 const MessagePermission: React.FC<MessagePermissionProps> = React.memo(({ message }) => {
   const { t } = useTranslation();
-  const { options = [], description, title, action, call_id, command_type } = message.content || {};
+  const { options = [], description, title, action, call_id, command_type, screenshot } = message.content || {};
 
   const [selected, setSelected] = useState<string | null>(null);
   const [isResponding, setIsResponding] = useState(false);
@@ -72,6 +72,11 @@ const MessagePermission: React.FC<MessagePermissionProps> = React.memo(({ messag
         {description && description !== displayTitle && (
           <div>
             <Text className='text-xs text-t-secondary'>{description}</Text>
+          </div>
+        )}
+        {screenshot && (
+          <div className='rounded-md overflow-hidden border' style={{ borderColor: 'var(--border-2)' }}>
+            <Image src={screenshot} alt={t('messages.browserApprovalPreview')} width='100%' style={{ maxHeight: 320, objectFit: 'contain' }} />
           </div>
         )}
         {!hasResponded && (

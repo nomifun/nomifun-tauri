@@ -193,6 +193,7 @@ mod tests {
                 value: json!("allow_once"),
                 params: None,
             }],
+            screenshot: None,
         }
     }
 

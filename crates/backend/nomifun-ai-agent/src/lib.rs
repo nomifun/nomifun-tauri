@@ -46,7 +46,7 @@ pub use capability::skill_manager::{
 };
 pub use factory::provider_config::{
     one_shot_completion, resolve_provider_config, streaming_completion, streaming_completion_kinded,
-    user_message, DeltaKind,
+    streaming_completion_text_or_reasoning, user_message, DeltaKind,
 };
 pub use factory::{AgentFactoryDeps, CompanionPromptProvider, build_agent_factory};
 pub use idle_scanner::start_idle_scanner;

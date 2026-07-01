@@ -221,6 +221,9 @@ impl IRunRepository for SqliteRunRepository {
             kind: p.kind,
             pattern_config: p.pattern_config,
             next_retry_at: None,
+            override_provider_id: None,
+            override_model: None,
+            preset_prompt: None,
             created_at: now,
             updated_at: now,
         })
@@ -327,6 +330,27 @@ impl IRunRepository for SqliteRunRepository {
         Ok(())
     }
 
+    async fn set_task_overrides(
+        &self,
+        id: &str,
+        override_provider_id: Option<String>,
+        override_model: Option<String>,
+        preset_prompt: Option<String>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE orch_run_tasks SET override_provider_id = ?, override_model = ?, \
+             preset_prompt = ?, updated_at = ? WHERE id = ?",
+        )
+        .bind(&override_provider_id)
+        .bind(&override_model)
+        .bind(&preset_prompt)
+        .bind(now_ms())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn delete_task(&self, id: &str) -> Result<(), sqlx::Error> {
         // One statement: deleting the task fires the task-keyed `ON DELETE CASCADE`
         // FKs (migration 018), sweeping out its dep edges (as blocker OR blocked)
@@ -348,6 +372,55 @@ impl IRunRepository for SqliteRunRepository {
             .bind(run_id)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    async fn reset_orphaned_running_tasks(
+        &self,
+        run_id: Option<&str>,
+    ) -> Result<u64, sqlx::Error> {
+        // Mirror `RunService::reset_task` in one bulk statement: status→pending,
+        // clear conversation_id/output_summary/output_files/next_retry_at, bump
+        // attempt, and — kind-aware — clear pattern_config ONLY for `agent` tasks
+        // (a verify/judge/loop node's pattern_config is its POLICY; wiping it would
+        // silently revert to defaults, so the CASE preserves it). The `WHERE status
+        // = 'running'` scopes the reset to orphaned in-flight rows; an optional
+        // `run_id` narrows it to one run (pause) vs. all runs (boot).
+        let base = "UPDATE orch_run_tasks SET \
+             status = 'pending', \
+             conversation_id = NULL, \
+             output_summary = NULL, \
+             output_files = NULL, \
+             next_retry_at = NULL, \
+             attempt = attempt + 1, \
+             pattern_config = CASE WHEN kind = 'agent' THEN NULL ELSE pattern_config END, \
+             updated_at = ? \
+             WHERE status = 'running'";
+        let result = match run_id {
+            Some(rid) => {
+                let sql = format!("{base} AND run_id = ?");
+                sqlx::query(&sql)
+                    .bind(now_ms())
+                    .bind(rid)
+                    .execute(&self.pool)
+                    .await?
+            }
+            None => sqlx::query(base).bind(now_ms()).execute(&self.pool).await?,
+        };
+        Ok(result.rows_affected())
+    }
+
+    async fn mark_run_running_tasks_cancelled(&self, run_id: &str) -> Result<(), sqlx::Error> {
+        // Status + updated_at only — preserve the interrupted node's partial
+        // conversation_id / output so a cancelled run stays inspectable.
+        sqlx::query(
+            "UPDATE orch_run_tasks SET status = 'cancelled', updated_at = ? \
+             WHERE run_id = ? AND status = 'running'",
+        )
+        .bind(now_ms())
+        .bind(run_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -1658,5 +1731,175 @@ mod tests {
         assert_eq!(deps.len(), 1, "original edge survives: {deps:?}");
         assert_eq!(deps[0].blocker_task_id, keep.id);
         assert_eq!(deps[0].blocked_task_id, drop.id);
+    }
+
+    // Helper: create a task with an explicit kind + status + optional pattern_config.
+    async fn mk_task(
+        repo: &SqliteRunRepository,
+        run_id: &str,
+        title: &str,
+        kind: &str,
+        status: &str,
+        pattern_config: Option<&str>,
+    ) -> String {
+        repo.create_task(CreateTaskParams {
+            run_id: run_id.into(),
+            title: title.into(),
+            spec: "s".into(),
+            task_profile: None,
+            status: status.into(),
+            graph_x: None,
+            graph_y: None,
+            role: None,
+            kind: kind.into(),
+            pattern_config: pattern_config.map(str::to_string),
+        })
+        .await
+        .unwrap()
+        .id
+    }
+
+    async fn mk_run(repo: &SqliteRunRepository, ws_id: Option<String>, goal: &str) -> String {
+        repo.create_run(CreateRunParams {
+            workspace_id: ws_id,
+            user_id: "u1".into(),
+            goal: goal.into(),
+            fleet_snapshot: "{}".into(),
+            autonomy: "auto".into(),
+            max_parallel: Some(1),
+            lead_conv_id: None,
+            work_dir: None,
+        })
+        .await
+        .unwrap()
+        .id
+    }
+
+    // Fix A CORE: `reset_orphaned_running_tasks(None)` settles EVERY `running` task
+    // back to `pending` (clearing conv/output/next_retry_at, bumping attempt) while
+    // being KIND-AWARE — an `agent` task's pattern_config (a stale loop-body carry)
+    // is cleared, but a `verify`/`judge`/`loop` node's pattern_config (its POLICY)
+    // is PRESERVED. Non-running rows (done/pending) are untouched. This is the boot
+    // reconciliation that cures the「重启后卡在执行中」orphan.
+    #[tokio::test]
+    async fn reset_orphaned_running_tasks_settles_all_kind_aware() {
+        let db = init_database_memory().await.unwrap();
+        let pool = db.pool().clone();
+        let ws = make_workspace(&pool).await;
+        let repo = SqliteRunRepository::new(pool);
+        let run = mk_run(&repo, Some(ws), "boot reconcile").await;
+
+        let agent_run = mk_task(&repo, &run, "agent-run", "agent", "running", Some("{\"group\":\"g\"}")).await;
+        let verify_run = mk_task(&repo, &run, "verify-run", "verify", "running", Some("{\"votes\":\"unanimous\"}")).await;
+        let done_t = mk_task(&repo, &run, "done", "agent", "done", Some("{\"keep\":1}")).await;
+        let pending_t = mk_task(&repo, &run, "pending", "agent", "pending", None).await;
+
+        // Stamp the running tasks with live-worker residue (conv/output/attempt/gate)
+        // so we can prove the reset clears it. The `done` task keeps its output.
+        for tid in [&agent_run, &verify_run, &done_t] {
+            repo.update_task(
+                tid,
+                UpdateTaskParams {
+                    conversation_id: Some(Some(900)),
+                    output_summary: Some(Some("[\"partial\"]".into())),
+                    output_files: Some(Some("[]".into())),
+                    attempt: Some(2),
+                    next_retry_at: Some(Some(now_ms() + 60_000)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let reset = repo.reset_orphaned_running_tasks(None).await.unwrap();
+        assert_eq!(reset, 2, "exactly the two running tasks were reset");
+
+        let by_id = |tasks: &[OrchRunTaskRow], id: &str| tasks.iter().find(|t| t.id == id).unwrap().clone();
+        let tasks = repo.list_tasks(&run).await.unwrap();
+
+        let a = by_id(&tasks, &agent_run);
+        assert_eq!(a.status, "pending", "agent running → pending");
+        assert_eq!(a.conversation_id, None, "conversation cleared");
+        assert_eq!(a.output_summary, None, "output cleared");
+        assert_eq!(a.output_files, None, "output files cleared");
+        assert_eq!(a.next_retry_at, None, "retry gate cleared");
+        assert_eq!(a.attempt, 3, "attempt bumped (2 → 3)");
+        assert_eq!(a.pattern_config, None, "agent pattern_config (loop carry) cleared");
+
+        let v = by_id(&tasks, &verify_run);
+        assert_eq!(v.status, "pending", "verify running → pending");
+        assert_eq!(v.conversation_id, None, "conversation cleared");
+        assert_eq!(v.attempt, 3, "attempt bumped");
+        assert_eq!(
+            v.pattern_config.as_deref(),
+            Some("{\"votes\":\"unanimous\"}"),
+            "verify pattern_config (POLICY) PRESERVED"
+        );
+
+        let d = by_id(&tasks, &done_t);
+        assert_eq!(d.status, "done", "done task untouched");
+        assert_eq!(d.attempt, 2, "done attempt unchanged");
+        assert_eq!(d.conversation_id, Some(900), "done output preserved");
+
+        let p = by_id(&tasks, &pending_t);
+        assert_eq!(p.status, "pending", "pending task still pending");
+        assert_eq!(p.attempt, 0, "pending attempt NOT bumped (only running rows reset)");
+    }
+
+    // Fix C SCOPING: `reset_orphaned_running_tasks(Some(run))` resets ONLY that run's
+    // running tasks — another run's running task is left live (the pause / rerun
+    // liveness path must not touch sibling runs).
+    #[tokio::test]
+    async fn reset_orphaned_running_tasks_scoped_to_one_run() {
+        let db = init_database_memory().await.unwrap();
+        let pool = db.pool().clone();
+        let ws = make_workspace(&pool).await;
+        let repo = SqliteRunRepository::new(pool);
+        let run_a = mk_run(&repo, Some(ws.clone()), "run A").await;
+        let run_b = mk_run(&repo, Some(ws), "run B").await;
+        let a_task = mk_task(&repo, &run_a, "a", "agent", "running", None).await;
+        let b_task = mk_task(&repo, &run_b, "b", "agent", "running", None).await;
+
+        let n = repo.reset_orphaned_running_tasks(Some(&run_a)).await.unwrap();
+        assert_eq!(n, 1, "only run A's running task reset");
+
+        let a = repo.get_task(&a_task).await.unwrap().unwrap();
+        assert_eq!(a.status, "pending", "run A's task reset to pending");
+        let b = repo.get_task(&b_task).await.unwrap().unwrap();
+        assert_eq!(b.status, "running", "run B's task left untouched");
+    }
+
+    // Fix B PRIMITIVE: `mark_run_running_tasks_cancelled` marks ONLY the run's
+    // `running` tasks `cancelled` (preserving their partial output for inspection),
+    // leaving settled/pending tasks and other runs untouched.
+    #[tokio::test]
+    async fn mark_run_running_tasks_cancelled_settles_only_running() {
+        let db = init_database_memory().await.unwrap();
+        let pool = db.pool().clone();
+        let ws = make_workspace(&pool).await;
+        let repo = SqliteRunRepository::new(pool);
+        let run = mk_run(&repo, Some(ws.clone()), "cancel run").await;
+        let other = mk_run(&repo, Some(ws), "other run").await;
+        let running = mk_task(&repo, &run, "running", "agent", "running", None).await;
+        let done_t = mk_task(&repo, &run, "done", "agent", "done", None).await;
+        let other_running = mk_task(&repo, &other, "other", "agent", "running", None).await;
+        // Stamp partial output on the running task — cancel must PRESERVE it.
+        repo.update_task(
+            &running,
+            UpdateTaskParams { conversation_id: Some(Some(901)), ..Default::default() },
+        )
+        .await
+        .unwrap();
+
+        repo.mark_run_running_tasks_cancelled(&run).await.unwrap();
+
+        let r = repo.get_task(&running).await.unwrap().unwrap();
+        assert_eq!(r.status, "cancelled", "running → cancelled");
+        assert_eq!(r.conversation_id, Some(901), "partial output preserved (still inspectable)");
+        let d = repo.get_task(&done_t).await.unwrap().unwrap();
+        assert_eq!(d.status, "done", "settled task untouched");
+        let o = repo.get_task(&other_running).await.unwrap().unwrap();
+        assert_eq!(o.status, "running", "other run's task untouched");
     }
 }

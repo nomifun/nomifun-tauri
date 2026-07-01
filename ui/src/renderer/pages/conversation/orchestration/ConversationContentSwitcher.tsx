@@ -73,8 +73,14 @@ const ConversationContentSwitcher: React.FC<ConversationContentSwitcherProps> = 
         {children}
       </div>
 
-      {/* Projected worker node — overlays the hidden main content. */}
-      {projecting && projectedPayload && <ProjectedWorkerView payload={projectedPayload} />}
+      {/* Projected worker node — overlays the hidden main content. `key` by the
+          projected task id so switching between nodes REMOUNTS the view (and its
+          NodePreconfigPanel / collapse state), matching the repo's
+          `key={conversation.id}` convention — otherwise an unsaved model/preset
+          from the previous node would leak into the next node's form. */}
+      {projecting && projectedPayload && (
+        <ProjectedWorkerView key={projectedPayload.task.id} payload={projectedPayload} />
+      )}
     </div>
   );
 };

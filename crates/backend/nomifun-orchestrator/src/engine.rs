@@ -425,6 +425,22 @@ impl RunEngine {
     pub fn resume_persisted_runs(&self, run_repo: Arc<dyn IRunRepository>) {
         let this = self.clone();
         tokio::spawn(async move {
+            // RECONCILE FIRST: a fresh process has NO live workers, so EVERY
+            // persisted `running` task is an orphan (the worker/loop that owned it
+            // died with the previous process). Settle them back to `pending` BEFORE
+            // restarting any loop, restoring the invariant `running ⟺ live worker`.
+            // Without this, an orphaned `running` task shows「执行中」forever and the
+            // rerun guard rejects it ("任务运行中…") — permanently stuck. Resettable
+            // runs then re-dispatch these pending tasks; terminal runs leave them
+            // re-runnable. Kind-aware (verify/judge/loop keep their policy config).
+            match run_repo.reset_orphaned_running_tasks(None).await {
+                Ok(n) if n > 0 => {
+                    info!(reset = n, "Run engine boot: reset orphaned running tasks → pending")
+                }
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "Run engine boot: reset orphaned running tasks failed"),
+            }
+
             let runs = match run_repo.list_runs_by_status("running").await {
                 Ok(r) => r,
                 Err(e) => {
@@ -526,6 +542,19 @@ impl RunEngine {
     ) -> Result<nomifun_api_types::Run, AppError> {
         let lock = self.deps.run_locks.for_run(run_id);
         let _rerun_guard = lock.lock().await;
+        // LIVENESS RECOVERY: `RunService::rerun_task` rejects a `running` target
+        // (its live worker would settle `done` over the reset). But if THIS run has
+        // no live loop (`!is_running`), a `running` task is a phantom ORPHAN — its
+        // worker died (e.g. a mid-session loop panic that deregistered the handle,
+        // or a stop before boot re-armed) — so the guard would wrongly wedge the
+        // node forever. Normalize the run's orphaned `running` → `pending` first (we
+        // hold the run lock + there is no loop, so nothing else races the reset),
+        // then rerun proceeds. A live run (`is_running`) is left untouched — its
+        // `running` really is live and the guard correctly asks the user to
+        // pause/stop first.
+        if !self.is_running(run_id) {
+            run_service.reset_orphaned_running(run_id).await?;
+        }
         run_service.rerun_task(user_id, run_id, task_id).await
     }
 
@@ -1413,14 +1442,31 @@ async fn resolve_task_member(
         .ok_or("run not found")?;
     let members: Vec<FleetMember> =
         serde_json::from_str(&run.fleet_snapshot).map_err(|_| "fleet snapshot unparseable")?;
-    match assignment {
+    let mut member = match assignment {
         Some(a) => members
             .into_iter()
             .find(|m| m.id == a.member_id)
-            .ok_or("assigned member not in snapshot"),
+            .ok_or("assigned member not in snapshot")?,
         // No assignment → default to member[0] (single-member fleet path).
-        None => members.into_iter().next().ok_or("fleet snapshot empty"),
+        None => members.into_iter().next().ok_or("fleet snapshot empty")?,
+    };
+    // 迁移 025 — per-task 模型覆盖(启动前配置台):当该节点同时设了 provider + model
+    // 覆盖时,用它们覆写解析出的成员的 provider/model(可选任意可用模型,不受 run 冻结
+    // 的 fleet 池限制),保留成员原有角色/persona/skills。门控于「两者都非空」——没有
+    // 覆盖的节点与 025 前逐字节一致(pending 调度 / rerun / loop 全走这里,一处即全覆盖)。
+    if let Ok(Some(task)) = deps.run_repo.get_task(task_id).await {
+        let ov_provider = task
+            .override_provider_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let ov_model = task.override_model.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        if let (Some(p), Some(m)) = (ov_provider, ov_model) {
+            member.provider_id = Some(p.to_string());
+            member.model = Some(m.to_string());
+        }
     }
+    Ok(member)
 }
 
 /// The completed upstream tasks' output summaries, in task order. Used to inject
@@ -1488,10 +1534,20 @@ fn compose_brief(
     task: &OrchRunTaskRow,
     upstream: &[(String, String)],
 ) -> String {
-    if task.kind == "synthesis" {
-        return compose_synthesis_brief(role_hint, task, upstream);
+    let mut out = if task.kind == "synthesis" {
+        compose_synthesis_brief(role_hint, task, upstream)
+    } else {
+        compose_agent_brief(role_hint, task, upstream)
+    };
+    // 迁移 025 — 用户预置要求(启动前配置台):作为独立一段追加到 worker brief,与
+    // 规划器写的 spec 分离(不覆盖它),读作明确的用户要求。门控于字段非空 —— 没有
+    // 预置要求的任务与 025 前逐字节一致。对 agent / synthesis 均生效(统一在此追加)。
+    if let Some(preset) = task.preset_prompt.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str("\n用户预置要求(请优先遵守):\n");
+        out.push_str(preset);
+        out.push('\n');
     }
-    compose_agent_brief(role_hint, task, upstream)
+    out
 }
 
 /// The unchanged `agent`-kind brief: role hint + task title/spec + completed
@@ -3743,6 +3799,9 @@ mod tests {
             kind: "agent".to_string(),
             pattern_config: None,
             next_retry_at: None,
+            override_provider_id: None,
+            override_model: None,
+            preset_prompt: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -3775,6 +3834,9 @@ mod tests {
             kind: kind.to_string(),
             pattern_config: None,
             next_retry_at: None,
+            override_provider_id: None,
+            override_model: None,
+            preset_prompt: None,
             created_at: 0,
             updated_at: 0,
         }
@@ -3839,6 +3901,37 @@ mod tests {
         assert_eq!(brief, expected, "agent-kind brief must match the pre-023 framing exactly");
     }
 
+    // 迁移 025: a non-empty `preset_prompt` (启动前配置台) is APPENDED as its own
+    // section for BOTH agent and synthesis kinds; a blank/absent one changes
+    // nothing (zero-regression, gated on presence).
+    #[test]
+    fn compose_brief_appends_preset_requirement_gated_on_presence() {
+        // agent: preset appended AFTER the unchanged base brief.
+        let mut a = task_row_with_kind("agent", "Do X", "the spec");
+        let a_base = compose_brief(Some("writer"), &a, &[]);
+        assert!(!a_base.contains("用户预置要求"), "no preset → no section");
+        a.preset_prompt = Some("务必用中文，并附引用".to_string());
+        let a_with = compose_brief(Some("writer"), &a, &[]);
+        assert!(a_with.starts_with(&a_base), "preset is appended, base brief unchanged");
+        assert!(a_with.contains("用户预置要求"), "agent preset section present: {a_with}");
+        assert!(a_with.contains("务必用中文，并附引用"));
+
+        // synthesis: preset also appended (uniform in compose_brief).
+        let mut s = task_row_with_kind("synthesis", "Merge", "synthesize");
+        let up = vec![("A".to_string(), "a".to_string())];
+        let s_base = compose_brief(None, &s, &up);
+        s.preset_prompt = Some("只输出要点".to_string());
+        let s_with = compose_brief(None, &s, &up);
+        assert!(s_with.starts_with(&s_base), "synthesis preset appended after base");
+        assert!(s_with.contains("用户预置要求") && s_with.contains("只输出要点"));
+
+        // blank preset (whitespace only) → byte-for-byte unchanged.
+        let mut b = task_row_with_kind("agent", "Y", "s");
+        let b_base = compose_brief(None, &b, &[]);
+        b.preset_prompt = Some("   \n  ".to_string());
+        assert_eq!(compose_brief(None, &b, &[]), b_base, "blank preset appends nothing");
+    }
+
     #[test]
     fn aggregate_summary_is_non_empty_and_counts_done() {
         let mk = |title: &str, status: &str, summary: Option<&str>| OrchRunTaskRow {
@@ -3859,6 +3952,9 @@ mod tests {
             kind: "agent".to_string(),
             pattern_config: None,
             next_retry_at: None,
+            override_provider_id: None,
+            override_model: None,
+            preset_prompt: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -7974,6 +8070,100 @@ mod tests {
         let _ = drive_to_completion(&svc, &run_id).await;
     }
 
+    // Fix C (LIVENESS RECOVERY): a `running` task with NO live loop is a phantom
+    // ORPHAN (its worker died — the reported「重启后卡在执行中、无法重跑」bug). Unlike
+    // `rerun_rejects_running_task` (a LIVE loop → correctly rejected), here the loop
+    // is killed mid-flight (`engine.stop`) so `!is_running`, and rerun must RECOVER:
+    // normalize the orphan → pending, then reset + re-drive — never wedge it with a 400.
+    #[tokio::test]
+    async fn rerun_recovers_phantom_running_when_no_live_loop() {
+        // A gated worker parks its task in `running` until released.
+        struct GatedWorker {
+            gate: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait]
+        impl WorkerRunner for GatedWorker {
+            async fn run(
+                &self,
+                _member: &FleetMember,
+                _workspace_dir: Option<&str>,
+                _run_id: &str,
+                task_id: &str,
+                _brief: &str,
+                _task_spec: &str,
+                _timeout: Duration,
+                on_started: Box<dyn FnOnce(i64) + Send>,
+            ) -> Result<WorkerOutcome, AppError> {
+                on_started(900);
+                self.gate.notified().await;
+                Ok(WorkerOutcome {
+                    conversation_id: 900,
+                    text: Some(format!("output of {task_id}")),
+                    ok: true,
+                    tokens: None,
+                })
+            }
+        }
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let worker: Arc<dyn WorkerRunner> = Arc::new(GatedWorker { gate: gate.clone() });
+        let (svc, engine, run_id) = rerun_chain_harness(worker).await;
+
+        // Drive until task A is live-`running` (its worker parked on the gate).
+        engine.start(run_id.clone());
+        let mut running_id = None;
+        for _ in 0..200 {
+            let d = svc.get_detail(&run_id).await.expect("detail");
+            running_id = d.tasks.iter().find(|t| t.status == "running").map(|t| t.id.clone());
+            if running_id.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let running_id = running_id.expect("a task reached running");
+
+        // Kill the loop mid-flight: the handle is removed (is_running=false) and the
+        // worker future aborted BEFORE it can write a terminal status — leaving the
+        // task stuck `running` with no live worker. THIS is the reported orphan (a
+        // crash / stop that never settled the node). Boot reconcile fixes it on the
+        // next restart; here we prove rerun ALSO recovers it live (no restart).
+        engine.stop(&run_id);
+        assert!(!engine.is_running(&run_id), "loop stopped → no live worker");
+        let still = svc.get_detail(&run_id).await.expect("detail");
+        assert_eq!(
+            still.tasks.iter().find(|t| t.id == running_id).unwrap().status,
+            "running",
+            "task is a phantom `running` orphan after the loop died"
+        );
+
+        // Rerun the phantom: must RECOVER (normalize orphan → pending), NOT reject
+        // with a 400 (which is only correct for a genuinely LIVE running task).
+        engine
+            .rerun_task(&svc, "u1", &run_id, &running_id)
+            .await
+            .expect("rerun of a phantom-running orphan must recover, not reject");
+        let reset = svc.get_detail(&run_id).await.expect("detail");
+        assert_eq!(
+            reset.tasks.iter().find(|t| t.id == running_id).unwrap().status,
+            "pending",
+            "phantom running recovered → pending (re-runnable)"
+        );
+
+        // Release the gated workers so the re-driven run settles (no leaked blocks),
+        // then confirm end-to-end recovery: the re-activated run drives to completed.
+        tokio::spawn({
+            let gate = gate.clone();
+            async move {
+                for _ in 0..30 {
+                    gate.notify_one();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        });
+        engine.start(run_id.clone());
+        let done = drive_to_completion(&svc, &run_id).await;
+        assert_eq!(done.run.status, "completed", "recovered run completes");
+    }
+
     // Edit a non-running task's spec → the task's spec changes AND a subsequent
     // rerun's brief reflects the NEW spec (the worker is called with the amended
     // task_spec on the re-run).
@@ -8898,6 +9088,9 @@ mod tests {
             kind: "agent".to_string(),
             pattern_config: None,
             next_retry_at: None,
+            override_provider_id: None,
+            override_model: None,
+            preset_prompt: None,
             created_at: 0,
             updated_at: 0,
         }

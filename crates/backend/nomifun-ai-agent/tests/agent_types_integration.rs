@@ -105,6 +105,8 @@ fn make_nomi_config() -> NomiResolvedConfig {
         bedrock_config: None,
         computer_use: false,
         browser_use: false,
+        browser_silent: true,
+        browser_source: "managed".to_owned(),
         browser_full_power: false,
         browser_persistent_login: false,
         browser_site_memory: false,

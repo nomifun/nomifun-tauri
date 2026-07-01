@@ -80,6 +80,10 @@ impl DesktopApprovalGate {
                     params: None,
                 },
             ],
+            // Phase 3: carry the facade's current-page preview (data:image/png;base64 URL)
+            // so the MessagePermission card can show it — the silent-mode "approve without a
+            // visible window" fix. `None` for egress asks / when capture failed.
+            screenshot: ask.screenshot.clone(),
         }
     }
 }
@@ -137,6 +141,7 @@ mod tests {
                 action: "click".into(),
                 description: "Pay now".into(),
             },
+            screenshot: None,
         }
     }
 

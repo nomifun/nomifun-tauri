@@ -89,6 +89,7 @@ import type {
   TRun,
   TRunDetail,
   TSteer,
+  TTaskConfigUpdate,
   TTaskSpecUpdate,
 } from '../types/orchestrator/orchestratorTypes';
 import type {
@@ -2867,6 +2868,14 @@ export const orchestrator = {
       (p) => `/api/orchestrator/runs/${p.run_id}/tasks/${p.task_id}/spec`,
       (p) => p.updates
     ),
+    // 启动前配置台 (迁移 025): set/clear a node's per-task model override + 预置要求.
+    // FULL replace of the three fields (null/blank clears); rejected (400) for a
+    // running task. A pending node picks these up at dispatch; a settled node on
+    // the next rerun.
+    setTaskConfig: httpPatch<void, { run_id: string; task_id: string; updates: TTaskConfigUpdate }>(
+      (p) => `/api/orchestrator/runs/${p.run_id}/tasks/${p.task_id}/config`,
+      (p) => p.updates
+    ),
     // List one directory level under a run's working directory (read-only). Root
     // is the run's `work_dir` (server resolves the actual dir); the client passes
     // an ABSOLUTE path (root or a node's fullPath) which is mapped to a
@@ -3373,6 +3382,28 @@ export const browserSecret = {
   remove: httpDelete<void, { pet_id: string; name: string }>(
     (p) => `/api/browser-secrets/${encodeURIComponent(p.pet_id)}/${encodeURIComponent(p.name)}`
   ),
+};
+
+/** Phase 2b「登录我的浏览器」status returned by open/close/status. */
+export interface IBrowserLoginStatus {
+  /** Whether a visible login browser is currently open. */
+  active: boolean;
+  /** Outcome code: 'opened' | 'already_open' | 'closed' | 'not_open' | 'launch_failed:<err>'. */
+  message?: string;
+  /** Whether close() captured the login state into the encrypted vault backup. */
+  saved: boolean;
+}
+
+/** 「登录我的浏览器」— open a visible browser bound to the shared profile so the user logs
+ *  into their sites once; silent agent sessions then reuse the login. `source` mirrors
+ *  agent.browserUse.source so the login browser uses the same binary. */
+export const browserLogin = {
+  /** Open the visible login window (idempotent while already open). */
+  open: httpPost<IBrowserLoginStatus, { source: 'managed' | 'system' }>('/api/browser/login/open'),
+  /** Close it (best-effort backs the login state up to the vault), returns final status. */
+  close: httpPost<IBrowserLoginStatus, void>('/api/browser/login/close'),
+  /** Poll whether a login window is currently open. */
+  status: httpGet<IBrowserLoginStatus, void>('/api/browser/login/status'),
 };
 
 // ==================== Knowledge Base Platform (knowledge) ====================

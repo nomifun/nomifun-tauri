@@ -192,11 +192,19 @@ async fn create(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: RunCreat
     // same non-empty id.
     let lead_conv_id = parse_lead_conv_id(&ctx.conversation_id);
 
+    // Resolve the effective autonomy. A Path-A run (bound to a lead conversation =
+    // the desktop 智能编排 entry) defaults to `interactive` so the plan PARKS at
+    // `awaiting_plan_approval` for the user to review/adjust/approve before it runs
+    // — matching the in-conversation approval banner. An explicit caller value still
+    // wins; a pure MCP / no-session call (no lead conv) keeps the `supervised`
+    // default (it has no approval UI to park for). Fixes 会话6: the lead model
+    // omitted autonomy → supervised → the plan auto-executed with no approval.
+    let autonomy = default_autonomy(p.autonomy, lead_conv_id);
+
     // Build the ad-hoc request from the EXPLICIT params: work_dir straight from the
-    // arg, autonomy passed through so an omitted value falls to `create_adhoc`'s own
-    // `supervised` default, lead_conv_id = the parsed calling-conversation id.
+    // arg, resolved autonomy, lead_conv_id = the parsed calling-conversation id.
     let req =
-        build_adhoc_request(p.goal, p.work_dir, model_range, p.autonomy, role_members, lead_conv_id, lead_model);
+        build_adhoc_request(p.goal, p.work_dir, model_range, autonomy, role_members, lead_conv_id, lead_model);
 
     // 4. Create: synthesize the fleet from the model range + park in `planning`.
     let run = match deps.orchestrator_run_service.create_adhoc(&user, req).await {
@@ -224,20 +232,36 @@ async fn create(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: RunCreat
             );
         }
     }
-    // 5. Plan: decompose the goal → task DAG + assignments, then apply the
-    //    autonomy gate. An `interactive` run parks at `awaiting_plan_approval`;
-    //    every other level (incl. the supervised default) flips to `running`.
+    // 5. PLAN.
     //
-    //    **DELIBERATELY SYNCHRONOUS — divergence from the Tab front door (B3).**
-    //    The Tab route (`routes::create_adhoc_run`) is OPTIMISTIC: it returns the
-    //    `planning`-state run immediately and runs `plan` in a background task
-    //    (`run_service::spawn_plan_and_start`) so the Tab UI sees the planning
-    //    thought stream over WS without waiting. This MCP/caps front door does NOT
-    //    have a WS subscription — it is a ONE-SHOT tool call whose RESULT must carry
-    //    the post-plan status + planned `task_count` (and, for an interactive run,
-    //    the 主管 relay message naming that count, built at step 8). Backgrounding
-    //    the plan here would return an empty/meaningless result to the calling
-    //    agent, so this path keeps the create → plan → start choreography INLINE.
+    // Path A (a linked lead conversation = the desktop 智能编排 entry): the calling
+    // conversation is SUBSCRIBED to the run over WS (its canvas streams `leadThinking`
+    // + status), so plan in the BACKGROUND — mirror the Tab front door via
+    // `spawn_plan_and_start` — and return the tool IMMEDIATELY. Blocking here is what
+    // caused 会话9: `plan()` on a slow/weak lead model takes tens of seconds; the
+    // SYNCHRONOUS tool call blocked the lead turn so long the weak model kept
+    // re-invoking `nomi_run_create` every ~60s → multiple orphaned `planning` runs +
+    // a 200s+ "stuck" turn with no visible progress. Returning at once keeps the lead
+    // turn short and lets the canvas show planning live; an `interactive` run then
+    // parks for approval, and `spawn_plan_and_start` only starts the engine for
+    // non-interactive runs.
+    if lead_conv_id.is_some() {
+        nomifun_orchestrator::spawn_plan_and_start(
+            deps.orchestrator_run_service.clone(),
+            deps.orchestrator_run_engine.as_ref().clone(),
+            run.id.clone(),
+            run.autonomy.clone(),
+        );
+        return ok(json!({
+            "run_id": run.id,
+            "status": "planning",
+            "message": planning_started_message(),
+        }));
+    }
+
+    // Pure MCP / no-session caller: NO WS subscription, so keep the ONE-SHOT
+    // synchronous choreography — the tool RESULT must carry the post-plan status +
+    // task_count for the calling agent (steps 6-8 below).
     if let Err(e) = deps.orchestrator_run_service.plan(&run.id).await {
         return json!({ "error": format!("run {} created but planning failed: {e}", run.id) });
     }
@@ -369,6 +393,20 @@ fn build_adhoc_request(
     }
 }
 
+/// Resolve the effective autonomy for an ad-hoc run created via the caps front
+/// door. An explicit, non-blank caller value always wins. Otherwise a Path-A run
+/// (bound to a lead conversation = the desktop 智能编排 entry) defaults to
+/// `interactive` so the plan parks at `awaiting_plan_approval` for the user to
+/// review/approve before it runs; a pure MCP / no-session call (no lead conv)
+/// returns `None` so `create_adhoc` applies its `supervised` default (no approval
+/// UI to park for).
+fn default_autonomy(explicit: Option<String>, lead_conv_id: Option<i64>) -> Option<String> {
+    match explicit {
+        Some(a) if !a.trim().is_empty() => Some(a),
+        _ => lead_conv_id.map(|_| "interactive".to_string()),
+    }
+}
+
 /// Parse `ctx.conversation_id` (a `String`, empty when there is no calling
 /// conversation) into a lead conversation id. An empty id ⇒ `None` (MCP /
 /// no-session caller — regress to the no-lead behavior); a non-empty id is parsed
@@ -421,6 +459,14 @@ fn awaiting_plan_message(task_count: usize) -> String {
     format!(
         "已拟定 {task_count} 个子任务的团队，待你在编排面板批准后开始执行。请把这一情况转达给用户，并等待其批准。"
     )
+}
+
+/// The 主管-facing relay message for a Path-A run whose planning was kicked off in
+/// the BACKGROUND (the calling conversation watches it live). The plan is not ready
+/// at return time, so instruct the lead to tell the user planning is underway in the
+/// canvas and to approve when it lands — do NOT keep calling the create tool.
+fn planning_started_message() -> String {
+    "编排已创建，正在后台拆解为任务图(可在右侧编排画布实时查看规划过程)。请告知用户:规划完成后会停在「待批准」,届时点「批准执行」或回复批准即可开始——现在无需再次创建编排,耐心等待规划完成即可。".to_string()
 }
 
 // ── assistant → role member resolution (P4 Task 2) ─────────────────────────
@@ -825,6 +871,31 @@ mod tests {
         assert!(req.autonomy.is_none(), "omitted autonomy → None (service default applies)");
         assert!(req.work_dir.is_none(), "omitted work_dir → None (temp dir)");
         assert!(req.lead_conv_id.is_none());
+    }
+
+    // 会话6 fix: the conversation entry (Path A, a lead conversation is bound) must
+    // default to `interactive` so the plan PARKS for approval instead of auto-running.
+    #[test]
+    fn default_autonomy_lead_conv_defaults_interactive() {
+        assert_eq!(default_autonomy(None, Some(6)).as_deref(), Some("interactive"), "lead conv → parks");
+        assert_eq!(
+            default_autonomy(Some("   ".into()), Some(6)).as_deref(),
+            Some("interactive"),
+            "blank autonomy treated as omitted → parks"
+        );
+    }
+
+    #[test]
+    fn default_autonomy_explicit_value_always_wins() {
+        assert_eq!(default_autonomy(Some("supervised".into()), Some(6)).as_deref(), Some("supervised"));
+        assert_eq!(default_autonomy(Some("interactive".into()), None).as_deref(), Some("interactive"));
+    }
+
+    #[test]
+    fn default_autonomy_no_lead_conv_stays_unset() {
+        // Pure MCP / no-session → None so create_adhoc applies its `supervised`
+        // default (no approval UI to park for).
+        assert_eq!(default_autonomy(None, None), None);
     }
 
     // The deterministic homepage channel: the exact `extra.orchestrator_model_range`

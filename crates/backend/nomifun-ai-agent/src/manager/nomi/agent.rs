@@ -253,6 +253,12 @@ impl NomiAgentManager {
         // P7B: 把会话的 visual-fallback LIVE 值灌进 BrowserConfig.visual_fallback（默认 OFF，opt-in）。
         // bootstrap 据它给 BrowserTool 注入会话模型的 VisualLocator（锚定失败时截图交视觉模型定位再点）。
         config.tools.browser.visual_fallback = config_extra.browser_visual_fallback;
+        // 「浏览器模式」两开关（与上面的 opt-in 开关正交，每会话 LIVE）：
+        // - 静默：silent(默认 true) → headless。facade 由 !headless 得 headful；无显示器时引擎本就强制 headless。
+        // - 来源：source("managed"/"system") → facade 解析为 ChromeSource（system=系统 Chrome/Edge 优先，
+        //   未探到回退 managed）。红线不变：两种来源都用专属 user-data-dir。
+        config.tools.browser.headless = config_extra.browser_silent;
+        config.tools.browser.source = config_extra.browser_source.clone();
 
         // Companion memory tools only touch the companion's own memory.db — never
         // user files — so they skip the approval gate in every session mode
@@ -1003,6 +1009,8 @@ mod tests {
             bedrock_config: None,
             computer_use: false,
             browser_use: false,
+            browser_silent: true,
+            browser_source: "managed".to_owned(),
             browser_full_power: false,
             browser_persistent_login: false,
             browser_site_memory: false,

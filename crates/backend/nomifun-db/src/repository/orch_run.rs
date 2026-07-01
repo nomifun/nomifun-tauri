@@ -204,6 +204,19 @@ pub trait IRunRepository: Send + Sync {
     /// field is `None`. Bumps `updated_at` whenever any column changes.
     async fn update_task(&self, id: &str, p: UpdateTaskParams) -> Result<(), sqlx::Error>;
 
+    /// FULL-replace a task's 「启动前配置台」overrides (迁移 025): the per-task model
+    /// override (`override_provider_id` / `override_model`) and 预置要求
+    /// (`preset_prompt`). `None` clears a column. Bumps `updated_at`. Separate from
+    /// [`update_task`] so the many existing `UpdateTaskParams` call sites stay
+    /// untouched.
+    async fn set_task_overrides(
+        &self,
+        id: &str,
+        override_provider_id: Option<String>,
+        override_model: Option<String>,
+        preset_prompt: Option<String>,
+    ) -> Result<(), sqlx::Error>;
+
     /// Delete ONE task (`DELETE FROM orch_run_tasks WHERE id = ?`). The task-keyed
     /// `ON DELETE CASCADE` FKs (migration 018) sweep out that task's dependency
     /// edges (`orch_run_task_deps`, where the task is blocker OR blocked) and its
@@ -221,6 +234,32 @@ pub trait IRunRepository: Send + Sync {
     /// `plan` (which mints fresh tasks every call) re-plans rather than appends.
     /// Requires `PRAGMA foreign_keys=ON` on the connection (the project default).
     async fn clear_run_tasks(&self, run_id: &str) -> Result<(), sqlx::Error>;
+
+    /// Reset ORPHANED `running` tasks back to `pending` in ONE bulk statement,
+    /// mirroring [`RunService::reset_task`] exactly (status→`pending`, clear
+    /// `conversation_id` / `output_summary` / `output_files` / `next_retry_at`,
+    /// `attempt = attempt + 1`, and — kind-aware — clear `pattern_config` ONLY for
+    /// `kind = 'agent'` while PRESERVING it for `verify`/`judge`/`loop` policy nodes).
+    ///
+    /// This enforces the core invariant `task.status = 'running' ⟺ a live worker
+    /// exists`: a `running` row with no live worker (process crash/restart, or a
+    /// stop path that aborted the loop) is an ORPHAN and must be settled back to a
+    /// re-runnable `pending` so the loop re-dispatches it (or the user can rerun).
+    ///
+    /// `run_id = None` → ALL runs (boot reconciliation: a fresh process has NO live
+    /// workers, so every `running` task is orphaned). `run_id = Some(id)` → just
+    /// that run (pause normalization). Returns the number of rows reset.
+    async fn reset_orphaned_running_tasks(
+        &self,
+        run_id: Option<&str>,
+    ) -> Result<u64, sqlx::Error>;
+
+    /// Mark a run's `running` tasks as `cancelled` in one statement (status +
+    /// `updated_at` only — the partial `conversation_id` / `output_*` are preserved
+    /// so a cancelled run's interrupted node stays inspectable). Used by `cancel`
+    /// to settle the interrupted node accurately (vs. leaving a phantom `running`).
+    /// A later rerun resets it (non-running → `pending`) as usual.
+    async fn mark_run_running_tasks_cancelled(&self, run_id: &str) -> Result<(), sqlx::Error>;
 
     // --- deps ---
 

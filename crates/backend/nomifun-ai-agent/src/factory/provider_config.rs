@@ -238,6 +238,37 @@ pub async fn streaming_completion_kinded(
     drain_text_response_kinded(rx, on_delta).await
 }
 
+/// Like [`streaming_completion_kinded`] but for the ORCHESTRATION PLANNER: when the
+/// model emits its answer ONLY in the reasoning channel (empty `content`), the
+/// returned String falls back to the assembled reasoning text (see
+/// [`drain_text_or_reasoning`]) so a requested JSON can still be recovered. Both
+/// `Text` and `Reasoning` deltas are forwarded to `on_delta` (for lead-thinking
+/// fan-out). This DIVERGES from the visible-answer one-shot semantics on purpose and
+/// must only be used where reasoning-as-answer is acceptable (planning / re-plan).
+pub async fn streaming_completion_text_or_reasoning(
+    cfg: &Config,
+    system: &str,
+    messages: Vec<Message>,
+    max_tokens: u32,
+    on_delta: impl FnMut(DeltaKind, &str) + Send,
+) -> Result<String, AppError> {
+    let provider: Arc<dyn LlmProvider> = create_provider(cfg);
+
+    let request = LlmRequest {
+        model: cfg.model.clone(),
+        system: system.to_owned(),
+        messages,
+        tools: vec![],
+        max_tokens,
+        thinking: None,
+        reasoning_effort: None,
+    };
+
+    let rx = provider.stream(&request).await.map_err(provider_error_to_app_error)?;
+
+    drain_text_or_reasoning(rx, on_delta).await
+}
+
 /// Convenience constructor for a user-role `Message` with a single text block.
 pub fn user_message(text: impl Into<String>) -> Message {
     Message::new(Role::User, vec![ContentBlock::Text { text: text.into() }])
@@ -319,6 +350,58 @@ async fn drain_text_response_kinded(
         ))
     } else {
         Ok(output)
+    }
+}
+
+/// Drain variant for the ORCHESTRATION PLANNER: assembles `TextDelta` into the
+/// primary buffer AND `ThinkingDelta` into a separate reasoning buffer (forwarding
+/// both to `on_delta`, tagged). On `Done`, returns the text buffer when it has
+/// content, otherwise FALLS BACK to the reasoning buffer.
+///
+/// Some OpenAI-compatible reasoning models (e.g. StepFun `step-*`) put their entire
+/// answer — including a requested JSON — in the `reasoning_content` channel
+/// (→ `ThinkingDelta`) and leave `content` (→ `TextDelta`) empty. The standard drain
+/// then returns `Ok("")` on `Done`, so the planner saw an empty completion and fell
+/// back to a single-task DAG (会话10). Returning the reasoning text on empty content
+/// lets `extract_json_object` still recover the plan JSON. Kept separate from
+/// [`drain_text_response_kinded`] so the visible-answer one-shot semantics (and its
+/// reasoning-only→Err contract) are unchanged.
+async fn drain_text_or_reasoning(
+    mut rx: tokio::sync::mpsc::Receiver<LlmEvent>,
+    mut on_delta: impl FnMut(DeltaKind, &str) + Send,
+) -> Result<String, AppError> {
+    let mut text = String::new();
+    let mut reasoning = String::new();
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            LlmEvent::TextDelta(delta) => {
+                on_delta(DeltaKind::Text, &delta);
+                text.push_str(&delta);
+            }
+            LlmEvent::ThinkingDelta(delta) => {
+                on_delta(DeltaKind::Reasoning, &delta);
+                reasoning.push_str(&delta);
+            }
+            LlmEvent::Done { .. } => {
+                return Ok(if text.trim().is_empty() { reasoning } else { text });
+            }
+            LlmEvent::Error(msg) => {
+                return Err(AppError::BadGateway(format!("LLM stream error: {msg}")));
+            }
+            // Ignore tool use and thinking signatures.
+            _ => {}
+        }
+    }
+
+    // Channel closed without a Done event: prefer text, else reasoning.
+    let out = if text.trim().is_empty() { reasoning } else { text };
+    if out.is_empty() {
+        Err(AppError::BadGateway(
+            "LLM stream ended without producing a response".into(),
+        ))
+    } else {
+        Ok(out)
     }
 }
 
@@ -466,6 +549,44 @@ mod tests {
         assert_eq!(text_chunks, vec!["Hello", ", world!"]);
         // …and the assembled answer == ONLY the TextDelta concat (one-shot equiv).
         assert_eq!(result, "Hello, world!");
+    }
+
+    // 会话10 fix: a reasoning-only stream (Done with EMPTY content) — as StepFun
+    // `step-*` produces — must return the REASONING text, not "", so the planner can
+    // still recover the JSON. The standard `drain_text_response_kinded` returns ""
+    // here; `drain_text_or_reasoning` falls back to reasoning.
+    #[tokio::test]
+    async fn drain_text_or_reasoning_falls_back_to_reasoning_on_empty_text() {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tx.send(LlmEvent::ThinkingDelta(r#"{"tasks":[{"title":"A",""#.into())).await.unwrap();
+        tx.send(LlmEvent::ThinkingDelta(r#"spec":"a","depends_on":[]}]}"#.into())).await.unwrap();
+        tx.send(LlmEvent::Done {
+            stop_reason: nomi_types::message::StopReason::EndTurn,
+            usage: nomi_types::message::TokenUsage::default(),
+        })
+        .await
+        .unwrap();
+
+        let result = drain_text_or_reasoning(rx, |_, _| {}).await.unwrap();
+        assert_eq!(result, r#"{"tasks":[{"title":"A","spec":"a","depends_on":[]}]}"#);
+    }
+
+    // When BOTH text and reasoning are present, the text (visible answer) wins — the
+    // reasoning fallback only kicks in for an EMPTY text buffer.
+    #[tokio::test]
+    async fn drain_text_or_reasoning_prefers_text_when_present() {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tx.send(LlmEvent::ThinkingDelta("thinking…".into())).await.unwrap();
+        tx.send(LlmEvent::TextDelta("real answer".into())).await.unwrap();
+        tx.send(LlmEvent::Done {
+            stop_reason: nomi_types::message::StopReason::EndTurn,
+            usage: nomi_types::message::TokenUsage::default(),
+        })
+        .await
+        .unwrap();
+
+        let result = drain_text_or_reasoning(rx, |_, _| {}).await.unwrap();
+        assert_eq!(result, "real answer");
     }
 
     // The kinded drain surfaces a stream Error as BadGateway, exactly like the

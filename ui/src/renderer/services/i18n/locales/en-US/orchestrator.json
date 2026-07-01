@@ -212,10 +212,36 @@
       "ok": "Rerun started",
       "error": "Rerun failed: {{error}}"
     },
+    "approve": {
+      "bannerEyebrow": "Awaiting approval",
+      "bannerText": "The plan is ready. Keep adjusting if you like; when ready, click Approve & Run to start.",
+      "button": "Approve & Run",
+      "ok": "Approved — starting execution",
+      "error": "Approval failed: {{error}}"
+    },
     "adopt": {
       "button": "Adopt as node output",
       "ok": "Adopted as the node's output",
       "error": "Adopt failed: {{error}}"
+    },
+    "preconfig": {
+      "title": "Pre-start config",
+      "subtitlePending": "Pick a model and pre-inject requirements; applied when the node starts",
+      "subtitleSettled": "Adjust this node's model & requirements; takes effect on rerun",
+      "modelLabel": "Model",
+      "followAuto": "Follow auto-routing (unset)",
+      "noModels": "No models available — configure a provider under Models first.",
+      "modelHint": "Any configured model — not limited to the pool chosen when this run was created.",
+      "presetLabel": "Preset requirement",
+      "presetPlaceholder": "Extra requirements/preferences this node must follow (appended to the node's input, separate from the task description).",
+      "footerPending": "Applied automatically when this node starts",
+      "footerSettled": "After saving, click 重跑 at the top to rerun with the new config",
+      "rerunConfig": "Rerun config (model / preset requirement)",
+      "save": "Save config",
+      "saving": "Saving…",
+      "savedPending": "Saved — applied when the node starts",
+      "savedRerun": "Saved; this node already ran — click 重跑 to rerun with the new config",
+      "saveError": "Save failed: {{error}}"
     },
     "task": {
       "status": {

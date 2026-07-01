@@ -56,6 +56,7 @@
   "export.unavailable": "Conversation export is unavailable",
   "unknownMessageType": "Unknown message type: {{type}}",
   "permissionRequest": "Permission Request",
+  "browserApprovalPreview": "Current page preview",
   "agentRequestingPermission": "The agent is requesting permission.",
   "command": "Command:",
   "chooseAction": "Choose an action:",

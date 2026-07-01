@@ -212,10 +212,36 @@
       "ok": "已发起重跑",
       "error": "重跑失败：{{error}}"
     },
+    "approve": {
+      "bannerEyebrow": "待批准",
+      "bannerText": "计划已就绪，可继续调整；准备好后点「批准执行」开始。",
+      "button": "批准执行",
+      "ok": "已批准，开始执行",
+      "error": "批准失败：{{error}}"
+    },
     "adopt": {
       "button": "采用为该节点产出",
       "ok": "已采用为该节点产出",
       "error": "采用失败：{{error}}"
+    },
+    "preconfig": {
+      "title": "启动前配置",
+      "subtitlePending": "为该节点指定模型、预置要求；启动时自动生效",
+      "subtitleSettled": "调整该节点的模型与要求，重跑后生效",
+      "modelLabel": "指定模型",
+      "followAuto": "跟随自动路由（不指定）",
+      "noModels": "暂无可用模型，请先在「模型」里配置 provider。",
+      "modelHint": "可选任意已配置的模型，不受本次编排创建时所选模型池限制。",
+      "presetLabel": "预置要求",
+      "presetPlaceholder": "在此写下该节点执行时必须遵守的额外要求/偏好（会追加到该节点的输入，与任务描述分开）。",
+      "footerPending": "该节点启动时自动应用此配置",
+      "footerSettled": "保存后点击顶部「重跑」用新配置重跑该节点",
+      "rerunConfig": "重跑配置（模型 / 预置要求）",
+      "save": "保存配置",
+      "saving": "保存中…",
+      "savedPending": "已保存，启动时自动生效",
+      "savedRerun": "已保存；该节点已运行过，点「重跑」用新配置重跑",
+      "saveError": "保存失败：{{error}}"
     },
     "task": {
       "status": {

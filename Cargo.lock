@@ -5333,6 +5333,7 @@ dependencies = [
  "http-body-util",
  "if-addrs",
  "nomi-browser",
+ "nomi-browser-engine",
  "nomi-computer",
  "nomi-config",
  "nomi-tools",

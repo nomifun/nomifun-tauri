@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use nomifun_ai_agent::{
-    one_shot_completion, resolve_provider_config, streaming_completion_kinded, user_message,
+    resolve_provider_config, streaming_completion_text_or_reasoning, user_message,
     DeltaKind,
 };
 use nomifun_api_types::{FleetMember, PlannedDag, PlannedTask, RunTask, RunTaskDep};
@@ -26,8 +26,18 @@ use nomifun_common::{AppError, ProviderWithModel};
 use nomifun_db::IProviderRepository;
 use nomifun_db::models::Provider;
 
-/// How many tokens the planner may use for its one-shot DAG completion.
-const PLAN_MAX_TOKENS: u32 = 4096;
+/// How many tokens the planner may use for its DAG completion. Sized generously
+/// because reasoning models (e.g. StepFun `step-*`) spend a large share of the
+/// budget "thinking" BEFORE emitting the JSON — at 4096 the reasoning phase could
+/// exhaust the budget (`finish_reason=length`) and truncate the plan (会话10). The
+/// conversation entry plans in the background, so the extra latency is not on the
+/// critical path.
+const PLAN_MAX_TOKENS: u32 = 8192;
+
+/// Non-silent notice pushed to the lead-thinking stream when planning FALLS BACK to
+/// the single-task DAG (the lead did not emit a parseable plan). Lets the user see
+/// the auto-decomposition failed instead of a mysterious single node.
+const PLAN_FALLBACK_NOTICE: &str = "\n\n⚠️ 未能将目标自动拆解为多任务(规划模型未产出有效的任务结构)。已回退为单任务并停在待批准——建议细化目标后重新规划,或改用推理更强的模型。";
 
 /// Max length of the fallback task title derived from the goal.
 const FALLBACK_TITLE_LEN: usize = 60;
@@ -381,14 +391,33 @@ impl PlanProducer for LlmPlanProducer {
         };
 
         let user = build_plan_user_prompt(goal, members, &descriptions);
-        // B2: with a sink, stream the lead deltas through it (the returned text is
-        // STILL just the TextDelta concat — byte-identical to one_shot); without a
-        // sink, take the original non-streaming one-shot path (zero change).
+        // With a sink, stream the lead deltas through it (the returned text is STILL
+        // just the TextDelta concat — byte-identical to one_shot); without a sink,
+        // take the non-streaming one-shot path (zero change).
         let raw = run_lead_completion(&cfg, PLAN_SYSTEM, user, PLAN_MAX_TOKENS, sink).await?;
+        if let Some(dag) = parse_plan_opt(&raw) {
+            return Ok(dag);
+        }
 
-        // parse_plan is fail-soft: a bad/empty reply degrades to a single-task DAG
-        // rather than erroring out, so the engine always has an executable plan.
-        Ok(parse_plan(&raw, goal))
+        // The lead did NOT emit a parseable task DAG — common with weak / low-
+        // reasoning "flash" models. Surface a NON-SILENT warning through the lead-
+        // thinking stream (best-effort) so the user learns the auto-decomposition
+        // failed rather than silently seeing one node, then degrade to the single-
+        // task fallback so the engine still has something. The conversation entry's
+        // `interactive` default then PARKS the run for approval — a failed plan is
+        // never auto-executed.
+        //
+        // **No retry.** A second synchronous LLM call here doubled planning latency;
+        // on the conversation path (a SYNCHRONOUS `nomi_run_create` tool call) that
+        // blocked the lead turn long enough for a slow/weak model to re-invoke the
+        // tool every ~60s → 会话9's multiple orphaned `planning` runs + a 200s+
+        // "stuck" turn. A single attempt bounds latency; the conversation path also
+        // now plans in the BACKGROUND (see caps_orchestrator) so it never blocks.
+        tracing::warn!(raw_len = raw.len(), "planner output unparseable; using single-task fallback DAG");
+        if let Some(sink) = sink {
+            (sink)(LeadDeltaKind::Text, PLAN_FALLBACK_NOTICE);
+        }
+        Ok(fallback_dag(goal))
     }
 
     async fn adjust(
@@ -458,12 +487,15 @@ impl PlanProducer for LlmPlanProducer {
     }
 }
 
-/// Run one lead-model one-shot completion, honoring an optional lead-thinking
-/// `sink`. With a sink, [`streaming_completion_kinded`] forwards each `Text` /
-/// `Reasoning` delta to it (mapped to [`LeadDeltaKind`]) while still returning the
-/// `TextDelta`-only concat; with `None`, [`one_shot_completion`] is used — the
-/// SAME bytes, but without the streaming machinery. The two paths return identical
-/// text for a given stream, so `parse_plan`/`parse_adjusted_plan` are unaffected.
+/// Run one lead-model completion for the planner, honoring an optional lead-
+/// thinking `sink`. Uses [`streaming_completion_text_or_reasoning`]: it forwards
+/// BOTH `Text` and `Reasoning` deltas to the sink (so the canvas shows the planning
+/// process) and — crucially — RETURNS the reasoning text when the model left
+/// `content` empty. Reasoning models like StepFun `step-*` emit their answer (incl.
+/// the requested plan JSON) only in the reasoning channel; the old text-only drain
+/// returned `""` for them → the planner fell back to a single-task DAG (会话10).
+/// `parse_plan`/`parse_adjusted_plan` then extract the JSON from whichever buffer
+/// carried it.
 async fn run_lead_completion(
     cfg: &nomifun_ai_agent::nomi_config::config::Config,
     system: &str,
@@ -471,19 +503,18 @@ async fn run_lead_completion(
     max_tokens: u32,
     sink: Option<&LeadThinkingSink>,
 ) -> Result<String, AppError> {
-    match sink {
-        Some(sink) => {
-            streaming_completion_kinded(
-                cfg,
-                system,
-                vec![user_message(user)],
-                max_tokens,
-                |kind, delta| (sink)(kind.into(), delta),
-            )
-            .await
-        }
-        None => one_shot_completion(cfg, system, vec![user_message(user)], max_tokens).await,
-    }
+    streaming_completion_text_or_reasoning(
+        cfg,
+        system,
+        vec![user_message(user)],
+        max_tokens,
+        |kind, delta| {
+            if let Some(sink) = sink {
+                (sink)(kind.into(), delta);
+            }
+        },
+    )
+    .await
 }
 
 /// How many tokens the lead may use for its one-shot run-summary completion.
@@ -666,19 +697,28 @@ fn build_plan_user_prompt(
 /// returns a single-task fallback DAG derived from `goal` (so the engine always
 /// has an executable plan).
 pub fn parse_plan(raw: &str, goal: &str) -> PlannedDag {
-    match extract_json_object(raw).and_then(|json| serde_json::from_str::<PlannedDag>(&json).ok()) {
-        Some(dag) if !dag.tasks.is_empty() => dag,
-        Some(_) => {
-            tracing::warn!("planner output parsed but tasks were empty; using fallback DAG");
-            fallback_dag(goal)
-        }
+    match parse_plan_opt(raw) {
+        Some(dag) => dag,
         None => {
             tracing::warn!(
                 raw_len = raw.len(),
-                "planner output unparseable (no valid JSON task DAG); using fallback DAG"
+                "planner output unparseable/empty (no valid JSON task DAG); using fallback DAG"
             );
             fallback_dag(goal)
         }
+    }
+}
+
+/// Parse the raw model text into a [`PlannedDag`], returning `None` on ANY failure
+/// (no JSON object, malformed JSON, wrong shape, or an empty `tasks` array) —
+/// **without** the goal-derived fallback. This is the non-fallback core so callers
+/// that need to KNOW planning failed (to retry, or to warn the user) can branch on
+/// the `None`; [`parse_plan`] wraps this with the single-task fallback so the engine
+/// always has an executable plan.
+pub fn parse_plan_opt(raw: &str) -> Option<PlannedDag> {
+    match extract_json_object(raw).and_then(|json| serde_json::from_str::<PlannedDag>(&json).ok()) {
+        Some(dag) if !dag.tasks.is_empty() => Some(dag),
+        _ => None,
     }
 }
 
@@ -1550,6 +1590,25 @@ mod tests {
         );
     }
 
+    // parse_plan_opt is the NON-fallback core: it returns None on every failure mode
+    // (so `produce` can retry / warn instead of silently falling back — the 会话6 fix),
+    // and Some only for a parseable, non-empty task DAG.
+    #[test]
+    fn parse_plan_opt_returns_none_on_every_failure_mode() {
+        assert!(parse_plan_opt("I'm sorry, I cannot help.").is_none(), "prose/garbage → None");
+        assert!(parse_plan_opt(r#"{"tasks":[]}"#).is_none(), "empty tasks → None");
+        assert!(parse_plan_opt(r#"{"tasks":[{"title":"x" "#).is_none(), "malformed JSON → None");
+        assert!(parse_plan_opt("").is_none(), "empty string → None");
+    }
+
+    #[test]
+    fn parse_plan_opt_returns_some_for_valid_dag() {
+        let raw = r#"{"tasks":[{"title":"A","spec":"a","depends_on":[]},{"title":"B","spec":"b","depends_on":[0]}]}"#;
+        let dag = parse_plan_opt(raw).expect("valid multi-task DAG → Some");
+        assert_eq!(dag.tasks.len(), 2);
+        assert_eq!(dag.tasks[1].depends_on, vec![0]);
+    }
+
     #[test]
     fn parse_plan_falls_back_on_empty_tasks() {
         let dag = parse_plan(r#"{"tasks":[]}"#, "Some goal");
@@ -1900,6 +1959,9 @@ mod tests {
             role: Some("研究".to_string()),
             kind: "agent".to_string(),
             pattern_config: None,
+            override_provider_id: None,
+            override_model: None,
+            preset_prompt: None,
             created_at: 0,
             updated_at: 0,
         }

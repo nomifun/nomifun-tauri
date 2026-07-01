@@ -287,11 +287,19 @@ pub(super) async fn build(
         cfg!(feature = "computer-use") || env_flag("NOMIFUN_COMPUTER_USE"),
     )
     .await;
-    // browser-use has no cargo-feature gate (native CDP engine works on every
-    // build), but its host default is OFF: driving a browser is intrusive enough
-    // (spawns Chromium, takes over pages) that it hurts UX as an always-on default.
-    // Opt-in only — the user enables it via the `agent.browserUse` pref toggle.
-    let browser_use_default = read_bool_pref(&deps, PREF_BROWSER_USE, false).await;
+    // browser-use has a cargo-feature gate (`browser-use`, desktop builds); on those
+    // builds it now defaults **ON** (user decision) — the native CDP engine launches its
+    // managed Chromium **lazily on first use**, so enabling it costs nothing until the agent
+    // actually drives a page, and it runs **silent (headless) by default** (see
+    // `agent.browserUse.silent`, host_default=true) so there is no pop-up window. The master
+    // toggle just lets the user turn it off. Builds without the feature register no browser
+    // tool regardless. `NOMIFUN_BROWSER_USE` env forces it on for feature-less parity/testing.
+    let browser_use_default = read_bool_pref(
+        &deps,
+        PREF_BROWSER_USE,
+        cfg!(feature = "browser-use") || env_flag("NOMIFUN_BROWSER_USE"),
+    )
+    .await;
     // F1-sec: evaluate「全权模式」LIVE 值（裁决⑨，default-deny）。用户在 System Settings 显式 opt-in
     // 的 `agent.browserUse.fullPower` 开关，每会话构造时 LIVE 读（read_bool_pref 范式，与上面的启用开关
     // 同源），灌进 BrowserConfig.full_power → BrowserTool::with_policy → 引擎 evaluate gate。默认 OFF
@@ -316,6 +324,13 @@ pub(super) async fn build(
     // 成本，须用户在 System Settings 显式 opt-in。
     let browser_visual_fallback_default =
         read_bool_pref(&deps, PREF_BROWSER_VISUAL_FALLBACK, false).await;
+    // 静默浏览器 LIVE 值（「浏览器模式」可见性维度）。host_default=**true**（产品默认静默）——
+    // 直接消除桌面弹窗困扰；用户可在 System Settings 关闭以弹出可见窗口。映射到 headless。
+    let browser_silent_default = read_bool_pref(&deps, PREF_BROWSER_SILENT, true).await;
+    // 浏览器来源 LIVE 值（与 silent 正交）。host_default="managed"（内置/下载 CfT）；"system" =
+    // 用户系统 Chrome/Edge 本体优先。红线不变：专属 user-data-dir 起独立托管实例。
+    let browser_source_default =
+        read_string_pref(&deps, PREF_BROWSER_SOURCE, BROWSER_SOURCE_DEFAULT).await;
 
     let browser_use_enabled = overrides.browser_use.unwrap_or(browser_use_default);
 
@@ -380,6 +395,10 @@ pub(super) async fn build(
         bedrock_config: fields.bedrock_config,
         computer_use: overrides.computer_use.unwrap_or(computer_use_default),
         browser_use: browser_use_enabled,
+        // 静默浏览器 LIVE 值（产品默认 ON=headless；无 per-session override，纯全局开关）。
+        browser_silent: browser_silent_default,
+        // 浏览器来源 LIVE 值（默认 "managed"；"system"=系统 Chrome/Edge 本体优先）。
+        browser_source: browser_source_default,
         // F1-sec: 全权模式 LIVE 值（无 per-session override，纯 client_preferences 全局开关）。
         browser_full_power: browser_full_power_default,
         // SD-6: 持久登录 LIVE 值（产品默认 ON，无 per-session override）。
@@ -499,6 +518,14 @@ const PREF_BROWSER_TAKEOVER: &str = "agent.browserUse.takeover";
 /// **P7B**: browser-use 视觉兜底点击（opt-in，有 token 成本）。`true` → DOM/aria 锚定失败时截图交视觉
 /// 模型定位再点；缺/`false`（host_default）→ OFF（不注入 locator、零行为变化）。前端 System Settings 写。
 const PREF_BROWSER_VISUAL_FALLBACK: &str = "agent.browserUse.visualFallback";
+/// **静默浏览器开关**（「浏览器模式」可见性维度）。`true`（**产品默认 ON**，host_default=true）→
+/// 引擎 headless（无可见窗口，解决弹窗困扰）；`false` → 弹出可见窗口。映射到 headless。前端写。
+const PREF_BROWSER_SILENT: &str = "agent.browserUse.silent";
+/// **浏览器来源**（「浏览器模式」来源维度，与 silent 正交）。`"managed"`（默认）= 内置/下载 CfT；
+/// `"system"` = 系统 Chrome/Edge 本体优先（未探到回退）。红线不变：专属 user-data-dir。前端写。
+const PREF_BROWSER_SOURCE: &str = "agent.browserUse.source";
+/// 浏览器来源 host default（无设置行/无 client_prefs 时）：内置/下载的 Chrome for Testing。
+const BROWSER_SOURCE_DEFAULT: &str = "managed";
 
 /// Read a boolean `client_preferences` toggle live, falling back to
 /// `host_default` when there is no setting row (fresh install) or no
@@ -516,6 +543,26 @@ async fn read_bool_pref(deps: &AgentFactoryDeps, key: &str, host_default: bool) 
             .map(|r| r.value.trim() == "true")
             .unwrap_or(host_default),
         Err(_) => host_default,
+    }
+}
+
+/// Read a string `client_preferences` value live, falling back to `host_default`
+/// when there is no setting row (fresh install), no client_prefs repo is wired, or
+/// the stored value is blank. Mirrors [`read_bool_pref`] for stringly settings
+/// (e.g. `agent.browserUse.source` = `"managed"`/`"system"`). Read per session so
+/// toggling the setting affects new sessions without a restart.
+async fn read_string_pref(deps: &AgentFactoryDeps, key: &str, host_default: &str) -> String {
+    let Some(repo) = deps.client_prefs.as_ref() else {
+        return host_default.to_owned();
+    };
+    match repo.get_by_keys(&[key]).await {
+        Ok(rows) => rows
+            .into_iter()
+            .find(|r| r.key == key)
+            .map(|r| r.value.trim().trim_matches('"').to_owned())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| host_default.to_owned()),
+        Err(_) => host_default.to_owned(),
     }
 }
 

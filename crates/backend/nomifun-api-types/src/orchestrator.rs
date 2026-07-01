@@ -296,6 +296,17 @@ pub struct RunTask {
     /// `task_profile`, kept as opaque JSON text so the wire/DB stay stable).
     #[serde(default)]
     pub pattern_config: Option<String>,
+    /// Per-task model override (迁移 025): when BOTH set, the node dispatches with
+    /// this provider×model (any available model, not just the run's fleet). `None`
+    /// = follow auto-routing. Set via the 「启动前配置台」.
+    #[serde(default)]
+    pub override_provider_id: Option<String>,
+    #[serde(default)]
+    pub override_model: Option<String>,
+    /// User 预置要求 (迁移 025) appended to the node's worker brief, separate from
+    /// the planner-written `spec`. `None`/blank = none.
+    #[serde(default)]
+    pub preset_prompt: Option<String>,
     /// Creation / last-update timestamps (epoch ms). Surfaced so the UI can show
     /// per-task pacing (用时 / 相对时间) in the roster and inspector.
     pub created_at: i64,
@@ -379,6 +390,21 @@ pub struct SteerRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSpecUpdateRequest {
     pub spec: String,
+}
+
+/// 启动前配置台 (迁移 025): the body of `PATCH .../tasks/{task_id}/config`. A FULL
+/// replace of the node's per-task model override + 预置要求 — the config panel
+/// always sends the desired state; a `null`/blank field clears it. The model
+/// override needs BOTH `override_provider_id` + `override_model` (a half-set is
+/// normalized to cleared server-side). The service rejects a `running` task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskConfigUpdateRequest {
+    #[serde(default)]
+    pub override_provider_id: Option<String>,
+    #[serde(default)]
+    pub override_model: Option<String>,
+    #[serde(default)]
+    pub preset_prompt: Option<String>,
 }
 
 /// Rename a run = change its goal. The body of `PATCH /api/orchestrator/runs/{id}`.
@@ -844,6 +870,9 @@ mod tests {
                     role: Some("研究".to_string()),
                     kind: "synthesis".to_string(),
                     pattern_config: Some("{\"group\":\"variants\"}".to_string()),
+                    override_provider_id: None,
+                    override_model: None,
+                    preset_prompt: None,
                     created_at: 1_700_000_000_000,
                     updated_at: 1_700_000_400_000,
                 },
@@ -864,6 +893,9 @@ mod tests {
                     role: None,
                     kind: "agent".to_string(),
                     pattern_config: None,
+                    override_provider_id: None,
+                    override_model: None,
+                    preset_prompt: None,
                     created_at: 1_700_000_000_000,
                     updated_at: 1_700_000_000_000,
                 },

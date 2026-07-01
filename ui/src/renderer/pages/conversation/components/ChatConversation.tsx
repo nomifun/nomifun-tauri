@@ -33,6 +33,7 @@ import CompanionChatPanel from '@/renderer/pages/nomi/companion/CompanionChatPan
 import { OrchestrationProvider } from '../orchestration/OrchestrationContext';
 import OrchestrationTopPanel from '../orchestration/OrchestrationTopPanel';
 import ConversationContentSwitcher from '../orchestration/ConversationContentSwitcher';
+import PlanApprovalBanner from '../orchestration/PlanApprovalBanner';
 import StarOfficeMonitorCard from '../platforms/openclaw/StarOfficeMonitorCard.tsx';
 // import SkillRuleGenerator from './components/SkillRuleGenerator'; // Temporarily hidden
 
@@ -199,6 +200,9 @@ const NomiConversationPanel: React.FC<{ conversation: NomiConversation; sliderTi
             左侧聊天区(默认 main)。 */}
         <div className='flex flex-row flex-1 min-h-0'>
           <div className='flex-1 min-h-0 flex flex-col'>
+            {/* 智能编排「编排后不自动执行」提示条:仅当本会话关联的 run 停在
+                awaiting_plan_approval 时显示,复用批准 IPC;其余情况渲染 null。 */}
+            <PlanApprovalBanner />
             {/* Content-area projection (会话原生编排, F7): keeps NomiChat ALWAYS
                 mounted and just toggles its visibility, overlaying a clicked DAG
                 worker node's read-only transcript when a node is projected. Node

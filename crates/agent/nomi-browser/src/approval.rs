@@ -59,6 +59,14 @@ pub enum ApprovalKind {
 pub struct ApprovalAsk {
     /// What is being approved (+ its safe, value-free preview).
     pub kind: ApprovalKind,
+    /// Optional current-page preview as a `data:image/png;base64,...` URL. The facade
+    /// attaches it (best-effort) for a human-takeover ask so a **silent (headless)**
+    /// session can still show the user the page they are approving an irreversible action
+    /// on — without needing a visible window. `None` for egress asks and whenever the
+    /// screenshot capture failed (the text ask is still surfaced; screenshot never gates).
+    /// The image is the engine's redaction-aware screenshot (same call `do_screenshot`
+    /// uses), so known secrets are blacked out before it leaves the engine.
+    pub screenshot: Option<String>,
 }
 
 impl ApprovalAsk {
@@ -154,6 +162,10 @@ impl EgressApprover for GateEgressApprover {
                 size: preview.size,
                 field_names: preview.field_names.clone(),
             },
+            // Egress asks never carry a screenshot (the page image is irrelevant to a
+            // value-free host/field-names egress decision, and could leak the very content
+            // the firewall is gating).
+            screenshot: None,
         };
         match self.gate.request_approval(ask).await {
             // Approve once. We deliberately do NOT map to ContinueAndRemember — "remember
@@ -234,6 +246,7 @@ mod tests {
                 size: 100,
                 field_names: vec!["card_number".into()],
             },
+            screenshot: None,
         };
         let desc = ask.description();
         // Field NAME appears; the prompt explicitly notes values are not shown.

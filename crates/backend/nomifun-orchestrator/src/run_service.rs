@@ -987,6 +987,59 @@ impl RunService {
         Ok(())
     }
 
+    /// 启动前配置台 (迁移 025): set/clear a node's per-task **model override** and
+    /// **预置要求**. Owner-scoped; rejects a `running` task (400) — pending / settled
+    /// (done/failed) nodes are fine (a settled node's change takes effect on the next
+    /// `rerun`; a pending node's at dispatch). This is a FULL replace of the three
+    /// override fields (the config panel always sends the desired state; `None`/blank
+    /// clears). The model override requires BOTH provider + model — a half-set is
+    /// normalized to "cleared" so a partial value never reaches dispatch. No engine
+    /// call: `resolve_task_member` / `compose_brief` read these at dispatch time.
+    pub async fn set_task_config(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        task_id: &str,
+        override_provider_id: Option<String>,
+        override_model: Option<String>,
+        preset_prompt: Option<String>,
+    ) -> Result<(), AppError> {
+        self.owned_run(user_id, run_id).await?;
+
+        let task = self
+            .run_repo
+            .get_task(task_id)
+            .await
+            .map_err(OrchestratorError::from)?
+            .ok_or_else(|| OrchestratorError::NotFound(format!("task {task_id}")))?;
+        if task.run_id != run_id {
+            return Err(OrchestratorError::NotFound(format!("task {task_id} in run {run_id}")).into());
+        }
+        if task.status == "running" {
+            return Err(OrchestratorError::BadRequest(
+                "任务运行中，请先暂停/停止再配置".into(),
+            )
+            .into());
+        }
+
+        // Trim to non-empty, else clear. Model override is all-or-nothing (both
+        // provider + model), so a half-set clears both.
+        let norm = |s: Option<String>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let (mut prov, mut model) = (norm(override_provider_id), norm(override_model));
+        if prov.is_none() || model.is_none() {
+            prov = None;
+            model = None;
+        }
+        let preset = norm(preset_prompt);
+
+        self.run_repo
+            .set_task_overrides(task_id, prov, model, preset)
+            .await
+            .map_err(OrchestratorError::from)?;
+        self.emitter.emit_run_plan_updated(run_id);
+        Ok(())
+    }
+
     /// RESET a settled task for re-execution: status→`pending`, clear
     /// `output_summary` + `conversation_id` (and `output_files`), and bump
     /// `attempt`. Shared by the target reset + the cascade walk in
@@ -1044,6 +1097,22 @@ impl RunService {
         Ok(())
     }
 
+    /// Reset a run's ORPHANED `running` tasks back to `pending` (thin service
+    /// wrapper over [`IRunRepository::reset_orphaned_running_tasks`] scoped to one
+    /// run). Called by [`RunEngine::rerun_task`](crate::engine::RunEngine::rerun_task)
+    /// ONLY when the run has no live loop (`!is_running`), so a `running` row is
+    /// provably an orphan whose worker died — normalizing it lets the subsequent
+    /// rerun proceed (the rerun guard rejects a `running` target). Kind-aware; no
+    /// emit (the caller's rerun emits + the route's refetch reload all task states).
+    pub async fn reset_orphaned_running(&self, run_id: &str) -> Result<u64, AppError> {
+        let n = self
+            .run_repo
+            .reset_orphaned_running_tasks(Some(run_id))
+            .await
+            .map_err(OrchestratorError::from)?;
+        Ok(n)
+    }
+
     /// Cancel a run: flip it to `cancelled` and emit. The engine's cooperative
     /// cancel (set via [`RunEngine::stop`](crate::engine::RunEngine::stop)) is
     /// the runtime counterpart; this is the persisted state change.
@@ -1058,6 +1127,17 @@ impl RunService {
         {
             return Err(OrchestratorError::NotFound(format!("run {run_id}")).into());
         }
+        // Settle the interrupted node(s): the cancel ROUTE called `engine.stop`
+        // FIRST, which aborted the run loop and cancelled its in-flight worker
+        // conversation(s) — so any `running` task is now a guaranteed ORPHAN (its
+        // worker is gone and the aborted loop will never write its terminal status).
+        // Mark them `cancelled` so the invariant `running ⟺ live worker` holds and
+        // no phantom「执行中」node survives the cancel (which would otherwise block a
+        // later rerun/adjust). A subsequent rerun resets it (non-running → pending).
+        self.run_repo
+            .mark_run_running_tasks_cancelled(run_id)
+            .await
+            .map_err(OrchestratorError::from)?;
         self.run_repo
             .update_run(
                 run_id,
@@ -2206,6 +2286,10 @@ fn task_row_to_dto(row: OrchRunTaskRow) -> RunTask {
         // default) so the DTO is unchanged for them.
         kind: row.kind,
         pattern_config: row.pattern_config,
+        // 迁移 025: 启动前配置台的模型覆盖 + 预置要求。旧行读回 None。
+        override_provider_id: row.override_provider_id,
+        override_model: row.override_model,
+        preset_prompt: row.preset_prompt,
         created_at: row.created_at,
         updated_at: row.updated_at,
     }
@@ -2852,6 +2936,69 @@ mod tests {
         let asg = &svc.get_detail(&run_id).await.unwrap().assignments[0];
         assert_eq!(asg.source, "override");
         assert!(!asg.locked, "explicit locked=false must not lock");
+    }
+
+    // 迁移 025 set_task_config: FULL-replace of model override + preset with
+    // trim/all-or-nothing normalization, and the owner / running guards.
+    #[tokio::test]
+    async fn set_task_config_full_replace_normalize_and_guards() {
+        let members = vec![
+            member_input("agent_a", &["coding"], "high", "standard"),
+            member_input("agent_b", &["writing"], "medium", "standard"),
+        ];
+        let dag = single_task_dag(None, Some(coding_profile()));
+        let (svc, repo, _snapshot, run_id) = harness(members, dag).await;
+        svc.plan(&run_id).await.expect("plan");
+        let task_id = svc.get_detail(&run_id).await.unwrap().tasks[0].id.clone();
+
+        // Full config: model override (both) + preset (trimmed).
+        svc.set_task_config(
+            "u1",
+            &run_id,
+            &task_id,
+            Some("prov_x".into()),
+            Some("model_y".into()),
+            Some("  必须用中文  ".into()),
+        )
+        .await
+        .expect("set full");
+        let t = repo.get_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(t.override_provider_id.as_deref(), Some("prov_x"));
+        assert_eq!(t.override_model.as_deref(), Some("model_y"));
+        assert_eq!(t.preset_prompt.as_deref(), Some("必须用中文"), "preset trimmed");
+
+        // Half-set (model only, no provider) → BOTH model fields cleared.
+        svc.set_task_config("u1", &run_id, &task_id, None, Some("model_z".into()), Some("keep".into()))
+            .await
+            .expect("half-set");
+        let t = repo.get_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(t.override_provider_id, None, "half-set clears provider");
+        assert_eq!(t.override_model, None, "half-set clears model");
+        assert_eq!(t.preset_prompt.as_deref(), Some("keep"));
+
+        // FULL replace with empties → all three cleared.
+        svc.set_task_config("u1", &run_id, &task_id, None, None, Some("   ".into()))
+            .await
+            .expect("clear");
+        let t = repo.get_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(t.override_provider_id, None);
+        assert_eq!(t.override_model, None);
+        assert_eq!(t.preset_prompt, None, "blank preset cleared");
+
+        // Non-owner is rejected (owned_run guard).
+        assert!(
+            svc.set_task_config("intruder", &run_id, &task_id, None, None, None).await.is_err(),
+            "non-owner rejected"
+        );
+
+        // A running task is rejected (must pause/stop first).
+        repo.update_task(&task_id, UpdateTaskParams { status: Some("running".into()), ..Default::default() })
+            .await
+            .unwrap();
+        assert!(
+            svc.set_task_config("u1", &run_id, &task_id, None, None, Some("y".into())).await.is_err(),
+            "running task rejected"
+        );
     }
 
     // (d) re-plan does NOT change a locked assignment. (The locked-skip guard in
@@ -4485,6 +4632,35 @@ mod tests {
         assert_eq!(after.tasks.len(), 1, "run untouched");
         assert_eq!(after.tasks[0].id, tid);
         assert!(!after.tasks.iter().any(|t| t.title == "新"), "no new task added");
+    }
+
+    // Fix B: cancelling a run SETTLES its interrupted `running` node to `cancelled`
+    // (not leaving a phantom「执行中」that would block a later rerun/adjust). The run
+    // route calls `engine.stop` first (aborting the loop + cancelling the worker) so
+    // by the time the service runs, the `running` row is a guaranteed orphan — here
+    // we simulate that static orphan (no live loop) and assert cancel normalizes it.
+    #[tokio::test]
+    async fn cancel_settles_running_task_to_cancelled() {
+        let (svc, run_id) = adjust_harness(
+            single_task_dag(Some(0), None),
+            AdjustedPlan { tasks: vec![] },
+        )
+        .await;
+        let before = svc.get_detail(&run_id).await.expect("detail");
+        let tid = before.tasks[0].id.clone();
+        svc.run_repo
+            .update_task(&tid, UpdateTaskParams { status: Some("running".to_string()), ..Default::default() })
+            .await
+            .expect("set running");
+
+        svc.cancel(&run_id).await.expect("cancel");
+
+        let after = svc.get_detail(&run_id).await.expect("detail");
+        assert_eq!(after.run.status, "cancelled", "run cancelled");
+        assert_eq!(
+            after.tasks[0].status, "cancelled",
+            "interrupted running node settled to cancelled (no phantom 执行中)"
+        );
     }
 
     // OWNER-SCOPE: a non-owner is rejected (403) and the run is untouched.

@@ -383,6 +383,12 @@ export interface IConfirmation<Option extends any = any> {
    * Used for "always allow" permission memory
    */
   command_type?: string;
+  /**
+   * Optional inline page preview (`data:image/png;base64,...`) for a browser
+   * takeover approval. Lets a silent (headless) session show the user the current
+   * page they're approving an irreversible action on. Absent for non-browser prompts.
+   */
+  screenshot?: string;
 }
 
 const isObject = (value: unknown): value is Record<string, unknown> =>

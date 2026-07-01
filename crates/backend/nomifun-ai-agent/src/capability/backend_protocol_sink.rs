@@ -56,6 +56,8 @@ impl BackendProtocolSink {
                     params: None,
                 },
             ],
+            // Non-browser tool confirmation → no page preview (browser takeover only).
+            screenshot: None,
         }
     }
 }

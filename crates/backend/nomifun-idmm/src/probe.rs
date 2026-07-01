@@ -1235,6 +1235,7 @@ mod tests {
                     params: None,
                 },
             ],
+            screenshot: None,
         }
     }
 

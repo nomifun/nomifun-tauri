@@ -104,6 +104,7 @@ impl AcpPermissionRequestData {
                     params: None,
                 })
                 .collect(),
+            screenshot: None,
         }
     }
 }

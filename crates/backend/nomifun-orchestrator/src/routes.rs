@@ -16,7 +16,7 @@ use axum::routing::{get, patch, post, put};
 use nomifun_api_types::{
     ApiResponse, AdjustRunRequest, CreateAdhocRunRequest, CreateFleetRequest, CreateRunRequest,
     CreateWorkspaceRequest, Fleet, OrchWorkspace, ReassignRequest, ReplanRequest, Run, RunDetail,
-    RunRenameRequest, SteerRequest, TaskSpecUpdateRequest, UpdateFleetRequest, UpdateWorkspaceRequest,
+    RunRenameRequest, SteerRequest, TaskConfigUpdateRequest, TaskSpecUpdateRequest, UpdateFleetRequest, UpdateWorkspaceRequest,
     WorkspaceEntry,
 };
 use nomifun_auth::CurrentUser;
@@ -99,6 +99,10 @@ pub fn orchestrator_routes(state: OrchestratorRouterState) -> Router {
         .route(
             "/api/orchestrator/runs/{run_id}/tasks/{task_id}/spec",
             patch(update_task_spec),
+        )
+        .route(
+            "/api/orchestrator/runs/{run_id}/tasks/{task_id}/config",
+            patch(set_task_config),
         )
         .with_state(state)
 }
@@ -583,6 +587,31 @@ async fn update_task_spec(
     state
         .run_service
         .update_task_spec(&user.id, &run_id, &task_id, &req.spec)
+        .await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+/// 启动前配置台 (迁移 025, owner-scoped): set/clear a node's per-task model override
+/// + 预置要求 via [`TaskConfigUpdateRequest`]. FULL replace of the three fields; the
+/// service rejects a `running` task (400). No engine call — `resolve_task_member` /
+/// `compose_brief` pick these up at dispatch (pending) or on the next `rerun` (settled).
+async fn set_task_config(
+    State(state): State<OrchestratorRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path((run_id, task_id)): Path<(String, String)>,
+    body: Result<Json<TaskConfigUpdateRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    state
+        .run_service
+        .set_task_config(
+            &user.id,
+            &run_id,
+            &task_id,
+            req.override_provider_id,
+            req.override_model,
+            req.preset_prompt,
+        )
         .await?;
     Ok(Json(ApiResponse::success()))
 }

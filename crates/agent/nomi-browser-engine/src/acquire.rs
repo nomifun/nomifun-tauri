@@ -78,6 +78,35 @@ pub const CHROME_BINARY_ENV: &str = "NOMIFUN_CHROME_BINARY";
 /// `<data_dir>/nomifun-browser/<version>/chrome-<platform>/...`。
 const BROWSER_SUBDIR: &str = "nomifun-browser";
 
+/// **浏览器来源**：用户在设置里选的「浏览器模式」之来源维度（与「静默/可见」正交）。
+///
+/// - [`ChromeSource::Managed`]（默认）：内置/下载的 Chrome for Testing 优先 —— 现行为，
+///   零依赖、可离线、版本钉死可控。
+/// - [`ChromeSource::System`]（「我的浏览器」）：用户系统里装的 Chrome/Edge **本体**优先
+///   （版本/指纹与日常一致），未探到则**优雅回退** Managed 顺序。**仍配专属
+///   `--user-data-dir` 起独立托管实例**——红线不变：绝不碰用户真实 profile（登录态由
+///   持久登录保险库单独维护，见 lib.rs `storage_state`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChromeSource {
+    /// 内置/下载的 Chrome for Testing 优先（现行默认）。
+    #[default]
+    Managed,
+    /// 系统已装 Chrome/Edge 本体优先；未找到回退 Managed。
+    System,
+}
+
+impl ChromeSource {
+    /// 从 `client_preferences` / `[tools.browser] source` 的字符串解析。
+    /// `"system"`（大小写/空白不敏感）→ [`ChromeSource::System`]；其余（含空串/未知/
+    /// `"managed"`）→ [`ChromeSource::Managed`]（default-safe：坏值静默退回默认，不阻断启动）。
+    pub fn from_source_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "system" => ChromeSource::System,
+            _ => ChromeSource::Managed,
+        }
+    }
+}
+
 /// 解压目录内可执行文件相对该平台解压根（`chrome-<platform>/`）的子路径。
 ///
 /// 注意 CfT 的 zip 顶层目录就是 `chrome-<platform>/`，故这里返回的是**含**该顶层
@@ -100,46 +129,80 @@ fn chrome_exe_subpath(platform: &str) -> Option<&'static str> {
     }
 }
 
-/// 纯优先级查找：按 env > 打包目录 > 数据目录 顺序找**已存在**的 chrome 可执行。
-/// 不下载、不触网，故 Windows 可单测。`None` 时交给 [`resolve_chrome_path`] 走下载兜底。
-///
-/// - `env_get`：注入的环境变量读取器（测试可注入假值）。
-/// - `bundled_dir`：Tauri resource dir（build 期固化），其下找 `chrome-<platform>/...`。
-/// - `data_dir`：应用数据目录，其下找 `nomifun-browser/<version>/chrome-<platform>/...`。
+/// env 覆写：`NOMIFUN_CHROME_BINARY` 指向的绝对路径，存在即用。两种 [`ChromeSource`] 下
+/// 都最高优先（用户显式指定的二进制永远赢）。`exists` 注入文件存在判定（测试可注入假值）。
+fn env_chrome_path(
+    env_get: impl Fn(&str) -> Option<String>,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let p = PathBuf::from(env_get(CHROME_BINARY_ENV)?);
+    exists(&p).then_some(p)
+}
+
+/// 托管 Chrome for Testing：打包目录优先、其次数据目录（运行时已下载）。**不含** env、
+/// **不含**系统浏览器（那两者由 [`resolve_local_chrome`] 按 source 编排）。`exists` 注入式，可单测。
+fn cft_chrome_path(
+    platform: &str,
+    bundled_dir: Option<&Path>,
+    data_dir: &Path,
+    exists: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let sub = chrome_exe_subpath(platform)?;
+    // 打包资源目录：<bundled>/chrome-<platform>/...
+    if let Some(bundled) = bundled_dir {
+        let cand = bundled.join(sub);
+        if exists(&cand) {
+            return Some(cand);
+        }
+    }
+    // 数据目录（运行时已下载）：<data>/nomifun-browser/<version>/chrome-<platform>/...
+    let cand = data_dir
+        .join(BROWSER_SUBDIR)
+        .join(PINNED_CHROME_VERSION)
+        .join(sub);
+    exists(&cand).then_some(cand)
+}
+
+/// 纯优先级查找：按 env > 打包目录 > 数据目录 顺序找**已存在**的 chrome 可执行（**不含**系统
+/// 浏览器探测）。生产路径已改用按 source 编排的 [`resolve_local_chrome`]；此函数保留给
+/// 「纯 CfT 解析」相关的单测（如下载兜底触发条件断言需**不**短路到系统浏览器），故仅测试编译。
+#[cfg(test)]
 fn resolve_chrome_path_in(
     platform: &str,
     env_get: impl Fn(&str) -> Option<String>,
     bundled_dir: Option<&Path>,
     data_dir: &Path,
 ) -> Option<PathBuf> {
-    // 1. env 显式指定的绝对路径，存在即用（最高优先）。
-    if let Some(p) = env_get(CHROME_BINARY_ENV) {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
+    let exists = |p: &Path| p.is_file();
+    env_chrome_path(&env_get, exists)
+        .or_else(|| cft_chrome_path(platform, bundled_dir, data_dir, exists))
+}
+
+/// 按 [`ChromeSource`] 编排的**纯优先级解析**（不下载、不触网，`exists`/`env_get` 注入式可单测）。
+///
+/// - env 覆写在**两种 source** 下都最高优先。
+/// - [`ChromeSource::System`]（「我的浏览器」）：系统 Chrome/Edge 优先，未找到回退托管 CfT。
+/// - [`ChromeSource::Managed`]（默认）：托管 CfT 优先，未找到回退系统浏览器（保持现行为）。
+///
+/// 返回 `None` → 本地无任何可用 chrome，交 [`resolve_chrome_path_with_source`] 走下载兜底。
+fn resolve_local_chrome(
+    platform: &str,
+    os: &str,
+    source: ChromeSource,
+    env_get: impl Fn(&str) -> Option<String>,
+    exists: impl Fn(&Path) -> bool,
+    bundled_dir: Option<&Path>,
+    data_dir: &Path,
+) -> Option<PathBuf> {
+    if let Some(p) = env_chrome_path(&env_get, &exists) {
+        return Some(p);
     }
-
-    let sub = chrome_exe_subpath(platform)?;
-
-    // 2. 打包资源目录：<bundled>/chrome-<platform>/...
-    if let Some(bundled) = bundled_dir {
-        let cand = bundled.join(sub);
-        if cand.is_file() {
-            return Some(cand);
-        }
+    let cft = || cft_chrome_path(platform, bundled_dir, data_dir, &exists);
+    let sys = || detect_system_browser_in(os, &env_get, &exists);
+    match source {
+        ChromeSource::System => sys().or_else(cft),
+        ChromeSource::Managed => cft().or_else(sys),
     }
-
-    // 3. 数据目录（运行时已下载）：<data>/nomifun-browser/<version>/chrome-<platform>/...
-    let cand = data_dir
-        .join(BROWSER_SUBDIR)
-        .join(PINNED_CHROME_VERSION)
-        .join(sub);
-    if cand.is_file() {
-        return Some(cand);
-    }
-
-    None
 }
 
 /// 当前平台上**系统已装** Chromium 系浏览器（Chrome 优先、Edge 兜底）的候选可执行
@@ -222,20 +285,30 @@ fn detect_system_browser_in(
         .find(|p| exists(p))
 }
 
-/// 解析当前平台的 Chrome 可执行绝对路径。
+/// 解析当前平台的 Chrome 可执行绝对路径（**托管来源** [`ChromeSource::Managed`]）。
+/// 保留此签名以免改动既有 ~10 处调用点；来源可选的新入口见
+/// [`resolve_chrome_path_with_source`]。
 ///
-/// 优先级（高→低）：
-/// 1. `NOMIFUN_CHROME_BINARY` env（绝对路径，存在即用）；
-/// 2. 打包资源目录 `bundled_dir/chrome-<platform>/...`（build 期固化）；
-/// 3. 数据目录 `<data_dir>/nomifun-browser/<version>/chrome-<platform>/...`（运行时已下载）；
-/// 4. **系统已装 Chrome/Edge**（[`detect_system_browser_in`]，Chromium 系，零下载/离线）；
-/// 5. 都没有 → 用钉死版本 + 代理感知 client 下载 CfT 到数据目录并解压，再返回。
-///
-/// 调用方（Task 7）负责提供 `data_dir`（应用数据目录）与 `bundled_dir`（Tauri
-/// resource dir），本 crate 不直接依赖任何应用数据目录来源，保持解耦。
+/// 优先级（高→低）：env > 打包 CfT > 已下载 CfT > 系统 Chrome/Edge > 下载 CfT。
 pub async fn resolve_chrome_path(
     data_dir: &Path,
     bundled_dir: Option<&Path>,
+) -> Result<PathBuf, BrowserError> {
+    resolve_chrome_path_with_source(data_dir, bundled_dir, ChromeSource::Managed).await
+}
+
+/// 解析当前平台的 Chrome 可执行绝对路径，按 [`ChromeSource`] 编排来源优先级。
+///
+/// - env 覆写（`NOMIFUN_CHROME_BINARY`）在两种 source 下都最高优先；
+/// - [`ChromeSource::System`]：系统 Chrome/Edge 优先 → 回退托管 CfT（打包/已下载）→ 下载兜底；
+/// - [`ChromeSource::Managed`]：打包 CfT → 已下载 CfT → 系统 Chrome/Edge → 下载兜底（现行为）。
+///
+/// 下载兜底只在**本地与系统都无任何 Chromium 系浏览器**时触发（钉死版本 + 代理感知 client）。
+/// 调用方（Task 7）负责提供 `data_dir`（应用数据目录）与 `bundled_dir`（Tauri resource dir）。
+pub async fn resolve_chrome_path_with_source(
+    data_dir: &Path,
+    bundled_dir: Option<&Path>,
+    source: ChromeSource,
 ) -> Result<PathBuf, BrowserError> {
     let platform = cft_platform_id(std::env::consts::OS, std::env::consts::ARCH).ok_or_else(|| {
         BrowserError::Unsupported {
@@ -248,27 +321,25 @@ pub async fn resolve_chrome_path(
         }
     })?;
 
-    // 1-3：env / 打包 CfT / 已下载 CfT，存在即直接返回。
-    if let Some(p) = resolve_chrome_path_in(platform, |k| std::env::var(k).ok(), bundled_dir, data_dir) {
-        return Ok(p);
-    }
-
-    // 4：系统已装 Chrome/Edge（Chromium 系）。多数机器已装 Chrome、Win10/11 必装 Edge——
-    // 复用其二进制即可零下载、离线、绕过 CfT 下载被墙/无网失败。永远配专属 user-data-dir
-    // 起独立托管实例（launch.rs 红线：绝不碰用户 profile）。
-    if let Some(p) = detect_system_browser_in(
+    // 1-4：env / 系统浏览器 / 打包 CfT / 已下载 CfT，顺序由 source 决定，存在即返回。
+    // 永远配专属 user-data-dir 起独立托管实例（launch.rs 红线：绝不碰用户 profile）。
+    if let Some(p) = resolve_local_chrome(
+        platform,
         std::env::consts::OS,
+        source,
         |k| std::env::var(k).ok(),
         |p| p.is_file(),
+        bundled_dir,
+        data_dir,
     ) {
         return Ok(p);
     }
 
-    // 5：下载兜底（系统无任何 Chromium 系浏览器、且未打包/未下载 CfT 时的最后手段）。
+    // 5：下载兜底（本地无 CfT 且系统无任何 Chromium 系浏览器时的最后手段）。下载的是 CfT。
     download_chrome(platform, data_dir).await?;
 
-    // 下载+解压后再走一次纯解析，确认可执行就位。
-    resolve_chrome_path_in(platform, |k| std::env::var(k).ok(), bundled_dir, data_dir).ok_or_else(|| {
+    // 下载+解压后确认可执行就位（下载落在数据目录的托管 CfT）。
+    cft_chrome_path(platform, bundled_dir, data_dir, |p: &Path| p.is_file()).ok_or_else(|| {
         BrowserError::Other(format!(
             "chrome executable missing after download into {}",
             data_dir.display()
@@ -645,6 +716,111 @@ mod tests {
     #[test]
     fn detect_unknown_os_yields_none() {
         assert!(detect_system_browser_in("freebsd", |_| None, |_| true).is_none());
+    }
+
+    // --- ChromeSource 解析 + source 编排优先级（纯逻辑，注入 env+exists，任意宿主可跑）------
+
+    #[test]
+    fn chrome_source_from_str_and_default() {
+        assert_eq!(ChromeSource::from_source_str("system"), ChromeSource::System);
+        assert_eq!(ChromeSource::from_source_str("System"), ChromeSource::System);
+        assert_eq!(ChromeSource::from_source_str("  SYSTEM  "), ChromeSource::System);
+        assert_eq!(ChromeSource::from_source_str("managed"), ChromeSource::Managed);
+        assert_eq!(ChromeSource::from_source_str(""), ChromeSource::Managed);
+        assert_eq!(ChromeSource::from_source_str("garbage"), ChromeSource::Managed);
+        assert_eq!(ChromeSource::default(), ChromeSource::Managed);
+    }
+
+    /// 取一个真实的系统 Chrome 候选路径（首个 chrome.exe 候选），用于注入 exists。
+    fn a_system_chrome() -> PathBuf {
+        system_browser_candidates("windows", |_| None)
+            .into_iter()
+            .find(|p| p.to_string_lossy().ends_with("chrome.exe"))
+            .expect("a windows chrome candidate")
+    }
+
+    #[test]
+    fn source_system_prefers_system_over_cft_managed_prefers_cft() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bundled = tmp.path().join("bundled");
+        let bundled_exe = bundled.join("chrome-win64/chrome.exe");
+        let data = tmp.path().join("data");
+        let sys = a_system_chrome();
+        // 同时「存在」打包 CfT 与系统 chrome。
+        let (be, se) = (bundled_exe.clone(), sys.clone());
+        let exists = move |p: &Path| *p == be || *p == se;
+
+        // System：选系统浏览器（优先于 CfT）。
+        let got = resolve_local_chrome(
+            "win64", "windows", ChromeSource::System, |_| None, &exists, Some(&bundled), &data,
+        );
+        assert_eq!(got, Some(sys));
+        // Managed：选 CfT（打包）——现行为。
+        let got2 = resolve_local_chrome(
+            "win64", "windows", ChromeSource::Managed, |_| None, &exists, Some(&bundled), &data,
+        );
+        assert_eq!(got2, Some(bundled_exe));
+    }
+
+    #[test]
+    fn source_system_falls_back_to_cft_when_no_system_browser() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bundled = tmp.path().join("bundled");
+        let bundled_exe = bundled.join("chrome-win64/chrome.exe");
+        let data = tmp.path().join("data");
+        let be = bundled_exe.clone();
+        let exists = move |p: &Path| *p == be; // 仅 CfT 存在，无系统浏览器
+        let got = resolve_local_chrome(
+            "win64", "windows", ChromeSource::System, |_| None, &exists, Some(&bundled), &data,
+        );
+        assert_eq!(got, Some(bundled_exe));
+    }
+
+    #[test]
+    fn source_managed_falls_back_to_system_when_no_cft() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data = tmp.path().join("data");
+        let sys = a_system_chrome();
+        let se = sys.clone();
+        let exists = move |p: &Path| *p == se; // 仅系统浏览器存在，无 CfT
+        let got = resolve_local_chrome(
+            "win64", "windows", ChromeSource::Managed, |_| None, &exists, None, &data,
+        );
+        assert_eq!(got, Some(sys));
+    }
+
+    #[test]
+    fn env_override_wins_in_both_sources() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env_exe = tmp.path().join("custom/chrome.exe");
+        let bundled = tmp.path().join("bundled");
+        let bundled_exe = bundled.join("chrome-win64/chrome.exe");
+        let data = tmp.path().join("data");
+        let sys = a_system_chrome();
+        // env + CfT + 系统浏览器都「存在」。
+        let (ee, be, se) = (env_exe.clone(), bundled_exe.clone(), sys.clone());
+        let exists = move |p: &Path| *p == ee || *p == be || *p == se;
+        let env_str = env_exe.to_string_lossy().to_string();
+        let env_get = |k: &str| (k == CHROME_BINARY_ENV).then(|| env_str.clone());
+        for source in [ChromeSource::System, ChromeSource::Managed] {
+            let got = resolve_local_chrome(
+                "win64", "windows", source, &env_get, &exists, Some(&bundled), &data,
+            );
+            assert_eq!(got, Some(env_exe.clone()), "env must win for {source:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_local_none_when_nothing_present() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data = tmp.path().join("data");
+        // 全空（无 env、无 CfT、无系统浏览器）→ None（交下载兜底）。
+        for source in [ChromeSource::System, ChromeSource::Managed] {
+            let got = resolve_local_chrome(
+                "win64", "windows", source, |_| None, |_| false, None, &data,
+            );
+            assert!(got.is_none(), "expected None for {source:?}");
+        }
     }
 
     /// 本机集成（需已装 Chrome/Edge）：验证**无 env 时**真实文件系统能探到系统浏览器。

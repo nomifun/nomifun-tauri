@@ -2846,6 +2846,7 @@ fn make_test_confirmations() -> Vec<Confirmation> {
             description: "Edit main.rs".into(),
             command_type: Some("bash".into()),
             options: vec![],
+            screenshot: None,
         },
         Confirmation {
             id: "c2".into(),
@@ -2855,6 +2856,7 @@ fn make_test_confirmations() -> Vec<Confirmation> {
             description: "Read config.toml".into(),
             command_type: None,
             options: vec![],
+            screenshot: None,
         },
     ]
 }

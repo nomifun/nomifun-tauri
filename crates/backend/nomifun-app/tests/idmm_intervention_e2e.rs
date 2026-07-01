@@ -102,6 +102,7 @@ impl IMockAgent for BlockedOnConfirmationAgent {
                     params: None,
                 },
             ],
+            screenshot: None,
         }]
     }
     fn confirm(

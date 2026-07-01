@@ -333,6 +333,14 @@ pub struct BrowserConfig {
     /// 同范式，host_default=false=OFF——视觉兜底每次都过一遍视觉模型，有额外 token 成本，须用户显式 opt-in）。
     #[serde(default)]
     pub visual_fallback: bool,
+    /// **浏览器来源**（「浏览器模式」的来源维度，与 `headless` 正交）。`"managed"`（默认）=
+    /// 内置/下载的 Chrome for Testing；`"system"` = 用户系统已装的 Chrome/Edge 本体优先
+    /// （未探到回退 managed）。**两种来源都用专属 user-data-dir 起独立托管实例**（红线：绝不
+    /// 碰用户真实 profile；登录态由持久登录保险库单独维护）。上层（backend factory）把用户在
+    /// System Settings 的 `client_preferences` `agent.browserUse.source` LIVE 值写到这里（每会话
+    /// 构造时读最新值），facade `BrowserTool` 由本字段解析出 `ChromeSource`。坏值静默退回 managed。
+    #[serde(default = "default_browser_source")]
+    pub source: String,
 }
 
 impl Default for BrowserConfig {
@@ -347,6 +355,7 @@ impl Default for BrowserConfig {
             persistent_login: false,
             site_memory: false,
             visual_fallback: false,
+            source: default_browser_source(),
         }
     }
 }
@@ -390,6 +399,10 @@ fn default_max_screenshot_edge() -> u32 {
 }
 fn default_browser_idle_timeout() -> u64 {
     300
+}
+/// 浏览器来源默认值：`"managed"`（内置/下载 CfT）。`"system"` = 用户系统 Chrome/Edge。
+fn default_browser_source() -> String {
+    "managed".to_owned()
 }
 fn default_true() -> bool {
     true
@@ -805,6 +818,14 @@ fn merge_config_files(global: ConfigFile, project: ConfigFile) -> ConfigFile {
         // P7B visual-fallback——任一层开启即开（与 full_power 同 OR 合并语义）。运行时由 backend factory 经
         // client_preferences LIVE 覆写（host_default=false），这里只是 toml 合并。
         visual_fallback: global.tools.browser.visual_fallback || project.tools.browser.visual_fallback,
+        // 浏览器来源——project 非默认（显式设了 "system"/其它）则覆盖 global，否则用 global（与
+        // browser_path 同「project 非默认优先」语义）。运行时由 backend factory 经 client_preferences
+        // LIVE 覆写（config.tools.browser.source），这里只是 toml 合并。
+        source: if project.tools.browser.source != default_browser_source() {
+            project.tools.browser.source
+        } else {
+            global.tools.browser.source
+        },
     };
     let max_recent_images = if project.tools.max_recent_images != default_max_recent_images() {
         project.tools.max_recent_images
@@ -1205,6 +1226,13 @@ max_sessions = 20                # auto-cleanup oldest
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_config_default_source_is_managed() {
+        // 默认来源 = "managed"（内置/下载 CfT）—— 新装/未配置即现行为，零回归。
+        // 引擎侧 `ChromeSource::from_source_str("managed")` == Managed（见 nomi-browser-engine::acquire）。
+        assert_eq!(BrowserConfig::default().source, "managed");
+    }
 
     // -------------------------------------------------------------------------
     // parse_builtin_provider tests

@@ -7,13 +7,15 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Dropdown, Menu, Spin } from '@arco-design/web-react';
-import { Brain, Comment, Down, Left, Redo, CheckOne } from '@icon-park/react';
+import { Brain, Comment, Down, Left, Redo, CheckOne, SettingOne } from '@icon-park/react';
 import { ipcBridge } from '@/common';
 import type { TChatConversation } from '@/common/config/storage';
 import type { OpenTaskPayload } from '@/renderer/pages/orchestrator/RunDetail/DagCanvas';
 import { memberShortLabel } from '@/renderer/pages/orchestrator/RunDetail/memberLabel';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 import { useOrchestration } from './OrchestrationContext';
+import NodePreconfigPanel from './NodePreconfigPanel';
+import RouteErrorBoundary from '@/renderer/components/layout/RouteErrorBoundary';
 import ReadOnlyConversationView from '@/renderer/pages/orchestrator/RunDetail/ReadOnlyConversationView';
 import styles from './projectedWorkerView.module.css';
 
@@ -100,6 +102,13 @@ const ProjectedWorkerView: React.FC<ProjectedWorkerViewProps> = ({ payload }) =>
   // A node that has already run (or is running) needs an explicit 重跑 for the new
   // model to take effect; a not-yet-started node simply picks it up at dispatch.
   const taskSettled = ['running', 'done', 'completed', 'failed', 'error'].includes(task.status);
+
+  // 启动前配置台 (迁移 025): a node that is NOT currently running can have its model
+  // + 预置要求 configured. A pending (no-conversation) node shows the panel as its
+  // body (applied at dispatch); a settled node shows it as a collapsible "重跑配置"
+  // above its transcript (applied on the next 重跑). A running node never shows it.
+  const canConfig = task.status !== 'running';
+  const [configOpen, setConfigOpen] = useState(false);
 
   // Reassign this node to a different fleet member (= a different model). The
   // backend only updates the assignment row — for a PENDING node the engine reads
@@ -330,25 +339,80 @@ const ProjectedWorkerView: React.FC<ProjectedWorkerViewProps> = ({ payload }) =>
           Not-started / loading covered; otherwise the worker's own conversation
           with its full composer (model pill, attachments, @, slash, send). */}
       <div className={styles.body}>
-        {conversationId === undefined ? (
-          <div className={styles.center}>
-            <span className={styles.emptyIcon}>
-              <Comment theme='outline' size='26' strokeWidth={3} />
-            </span>
-            <div className={styles.emptyTitle}>
-              {t('orchestrator.run.transcript.notStarted', { defaultValue: '该 agent 尚未开始' })}
+        <RouteErrorBoundary>
+          {conversationId === undefined ? (
+            canConfig ? (
+            // Pending node — no worker conversation yet. The body IS the 启动前配置台
+            // (model override + 预置要求), applied automatically at dispatch. Own
+            // scroll container so it fills the pane and is fully reachable.
+            <div className='flex-1 min-h-0 overflow-y-auto'>
+              <NodePreconfigPanel runId={runId} task={task} settled={false} onSaved={payload.refetch} />
             </div>
-            <div className={styles.emptyHint}>
-              {t('orchestrator.run.transcript.noConversation', {
-                defaultValue: '该节点还没有被 worker 接手,暂无可查看的会话记录。',
-              })}
+          ) : (
+            <div className={styles.center}>
+              <span className={styles.emptyIcon}>
+                <Comment theme='outline' size='26' strokeWidth={3} />
+              </span>
+              <div className={styles.emptyTitle}>
+                {t('orchestrator.run.transcript.notStarted', { defaultValue: '该 agent 尚未开始' })}
+              </div>
+              <div className={styles.emptyHint}>
+                {t('orchestrator.run.transcript.noConversation', {
+                  defaultValue: '该节点还没有被 worker 接手,暂无可查看的会话记录。',
+                })}
+              </div>
             </div>
-          </div>
+          )
         ) : loading ? (
           <Spin loading className='flex flex-1 items-center justify-center' />
         ) : conversation ? (
-          <ReadOnlyConversationView conversation={conversation} agent_name={task.title} />
+          // Settled node — an OPTIONAL collapsible 重跑配置 above the read-only
+          // transcript. Rendered as SIBLINGS of the flex-col `.body` (NO wrapper
+          // div) so ReadOnlyConversationView (NomiChat, `flex-1`) keeps filling the
+          // remaining height exactly as before — wrapping it in a plain block broke
+          // NomiChat's flex sizing (the composer floated to the top).
+          <>
+            {canConfig && (
+              <div className='shrink-0 border-b border-solid border-[var(--color-border-2)]'>
+                <div
+                  role='button'
+                  tabIndex={0}
+                  aria-expanded={configOpen}
+                  onClick={() => setConfigOpen((v) => !v)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      setConfigOpen((v) => !v);
+                    }
+                  }}
+                  className='flex cursor-pointer select-none items-center gap-6px px-16px py-9px text-12px font-600 text-[var(--color-text-2)] hover:text-[var(--color-text-1)]'
+                >
+                  <SettingOne theme='outline' size='13' strokeWidth={3} className='line-height-0 text-[rgb(var(--primary-6))]' />
+                  <span>{t('orchestrator.run.preconfig.rerunConfig', { defaultValue: '重跑配置（模型 / 预置要求）' })}</span>
+                  <Down
+                    theme='outline'
+                    size='12'
+                    strokeWidth={3}
+                    className={`line-height-0 transition-transform duration-150 ${configOpen ? 'rotate-180' : ''}`}
+                  />
+                </div>
+                {configOpen && (
+                  <div className='max-h-340px overflow-y-auto border-t border-solid border-[var(--color-border-2)]'>
+                    <NodePreconfigPanel runId={runId} task={task} settled onSaved={payload.refetch} />
+                  </div>
+                )}
+              </div>
+            )}
+            <ReadOnlyConversationView conversation={conversation} agent_name={task.title} />
+          </>
+        ) : canConfig ? (
+          // A conversation id exists but the record couldn't load — still let the
+          // user configure this node instead of showing a blank body.
+          <div className='flex-1 min-h-0 overflow-y-auto'>
+            <NodePreconfigPanel runId={runId} task={task} settled onSaved={payload.refetch} />
+          </div>
         ) : null}
+        </RouteErrorBoundary>
       </div>
     </div>
   );

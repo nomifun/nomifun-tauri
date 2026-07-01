@@ -64,6 +64,9 @@ pub use vault::{
     SHARED_STORAGE_STATE_DIR, VaultError, load_storage_state, save_storage_state,
     shared_storage_state_path, storage_state_path,
 };
+/// **浏览器来源**（「浏览器模式」的来源维度，与 headless 正交）：托管 CfT vs 系统 Chrome/Edge。
+/// 见 [`acquire::ChromeSource`]。经 [`EngineConfig::chrome_source`] 注入 → `create_engine` 解析二进制。
+pub use acquire::ChromeSource;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -98,6 +101,12 @@ pub struct EngineConfig {
     pub bundled_dir: Option<PathBuf>,
     /// 是否希望带可见窗口。注意：无显示器时本标志被忽略，强制 headless。默认 false。
     pub headful: bool,
+    /// **浏览器来源**（[`ChromeSource`]，与 `headful` 正交）：`Managed`（默认）= 内置/下载的
+    /// Chrome for Testing；`System`（「我的浏览器」）= 系统已装 Chrome/Edge 本体优先（未探到
+    /// 回退 Managed）。上层从 `client_preferences` `agent.browserUse.source` 解析后灌入
+    /// （facade `BrowserTool` 由 `BrowserConfig.source` 解析）。**两种来源都配专属
+    /// user-data-dir 起独立托管实例**——红线不变：绝不碰用户真实 profile。
+    pub chrome_source: ChromeSource,
     /// **E4 下载沙箱落点**：per-pet 隔离 workspace 目录（companion.rs 的
     /// `{companion_id}/workspace`）。下载经 `Browser.setDownloadBehavior(allowAndName)` 落进
     /// 它的 `downloads/` 子目录（[`download::download_dir`]）——**绝不**落用户真实 Downloads。
@@ -159,6 +168,7 @@ impl std::fmt::Debug for EngineConfig {
             .field("data_dir", &self.data_dir)
             .field("bundled_dir", &self.bundled_dir)
             .field("headful", &self.headful)
+            .field("chrome_source", &self.chrome_source)
             .field("workspace_dir", &self.workspace_dir)
             .field("evaluate_full_power", &self.evaluate_full_power)
             .field("evaluate_persistent_login", &self.evaluate_persistent_login)
@@ -176,6 +186,8 @@ impl Default for EngineConfig {
             data_dir: std::env::temp_dir().join("nomifun-browser-data"),
             bundled_dir: None,
             headful: false,
+            // 默认来源 = Managed（内置/下载 CfT 优先）= 现行为，零回归。
+            chrome_source: ChromeSource::Managed,
             workspace_dir: None,
             // E3 default-deny：evaluate 全権默认 OFF（没有任何 session 默认能 evaluate）。
             evaluate_full_power: false,
@@ -201,9 +213,13 @@ impl Default for EngineConfig {
 /// 数据目录布局：chrome 下到 `<data_dir>/nomifun-browser/<version>/...`；专属
 /// user-data-dir = `<data_dir>/profile`（红线：**绝不**指向用户真实 profile）。
 pub async fn create_engine(config: EngineConfig) -> Result<Arc<dyn BrowserEngine>, BrowserError> {
-    // 1) resolve chrome 可执行（env > 打包 > 数据目录 > 下载兜底）。
-    let chrome_path =
-        crate::acquire::resolve_chrome_path(&config.data_dir, config.bundled_dir.as_deref()).await?;
+    // 1) resolve chrome 可执行（env > 打包 > 数据目录 > 下载兜底；顺序由 chrome_source 编排）。
+    let chrome_path = crate::acquire::resolve_chrome_path_with_source(
+        &config.data_dir,
+        config.bundled_dir.as_deref(),
+        config.chrome_source,
+    )
+    .await?;
 
     // 2) 专属 user-data-dir（红线：非用户 profile；放在我们自己的 data_dir 下）。
     let user_data_dir = config.data_dir.join("profile");
@@ -252,6 +268,8 @@ mod tests {
     fn engine_config_default_is_headless_with_temp_data_dir() {
         let c = EngineConfig::default();
         assert!(!c.headful);
+        // 默认来源 = Managed（内置/下载 CfT 优先）= 现行为，零回归。
+        assert_eq!(c.chrome_source, ChromeSource::Managed);
         assert!(c.bundled_dir.is_none());
         assert!(c.data_dir.ends_with("nomifun-browser-data"));
         // E4：无 per-pet 上下文时 workspace_dir 默认 None（兜底落 <data_dir>/downloads）。

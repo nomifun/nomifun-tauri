@@ -167,6 +167,14 @@ export type TRunTask = {
    * carries the fan-out group tag (`{"group":"<label>"}`) on sibling agent tasks;
    * absent for ordinary tasks. */
   pattern_config?: string;
+  /** Per-task model override (启动前配置台, migration 025): when BOTH set, this node
+   * dispatches with this provider×model (any available model, not just the run's
+   * frozen fleet). Absent = follow auto-routing. */
+  override_provider_id?: string;
+  override_model?: string;
+  /** User 预置要求 (migration 025) appended to the node's worker brief, separate
+   * from the planner-written `spec`. Absent/blank = none. */
+  preset_prompt?: string;
   /** Creation / last-update timestamps (epoch ms). Drive per-task pacing in the
    * roster + inspector (用时 = updated_at − created_at, 相对时间). */
   created_at: number;
@@ -295,4 +303,17 @@ export type TSteer = {
  * node with the amended spec. */
 export type TTaskSpecUpdate = {
   spec: string;
+};
+
+/**
+ * 启动前配置台 (migration 025): a FULL replace of a node's per-task model override
+ * + 预置要求. The panel always sends the desired state; an omitted/empty field
+ * clears it. The model override needs BOTH `override_provider_id` +
+ * `override_model` (a half-set is normalized to cleared server-side). Rejected
+ * (400) for a running task; a pending node picks it up at dispatch, a settled one
+ * on the next rerun. */
+export type TTaskConfigUpdate = {
+  override_provider_id?: string;
+  override_model?: string;
+  preset_prompt?: string;
 };
