@@ -12,6 +12,7 @@ import { ipcBridge } from '@/common';
 import type { IModelFailoverCandidate, IModelFailoverConfig } from '@/common/adapter/ipcBridge';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 import { useProvidersQuery } from '@renderer/hooks/agent/useModelProviderList';
+import { buildModelFailoverConfigForSave } from './modelFailoverQueue';
 
 const DEFAULT_CONFIG: IModelFailoverConfig = {
   enabled: false,
@@ -87,8 +88,12 @@ const ModelFailoverContent: React.FC = () => {
   const save = async () => {
     setSaving(true);
     try {
-      const saved = await ipcBridge.agentModelFailover.updateSettings.invoke(config);
+      const saveResult = buildModelFailoverConfigForSave(config, draftProvider, draftModel);
+      const saved = await ipcBridge.agentModelFailover.updateSettings.invoke(saveResult.config);
       setConfig({ ...DEFAULT_CONFIG, ...saved, queue: saved.queue ?? [] });
+      if (saveResult.hasCompleteDraft) {
+        setDraftModel(undefined);
+      }
       message.success(t('modelFailover.saved'));
     } catch (e) {
       message.error(String(e));
