@@ -57,6 +57,7 @@ const SystemModalContent: React.FC = () => {
   const [cronNotificationEnabled, setCronNotificationEnabled] = useState(false);
   const [saveUploadToWorkspace, setSaveUploadToWorkspace] = useState(false);
   const [autoPreviewOfficeFiles, setAutoPreviewOfficeFiles] = useState(true);
+  const [autoOrchestration, setAutoOrchestration] = useState(false);
   const [sendKey, setSendKey] = useState<'enter' | 'mod-enter'>('enter');
   const [factoryResetVisible, setFactoryResetVisible] = useState(false);
 
@@ -89,6 +90,7 @@ const SystemModalContent: React.FC = () => {
     setCronNotificationEnabled(configService.get('system.cronNotificationEnabled') ?? false);
     setSaveUploadToWorkspace(configService.get('upload.saveToWorkspace') ?? false);
     setAutoPreviewOfficeFiles(configService.get('system.autoPreviewOfficeFiles') ?? true);
+    setAutoOrchestration(configService.get('nomi.autoOrchestration') ?? false);
     setSendKey(configService.get('chat.sendKey') ?? 'enter');
   }, [isDesktop]);
 
@@ -184,6 +186,14 @@ const SystemModalContent: React.FC = () => {
     configService.set('system.autoPreviewOfficeFiles', checked).catch(() => {
       setAutoPreviewOfficeFiles(!checked);
       configService.setLocal('system.autoPreviewOfficeFiles', !checked);
+    });
+  }, []);
+
+  const handleAutoOrchestrationChange = useCallback((checked: boolean) => {
+    setAutoOrchestration(checked);
+    configService.set('nomi.autoOrchestration', checked).catch(() => {
+      setAutoOrchestration(!checked);
+      configService.setLocal('nomi.autoOrchestration', !checked);
     });
   }, []);
 
@@ -283,6 +293,12 @@ const SystemModalContent: React.FC = () => {
       label: t('settings.autoPreviewOfficeFiles'),
       description: t('settings.autoPreviewOfficeFilesDesc'),
       component: <Switch checked={autoPreviewOfficeFiles} onChange={handleAutoPreviewOfficeFilesChange} />,
+    },
+    {
+      key: 'autoOrchestration',
+      label: t('settings.autoOrchestration'),
+      description: t('settings.autoOrchestrationDesc'),
+      component: <Switch checked={autoOrchestration} onChange={handleAutoOrchestrationChange} />,
     },
   ];
 

@@ -138,15 +138,25 @@ pub(super) async fn build(
     );
 
     // Orchestration lead (会话 entry "auto/range" models → extra.orchestrator_role
-    // == "lead"): prepend the server-authored 编排主管 system prompt so the
-    // conversation decomposes complex requirements via `nomi_run_create`. Composed
-    // LAST so the 主管 prompt leads, with the full preset/persona/knowledge prompt
-    // preserved after the separator. Tool availability is NOT granted here — the
-    // orchestration tools ride the independently-gated desktop gateway; a
-    // client-supplied role can only shape the prompt, never self-authorize tools.
+    // == "lead", OR the global 智能编排 preference for a plain desktop session):
+    // prepend the server-authored 编排主管 system prompt so the conversation
+    // decomposes complex requirements via `nomi_run_create`. Composed LAST so the
+    // 主管 prompt leads, with the full preset/persona/knowledge prompt preserved
+    // after the separator. Tool availability is NOT granted here — the
+    // orchestration tools ride the desktop gateway that every locally-trusted
+    // desktop session is already granted server-side; this only shapes the prompt
+    // (no capability or approval-mode change). Companions use their own in-persona
+    // nudge; remote/IM never auto-fan-out.
+    let auto_orchestration = read_bool_pref(&deps, PREF_AUTO_ORCHESTRATION, false).await;
+    let lead = is_orchestration_lead(
+        overrides.orchestrator_role.as_deref(),
+        auto_orchestration,
+        overrides.companion,
+        overrides.channel_platform.is_some(),
+    );
     overrides.system_prompt = compose_lead_prompt(
         overrides.system_prompt.take(),
-        overrides.orchestrator_role.as_deref(),
+        if lead { Some("lead") } else { None },
     );
 
     // Companion-owned sessions (local 桌面伙伴 chat + IM channel master) must
@@ -526,6 +536,10 @@ const PREF_BROWSER_SILENT: &str = "agent.browserUse.silent";
 const PREF_BROWSER_SOURCE: &str = "agent.browserUse.source";
 /// 浏览器来源 host default（无设置行/无 client_prefs 时）：内置/下载的 Chrome for Testing。
 const BROWSER_SOURCE_DEFAULT: &str = "managed";
+/// 全局「智能编排」开关（client preference）。为真时，普通桌面会话默认成为编排 lead（注入
+/// 主管 prompt，鼓励对复杂需求 `nomi_run_create` 扇出）。伙伴走各自的 smart_orchestration
+/// 人格提示、远程会话不参与，故此处仅对「非伙伴、非远程」的桌面会话生效。默认 OFF（opt-in）。
+const PREF_AUTO_ORCHESTRATION: &str = "nomi.autoOrchestration";
 
 /// Read a boolean `client_preferences` toggle live, falling back to
 /// `host_default` when there is no setting row (fresh install) or no
@@ -648,6 +662,18 @@ fn append_knowledge_context(
 /// instructs the lead not to ask for them. Kept as a `const` so the composition
 /// is unit-testable without standing up the async factory.
 pub(crate) const LEAD_ORCHESTRATOR_PROMPT: &str = "你是 NomiFun 的编排主管。用户已在本会话限定可用模型范围（见运行上下文）。对简单或单步需求：直接作答。对复杂、可拆分为多个并行/有依赖子任务的需求：调用工具 `nomi_run_create(goal)` 把需求拆成任务 DAG 并行执行（模型范围与工作目录会自动取用），随后用 `nomi_run_status`/`nomi_run_result` 跟进并向用户汇报进展与产出。不要询问 workspace 或 fleet——它们已不存在。";
+
+/// Decide whether a session should act as an orchestration lead (and thus get
+/// the 主管 prompt). Pure so the policy is unit-testable.
+///
+/// - An explicit `extra.orchestrator_role == "lead"` always wins (WebUI-set / per-session).
+/// - Otherwise the global 智能编排 preference (`nomi.autoOrchestration`) turns
+///   plain desktop sessions into leads by default — but NOT companions (they use
+///   their own in-persona `smart_orchestration` nudge) and NOT remote/IM sessions
+///   (`caps_orchestrator` denies Remote, so a lead prompt there would be a dead end).
+pub(crate) fn is_orchestration_lead(role: Option<&str>, auto_pref: bool, is_companion: bool, is_remote: bool) -> bool {
+    role == Some("lead") || (auto_pref && !is_companion && !is_remote)
+}
 
 /// Compose the 主管 system prompt onto whatever base prompt the assembly has
 /// produced (preset rules + companion persona + knowledge context), when the
@@ -1732,6 +1758,22 @@ mod tests {
         // Non-lead with no base stays None (no injection).
         assert_eq!(compose_lead_prompt(None, None), None);
         assert_eq!(compose_lead_prompt(None, Some("member")), None);
+    }
+
+    #[test]
+    fn is_orchestration_lead_policy() {
+        // Explicit role wins regardless of preference/companion/remote.
+        assert!(is_orchestration_lead(Some("lead"), false, false, false));
+        assert!(is_orchestration_lead(Some("lead"), false, true, false));
+        // Global 智能编排 preference makes a plain desktop session a lead.
+        assert!(is_orchestration_lead(None, true, false, false));
+        // …but never a companion (它有自己的 smart_orchestration 人设提示)…
+        assert!(!is_orchestration_lead(None, true, true, false));
+        // …nor a remote/IM session (caps_orchestrator denies Remote).
+        assert!(!is_orchestration_lead(None, true, false, true));
+        // Preference off + no explicit role → not a lead.
+        assert!(!is_orchestration_lead(None, false, false, false));
+        assert!(!is_orchestration_lead(Some("member"), false, false, false));
     }
 
     #[test]

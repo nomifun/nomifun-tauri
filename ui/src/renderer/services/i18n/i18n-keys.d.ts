@@ -2774,6 +2774,8 @@ export type I18nKey =
   | 'settings.authMethod'
   | 'settings.autoInjectedSkills'
   | 'settings.autoInjectedSkillsBadge'
+  | 'settings.autoOrchestration'
+  | 'settings.autoOrchestrationDesc'
   | 'settings.autoPreviewOfficeFiles'
   | 'settings.autoPreviewOfficeFilesDesc'
   | 'settings.baiduManualDownload'

@@ -219,6 +219,8 @@
   "saveUploadToWorkspace": "上传文件保存到项目文件夹",
   "autoPreviewOfficeFiles": "自动预览新建 Office 文件",
   "autoPreviewOfficeFilesDesc": "自动打开当前项目中新创建的 Word、Excel 和 PowerPoint 文件，并忽略 Office 临时锁定文件。",
+  "autoOrchestration": "智能编排（普通会话）",
+  "autoOrchestrationDesc": "开启后，普通会话遇到复杂、可拆分的多步任务时，会自动把活拆给子 agent 并行处理，主会话只负责调度与汇总、保持上下文清爽。关闭时仍可在会话里手动发起编排。（桌宠伙伴的智能编排在伙伴设置里单独开启。）",
   "computerUse": "桌面控制（computer use）",
   "computerUseDesc": "允许智能体观察并操作桌面（截屏、读取窗口控件、点击、输入、滚动、可靠启动应用/网址）。关闭后智能体仅能使用终端等工具。",
   "browserPersistentLogin": "持久登录",
