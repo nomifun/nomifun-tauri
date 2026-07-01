@@ -472,6 +472,35 @@ pub fn create_router_with_all_state(
         "startup: route groups built"
     );
 
+    // Phase 2b: 「登录我的浏览器」——用户一键拉起可见登录浏览器(共享 profile),登录一次后静默会话复用。
+    // 仅 browser-use 构建(需 CDP 引擎);面向桌面(headful 需显示器)。auth 中间件保护(与其它诊断端点同)。
+    #[cfg(feature = "browser-use")]
+    let browser_login_authenticated = {
+        let browser_data_dir = nomi_config::config::app_config_dir()
+            .map(|d| d.join("browser-data"))
+            .unwrap_or_else(|| std::env::temp_dir().join("nomifun-browser-data"));
+        let login_state = crate::router::browser_login::BrowserLoginState::new(
+            browser_data_dir,
+            crate::commands::bundled_chrome_dir(),
+            crate::config::derive_encryption_key(&services.jwt_secret_raw),
+        );
+        Router::new()
+            .route(
+                "/api/browser/login/open",
+                post(crate::router::browser_login::open_browser_login),
+            )
+            .route(
+                "/api/browser/login/close",
+                post(crate::router::browser_login::close_browser_login),
+            )
+            .route(
+                "/api/browser/login/status",
+                get(crate::router::browser_login::browser_login_status),
+            )
+            .with_state(login_state)
+            .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware))
+    };
+
     let router = Router::new()
         .route("/health", get(health_check))
         .merge(auth_routes(auth_state))
@@ -505,6 +534,10 @@ pub fn create_router_with_all_state(
         .merge(guide_mcp_authenticated)
         .merge(mcp_register_template_authenticated)
         .merge(register_knowledge_authenticated);
+
+    // Phase 2b: mount the login-browser routes (browser-use builds only).
+    #[cfg(feature = "browser-use")]
+    let router = router.merge(browser_login_authenticated);
 
     // CSRF (Double Submit Cookie) protects cookie-authenticated (remote
     // browser) requests. It is skipped entirely under NoAuth, and skips

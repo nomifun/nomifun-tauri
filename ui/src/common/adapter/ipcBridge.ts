@@ -3375,6 +3375,28 @@ export const browserSecret = {
   ),
 };
 
+/** Phase 2b「登录我的浏览器」status returned by open/close/status. */
+export interface IBrowserLoginStatus {
+  /** Whether a visible login browser is currently open. */
+  active: boolean;
+  /** Outcome code: 'opened' | 'already_open' | 'closed' | 'not_open' | 'launch_failed:<err>'. */
+  message?: string;
+  /** Whether close() captured the login state into the encrypted vault backup. */
+  saved: boolean;
+}
+
+/** 「登录我的浏览器」— open a visible browser bound to the shared profile so the user logs
+ *  into their sites once; silent agent sessions then reuse the login. `source` mirrors
+ *  agent.browserUse.source so the login browser uses the same binary. */
+export const browserLogin = {
+  /** Open the visible login window (idempotent while already open). */
+  open: httpPost<IBrowserLoginStatus, { source: 'managed' | 'system' }>('/api/browser/login/open'),
+  /** Close it (best-effort backs the login state up to the vault), returns final status. */
+  close: httpPost<IBrowserLoginStatus, void>('/api/browser/login/close'),
+  /** Poll whether a login window is currently open. */
+  status: httpGet<IBrowserLoginStatus, void>('/api/browser/login/status'),
+};
+
 // ==================== Knowledge Base Platform (knowledge) ====================
 
 /** One URL entry of a knowledge-base URL source. */

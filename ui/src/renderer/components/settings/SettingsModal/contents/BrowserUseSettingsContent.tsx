@@ -6,8 +6,9 @@
  */
 
 import { configService } from '@/common/config/configService';
+import { ipcBridge } from '@/common';
 import NomiScrollArea from '@/renderer/components/base/NomiScrollArea';
-import { Alert, Radio, Switch } from '@arco-design/web-react';
+import { Alert, Button, Message, Radio, Switch } from '@arco-design/web-react';
 import React, { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useSettingsViewMode } from '../settingsViewContext';
@@ -29,6 +30,9 @@ const BrowserUseSettingsContent: React.FC = () => {
   const [siteMemory, setSiteMemory] = useState(false);
   const [takeover, setTakeover] = useState(false);
   const [visualFallback, setVisualFallback] = useState(false);
+  // Phase 2b「登录我的浏览器」:是否有可见登录窗口开着 + 操作进行中。
+  const [loginOpen, setLoginOpen] = useState(false);
+  const [loginBusy, setLoginBusy] = useState(false);
 
   useEffect(() => {
     const storedPersistentLogin = configService.get('agent.browserUse.persistentLogin') ?? true;
@@ -48,6 +52,44 @@ const BrowserUseSettingsContent: React.FC = () => {
       configService.set('agent.browserUse.fullPower', false).catch(() => {});
     }
   }, []);
+
+  // Phase 2b: reflect whether a login browser is already open (global singleton).
+  useEffect(() => {
+    let cancelled = false;
+    ipcBridge.browserLogin.status
+      .invoke()
+      .then((res) => {
+        if (!cancelled && res) setLoginOpen(!!res.active);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // 「登录我的浏览器」:未开 → 拉起可见登录窗口(用当前来源);已开 → 关闭并备份登录态。
+  const handleLoginToggle = useCallback(async () => {
+    if (loginBusy) return;
+    setLoginBusy(true);
+    try {
+      if (loginOpen) {
+        const res = await ipcBridge.browserLogin.close.invoke();
+        setLoginOpen(res ? !!res.active : false);
+      } else {
+        const res = await ipcBridge.browserLogin.open.invoke({ source });
+        setLoginOpen(res ? !!res.active : false);
+        if (res && !res.active && (res.message || '').startsWith('launch_failed')) {
+          Message.error(t('settings.browserLoginFailed'));
+        } else if (res && res.active) {
+          Message.info(t('settings.browserLoginOpenedHint'));
+        }
+      }
+    } catch {
+      Message.error(t('settings.browserLoginFailed'));
+    } finally {
+      setLoginBusy(false);
+    }
+  }, [loginBusy, loginOpen, source, t]);
 
   const persistBoolean = useCallback(
     (key: Parameters<typeof configService.set>[0], checked: boolean, revert: () => void) => {
@@ -159,6 +201,11 @@ const BrowserUseSettingsContent: React.FC = () => {
               </PreferenceRow>
               <PreferenceRow label={t('settings.browserSilent')} description={t('settings.browserSilentDesc')}>
                 <Switch checked={silent} disabled={!browserUse} onChange={handleSilentChange} />
+              </PreferenceRow>
+              <PreferenceRow label={t('settings.browserLogin')} description={t('settings.browserLoginDesc')}>
+                <Button size='small' loading={loginBusy} disabled={!browserUse} onClick={handleLoginToggle}>
+                  {loginOpen ? t('settings.browserLoginClose') : t('settings.browserLoginOpen')}
+                </Button>
               </PreferenceRow>
               <PreferenceRow
                 label={t('settings.browserPersistentLogin')}

@@ -43,6 +43,7 @@ browser-use = [
     "nomifun-ai-agent/browser-use",
     "nomifun-gateway/browser-use",
     "dep:nomi-browser",
+    "dep:nomi-browser-engine",
     "dep:nomi-config",
     "dep:nomi-tools",
     "dep:nomi-types",
@@ -110,6 +111,10 @@ nomi-computer = { workspace = true, optional = true }
 # browser engine + Chromium, so web/headless builds stay lean. Shares the
 # optional nomi-config/-tools/-types deps with computer-use.
 nomi-browser = { workspace = true, optional = true }
+# Phase 2b: the "log into my browser" settings action drives a headful engine
+# directly (create_engine + capture_storage_state + storage_state vault), so the
+# login persists into the shared profile/vault. Only the browser-use feature pulls it.
+nomi-browser-engine = { workspace = true, optional = true }
 nomi-config = { workspace = true, optional = true }
 nomi-tools = { workspace = true, optional = true }
 nomi-types = { workspace = true, optional = true }
