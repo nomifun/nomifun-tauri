@@ -14,6 +14,7 @@ mod id;
 mod pagination;
 mod timestamp;
 mod types;
+pub mod vision_registry;
 
 pub use case_convert::{camel_to_snake, normalize_keys_to_snake_case};
 pub use crypto::{decrypt_string, encrypt_string};
@@ -29,3 +30,4 @@ pub use id::{generate_id, generate_prefixed_id};
 pub use pagination::PaginatedResult;
 pub use timestamp::{TimestampMs, now_ms};
 pub use types::{CommandSpec, Confirmation, ConfirmationOption, EnvVar, ProviderWithModel};
+pub use vision_registry::VisionUnsupportedRegistry;
