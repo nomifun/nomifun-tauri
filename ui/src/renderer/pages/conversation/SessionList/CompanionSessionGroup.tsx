@@ -17,6 +17,11 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 
+import {
+  COMPANION_COLLAPSED_LIST_LIMIT,
+  getVisibleCompanionEntries,
+} from './utils/companionVisibleEntries';
+
 interface Props {
   /** Active conversation id parsed from the `/conversation/:id` route, for row highlight. */
   activeConversationId: number | null;
@@ -54,6 +59,7 @@ const CompanionSessionGroup: React.FC<Props> = ({
   const { t } = useTranslation();
   const navigate = useNavigate();
   const { companions } = useCompanions();
+  const [showAllCompanions, setShowAllCompanions] = useState(false);
 
   // companionId → 其唯一会话 id（只读解析，用于活动行高亮 + 点击直达，避免无谓 ensure）。
   // 随花名册变化重解析；getCompanionSession 对未建会话返回 null（不入表）。
@@ -146,6 +152,17 @@ const CompanionSessionGroup: React.FC<Props> = ({
     );
   }
 
+  const activeCompanionIndex =
+    activeConversationId == null
+      ? -1
+      : companions.findIndex((c) => sessionMap.get(c.id) === activeConversationId);
+  const forceShowActiveCompanion =
+    activeCompanionIndex >= COMPANION_COLLAPSED_LIST_LIMIT;
+  const visibleCompanions = getVisibleCompanionEntries(
+    companions,
+    showAllCompanions || forceShowActiveCompanion
+  );
+
   return (
     <div className='min-w-0 mb-2px'>
       {/* 与「项目/工作路径」完全同款的纯 section 标题（无边框/盒子/箭头，只有标签 + 数字）。
@@ -164,7 +181,7 @@ const CompanionSessionGroup: React.FC<Props> = ({
 
       {expanded && (
         <div className='flex flex-col gap-2px mt-2px'>
-          {companions.map((c) => {
+          {visibleCompanions.entries.map((c) => {
             const active = activeConversationId != null && sessionMap.get(c.id) === activeConversationId;
             const modelReady = modelReadyOf(c);
             return (
@@ -207,6 +224,21 @@ const CompanionSessionGroup: React.FC<Props> = ({
               </div>
             );
           })}
+          {visibleCompanions.hasOverflow && !forceShowActiveCompanion && (
+            <button
+              type='button'
+              aria-expanded={showAllCompanions}
+              className='ml-48px mt-1px mb-2px inline-flex h-20px w-fit max-w-full appearance-none items-center border-none bg-transparent p-0 text-left text-12px leading-20px text-t-quaternary transition-colors cursor-pointer select-none hover:text-t-secondary focus:outline-none focus-visible:text-t-primary'
+              onClick={(e) => {
+                e.stopPropagation();
+                setShowAllCompanions((value) => !value);
+              }}
+            >
+              {showAllCompanions
+                ? t('sessionList.collapseDisplay')
+                : t('sessionList.expandDisplay', { count: visibleCompanions.hiddenCount })}
+            </button>
+          )}
         </div>
       )}
     </div>

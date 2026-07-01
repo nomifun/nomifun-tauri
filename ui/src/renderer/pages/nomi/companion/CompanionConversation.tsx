@@ -60,7 +60,6 @@ const CompanionConversation: React.FC<Props> = ({ conversation, companion }) => 
       conversation_id={conversation.id}
       hideAdvancedControls
       disableRename
-      selfContainedWorkspaceToggle
       workspaceEnabled={Boolean(workspace)}
       workspacePath={workspace || undefined}
       sider={<ChatSlider conversation={conversation} />}
