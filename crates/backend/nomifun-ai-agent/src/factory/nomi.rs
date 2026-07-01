@@ -287,11 +287,19 @@ pub(super) async fn build(
         cfg!(feature = "computer-use") || env_flag("NOMIFUN_COMPUTER_USE"),
     )
     .await;
-    // browser-use has no cargo-feature gate (native CDP engine works on every
-    // build), but its host default is OFF: driving a browser is intrusive enough
-    // (spawns Chromium, takes over pages) that it hurts UX as an always-on default.
-    // Opt-in only — the user enables it via the `agent.browserUse` pref toggle.
-    let browser_use_default = read_bool_pref(&deps, PREF_BROWSER_USE, false).await;
+    // browser-use has a cargo-feature gate (`browser-use`, desktop builds); on those
+    // builds it now defaults **ON** (user decision) — the native CDP engine launches its
+    // managed Chromium **lazily on first use**, so enabling it costs nothing until the agent
+    // actually drives a page, and it runs **silent (headless) by default** (see
+    // `agent.browserUse.silent`, host_default=true) so there is no pop-up window. The master
+    // toggle just lets the user turn it off. Builds without the feature register no browser
+    // tool regardless. `NOMIFUN_BROWSER_USE` env forces it on for feature-less parity/testing.
+    let browser_use_default = read_bool_pref(
+        &deps,
+        PREF_BROWSER_USE,
+        cfg!(feature = "browser-use") || env_flag("NOMIFUN_BROWSER_USE"),
+    )
+    .await;
     // F1-sec: evaluate「全权模式」LIVE 值（裁决⑨，default-deny）。用户在 System Settings 显式 opt-in
     // 的 `agent.browserUse.fullPower` 开关，每会话构造时 LIVE 读（read_bool_pref 范式，与上面的启用开关
     // 同源），灌进 BrowserConfig.full_power → BrowserTool::with_policy → 引擎 evaluate gate。默认 OFF

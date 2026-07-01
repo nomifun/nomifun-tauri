@@ -62,8 +62,9 @@ export type ConfigKeyMap = {
   // (observe/click/type/launch). Read by the backend agent factory per session.
   'agent.computerUse': boolean | undefined;
   // Browser control (browser-use): gates the nomi engine's built-in browser
-  // tools (native CDP engine). Off by default; enabling it fetches Chrome on
-  // first use. Read by the backend agent factory per session.
+  // tools (native CDP engine). ON by default on browser-use (desktop) builds; the
+  // managed Chromium is fetched lazily on first use and runs silently (headless).
+  // Read by the backend agent factory per session.
   'agent.browserUse': boolean | undefined;
   // Silent browser (browser-use sub-setting, visibility axis): run the managed
   // browser headless (no visible window). ON by default — removes the pop-up

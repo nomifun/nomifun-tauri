@@ -38,7 +38,7 @@ const BrowserUseSettingsContent: React.FC = () => {
     const storedPersistentLogin = configService.get('agent.browserUse.persistentLogin') ?? true;
     const storedFullPower = configService.get('agent.browserUse.fullPower') ?? false;
 
-    setBrowserUse(configService.get('agent.browserUse') ?? false);
+    setBrowserUse(configService.get('agent.browserUse') ?? true);
     // 「浏览器模式」两开关：默认静默(ON)、来源默认内置(managed)。
     setSilent(configService.get('agent.browserUse.silent') ?? true);
     setSource((configService.get('agent.browserUse.source') as BrowserSource) ?? 'managed');
