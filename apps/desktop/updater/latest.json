@@ -1,19 +1,11 @@
 {
-  "version": "0.1.13",
-  "notes": "- Improved orchestration reliability and control: DAG node pre-configuration,\n  per-node model selection, explicit in-conversation approval before execution,\n  and fixes for broken DAG lines, orphaned running nodes, one-node planning, and\n  blank pending states.\n- Added graceful handling for providers/models that do not support image input:\n  image capability tracking, proactive image removal, retry without interrupting\n  the conversation, and a visible in-conversation notice.\n- Expanded browser-use controls with silent mode defaults, managed/system\n  browser source selection, persistent encrypted browser login, a one-click\n  browser login action, and screenshot context for silent approvals.\n- Fixed WebUI credential persistence across restarts and added per-model context\n  window configuration.\n- Polished updater error handling, local update test clients, README screenshots,\n  provider quick links, and contact assets.\n- Packaging note: this Mac-side release publishes macOS installer and updater\n  assets. Windows and Linux packages must be added later from their native build\n  machines.",
-  "pub_date": "2026-07-01T13:25:06.043Z",
+  "version": "0.1.14",
+  "notes": "- Conversation: opening a new conversation now jumps in instantly with a visible loading state instead of a blank wait.\n- Updater: the update dialog shows its disclaimer at the bottom of the modal.\n- Keep the Baidu manual-download entry visible.\n- Release tooling: one-click macOS and Windows release flows (`bun run release:mac` / `release:win`) with automatic first-time vs. append detection.\n\nWindows packages ship first for this version; the macOS updater entry is added afterward from the Mac build machine.",
+  "pub_date": "2026-07-01T15:08:20.128Z",
   "platforms": {
-    "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODFyMTRqczkvQVd6ODdyMVNBVklTK0J0MXBCWE92eTBlYlh3ZmlZNEk0MjZ1QzdFUlU0QjIzOGx1ZW9YN2hoUS9maDdHc0pMOSt5NVlmeVZCdHhsaEFJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyOTEwMTQwCWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6ClRxZWtjVzBUMzE0UGNkRjY3K0VFTWYvOE9OU0dXdGVReU1TZ3Zubk1ZYVRteHBRcXdDdXhrQ1JENlYycS9HdzVXaVY3L3NPS3F0Sjc2VWRVcm9DZEF3PT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.1.13/NomiFun.app.tar.gz"
-    },
-    "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODFyMTRqczkvQVd6ODdyMVNBVklTK0J0MXBCWE92eTBlYlh3ZmlZNEk0MjZ1QzdFUlU0QjIzOGx1ZW9YN2hoUS9maDdHc0pMOSt5NVlmeVZCdHhsaEFJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyOTEwMTQwCWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6ClRxZWtjVzBUMzE0UGNkRjY3K0VFTWYvOE9OU0dXdGVReU1TZ3Zubk1ZYVRteHBRcXdDdXhrQ1JENlYycS9HdzVXaVY3L3NPS3F0Sjc2VWRVcm9DZEF3PT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.1.13/NomiFun.app.tar.gz"
-    },
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODF3QkUvU3JtZWF1UTZFSEZVTm5EWTJ6WDRYUytIL2ZLQitxUVJGNks0bm56aTVSV0hXRnJUMmRDR2lUUjN6Um9SUEFwZWIwRGc3ZVF2NkkxZ1YwbFFRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyOTEyMTY3CWZpbGU6Tm9taUZ1bl8wLjEuMTNfeDY0LXNldHVwLmV4ZQpnNXRySUlFNjZlcWVWM2NoSW0zb29pbkUxTnMrV2RTaGQxUW9FbTJBNnZvakE4cFJ5WFBGKzhQbDdQY2JWKzhBWFJPWDZSVm12M09PeGJkZU1ITW5EUT09Cg==",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.1.13/NomiFun_0.1.13_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODk1LzQwSmRvbkt3c0dEeG1KSXlSd2d1L2ZtemM4RXZ3VCttM3lPT3hSTGZ0NlV6N1R1ekdBMWxUcVBRcFRZNnA5OUUzL2ZxQ1VGRXRKV2txODZPOFFFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyOTE4NDk4CWZpbGU6Tm9taUZ1bl8wLjEuMTRfeDY0LXNldHVwLmV4ZQp2ZjY2M2lRenJzS1hsSVRpNWZSRnhqeStrMG81L0dyRGdqVUVIeUQyWGxwNWRmaTB1cFJ0UmhkbTUwUGhkaXZOV0RMTDNtMmZLUjN0N2NGTUQzZmVCUT09Cg==",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.1.14/NomiFun_0.1.14_x64-setup.exe"
     }
   }
 }
