@@ -1080,6 +1080,12 @@ impl BrowserEngine for CdpBackend {
         CdpBackend::bring_to_front(self).await
     }
 
+    async fn capture_storage_state(
+        &self,
+    ) -> Result<crate::storage_state::StorageState, BrowserError> {
+        CdpBackend::capture_storage_state(self).await
+    }
+
     async fn click_at_css_point(&self, x: f64, y: f64) -> Result<(), BrowserError> {
         use crate::input::Point;
         self.click_at(Point { x, y }).await
@@ -2255,6 +2261,23 @@ impl CdpBackend {
             })?
             .unwrap_or_default();
         Ok(crate::storage_state::StorageState::from_cdp_cookies(cookies))
+    }
+
+    /// **持久登录：组合捕获当前登录态**（[`Self::capture_cookies`] 全域 cookie +
+    /// [`Self::capture_local_storage`] 当前 origin 的 localStorage + [`Self::capture_index_db`]
+    /// best-effort）。cookie 是登录态主载体（全域采全）;localStorage/IndexedDB origin-bound,
+    /// 只采当前 active tab 那个 origin。localStorage 采不到（about:blank / 无 location）→ 只带 cookie。
+    /// IndexedDB 采集失败 → best-effort 忽略（`index_db=None`），绝不因此让整体 capture 失败。
+    pub async fn capture_storage_state(
+        &self,
+    ) -> Result<crate::storage_state::StorageState, BrowserError> {
+        let mut state = self.capture_cookies().await?;
+        if let Some(mut origin_storage) = self.capture_local_storage().await? {
+            // best-effort IndexedDB for the same origin; a failure must not sink the capture.
+            origin_storage.index_db = self.capture_index_db().await.ok().flatten();
+            state.local_storage.push(origin_storage);
+        }
+        Ok(state)
     }
 
     /// **W4b：把 storage_state 的 cookie 灌进默认 browser context（恢复登录态）**（DESIGN §17）。

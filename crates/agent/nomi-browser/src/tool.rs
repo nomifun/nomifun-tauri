@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -27,6 +27,7 @@ use serde_json::{Value, json};
 use nomi_browser_engine::progress::Progress;
 use nomi_browser_engine::{ActSpec, BrowserEngine, BrowserError, Capabilities, Effect, TypeInput};
 use nomi_browser_engine::{ChromeSource, EngineConfig, Observation, create_engine};
+use nomi_browser_engine::{load_storage_state, save_storage_state, shared_storage_state_path};
 use nomi_config::config::BrowserConfig;
 use nomi_protocol::ToolApprovalManager;
 use nomi_protocol::events::ToolCategory;
@@ -182,6 +183,9 @@ pub struct BrowserTool {
     /// `BrowserConfig.source` 解析（`with_data_dir` / 测试默认 `Managed`），`engine()` 透传给
     /// `EngineConfig.chrome_source`。红线不变：两种来源都用专属 user-data-dir。
     chrome_source: ChromeSource,
+    /// 持久登录 vault **节流保存**的上次落盘时刻。`spawn_persist_login` 每次成功导航后 best-effort
+    /// capture+save 登录态到加密 vault，但 ≥60s 才落一次（避免每次导航都跑 CDP capture + 写盘）。
+    last_persist_login: Mutex<Option<Instant>>,
     /// Lazily-initialized browser engine. `Some(Err)` caches an unavailable
     /// backend (chrome not resolvable, launch/connect failure) so we don't
     /// retry per call — the same failure-cache discipline as `ComputerTool`'s
@@ -436,6 +440,8 @@ impl BrowserTool {
             // 默认来源 = Managed（内置/下载 CfT）。`new()` 从 BrowserConfig.source 覆写为 System；
             // 仅有 data_dir 的调用方 / 测试保持 Managed（现行为，零回归）。
             chrome_source: ChromeSource::Managed,
+            // 持久登录节流保存：初始 None（首次导航即落一次 vault）。
+            last_persist_login: Mutex::new(None),
             engine: Mutex::new(None),
             last_snapshot: Mutex::new(None),
             secret_store: Mutex::new(None),
@@ -782,6 +788,24 @@ impl BrowserTool {
         // Slow path: build the engine WITHOUT holding the lock across the await
         // (construction is async and may take seconds). A concurrent first call
         // could also build one; that is fine — we keep whichever lands first.
+
+        // 持久登录（seed 侧，激活原本 dead-wired 的 vault 恢复）：仅当开启持久登录 **且磁盘 profile
+        // 尚不存在**（全新安装 / profile 被清）时，从加密 vault 播种一次登录态。为什么只在 profile 全新时
+        // seed：所有会话共用同一磁盘 profile（`<data_dir>/profile`），Chrome 会从磁盘加载最新 cookie；
+        // 若每次启动都注入（可能过时的）vault，`Storage.setCookies` 是 upsert，会用旧值**覆盖磁盘上更
+        // 新的 cookie** → 掉登录。故 profile 已存在时磁盘即权威、不注入；仅全新 profile 用 vault 做
+        // 恢复/迁移种子。key 复用 secret vault 的机器绑定 key（同一把）。坏/缺 vault → None（优雅降级）。
+        let storage_state = if self.evaluate_persistent_login
+            && !self.data_dir.join("profile").exists()
+        {
+            self.persist_login_key().and_then(|key| {
+                load_storage_state(&shared_storage_state_path(&self.data_dir), &key)
+                    .and_then(|s| serde_json::to_value(&s).ok())
+            })
+        } else {
+            None
+        };
+
         let result = create_engine(EngineConfig {
             data_dir: self.data_dir.clone(),
             // PKG-1: inject the bundled Chrome resource dir (from Tauri resource dir)
@@ -809,7 +833,7 @@ impl BrowserTool {
             // 空 = 不限制出口域（现行为，零回归）；IP 封禁 + 跨域 POST 门控仍随 default() 开。D1 的
             // TODO(X2) 已闭合：真值不再恒 default()，而是来自用户注册的 secret。
             firewall,
-            storage_state: None,
+            storage_state,
             // P3-D2 / SD-5 出口审批通道：被防火墙门控（GatePost）的跨域 POST / 未授权域出口在引擎层
             // **悬挂等裁决**。**Phase D 接线**：当 facade 被注入 approval gate（`with_approval_gate`，
             // 桌面=事件+ToolApprovalManager / 网关=GW2 confirm）时，交引擎一个 [`GateEgressApprover`]
@@ -832,6 +856,65 @@ impl BrowserTool {
             *guard = Some(result);
         }
         guard.as_ref().unwrap().clone()
+    }
+
+    /// The machine-bound key for the persistent-login vault. Reuses the SAME key the
+    /// secret vault uses (both are the app's machine-bound `encryption_key`, threaded via
+    /// [`BrowserSecretSource`]). `None` when no source is wired (CLI / tests) → persistent
+    /// login save/restore is skipped (the on-disk profile still persists natively).
+    fn persist_login_key(&self) -> Option<[u8; nomifun_secret::KEY_SIZE]> {
+        self.secret_source.as_ref().map(|s| s.key)
+    }
+
+    /// **持久登录（save 侧，激活原本 dead-wired 的 vault 保存）**：best-effort、节流(≥60s)地把当前
+    /// 登录态（[`BrowserEngine::capture_storage_state`]）加密落**共享 vault**，作为磁盘 profile 之外的
+    /// 加密备份（profile 被清后可经 seed 恢复）。非阻塞（`tokio::spawn`）——不给导航加延迟；捕获/落盘
+    /// 失败仅 warn（持久登录是增强，绝不影响动作）。**空快照不落**（避免会话早期 about:blank 的空登录态
+    /// 覆盖掉一份好备份）。仅在开启持久登录 + 有机器绑定 key 时生效。
+    fn spawn_persist_login(&self, engine: &Arc<dyn BrowserEngine>) {
+        if !self.evaluate_persistent_login {
+            return;
+        }
+        let Some(key) = self.persist_login_key() else {
+            return;
+        };
+        // 节流：≥60s 才落一次（首次导航即落，之后限频）。
+        {
+            let mut last = self.last_persist_login.lock().expect("last_persist_login poisoned");
+            let now = Instant::now();
+            if let Some(prev) = *last
+                && now.duration_since(prev) < Duration::from_secs(60)
+            {
+                return;
+            }
+            *last = Some(now);
+        }
+        let engine = engine.clone();
+        let vault_path = shared_storage_state_path(&self.data_dir);
+        tokio::spawn(async move {
+            match engine.capture_storage_state().await {
+                Ok(state) => {
+                    // 空快照（无 cookie 且无 localStorage）不落——不拿 about:blank 的空态覆盖好备份。
+                    if state.cookies.is_empty() && state.local_storage.is_empty() {
+                        return;
+                    }
+                    if let Err(e) = save_storage_state(&state, &vault_path, &key) {
+                        tracing::warn!(
+                            target: "nomi_browser::persist_login",
+                            error = %e,
+                            "save persistent-login vault failed (login state not backed up this round)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        target: "nomi_browser::persist_login",
+                        error = %e,
+                        "capture storage_state failed; skipping vault save (best-effort)"
+                    );
+                }
+            }
+        });
     }
 
     /// **Self-heal on a lost browser session.** Format an engine-method error into a
@@ -886,6 +969,8 @@ impl BrowserTool {
         };
         match engine.navigate(url, new_tab).await {
             Ok(nav) => {
+                // 持久登录：导航成功后（登录跳转常伴随导航）best-effort 节流备份登录态到加密 vault。
+                self.spawn_persist_login(&engine);
                 let status = nav
                     .http_status
                     .map(|s| format!(" (HTTP {s})"))

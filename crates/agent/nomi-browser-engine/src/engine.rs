@@ -309,6 +309,24 @@ pub trait BrowserEngine: Send + Sync {
         })
     }
 
+    /// **持久登录：按需捕获当前登录态 [`StorageState`]**（cookie 全域 + 当前 origin 的
+    /// localStorage / best-effort IndexedDB）。供上层（facade 登录后 / 登录按钮结束时）
+    /// `save_storage_state` 落加密 vault，实现跨会话/重启的持久登录。
+    ///
+    /// **origin-bound 现实**：cookie 经 `Storage.getCookies` 取**全域**;localStorage / IndexedDB
+    /// 按 origin 分区,只能取**当前 active tab 的那个 origin**(CDP 限制)。cookie 是登录态主载体,
+    /// 故此捕获对绝大多数登录足够;多 origin 的 localStorage 需分别 navigate 后各采一次。
+    ///
+    /// 默认实现返回 `Unsupported`(非 CDP 后端 / 假后端)。
+    async fn capture_storage_state(
+        &self,
+    ) -> Result<crate::storage_state::StorageState, BrowserError> {
+        Err(BrowserError::Unsupported {
+            capability: "capture_storage_state".into(),
+            hint: "storage_state capture not supported by this backend".into(),
+        })
+    }
+
     /// **P7B: Visual fallback point-click seam.** Click at absolute CSS-pixel
     /// coordinates (zero DPR — the caller has already divided by devicePixelRatio).
     ///
