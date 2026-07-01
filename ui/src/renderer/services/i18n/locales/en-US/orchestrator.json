@@ -212,6 +212,13 @@
       "ok": "Rerun started",
       "error": "Rerun failed: {{error}}"
     },
+    "approve": {
+      "bannerEyebrow": "Awaiting approval",
+      "bannerText": "The plan is ready. Keep adjusting if you like; when ready, click Approve & Run to start.",
+      "button": "Approve & Run",
+      "ok": "Approved — starting execution",
+      "error": "Approval failed: {{error}}"
+    },
     "adopt": {
       "button": "Adopt as node output",
       "ok": "Adopted as the node's output",
