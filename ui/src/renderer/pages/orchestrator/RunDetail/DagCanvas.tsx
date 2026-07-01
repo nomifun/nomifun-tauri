@@ -6,7 +6,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ReactFlow, Background, BackgroundVariant, Controls, MiniMap, Position, type Edge, type NodeHandle, type ReactFlowInstance } from '@xyflow/react';
+import { ReactFlow, Background, BackgroundVariant, Controls, MiniMap, type Edge, type ReactFlowInstance } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import './dag-canvas.css';
 import { Branch } from '@icon-park/react';
@@ -232,16 +232,6 @@ const FIT_VIEW_OPTIONS = { padding: 0.12, maxZoom: 1.6 } as const;
 const MINIMAP_NODE_W = 220;
 const MINIMAP_NODE_H = 96;
 
-/** Card width — mirrors the `w-220px` on every node card; the declared handles'
- * `x` is its horizontal center. */
-const CARD_W = 220;
-/** Fallback source-handle Y (≈ card bottom) used ONLY for the one frame before a
- * node is measured (main is a short crown+label card; task cards are taller).
- * The measured height refines it; the edge renders regardless. See the declared
- * `handles` note in the `nodes` memo below. */
-const MAIN_FALLBACK_H = 64;
-const TASK_FALLBACK_H = MINIMAP_NODE_H;
-
 /**
  * The MiniMap's LITERAL mirror of {@link taskStatusMeta}.
  *
@@ -365,6 +355,14 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onOpenTask, onOpenMain, ma
   const rfRef = useRef<ReactFlowInstance<DagFlowNode, Edge> | null>(null);
   const flowWrapRef = useRef<HTMLDivElement | null>(null);
   const wasVisibleRef = useRef(false);
+  // Node-object identity cache (keyed by node id → {signature, object}). Reusing
+  // the SAME object reference for an unchanged node lets react-flow's
+  // `adoptUserNodes` hit its reference-equality reuse branch and PRESERVE that
+  // node's already-measured `handleBounds` — instead of rebuilding a fresh
+  // object every render (on click / live refetch), which resets handleBounds and
+  // (with the previous declared-handles hack) permanently broke the edge
+  // geometry until a remount. See the note above `buildNodes` below.
+  const nodeCacheRef = useRef<Map<string, { sig: string; node: DagFlowNode }>>(new Map());
   useEffect(() => {
     const el = flowWrapRef.current;
     if (!el) return;
@@ -457,61 +455,34 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onOpenTask, onOpenMain, ma
       const group = parseGroupLabel(task.pattern_config);
       if (group && !hueByGroup.has(group)) hueByGroup.set(group, hueForGroup(group));
     }
-    // ROOT-CAUSE FIX for "画布连线丢失 / 点击后连线乱跳" — declare each node's
-    // handle bounds so they reproduce react-flow's DOM measurement TO THE PIXEL.
+    // ROOT-CAUSE FIX for "画布连线丢失 / 点击后连线乱跳".
     //
-    // WHY the lines dropped: this canvas drives `nodes` as a controlled prop and
-    // rebuilds every node OBJECT each render (live refetch / selection). On
-    // re-adoption `@xyflow/system` recomputes `handleBounds = parseHandles(...)`,
-    // and a node WITHOUT an explicit `handles` array falls into
-    // `!userNode.measured ? undefined : prev` → in the pre-measure window (first
-    // frame; lazy-remount before `onInit`) `handleBounds` is RESET to undefined →
-    // `getEdgePosition` fails `isNodeInitialized` → the edge renders null and,
-    // with the card size unchanged, never re-measures back.
+    // This canvas drives `nodes` as a controlled prop and rebuilds a FRESH object
+    // for every node on each render (click → activeTaskId change, or live
+    // refetch). react-flow's `adoptUserNodes` reuses a node's internals ONLY when
+    // the object reference is identical (`userNode === prev.internals.userNode`);
+    // a fresh object takes the rebuild branch, which resets `internals.measured`
+    // and recomputes `handleBounds` from the userNode. The prior fixes made this
+    // worse: declaring `handles` (+ `initialWidth`) kept `isInitialized`
+    // permanently true, so the NodeWrapper's ResizeObserver NEVER re-measured the
+    // DOM after a click — the edge endpoints froze at a stale/fallback height and
+    // only a remount ("refresh") restored them.
     //
-    // WHY declaring handles alone made them JITTER on click: react-flow keeps
-    // measuring the real `<Handle>` DOM and OVERWRITES `internals.handleBounds`
-    // via the ResizeObserver, while every re-adopt rebuilds them from the
-    // DECLARED array — so the endpoint flips between the two whenever they differ.
-    // The cure is to make the declared bounds resolve to the SAME endpoint the
-    // DOM yields, so it doesn't matter which path wrote last.
-    //
-    // react-flow stores a handle's TOP-LEFT relative to the node and, for an
-    // edge, resolves the endpoint as Top→(x+w/2, y) / Bottom→(x+w/2, y+h). The
-    // default `.react-flow__handle` is `left:50%` + `translate(-50%, ∓50%)`, so a
-    // W×H card's top/bottom handles measure to centers (W/2, 0) / (W/2, H) with
-    // their box overhanging the edge by half the glyph. Reproducing that exactly
-    // means top-left = (W/2 − HANDLE_SZ/2, edgeY − HANDLE_SZ/2) with the real
-    // glyph size — and feeding react-flow's own measured W/H so declared ≡
-    // measured (the fallback covers only the single pre-measure frame; the edge
-    // still renders then, just refines once measured).
-    const HANDLE_SZ = 7; // must match the width/height on TaskNode/MainNode <Handle>
-    const measuredDimsOf = (nodeId: string): { w: number; h: number } | undefined => {
-      const m = rfRef.current?.getInternalNode(nodeId)?.measured;
-      return typeof m?.width === 'number' && m.width > 0 && typeof m?.height === 'number' && m.height > 0
-        ? { w: m.width, h: m.height }
-        : undefined;
+    // Fix = (B) DON'T declare `handles` / feed `measured` back, so a rebuilt
+    // node's `handleBounds` legitimately resets to undefined → `isInitialized`
+    // flips false → react-flow unobserves+re-observes and re-measures the real DOM
+    // (exactly the mount/refresh path) → accurate, self-healing. Plus (C) reuse
+    // the SAME object reference for any node whose render-relevant content is
+    // unchanged, so react-flow keeps its already-measured handleBounds untouched —
+    // meaning only the one node whose selection actually flipped re-measures, and
+    // every other edge stays rock-steady across clicks.
+    const reuse = <T extends DagFlowNode>(id: string, sig: string, build: () => T): T => {
+      const cached = nodeCacheRef.current.get(id);
+      if (cached && cached.sig === sig) return cached.node as T;
+      const node = build();
+      nodeCacheRef.current.set(id, { sig, node });
+      return node;
     };
-    const targetTop = (w: number): NodeHandle => ({
-      id: null,
-      type: 'target',
-      position: Position.Top,
-      x: w / 2 - HANDLE_SZ / 2,
-      y: -HANDLE_SZ / 2,
-      width: HANDLE_SZ,
-      height: HANDLE_SZ,
-    });
-    const sourceBottom = (w: number, h: number): NodeHandle => ({
-      id: null,
-      type: 'source',
-      position: Position.Bottom,
-      x: w / 2 - HANDLE_SZ / 2,
-      y: h - HANDLE_SZ / 2,
-      width: HANDLE_SZ,
-      height: HANDLE_SZ,
-    });
-    const taskHandles = (w: number, h: number): NodeHandle[] => [targetTop(w), sourceBottom(w, h)];
-    const mainHandles = (w: number, h: number): NodeHandle[] => [sourceBottom(w, h)];
     // BACKWARD COMPAT: when no `onOpenMain` is given we shift NOTHING — `offsetY`
     // is 0 so the position object is computed exactly as before (and the array
     // below holds only task nodes, with no injected main / edges).
@@ -537,23 +508,16 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onOpenTask, onOpenMain, ma
       const isLoop = taskKind === 'loop';
       const groupLabel = parseGroupLabel(task.pattern_config);
       const groupHue = groupLabel ? hueByGroup.get(groupLabel) : undefined;
-      return {
+      const selected = activeTaskId != null && task.id === activeTaskId;
+      const built: TaskFlowNode = {
         id: task.id,
         type: 'task',
-        // Selection mirrors the conversation's projection state (driven solely by
-        // `activeTaskId`; see the prop doc + `elementsSelectable={false}` below).
-        // react-flow forwards this to `NodeProps.selected`, lighting up TaskNode's
-        // selected ring the instant the content area switches to this task.
-        selected: activeTaskId != null && task.id === activeTaskId,
+        // react-flow forwards `selected` to NodeProps.selected (TaskNode's ring).
+        selected,
         position: pos,
-        // Pixel-exact handle bounds (see the note above `measuredDimsOf`) — never
-        // drop, never jitter on click. Falls back to the card width / a
-        // representative height only for the single frame before measurement.
-        handles: taskHandles(measuredDimsOf(task.id)?.w ?? CARD_W, measuredDimsOf(task.id)?.h ?? TASK_FALLBACK_H),
         // Size hints so the MiniMap can render this node's rect (see
-        // MINIMAP_NODE_W/H). `initialWidth/Height` give react-flow a non-zero
-        // size for the minimap WITHOUT pinning the rendered card's DOM size, so
-        // the card keeps its `w-220px` + auto-height on the main canvas.
+        // MINIMAP_NODE_W/H) and `nodeHasDimensions` stays true; the rendered card
+        // keeps its `w-220px` + auto-height (these never pin the DOM size).
         initialWidth: MINIMAP_NODE_W,
         initialHeight: MINIMAP_NODE_H,
         data: {
@@ -606,6 +570,12 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onOpenTask, onOpenMain, ma
           onOpen: () => handleOpenTask(task),
         },
       };
+      // Reuse the prior object when nothing render-relevant changed. `onOpen` is a
+      // function → omitted by JSON.stringify, so a same-content node reuses its
+      // object (react-flow keeps its measured handleBounds); only a node whose
+      // status/selection/data actually changed gets a fresh object + re-measure.
+      const sig = JSON.stringify(built);
+      return reuse(task.id, sig, () => built);
     });
 
     // BACKWARD COMPAT: without `onOpenMain` we return the task nodes untouched —
@@ -626,17 +596,13 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onOpenTask, onOpenMain, ma
     const maxX = Math.max(...xsForCenter);
     const mainX = (minX + maxX) / 2;
 
-    const mainNode: MainFlowNode = {
+    const mainBuilt: MainFlowNode = {
       id: MAIN_NODE_ID,
       type: 'main',
-      // The main node's "you are here" highlight comes from `data.active`
-      // (`mainActive`), not the blue selection ring — keep it unselected so the
-      // two affordances stay visually distinct (task = blue ring, main = brand ring).
+      // "You are here" highlight comes from data.active (brand ring), not the blue
+      // selection ring — keep it unselected so the two affordances stay distinct.
       selected: false,
       position: { x: mainX, y: 0 },
-      // Pixel-exact source-handle bounds (see the note above `measuredDimsOf`) —
-      // keeps the main→root lines from dropping or jittering on click.
-      handles: mainHandles(measuredDimsOf(MAIN_NODE_ID)?.w ?? CARD_W, measuredDimsOf(MAIN_NODE_ID)?.h ?? MAIN_FALLBACK_H),
       initialWidth: MINIMAP_NODE_W,
       initialHeight: MINIMAP_NODE_H,
       data: {
@@ -645,6 +611,7 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onOpenTask, onOpenMain, ma
         onOpen: onOpenMain,
       },
     };
+    const mainNode = reuse(MAIN_NODE_ID, JSON.stringify(mainBuilt), () => mainBuilt);
     return [mainNode, ...taskNodes];
   }, [detail?.tasks, detail?.deps, assignmentByTask, memberById, handleOpenTask, t, onOpenMain, mainActive, activeTaskId]);
 
