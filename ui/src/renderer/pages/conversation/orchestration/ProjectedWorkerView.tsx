@@ -103,7 +103,7 @@ const ProjectedWorkerView: React.FC<ProjectedWorkerViewProps> = ({ payload }) =>
   // model to take effect; a not-yet-started node simply picks it up at dispatch.
   const taskSettled = ['running', 'done', 'completed', 'failed', 'error'].includes(task.status);
 
-  // 启动前配置台 (迁移 025): a node that is NOT currently running can have its model
+  // 启动前配置台 (迁移 026): a node that is NOT currently running can have its model
   // + 预置要求 configured. A pending (no-conversation) node shows the panel as its
   // body (applied at dispatch); a settled node shows it as a collapsible "重跑配置"
   // above its transcript (applied on the next 重跑). A running node never shows it.

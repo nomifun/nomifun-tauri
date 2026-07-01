@@ -296,14 +296,14 @@ pub struct RunTask {
     /// `task_profile`, kept as opaque JSON text so the wire/DB stay stable).
     #[serde(default)]
     pub pattern_config: Option<String>,
-    /// Per-task model override (迁移 025): when BOTH set, the node dispatches with
+    /// Per-task model override (迁移 026): when BOTH set, the node dispatches with
     /// this provider×model (any available model, not just the run's fleet). `None`
     /// = follow auto-routing. Set via the 「启动前配置台」.
     #[serde(default)]
     pub override_provider_id: Option<String>,
     #[serde(default)]
     pub override_model: Option<String>,
-    /// User 预置要求 (迁移 025) appended to the node's worker brief, separate from
+    /// User 预置要求 (迁移 026) appended to the node's worker brief, separate from
     /// the planner-written `spec`. `None`/blank = none.
     #[serde(default)]
     pub preset_prompt: Option<String>,
@@ -392,7 +392,7 @@ pub struct TaskSpecUpdateRequest {
     pub spec: String,
 }
 
-/// 启动前配置台 (迁移 025): the body of `PATCH .../tasks/{task_id}/config`. A FULL
+/// 启动前配置台 (迁移 026): the body of `PATCH .../tasks/{task_id}/config`. A FULL
 /// replace of the node's per-task model override + 预置要求 — the config panel
 /// always sends the desired state; a `null`/blank field clears it. The model
 /// override needs BOTH `override_provider_id` + `override_model` (a half-set is

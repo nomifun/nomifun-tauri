@@ -591,7 +591,7 @@ async fn update_task_spec(
     Ok(Json(ApiResponse::success()))
 }
 
-/// 启动前配置台 (迁移 025, owner-scoped): set/clear a node's per-task model override
+/// 启动前配置台 (迁移 026, owner-scoped): set/clear a node's per-task model override
 /// + 预置要求 via [`TaskConfigUpdateRequest`]. FULL replace of the three fields; the
 /// service rejects a `running` task (400). No engine call — `resolve_task_member` /
 /// `compose_brief` pick these up at dispatch (pending) or on the next `rerun` (settled).

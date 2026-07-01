@@ -105,6 +105,45 @@ async fn migrations_applied() {
     assert!(count.0 >= 1, "at least one migration should be applied");
 }
 
+#[test]
+fn migration_file_versions_are_unique() {
+    let migrations_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut files_by_version = std::collections::BTreeMap::<String, Vec<String>>::new();
+
+    for entry in std::fs::read_dir(&migrations_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("sql") {
+            continue;
+        }
+
+        let file_name = path.file_name().and_then(|name| name.to_str()).unwrap();
+        let (version, _) = file_name.split_once('_').unwrap_or_else(|| {
+            panic!("migration file {file_name} must start with a numeric version")
+        });
+        assert!(
+            version.chars().all(|ch| ch.is_ascii_digit()),
+            "migration file {file_name} must start with a numeric version"
+        );
+        files_by_version
+            .entry(version.to_string())
+            .or_default()
+            .push(file_name.to_string());
+    }
+
+    let duplicates = files_by_version
+        .into_iter()
+        .filter_map(|(version, files)| {
+            (files.len() > 1).then(|| format!("{version}: {}", files.join(", ")))
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        duplicates.is_empty(),
+        "migration versions must be unique; duplicates: {}",
+        duplicates.join("; ")
+    );
+}
+
 // -- T1.5 System default user --
 
 #[tokio::test]
@@ -270,10 +309,9 @@ async fn creates_parent_directories() {
 // version 1, applied versions 2–N missing from the resolved set) must be
 // renamed to `*.pre-baseline.bak` and rebuilt empty instead of failing fast.
 //
-// The forged "extra applied version" below must stay ONE PAST the highest
-// real migration on disk so it represents a version absent from the resolved
-// set (a real version would collide with the already-applied row). Bump it
-// whenever a new migration lands.
+// The forged "extra applied version" below is picked as ONE PAST the highest
+// applied migration so it represents a version absent from the resolved set
+// (a real version would collide with the already-applied row).
 
 #[tokio::test]
 async fn pre_baseline_database_is_renamed_and_rebuilt() {
@@ -287,10 +325,16 @@ async fn pre_baseline_database_is_renamed_and_rebuilt() {
         .execute(db.pool())
         .await
         .unwrap();
+    let forged_version: (i64,) =
+        sqlx::query_as("SELECT COALESCE(MAX(version), 0) + 1 FROM _sqlx_migrations")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
     sqlx::query(
         "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
-         VALUES (26, 'forged future version', TRUE, X'00', 0)",
+         VALUES (?, 'forged future version', TRUE, X'00', 0)",
     )
+    .bind(forged_version.0)
     .execute(db.pool())
     .await
     .unwrap();

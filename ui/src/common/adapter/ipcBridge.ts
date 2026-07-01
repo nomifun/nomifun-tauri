@@ -2868,7 +2868,7 @@ export const orchestrator = {
       (p) => `/api/orchestrator/runs/${p.run_id}/tasks/${p.task_id}/spec`,
       (p) => p.updates
     ),
-    // 启动前配置台 (迁移 025): set/clear a node's per-task model override + 预置要求.
+    // 启动前配置台 (迁移 026): set/clear a node's per-task model override + 预置要求.
     // FULL replace of the three fields (null/blank clears); rejected (400) for a
     // running task. A pending node picks these up at dispatch; a settled node on
     // the next rerun.

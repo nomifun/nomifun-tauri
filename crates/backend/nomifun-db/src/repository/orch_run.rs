@@ -204,7 +204,7 @@ pub trait IRunRepository: Send + Sync {
     /// field is `None`. Bumps `updated_at` whenever any column changes.
     async fn update_task(&self, id: &str, p: UpdateTaskParams) -> Result<(), sqlx::Error>;
 
-    /// FULL-replace a task's 「启动前配置台」overrides (迁移 025): the per-task model
+    /// FULL-replace a task's 「启动前配置台」overrides (迁移 026): the per-task model
     /// override (`override_provider_id` / `override_model`) and 预置要求
     /// (`preset_prompt`). `None` clears a column. Bumps `updated_at`. Separate from
     /// [`update_task`] so the many existing `UpdateTaskParams` call sites stay

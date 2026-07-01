@@ -1,4 +1,4 @@
--- 025 节点启动前配置台(选模型 + 预置要求)。append-only,基线不动。
+-- 026 节点启动前配置台(选模型 + 预置要求)。append-only,基线不动。
 -- 给 orch_run_tasks 加三个可空列,让用户在任务【启动前】为单个节点覆盖模型 / 预置一段要求:
 --   override_provider_id / override_model = per-task 模型覆盖(任意可用 provider×model,
 --       不受 run 创建时冻结的 fleet 池限制)。引擎 dispatch 时若二者都非空,则用它覆写该

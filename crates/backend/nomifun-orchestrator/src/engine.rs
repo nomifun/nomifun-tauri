@@ -1450,7 +1450,7 @@ async fn resolve_task_member(
         // No assignment → default to member[0] (single-member fleet path).
         None => members.into_iter().next().ok_or("fleet snapshot empty")?,
     };
-    // 迁移 025 — per-task 模型覆盖(启动前配置台):当该节点同时设了 provider + model
+    // 迁移 026 — per-task 模型覆盖(启动前配置台):当该节点同时设了 provider + model
     // 覆盖时,用它们覆写解析出的成员的 provider/model(可选任意可用模型,不受 run 冻结
     // 的 fleet 池限制),保留成员原有角色/persona/skills。门控于「两者都非空」——没有
     // 覆盖的节点与 025 前逐字节一致(pending 调度 / rerun / loop 全走这里,一处即全覆盖)。
@@ -1539,7 +1539,7 @@ fn compose_brief(
     } else {
         compose_agent_brief(role_hint, task, upstream)
     };
-    // 迁移 025 — 用户预置要求(启动前配置台):作为独立一段追加到 worker brief,与
+    // 迁移 026 — 用户预置要求(启动前配置台):作为独立一段追加到 worker brief,与
     // 规划器写的 spec 分离(不覆盖它),读作明确的用户要求。门控于字段非空 —— 没有
     // 预置要求的任务与 025 前逐字节一致。对 agent / synthesis 均生效(统一在此追加)。
     if let Some(preset) = task.preset_prompt.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -3901,7 +3901,7 @@ mod tests {
         assert_eq!(brief, expected, "agent-kind brief must match the pre-023 framing exactly");
     }
 
-    // 迁移 025: a non-empty `preset_prompt` (启动前配置台) is APPENDED as its own
+    // 迁移 026: a non-empty `preset_prompt` (启动前配置台) is APPENDED as its own
     // section for BOTH agent and synthesis kinds; a blank/absent one changes
     // nothing (zero-regression, gated on presence).
     #[test]

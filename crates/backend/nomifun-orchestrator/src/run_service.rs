@@ -987,7 +987,7 @@ impl RunService {
         Ok(())
     }
 
-    /// 启动前配置台 (迁移 025): set/clear a node's per-task **model override** and
+    /// 启动前配置台 (迁移 026): set/clear a node's per-task **model override** and
     /// **预置要求**. Owner-scoped; rejects a `running` task (400) — pending / settled
     /// (done/failed) nodes are fine (a settled node's change takes effect on the next
     /// `rerun`; a pending node's at dispatch). This is a FULL replace of the three
@@ -2286,7 +2286,7 @@ fn task_row_to_dto(row: OrchRunTaskRow) -> RunTask {
         // default) so the DTO is unchanged for them.
         kind: row.kind,
         pattern_config: row.pattern_config,
-        // 迁移 025: 启动前配置台的模型覆盖 + 预置要求。旧行读回 None。
+        // 迁移 026: 启动前配置台的模型覆盖 + 预置要求。旧行读回 None。
         override_provider_id: row.override_provider_id,
         override_model: row.override_model,
         preset_prompt: row.preset_prompt,
@@ -2938,7 +2938,7 @@ mod tests {
         assert!(!asg.locked, "explicit locked=false must not lock");
     }
 
-    // 迁移 025 set_task_config: FULL-replace of model override + preset with
+    // 迁移 026 set_task_config: FULL-replace of model override + preset with
     // trim/all-or-nothing normalization, and the owner / running guards.
     #[tokio::test]
     async fn set_task_config_full_replace_normalize_and_guards() {
