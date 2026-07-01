@@ -1409,6 +1409,10 @@ export interface IWebUIStatus {
   networkUrls?: string[];
   lanIP?: string;
   adminUsername: string;
+  /** Whether a real admin password is stored (non-empty hash). Lets the UI
+   *  distinguish "credential set (hidden)" from "never provisioned" even when
+   *  the LAN server is stopped, so a persisted password is not read as lost. */
+  passwordSet?: boolean;
   initialPassword?: string;
   /** Set when a start attempt failed (e.g. could not bind the port). */
   error?: string;
@@ -1447,6 +1451,8 @@ export const webui = {
     networkUrl?: string;
     networkUrls?: string[];
     lanIP?: string;
+    adminUsername?: string;
+    passwordSet?: boolean;
     initialPassword?: string;
   }>((cb) => subscribeWebuiStatus(cb)),
   changePassword: httpPost<void, { newPassword: string }>('/api/webui/change-password', (p) => ({

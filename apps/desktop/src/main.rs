@@ -172,9 +172,14 @@ struct CompanionWindowSpec {
 // async so they run on Tauri's async runtime — never blocking the main thread.
 
 /// Current WebUI/LAN serving status (running, port, LAN IP, URL).
+///
+/// Async because it resolves the persisted admin identity fresh from the DB
+/// (via `status_snapshot`), so the panel shows the real username / password-set
+/// state even when the LAN listener is stopped (e.g. right after a restart).
 #[tauri::command]
-fn webui_get_status(server: tauri::State<'_, Arc<DesktopServer>>) -> WebUiStatus {
-    server.status()
+async fn webui_get_status(server: tauri::State<'_, Arc<DesktopServer>>) -> Result<WebUiStatus, String> {
+    let server = server.inner().clone();
+    Ok(server.status_snapshot().await)
 }
 
 /// Start LAN serving (bind `0.0.0.0:25808`, fallback port if taken).

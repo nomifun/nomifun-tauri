@@ -246,3 +246,62 @@ async fn webui_lan_dev_proxy_serves_live_frontend() {
 
     server.stop_lan().await;
 }
+
+/// Regression for the credential-persistence bug: a username the user set while
+/// WebUI was OFF (password still empty) must NOT be reset to "admin" when the
+/// LAN server is first enabled, and `status_snapshot` must report the persisted
+/// username + `password_set` even before/without the LAN listener running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn webui_enable_preserves_user_set_username_and_reports_persisted_state() {
+    use clap::Parser as _;
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let data_dir = tmp.path().to_string_lossy().into_owned();
+    let spa_dir = tmp.path().join("spa");
+    std::fs::create_dir_all(&spa_dir).unwrap();
+    std::fs::write(spa_dir.join("index.html"), "<!doctype html><title>Nomi</title>").unwrap();
+
+    let cli = nomifun_app::cli::Cli::parse_from(["nomifun-desktop-test", "--data-dir", &data_dir]);
+    let merged_path = std::env::var("PATH").unwrap_or_default();
+
+    let (server, _keep) = nomifun_app::DesktopServer::start(&cli, &merged_path, Some(spa_dir), None)
+        .await
+        .expect("DesktopServer::start failed");
+
+    // Simulate the user renaming the admin from the panel while WebUI is OFF:
+    // this leaves `password_hash` empty. Open the SAME db file the server uses
+    // (WAL allows a second connection) and rewrite the username directly.
+    let db_path = tmp.path().join("nomifun-backend.db");
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", db_path.display()))
+        .await
+        .expect("open backend db");
+    let affected = sqlx::query("UPDATE users SET username = 'custom_admin' WHERE id = 'system_default_user'")
+        .execute(&pool)
+        .await
+        .expect("rename system admin")
+        .rows_affected();
+    assert_eq!(affected, 1, "should have renamed the seeded system_default_user");
+    pool.close().await;
+
+    // Before enabling: snapshot reflects the persisted username and "no password yet".
+    let before = server.status_snapshot().await;
+    assert_eq!(before.admin_username, "custom_admin", "persisted username must surface while stopped");
+    assert!(!before.password_set, "no password provisioned yet");
+
+    // Enable LAN: this provisions a password but MUST NOT clobber the username.
+    let started = server.start_lan().await;
+    assert!(started.running, "start_lan failed: {:?}", started.error);
+    assert_eq!(started.admin_username, "custom_admin", "username must be preserved, not reset to 'admin'");
+    assert!(started.password_set, "a password must exist once LAN is exposed");
+    assert!(
+        started.initial_password.is_some(),
+        "first enable should surface the one-time initial password"
+    );
+
+    // "Restart" equivalent: a fresh snapshot still shows the custom username and
+    // that a password is set (the credential is durable, not perceived as lost).
+    server.stop_lan().await;
+    let after = server.status_snapshot().await;
+    assert_eq!(after.admin_username, "custom_admin");
+    assert!(after.password_set, "password must remain set after stopping the LAN listener");
+}

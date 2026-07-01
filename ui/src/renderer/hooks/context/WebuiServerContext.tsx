@@ -124,6 +124,8 @@ export const WebuiServerProvider: React.FC<{ children: React.ReactNode }> = ({ c
           networkUrl: data.networkUrl,
           networkUrls: data.networkUrls ?? prev?.networkUrls,
           lanIP: prev?.lanIP,
+          adminUsername: data.adminUsername || prev?.adminUsername || 'admin',
+          passwordSet: data.passwordSet ?? prev?.passwordSet,
           initialPassword: prev?.initialPassword,
         }));
       } else {
@@ -156,6 +158,8 @@ export const WebuiServerProvider: React.FC<{ children: React.ReactNode }> = ({ c
         networkUrl: result.networkUrl,
         networkUrls: result.networkUrls,
         lanIP: result.lanIP,
+        adminUsername: result.adminUsername || prev?.adminUsername || 'admin',
+        passwordSet: result.passwordSet ?? prev?.passwordSet,
         initialPassword: result.initialPassword ?? prev?.initialPassword,
       }));
       await configService.set(DESKTOP_WEBUI_ENABLED_KEY, true);

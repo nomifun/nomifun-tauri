@@ -445,6 +445,7 @@
   "webui.browserNotSupported": "浏览器端无法访问 WebUI 设置",
   "webui.browserNotSupportedDesc": "出于安全考虑，WebUI 设置只能在桌面应用中管理。请在 NomiFun 桌面应用中打开设置面板进行配置。",
   "webui.passwordHidden": "******",
+  "webui.passwordNotSet": "尚未设置（启用 WebUI 时自动生成）",
   "webui.passwordOnlyFirstTime": "密码仅在首次启动时显示，之后将被隐藏",
   "webui.resetPasswordWarning": "请保管好重置之后的密码！",
   "webui.featureRemoteDesc": "启用 WebUI 后，你可以通过手机或远程浏览器访问 NomiFun。",
