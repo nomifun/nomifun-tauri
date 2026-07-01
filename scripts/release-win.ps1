@@ -208,6 +208,25 @@ function Commit-Latest($message, $extraPaths) {
   if ($LASTEXITCODE -ne 0) { Fail "commit 失败。" }
 }
 
+# 推送 main，兼容构建期间远端被并发推进：被拒则 rebase 一次并重试；有 tag 时把 tag 移到
+# rebase 后的提交。rebase 冲突则 abort 并让用户手动处理（产物已在 target/，可 -SkipPull 复用）。
+function Push-Main([string]$tagToMove) {
+  git push origin main
+  if ($LASTEXITCODE -eq 0) { return }
+  Write-Host "  push 被拒（构建期间远端有新提交），rebase 后重试一次..."
+  git -c user.name=nomifun pull --rebase origin main
+  if ($LASTEXITCODE -ne 0) {
+    $ErrorActionPreference = 'Continue'; git rebase --abort 2>$null; $ErrorActionPreference = 'Stop'
+    Fail "rebase 遇冲突已 abort。请手动 git pull --rebase 解决后重跑（产物已在 target/，可加 -SkipPull 复用）。"
+  }
+  if ($tagToMove) {
+    git tag -f $tagToMove
+    if ($LASTEXITCODE -ne 0) { Fail "重定位 tag $tagToMove 失败。" }
+  }
+  git push origin main
+  if ($LASTEXITCODE -ne 0) { Fail "rebase 后 push 仍失败（可能再次并发），请重跑。" }
+}
+
 if ($Mode -eq 'CREATE') {
   if ($NoPush) {
     Write-Host "  -NoPush（CREATE）：已本地 bump/构建/合并 latest.json，但不提交/建 Release。"
@@ -225,8 +244,7 @@ if ($Mode -eq 'CREATE') {
     } else {
       Write-Host "  tag $Tag 已存在，复用。"
     }
-    git push origin main
-    if ($LASTEXITCODE -ne 0) { Fail "git push main 失败。" }
+    Push-Main $Tag
     git push origin $Tag
     if ($LASTEXITCODE -ne 0) { Fail "git push tag 失败。" }
 
@@ -248,8 +266,7 @@ if ($Mode -eq 'CREATE') {
   } else {
     Write-Host "▶ 提交 latest.json 回 main（author=nomifun）..."
     Commit-Latest "chore(release): add Windows x64 updater entry to $Tag latest.json" @()
-    git push origin main
-    if ($LASTEXITCODE -ne 0) { Fail "push 失败。" }
+    Push-Main $null
   }
 }
 
@@ -259,7 +276,9 @@ if (-not ($Mode -eq 'CREATE' -and $NoPush)) {
   $endpoint = "https://github.com/$Repo/releases/latest/download/latest.json"
   try {
     $resp = Invoke-WebRequest -Uri $endpoint -UseBasicParsing -MaximumRedirection 10
-    $pub  = $resp.Content | ConvertFrom-Json
+    # release-assets CDN 用 octet-stream 返回，$resp.Content 可能是字节数组，需解码成字符串。
+    $raw  = if ($resp.Content -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($resp.Content) } else { [string]$resp.Content }
+    $pub  = $raw | ConvertFrom-Json
     Write-Host "  version   : $($pub.version)"
     Write-Host "  platforms : $($pub.platforms.PSObject.Properties.Name -join ', ')"
     Write-Host "  windows   : $($pub.platforms.'windows-x86_64'.url)"
