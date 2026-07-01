@@ -858,6 +858,7 @@
   "openLink": "Open link",
   "officialWebsite": "Official Website",
   "checkForUpdates": "Check for updates",
+  "baiduManualDownload": "Baidu mirror",
   "includePrereleaseUpdates": "Include prerelease/dev builds",
   "saveModelConfigFailed": "Failed to save model configuration",
   "healthCheck": "Health Check",

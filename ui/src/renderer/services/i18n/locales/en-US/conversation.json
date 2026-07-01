@@ -108,6 +108,10 @@
   "noAgentsAvailable": "No agents available",
   "noModelConfigured": "No model configured. Please configure in settings.",
   "createFailed": "Failed to create conversation",
+  "pending": {
+    "creating": "Creating conversation…",
+    "startingAutoWork": "Starting AutoWork…"
+  },
   "createError": {
     "pathVariants": {
       "WORKSPACE_PATH_EDGE_WHITESPACE_UNSUPPORTED": "The selected workspace path \"{{workspacePath}}\" contains a folder name that begins or ends with a space or other whitespace character. Rename the affected folder so its name does not begin or end with whitespace, then try again."

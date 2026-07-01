@@ -35,7 +35,59 @@ tag 统一使用 `vX.Y.Z`，例如 `v0.1.11`。
 
 ## macOS 发版
 
-在 Mac 上执行。下面命令会同时产出：
+必须在 Mac 上执行。一键脚本会自动判定两种场景：
+
+- **追加(APPEND)**：该版本的 GitHub Release 已存在（可能 Windows 侧先发过）——只补 macOS
+  产物、把 `darwin-x86_64` / `darwin-aarch64` 条目并进 `latest.json`。
+- **首发(CREATE)**：该版本还没有 Release（macOS 先发）——建 tag、建 Release（带 release
+  note）、上传 macOS 产物；可用 `-Version` 顺带打版本号。
+
+### 一键发版（推荐）
+
+一次性配置好后即可反复一键：
+
+1. 从密钥库拷入 updater 私钥 `apps/desktop/signing/nomifun-updater.key`（keyID
+   `F3AA272E60AA7952`，已被 gitignore，必须与 `tauri.conf.json` 内嵌 `pubkey` 匹配）。
+2. 配置 `apps/desktop/signing/.env.signing`，填好 Developer ID 签名与 Apple notarization 信息。
+3. 运行 `gh auth login`，或复制 `apps/desktop/signing/.env.release.example` 为 `.env.release`
+   并填入 `GH_TOKEN=...`。
+
+然后：
+
+```bash
+git pull
+
+# 追加（Windows 已先发，补 macOS）：
+bun run release:mac
+
+# 首发（macOS 先发）：-Version 顺带 bump，-NotesFile/-Notes 提供 release note（首发必填）
+bun run release:mac -Version 0.1.14 -NotesFile notes.md
+bun run release:mac -Version 0.1.14 -Notes "- 修复若干问题"
+
+# 通用开关：
+bun run release:mac -DryRun     # 只读预检并打印计划（含判定出的模式），不 pull/bump/构建/上传/推送
+bun run release:mac -NoPush     # APPEND：仍上传但不提交推送；CREATE：只本地 bump/构建，不建 Release
+bun run release:mac -SkipPull   # 真实执行时跳过 git pull
+```
+
+**版本号**：单一真源是根 `Cargo.toml [workspace.package].version`。追加模式用当前版本；首发
+时若带 `-Version X.Y.Z` 且与当前不同，脚本先跑 `bun run bump` 打版本号，再以 `nomifun`
+署名提交、打 tag、建 Release（不带 `-Version` 则按当前版本走）。
+
+**Release note（对 LLM 友好）**：走命令行、不与 CHANGELOG 耦合，且 **GitHub Release 正文与
+`latest.json` 的 `notes` 共用同一份**。多行说明建议先写到 `.md` 再用 `-NotesFile` 传入。
+**首发若既没 `-NotesFile` 也没 `-Notes`，脚本直接报错，不会建出空说明的 Release**；
+追加模式 note 可选。
+
+脚本自动完成：读 `.env.release` 的 `GH_TOKEN`（若存在）或沿用 `gh auth login`、加载 updater
+私钥、判定模式、执行 `build:mac --signed --config apps/desktop/tauri.updater.conf.json`、校验
+staple / codesign / Gatekeeper、`make:latest` 合并 darwin 条目、上传（追加 `--clobber` / 首发
+`gh release create`）、以 `nomifun` 提交 `latest.json`（首发含 bump）回 `main`、拉取 updater
+端点校验。任何一步失败都会明确报错并中断。
+
+### 手动分步（等价于一键脚本内部流程）
+
+下面命令会同时产出：
 
 - 手动安装包：`dist/desktop/NomiFun_<version>_universal.dmg`
 - 自动更新包：`target/universal-apple-darwin/release/bundle/macos/NomiFun.app.tar.gz`
@@ -63,7 +115,61 @@ bun run make:latest
 
 ## Windows 发版
 
-必须在 Windows 机器上执行。先拉到与当前 Release 一致的代码：
+必须在 Windows 机器上执行。一键脚本会自动判定两种场景：
+
+- **追加(APPEND)**：该版本的 GitHub Release 已存在（通常 macOS 侧先发过）——只补 Windows
+  产物、把 windows 条目并进 `latest.json`。
+- **首发(CREATE)**：该版本还没有 Release（Windows 先发）——建 tag、建 Release（带 release
+  note）、上传 Windows 产物；可用 `-Version` 顺带打版本号。
+
+### 一键发版（推荐）
+
+一次性配置好后即可反复一键：
+
+1. 从密钥库拷入 updater 私钥 `apps/desktop/signing/nomifun-updater.key`（keyID
+   `F3AA272E60AA7952`，已被 gitignore，必须与 `tauri.conf.json` 内嵌 `pubkey` 匹配）。
+2. 复制 `apps/desktop/signing/.env.release.example` 为 `.env.release`（已被 gitignore），
+   填入 `GH_TOKEN=...`（`repo` 权限的经典 PAT，或对本仓库 Contents:read/write 的细粒度 PAT）。
+
+然后：
+
+```powershell
+git pull
+
+# 追加（macOS 已先发，补 Windows）：
+bun run release:win
+
+# 首发（Windows 先发）：-Version 顺带 bump，-NotesFile/-Notes 提供 release note（首发必填）
+bun run release:win -Version 0.1.14 -NotesFile notes.md
+bun run release:win -Version 0.1.14 -Notes "- 修复若干问题"
+
+# 通用开关：
+bun run release:win -DryRun     # 只读预检并打印计划（含判定出的模式），不 bump/构建/上传/推送
+bun run release:win -NoPush     # APPEND：仍上传但不提交推送；CREATE：只本地 bump/构建，不建 Release
+bun run release:win -SkipPull   # 跳过 git pull
+```
+
+**版本号**：单一真源是根 `Cargo.toml [workspace.package].version`。追加模式用当前版本；首发
+时若带 `-Version X.Y.Z` 且与当前不同，脚本先跑 `bun run bump` 打版本号，再以 `nomifun`
+署名提交、打 tag、建 Release（不带 `-Version` 则按当前版本走）。
+
+**Release note（对 LLM 友好）**：走命令行、不与 CHANGELOG 耦合，且 **GitHub Release 正文与
+`latest.json` 的 `notes` 共用同一份**。多行说明建议先写到 `.md` 再用 `-NotesFile` 传入
+（PowerShell 传多行参数不稳，脚本内部也用文件中转）。**首发若既没 `-NotesFile` 也没
+`-Notes`，脚本直接报错，不会建出空说明的 Release**；追加模式 note 可选（不传则沿用既有，
+`latest.json notes` 由 CHANGELOG 当前版本小节兜底）。
+
+脚本自动完成：读 `.env.release` 的 `GH_TOKEN` 注入 `gh`、加载签名私钥、判定模式、清理旧版本
+残留 NSIS 产物、构建更新产物、`make:latest` 合并 windows 条目、上传（追加 `--clobber` / 首发
+`gh release create`）、以 `nomifun` 提交 `latest.json`（首发含 bump）回 `main`、拉取 updater
+端点校验。任何一步失败都会明确报错并中断。
+
+> 未启用 Authenticode 时，手动安装包仍可能触发 SmartScreen / 未知发布者提示；自动更新验签
+> 走 Tauri updater 的 minisign 签名，与 Authenticode 无关，一键脚本已覆盖。
+
+### 手动分步（等价于一键脚本内部流程）
+
+先拉到与当前 Release 一致的代码：
 
 ```powershell
 git pull

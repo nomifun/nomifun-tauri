@@ -46,7 +46,9 @@ const repo = flag('repo', DEFAULT_REPO);
 const out = flag('out', DEFAULT_OUT);
 const collect = flag('collect', false) === true;
 const version = flag('version') || readWorkspaceVersion();
-const notes = flag('notes') || readChangelogNotes() || `NomiFun v${version}`;
+const notesFile = flag('notes-file');
+const notesFromFile = typeof notesFile === 'string' && existsSync(notesFile) ? readFileSync(notesFile, 'utf8').trim() : null;
+const notes = flag('notes') || notesFromFile || readChangelogNotes(version) || `NomiFun v${version}`;
 const distDir = join(ROOT, 'dist/desktop');
 
 // 单一真源版本号：根 Cargo.toml 的 [workspace.package].version。
@@ -68,13 +70,24 @@ function readWorkspaceVersion() {
   process.exit(1);
 }
 
-// 发布说明：取 CHANGELOG.md 顶部第一个版本小节（两个 `## ` 之间）的正文；读不到返回 null。
-function readChangelogNotes() {
+// 发布说明：从 CHANGELOG.md 取当前版本小节的正文。优先匹配标题里含本次 version 的
+// 小节（如 `## v0.1.13 - ...`）；匹配不到则退回第一个**非 Unreleased** 小节。跳过
+// `## Unreleased`（占位内容如 "No unreleased changes yet."）——补发平台包时若误取它，
+// 会把 latest.json 里已写好的发布说明覆盖成占位。读不到返回 null。
+function readChangelogNotes(version) {
   const p = join(ROOT, 'CHANGELOG.md');
   if (!existsSync(p)) return null;
   const lines = readFileSync(p, 'utf8').split('\n');
-  const start = lines.findIndex((l) => /^##\s+/.test(l));
-  if (start === -1) return null;
+  const heads = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/^##\s+/.test(lines[i])) heads.push(i);
+  }
+  if (heads.length === 0) return null;
+  const isUnreleased = (i) => /^##\s+unreleased\b/i.test(lines[i]);
+  const namesVersion = (i) => version && lines[i].includes(version);
+  let start = heads.find(namesVersion);
+  if (start === undefined) start = heads.find((i) => !isUnreleased(i));
+  if (start === undefined) return null;
   const body = [];
   for (let i = start + 1; i < lines.length; i++) {
     if (/^##\s+/.test(lines[i])) break;
@@ -173,14 +186,21 @@ if (foundKeys.length === 0) {
   process.exit(1);
 }
 
-// ── 合并进既有 latest.json（保留其它平台的真实条目，丢弃占位模板条目）。 ───────
+// ── 合并进既有 latest.json（同版本时保留其它平台的真实条目，丢弃占位模板条目）。 ──
 const manifest = { version, notes, pub_date: new Date().toISOString(), platforms: {} };
 if (existsSync(out)) {
   try {
     const prev = JSON.parse(readFileSync(out, 'utf8'));
-    for (const [k, v] of Object.entries(prev.platforms || {})) {
-      const placeholder = !v?.signature || v.signature.includes('<<') || String(v.url).includes('REPLACE-WITH');
-      if (!placeholder) manifest.platforms[k] = v;
+    // 只在版本一致时保留既有平台条目：每个条目的 url 里都带版本号，跨版本保留会让旧平台
+    // 指向上一版的下载链（首发某个新版本时尤其危险——如 0.1.14 里残留 0.1.13 的 darwin
+    // 条目）。版本不同则视为新版本，从空清单开始，只写本机本次构建出的平台。
+    if (prev.version === version) {
+      for (const [k, v] of Object.entries(prev.platforms || {})) {
+        const placeholder = !v?.signature || v.signature.includes('<<') || String(v.url).includes('REPLACE-WITH');
+        if (!placeholder) manifest.platforms[k] = v;
+      }
+    } else if (prev.version) {
+      console.warn(`  ! 既有 latest.json 版本 ${prev.version} ≠ 本次 ${version}，丢弃旧平台条目，重建清单。`);
     }
   } catch {
     console.warn(`  ! 既有 ${rel(out)} 解析失败，将重新生成。`);

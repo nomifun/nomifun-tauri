@@ -6,7 +6,7 @@
  */
 
 import { Divider, Typography, Button } from '@arco-design/web-react';
-import { Github, Right } from '@icon-park/react';
+import { Download, Github, Refresh, Right } from '@icon-park/react';
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import classNames from 'classnames';
@@ -135,9 +135,25 @@ const AboutModalContent: React.FC = () => {
 
             {/* Check Update Section */}
             {isDesktop && (
-              <div className='flex flex-col items-center gap-12px w-full max-w-300px bg-fill-2 p-16px rounded-lg'>
-                <Button type='primary' long onClick={checkUpdate}>
+              <div className='flex flex-wrap items-center justify-center gap-8px w-full max-w-360px bg-fill-2 p-16px rounded-lg'>
+                <Button
+                  type='primary'
+                  onClick={checkUpdate}
+                  icon={<Refresh theme='outline' size='14' />}
+                  className='min-w-120px flex-1 !px-12px'
+                >
                   {t('settings.checkForUpdates')}
+                </Button>
+                <Button
+                  onClick={() =>
+                    openLink(NOMIFUN_PUBLIC_LINKS.baiduPan).catch((error) =>
+                      console.error('Failed to open Baidu manual download:', error)
+                    )
+                  }
+                  icon={<Download theme='outline' size='14' />}
+                  className='min-w-144px flex-1 !px-12px'
+                >
+                  {t('settings.baiduManualDownload')}
                 </Button>
               </div>
             )}

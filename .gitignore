@@ -34,6 +34,10 @@ apps/desktop/.tauri/
 
 # macOS code signing / notarization secrets — NEVER commit
 apps/desktop/signing/.env.signing
+
+# Release upload token for `bun run release:win` — NEVER commit (holds a GitHub PAT).
+# The .example alongside it is safe to track.
+apps/desktop/signing/.env.release
 *.p8
 *.p12
 *.cer

@@ -108,6 +108,10 @@
   "noAgentsAvailable": "没有可用的 Agent",
   "noModelConfigured": "未配置模型，请前往设置页面配置。",
   "createFailed": "创建会话失败",
+  "pending": {
+    "creating": "正在创建会话…",
+    "startingAutoWork": "正在启动自动工作…"
+  },
   "createError": {
     "pathVariants": {
       "WORKSPACE_PATH_EDGE_WHITESPACE_UNSUPPORTED": "所选工作区路径“{{workspacePath}}”中存在以空格或其他空白字符开头/结尾的目录名。请重命名相关目录（目录名首尾不能是空白字符）后重试。"

@@ -313,6 +313,17 @@ const UpdateModal: React.FC = () => {
     <div className={`text-12px leading-18px text-[rgb(var(--warning-6))] ${className}`}>{t('update.disclaimer')}</div>
   );
 
+  const renderBaiduManualDownloadButton = (className = '') => (
+    <Button
+      size='small'
+      onClick={openBaiduReleaseMirror}
+      icon={<Download size='14' />}
+      className={`!px-16px ${className}`}
+    >
+      {t('settings.baiduManualDownload')}
+    </Button>
+  );
+
   const renderContent = () => {
     switch (status) {
       case 'checking':
@@ -323,6 +334,7 @@ const UpdateModal: React.FC = () => {
               <div className='absolute inset-0 border-3 border-primary border-t-transparent rounded-full animate-spin' />
             </div>
             <div className='text-15px text-t-primary font-500'>{t('update.checking')}</div>
+            <div className='mt-16px'>{renderBaiduManualDownloadButton()}</div>
           </div>
         );
 
@@ -336,6 +348,7 @@ const UpdateModal: React.FC = () => {
             <div className='text-13px text-t-tertiary'>
               {t('update.currentVersion', { version: currentVersion || '-' })}
             </div>
+            <div className='mt-16px'>{renderBaiduManualDownloadButton()}</div>
           </div>
         );
 
@@ -358,7 +371,7 @@ const UpdateModal: React.FC = () => {
                   </div>
                 </div>
               </div>
-              <div className='flex items-center gap-12px'>
+              <div className='flex flex-wrap items-center justify-end gap-8px'>
                 {!hasCompatibleManualAsset && !autoUpdateAvailable && releasePageUrl ? (
                   <Button type='primary' size='small' onClick={openReleasePage} className='!px-16px'>
                     {t('update.goToRelease')}
@@ -372,6 +385,7 @@ const UpdateModal: React.FC = () => {
                     {t('update.downloadButton')}
                   </Button>
                 )}
+                {renderBaiduManualDownloadButton()}
               </div>
             </div>
 
@@ -405,7 +419,6 @@ const UpdateModal: React.FC = () => {
                   {PRODUCT_WEBSITE_URL}
                 </button>
               </div>
-              {renderDisclaimer('mt-8px border-t border-solid border-[rgba(var(--warning-6),0.18)] pt-8px')}
             </div>
 
             {/* Release notes content */}
@@ -444,6 +457,7 @@ const UpdateModal: React.FC = () => {
                 <span className='text-[rgb(var(--primary-6))] font-500'>{progress.speed}</span>
               </div>
             </div>
+            <div className='mt-16px'>{renderBaiduManualDownloadButton()}</div>
           </div>
         );
 
@@ -457,15 +471,18 @@ const UpdateModal: React.FC = () => {
             <div className='mb-24px text-13px text-[rgb(var(--warning-6))] max-w-360px text-center'>
               {t('update.installWarning')}
             </div>
-            <Button
-              type='primary'
-              size='small'
-              onClick={quitAndInstall}
-              icon={<Install size='14' />}
-              className='!px-16px'
-            >
-              {t('update.installNow')}
-            </Button>
+            <div className='flex flex-wrap justify-center gap-12px'>
+              <Button
+                type='primary'
+                size='small'
+                onClick={quitAndInstall}
+                icon={<Install size='14' />}
+                className='!px-16px'
+              >
+                {t('update.installNow')}
+              </Button>
+              {renderBaiduManualDownloadButton()}
+            </div>
           </div>
         );
 
@@ -479,13 +496,14 @@ const UpdateModal: React.FC = () => {
             <div className='text-12px text-t-tertiary mb-24px text-center max-w-360px break-all line-clamp-2'>
               {downloadPath}
             </div>
-            <div className='flex gap-12px'>
+            <div className='flex flex-wrap justify-center gap-12px'>
               <Button size='small' onClick={showInFolder} icon={<FolderOpen size='14' />} className='!px-16px'>
                 {t('update.showInFolder')}
               </Button>
               <Button type='primary' size='small' onClick={openFile} className='!px-16px'>
                 {t('update.openFile')}
               </Button>
+              {renderBaiduManualDownloadButton()}
             </div>
           </div>
         );
@@ -505,16 +523,11 @@ const UpdateModal: React.FC = () => {
               <Button type='primary' size='small' onClick={openReleasePage} className='!px-16px'>
                 {t('update.goToRelease')}
               </Button>
-              <Button size='small' onClick={openBaiduReleaseMirror} className='!px-16px'>
-                {t('update.baiduMirrorLink')}
-              </Button>
+              {renderBaiduManualDownloadButton()}
               <Button size='small' onClick={openProductWebsite} className='!px-16px'>
                 {t('update.productWebsiteLink')}
               </Button>
             </div>
-            {renderDisclaimer(
-              'mt-18px max-w-420px border-t border-solid border-[rgba(var(--warning-6),0.18)] pt-12px text-center'
-            )}
           </div>
         );
     }
@@ -536,7 +549,12 @@ const UpdateModal: React.FC = () => {
         overflow: 'hidden',
       }}
     >
-      <div className='flex flex-col h-full w-full'>{renderContent()}</div>
+      <div className='flex flex-col h-full w-full'>
+        <div className='min-h-0 flex-1'>{renderContent()}</div>
+        {renderDisclaimer(
+          'shrink-0 border-t border-solid border-[rgba(var(--warning-6),0.18)] bg-fill-1/60 px-20px py-10px text-center'
+        )}
+      </div>
     </NomiModal>
   );
 };

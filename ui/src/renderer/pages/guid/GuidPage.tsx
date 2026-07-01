@@ -39,6 +39,7 @@ import { useGuidInput } from './hooks/useGuidInput';
 import { useGuidMention } from './hooks/useGuidMention';
 import { useGuidModelSelection } from './hooks/useGuidModelSelection';
 import { useGuidSend } from './hooks/useGuidSend';
+import { usePendingConversation } from '@/renderer/pages/conversation/components/ConversationShell/PendingConversationContext';
 import { useTypewriterPlaceholder } from './hooks/useTypewriterPlaceholder';
 import { ensureBackendMcpCatalog } from '@/renderer/hooks/mcp/catalog';
 import { resolveAgentLogo } from '@/renderer/utils/model/agentLogo';
@@ -53,6 +54,14 @@ import styles from './index.module.css';
 const GuidPage: React.FC = () => {
   const { t, i18n } = useTranslation();
   const navigate = useNavigate();
+  const pendingConversation = usePendingConversation();
+
+  // Warm the conversation page's lazy chunk while the user is composing, so the
+  // first navigation into a conversation doesn't stall on a cold code-split
+  // load (Suspense AppLoader). Idempotent — React.lazy caches the import.
+  useEffect(() => {
+    void import('@renderer/pages/conversation');
+  }, []);
   const location = useLocation();
   const guidContainerRef = useRef<HTMLDivElement>(null);
   const openAssistantDetailsRef = useRef<(() => void) | null>(null);
@@ -217,6 +226,10 @@ const GuidPage: React.FC = () => {
     // Navigation
     navigate,
     t,
+
+    // Instant "creating conversation" loading overlay (ConversationShell-level)
+    beginPending: pendingConversation.begin,
+    endPending: pendingConversation.end,
   });
 
   // --- Coordinated handlers (depend on multiple hooks) ---

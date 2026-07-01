@@ -1,10 +1,11 @@
 import { ipcBridge } from '@/common';
-import { Message, Spin } from '@arco-design/web-react';
+import { Message } from '@arco-design/web-react';
 import React, { useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useParams } from 'react-router-dom';
 import useSWR from 'swr';
 import ChatConversation from './components/ChatConversation';
+import MessageListSkeleton from './Messages/components/MessageListSkeleton';
 import { useAutoTitle } from '@/renderer/hooks/chat/useAutoTitle';
 import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conversationCache';
 
@@ -56,7 +57,7 @@ const ChatConversationIndex: React.FC = () => {
     navigate('/', { replace: true });
   }, [id, isLoading, data, navigate, t]);
 
-  if (isLoading) return <Spin loading></Spin>;
+  if (isLoading) return <MessageListSkeleton />;
   return <ChatConversation conversation={data ?? undefined}></ChatConversation>;
 };
 

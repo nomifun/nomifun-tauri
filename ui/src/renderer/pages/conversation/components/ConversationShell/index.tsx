@@ -18,6 +18,8 @@ import { useSidebarDisplayPreferences } from '@renderer/pages/conversation/Sessi
 import { addProjectWorkpath } from '@renderer/pages/conversation/SessionList/utils/projectWorkpaths';
 import { SESSION_SIDER_TOGGLE_EVENT, dispatchSessionSiderStateEvent } from '@renderer/utils/workspace/sessionSiderEvents';
 import SessionCreateBar from './SessionCreateBar';
+import { PendingConversationProvider } from './PendingConversationContext';
+import PendingConversationOverlay from './PendingConversationOverlay';
 
 const SESSION_SIDER_STORAGE_KEY = 'nomifun:session-sider-collapsed';
 const SESSION_SIDER_WIDTH_STORAGE_KEY = 'nomifun:session-sider-width';
@@ -172,20 +174,23 @@ const ConversationShell: React.FC = () => {
   );
 
   return (
-    <div className='relative flex size-full min-h-0'>
-      {!collapsed &&
-        (isMobile ? (
-          <>
-            <div className='absolute inset-0 z-20 bg-[rgba(0,0,0,0.45)]' onClick={collapse} />
-            <div className='absolute inset-y-0 left-0 z-30 h-full'>{panel}</div>
-          </>
-        ) : (
-          panel
-        ))}
-      <div className='flex-1 min-w-0 min-h-0 flex flex-col'>
-        <Outlet />
+    <PendingConversationProvider>
+      <div className='relative flex size-full min-h-0'>
+        {!collapsed &&
+          (isMobile ? (
+            <>
+              <div className='absolute inset-0 z-20 bg-[rgba(0,0,0,0.45)]' onClick={collapse} />
+              <div className='absolute inset-y-0 left-0 z-30 h-full'>{panel}</div>
+            </>
+          ) : (
+            panel
+          ))}
+        <div className='relative flex-1 min-w-0 min-h-0 flex flex-col'>
+          <Outlet />
+          <PendingConversationOverlay />
+        </div>
       </div>
-    </div>
+    </PendingConversationProvider>
   );
 };
 

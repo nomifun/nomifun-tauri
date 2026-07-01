@@ -28,6 +28,17 @@ describe('public contact links', () => {
     expect(aboutSource.includes('ABOUT_LINK_TARGET')).toBe(false);
   });
 
+  test('keeps the Baidu manual installer link visible beside update checks', () => {
+    const aboutSource = readSource(new URL('./AboutModalContent.tsx', import.meta.url));
+    const contactSource = readSource(new URL('./FeedbackReportModal.tsx', import.meta.url));
+    const updateModalSource = readSource(new URL('../../UpdateModal.tsx', import.meta.url));
+
+    expect(contactSource.includes("baiduPan: 'https://pan.baidu.com/s/5GPonoJNrwJ7GciBSDgXLaA'")).toBe(true);
+    expect(aboutSource.includes('NOMIFUN_PUBLIC_LINKS.baiduPan')).toBe(true);
+    expect(aboutSource.includes('settings.baiduManualDownload')).toBe(true);
+    expect(updateModalSource.includes('settings.baiduManualDownload')).toBe(true);
+  });
+
   test('keeps the Contact modal visually quiet instead of rendering chunky cards', () => {
     const contactSource = readSource(new URL('./FeedbackReportModal.tsx', import.meta.url));
 

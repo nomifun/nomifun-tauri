@@ -10,7 +10,7 @@
   "baiduMirrorLink": "Baidu Netdisk mirror",
   "productWebsiteHint": "Product website:",
   "productWebsiteLink": "Product website",
-  "disclaimer": "Disclaimer: This project is a free, nonprofit, open-source project. Update to the latest version with care. The project authors are not liable for data loss or damage caused by updates.",
+  "disclaimer": "Disclaimer: This is a free, nonprofit, open-source project. The project authors are not responsible for any user data loss or damage caused by version updates. Please upgrade with care.",
   "releaseFeedUnavailable": "Could not load a valid update feed. You can retry, or check Releases, Baidu Netdisk, and the product website manually.",
   "noReleaseNotes": "No release notes provided.",
   "downloadingTitle": "Downloading update...",

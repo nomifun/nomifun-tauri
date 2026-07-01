@@ -337,8 +337,14 @@ bun run test       # Rust 测试（日常可用 test:fast 跑 nextest）
 | `bun run dev:ui` | 仅启动前端开发服务器（纯 vite，无后端） |
 | **构建（出制品）** | |
 | `bun run build` | 为当前操作系统打桌面安装包 |
+| `bun run build:win` | 打 Windows 安装包（NSIS），汇总到 dist/desktop/ |
+| `bun run build:mac` | 打 macOS 安装包（.dmg），汇总到 dist/desktop/ |
+| `bun run build:linux` | 打 Linux 安装包（.deb/.AppImage/.rpm），汇总到 dist/desktop/ |
 | `bun run build:signed` | 打桌面包并签名+公证（仅 macOS） |
 | `bun run build:updater` | 打桌面包并产出自更新 .sig 制品 |
+| `bun run make:latest` | 扫描本机更新产物，生成/合并自动更新清单 latest.json |
+| `bun run release:mac` | 一键 macOS 发版：自动判定追加/首发；首发用 -Version 打版本号 + -NotesFile/-Notes 建 Release；-DryRun 只预检 |
+| `bun run release:win` | 一键 Windows 发版：自动判定追加/首发；首发用 -Version 打版本号 + -NotesFile/-Notes 建 Release；-DryRun 只预检 |
 | `bun run build:ui` | 前端生产构建 → ui/dist |
 | **运行（组装好的应用）** | |
 | `bun run serve:web` | 启动 Web 服务器，托管已构建的前端 |
@@ -358,6 +364,7 @@ bun run test       # Rust 测试（日常可用 test:fast 跑 nextest）
 | **维护 / 工具** | |
 | `bun run clean` | 深度回收构建空间（debug 产物 + flycheck + 旧安装包） |
 | `bun run seed:dev` | 用生产数据目录播种 dev 数据目录 |
+| `bun run bump` | 统一改版本号：根 Cargo.toml(真源) + package.json + ui + Cargo.lock，可选 --tag 提交并打 tag |
 | `bun run help` | 打印脚本目录（--check 校验登记 / --readme 生成 README 表） |
 
 <sub>此表的英文权威版由 <code>bun run help --readme</code> 在 <a href="README.md">README.md</a> 中自动维护。</sub>

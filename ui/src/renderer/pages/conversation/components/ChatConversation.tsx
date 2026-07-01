@@ -25,7 +25,7 @@ import NanobotChat from '../platforms/nanobot/NanobotChat';
 import OpenClawChat from '../platforms/openclaw/OpenClawChat';
 import RemoteChat from '../platforms/remote/RemoteChat';
 import { saveNomiDefaultModel } from '@/renderer/pages/guid/hooks/agentSelectionUtils';
-import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conversationCache';
+import { getConversationOrNull, seedConversationCache } from '@/renderer/pages/conversation/utils/conversationCache';
 import { getConversationCreateErrorMessage } from '@/renderer/pages/conversation/utils/conversationCreateError';
 import NomiChat from '../platforms/nomi/NomiChat';
 import { useNomiModelSelection } from '../platforms/nomi/useNomiModelSelection';
@@ -126,6 +126,7 @@ const _AddNewConversation: React.FC<{ conversation: TChatConversation }> = ({ co
                     : source.extra,
               } as TChatConversation,
             });
+            seedConversationCache(created);
             void navigate(`/conversation/${created.id}`);
             emitter.emit('chat.history.refresh');
           } catch (error) {

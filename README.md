@@ -409,6 +409,9 @@ fails on the webkit2gtk link — build on the target architecture's machine/cont
 | `bun run build:linux` | 打 Linux 安装包（.deb/.AppImage/.rpm），汇总到 dist/desktop/ |
 | `bun run build:signed` | 打桌面包并签名+公证（仅 macOS） |
 | `bun run build:updater` | 打桌面包并产出自更新 .sig 制品 |
+| `bun run make:latest` | 扫描本机更新产物，生成/合并自动更新清单 latest.json |
+| `bun run release:mac` | 一键 macOS 发版：自动判定追加/首发；首发用 -Version 打版本号 + -NotesFile/-Notes 建 Release；-DryRun 只预检 |
+| `bun run release:win` | 一键 Windows 发版：自动判定追加/首发；首发用 -Version 打版本号 + -NotesFile/-Notes 建 Release；-DryRun 只预检 |
 | `bun run build:ui` | 前端生产构建 → ui/dist |
 | **运行（组装好的应用）** | |
 | `bun run serve:web` | 启动 Web 服务器，托管已构建的前端 |

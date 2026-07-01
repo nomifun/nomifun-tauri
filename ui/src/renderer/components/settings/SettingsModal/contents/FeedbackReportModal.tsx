@@ -19,6 +19,7 @@ export const NOMIFUN_PUBLIC_LINKS = {
   contact: 'https://www.nomifun.com/contact',
   issues: 'https://github.com/nomifun/nomifun-tauri/issues',
   releases: 'https://github.com/nomifun/nomifun-tauri/releases',
+  baiduPan: 'https://pan.baidu.com/s/5GPonoJNrwJ7GciBSDgXLaA',
   email: '535526063@qq.com',
   emailHref: 'mailto:535526063@qq.com',
 } as const;

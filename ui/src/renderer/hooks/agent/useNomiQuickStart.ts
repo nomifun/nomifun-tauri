@@ -10,6 +10,7 @@ import { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { emitter } from '@/renderer/utils/emitter';
+import { seedConversationCache } from '@/renderer/pages/conversation/utils/conversationCache';
 import { useGuidModelSelection } from '@/renderer/pages/guid/hooks/useGuidModelSelection';
 
 export interface NomiQuickStartOptions {
@@ -50,6 +51,7 @@ export const useNomiQuickStart = () => {
         }
         emitter.emit('chat.history.refresh');
         sessionStorage.setItem(`nomi_initial_message_${conversation.id}`, JSON.stringify({ input: prompt }));
+        seedConversationCache(conversation);
         await navigate(`/conversation/${conversation.id}`);
         return true;
       } catch (error) {
