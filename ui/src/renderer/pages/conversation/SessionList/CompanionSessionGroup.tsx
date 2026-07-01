@@ -12,7 +12,7 @@ import { customFigureMetaOf } from '@renderer/pages/companion/characters/customM
 import { useCompanions } from '@renderer/pages/nomi/useNomi';
 import { cleanupSiderTooltips } from '@renderer/utils/ui/siderTooltip';
 import { Message, Tooltip } from '@arco-design/web-react';
-import { Right, Setting } from '@icon-park/react';
+import { Right } from '@icon-park/react';
 import classNames from 'classnames';
 import React, { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -112,18 +112,12 @@ const CompanionSessionGroup: React.FC<Props> = ({
     [navigate, onSessionClick, sessionMap]
   );
 
-  const handleManage = useCallback(() => {
-    cleanupSiderTooltips();
-    onSessionClick?.();
-    void navigate('/nomi');
-  }, [navigate, onSessionClick]);
-
   // 无伙伴时不渲染分组（避免对不使用伙伴的用户造成噪音；创建后经 WS 刷新即出现）。
   if (companions.length === 0) return null;
 
   if (collapsed) {
     return (
-      <div className='min-w-0 flex flex-col items-center gap-4px pb-6px mb-2px border-b border-solid border-[var(--color-border-1)]'>
+      <div className='min-w-0 flex flex-col items-center gap-4px mb-4px'>
         {companions.map((c) => {
           const active = activeConversationId != null && sessionMap.get(c.id) === activeConversationId;
           return (
@@ -154,50 +148,37 @@ const CompanionSessionGroup: React.FC<Props> = ({
   }
 
   return (
-    <div className='min-w-0 pb-6px mb-2px border-b border-solid border-[var(--color-border-1)]'>
-      {/* Foldable section header. The fold chevron sits on the RIGHT so the label
-          stays flush-left, aligned with the sibling 「项目/工作路径」 caption (a plain,
-          non-foldable label). Clicking anywhere on the row toggles the persisted
-          fold state (default expanded). */}
-      <div
-        className='group/comphdr flex items-center gap-6px h-24px pl-4px pr-4px cursor-pointer select-none rd-6px hover:bg-fill-2 transition-colors min-w-0'
-        onClick={() => onToggleExpanded?.()}
-      >
-        <span className='text-13px text-t-tertiary group-hover/comphdr:text-t-primary transition-colors font-[500] leading-none tracking-wide truncate min-w-0'>
-          {t('sessionList.companionGroup')}
-        </span>
-        <span className='text-12px text-t-tertiary leading-none shrink-0'>{companions.length}</span>
-        <span className='ml-auto flex items-center gap-2px shrink-0'>
-          <Tooltip content={t('sessionList.companionManage')} position='top' mini>
-            <span
-              role='button'
-              aria-label={t('sessionList.companionManage')}
+    <div className='min-w-0 mb-2px'>
+      {/* 与「项目/工作路径」同款的纯 section 标题（无边框/无盒子/无 hover 底色），
+          仅右侧多一个折叠 chevron 作为开合指示。整行可点击切换持久化折叠态（默认展开）。 */}
+      <div className='px-2px'>
+        <div
+          className='group/comphdr h-22px px-2px flex items-center gap-6px select-none cursor-pointer min-w-0'
+          onClick={() => onToggleExpanded?.()}
+        >
+          <span className='text-13px text-t-tertiary font-[500] leading-none tracking-wide truncate min-w-0'>
+            {t('sessionList.companionGroup')}
+          </span>
+          <span className='ml-auto flex items-center gap-4px shrink-0'>
+            <span className='text-12px text-t-tertiary leading-none'>{companions.length}</span>
+            <button
+              type='button'
+              aria-label={expanded ? t('common.collapse') : t('common.expand')}
+              aria-expanded={expanded}
+              className='size-16px flex items-center justify-center text-t-tertiary hover:text-t-primary transition-colors shrink-0 bg-transparent border-none p-0 cursor-pointer'
               onClick={(e) => {
                 e.stopPropagation();
-                handleManage();
+                onToggleExpanded?.();
               }}
-              className='hidden group-hover/comphdr:flex items-center justify-center w-18px h-18px rd-5px text-t-tertiary hover:!text-primary-6 hover:bg-fill-2 transition-all cursor-pointer'
             >
-              <Setting theme='outline' size='13' />
-            </span>
-          </Tooltip>
-          <button
-            type='button'
-            aria-label={expanded ? t('common.collapse') : t('common.expand')}
-            aria-expanded={expanded}
-            className='size-18px flex items-center justify-center text-t-tertiary group-hover/comphdr:text-t-primary transition-colors shrink-0 bg-transparent border-none p-0 cursor-pointer'
-            onClick={(e) => {
-              e.stopPropagation();
-              onToggleExpanded?.();
-            }}
-          >
-            <Right
-              theme='outline'
-              size={12}
-              className={classNames('transition-transform duration-150', { 'rotate-90': expanded })}
-            />
-          </button>
-        </span>
+              <Right
+                theme='outline'
+                size={12}
+                className={classNames('transition-transform duration-150', { 'rotate-90': expanded })}
+              />
+            </button>
+          </span>
+        </div>
       </div>
 
       {expanded && (
