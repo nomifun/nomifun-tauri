@@ -877,6 +877,36 @@ impl CompanionService {
         self.store.list_memories(filter).await
     }
 
+    // ----- session-window day digests (伙伴会话归档回看) -----
+
+    /// Archived day-digests for one companion. `since`/`until` are inclusive
+    /// `YYYYMMDD` bounds (empty = open). When both are empty, returns the most
+    /// recent `limit` digests (newest first); otherwise the range (ascending).
+    pub async fn list_day_digests(
+        &self,
+        companion_id: &str,
+        since: &str,
+        until: &str,
+        limit: i64,
+    ) -> Result<Vec<crate::store::SessionWindow>, AppError> {
+        if since.is_empty() && until.is_empty() {
+            self.store.list_digests(companion_id, limit).await
+        } else {
+            self.store.digests_in_range(companion_id, since, until).await
+        }
+    }
+
+    /// "去年今日" — archived digests whose day-of-year (`MMDD`) matches, excluding
+    /// today. `mmdd` is a 4-char `MMDD`.
+    pub async fn digests_on_this_day(
+        &self,
+        companion_id: &str,
+        mmdd: &str,
+        exclude_day: &str,
+        limit: i64,
+    ) -> Result<Vec<crate::store::SessionWindow>, AppError> {
+        self.store.digests_on_day_of_year(companion_id, mmdd, exclude_day, limit).await
+    }
     pub async fn add_memory(&self, kind: &str, content: &str, tags: &[String], scope: MemoryScope) -> Result<CompanionMemory, AppError> {
         if !crate::store::MEMORY_KINDS.contains(&kind) {
             return Err(AppError::BadRequest(format!("invalid memory kind '{kind}'")));
@@ -1237,7 +1267,8 @@ impl CompanionService {
 impl nomifun_ai_agent::CompanionPromptProvider for CompanionService {
     async fn build_system_prompt(&self, companion_id: Option<&str>, channel_platform: Option<&str>) -> Option<String> {
         let profile = self.registry.get(companion_id.map(str::trim).filter(|id| !id.is_empty())?).await?;
-        Some(crate::companion::build_companion_system_prompt(&self.store, &profile, channel_platform).await)
+        let smart = self.config.read().await.smart_orchestration;
+        Some(crate::companion::build_companion_system_prompt(&self.store, &profile, channel_platform, smart).await)
     }
 }
 

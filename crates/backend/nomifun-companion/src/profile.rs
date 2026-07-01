@@ -247,6 +247,13 @@ pub struct SharedCompanionConfig {
     pub evolve: SharedEvolveConfig,
     #[serde(default)]
     pub archive: SharedArchiveConfig,
+    /// 智能编排（默认 OFF, opt-in）：开启后，本地伙伴会话获得"调度官"能力提示——
+    /// 遇到复杂/多步大任务时用 `nomi_run_create` 把活拆给隔离子 agent 并行处理，
+    /// 伙伴只负责调度与汇总，保持自己的对话上下文清爽（与会话归档协同：主线程只留
+    /// 总结、更易归档）。工具本身随桌面网关（desktopGateway）提供；远程 IM 会话不注入
+    /// （caps_orchestrator 对 Remote 硬拒）。
+    #[serde(default)]
+    pub smart_orchestration: bool,
     /// Which companion new/unattributed activity defaults to.
     pub default_companion_id: String,
     /// Opt-in (default None = off): when set to a directory path, companion
