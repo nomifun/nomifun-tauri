@@ -68,6 +68,11 @@ pub struct WebUiStatus {
     pub lan_ip: Option<String>,
     /// Admin username for the remote login (default `admin`).
     pub admin_username: String,
+    /// Whether a real admin password has been set (non-empty `password_hash`).
+    /// Lets the desktop UI distinguish "credential configured (hidden)" from
+    /// "never provisioned" even when the LAN server is stopped, so a persisted
+    /// password is not perceived as lost after a restart.
+    pub password_set: bool,
     /// One-time initial password, set ONLY in the direct return of a first
     /// `start` that provisioned credentials. Never broadcast on the status
     /// channel (so it is shown once, not persisted in memory).
@@ -176,9 +181,15 @@ impl DesktopServer {
             });
         }
 
+        // Seed the initial status with the PERSISTED admin identity so the
+        // desktop UI shows the real username / "password set" state immediately
+        // at boot, before the LAN listener is ever started.
+        let (initial_admin, initial_pw_set) = resolve_admin(&*user_repo).await;
         let initial = WebUiStatus {
             running: false,
             local_url: format!("http://localhost:{loopback_port}"),
+            admin_username: initial_admin,
+            password_set: initial_pw_set,
             ..Default::default()
         };
         let (status_tx, status_rx) = watch::channel(initial);
@@ -224,6 +235,22 @@ impl DesktopServer {
         self.status_rx.borrow().clone()
     }
 
+    /// Status snapshot with the admin identity resolved FRESH from the DB.
+    ///
+    /// The cached watch value only carries the username while the LAN listener
+    /// is running (it is set inside `start_lan`); a stopped or just-booted
+    /// server would otherwise report an empty username and `password_set=false`,
+    /// making a persisted credential look lost after a restart. This overlays
+    /// the persisted `admin_username` / `password_set` so `getStatus` is always
+    /// truthful regardless of LAN state.
+    pub async fn status_snapshot(&self) -> WebUiStatus {
+        let mut st = self.status();
+        let (username, password_set) = resolve_admin(&*self.user_repo).await;
+        st.admin_username = username;
+        st.password_set = password_set;
+        st
+    }
+
     /// Subscribe to status changes (for emitting a Tauri event on each change).
     pub fn subscribe_status(&self) -> watch::Receiver<WebUiStatus> {
         self.status_rx.clone()
@@ -250,6 +277,11 @@ impl DesktopServer {
         // admin via `/api/auth/setup`. On first enable we generate a strong
         // password and return it ONCE (shown to the owner), mirroring the old
         // desktop behavior; thereafter the stored credential is reused.
+        //
+        // We fill ONLY the password (`set_system_user_password_if_uninitialized`),
+        // never the username: the panel lets the user rename the admin while
+        // WebUI is off (which leaves password_hash empty), so overwriting the
+        // username here would silently revert their chosen name back to "admin".
         let has_password = self.user_repo.has_users().await.unwrap_or(false);
         let mut initial_password: Option<String> = None;
         if !has_password {
@@ -264,14 +296,17 @@ impl DesktopServer {
                 Ok(Err(e)) => return self.fail_start(format!("生成访问密码失败: {e}")),
                 Err(e) => return self.fail_start(format!("生成访问密码失败: {e}")),
             };
-            if let Err(e) = self
+            match self
                 .user_repo
-                .set_system_user_credentials("admin", &hashed)
+                .set_system_user_password_if_uninitialized(&hashed)
                 .await
             {
-                return self.fail_start(format!("写入访问密码失败: {e}"));
+                // Freshly provisioned — surface the one-time plaintext once.
+                Ok(true) => initial_password = Some(pw),
+                // A password already existed (race / prior enable): reuse it.
+                Ok(false) => {}
+                Err(e) => return self.fail_start(format!("写入访问密码失败: {e}")),
             }
-            initial_password = Some(pw);
         }
 
         // Build the LAN app: shared router (/api, /ws) + the app shell.
@@ -325,7 +360,7 @@ impl DesktopServer {
             port,
         });
 
-        let admin_username = self.admin_username().await;
+        let (admin_username, password_set) = resolve_admin(&*self.user_repo).await;
         let network_url = lan_ip.as_ref().map(|ip| format!("http://{ip}:{port}"));
         let network_urls: Vec<String> = lan_ips
             .iter()
@@ -343,6 +378,7 @@ impl DesktopServer {
             network_urls: network_urls.clone(),
             lan_ip: lan_ip.as_ref().map(|ip| ip.to_string()),
             admin_username: admin_username.clone(),
+            password_set,
             initial_password: None,
             error: None,
         };
@@ -368,14 +404,6 @@ impl DesktopServer {
         st
     }
 
-    /// Current admin username (defaults to `admin` if unknown).
-    async fn admin_username(&self) -> String {
-        match self.user_repo.get_system_user().await {
-            Ok(Some(u)) => u.username,
-            _ => "admin".to_string(),
-        }
-    }
-
     /// Stop LAN serving and return the resulting status. The loopback listener
     /// (the desktop's own webview) is unaffected.
     pub async fn stop_lan(self: &Arc<Self>) -> WebUiStatus {
@@ -384,9 +412,14 @@ impl DesktopServer {
             let _ = listener.shutdown.send(true);
             tracing::info!(port = listener.port, "desktop LAN serving stopped");
         }
+        // Carry the persisted admin identity into the stopped status so the UI
+        // keeps showing the real username / password-set state after stopping.
+        let (admin_username, password_set) = resolve_admin(&*self.user_repo).await;
         let status = WebUiStatus {
             running: false,
             local_url: format!("http://localhost:{}", self.loopback_port),
+            admin_username,
+            password_set,
             ..Default::default()
         };
         let _ = self.status_tx.send(status.clone());
@@ -425,6 +458,21 @@ impl DesktopServer {
 /// identically.
 async fn bind_lan(preferred: u16) -> Result<(u16, TcpListener)> {
     crate::bootstrap::bind_with_fallback(IpAddr::V4(Ipv4Addr::UNSPECIFIED), preferred).await
+}
+
+/// Resolve the persisted admin identity from the DB: `(username, password_set)`.
+///
+/// `password_set` is true when the system user has a non-empty `password_hash`
+/// (i.e. a real credential exists). Falls back to `("admin", false)` on any DB
+/// error or missing row, so callers always get a displayable username.
+async fn resolve_admin(user_repo: &dyn IUserRepository) -> (String, bool) {
+    match user_repo.get_system_user().await {
+        Ok(Some(u)) => {
+            let name = if u.username.is_empty() { "admin".to_string() } else { u.username };
+            (name, !u.password_hash.trim().is_empty())
+        }
+        _ => ("admin".to_string(), false),
+    }
 }
 
 /// Routing-preferred source IPv4 (the address used to reach off-box hosts).

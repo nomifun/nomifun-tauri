@@ -3,7 +3,7 @@
 <div align="center">
 
 <a href="https://www.nomifun.com">
-  <img src="docs/images/brand/og-cover.svg" alt="NomiFun — Fully open-source, local-first super AI workstation" width="820">
+  <img src="docs/images/readme-00-orchestration-hero.png" alt="NomiFun orchestration conversation, reusable roles, and DAG canvas" width="100%">
 </a>
 
 <h3>A no-holds-barred, fully open-source, <em>local-first</em> super AI workstation.</h3>
@@ -36,11 +36,17 @@
   <a href="docs/README.md">📖 Docs</a>&nbsp;·&nbsp;
   <a href="#-getting-started">🚀 Get started</a>&nbsp;·&nbsp;
   <a href="https://github.com/nomifun/nomifun-tauri/releases">📦 Releases</a>&nbsp;·&nbsp;
+  <a href="https://pan.baidu.com/s/5GPonoJNrwJ7GciBSDgXLaA">China mirror</a>&nbsp;·&nbsp;
   <a href="./RELEASING.zh-CN.md">发版手册</a>&nbsp;·&nbsp;
   <a href="#-contact--community">💬 Community</a>
 </p>
 
 </div>
+
+---
+
+> [!IMPORTANT]
+> **Public-interest open-source and data-risk notice**: NomiFun is a public-interest open-source project. The maintainers do not assume responsibility for user data loss, corruption, or unrecoverable damage during iteration. Back up your data before upgrades, migrations, experimental features, or real production use.
 
 ---
 
@@ -82,30 +88,39 @@ See [`SECURITY.md`](SECURITY.md) for the deployment threat model and responsible
 <div align="center">
 
 <p>
-  🎬 <b>Intro video:</b> <a href="https://www.youtube.com/watch?v=Z28XyhvNh_E">https://www.youtube.com/watch?v=Z28XyhvNh_E</a>
+  🎬 <b>Demo videos:</b>
+  China:
+  <a href="https://www.douyin.com/user/self?from_tab_name=main&modal_id=7657100052061523209">Douyin</a>
+  ·
+  <a href="https://www.bilibili.com/video/BV1kwKZ6UE5X/">Bilibili</a>
+  &nbsp;|&nbsp;
+  International:
+  <a href="https://youtu.be/AsEToBDFR9s">YouTube</a>
+  ·
+  <a href="https://x.com/colir0/status/2072001821640437776?s=20">X</a>
 </p>
 
 <p>
-  <img src="docs/images/readme-01-workbench-overview.png" alt="NomiFun desktop workbench with conversation, companion, and project metrics" width="100%">
-  <br/><sub><b>Desktop workbench: conversation, companion, and live session metrics</b></sub>
+  <img src="docs/images/readme-01-workbench-overview.png" alt="NomiFun orchestration conversation and DAG canvas" width="100%">
+  <br/><sub><b>Work orchestration: conversation, reusable roles, and DAG canvas</b></sub>
 </p>
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/images/gs-01-introduction-hero.png" alt="Home / new session"><br/><sub><b>Home & sessions</b></sub></td>
-    <td width="50%"><img src="docs/images/channels-01-overview.png" alt="Companion remote channels"><br/><sub><b>Companion · IM channels</b></sub></td>
+    <td width="50%"><img src="docs/images/readme-05-companions.png" alt="Desktop companion overview"><br/><sub><b>Desktop companions · memory and growth</b></sub></td>
+    <td width="50%"><img src="docs/images/readme-07-requirements.png" alt="Requirements platform list"><br/><sub><b>Requirements platform · AutoWork entry</b></sub></td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/images/autowork-03-kanban.png" alt="Requirements board"><br/><sub><b>Requirements · AutoWork board</b></sub></td>
-    <td width="50%"><img src="docs/images/webui-01-settings-overview.png" alt="Open capabilities"><br/><sub><b>Open capability bus</b></sub></td>
+    <td width="50%"><img src="docs/images/readme-06-knowledge.png" alt="Knowledge base list"><br/><sub><b>Knowledge base · local domain context</b></sub></td>
+    <td width="50%"><img src="docs/images/readme-02-terminal-create.png" alt="Create an agent terminal"><br/><sub><b>Terminal · capabilities for Agent CLI</b></sub></td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/images/terminal-03-driving-session.png" alt="Terminal session"><br/><sub><b>Agent-driven terminal</b></sub></td>
-    <td width="50%"><img src="docs/images/webui-04-qr-login-phone.png" alt="Phone QR login"><br/><sub><b>WebUI · scan-to-connect</b></sub></td>
+    <td width="50%"><img src="docs/images/readme-03-assistants.png" alt="Assistants and Skills capability library"><br/><sub><b>Assistants & Skills · scenario capability library</b></sub></td>
+    <td width="50%"><img src="docs/images/readme-04-model-agents.png" alt="Models and Agents management"><br/><sub><b>Models & Agents · unified management and setup</b></sub></td>
   </tr>
 </table>
 
-<sub>Real in-app captures. See <a href="docs/images/SCREENSHOTS.md">the screenshot manifest</a> for the full set and capture method.</sub>
+<sub>Captured from the live NomiFun desktop app on 2026-07-01 and kept at 2560px wide. See <a href="docs/images/SCREENSHOTS.md">the screenshot manifest</a> for the full set and capture method.</sub>
 
 </div>
 
@@ -177,6 +192,25 @@ Every capability NomiFun has is exposed through a single, typed capability regis
 - **~19 external agents over ACP** — connect Claude Code, Codex, Gemini, Qwen, Kimi, Cursor, Copilot, Goose, OpenCode, Droid, and more, and NomiFun feeds them models *and* its native capabilities (computer/browser/knowledge/gateway) over injected MCP bridges.
 - **Everywhere** — the native capabilities are available to the built-in agent, to ACP agents, in the chat UI, **and** in the terminal.
 
+### 🔌 Model providers: quick setup links
+
+NomiFun does not lock you into a single model vendor. Pick providers by region, price, quota, model capability, and data policy, then paste the API key into NomiFun's **Models & Agents** page. These are third-party services; pricing, regional availability, rate limits, and data-handling terms are controlled by each provider.
+
+| Provider | Start here | Good to evaluate |
+|---|---|---|
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=platform.stepfun.ai" alt="StepFun logo" width="20" height="20"> **StepFun** | [Platform](https://platform.stepfun.ai/) | Step models for Chinese, agentic, and cost-conscious workloads |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=platform.kimi.ai" alt="Kimi logo" width="20" height="20"> **Kimi / Moonshot AI** | [API keys](https://platform.kimi.ai/console/api-keys) | Long context, Chinese writing, coding, and general tasks |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=bigmodel.cn" alt="GLM logo" width="20" height="20"> **GLM / Zhipu BigModel** | [API keys](https://open.bigmodel.cn/usercenter/apikeys) | GLM models, general reasoning, coding, and enterprise integration |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=www.volcengine.com" alt="Doubao logo" width="20" height="20"> **Doubao / Volcengine Ark** | [API keys](https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey) | Doubao models and China-region cloud/enterprise workflows |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=help.aliyun.com" alt="Qwen logo" width="20" height="20"> **Qwen / Alibaba Cloud Model Studio** | [API keys](https://bailian.console.aliyun.com/?tab=model#/api-key) | Qwen models, DashScope, and Alibaba Cloud workflows |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=platform.minimax.io" alt="MiniMax logo" width="20" height="20"> **MiniMax / MinMax** | [API keys](https://platform.minimax.io/user-center/basic-information/interface-key) | MiniMax models, long-form text, multimodal, and voice capabilities |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=mimo.mi.com" alt="MiMo logo" width="20" height="20"> **MiMo / Xiaomi** | [Website](https://mimo.mi.com/) | MiMo models and Xiaomi ecosystem capabilities |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=platform.deepseek.com" alt="DeepSeek logo" width="20" height="20"> **DeepSeek** | [API keys](https://platform.deepseek.com/api_keys) | Reasoning, coding, and high value-for-money model calls |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=openrouter.ai" alt="OpenRouter logo" width="20" height="20"> **OpenRouter** | [API keys](https://openrouter.ai/keys) | Multi-model aggregation, unified billing, fallback routing, and comparison |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=platform.claude.com" alt="Claude logo" width="20" height="20"> **Claude / Anthropic** | [API keys](https://platform.claude.com/settings/keys) | Claude models, long-form work, coding, and the Claude Code ecosystem |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=openai.com" alt="OpenAI logo" width="20" height="20"> **GPT / OpenAI** | [GPT models](https://platform.openai.com/docs/models) · [API keys](https://platform.openai.com/api-keys) | GPT models, OpenAI API, agent workflows, coding, and general-purpose tasks |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=aistudio.google.com" alt="Gemini logo" width="20" height="20"> **Gemini / Google AI** | [API keys](https://aistudio.google.com/app/apikey) | Gemini models, multimodal work, very long context, and Google AI Studio |
+
 ### 💻 Terminal mode
 
 > Guide: [`docs/guides/terminal.md`](docs/guides/terminal.md)
@@ -243,7 +277,7 @@ Start with [`docs/architecture/overview.md`](docs/architecture/overview.md) for 
 
 ## 🚀 Getting started
 
-> ℹ️ There are **no prebuilt installers yet** — install from source or run the server with Docker. Watch [Releases](https://github.com/nomifun/nomifun-tauri/releases) for binaries.
+> 📦 **Installers**: use [GitHub Releases](https://github.com/nomifun/nomifun-tauri/releases) first. Mainland China users can use the [Baidu Netdisk mirror](https://pan.baidu.com/s/5GPonoJNrwJ7GciBSDgXLaA) (shared as `nomifun`). You can also install from source or run the server with Docker.
 
 **Prerequisites**
 
@@ -468,10 +502,10 @@ We'd love to hear from you. The fastest way to reach us is GitHub; the social ch
 | 🐙 **GitHub** | [nomifun/nomifun-tauri](https://github.com/nomifun/nomifun-tauri) · [Issues](https://github.com/nomifun/nomifun-tauri/issues) · [Releases](https://github.com/nomifun/nomifun-tauri/releases) |
 | ✉️ **Email** | `hello@nomifun.com` <sub>(provisional — being finalized)</sub> |
 | 📕 **小红书 / RED** | [NomiFun](https://xhslink.com/m/4x6ti8n6cA1) |
-| 📺 **Bilibili** | [NomiFun](https://b23.tv/0UhgKDh) |
-| 🎵 **抖音 / Douyin** | [NomiFun](https://v.douyin.com/MDT5QVdYaJk/) |
-| ▶️ **YouTube** | [@NomiFun-o2y](https://www.youtube.com/@NomiFun-o2y) |
-| 𝕏 **X (Twitter)** | [@colir0](https://x.com/colir0) |
+| 📺 **Bilibili** | [NomiFun](https://b23.tv/0UhgKDh) · [demo video](https://www.bilibili.com/video/BV1kwKZ6UE5X/) |
+| 🎵 **抖音 / Douyin** | [NomiFun](https://v.douyin.com/MDT5QVdYaJk/) · [demo video](https://www.douyin.com/user/self?from_tab_name=main&modal_id=7657100052061523209) |
+| ▶️ **YouTube** | [@NomiFun-o2y](https://www.youtube.com/@NomiFun-o2y) · [demo video](https://youtu.be/AsEToBDFR9s) |
+| 𝕏 **X (Twitter)** | [@colir0](https://x.com/colir0) · [demo post](https://x.com/colir0/status/2072001821640437776?s=20) |
 | 🎬 **TikTok** | [@colir0luo](https://www.tiktok.com/@colir0luo) |
 
 **Join the chat groups** — scan to join:

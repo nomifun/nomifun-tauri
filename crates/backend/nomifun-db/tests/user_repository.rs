@@ -166,6 +166,27 @@ async fn t2_9_set_system_user_credentials_conflict_with_existing_username() {
     assert!(matches!(err, DbError::Conflict(_)), "expected Conflict, got: {err:?}");
 }
 
+#[tokio::test]
+async fn t2_9_set_system_user_password_if_uninitialized_preserves_username() {
+    let r = repo().await;
+    // Rename the system admin while its password is still empty (WebUI-off edit).
+    r.update_username("system_default_user", "renamed").await.unwrap();
+
+    let wrote = r.set_system_user_password_if_uninitialized("hash1").await.unwrap();
+    assert!(wrote, "should provision the password when empty");
+
+    let user = r.get_system_user().await.unwrap().unwrap();
+    assert_eq!(user.username, "renamed", "username must NOT be reset to admin");
+    assert_eq!(user.password_hash, "hash1");
+
+    // Idempotent: a second enable does not overwrite the stored password.
+    let wrote_again = r.set_system_user_password_if_uninitialized("hash2").await.unwrap();
+    assert!(!wrote_again);
+    let user = r.get_system_user().await.unwrap().unwrap();
+    assert_eq!(user.password_hash, "hash1");
+    assert_eq!(user.username, "renamed");
+}
+
 // -- T2.10 Update password --
 
 #[tokio::test]

@@ -294,10 +294,13 @@ async fn pre_baseline_database_is_renamed_and_rebuilt() {
     .execute(db.pool())
     .await
     .unwrap();
-    // Marker row that must NOT survive the rebuild.
+    // Marker row that must NOT survive the rebuild. Empty password_hash makes it
+    // disposable dev data (no real credential), so the salvage guardrail allows
+    // the rebuild. (A row with a real password would be REFUSED — see the
+    // pre_baseline_rebuild_refused_* test below.)
     sqlx::query(
         "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
-         VALUES ('u_old', 'old_dev_user', 'h', 1, 1)",
+         VALUES ('u_old', 'old_dev_user', '', 1, 1)",
     )
     .execute(db.pool())
     .await
@@ -323,6 +326,53 @@ async fn pre_baseline_database_is_renamed_and_rebuilt() {
     assert!(backup.exists(), "old database should be preserved as .pre-baseline.bak");
 
     db.close().await;
+}
+
+#[tokio::test]
+async fn pre_baseline_rebuild_refused_when_credential_present() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nomifun-backend.db");
+
+    // Build a valid DB, seed a user with a REAL (non-empty) password, then forge
+    // a pre-baseline migration mismatch.
+    let db = init_database(&path).await.unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
+         VALUES ('u_real', 'real_user', 'bcrypt_hash', 1, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = X'00'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.close().await;
+
+    // Re-init: the guardrail must REFUSE to rebuild (a real credential exists),
+    // returning an error and preserving the database in place.
+    let result = init_database(&path).await;
+    assert!(
+        result.is_err(),
+        "init must fail fast rather than wipe a database holding a real credential"
+    );
+
+    // The original DB is preserved in place (NOT renamed aside), so the row survives.
+    assert!(path.exists(), "the real database file must be preserved in place");
+    assert!(
+        !dir.path().join("nomifun-backend.db.pre-baseline.bak").exists(),
+        "a credential-bearing DB must not be renamed to a .pre-baseline.bak"
+    );
+    // Confirm the credential row is still intact in the preserved file.
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", path.display()))
+        .await
+        .unwrap();
+    let survived: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE id = 'u_real'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    assert_eq!(survived.0, 1, "the real credential row must survive the refusal");
 }
 
 #[tokio::test]

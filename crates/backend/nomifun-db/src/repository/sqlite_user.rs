@@ -102,6 +102,23 @@ impl IUserRepository for SqliteUserRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn set_system_user_password_if_uninitialized(&self, password_hash: &str) -> Result<bool, DbError> {
+        let now = nomifun_common::now_ms();
+        // Only the password column is touched, and only while it is still empty
+        // — the username the user may have set is preserved. The WHERE clause is
+        // the gate, so a second concurrent enable writes 0 rows.
+        let result = sqlx::query(
+            "UPDATE users SET password_hash = ?, updated_at = ? \
+             WHERE id = 'system_default_user' AND (password_hash = '' OR password_hash IS NULL)",
+        )
+        .bind(password_hash)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn create_user(&self, username: &str, password_hash: &str) -> Result<User, DbError> {
         let id = nomifun_common::generate_prefixed_id("user");
         let now = nomifun_common::now_ms();
@@ -504,5 +521,34 @@ mod tests {
         let user = repo.get_system_user().await.unwrap().unwrap();
         assert_eq!(user.username, "admin");
         assert_eq!(user.password_hash, "secure_hash");
+    }
+
+    #[tokio::test]
+    async fn set_system_user_password_if_uninitialized_preserves_username() {
+        let (repo, _db) = setup().await;
+
+        // User renamed the system account while its password was still empty.
+        repo.update_username("system_default_user", "bob").await.unwrap();
+
+        // Provisioning a password must fill the password WITHOUT touching the username.
+        let wrote = repo
+            .set_system_user_password_if_uninitialized("provisioned_hash")
+            .await
+            .unwrap();
+        assert!(wrote, "should write when password was empty");
+
+        let user = repo.get_system_user().await.unwrap().unwrap();
+        assert_eq!(user.username, "bob", "username must be preserved, not reset to admin");
+        assert_eq!(user.password_hash, "provisioned_hash");
+
+        // A second enable is a no-op: password already set, nothing changes.
+        let wrote_again = repo
+            .set_system_user_password_if_uninitialized("another_hash")
+            .await
+            .unwrap();
+        assert!(!wrote_again, "should not overwrite an existing password");
+        let user = repo.get_system_user().await.unwrap().unwrap();
+        assert_eq!(user.password_hash, "provisioned_hash", "existing password must be kept");
+        assert_eq!(user.username, "bob");
     }
 }
