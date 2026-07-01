@@ -3693,6 +3693,7 @@ export type I18nKey =
   | 'settings.webui.passwordChangeFailed'
   | 'settings.webui.passwordChanged'
   | 'settings.webui.passwordHidden'
+  | 'settings.webui.passwordNotSet'
   | 'settings.webui.passwordHint'
   | 'settings.webui.passwordMinLength'
   | 'settings.webui.passwordMismatch'

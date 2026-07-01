@@ -66,7 +66,9 @@ const WebuiControlPanel: React.FC<WebuiControlPanelProps> = ({ mode = 'popover' 
     Message.success(t('common.copySuccess'));
   };
 
-  const displayUsername = usernameOverride ?? status?.adminUsername ?? 'admin';
+  // Use `||` (not `??`) so an empty-string username from a not-yet-populated
+  // status falls back to the persisted value / 'admin' instead of rendering blank.
+  const displayUsername = usernameOverride || status?.adminUsername || 'admin';
   const qrBaseUrls = useMemo(() => getWebuiQrBaseUrls(status, accessUrls, port), [status, accessUrls, port]);
   const qrUrl = useMemo(() => {
     if (!qrToken || !selectedQrBaseUrl) return null;
@@ -232,8 +234,12 @@ const WebuiControlPanel: React.FC<WebuiControlPanelProps> = ({ mode = 'popover' 
 
   // 密码默认显示 ******，仅首次启动返回的一次性明文可见；改密后由 clearInitialPassword 收起。
   // Password shows ****** by default; only the one-time plaintext from first start
-  // is visible, and a change forgets it (clearInitialPassword).
-  const displayPassword = initialPassword ? initialPassword : t('settings.webui.passwordHidden');
+  // is visible, and a change forgets it (clearInitialPassword). When the backend
+  // reports no password has ever been set (passwordSet === false), show a
+  // "not set yet" hint instead of ****** so a fresh install does not imply a
+  // hidden credential. Defaults to "set" while status is loading to avoid a flash.
+  const passwordIsSet = status?.passwordSet ?? true;
+  const displayPassword = initialPassword ? initialPassword : passwordIsSet ? t('settings.webui.passwordHidden') : t('settings.webui.passwordNotSet');
   const containerClass =
     mode === 'page'
       ? 'w-full overflow-visible flex flex-col gap-12px'

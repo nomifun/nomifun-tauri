@@ -445,6 +445,7 @@
   "webui.browserNotSupported": "WebUI settings not available in browser",
   "webui.browserNotSupportedDesc": "For security reasons, WebUI settings can only be managed in the desktop application. Please open the settings panel in NomiFun desktop app to configure.",
   "webui.passwordHidden": "******",
+  "webui.passwordNotSet": "Not set yet (generated when WebUI is enabled)",
   "webui.passwordOnlyFirstTime": "Password is only shown on first startup and will be hidden afterwards",
   "webui.resetPasswordWarning": "Please keep the reset password safe!",
   "webui.featureRemoteDesc": "Enable WebUI so your phone or remote browser can access Nomi.",

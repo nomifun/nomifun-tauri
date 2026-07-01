@@ -214,6 +214,12 @@ impl NomiAgentManager {
         if let Some(path) = config_extra.compat_overrides.api_path {
             config.compat.api_path = Some(path);
         }
+        // 图片支持 override(主动剔除):工厂据 VisionUnsupportedRegistry 命中注入
+        // Some(false),灌进 compat.supports_image → build_messages 发送时剔图。
+        // None → 保持 Config::resolve 的默认(supports_image()==true),行为不变。
+        if let Some(supports_image) = config_extra.compat_overrides.supports_image {
+            config.compat.supports_image = Some(supports_image);
+        }
 
         // Make the engine compact against the provider's declared context
         // window when set (else keep the resolved default). Same value the

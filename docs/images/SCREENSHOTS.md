@@ -74,26 +74,38 @@ see notes).
 
 | Id | Route / screen | Host | Caption | Used in | Status |
 | --- | --- | --- | --- | --- | --- |
-| `readme-01-workbench-overview.png` | desktop app / conversation workbench | desktop | Main desktop workbench with conversation, companion, and live metrics | README / README.zh-CN | live |
+| `readme-00-orchestration-hero.png` | desktop app / conversation orchestration | desktop | Header hero showing orchestration conversation, reusable roles, and DAG canvas | README / README.zh-CN | live |
+| `readme-01-workbench-overview.png` | desktop app / conversation orchestration | desktop | Work orchestration with conversation, reusable roles, and DAG canvas | README / README.zh-CN | live |
+| `readme-02-terminal-create.png` | `#/terminal-new` | desktop | Create terminal flow with expanded capability handoff panel | README / README.zh-CN | live |
+| `readme-03-assistants.png` | `#/assistants?tab=assistants` | desktop | Assistants and Skills capability library | README / README.zh-CN | live |
+| `readme-04-model-agents.png` | `#/models` | desktop | Models and Agents management with installed and supported CLI agents | README / README.zh-CN | live |
+| `readme-05-companions.png` | `#/nomi` | desktop | Desktop companion overview with memory and growth state | README / README.zh-CN | live |
+| `readme-06-knowledge.png` | `#/knowledge` | desktop | Knowledge base list and local domain context | README / README.zh-CN | live |
+| `readme-07-requirements.png` | `#/requirements` | desktop | Requirements platform list and AutoWork entry | README / README.zh-CN | live |
 | `gs-01-introduction-hero.png` | `#/guid` | web | Home / new-session page | getting-started/introduction | live |
 | `gs-02-desktop-dev.png` | `#/guid` | web (interim) | Desktop app home — app content; native window chrome pending | getting-started/introduction | live\* |
 | `gs-03-web-first-run-setup.png` | `#/login` (no admin) | web (auth) | First-run admin setup | getting-started/installation | live |
 | `gs-04-quickstart-login.png` | `#/login` (admin exists) | web (auth) | Login screen | getting-started/quick-start | live |
 | `gs-05-quickstart-guid.png` | `#/guid` | web | Home page (agent bar + input) | getting-started/quick-start | live |
-| `gs-06-quickstart-model-settings.png` | `#/models` | web | Model & Agent settings | getting-started/quick-start | live || `desktop-01-main-window.png` | `#/guid` | web (interim) | Desktop main window content; native chrome pending | guides/desktop-app | live\* |
-| `webui-01-settings-overview.png` | `#/open-capabilities` | web | Open Capabilities panel | guides/webui-remote-access | live || `webui-03-login-screen.png` | `#/login` | web (auth) | Login screen on a remote browser | guides/webui-remote-access | live |
+| `gs-06-quickstart-model-settings.png` | `#/models` | web | Model & Agent settings | getting-started/quick-start | live |
+| `desktop-01-main-window.png` | `#/guid` | web (interim) | Desktop main window content; native chrome pending | guides/desktop-app | live\* |
+| `webui-01-settings-overview.png` | `#/open-capabilities` | web | Open Capabilities panel | guides/webui-remote-access | live |
+| `webui-03-login-screen.png` | `#/login` | web (auth) | Login screen on a remote browser | guides/webui-remote-access | live |
 | `webui-04-qr-login-phone.png` | `#/login` @ 390px | web (phone) | Login on a phone-width viewport | guides/webui-remote-access | live |
 | `terminal-01-session.png` | `#/terminal/:id` | web | In-app terminal session | guides/terminal | live |
 | `terminal-02-create-page.png` | `#/terminal-new` | web | Terminal create page | guides/terminal | live |
-| `terminal-03-driving-session.png` | `#/terminal/:id` | web | Driving a terminal (live output) | guides/terminal | live || `autowork-01-tag-sessions.png` | `#/requirements/extensions?tab=autowork` | web | AutoWork tag-sessions overview | guides/autowork-requirements | live |
+| `terminal-03-driving-session.png` | `#/terminal/:id` | web | Driving a terminal (live output) | guides/terminal | live |
+| `autowork-01-tag-sessions.png` | `#/requirements/extensions?tab=autowork` | web | AutoWork tag-sessions overview | guides/autowork-requirements | live |
 | `autowork-02-list.png` | `#/requirements` | web | Requirements list | guides/autowork-requirements | live |
 | `autowork-03-kanban.png` | `#/requirements?view=board` | web | Requirements board (pending/in-progress/done/…) | guides/autowork-requirements | live |
 | `autowork-04-tag-sessions.png` | `#/requirements/extensions?tab=autowork` | web | Tag-sessions table | guides/autowork-requirements | live |
 | `autowork-05-webhook-binding.png` | `#/requirements/extensions?tab=notify` | web | Notify / webhook tab | guides/autowork-requirements | live |
 | `cron-01-list.png` | `#/scheduled` | web | Scheduled Tasks list + keep-awake banner | guides/scheduled-tasks | live |
 | `cron-02-create-dialog.png` | `#/scheduled` (New task) | web | Create scheduled task dialog | guides/scheduled-tasks | live |
-| `cron-03-detail.png` | `#/scheduled/:job_id` | web | Job detail: schedule, Run now, history | guides/scheduled-tasks | live || `channels-01-overview.png` | `#/nomi?tab=remote` | web | Companion Remote tab — channel overview | guides/channels | live |
-| `channels-02-pairing.png` | `#/nomi?tab=remote` (connect) | web | Channel connect / settings dialog | guides/channels | live || `mcp-01-capabilities.png` | `#/mcp` | web | MCP page | guides/mcp-and-skills | live |
+| `cron-03-detail.png` | `#/scheduled/:job_id` | web | Job detail: schedule, Run now, history | guides/scheduled-tasks | live |
+| `channels-01-overview.png` | `#/nomi?tab=remote` | web | Companion Remote tab — channel overview | guides/channels | live |
+| `channels-02-pairing.png` | `#/nomi?tab=remote` (connect) | web | Channel connect / settings dialog | guides/channels | live |
+| `mcp-01-capabilities.png` | `#/mcp` | web | MCP page | guides/mcp-and-skills | live |
 | `mcp-03-skills.png` | `#/assistants?tab=skills` | web | Skills tab | guides/mcp-and-skills | live |
 | `assistants-01-list.png` | `#/assistants?tab=assistants` | web | Assistants list (builtin library) | guides/assistants | live |
 | `assistants-02-editor.png` | `#/assistants?tab=assistants` (edit) | web | Assistant editor drawer | guides/assistants | live |

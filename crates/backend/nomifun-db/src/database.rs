@@ -69,7 +69,20 @@ pub async fn init_database(path: &Path) -> Result<Database, DbError> {
     match try_init_file(path).await {
         Ok(db) => Ok(db),
         Err(e) if path.exists() && is_pre_baseline_migration_error(&e) => {
-            // Pre-launch convenience; remove before release, restoring fail-fast.
+            // Guardrail (this whole salvage path is pre-launch convenience — see
+            // the NOTE at `rebuild_pre_baseline_database`). The rebuild WIPES the
+            // database (renames it aside, starts empty), so it must NEVER run
+            // against a database that still holds a real user credential: refuse,
+            // preserve the file in place, and fail fast so a genuine login is
+            // never silently reset to a "needs setup" state. A disposable
+            // no-credential DB (fresh/dev) is still rebuilt so startup recovers.
+            if database_has_real_credential(path).await {
+                return Err(DbError::Init(format!(
+                    "refusing to rebuild a database that still holds a real user credential \
+                     (pre-baseline migration mismatch); preserved {} in place. Original error: {e}",
+                    path.display()
+                )));
+            }
             rebuild_pre_baseline_database(path, e).await
         }
         Err(e) if path.exists() && should_attempt_recovery(&e) => {
@@ -386,6 +399,45 @@ fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Best-effort check: does the (migration-mismatched) database at `path` still
+/// contain a user with a REAL (non-empty) password?
+///
+/// Gates the destructive pre-baseline rebuild so it never wipes a DB holding a
+/// real credential. Opens its own connection WITHOUT running migrations and
+/// only runs a `SELECT COUNT`, so it works against the old schema. Uses a
+/// read-write open (not read-only) so a WAL-mode database is always fully
+/// readable — a false "no credential" here would let the rebuild wipe a real
+/// login, which is exactly what we must prevent. The caller has already closed
+/// its own pool (see `try_init_file`), so this does not contend with it.
+///
+/// Any open/query failure returns `false` (allow rebuild); the rebuild only
+/// RENAMES the file aside (never deletes), so an unreadable DB is still kept.
+async fn database_has_real_credential(path: &Path) -> bool {
+    let opts = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS));
+    let pool = match PoolOptions::<Sqlite>::new().max_connections(1).connect_with(opts).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("pre-baseline guard: could not open {} to probe credentials: {e}", path.display());
+            return false;
+        }
+    };
+    let probe: Result<(i64,), _> =
+        sqlx::query_as("SELECT COUNT(*) FROM users WHERE password_hash != '' AND password_hash IS NOT NULL")
+            .fetch_one(&pool)
+            .await;
+    pool.close().await;
+    match probe {
+        Ok((count,)) => count > 0,
+        Err(e) => {
+            warn!("pre-baseline guard: credential probe failed on {}: {e}", path.display());
+            false
+        }
+    }
+}
+
 async fn rebuild_pre_baseline_database(path: &Path, original_error: DbError) -> Result<Database, DbError> {
     let backup = pre_baseline_backup_path(path);
     info!(
@@ -591,6 +643,36 @@ mod tests {
         .unwrap();
 
         assert_eq!(fk_table, "conversations");
+    }
+
+    #[tokio::test]
+    async fn database_has_real_credential_distinguishes_empty_and_set_passwords() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe.db");
+
+        // Fresh DB: only the seeded system_default_user with an EMPTY password.
+        {
+            let db = init_database(&path).await.unwrap();
+            db.close().await;
+        }
+        assert!(
+            !database_has_real_credential(&path).await,
+            "an empty-password seed must not be treated as a real credential"
+        );
+
+        // Now write a real password hash and re-probe.
+        {
+            let db = init_database(&path).await.unwrap();
+            sqlx::query("UPDATE users SET password_hash = 'realhash' WHERE id = 'system_default_user'")
+                .execute(db.pool())
+                .await
+                .unwrap();
+            db.close().await;
+        }
+        assert!(
+            database_has_real_credential(&path).await,
+            "a non-empty password_hash must be detected so the rebuild is refused"
+        );
     }
 
     #[test]

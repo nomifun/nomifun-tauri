@@ -617,6 +617,28 @@ fn classify_provider_api(lower: &str) -> Option<ClassifiedError> {
             Some(AgentErrorResolutionTarget::ProviderSettings),
         ));
     }
+    // 图片不支持:上游对 image_url 内容反序列化失败 / 明确拒绝图片。必须排在
+    // 通用 invalid_request 分支之前(那条会吞掉 "invalid_request_error")。
+    // retryable=false + 不在 is_provider_fault → 由会话服务发送环专门"剔图重跑"。
+    if contains_any(
+        lower,
+        &[
+            "image_url",
+            "unknown variant `image_url`",
+            "unknown variant 'image_url'",
+            "does not support image",
+            "image input",
+            "multimodal",
+        ],
+    ) {
+        return Some(provider_error(
+            "当前模型不支持图片输入",
+            AgentErrorCode::UserLlmProviderImageUnsupported,
+            false,
+            AgentErrorResolutionKind::SendFeedback,
+            Some(AgentErrorResolutionTarget::Feedback),
+        ));
+    }
     if contains_any(
         lower,
         &[
@@ -1198,6 +1220,21 @@ mod tests {
             let err = AgentSendError::from_app_error(AppError::BadGateway(detail.into()));
             assert_eq!(err.stream_error().retryable, Some(false));
         }
+    }
+
+    #[test]
+    fn classifies_image_unsupported_from_serde_variant_error() {
+        let detail = "Failed to deserialize the JSON body into the target type: \
+            messages[6]: unknown variant `image_url`, expected `text` at line 1 column 169755";
+        let err = AgentSendError::from_app_error(AppError::BadGateway(detail.into()));
+        assert_eq!(err.code(), Some(AgentErrorCode::UserLlmProviderImageUnsupported));
+    }
+
+    #[test]
+    fn plain_invalid_request_still_classifies_as_invalid_request() {
+        let detail = "invalid_request_error: content is required";
+        let err = AgentSendError::from_app_error(AppError::BadGateway(detail.into()));
+        assert_eq!(err.code(), Some(AgentErrorCode::UserLlmProviderInvalidRequest));
     }
 
     #[test]

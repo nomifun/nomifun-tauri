@@ -16,6 +16,19 @@ use crate::types::NomiCompatOverrides;
 
 use super::nomi::{map_nomi_provider, resolve_bedrock_config, resolve_nomi_url_and_compat};
 
+/// 依 registry 决定该 provider+model 的图片支持 override。
+/// `Some(false)` = 已知不支持(发送时剔图);`None` = 未知(默认支持,行为不变)。
+///
+/// 只读进程级 `VisionUnsupportedRegistry`(内存,不落库),registry 无条目时
+/// 返回 `None` → 下游 `compat.supports_image` 保持默认 `true`,现有行为不变。
+pub(crate) fn image_support_override(provider_id: &str, model: &str) -> Option<bool> {
+    if nomifun_common::VisionUnsupportedRegistry::global().is_unsupported(provider_id, model) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Intermediate result of resolving a provider DB row before building a full
 /// `Config`. Used internally by both `resolve_provider_config` and the nomi
 /// agent factory to avoid duplicating the load+decrypt+map+url logic.
@@ -51,8 +64,11 @@ pub(crate) async fn resolve_provider_fields(
 
     let provider = map_nomi_provider(&row.platform, model, row.model_protocols.as_deref());
 
-    let (base_url, compat_overrides) =
+    let (base_url, mut compat_overrides) =
         resolve_nomi_url_and_compat(&row.platform, &row.base_url, &provider, row.is_full_url);
+    // 依进程级 registry 命中把「不支持图片」透传为 compat override(主动剔除)。
+    // 未命中 → None → 下游默认 supports_image=true,现有行为不变。
+    compat_overrides.supports_image = image_support_override(provider_id, model);
 
     let bedrock_config = if row.platform == "bedrock" {
         resolve_bedrock_config(row.bedrock_config.as_deref())
@@ -113,6 +129,10 @@ pub async fn resolve_provider_config(
     if let Some(path) = fields.compat_overrides.api_path {
         config.compat.api_path = Some(path);
     }
+    // NB: compat_overrides.supports_image is intentionally NOT applied here —
+    // this one-shot path (IDMM sidecar) builds text-only messages, so image
+    // stripping is moot. Only the nomi agent manager applies it. Do not add it
+    // for "consistency"; it would be dead config on this path.
 
     Ok(config)
 }
@@ -375,6 +395,16 @@ async fn drain_text_or_reasoning(
 
 fn provider_error_to_app_error(e: ProviderError) -> AppError {
     AppError::BadGateway(format!("LLM provider error: {e}"))
+}
+
+#[cfg(test)]
+mod image_override_tests {
+    use super::*;
+
+    #[test]
+    fn override_none_when_not_marked() {
+        assert_eq!(image_support_override("unlikely-prov-xyz", "unlikely-model"), None);
+    }
 }
 
 #[cfg(test)]

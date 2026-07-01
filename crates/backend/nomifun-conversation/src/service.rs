@@ -1805,6 +1805,8 @@ impl ConversationService {
             // turn. The seam stops switching at min(max_switches, queue.len()),
             // and a queue-exhausted pick surfaces the ORIGINAL error.
             let mut failover_switches_done: u32 = 0;
+            // 本轮已做过的"剔图重跑"次数(bounded=1,防死循环)。
+            let mut image_strip_retries_done: u32 = 0;
             // Phase 3 (review #2): models already switched to this turn. Passed
             // to the picker so it advances MONOTONICALLY — never re-tries a
             // candidate it already failed over to (no queue thrash).
@@ -1851,17 +1853,23 @@ impl ConversationService {
                     relay = relay.with_runtime_state(state);
                 }
 
-                // review #1/#5: when failover is live AND this turn is still
-                // within the switch bound, install the suppressor so the relay
-                // hides a pre-response provider-fault error that the seam below
-                // will fail over. Rebuilt per iteration because the remaining
-                // budget shrinks as `failover_switches_done` grows.
-                if let Some(config) = failover_config.as_ref() {
-                    let bound = config.max_switches.min(config.queue.len() as u32);
-                    if failover_switches_done < bound {
-                        relay = relay.with_failover_suppressor(Arc::new(
-                            crate::model_failover::is_provider_fault,
-                        ));
+                // 为 nomi 轮安装 pre-response 错误抑制器:既隐藏"将被换模型重试"的
+                // provider fault(在切换上限内),也隐藏"将被同模型剔图重试"的
+                // image-unsupported 400(每轮一次)。被吞的错误进 outcome.suppressed_error,
+                // 若两种重试都未触发,则下方原样 re-surface。
+                if agent.agent_type() == AgentType::Nomi {
+                    let failover_within_bound = failover_config.as_ref().is_some_and(|c| {
+                        failover_switches_done < c.max_switches.min(c.queue.len() as u32)
+                    });
+                    let image_retry_available = image_strip_retries_done == 0;
+                    if failover_within_bound || image_retry_available {
+                        relay = relay.with_failover_suppressor(Arc::new(move |code| {
+                            (failover_within_bound
+                                && crate::model_failover::is_provider_fault(code))
+                                || (image_retry_available
+                                    && code
+                                        == nomifun_api_types::AgentErrorCode::UserLlmProviderImageUnsupported)
+                        }));
                     }
                 }
 
@@ -1925,6 +1933,40 @@ impl ConversationService {
                         resend_msg_id,
                     ));
                     continue;
+                }
+
+                // 图片不支持降级:pre-response 的 image-unsupported 400 → 记忆 + 提示 +
+                // 同模型剔图重跑(每轮一次)。重跑因命中 registry 而剔图,通常成功。
+                // 未触发(已重跑过 / 非 nomi / 有响应 / 码不符 / 重建失败)则落到下方
+                // re-surface,把原始错误显示给用户。
+                if image_strip_retries_done == 0
+                    && agent.agent_type() == AgentType::Nomi
+                    && outcome.terminal.is_error()
+                    && !outcome.emitted_response
+                    && outcome.terminal.code()
+                        == Some(nomifun_api_types::AgentErrorCode::UserLlmProviderImageUnsupported)
+                {
+                    if let Some(rebuilt) = service
+                        .strip_images_and_rebuild(&conv_id, &task_manager)
+                        .await
+                    {
+                        service.persist_images_stripped_tip(&conv_id).await;
+                        info!(
+                            conversation_id = %conv_id,
+                            "Model rejected images; stripped images and resending same model"
+                        );
+                        agent = rebuilt;
+                        image_strip_retries_done += 1;
+                        let resend_msg_id = Self::mint_msg_id();
+                        pending_send = Some((
+                            SendMessageData {
+                                msg_id: resend_msg_id.clone(),
+                                ..resend_payload
+                            },
+                            resend_msg_id,
+                        ));
+                        continue;
+                    }
                 }
 
                 // review #1/#5: the relay SUPPRESSED a pre-response provider error

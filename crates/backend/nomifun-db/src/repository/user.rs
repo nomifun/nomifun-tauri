@@ -42,6 +42,20 @@ pub trait IUserRepository: Send + Sync {
         password_hash: &str,
     ) -> Result<bool, DbError>;
 
+    /// Sets the system default user's password hash ONLY if it is currently
+    /// empty/NULL, and NEVER touches the username.
+    ///
+    /// This is the desktop LAN-provisioning primitive: it must fill in a
+    /// password before exposing the WebUI to the network, but must not clobber
+    /// a username the user already chose (unlike
+    /// [`set_system_user_credentials`](Self::set_system_user_credentials), whose
+    /// SQL rewrites both columns). The `WHERE` clause is the race-safe gate, so
+    /// a second concurrent enable updates 0 rows and reuses the stored password.
+    ///
+    /// Returns `Ok(true)` when the password was written (it was uninitialised),
+    /// `Ok(false)` when a password already existed (nothing changed).
+    async fn set_system_user_password_if_uninitialized(&self, password_hash: &str) -> Result<bool, DbError>;
+
     /// Creates a new user and returns the inserted row.
     ///
     /// Returns `DbError::Conflict` if the username already exists.

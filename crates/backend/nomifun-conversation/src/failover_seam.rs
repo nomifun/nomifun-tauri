@@ -245,6 +245,53 @@ impl ConversationService {
         Some(FailoverSwitch { agent, picked })
     }
 
+    /// 同模型"剔图重建":标记 registry(该 provider+model 不支持图片)→ kill →
+    /// 用同一行重建任务。重建时工厂重新读 registry → compat.supports_image=false →
+    /// build_messages 剔图。仅 nomi 会话放行;返回新句柄或 None(不可重建)。
+    pub(crate) async fn strip_images_and_rebuild(
+        &self,
+        conversation_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Option<AgentInstance> {
+        let conv_id = parse_conv_id(conversation_id).ok()?;
+        let row = match self.conversation_repo().get(conv_id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                warn!(conversation_id, "strip_images_and_rebuild skipped: conversation row missing");
+                return None;
+            }
+            Err(e) => {
+                warn!(error = %ErrorChain(&e), conversation_id, "strip_images_and_rebuild skipped: load failed");
+                return None;
+            }
+        };
+        let agent_type: AgentType = string_to_enum(&row.r#type).ok()?;
+        if agent_type != AgentType::Nomi {
+            return None;
+        }
+        let pm = provider_model_from_conversation_row(&row);
+        nomifun_common::VisionUnsupportedRegistry::global().mark_unsupported(&pm.provider_id, &pm.model);
+
+        task_manager
+            .kill_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
+            .await;
+
+        let build_opts = match self.build_task_options(&row) {
+            Ok(opts) => opts,
+            Err(e) => {
+                warn!(error = %ErrorChain(&e), conversation_id, "strip_images_and_rebuild aborted: build_task_options failed");
+                return None;
+            }
+        };
+        match task_manager.get_or_build_task(conversation_id, build_opts).await {
+            Ok(agent) => Some(agent),
+            Err(e) => {
+                warn!(error = %ErrorChain(&e), conversation_id, "strip_images_and_rebuild aborted: rebuild failed");
+                None
+            }
+        }
+    }
+
     /// send-loop(plan D3)的故障转移决策入口:在 `consume_with_send_error` 之后调用。
     /// **全部满足**才转移(否则返回 `None`,send-loop 按现状 emit 原始错误):
     /// 1. terminal 是 Error 且 code 命中 [`crate::model_failover::is_provider_fault`];

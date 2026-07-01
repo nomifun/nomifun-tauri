@@ -417,4 +417,9 @@ mod tests {
         assert!(!is_provider_fault(AgentErrorCode::UserAgentNotInstalled));
         assert!(!is_provider_fault(AgentErrorCode::NomifunConversationBusy));
     }
+
+    #[test]
+    fn image_unsupported_is_not_provider_fault() {
+        assert!(!is_provider_fault(AgentErrorCode::UserLlmProviderImageUnsupported));
+    }
 }

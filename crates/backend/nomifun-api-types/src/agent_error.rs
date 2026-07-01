@@ -40,6 +40,9 @@ pub enum AgentErrorCode {
     UserLlmProviderUnsupportedModel,
     UserLlmProviderEndpointNotFound,
     UserLlmProviderInvalidRequest,
+    /// 模型不支持图片输入(收到 image_url 类 400)。会话服务据此剔图重跑,
+    /// 故意 **不** 计入 is_provider_fault(不触发换模型)。
+    UserLlmProviderImageUnsupported,
     UserLlmProviderInvalidToolSchema,
     UserLlmProviderContextTooLarge,
     UserLlmProviderRateLimited,
@@ -155,6 +158,15 @@ impl AgentStreamErrorData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_unsupported_serde_roundtrip() {
+        let code = AgentErrorCode::UserLlmProviderImageUnsupported;
+        let json = serde_json::to_string(&code).unwrap();
+        assert_eq!(json, "\"USER_LLM_PROVIDER_IMAGE_UNSUPPORTED\"");
+        let back: AgentErrorCode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, code);
+    }
 
     #[test]
     fn classified_error_serializes_as_public_contract() {

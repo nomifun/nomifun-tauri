@@ -92,8 +92,11 @@ impl OpenAIProvider {
                                     "tool_call_id": tool_use_id,
                                     "content": content
                                 }));
-                                if let Some(img_msg) = tool_images_user_message(tool_use_id, images)
-                                {
+                                if let Some(img_msg) = tool_images_user_message(
+                                    tool_use_id,
+                                    images,
+                                    compat.supports_image(),
+                                ) {
                                     result.push(img_msg);
                                 }
                             }
@@ -109,6 +112,7 @@ impl OpenAIProvider {
                             // Multimodal user message: build content array with
                             // text and image_url parts.
                             let mut parts: Vec<Value> = Vec::new();
+                            let mut stripped_images = 0usize;
                             for block in &msg.content {
                                 match block {
                                     ContentBlock::Text { text } => {
@@ -121,15 +125,25 @@ impl OpenAIProvider {
                                         }
                                     }
                                     ContentBlock::Image { media_type, data } => {
-                                        parts.push(json!({
-                                            "type": "image_url",
-                                            "image_url": {
-                                                "url": format!("data:{media_type};base64,{data}")
-                                            }
-                                        }));
+                                        if compat.supports_image() {
+                                            parts.push(json!({
+                                                "type": "image_url",
+                                                "image_url": {
+                                                    "url": format!("data:{media_type};base64,{data}")
+                                                }
+                                            }));
+                                        } else {
+                                            stripped_images += 1;
+                                        }
                                     }
                                     _ => {}
                                 }
+                            }
+                            if stripped_images > 0 {
+                                parts.push(json!({
+                                    "type": "text",
+                                    "text": "[图片已省略：当前模型不支持图片输入]"
+                                }));
                             }
                             result.push(json!({
                                 "role": "user",
@@ -257,7 +271,11 @@ impl OpenAIProvider {
                                 "tool_call_id": tool_use_id,
                                 "content": content
                             }));
-                            if let Some(img_msg) = tool_images_user_message(tool_use_id, images) {
+                            if let Some(img_msg) = tool_images_user_message(
+                                tool_use_id,
+                                images,
+                                compat.supports_image(),
+                            ) {
                                 result.push(img_msg);
                             }
                         }
@@ -358,8 +376,9 @@ fn generate_call_id() -> String {
 fn tool_images_user_message(
     tool_use_id: &str,
     images: &[nomi_types::tool::ToolImage],
+    supports_image: bool,
 ) -> Option<Value> {
-    if images.is_empty() {
+    if images.is_empty() || !supports_image {
         return None;
     }
     let mut parts: Vec<Value> = vec![json!({
@@ -968,6 +987,45 @@ mod tests {
                 .unwrap()
                 .ends_with("aGVsbG8=")
         );
+    }
+
+    #[test]
+    fn strips_user_image_when_supports_image_false() {
+        use nomi_types::message::{ContentBlock, Message, Role};
+        let compat = ProviderCompat {
+            supports_image: Some(false),
+            ..Default::default()
+        };
+        let messages = vec![Message::new(
+            Role::User,
+            vec![
+                ContentBlock::Text { text: "看这张图".into() },
+                ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "AAAA".into(),
+                },
+            ],
+        )];
+        let out = OpenAIProvider::build_messages(&messages, "", &compat);
+        let s = serde_json::to_string(&out).unwrap();
+        assert!(!s.contains("image_url"), "不应出现 image_url: {s}");
+        assert!(s.contains("图片已省略"), "应出现占位: {s}");
+    }
+
+    #[test]
+    fn keeps_user_image_when_supports_image_true() {
+        use nomi_types::message::{ContentBlock, Message, Role};
+        let compat = ProviderCompat::default(); // supports_image() == true
+        let messages = vec![Message::new(
+            Role::User,
+            vec![ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            }],
+        )];
+        let out = OpenAIProvider::build_messages(&messages, "", &compat);
+        let s = serde_json::to_string(&out).unwrap();
+        assert!(s.contains("image_url"), "应保留 image_url: {s}");
     }
 
     use super::*;
