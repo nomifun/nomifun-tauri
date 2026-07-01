@@ -425,6 +425,22 @@ impl RunEngine {
     pub fn resume_persisted_runs(&self, run_repo: Arc<dyn IRunRepository>) {
         let this = self.clone();
         tokio::spawn(async move {
+            // RECONCILE FIRST: a fresh process has NO live workers, so EVERY
+            // persisted `running` task is an orphan (the worker/loop that owned it
+            // died with the previous process). Settle them back to `pending` BEFORE
+            // restarting any loop, restoring the invariant `running ⟺ live worker`.
+            // Without this, an orphaned `running` task shows「执行中」forever and the
+            // rerun guard rejects it ("任务运行中…") — permanently stuck. Resettable
+            // runs then re-dispatch these pending tasks; terminal runs leave them
+            // re-runnable. Kind-aware (verify/judge/loop keep their policy config).
+            match run_repo.reset_orphaned_running_tasks(None).await {
+                Ok(n) if n > 0 => {
+                    info!(reset = n, "Run engine boot: reset orphaned running tasks → pending")
+                }
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "Run engine boot: reset orphaned running tasks failed"),
+            }
+
             let runs = match run_repo.list_runs_by_status("running").await {
                 Ok(r) => r,
                 Err(e) => {
@@ -526,6 +542,19 @@ impl RunEngine {
     ) -> Result<nomifun_api_types::Run, AppError> {
         let lock = self.deps.run_locks.for_run(run_id);
         let _rerun_guard = lock.lock().await;
+        // LIVENESS RECOVERY: `RunService::rerun_task` rejects a `running` target
+        // (its live worker would settle `done` over the reset). But if THIS run has
+        // no live loop (`!is_running`), a `running` task is a phantom ORPHAN — its
+        // worker died (e.g. a mid-session loop panic that deregistered the handle,
+        // or a stop before boot re-armed) — so the guard would wrongly wedge the
+        // node forever. Normalize the run's orphaned `running` → `pending` first (we
+        // hold the run lock + there is no loop, so nothing else races the reset),
+        // then rerun proceeds. A live run (`is_running`) is left untouched — its
+        // `running` really is live and the guard correctly asks the user to
+        // pause/stop first.
+        if !self.is_running(run_id) {
+            run_service.reset_orphaned_running(run_id).await?;
+        }
         run_service.rerun_task(user_id, run_id, task_id).await
     }
 
@@ -8039,6 +8068,100 @@ mod tests {
             }
         });
         let _ = drive_to_completion(&svc, &run_id).await;
+    }
+
+    // Fix C (LIVENESS RECOVERY): a `running` task with NO live loop is a phantom
+    // ORPHAN (its worker died — the reported「重启后卡在执行中、无法重跑」bug). Unlike
+    // `rerun_rejects_running_task` (a LIVE loop → correctly rejected), here the loop
+    // is killed mid-flight (`engine.stop`) so `!is_running`, and rerun must RECOVER:
+    // normalize the orphan → pending, then reset + re-drive — never wedge it with a 400.
+    #[tokio::test]
+    async fn rerun_recovers_phantom_running_when_no_live_loop() {
+        // A gated worker parks its task in `running` until released.
+        struct GatedWorker {
+            gate: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait]
+        impl WorkerRunner for GatedWorker {
+            async fn run(
+                &self,
+                _member: &FleetMember,
+                _workspace_dir: Option<&str>,
+                _run_id: &str,
+                task_id: &str,
+                _brief: &str,
+                _task_spec: &str,
+                _timeout: Duration,
+                on_started: Box<dyn FnOnce(i64) + Send>,
+            ) -> Result<WorkerOutcome, AppError> {
+                on_started(900);
+                self.gate.notified().await;
+                Ok(WorkerOutcome {
+                    conversation_id: 900,
+                    text: Some(format!("output of {task_id}")),
+                    ok: true,
+                    tokens: None,
+                })
+            }
+        }
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let worker: Arc<dyn WorkerRunner> = Arc::new(GatedWorker { gate: gate.clone() });
+        let (svc, engine, run_id) = rerun_chain_harness(worker).await;
+
+        // Drive until task A is live-`running` (its worker parked on the gate).
+        engine.start(run_id.clone());
+        let mut running_id = None;
+        for _ in 0..200 {
+            let d = svc.get_detail(&run_id).await.expect("detail");
+            running_id = d.tasks.iter().find(|t| t.status == "running").map(|t| t.id.clone());
+            if running_id.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let running_id = running_id.expect("a task reached running");
+
+        // Kill the loop mid-flight: the handle is removed (is_running=false) and the
+        // worker future aborted BEFORE it can write a terminal status — leaving the
+        // task stuck `running` with no live worker. THIS is the reported orphan (a
+        // crash / stop that never settled the node). Boot reconcile fixes it on the
+        // next restart; here we prove rerun ALSO recovers it live (no restart).
+        engine.stop(&run_id);
+        assert!(!engine.is_running(&run_id), "loop stopped → no live worker");
+        let still = svc.get_detail(&run_id).await.expect("detail");
+        assert_eq!(
+            still.tasks.iter().find(|t| t.id == running_id).unwrap().status,
+            "running",
+            "task is a phantom `running` orphan after the loop died"
+        );
+
+        // Rerun the phantom: must RECOVER (normalize orphan → pending), NOT reject
+        // with a 400 (which is only correct for a genuinely LIVE running task).
+        engine
+            .rerun_task(&svc, "u1", &run_id, &running_id)
+            .await
+            .expect("rerun of a phantom-running orphan must recover, not reject");
+        let reset = svc.get_detail(&run_id).await.expect("detail");
+        assert_eq!(
+            reset.tasks.iter().find(|t| t.id == running_id).unwrap().status,
+            "pending",
+            "phantom running recovered → pending (re-runnable)"
+        );
+
+        // Release the gated workers so the re-driven run settles (no leaked blocks),
+        // then confirm end-to-end recovery: the re-activated run drives to completed.
+        tokio::spawn({
+            let gate = gate.clone();
+            async move {
+                for _ in 0..30 {
+                    gate.notify_one();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        });
+        engine.start(run_id.clone());
+        let done = drive_to_completion(&svc, &run_id).await;
+        assert_eq!(done.run.status, "completed", "recovered run completes");
     }
 
     // Edit a non-running task's spec → the task's spec changes AND a subsequent

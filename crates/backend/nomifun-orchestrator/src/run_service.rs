@@ -1097,6 +1097,22 @@ impl RunService {
         Ok(())
     }
 
+    /// Reset a run's ORPHANED `running` tasks back to `pending` (thin service
+    /// wrapper over [`IRunRepository::reset_orphaned_running_tasks`] scoped to one
+    /// run). Called by [`RunEngine::rerun_task`](crate::engine::RunEngine::rerun_task)
+    /// ONLY when the run has no live loop (`!is_running`), so a `running` row is
+    /// provably an orphan whose worker died — normalizing it lets the subsequent
+    /// rerun proceed (the rerun guard rejects a `running` target). Kind-aware; no
+    /// emit (the caller's rerun emits + the route's refetch reload all task states).
+    pub async fn reset_orphaned_running(&self, run_id: &str) -> Result<u64, AppError> {
+        let n = self
+            .run_repo
+            .reset_orphaned_running_tasks(Some(run_id))
+            .await
+            .map_err(OrchestratorError::from)?;
+        Ok(n)
+    }
+
     /// Cancel a run: flip it to `cancelled` and emit. The engine's cooperative
     /// cancel (set via [`RunEngine::stop`](crate::engine::RunEngine::stop)) is
     /// the runtime counterpart; this is the persisted state change.
@@ -1111,6 +1127,17 @@ impl RunService {
         {
             return Err(OrchestratorError::NotFound(format!("run {run_id}")).into());
         }
+        // Settle the interrupted node(s): the cancel ROUTE called `engine.stop`
+        // FIRST, which aborted the run loop and cancelled its in-flight worker
+        // conversation(s) — so any `running` task is now a guaranteed ORPHAN (its
+        // worker is gone and the aborted loop will never write its terminal status).
+        // Mark them `cancelled` so the invariant `running ⟺ live worker` holds and
+        // no phantom「执行中」node survives the cancel (which would otherwise block a
+        // later rerun/adjust). A subsequent rerun resets it (non-running → pending).
+        self.run_repo
+            .mark_run_running_tasks_cancelled(run_id)
+            .await
+            .map_err(OrchestratorError::from)?;
         self.run_repo
             .update_run(
                 run_id,
@@ -4605,6 +4632,35 @@ mod tests {
         assert_eq!(after.tasks.len(), 1, "run untouched");
         assert_eq!(after.tasks[0].id, tid);
         assert!(!after.tasks.iter().any(|t| t.title == "新"), "no new task added");
+    }
+
+    // Fix B: cancelling a run SETTLES its interrupted `running` node to `cancelled`
+    // (not leaving a phantom「执行中」that would block a later rerun/adjust). The run
+    // route calls `engine.stop` first (aborting the loop + cancelling the worker) so
+    // by the time the service runs, the `running` row is a guaranteed orphan — here
+    // we simulate that static orphan (no live loop) and assert cancel normalizes it.
+    #[tokio::test]
+    async fn cancel_settles_running_task_to_cancelled() {
+        let (svc, run_id) = adjust_harness(
+            single_task_dag(Some(0), None),
+            AdjustedPlan { tasks: vec![] },
+        )
+        .await;
+        let before = svc.get_detail(&run_id).await.expect("detail");
+        let tid = before.tasks[0].id.clone();
+        svc.run_repo
+            .update_task(&tid, UpdateTaskParams { status: Some("running".to_string()), ..Default::default() })
+            .await
+            .expect("set running");
+
+        svc.cancel(&run_id).await.expect("cancel");
+
+        let after = svc.get_detail(&run_id).await.expect("detail");
+        assert_eq!(after.run.status, "cancelled", "run cancelled");
+        assert_eq!(
+            after.tasks[0].status, "cancelled",
+            "interrupted running node settled to cancelled (no phantom 执行中)"
+        );
     }
 
     // OWNER-SCOPE: a non-owner is rejected (403) and the run is untouched.
