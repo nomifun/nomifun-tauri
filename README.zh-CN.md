@@ -191,6 +191,25 @@ NomiFun 的每一项能力都经由单一、强类型的能力注册表对外开
 - **经 ACP 直连约 19 个外部智能体** —— Claude Code、Codex、Gemini、Qwen、Kimi、Cursor、Copilot、Goose、OpenCode、Droid 等，NomiFun 为它们提供模型*以及*自家的原生能力（computer/browser/knowledge/gateway，经注入的 MCP 桥）。
 - **处处可用** —— 这些原生能力对内置智能体、ACP 智能体、聊天界面**以及**终端一律可用。
 
+### 🔌 大模型供应商快捷入口
+
+NomiFun 不绑定任何一家模型厂商。你可以按地区、价格、额度、模型能力和数据政策选择供应商，注册后把 API Key 填到 NomiFun 的 **模型 & Agent** 页面即可使用。以下均为第三方服务，费用、可用地区、速率限制与数据处理规则以各家官方说明为准。
+
+| 供应商 | 快速入口 | 推荐关注点 |
+|---|---|---|
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=platform.stepfun.ai" alt="StepFun logo" width="20" height="20"> **StepFun / 阶跃星辰** | [开放平台](https://platform.stepfun.ai/) | Step 系列模型，适合中文、Agent 与性价比场景 |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=platform.kimi.ai" alt="Kimi logo" width="20" height="20"> **Kimi / Moonshot AI** | [API Key](https://platform.kimi.ai/console/api-keys) | 长上下文、中文写作、代码与通用任务 |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=bigmodel.cn" alt="GLM logo" width="20" height="20"> **GLM / 智谱 BigModel** | [API Key](https://open.bigmodel.cn/usercenter/apikeys) | GLM 系列、通用推理、代码与企业接入 |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=www.volcengine.com" alt="Doubao logo" width="20" height="20"> **Doubao / 火山方舟** | [API Key](https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey) | 豆包系列模型，适合国内云账号与企业部署链路 |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=help.aliyun.com" alt="Qwen logo" width="20" height="20"> **Qwen / 通义千问 / 百炼** | [API Key](https://bailian.console.aliyun.com/?tab=model#/api-key) | Qwen 系列、DashScope 生态与阿里云工作流 |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=platform.minimax.io" alt="MiniMax logo" width="20" height="20"> **MiniMax / MinMax** | [API Key](https://platform.minimax.io/user-center/basic-information/interface-key) | MiniMax 模型、长文本、多模态与语音能力 |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=mimo.mi.com" alt="MiMo logo" width="20" height="20"> **MiMo / 小米** | [官网](https://mimo.mi.com/) | MiMo 系列模型与小米生态能力 |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=platform.deepseek.com" alt="DeepSeek logo" width="20" height="20"> **DeepSeek** | [API Key](https://platform.deepseek.com/api_keys) | 推理、代码与高性价比模型调用 |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=openrouter.ai" alt="OpenRouter logo" width="20" height="20"> **OpenRouter** | [API Key](https://openrouter.ai/keys) | 多模型聚合、统一账单、备用路由与模型对比 |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=platform.claude.com" alt="Claude logo" width="20" height="20"> **Claude / Anthropic** | [API Key](https://platform.claude.com/settings/keys) | Claude 系列、长文本、代码与 Claude Code 生态 |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=developers.openai.com" alt="Codex logo" width="20" height="20"> **Codex / OpenAI** | [Codex](https://developers.openai.com/codex) · [API Key](https://platform.openai.com/api-keys) | Codex、OpenAI API、代码 Agent 与通用模型 |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=aistudio.google.com" alt="Gemini logo" width="20" height="20"> **Gemini / Google AI** | [API Key](https://aistudio.google.com/app/apikey) | Gemini 系列、多模态、超长上下文与 Google AI Studio |
+
 ### 💻 终端模式
 
 > 指南：[`docs/guides/terminal.zh.md`](docs/guides/terminal.zh.md)

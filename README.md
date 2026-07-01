@@ -192,6 +192,25 @@ Every capability NomiFun has is exposed through a single, typed capability regis
 - **~19 external agents over ACP** — connect Claude Code, Codex, Gemini, Qwen, Kimi, Cursor, Copilot, Goose, OpenCode, Droid, and more, and NomiFun feeds them models *and* its native capabilities (computer/browser/knowledge/gateway) over injected MCP bridges.
 - **Everywhere** — the native capabilities are available to the built-in agent, to ACP agents, in the chat UI, **and** in the terminal.
 
+### 🔌 Model providers: quick setup links
+
+NomiFun does not lock you into a single model vendor. Pick providers by region, price, quota, model capability, and data policy, then paste the API key into NomiFun's **Models & Agents** page. These are third-party services; pricing, regional availability, rate limits, and data-handling terms are controlled by each provider.
+
+| Provider | Start here | Good to evaluate |
+|---|---|---|
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=platform.stepfun.ai" alt="StepFun logo" width="20" height="20"> **StepFun** | [Platform](https://platform.stepfun.ai/) | Step models for Chinese, agentic, and cost-conscious workloads |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=platform.kimi.ai" alt="Kimi logo" width="20" height="20"> **Kimi / Moonshot AI** | [API keys](https://platform.kimi.ai/console/api-keys) | Long context, Chinese writing, coding, and general tasks |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=bigmodel.cn" alt="GLM logo" width="20" height="20"> **GLM / Zhipu BigModel** | [API keys](https://open.bigmodel.cn/usercenter/apikeys) | GLM models, general reasoning, coding, and enterprise integration |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=www.volcengine.com" alt="Doubao logo" width="20" height="20"> **Doubao / Volcengine Ark** | [API keys](https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey) | Doubao models and China-region cloud/enterprise workflows |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=help.aliyun.com" alt="Qwen logo" width="20" height="20"> **Qwen / Alibaba Cloud Model Studio** | [API keys](https://bailian.console.aliyun.com/?tab=model#/api-key) | Qwen models, DashScope, and Alibaba Cloud workflows |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=platform.minimax.io" alt="MiniMax logo" width="20" height="20"> **MiniMax / MinMax** | [API keys](https://platform.minimax.io/user-center/basic-information/interface-key) | MiniMax models, long-form text, multimodal, and voice capabilities |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=mimo.mi.com" alt="MiMo logo" width="20" height="20"> **MiMo / Xiaomi** | [Website](https://mimo.mi.com/) | MiMo models and Xiaomi ecosystem capabilities |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=platform.deepseek.com" alt="DeepSeek logo" width="20" height="20"> **DeepSeek** | [API keys](https://platform.deepseek.com/api_keys) | Reasoning, coding, and high value-for-money model calls |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=openrouter.ai" alt="OpenRouter logo" width="20" height="20"> **OpenRouter** | [API keys](https://openrouter.ai/keys) | Multi-model aggregation, unified billing, fallback routing, and comparison |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=platform.claude.com" alt="Claude logo" width="20" height="20"> **Claude / Anthropic** | [API keys](https://platform.claude.com/settings/keys) | Claude models, long-form work, coding, and the Claude Code ecosystem |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=developers.openai.com" alt="Codex logo" width="20" height="20"> **Codex / OpenAI** | [Codex](https://developers.openai.com/codex) · [API keys](https://platform.openai.com/api-keys) | Codex, OpenAI API, code agents, and general-purpose models |
+| <img src="https://www.google.com/s2/favicons?sz=64&domain=aistudio.google.com" alt="Gemini logo" width="20" height="20"> **Gemini / Google AI** | [API keys](https://aistudio.google.com/app/apikey) | Gemini models, multimodal work, very long context, and Google AI Studio |
+
 ### 💻 Terminal mode
 
 > Guide: [`docs/guides/terminal.md`](docs/guides/terminal.md)
