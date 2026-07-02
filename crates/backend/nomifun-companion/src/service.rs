@@ -438,10 +438,20 @@ impl CompanionService {
         id: &str,
         exposure: nomifun_api_types::ExposureMode,
     ) -> Result<CompanionProfileConfig, AppError> {
+        // Snapshot the pre-flip tier so the audit detail reads "{old} → {new}".
+        let prev_exposure = self.registry.get(id).await.map(|p| p.exposure).unwrap_or_default();
         let profile = self
             .registry
             .patch(id, serde_json::json!({ "exposure": exposure }))
             .await?;
+        // Audit the flip whenever PublicService is on either side (publish or
+        // un-publish of an "外呼员工"). The outbound-employee log only tracks
+        // PublicService lifecycle, so a private↔trusted_remote change is not
+        // recorded. Best-effort: never fails the flip.
+        use nomifun_api_types::ExposureMode::PublicService;
+        if prev_exposure == PublicService || profile.exposure == PublicService {
+            self.append_audit_entry(id, crate::audit::AuditEntry::exposure_change(prev_exposure, profile.exposure));
+        }
         self.emitter.emit_companion_updated(&profile.id, &profile);
         // Recycle the companion's bound (channel) sessions so a warm session
         // rebuilds against the new exposure immediately, not just on next cold
@@ -453,6 +463,52 @@ impl CompanionService {
             }
         }
         Ok(profile)
+    }
+
+    // ----- outbound-employee (PublicService) audit log -----
+
+    /// Best-effort append of an audit entry to the companion's per-companion
+    /// `audit.jsonl` (`{companions_dir}/{id}/audit.jsonl`). A failing write is
+    /// logged and swallowed — auditing must never break the turn / exposure flip
+    /// it documents.
+    fn append_audit_entry(&self, companion_id: &str, entry: crate::audit::AuditEntry) {
+        let dir = self.registry.companions_dir().join(companion_id);
+        if let Err(e) = crate::audit::append_audit(&dir, &entry) {
+            tracing::warn!(error = %e, companion_id, "append companion audit entry failed");
+        }
+    }
+
+    /// Record a `"turn"` audit entry for an inbound turn hosted by `companion_id`,
+    /// but ONLY when that companion is a `PublicService` "外呼员工" (its live
+    /// exposure tier is read here — the write hook stays a no-op for private
+    /// companions). Best-effort: never fails the turn.
+    pub async fn record_public_service_turn(
+        &self,
+        companion_id: &str,
+        surface: &str,
+        channel_platform: Option<String>,
+        text: &str,
+    ) {
+        let is_public = self
+            .registry
+            .get(companion_id)
+            .await
+            .map(|p| p.exposure == nomifun_api_types::ExposureMode::PublicService)
+            .unwrap_or(false);
+        if !is_public {
+            return;
+        }
+        self.append_audit_entry(companion_id, crate::audit::AuditEntry::turn(surface, channel_platform, text));
+    }
+
+    /// The most-recent `limit` audit entries for a companion (newest-first).
+    /// Existence-gated: an unknown companion 404s before any file read.
+    pub async fn read_audit(&self, companion_id: &str, limit: usize) -> Result<crate::audit::AuditPage, AppError> {
+        self.get_companion(companion_id).await?;
+        let dir = self.registry.companions_dir().join(companion_id);
+        Ok(crate::audit::AuditPage {
+            entries: crate::audit::read_recent_audit(&dir, limit),
+        })
     }
 
     /// Best-effort：把伙伴「已存在」会话的工作区目录收敛到当前名字。无会话则跳过
@@ -1798,6 +1854,59 @@ mod tests {
         assert_eq!(svc.get_config().await.default_companion_id, first.id);
         assert_ne!(first.id, second.id);
         assert_eq!(svc.list_companions().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn set_exposure_writes_audit_entry_and_gates_turn_audit() {
+        use nomifun_api_types::ExposureMode;
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service(dir.path()).await;
+        let c = svc.create_companion("外呼", "ink").await.unwrap();
+
+        // Private companion: a turn audit is a no-op (nothing recorded).
+        svc.record_public_service_turn(&c.id, "channel", Some("telegram".into()), "私聊内容").await;
+        assert!(svc.read_audit(&c.id, 50).await.unwrap().entries.is_empty());
+
+        // Flip to PublicService → an exposure_change entry lands.
+        svc.set_exposure(&c.id, ExposureMode::PublicService).await.unwrap();
+        let page = svc.read_audit(&c.id, 50).await.unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].kind, "exposure_change");
+        assert_eq!(page.entries[0].surface, "desktop");
+        assert_eq!(page.entries[0].detail, "private → public_service");
+
+        // Now a companion-bound turn IS audited (newest-first at index 0).
+        svc.record_public_service_turn(&c.id, "channel", Some("telegram".into()), "帮我查下订单").await;
+        let page = svc.read_audit(&c.id, 50).await.unwrap();
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.entries[0].kind, "turn");
+        assert_eq!(page.entries[0].surface, "channel");
+        assert_eq!(page.entries[0].channel_platform.as_deref(), Some("telegram"));
+        assert_eq!(page.entries[0].detail, "帮我查下订单");
+        assert_eq!(page.entries[1].kind, "exposure_change");
+
+        // Flip back to Private → the un-publish is also recorded (PublicService
+        // was on the old side), but subsequent turns stop being audited.
+        svc.set_exposure(&c.id, ExposureMode::Private).await.unwrap();
+        svc.record_public_service_turn(&c.id, "channel", None, "私聊又来了").await;
+        let page = svc.read_audit(&c.id, 50).await.unwrap();
+        assert_eq!(page.entries.len(), 3, "un-publish recorded, private turn not");
+        assert_eq!(page.entries[0].kind, "exposure_change");
+        assert_eq!(page.entries[0].detail, "public_service → private");
+
+        // Unknown companion → 404 (existence-gated).
+        assert!(matches!(svc.read_audit("companion_nope", 50).await, Err(AppError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn set_exposure_private_to_trusted_remote_is_not_audited() {
+        use nomifun_api_types::ExposureMode;
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service(dir.path()).await;
+        let c = svc.create_companion("常规", "ink").await.unwrap();
+        // No PublicService on either side → the outbound-employee log stays empty.
+        svc.set_exposure(&c.id, ExposureMode::TrustedRemote).await.unwrap();
+        assert!(svc.read_audit(&c.id, 50).await.unwrap().entries.is_empty());
     }
 
     #[tokio::test]

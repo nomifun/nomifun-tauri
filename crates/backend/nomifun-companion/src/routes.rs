@@ -32,6 +32,7 @@ pub fn companion_routes(state: CompanionRouterState) -> Router {
             "/api/companion/companions/{companion_id}/exposure",
             axum::routing::put(set_companion_exposure),
         )
+        .route("/api/companion/companions/{companion_id}/audit", get(get_companion_audit))
         .route("/api/companion/companions/{companion_id}/figure", post(upload_figure).get(get_figure))
         .route("/api/companion/matting-model", get(get_matting_model))
         .route("/api/companion/figures", get(list_figures).post(create_figure))
@@ -561,6 +562,23 @@ async fn set_companion_exposure(
     Ok(Json(ApiResponse::ok(
         state.service.set_exposure(&companion_id, req.exposure).await?,
     )))
+}
+
+#[derive(Deserialize)]
+struct AuditQuery {
+    limit: Option<usize>,
+}
+
+/// The outbound-employee (PublicService) audit log for a companion, newest-first.
+/// `limit` defaults to 50 and is clamped to 1..=200.
+async fn get_companion_audit(
+    State(state): State<CompanionRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(companion_id): Path<String>,
+    Query(q): Query<AuditQuery>,
+) -> Result<Json<ApiResponse<crate::audit::AuditPage>>, AppError> {
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    Ok(Json(ApiResponse::ok(state.service.read_audit(&companion_id, limit).await?)))
 }
 
 async fn companion_status(

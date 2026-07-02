@@ -11,6 +11,7 @@
 //! per-companion companion chat; `service` bundles them; `routes`/`state` are the
 //! API surface; `migrate` lifts a legacy `companion/nomi/` install into the split.
 
+pub mod audit;
 pub mod collector;
 pub mod companion;
 pub mod archiver;
