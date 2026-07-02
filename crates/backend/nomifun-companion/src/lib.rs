@@ -13,6 +13,8 @@
 
 pub mod collector;
 pub mod companion;
+pub mod archiver;
+pub mod archive_port;
 pub mod config;
 pub mod events;
 pub mod evolution;
@@ -36,7 +38,7 @@ pub mod store;
 pub use config::CompanionConfig;
 pub use events::CompanionEventEmitter;
 pub use figures::FigureMeta;
-pub use profile::{CustomFigureMeta, HeadBox, CompanionProfileConfig, CompanionWindowConfig, SharedLearnConfig, SharedCompanionConfig};
+pub use profile::{CustomFigureMeta, HeadBox, CompanionProfileConfig, CompanionWindowConfig, SharedArchiveConfig, SharedLearnConfig, SharedCompanionConfig};
 pub use registry::CompanionRegistry;
 pub use routes::{companion_public_routes, companion_routes};
 pub use service::CompanionService;

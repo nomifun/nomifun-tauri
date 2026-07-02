@@ -64,6 +64,18 @@ impl ToolRegistry {
             })
             .collect()
     }
+
+    /// Keep only the tools whose name is in `allowed`. An EMPTY `allowed` is a
+    /// no-op (= unrestricted), so callers can pass a config value straight
+    /// through. Used for restricted sub-agent worker sessions (per-node tool
+    /// whitelist) — registration-time filtering, because the registry has no
+    /// unregister.
+    pub fn retain_named(&mut self, allowed: &[String]) {
+        if allowed.is_empty() {
+            return;
+        }
+        self.tools.retain(|t| allowed.iter().any(|a| a == t.name()));
+    }
 }
 
 #[cfg(test)]
@@ -275,6 +287,29 @@ mod tests {
         let registry = ToolRegistry::new();
         let defs = registry.to_tool_defs_filtered(|_| true);
         assert!(defs.is_empty());
+    }
+
+    // --- retain_named (per-node tool whitelist) tests ---
+
+    #[test]
+    fn retain_named_keeps_only_allowed_and_empty_is_noop() {
+        let mut registry = ToolRegistry::new();
+        registry.register(make_tool("Glob", "find files"));
+        registry.register(make_tool("Grep", "search content"));
+        registry.register(make_tool("Bash", "run commands"));
+
+        // 空 allowlist = 不限制（默认，零回归）。
+        registry.retain_named(&[]);
+        assert!(registry.get("Glob").is_some());
+        assert!(registry.get("Grep").is_some());
+        assert!(registry.get("Bash").is_some());
+
+        // 非空 = 只保留白名单内的（含 MCP 代理等一切已注册工具）。
+        registry.retain_named(&["Glob".to_string(), "Grep".to_string()]);
+        assert!(registry.get("Glob").is_some());
+        assert!(registry.get("Grep").is_some());
+        assert!(registry.get("Bash").is_none(), "白名单外的工具必须被移除");
+        assert_eq!(registry.tool_names().len(), 2);
     }
 
     // --- deferred flag tests ---

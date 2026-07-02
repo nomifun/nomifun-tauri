@@ -281,12 +281,24 @@ fn build_synthesis_prompt(results: &[crate::spawner::SubAgentResult]) -> String 
 }
 
 fn parse_tasks(input: &Value) -> Result<Vec<SubAgentConfig>, String> {
-    let tasks_arr = input["tasks"]
-        .as_array()
-        .ok_or("Missing or invalid 'tasks' array")?;
+    // Accept both a real array and a provider-stringified one (`tasks` sent as a
+    // JSON string). The engine also coerces this centrally
+    // (nomi_tools::coerce_input_to_schema) before dispatch; this local net keeps
+    // the tool correct when called directly (sub-agent runners, tests).
+    let tasks_arr: Vec<Value> = match &input["tasks"] {
+        Value::Array(a) => a.clone(),
+        Value::String(s) => serde_json::from_str::<Value>(s)
+            .ok()
+            .and_then(|v| match v {
+                Value::Array(a) => Some(a),
+                _ => None,
+            })
+            .ok_or("Missing or invalid 'tasks' array")?,
+        _ => return Err("Missing or invalid 'tasks' array".to_string()),
+    };
 
     let mut configs = Vec::new();
-    for task in tasks_arr {
+    for task in &tasks_arr {
         let name = task["name"]
             .as_str()
             .ok_or("Each task must have a 'name' string")?
@@ -311,10 +323,44 @@ fn parse_tasks(input: &Value) -> Result<Vec<SubAgentConfig>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_synthesis_prompt, role_tools, wants_synthesis};
+    use super::{build_synthesis_prompt, parse_tasks, role_tools, wants_synthesis};
     use crate::spawner::SubAgentResult;
     use nomi_types::message::TokenUsage;
     use serde_json::json;
+
+    #[test]
+    fn parse_tasks_accepts_real_array() {
+        let cfgs = parse_tasks(&json!({
+            "tasks": [{"name": "a", "prompt": "p1"}, {"name": "b", "prompt": "p2", "role": "searcher"}]
+        }))
+        .unwrap();
+        assert_eq!(cfgs.len(), 2);
+        assert_eq!(cfgs[0].name, "a");
+        assert_eq!(cfgs[0].prompt, "p1");
+        // role=searcher restricts tools to read-only.
+        assert_eq!(cfgs[1].allowed_tools, vec!["Read", "Grep", "Glob"]);
+    }
+
+    #[test]
+    fn parse_tasks_accepts_provider_stringified_array() {
+        // The reported failure: `tasks` arrived as a JSON *string*. It must parse.
+        let cfgs = parse_tasks(&json!({
+            "tasks": "[{\"name\": \"子agent1\", \"prompt\": \"请直接输出: hello world\"}, {\"name\": \"子agent2\", \"prompt\": \"请直接输出: hello world\"}]"
+        }))
+        .unwrap();
+        assert_eq!(cfgs.len(), 2);
+        assert_eq!(cfgs[0].name, "子agent1");
+        assert_eq!(cfgs[1].prompt, "请直接输出: hello world");
+    }
+
+    #[test]
+    fn parse_tasks_rejects_missing_and_garbage() {
+        assert!(parse_tasks(&json!({})).is_err());
+        assert!(parse_tasks(&json!({ "tasks": "not json" })).is_err());
+        assert!(parse_tasks(&json!({ "tasks": 42 })).is_err());
+        // Missing required per-task fields still error clearly.
+        assert!(parse_tasks(&json!({ "tasks": [{"name": "a"}] })).is_err());
+    }
 
     fn result(name: &str, text: &str, is_error: bool) -> SubAgentResult {
         SubAgentResult {

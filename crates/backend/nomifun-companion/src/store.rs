@@ -106,6 +106,33 @@ pub struct CompanionThread {
     pub updated_at: TimestampMs,
 }
 
+/// One archived (or currently open) companion session window — a bounded span
+/// of the companion's single chat thread. Closed on ≥`idle_minutes` of
+/// inactivity, compressed into a day-partitioned `digest`, after which the live
+/// engine context is reset (`clear_context`) so the next window starts small.
+/// `session_day` is the window's LOCAL start day (`YYYYMMDD`) — the partition key
+/// for "去年今日" recall, so a cross-midnight session stays attributed to the day
+/// it began.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionWindow {
+    pub id: String,
+    pub companion_id: String,
+    pub conversation_id: String,
+    pub session_day: String,
+    pub started_at: TimestampMs,
+    pub last_activity_at: TimestampMs,
+    pub closed_at: Option<TimestampMs>,
+    /// `open` | `archived` | `skipped` (too little content to summarize).
+    pub status: String,
+    pub message_count: i64,
+    /// Only messages with `created_at > boundary_ts` belong to this window.
+    pub boundary_ts: TimestampMs,
+    pub digest: Option<String>,
+    /// JSON blob of structured highlights (topics/decisions/mood/todos).
+    pub highlights: Option<String>,
+    pub token_estimate: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompanionLearnRun {
     pub id: String,
@@ -258,6 +285,24 @@ CREATE TABLE IF NOT EXISTS evolution_feedback (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_evolution_feedback_sig ON evolution_feedback(signature);
+
+CREATE TABLE IF NOT EXISTS companion_session_windows (
+  id TEXT PRIMARY KEY,
+  companion_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  session_day TEXT NOT NULL,
+  started_at INTEGER NOT NULL,
+  last_activity_at INTEGER NOT NULL,
+  closed_at INTEGER,
+  status TEXT NOT NULL DEFAULT 'open',
+  message_count INTEGER NOT NULL DEFAULT 0,
+  boundary_ts INTEGER NOT NULL DEFAULT 0,
+  digest TEXT,
+  highlights TEXT,
+  token_estimate INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_csw_companion_day ON companion_session_windows(companion_id, session_day);
+CREATE INDEX IF NOT EXISTS idx_csw_status ON companion_session_windows(companion_id, status, last_activity_at);
 "#;
 
 fn db_err(e: sqlx::Error) -> AppError {
@@ -275,7 +320,7 @@ const COMPANION_UNIQUE_INDEX: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_comp
 
 /// Current schema version stamped into `PRAGMA user_version`. The base
 /// SCHEMA always reflects this latest shape (fresh dbs are born current).
-const STORE_VERSION: i64 = 4;
+const STORE_VERSION: i64 = 5;
 
 /// Schema bootstrap shared by `open`/`open_memory`. Runs entirely on one
 /// acquired connection so DDL is never spread across pool members. Probes
@@ -439,6 +484,18 @@ async fn apply_migrations_on(conn: &mut SqliteConnection) -> Result<(), AppError
             }
         }
     }
+    if version < 5 {
+        sqlx::raw_sql("BEGIN IMMEDIATE").execute(&mut *conn).await.map_err(db_err)?;
+        match migrate_v4_to_v5(conn).await {
+            Ok(()) => {
+                sqlx::raw_sql("COMMIT").execute(&mut *conn).await.map_err(db_err)?;
+            }
+            Err(e) => {
+                let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await;
+                return Err(e);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -563,6 +620,38 @@ async fn migrate_v3_to_v4(conn: &mut SqliteConnection) -> Result<(), AppError> {
     Ok(())
 }
 
+/// v4 → v5: add `companion_session_windows` (伙伴会话窗口归档). A brand-new table,
+/// so `CREATE TABLE IF NOT EXISTS` + its indexes are self-contained and idempotent
+/// (production also gets the table via the inline SCHEMA run before this ladder, so
+/// this rung mostly just stamps the version on pre-v5 dbs). Never touches existing
+/// tables/rows — memories/threads/learn history are untouched.
+async fn migrate_v4_to_v5(conn: &mut SqliteConnection) -> Result<(), AppError> {
+    sqlx::raw_sql(
+        "CREATE TABLE IF NOT EXISTS companion_session_windows (
+           id TEXT PRIMARY KEY,
+           companion_id TEXT NOT NULL,
+           conversation_id TEXT NOT NULL,
+           session_day TEXT NOT NULL,
+           started_at INTEGER NOT NULL,
+           last_activity_at INTEGER NOT NULL,
+           closed_at INTEGER,
+           status TEXT NOT NULL DEFAULT 'open',
+           message_count INTEGER NOT NULL DEFAULT 0,
+           boundary_ts INTEGER NOT NULL DEFAULT 0,
+           digest TEXT,
+           highlights TEXT,
+           token_estimate INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE INDEX IF NOT EXISTS idx_csw_companion_day ON companion_session_windows(companion_id, session_day);
+         CREATE INDEX IF NOT EXISTS idx_csw_status ON companion_session_windows(companion_id, status, last_activity_at);",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(db_err)?;
+    sqlx::raw_sql("PRAGMA user_version = 5").execute(&mut *conn).await.map_err(db_err)?;
+    Ok(())
+}
+
 fn row_to_memory(row: &sqlx::sqlite::SqliteRow) -> CompanionMemory {
     let tags: String = row.get("tags");
     CompanionMemory {
@@ -584,6 +673,36 @@ fn row_to_memory(row: &sqlx::sqlite::SqliteRow) -> CompanionMemory {
         // uniform with skills.
         scope_kind: row.try_get::<String, _>("scope_kind").unwrap_or_else(|_| "user".to_string()),
         scope_companion_id: row.try_get::<Option<String>, _>("scope_companion_id").ok().flatten().unwrap_or_default(),
+    }
+}
+
+/// Local-time day key (`YYYYMMDD`) for a ms-epoch timestamp — the partition key
+/// for session-window digests. Uses the local timezone to stay consistent with
+/// the event collector's `events/YYYYMMDD.jsonl` day boundaries.
+pub fn local_day(ts_ms: TimestampMs) -> String {
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_millis_opt(ts_ms)
+        .single()
+        .map(|d| d.format("%Y%m%d").to_string())
+        .unwrap_or_else(|| "00000000".into())
+}
+
+fn row_to_window(row: &sqlx::sqlite::SqliteRow) -> SessionWindow {
+    SessionWindow {
+        id: row.get("id"),
+        companion_id: row.get("companion_id"),
+        conversation_id: row.get("conversation_id"),
+        session_day: row.get("session_day"),
+        started_at: row.get("started_at"),
+        last_activity_at: row.get("last_activity_at"),
+        closed_at: row.try_get::<Option<TimestampMs>, _>("closed_at").ok().flatten(),
+        status: row.get("status"),
+        message_count: row.get("message_count"),
+        boundary_ts: row.get("boundary_ts"),
+        digest: row.try_get::<Option<String>, _>("digest").ok().flatten(),
+        highlights: row.try_get::<Option<String>, _>("highlights").ok().flatten(),
+        token_estimate: row.get("token_estimate"),
     }
 }
 
@@ -1115,6 +1234,166 @@ impl CompanionStore {
             used <= char_budget
         });
         Ok(picked)
+    }
+
+    // ----- session windows (伙伴会话窗口归档) -----
+
+    /// The companion's currently-open window, if any.
+    pub async fn open_window(&self, companion_id: &str) -> Result<Option<SessionWindow>, AppError> {
+        let row = sqlx::query(
+            "SELECT * FROM companion_session_windows WHERE companion_id = ? AND status = 'open' \
+             ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(companion_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.as_ref().map(row_to_window))
+    }
+
+    /// Get-or-create the companion's open window. A fresh window's `boundary_ts`
+    /// is `now` unless `boundary_ts` overrides it (used when rolling over from a
+    /// just-closed window so the new window excludes already-archived messages).
+    pub async fn ensure_open_window(
+        &self,
+        companion_id: &str,
+        conversation_id: &str,
+        boundary_ts: TimestampMs,
+    ) -> Result<SessionWindow, AppError> {
+        if let Some(w) = self.open_window(companion_id).await? {
+            return Ok(w);
+        }
+        let now = now_ms();
+        let w = SessionWindow {
+            id: generate_prefixed_id("csw"),
+            companion_id: companion_id.to_owned(),
+            conversation_id: conversation_id.to_owned(),
+            session_day: local_day(now),
+            started_at: now,
+            last_activity_at: now,
+            closed_at: None,
+            status: "open".into(),
+            message_count: 0,
+            boundary_ts,
+            digest: None,
+            highlights: None,
+            token_estimate: 0,
+        };
+        sqlx::query(
+            "INSERT INTO companion_session_windows \
+             (id, companion_id, conversation_id, session_day, started_at, last_activity_at, \
+              closed_at, status, message_count, boundary_ts, digest, highlights, token_estimate) \
+             VALUES(?,?,?,?,?,?,NULL,'open',0,?,NULL,NULL,0)",
+        )
+        .bind(&w.id)
+        .bind(&w.companion_id)
+        .bind(&w.conversation_id)
+        .bind(&w.session_day)
+        .bind(w.started_at)
+        .bind(w.last_activity_at)
+        .bind(w.boundary_ts)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(w)
+    }
+
+    /// Record activity on an open window (bumps `last_activity_at` and, when
+    /// larger, `message_count`). Never regresses the count so a partial re-scan
+    /// can't shrink it.
+    pub async fn touch_window(&self, window_id: &str, last_activity_at: TimestampMs, message_count: i64) -> Result<(), AppError> {
+        sqlx::query(
+            "UPDATE companion_session_windows SET last_activity_at = ?, message_count = MAX(message_count, ?) \
+             WHERE id = ? AND status = 'open'",
+        )
+        .bind(last_activity_at)
+        .bind(message_count)
+        .bind(window_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Close a window with its compressed digest. `status` is `archived` (has a
+    /// digest) or `skipped` (too little content — digest stays NULL).
+    pub async fn close_window(
+        &self,
+        window_id: &str,
+        status: &str,
+        digest: Option<&str>,
+        highlights: Option<&str>,
+        token_estimate: i64,
+    ) -> Result<(), AppError> {
+        sqlx::query(
+            "UPDATE companion_session_windows \
+             SET status = ?, digest = ?, highlights = ?, token_estimate = ?, closed_at = ? \
+             WHERE id = ?",
+        )
+        .bind(status)
+        .bind(digest)
+        .bind(highlights)
+        .bind(token_estimate)
+        .bind(now_ms())
+        .bind(window_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Archived digests for one companion, most-recent day first. `limit` caps rows.
+    pub async fn list_digests(&self, companion_id: &str, limit: i64) -> Result<Vec<SessionWindow>, AppError> {
+        let rows = sqlx::query(
+            "SELECT * FROM companion_session_windows WHERE companion_id = ? AND status = 'archived' \
+             ORDER BY started_at DESC LIMIT ?",
+        )
+        .bind(companion_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.iter().map(row_to_window).collect())
+    }
+
+    /// Digests whose LOCAL start day falls in `[since_day, until_day]` (inclusive,
+    /// `YYYYMMDD` string compare). Either bound may be empty to leave it open.
+    pub async fn digests_in_range(&self, companion_id: &str, since_day: &str, until_day: &str) -> Result<Vec<SessionWindow>, AppError> {
+        let rows = sqlx::query(
+            "SELECT * FROM companion_session_windows \
+             WHERE companion_id = ? AND status = 'archived' \
+               AND (? = '' OR session_day >= ?) AND (? = '' OR session_day <= ?) \
+             ORDER BY session_day ASC, started_at ASC",
+        )
+        .bind(companion_id)
+        .bind(since_day)
+        .bind(since_day)
+        .bind(until_day)
+        .bind(until_day)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.iter().map(row_to_window).collect())
+    }
+
+    /// "去年今日" — archived digests whose day-of-year (`MMDD`) matches `mmdd`,
+    /// excluding the current `session_day`, most-recent year first. `mmdd` is the
+    /// 4-char suffix of a `YYYYMMDD` day.
+    pub async fn digests_on_day_of_year(&self, companion_id: &str, mmdd: &str, exclude_day: &str, limit: i64) -> Result<Vec<SessionWindow>, AppError> {
+        let rows = sqlx::query(
+            "SELECT * FROM companion_session_windows \
+             WHERE companion_id = ? AND status = 'archived' \
+               AND substr(session_day, 5) = ? AND session_day != ? \
+             ORDER BY session_day DESC LIMIT ?",
+        )
+        .bind(companion_id)
+        .bind(mmdd)
+        .bind(exclude_day)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.iter().map(row_to_window).collect())
     }
 
     // ----- suggestions -----
@@ -2859,5 +3138,140 @@ mod tests {
         let _store = CompanionStore::open(dir.path()).await.unwrap();
         // First-wins across parallel tests — only presence is deterministic.
         assert!(live_store().is_some());
+    }
+
+    // ----- session windows (伙伴会话窗口归档) -----
+
+    #[tokio::test]
+    async fn fresh_db_born_at_v5_with_session_windows() {
+        let store = CompanionStore::open_memory().await.unwrap();
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='companion_session_windows'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "fresh db must be born with companion_session_windows");
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version").fetch_one(&store.pool).await.unwrap();
+        assert_eq!(version, STORE_VERSION);
+        assert_eq!(STORE_VERSION, 5);
+    }
+
+    #[tokio::test]
+    async fn migrate_v4_to_v5_adds_session_windows_idempotent() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(SqliteConnectOptions::new().in_memory(true))
+            .await
+            .unwrap();
+        // A pre-v5 db missing companion_session_windows, stamped v4.
+        sqlx::raw_sql(
+            "CREATE TABLE companion_threads (conversation_id TEXT PRIMARY KEY, companion_id TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0);
+             PRAGMA user_version = 4;",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        apply_migrations(&pool).await.unwrap();
+        apply_migrations(&pool).await.unwrap(); // second run must be a no-op
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='companion_session_windows'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1);
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version").fetch_one(&pool).await.unwrap();
+        assert_eq!(version, STORE_VERSION);
+    }
+
+    #[tokio::test]
+    async fn window_lifecycle_open_touch_close_and_list() {
+        let store = CompanionStore::open_memory().await.unwrap();
+        // ensure_open_window is idempotent: second call returns the same row.
+        let w1 = store.ensure_open_window("c1", "conv1", 100).await.unwrap();
+        let w2 = store.ensure_open_window("c1", "conv1", 999).await.unwrap();
+        assert_eq!(w1.id, w2.id, "must reuse the open window");
+        assert_eq!(w2.boundary_ts, 100, "boundary must not change on reuse");
+        assert_eq!(store.open_window("c1").await.unwrap().unwrap().id, w1.id);
+
+        store.touch_window(&w1.id, 500, 7).await.unwrap();
+        // count never regresses.
+        store.touch_window(&w1.id, 600, 3).await.unwrap();
+        let open = store.open_window("c1").await.unwrap().unwrap();
+        assert_eq!(open.last_activity_at, 600);
+        assert_eq!(open.message_count, 7);
+
+        store
+            .close_window(&w1.id, "archived", Some("今天陪主人修了 bug"), Some(r#"{"topics":["bug"]}"#), 42)
+            .await
+            .unwrap();
+        assert!(store.open_window("c1").await.unwrap().is_none(), "archived window is no longer open");
+        let digests = store.list_digests("c1", 10).await.unwrap();
+        assert_eq!(digests.len(), 1);
+        assert_eq!(digests[0].digest.as_deref(), Some("今天陪主人修了 bug"));
+        assert_eq!(digests[0].token_estimate, 42);
+        assert_eq!(digests[0].status, "archived");
+    }
+
+    #[tokio::test]
+    async fn skipped_window_is_not_a_digest() {
+        let store = CompanionStore::open_memory().await.unwrap();
+        let w = store.ensure_open_window("c1", "conv1", 0).await.unwrap();
+        store.close_window(&w.id, "skipped", None, None, 0).await.unwrap();
+        assert!(store.list_digests("c1", 10).await.unwrap().is_empty(), "skipped windows never surface as digests");
+    }
+
+    /// Insert an already-closed archived window with a specific session_day (bypassing
+    /// the open→close flow so day-partition queries can be exercised deterministically).
+    async fn seed_digest(store: &CompanionStore, companion: &str, day: &str) {
+        let now = now_ms();
+        sqlx::query(
+            "INSERT INTO companion_session_windows \
+             (id, companion_id, conversation_id, session_day, started_at, last_activity_at, closed_at, status, message_count, boundary_ts, digest, highlights, token_estimate) \
+             VALUES(?,?,?,?,?,?,?, 'archived', 5, 0, ?, NULL, 10)",
+        )
+        .bind(generate_prefixed_id("csw"))
+        .bind(companion)
+        .bind("conv1")
+        .bind(day)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .bind(format!("digest for {day}"))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn digests_in_range_and_day_of_year() {
+        let store = CompanionStore::open_memory().await.unwrap();
+        seed_digest(&store, "c1", "20250702").await; // 去年今日
+        seed_digest(&store, "c1", "20260101").await;
+        seed_digest(&store, "c1", "20260702").await; // 今日
+        seed_digest(&store, "c2", "20250702").await; // 其他伙伴，须隔离
+
+        // Range query, ascending, scoped to c1.
+        let range = store.digests_in_range("c1", "20260101", "20261231").await.unwrap();
+        assert_eq!(range.len(), 2);
+        assert_eq!(range[0].session_day, "20260101");
+        assert_eq!(range[1].session_day, "20260702");
+
+        // Open-ended lower bound.
+        let all = store.digests_in_range("c1", "", "").await.unwrap();
+        assert_eq!(all.len(), 3);
+
+        // "去年今日" — MMDD = 0702, excluding today's 20260702.
+        let on_day = store.digests_on_day_of_year("c1", "0702", "20260702", 10).await.unwrap();
+        assert_eq!(on_day.len(), 1);
+        assert_eq!(on_day[0].session_day, "20250702");
+    }
+
+    #[test]
+    fn local_day_is_yyyymmdd() {
+        let d = local_day(now_ms());
+        assert_eq!(d.len(), 8, "day key is YYYYMMDD");
+        assert!(d.chars().all(|c| c.is_ascii_digit()));
     }
 }

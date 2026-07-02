@@ -115,6 +115,8 @@ fn make_nomi_config() -> NomiResolvedConfig {
         goal: None,
         browser_secret_vault: None,
         owner_token: None,
+        in_process_spawn: true,
+        allowed_tools: Vec::new(),
     }
 }
 

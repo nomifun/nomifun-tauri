@@ -126,6 +126,9 @@ impl ProviderHealthCheckService {
             goal: None,
             browser_secret_vault: None,
             owner_token: None,
+            // 健康探针一回合、不用工具：不必构造进程内 Spawn。
+            in_process_spawn: false,
+            allowed_tools: Vec::new(),
         })
     }
 }
@@ -553,6 +556,8 @@ mod tests {
             goal: None,
             browser_secret_vault: None,
             owner_token: None,
+            in_process_spawn: false,
+            allowed_tools: Vec::new(),
         };
 
         assert!(should_use_openai_model_probe("custom", &config));

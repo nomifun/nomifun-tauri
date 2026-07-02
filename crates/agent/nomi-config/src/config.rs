@@ -226,6 +226,17 @@ pub struct ToolsConfig {
     /// stop-latency (the run is awaited, not dropped). (Phase 0 F0.4)
     #[serde(default)]
     pub cooperative_cancel: bool,
+    /// 是否注册进程内 `Spawn` 子 agent 工具（默认 true = 现状）。桌面后端会话
+    /// 由工厂置 false —— 子 agent 改走可视化的 `nomi_spawn` 编排扇出（每个
+    /// 子任务在 DAG 画布上有状态与转录）；CLI/独立模式保持 true（进程内
+    /// Spawn 仍是其唯一扇出手段）。
+    #[serde(default = "default_true")]
+    pub in_process_spawn: bool,
+    /// 非空时：bootstrap 注册完全部工具后只保留名字在此列表内的（含 MCP 代理
+    /// 工具）。受限角色的编排 worker（searcher/reviewer 只读等）用它做
+    /// per-node 工具白名单。空（默认）= 不限制。
+    #[serde(default)]
+    pub builtin_allowlist: Vec<String>,
 }
 
 /// One language-server entry for the `Lsp` tool (§3.3).
@@ -254,6 +265,8 @@ impl Default for ToolsConfig {
             subagent_token_budget: None,
             bash_sandbox: false,
             cooperative_cancel: false,
+            in_process_spawn: true,
+            builtin_allowlist: Vec::new(),
         }
     }
 }
@@ -853,6 +866,14 @@ fn merge_config_files(global: ConfigFile, project: ConfigFile) -> ConfigFile {
             subagent_token_budget: project.tools.subagent_token_budget.or(global.tools.subagent_token_budget),
             bash_sandbox: global.tools.bash_sandbox || project.tools.bash_sandbox,
             cooperative_cancel: global.tools.cooperative_cancel || project.tools.cooperative_cancel,
+            // 任一层显式关闭即关闭（默认皆 true，行为不变）。
+            in_process_spawn: global.tools.in_process_spawn && project.tools.in_process_spawn,
+            // 项目层非空则覆盖全局（与 write_root 同模式）。
+            builtin_allowlist: if !project.tools.builtin_allowlist.is_empty() {
+                project.tools.builtin_allowlist
+            } else {
+                global.tools.builtin_allowlist
+            },
         }
     } else {
         ToolsConfig {
@@ -875,6 +896,14 @@ fn merge_config_files(global: ConfigFile, project: ConfigFile) -> ConfigFile {
             subagent_token_budget: project.tools.subagent_token_budget.or(global.tools.subagent_token_budget),
             bash_sandbox: global.tools.bash_sandbox || project.tools.bash_sandbox,
             cooperative_cancel: global.tools.cooperative_cancel || project.tools.cooperative_cancel,
+            // 任一层显式关闭即关闭（默认皆 true，行为不变）。
+            in_process_spawn: global.tools.in_process_spawn && project.tools.in_process_spawn,
+            // 项目层非空则覆盖全局（与 write_root 同模式）。
+            builtin_allowlist: if !project.tools.builtin_allowlist.is_empty() {
+                project.tools.builtin_allowlist
+            } else {
+                global.tools.builtin_allowlist
+            },
         }
     };
 
@@ -2204,5 +2233,16 @@ max_tokens = 1234
 
         let config = Config::resolve(&cli_args);
         assert!(config.is_ok());
+    }
+
+    #[test]
+    fn tools_config_new_fields_default_to_current_behavior() {
+        let t = ToolsConfig::default();
+        assert!(t.in_process_spawn, "默认必须保留进程内 Spawn（CLI 零回归）");
+        assert!(t.builtin_allowlist.is_empty(), "默认不限制工具");
+        // serde 缺字段也回落默认（旧 config 文件零回归）。
+        let de: ToolsConfig = serde_json::from_str("{}").unwrap();
+        assert!(de.in_process_spawn);
+        assert!(de.builtin_allowlist.is_empty());
     }
 }

@@ -11,6 +11,7 @@ import { Button, Empty, Message, Radio, Spin, Tabs } from '@arco-design/web-reac
 import { ipcBridge } from '@/common';
 import OverviewTab from './tabs/OverviewTab';
 import MemoriesTab from './tabs/MemoriesTab';
+import ReviewTab from './tabs/ReviewTab';
 import CollectTab from './tabs/CollectTab';
 import LearnTab from './tabs/LearnTab';
 import SuggestionsTab from './tabs/SuggestionsTab';
@@ -30,7 +31,7 @@ import { useCompanion, useCompanions, useCompanionShared } from './useNomi';
  *  is one click from the selected companion rather than buried under a "shared" domain switch.
  *  聊天已迁出管理中心 → 统一从「会话」侧边栏的桌面伙伴分组进入标准 /conversation/:id；
  *  本页只保留管理（形象/远程/记忆/技能/知识/设置）。 */
-const COMPANION_TABS = ['overview', 'remote', 'memories', 'knowledge', 'skills', 'secrets', 'settings'] as const;
+const COMPANION_TABS = ['overview', 'remote', 'memories', 'review', 'knowledge', 'skills', 'secrets', 'settings'] as const;
 const SHARED_TABS = ['collect', 'learn', 'suggestions', 'migrate'] as const;
 const ALL_TABS: readonly string[] = [...COMPANION_TABS, ...SHARED_TABS];
 /** Standalone figure-library domain (not companion-scoped, no tab set of its own). */
@@ -221,6 +222,7 @@ const NomiConfigPage: React.FC = () => {
                         <Radio value='overview'>{t('nomi.tabs.overview')}</Radio>
                         <Radio value='remote'>{t('nomi.tabs.remote')}</Radio>
                         <Radio value='memories'>{t('nomi.tabs.memories')}</Radio>
+                        <Radio value='review'>{t('nomi.tabs.review')}</Radio>
                         <Radio value='knowledge'>{t('nomi.tabs.knowledge')}</Radio>
                         <Radio value='skills'>{t('nomi.tabs.skills', { defaultValue: '技能' })}</Radio>
                         <Radio value='secrets'>{t('nomi.tabs.secrets')}</Radio>
@@ -242,6 +244,7 @@ const NomiConfigPage: React.FC = () => {
                       {activeTab === 'memories' && (
                         <MemoriesTab key={selectedCompanionId} companionId={selectedCompanionId} companions={companions} />
                       )}
+                      {activeTab === 'review' && <ReviewTab key={selectedCompanionId} companionId={selectedCompanionId} />}
                       {activeTab === 'knowledge' && <KnowledgeTab key={selectedCompanionId} companion={companion} />}
                       {activeTab === 'skills' && <SkillsTab key={selectedCompanionId} companion={companion} />}
                       {activeTab === 'remote' && <RemoteTab key={selectedCompanionId} companion={companion} />}

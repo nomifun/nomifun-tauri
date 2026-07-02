@@ -129,6 +129,90 @@ fn extract_json_object(raw: &str) -> Option<&str> {
     Some(&raw[start..=end])
 }
 
+// ----- session-window archive digests (伙伴会话窗口归档) -----
+
+pub const ARCHIVE_MAX_TOKENS: u32 = 2048;
+
+/// Structured output of one session-window digest run.
+#[derive(Debug, Deserialize)]
+pub struct ArchiveOutput {
+    /// One short narrative paragraph (中文) of what happened this session.
+    pub summary: String,
+    #[serde(default)]
+    pub topics: Vec<String>,
+    #[serde(default)]
+    pub decisions: Vec<String>,
+    #[serde(default)]
+    pub todos: Vec<String>,
+    #[serde(default)]
+    pub mood: Option<String>,
+}
+
+impl ArchiveOutput {
+    /// Serialize the structured fields (everything but the free-text summary)
+    /// into the `highlights` JSON column. `None` when nothing structured.
+    pub fn highlights_json(&self) -> Option<String> {
+        if self.topics.is_empty() && self.decisions.is_empty() && self.todos.is_empty() && self.mood.is_none() {
+            return None;
+        }
+        serde_json::to_string(&serde_json::json!({
+            "topics": self.topics,
+            "decisions": self.decisions,
+            "todos": self.todos,
+            "mood": self.mood,
+        }))
+        .ok()
+    }
+}
+
+pub const ARCHIVE_SYSTEM: &str = r#"你是电子伙伴的"日记归档官"。给你一段伙伴与主人的会话记录（一个会话窗口），请把它压缩成一条按天存档的日记摘要，供伙伴日后回顾（比如主人问"去年今日我们聊了啥"）。
+
+规则：
+1. summary：用第一人称、中文、2~5 句，温暖而具体地概括这次会话主人做了什么、聊了什么、结论是什么。像伙伴写给自己的日记，不要流水账、不要逐条复述。
+2. topics：3~6 个关键词/短语，便于检索。
+3. decisions：本次会话中做出的明确决定或结论（没有就空数组）。
+4. todos：本次会话遗留的未完成事项或后续计划（没有就空数组）。
+5. mood：从 happy/content/sleepy/worried/excited 中选一个，代表伙伴这次会话的心情。
+6. 只根据会话内容归纳，不要编造；主人未说的不要写进 decisions/todos。
+7. 会话里 [伙伴] 是伙伴自己说的话，只作上下文；[用户] 是主人说的话，是事实来源。
+
+只输出一个 JSON 对象，不要任何其他文字、不要 markdown 代码围栏：
+{"summary":"...","topics":["..."],"decisions":["..."],"todos":["..."],"mood":"content"}"#;
+
+/// Build the archive user prompt from a session window's role-tagged lines
+/// (each already formatted as `[用户] ...` / `[伙伴] ...`). `day` is the
+/// window's local start day (`YYYY-MM-DD`), surfaced so the model can date its
+/// diary voice.
+pub fn build_archive_prompt(day: &str, lines: &[String]) -> String {
+    let mut prompt = format!("## 会话日期\n{day}\n\n## 会话记录\n");
+    if lines.is_empty() {
+        prompt.push_str("（空）\n");
+    }
+    for line in lines {
+        prompt.push_str(line);
+        prompt.push('\n');
+    }
+    prompt.push_str("\n请按系统指令输出 JSON 摘要。");
+    prompt
+}
+
+/// Parse the model output into `ArchiveOutput`, tolerating ```json fences and
+/// surrounding prose. Rejects empty summaries and normalizes an invalid mood to
+/// `None`.
+pub fn parse_archive_output(raw: &str) -> Result<ArchiveOutput, String> {
+    let cleaned = extract_json_object(raw).ok_or_else(|| "no JSON object found in archive output".to_owned())?;
+    let mut output: ArchiveOutput = serde_json::from_str(cleaned).map_err(|e| format!("invalid archive JSON: {e}"))?;
+    if output.summary.trim().is_empty() {
+        return Err("archive summary is empty".to_owned());
+    }
+    if let Some(mood) = &output.mood {
+        if !MOODS.contains(&mood.as_str()) {
+            output.mood = None;
+        }
+    }
+    Ok(output)
+}
+
 pub(crate) fn persona_flavor(preset: &str) -> &'static str {
     match preset {
         "calm" => "你的性格沉稳温柔，像一位安静可靠的伙伴，说话简洁、不用太多语气词。",
@@ -187,5 +271,41 @@ mod tests {
         assert!(LEARN_SYSTEM.contains("companion.user_message"));
         assert!(LEARN_SYSTEM.contains("companion.reply"));
         assert!(LEARN_SYSTEM.contains("supersede_ids"));
+    }
+
+    #[test]
+    fn parse_archive_output_plain_and_fenced() {
+        let plain = r#"{"summary":"今天陪主人修了一下午 Rust 编译错误，最后定位到生命周期问题。","topics":["Rust","编译错误","生命周期"],"decisions":["改用 Arc 传递状态"],"todos":["明天补单元测试"],"mood":"content"}"#;
+        let out = parse_archive_output(plain).unwrap();
+        assert!(out.summary.contains("Rust"));
+        assert_eq!(out.topics.len(), 3);
+        assert_eq!(out.decisions.len(), 1);
+        assert_eq!(out.todos.len(), 1);
+        assert_eq!(out.mood.as_deref(), Some("content"));
+        let hl = out.highlights_json().unwrap();
+        assert!(hl.contains("生命周期"));
+
+        let fenced = format!("好的：\n```json\n{plain}\n```");
+        assert!(parse_archive_output(&fenced).is_ok());
+    }
+
+    #[test]
+    fn parse_archive_output_rejects_empty_and_normalizes_mood() {
+        assert!(parse_archive_output("我不会").is_err());
+        assert!(parse_archive_output(r#"{"summary":"   "}"#).is_err(), "empty summary rejected");
+        let bad_mood = r#"{"summary":"聊了会天","mood":"furious"}"#;
+        let out = parse_archive_output(bad_mood).unwrap();
+        assert!(out.mood.is_none(), "invalid mood normalized to None");
+        // No structured fields → no highlights JSON.
+        assert!(out.highlights_json().is_none());
+    }
+
+    #[test]
+    fn build_archive_prompt_lists_lines_and_day() {
+        let prompt = build_archive_prompt("2026-07-02", &["[用户] 帮我看看这个 bug".into(), "[伙伴] 好的~".into()]);
+        assert!(prompt.contains("2026-07-02"));
+        assert!(prompt.contains("[用户] 帮我看看这个 bug"));
+        assert!(prompt.contains("[伙伴] 好的~"));
+        assert!(ARCHIVE_SYSTEM.contains("去年今日"));
     }
 }

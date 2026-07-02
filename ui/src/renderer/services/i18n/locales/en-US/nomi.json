@@ -5,6 +5,7 @@
   "tabs": {
     "overview": "Overview",
     "memories": "Memories",
+    "review": "Session Review",
     "collect": "Data Sources",
     "learn": "Knowledge Exchange",
     "suggestions": "Suggestions",
@@ -222,6 +223,21 @@
     "reflectHint": "Also reflect after a complex task whether it's worth saving",
     "autoActivate": "Auto-activate high-confidence",
     "autoActivateHint": "Strongly-repeated high-confidence skills activate directly (still revocable in the Skills tab)"
+  },
+  "archive": {
+    "title": "Session archiving",
+    "hint": "Long companion chats grow the context ever larger and costlier. When enabled, an idle chat window is compressed into a day-partitioned diary and the live context is reset — keeping the companion lean and able to take on denser work.",
+    "enabled": "Enable session archiving",
+    "idleMinutes": "Idle-to-archive threshold",
+    "reviewTitle": "Session review (by day)",
+    "reviewEmpty": "No archived session diaries yet. Once session archiving is on, idle chats settle here by day.",
+    "onThisDay": "On this day",
+    "onThisDayEmpty": "No records from this day in past years yet."
+  },
+  "orchestration": {
+    "title": "Smart orchestration",
+    "hint": "When enabled, for complex multi-step tasks the companion splits the work across sub-agents running in parallel, itself only coordinating and summarizing — keeping its own context clean. Simple things it still does directly.",
+    "enabled": "Enable smart orchestration"
   },
   "learn": {
     "enabled": "Scheduled learning",

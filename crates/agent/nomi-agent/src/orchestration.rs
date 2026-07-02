@@ -179,6 +179,14 @@ async fn execute_single(
     let (result, modifier) = match registry.get(name) {
         Some(tool) => {
             let max_size = tool.max_result_size();
+            // Normalize provider-stringified nested args against the tool's schema
+            // before dispatch: many OpenAI-compatible / non-Anthropic models send a
+            // nested `array`/`object` argument (e.g. Spawn's `tasks`) as a JSON
+            // *string*, which would fail the tool's `.as_array()`/`.as_object()` and
+            // be rejected ("Missing or invalid 'tasks' array"). Coercing once here —
+            // the single execution choke point — makes EVERY tool robust to it, on
+            // every path (approval / non-approval / concurrent) and for sub-agents.
+            let input = &nomi_tools::coerce_input_to_schema(&tool.input_schema(), input.clone());
             let r = tool.execute(input.clone()).await;
             let modifier = if r.is_error {
                 None

@@ -46,6 +46,7 @@ pub fn companion_routes(state: CompanionRouterState) -> Router {
         .route("/api/companion/suggestions/{id}/decide", post(decide_suggestion))
         .route("/api/companion/companions/{companion_id}/skills", get(list_companion_skills))
         .route("/api/companion/companions/{companion_id}/weekly-digest", get(weekly_digest))
+        .route("/api/companion/companions/{companion_id}/digests", get(list_day_digests))
         .route(
             "/api/companion/companions/{companion_id}/skills/{name}",
             get(get_companion_skill).put(update_companion_skill),
@@ -291,6 +292,43 @@ async fn weekly_digest(
     let days = q.days.unwrap_or(7).clamp(1, 90);
     let since_ms = nomifun_common::now_ms() - days * 86_400_000;
     Ok(Json(ApiResponse::ok(state.service.weekly_digest(&companion_id, since_ms).await?)))
+}
+
+#[derive(Deserialize)]
+struct DayDigestsQuery {
+    /// Inclusive `YYYYMMDD` lower bound (empty/absent = open).
+    since: Option<String>,
+    /// Inclusive `YYYYMMDD` upper bound (empty/absent = open).
+    until: Option<String>,
+    /// "去年今日" mode: a 4-char `MMDD`; when set, returns same-day-of-year
+    /// archived digests (excluding today), ignoring `since`/`until`.
+    on_day: Option<String>,
+    limit: Option<i64>,
+}
+
+/// Archived session-window day-digests for a companion (伙伴会话归档回看时间线数据源).
+async fn list_day_digests(
+    State(state): State<CompanionRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(companion_id): Path<String>,
+    Query(q): Query<DayDigestsQuery>,
+) -> Result<Json<ApiResponse<Vec<crate::store::SessionWindow>>>, AppError> {
+    let limit = q.limit.unwrap_or(60).clamp(1, 365);
+    let digests = if let Some(mmdd) = q.on_day.filter(|s| s.len() == 4) {
+        let today = crate::store::local_day(nomifun_common::now_ms());
+        state.service.digests_on_this_day(&companion_id, &mmdd, &today, limit).await?
+    } else {
+        state
+            .service
+            .list_day_digests(
+                &companion_id,
+                q.since.as_deref().unwrap_or(""),
+                q.until.as_deref().unwrap_or(""),
+                limit,
+            )
+            .await?
+    };
+    Ok(Json(ApiResponse::ok(digests)))
 }
 
 async fn get_companion_skill(

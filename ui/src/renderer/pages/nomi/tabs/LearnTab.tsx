@@ -202,6 +202,51 @@ const LearnTab: React.FC<Props> = ({ shared }) => {
         </div>
       </div>
 
+      {/* Session archiving — compress idle chat windows into day-digests + reset live context. */}
+      <div className='flex items-start gap-16px bg-fill-2 rd-10px px-14px py-12px'>
+        <div className='w-200px shrink-0'>
+          <div className='text-14px text-t-primary font-500'>{t('nomi.archive.title')}</div>
+          <div className='text-12px text-t-tertiary mt-2px'>{t('nomi.archive.hint')}</div>
+        </div>
+        <div className='flex-1 min-w-0 flex flex-col gap-10px'>
+          <div className='flex items-center gap-8px'>
+            <span className='text-13px text-t-secondary'>{t('nomi.archive.enabled')}</span>
+            <Switch
+              checked={sharedConfig.archive?.enabled ?? false}
+              onChange={(checked) => void patchSharedConfig({ archive: { enabled: checked } })}
+            />
+          </div>
+          <div className='flex items-center gap-8px'>
+            <span className='text-13px text-t-secondary'>{t('nomi.archive.idleMinutes')}</span>
+            <InputNumber
+              style={{ width: 120 }}
+              min={5}
+              max={1440}
+              value={sharedConfig.archive?.idle_minutes ?? 30}
+              onChange={(v) => void patchSharedConfig({ archive: { idle_minutes: Number(v) || 30 } })}
+              suffix={t('nomi.learn.minutes')}
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Smart orchestration — companion delegates complex tasks to isolated sub-agents. */}
+      <div className='flex items-start gap-16px bg-fill-2 rd-10px px-14px py-12px'>
+        <div className='w-200px shrink-0'>
+          <div className='text-14px text-t-primary font-500'>{t('nomi.orchestration.title')}</div>
+          <div className='text-12px text-t-tertiary mt-2px'>{t('nomi.orchestration.hint')}</div>
+        </div>
+        <div className='flex-1 min-w-0 flex flex-col gap-10px'>
+          <div className='flex items-center gap-8px'>
+            <span className='text-13px text-t-secondary'>{t('nomi.orchestration.enabled')}</span>
+            <Switch
+              checked={sharedConfig.smart_orchestration ?? false}
+              onChange={(checked) => void patchSharedConfig({ smart_orchestration: checked })}
+            />
+          </div>
+        </div>
+      </div>
+
       <Table
         rowKey='id'
         data={runs}
