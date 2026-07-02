@@ -389,7 +389,15 @@ impl CompanionService {
     /// create-time snapshot. If the companion had no session yet but the model just
     /// became configured, the session is auto-ensured (idempotent). All of the
     /// companion-side work is best-effort: it never fails the patch.
-    pub async fn patch_companion(&self, id: &str, patch: serde_json::Value) -> Result<CompanionProfileConfig, AppError> {
+    pub async fn patch_companion(&self, id: &str, mut patch: serde_json::Value) -> Result<CompanionProfileConfig, AppError> {
+        // Security (提权防护): `exposure`（对外服务信任档）NEVER travels through the
+        // general merge-patch. This path is reachable from the gateway
+        // `nomi_companion_update` tool, so an injected/compromised session could
+        // otherwise flip a PublicService companion back to Private and un-clamp
+        // itself. Exposure is owner-only, via `set_exposure` (local-trust REST).
+        if let Some(obj) = patch.as_object_mut() {
+            obj.remove("exposure");
+        }
         // Snapshot the pre-patch model so we can tell whether this patch
         // actually changed it (RFC 7396 patches need not mention `model`).
         let prev = self.registry.get(id).await;
@@ -413,6 +421,36 @@ impl CompanionService {
         // （best-effort，不为改名新建会话；agent 运行中占用则保留旧名下次再迁）。
         if prev_name.as_deref() != Some(profile.name.as_str()) {
             self.reconcile_companion_workspace(&profile).await;
+        }
+        Ok(profile)
+    }
+
+    /// Owner-only: set a companion's 对外服务信任档 (exposure tier). Deliberately
+    /// separate from [`patch_companion`] because exposure is security-sensitive —
+    /// `patch_companion` is reachable from the gateway `nomi_companion_update`
+    /// tool, whereas this method is wired ONLY to the local-trust owner REST route
+    /// (`PUT /api/companion/companions/{id}/exposure`). Flipping a companion to
+    /// `PublicService` makes every session it hosts safe-clamped; the factory
+    /// reads exposure LIVE, and we recycle its bound channel sessions so an
+    /// already-warm public session picks up the new clamp on its next turn.
+    pub async fn set_exposure(
+        &self,
+        id: &str,
+        exposure: nomifun_api_types::ExposureMode,
+    ) -> Result<CompanionProfileConfig, AppError> {
+        let profile = self
+            .registry
+            .patch(id, serde_json::json!({ "exposure": exposure }))
+            .await?;
+        self.emitter.emit_companion_updated(&profile.id, &profile);
+        // Recycle the companion's bound (channel) sessions so a warm session
+        // rebuilds against the new exposure immediately, not just on next cold
+        // build. Reuses the model-change cleanup hook (same "recycle this
+        // companion's sessions" effect). Best-effort; never fails the flip.
+        if let Some(hooks) = self.cleanup_hooks.get() {
+            for hook in hooks {
+                hook.on_companion_model_changed(&profile.id).await;
+            }
         }
         Ok(profile)
     }
@@ -1932,6 +1970,54 @@ mod tests {
         assert_eq!(patched.name, "新名");
         assert!(patched.appearance.companion_enabled);
         assert_eq!(svc.get_companion(&a.id).await.unwrap().name, "新名");
+    }
+
+    #[tokio::test]
+    async fn patch_companion_ignores_exposure_but_set_exposure_applies_it() {
+        use nomifun_api_types::ExposureMode;
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service(dir.path()).await;
+        let a = svc.create_companion("客服", "ink").await.unwrap();
+        assert_eq!(a.exposure, ExposureMode::Private);
+
+        // 提权防护：the general merge-patch (reachable from the gateway tool)
+        // MUST NOT change exposure, even if the field is present in the patch.
+        let patched = svc
+            .patch_companion(
+                &a.id,
+                serde_json::json!({ "name": "客服A", "exposure": "public_service" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(patched.name, "客服A", "other fields still patch");
+        assert_eq!(
+            patched.exposure,
+            ExposureMode::Private,
+            "exposure must be stripped from the general patch"
+        );
+
+        // The dedicated owner-only path DOES apply it.
+        let public = svc
+            .set_exposure(&a.id, ExposureMode::PublicService)
+            .await
+            .unwrap();
+        assert_eq!(public.exposure, ExposureMode::PublicService);
+        assert_eq!(
+            svc.get_companion(&a.id).await.unwrap().exposure,
+            ExposureMode::PublicService,
+            "exposure persists"
+        );
+
+        // And a subsequent general patch still cannot flip it back.
+        let after = svc
+            .patch_companion(&a.id, serde_json::json!({ "exposure": "private" }))
+            .await
+            .unwrap();
+        assert_eq!(
+            after.exposure,
+            ExposureMode::PublicService,
+            "a public companion cannot be un-clamped via the general patch"
+        );
     }
 
     #[tokio::test]

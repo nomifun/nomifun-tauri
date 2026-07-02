@@ -28,6 +28,10 @@ pub fn companion_routes(state: CompanionRouterState) -> Router {
             get(get_companion).patch(patch_companion).delete(delete_companion),
         )
         .route("/api/companion/companions/{companion_id}/status", get(companion_status))
+        .route(
+            "/api/companion/companions/{companion_id}/exposure",
+            axum::routing::put(set_companion_exposure),
+        )
         .route("/api/companion/companions/{companion_id}/figure", post(upload_figure).get(get_figure))
         .route("/api/companion/matting-model", get(get_matting_model))
         .route("/api/companion/figures", get(list_figures).post(create_figure))
@@ -536,6 +540,27 @@ async fn delete_companion(
 ) -> Result<StatusCode, AppError> {
     state.service.delete_companion(&companion_id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct SetExposureRequest {
+    exposure: nomifun_api_types::ExposureMode,
+}
+
+/// Owner-only: set a companion's 对外服务信任档. Separate from the general merge
+/// patch so this security-sensitive field is unreachable via the gateway
+/// `nomi_companion_update` tool (提权防护). `PublicService` turns the companion
+/// into an "外呼员工" — every session it hosts is safe-clamped by the factory.
+async fn set_companion_exposure(
+    State(state): State<CompanionRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(companion_id): Path<String>,
+    body: Result<Json<SetExposureRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<CompanionProfileConfig>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    Ok(Json(ApiResponse::ok(
+        state.service.set_exposure(&companion_id, req.exposure).await?,
+    )))
 }
 
 async fn companion_status(
