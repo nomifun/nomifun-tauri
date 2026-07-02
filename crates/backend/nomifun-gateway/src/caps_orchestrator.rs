@@ -141,6 +141,53 @@ struct SpawnParams {
     synthesize: Option<bool>,
 }
 
+// ── re-adjust (supervision) param structs ─────────────────────────────────
+
+/// Incrementally re-strategize a run: a natural-language `intent` the lead LLM
+/// reconciles as KEEP / DROP / NEW over the existing tasks (completed work is
+/// preserved). The primary re-strategy lever after a failure.
+#[derive(Deserialize, JsonSchema)]
+struct RunAdjustParams {
+    /// The run to adjust (from nomi_run_create / nomi_spawn).
+    run_id: String,
+    /// What to change, in natural language (e.g. "换一种方式重做失败的安全扫描节点，
+    /// 保留已完成的其它节点").
+    intent: String,
+}
+
+/// Re-run ONE node (and cascade-reset its already-settled downstream), e.g. to
+/// retry a failed node — optionally after changing its model/prompt via
+/// `nomi_task_config`.
+#[derive(Deserialize, JsonSchema)]
+struct TaskRerunParams {
+    run_id: String,
+    /// The task/node id (from nomi_run_status).
+    task_id: String,
+}
+
+/// Override a node's model and/or preset requirement before re-running it — e.g.
+/// route a failing node to a stronger/different model.
+#[derive(Deserialize, JsonSchema)]
+struct TaskConfigParams {
+    run_id: String,
+    task_id: String,
+    /// Provider id to route this node to (pair with `model`). Omit to keep current.
+    #[serde(default)]
+    provider_id: Option<String>,
+    /// Model name for this node (pair with `provider_id`). Omit to keep current.
+    #[serde(default)]
+    model: Option<String>,
+    /// A preset requirement appended to this node's brief (separate from its spec).
+    #[serde(default)]
+    preset_prompt: Option<String>,
+}
+
+/// Cancel a run and terminate its in-flight sub-agents.
+#[derive(Deserialize, JsonSchema)]
+struct RunCancelParams {
+    run_id: String,
+}
+
 // ── handlers ──────────────────────────────────────────────────────────────
 
 async fn create(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: RunCreateParams) -> Value {
@@ -824,9 +871,107 @@ async fn spawn(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: SpawnPara
     }))
 }
 
+// ── re-adjust (supervision) handlers ──────────────────────────────────────
+
+/// Incremental re-strategy (KEEP/DROP/NEW). Mirrors the Tab `adjust_run` route:
+/// engine.adjust → (re)start the loop if the reconciled run is running with no
+/// live loop. Completed work is preserved.
+async fn run_adjust(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: RunAdjustParams) -> Value {
+    let user = match require_user(&ctx) {
+        Ok(u) => u.to_owned(),
+        Err(e) => return e,
+    };
+    if p.intent.trim().is_empty() {
+        return json!({ "error": "intent must not be empty" });
+    }
+    match deps
+        .orchestrator_run_engine
+        .adjust(&deps.orchestrator_run_service, &user, &p.run_id, &p.intent)
+        .await
+    {
+        Ok(run) => {
+            if run.status == "running" && !deps.orchestrator_run_engine.is_running(&p.run_id) {
+                deps.orchestrator_run_engine.start(p.run_id.clone());
+            }
+            ok(json!({
+                "run_id": run.id,
+                "status": run.status,
+                "message": "已按你的意图增量调整编排（保留已完成节点、重做/新增其余）。调整后会继续执行，完成或失败时自动回执——无需轮询。",
+            }))
+        }
+        Err(e) => json!({ "error": e.to_string() }),
+    }
+}
+
+/// Re-run one node (+ cascade-reset its downstream). Mirrors the Tab `rerun_task`
+/// route. Retry a failed node — optionally after `nomi_task_config` changes it.
+async fn task_rerun(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: TaskRerunParams) -> Value {
+    let user = match require_user(&ctx) {
+        Ok(u) => u.to_owned(),
+        Err(e) => return e,
+    };
+    match deps
+        .orchestrator_run_engine
+        .rerun_task(&deps.orchestrator_run_service, &user, &p.run_id, &p.task_id)
+        .await
+    {
+        Ok(run) => {
+            if run.status == "running" && !deps.orchestrator_run_engine.is_running(&p.run_id) {
+                deps.orchestrator_run_engine.start(p.run_id.clone());
+            }
+            ok(json!({
+                "run_id": run.id,
+                "status": run.status,
+                "message": "已重跑该节点并级联重置其下游；继续执行、完成/失败自动回执。",
+            }))
+        }
+        Err(e) => json!({ "error": e.to_string() }),
+    }
+}
+
+/// Change a node's model / preset requirement. Mirrors the Tab `set_task_config`
+/// route (takes effect on next dispatch; for a settled node follow with rerun).
+async fn task_config(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: TaskConfigParams) -> Value {
+    let user = match require_user(&ctx) {
+        Ok(u) => u.to_owned(),
+        Err(e) => return e,
+    };
+    match deps
+        .orchestrator_run_service
+        .set_task_config(&user, &p.run_id, &p.task_id, p.provider_id, p.model, p.preset_prompt)
+        .await
+    {
+        Ok(()) => ok(json!({
+            "run_id": p.run_id,
+            "task_id": p.task_id,
+            "message": "已更新该节点的模型/预置要求。pending 节点下次派发即生效；已结算节点请再调 nomi_task_rerun 使其以新配置重跑。",
+        })),
+        Err(e) => json!({ "error": e.to_string() }),
+    }
+}
+
+/// Cancel a run + terminate its in-flight sub-agents. Mirrors the Tab `cancel_run`
+/// route (engine.stop + run_service.cancel).
+async fn run_cancel(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: RunCancelParams) -> Value {
+    if let Err(e) = require_user(&ctx) {
+        return e;
+    }
+    deps.orchestrator_run_engine.stop(&p.run_id);
+    match deps.orchestrator_run_service.cancel(&p.run_id).await {
+        Ok(()) => ok(json!({
+            "run_id": p.run_id,
+            "status": "cancelled",
+            "message": "已取消该编排，在飞子任务已终止。",
+        })),
+        Err(e) => json!({ "error": e.to_string() }),
+    }
+}
+
 // ── result projections (RunDetail → compact LLM-friendly shape) ───────────
 
-/// Run status + per-task {id, title, status}.
+/// Run status + per-task {id, title, status, attempt, conversation_id, last_error}
+/// — enough for the supervising lead to diagnose (which node, how many attempts,
+/// why it failed) and decide a re-strategy.
 fn project_status(detail: &RunDetail) -> Value {
     json!({
         "run_id": detail.run.id,
@@ -834,14 +979,21 @@ fn project_status(detail: &RunDetail) -> Value {
         "tasks": detail
             .tasks
             .iter()
-            .map(|t| json!({ "id": t.id, "title": t.title, "status": t.status }))
+            .map(|t| json!({
+                "id": t.id,
+                "title": t.title,
+                "status": t.status,
+                "attempt": t.attempt,
+                "conversation_id": t.conversation_id,
+                "last_error": t.last_error,
+            }))
             .collect::<Vec<_>>(),
     })
 }
 
-/// Run status + summary + per-task {title, output_summary}. When the run is not
-/// yet terminal, `status` reflects the in-flight state (e.g. "running"); the
-/// summary / output fields are simply whatever has been persisted so far.
+/// Run status + summary + per-task {id, title, status, output_summary, attempt,
+/// last_error}. While not terminal, `status` reflects the in-flight state; failed
+/// nodes carry `last_error` so the lead can explain / re-strategize.
 fn project_result(detail: &RunDetail) -> Value {
     json!({
         "run_id": detail.run.id,
@@ -850,7 +1002,14 @@ fn project_result(detail: &RunDetail) -> Value {
         "tasks": detail
             .tasks
             .iter()
-            .map(|t| json!({ "title": t.title, "output_summary": t.output_summary }))
+            .map(|t| json!({
+                "id": t.id,
+                "title": t.title,
+                "status": t.status,
+                "output_summary": t.output_summary,
+                "attempt": t.attempt,
+                "last_error": t.last_error,
+            }))
             .collect::<Vec<_>>(),
     })
 }
@@ -909,6 +1068,51 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
         )
         .deny_on(ORCHESTRATOR_DENY_SURFACES),
         |deps, _ctx, p| result(deps, p),
+    ));
+
+    // 4. Supervision / re-adjust (write, Desktop-only): let the master agent
+    //    RE-STRATEGIZE a run after a failure instead of only observing it — adjust
+    //    the plan, re-run a node, change a node's model, or cancel. Same domain
+    //    deny (Remote) as the rest.
+    out.push(Capability::new::<RunAdjustParams, _, _>(
+        CapabilityMeta::new(
+            "nomi_run_adjust",
+            "orchestrator",
+            "Incrementally re-strategize a run from a natural-language intent (the lead reconciles it as keep/drop/new over existing tasks, preserving completed work). The primary lever to recover from a failure — e.g. redo the failed node a different way while keeping the rest. Params: run_id, intent. Returns run status.",
+            DangerTier::Write,
+        )
+        .deny_on(ORCHESTRATOR_DENY_SURFACES),
+        |deps, ctx, p| run_adjust(deps, ctx, p),
+    ));
+    out.push(Capability::new::<TaskRerunParams, _, _>(
+        CapabilityMeta::new(
+            "nomi_task_rerun",
+            "orchestrator",
+            "Re-run one node of a run (and cascade-reset its already-settled downstream) — e.g. retry a failed node, optionally after changing its model/prompt via nomi_task_config. Params: run_id, task_id (from nomi_run_status).",
+            DangerTier::Write,
+        )
+        .deny_on(ORCHESTRATOR_DENY_SURFACES),
+        |deps, ctx, p| task_rerun(deps, ctx, p),
+    ));
+    out.push(Capability::new::<TaskConfigParams, _, _>(
+        CapabilityMeta::new(
+            "nomi_task_config",
+            "orchestrator",
+            "Override a node's model (provider_id + model) and/or preset requirement before re-running it — e.g. route a failing node to a stronger model, then nomi_task_rerun. Params: run_id, task_id, provider_id?, model?, preset_prompt?.",
+            DangerTier::Write,
+        )
+        .deny_on(ORCHESTRATOR_DENY_SURFACES),
+        |deps, ctx, p| task_config(deps, ctx, p),
+    ));
+    out.push(Capability::new::<RunCancelParams, _, _>(
+        CapabilityMeta::new(
+            "nomi_run_cancel",
+            "orchestrator",
+            "Cancel a run and terminate its in-flight sub-agents. Params: run_id.",
+            DangerTier::Write,
+        )
+        .deny_on(ORCHESTRATOR_DENY_SURFACES),
+        |deps, ctx, p| run_cancel(deps, ctx, p),
     ));
 }
 
@@ -1168,7 +1372,7 @@ mod tests {
     #[test]
     fn orchestrator_tools_registered_and_visible_on_desktop() {
         let reg = Registry::global();
-        for name in ["nomi_run_create", "nomi_spawn", "nomi_run_status", "nomi_run_result"] {
+        for name in ["nomi_run_create", "nomi_spawn", "nomi_run_status", "nomi_run_result", "nomi_run_adjust", "nomi_task_rerun", "nomi_task_config", "nomi_run_cancel"] {
             assert!(
                 reg.contains(name),
                 "orchestrator tool {name} is not registered"
@@ -1199,7 +1403,7 @@ mod tests {
             .iter()
             .map(|s| s.name)
             .collect();
-        for name in ["nomi_run_create", "nomi_spawn", "nomi_run_status", "nomi_run_result"] {
+        for name in ["nomi_run_create", "nomi_spawn", "nomi_run_status", "nomi_run_result", "nomi_run_adjust", "nomi_task_rerun", "nomi_task_config", "nomi_run_cancel"] {
             // Not advertised on the Remote surface.
             assert!(
                 !remote.contains(&name),

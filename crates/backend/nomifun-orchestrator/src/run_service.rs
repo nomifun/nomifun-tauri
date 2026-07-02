@@ -2369,6 +2369,7 @@ fn task_row_to_dto(row: OrchRunTaskRow) -> RunTask {
         override_provider_id: row.override_provider_id,
         override_model: row.override_model,
         preset_prompt: row.preset_prompt,
+        last_error: row.last_error,
         created_at: row.created_at,
         updated_at: row.updated_at,
     }

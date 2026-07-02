@@ -1945,6 +1945,7 @@ mod tests {
         RunTask {
             id: id.to_string(),
             run_id: "run_x".to_string(),
+            last_error: None,
             title: title.to_string(),
             spec: format!("spec-{title}"),
             task_profile: None,

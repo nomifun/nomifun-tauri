@@ -307,6 +307,12 @@ pub struct RunTask {
     /// the planner-written `spec`. `None`/blank = none.
     #[serde(default)]
     pub preset_prompt: Option<String>,
+    /// Persisted failure reason (迁移 027): `<code>: <message>` from the worker's
+    /// error marker, or a generic timeout/no-reply reason, set when a node
+    /// permanently failed. `None` = never failed (or pre-column). Surfaced so the
+    /// master agent / supervision tools can see WHY a node failed.
+    #[serde(default)]
+    pub last_error: Option<String>,
     /// Creation / last-update timestamps (epoch ms). Surfaced so the UI can show
     /// per-task pacing (用时 / 相对时间) in the roster and inspector.
     pub created_at: i64,

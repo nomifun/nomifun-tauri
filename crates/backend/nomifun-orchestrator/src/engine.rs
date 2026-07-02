@@ -3900,6 +3900,30 @@ mod tests {
         assert_eq!(reports[0].2, "failed", "outcome is failed");
     }
 
+    /// A permanently-failed task PERSISTS a `last_error` reason, surfaced on the DTO
+    /// for the lead's diagnosis. The mock worker has no error marker → the generic
+    /// timeout/no-reply fallback is recorded (never an empty "why").
+    #[tokio::test]
+    async fn failed_task_persists_last_error() {
+        let worker: Arc<dyn WorkerRunner> = Arc::new(AlwaysFailWorker);
+        let (run_service, engine, _reporter) = reporter_stack(worker, 0).await;
+        let run_id = adhoc_lead_run(&run_service, 7).await;
+        engine.start(run_id.clone());
+        assert!(wait_run_status(&run_service, &run_id, "failed").await, "run must fail");
+        let detail = run_service.get_detail(&run_id).await.expect("detail");
+        let failed = detail
+            .tasks
+            .iter()
+            .find(|t| t.status == "failed")
+            .expect("a failed task");
+        let err = failed.last_error.as_deref().unwrap_or("");
+        assert!(!err.is_empty(), "failed task must persist a last_error reason");
+        assert!(
+            err.contains("worker") || err.contains("超时") || err.contains("无回复"),
+            "generic fallback reason expected, got: {err}"
+        );
+    }
+
     // ── UC-2b: per-task token observability ───────────────────────────────────
 
     /// A worker that reports a FIXED token count on every task it runs, so a test
