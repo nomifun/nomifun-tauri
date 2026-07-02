@@ -131,7 +131,6 @@ const EmployeeDrawer: React.FC<Props> = ({ companionId, onClose, setExposure, on
       visible={!!companionId}
       placement='right'
       width={560}
-      zIndex={1100}
       getPopupContainer={() => document.body}
       autoFocus={false}
       onCancel={onClose}
