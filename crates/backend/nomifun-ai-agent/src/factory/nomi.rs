@@ -24,9 +24,15 @@ pub(super) async fn build(
 ) -> Result<AgentInstance, AppError> {
     let mut overrides: NomiBuildExtra = serde_json::from_value(options.extra).unwrap_or_default();
 
-    // 对外服务钳制（execution-time 后端权威闸）：`PublicService` 会话在任何其它
-    // 处理之前先被硬性收窄——关网关 / computer / browser，工具收敛到安全白名单。
-    // 覆盖任何 client/host 传入值；`in_process_spawn` 是派生值，在其构造点单独收口。
+    // 对外服务钳制（execution-time 后端权威闸）：exposure 的权威来源有二——
+    // ① 入口显式盖章（`extra.exposure`，未来 Remote/渠道公开令牌用）；
+    // ② 绑定伙伴自身档位（LIVE 读，翻档下一轮即生效，不吃 stale extra）。
+    // 取二者更严者；`PublicService` 会话在任何其它处理之前被硬性收窄——关网关 /
+    // computer / browser / spawn，工具收敛到安全白名单。覆盖任何 client/host 传入值。
+    if let Some(provider) = deps.companion_prompt.as_ref() {
+        let companion_exposure = provider.exposure(overrides.companion_id.as_deref()).await;
+        overrides.exposure = overrides.exposure.stricter(companion_exposure);
+    }
     apply_exposure_clamp(&mut overrides);
 
     // Merge preset assistant rules into system_prompt (used as custom_prompt

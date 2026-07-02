@@ -97,6 +97,12 @@ pub struct CompanionProfileConfig {
     pub model: ModelConfig,
     pub appearance: CompanionWindowConfig,
     pub created_at: i64,
+    /// 对外服务信任档。`PublicService` 把这个伙伴变成"外呼员工"：它承载的每一条会话
+    /// （桌面气泡 / 聊天 Tab / IM 渠道）都被 nomi 工厂硬性收窄到安全白名单（无 shell /
+    /// 文件 / computer / browser / 网关），且工厂 LIVE 读取本字段——翻档下一轮即生效。
+    /// 缺省 `Private` = 今日全能力伙伴，旧 config.json 零迁移 round-trip。
+    #[serde(default)]
+    pub exposure: nomifun_api_types::ExposureMode,
 }
 
 impl CompanionProfileConfig {
@@ -115,6 +121,7 @@ impl CompanionProfileConfig {
             model: ModelConfig::default(),
             appearance: CompanionWindowConfig::default(),
             created_at: now_ms(),
+            exposure: nomifun_api_types::ExposureMode::Private,
         }
     }
 

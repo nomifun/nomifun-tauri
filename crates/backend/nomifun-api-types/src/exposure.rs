@@ -27,6 +27,22 @@ pub enum ExposureMode {
     PublicService,
 }
 
+impl ExposureMode {
+    /// The stricter (more locked-down) of two exposure tiers. `PublicService`
+    /// dominates everything (it is the only clamped tier), so if EITHER an ingress
+    /// stamp or the bound companion's own tier says `PublicService`, the session is
+    /// clamped. Used to combine the ingress-supplied exposure with the companion's
+    /// authoritative tier in the factory.
+    pub fn stricter(self, other: ExposureMode) -> ExposureMode {
+        use ExposureMode::*;
+        match (self, other) {
+            (PublicService, _) | (_, PublicService) => PublicService,
+            (TrustedRemote, _) | (_, TrustedRemote) => TrustedRemote,
+            _ => Private,
+        }
+    }
+}
+
 /// The ONLY native tools a `PublicService` session may keep. MUST stay non-empty:
 /// an empty allowlist is a **no-op** in `ToolRegistry::retain_named` (= keep
 /// everything), which is the exact footgun this tier exists to prevent. Grows
@@ -133,5 +149,18 @@ mod tests {
         );
         let m: ExposureMode = serde_json::from_value(serde_json::json!("private")).unwrap();
         assert_eq!(m, ExposureMode::Private);
+    }
+
+    #[test]
+    fn stricter_is_public_service_dominant_and_symmetric() {
+        use ExposureMode::*;
+        // PublicService dominates from either side.
+        assert_eq!(PublicService.stricter(Private), PublicService);
+        assert_eq!(Private.stricter(PublicService), PublicService);
+        assert_eq!(TrustedRemote.stricter(PublicService), PublicService);
+        // Non-clamped tiers combine without escalating to clamped.
+        assert_eq!(Private.stricter(Private), Private);
+        assert_eq!(Private.stricter(TrustedRemote), TrustedRemote);
+        assert_eq!(TrustedRemote.stricter(TrustedRemote), TrustedRemote);
     }
 }

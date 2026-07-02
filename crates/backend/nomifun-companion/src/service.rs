@@ -1270,6 +1270,20 @@ impl nomifun_ai_agent::CompanionPromptProvider for CompanionService {
         let smart = self.config.read().await.smart_orchestration;
         Some(crate::companion::build_companion_system_prompt(&self.store, &profile, channel_platform, smart).await)
     }
+
+    async fn exposure(&self, companion_id: Option<&str>) -> nomifun_api_types::ExposureMode {
+        // Read the companion's persisted tier live; unknown / unbound → Private
+        // (full capabilities, today's behavior). A missing profile is not public.
+        match companion_id.map(str::trim).filter(|id| !id.is_empty()) {
+            Some(id) => self
+                .registry
+                .get(id)
+                .await
+                .map(|p| p.exposure)
+                .unwrap_or_default(),
+            None => nomifun_api_types::ExposureMode::Private,
+        }
+    }
 }
 
 #[cfg(test)]
