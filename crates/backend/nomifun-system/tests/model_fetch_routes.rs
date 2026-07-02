@@ -15,12 +15,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use nomifun_common::encrypt_string;
 use nomifun_db::{
-    CreateProviderParams, IProviderRepository, SqliteClientPreferenceRepository, SqliteProviderRepository,
-    SqliteSettingsRepository, init_database_memory,
+    CreateProviderParams, IProviderRepository, SqliteClientPreferenceRepository,
+    SqliteProviderRepository, SqliteSettingsRepository, init_database_memory,
 };
 use nomifun_system::{
-    ClientPrefService, ModelFetchService, ProtocolDetectionService, ProviderService, SettingsService,
-    SystemRouterState, VersionCheckService, system_routes,
+    ClientPrefService, ModelFetchService, ProtocolDetectionService, ProviderService,
+    SettingsService, SystemRouterState, VersionCheckService, system_routes,
 };
 
 // ---------------------------------------------------------------------------
@@ -31,10 +31,14 @@ const TEST_KEY: [u8; 32] = [0x42; 32];
 
 fn build_state(db: &nomifun_db::Database) -> SystemRouterState {
     let provider_repo = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
-    let http_client = reqwest::Client::new();
+    let http_client = reqwest::Client::builder().no_proxy().build().unwrap();
     SystemRouterState {
-        settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(db.pool().clone()))),
-        client_pref_service: ClientPrefService::new(Arc::new(SqliteClientPreferenceRepository::new(db.pool().clone()))),
+        settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(
+            db.pool().clone(),
+        ))),
+        client_pref_service: ClientPrefService::new(Arc::new(
+            SqliteClientPreferenceRepository::new(db.pool().clone()),
+        )),
         provider_service: ProviderService::new(provider_repo.clone(), TEST_KEY),
         model_fetch_service: ModelFetchService::new(provider_repo, TEST_KEY, http_client.clone()),
         protocol_detection_service: ProtocolDetectionService::new(http_client.clone()),
@@ -49,7 +53,12 @@ async fn setup() -> (axum::Router, nomifun_db::Database) {
     (system_routes(state), db)
 }
 
-async fn create_provider(db: &nomifun_db::Database, platform: &str, base_url: &str, api_key: &str) -> String {
+async fn create_provider(
+    db: &nomifun_db::Database,
+    platform: &str,
+    base_url: &str,
+    api_key: &str,
+) -> String {
     let repo = SqliteProviderRepository::new(db.pool().clone());
     let encrypted = encrypt_string(api_key, &TEST_KEY).unwrap();
     let row = repo
@@ -97,7 +106,10 @@ fn post_request(uri: &str, body: serde_json::Value) -> Request<Body> {
 #[tokio::test]
 async fn fetch_models_nonexistent_provider() {
     let (router, _db) = setup().await;
-    let req = post_request("/api/providers/nonexistent/models", json!({"try_fix": false}));
+    let req = post_request(
+        "/api/providers/nonexistent/models",
+        json!({"try_fix": false}),
+    );
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
@@ -106,7 +118,10 @@ async fn fetch_models_nonexistent_provider() {
 async fn fetch_models_vertex_ai_hardcoded() {
     let (router, db) = setup().await;
     let id = create_provider(&db, "vertex-ai", "https://unused", "fake-key").await;
-    let req = post_request(&format!("/api/providers/{id}/models"), json!({"try_fix": false}));
+    let req = post_request(
+        &format!("/api/providers/{id}/models"),
+        json!({"try_fix": false}),
+    );
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -128,7 +143,123 @@ async fn fetch_models_minimax_hardcoded() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let json = body_json(resp).await;
-    assert_eq!(json["data"]["models"].as_array().unwrap().len(), 3);
+    let models = json["data"]["models"].as_array().unwrap();
+    assert!(models.iter().any(|model| model == "MiniMax-M3"));
+    assert!(models.iter().any(|model| model == "MiniMax-M2.7"));
+    assert!(models.iter().any(|model| model == "MiniMax-Text-01"));
+}
+
+#[tokio::test]
+async fn fetch_models_mimo_falls_back_to_supported_chat_models() {
+    let (router, db) = setup().await;
+    let id = create_provider(&db, "mimo", "https://unused", "fake-key").await;
+    let req = post_request(&format!("/api/providers/{id}/models"), json!({}));
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let models = json["data"]["models"].as_array().unwrap();
+    assert!(models.iter().any(|model| model == "mimo-v2.5-pro"));
+    assert!(models.iter().any(|model| model == "mimo-v2.5"));
+}
+
+#[tokio::test]
+async fn fetch_models_mimo_token_plan_falls_back_to_supported_chat_models() {
+    let (router, db) = setup().await;
+    let id = create_provider(&db, "mimo-token-plan-cn", "https://unused", "fake-key").await;
+    let req = post_request(&format!("/api/providers/{id}/models"), json!({}));
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let models = json["data"]["models"].as_array().unwrap();
+    assert!(models.iter().any(|model| model == "mimo-v2.5-pro"));
+    assert!(models.iter().any(|model| model == "mimo-v2.5"));
+}
+
+#[tokio::test]
+async fn fetch_models_minimax_code_falls_back_to_supported_coding_models() {
+    let (router, db) = setup().await;
+    let id = create_provider(&db, "minimax-code", "https://unused", "fake-key").await;
+    let req = post_request(&format!("/api/providers/{id}/models"), json!({}));
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let models = json["data"]["models"].as_array().unwrap();
+    assert!(models.iter().any(|model| model == "MiniMax-M3"));
+    assert!(models.iter().any(|model| model == "MiniMax-M2.7-highspeed"));
+}
+
+#[tokio::test]
+async fn fetch_models_minimax_coding_plan_falls_back_to_supported_coding_models() {
+    let (router, db) = setup().await;
+    let id = create_provider(&db, "minimax-coding-plan", "https://unused", "fake-key").await;
+    let req = post_request(&format!("/api/providers/{id}/models"), json!({}));
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let models = json["data"]["models"].as_array().unwrap();
+    assert!(models.iter().any(|model| model == "MiniMax-M3"));
+    assert!(models.iter().any(|model| model == "MiniMax-M2.1"));
+}
+
+#[tokio::test]
+async fn fetch_models_stepfun_plan_falls_back_to_supported_coding_models() {
+    let (router, db) = setup().await;
+    let id = create_provider(&db, "stepfun-plan", "https://unused", "fake-key").await;
+    let req = post_request(&format!("/api/providers/{id}/models"), json!({}));
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let models = json["data"]["models"].as_array().unwrap();
+    assert!(models.iter().any(|model| model == "step-3.7-flash"));
+    assert!(models.iter().any(|model| model == "step-router-v1"));
+}
+
+#[tokio::test]
+async fn fetch_models_glm_coding_plan_falls_back_to_supported_coding_models() {
+    let (router, db) = setup().await;
+    let id = create_provider(&db, "glm-coding-plan", "https://unused", "fake-key").await;
+    let req = post_request(&format!("/api/providers/{id}/models"), json!({}));
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let models = json["data"]["models"].as_array().unwrap();
+    assert!(models.iter().any(|model| model == "glm-5.2"));
+    assert!(models.iter().any(|model| model == "glm-5"));
+    assert!(models.iter().any(|model| model == "glm-4.7"));
+}
+
+#[tokio::test]
+async fn fetch_models_qianfan_coding_plan_falls_back_to_supported_coding_models() {
+    let (router, db) = setup().await;
+    let id = create_provider(&db, "qianfan-coding-plan", "https://unused", "fake-key").await;
+    let req = post_request(&format!("/api/providers/{id}/models"), json!({}));
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let models = json["data"]["models"].as_array().unwrap();
+    assert!(models.iter().any(|model| model == "qianfan-code-latest"));
+    assert!(models.iter().any(|model| model == "kimi-k2.5"));
+    assert!(models.iter().any(|model| model == "glm-5"));
+}
+
+#[tokio::test]
+async fn fetch_models_ark_coding_plan_falls_back_to_supported_coding_models() {
+    let (router, db) = setup().await;
+    let id = create_provider(&db, "ark-coding-plan", "https://unused", "fake-key").await;
+    let req = post_request(&format!("/api/providers/{id}/models"), json!({}));
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let models = json["data"]["models"].as_array().unwrap();
+    assert!(models.iter().any(|model| model == "ark-code-latest"));
 }
 
 // ---------------------------------------------------------------------------
@@ -153,7 +284,10 @@ async fn fetch_models_openai_compatible_success() {
     let (router, db) = setup().await;
     let id = create_provider(&db, "openai", &mock_server.uri(), "test-api-key").await;
 
-    let req = post_request(&format!("/api/providers/{id}/models"), json!({"try_fix": false}));
+    let req = post_request(
+        &format!("/api/providers/{id}/models"),
+        json!({"try_fix": false}),
+    );
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -162,6 +296,33 @@ async fn fetch_models_openai_compatible_success() {
     assert_eq!(models.len(), 2);
     assert_eq!(models[0], "gpt-4o");
     assert_eq!(models[1], "gpt-4o-mini");
+}
+
+#[tokio::test]
+async fn fetch_models_openai_compatible_uses_first_comma_separated_key() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .and(header("Authorization", "Bearer first-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "gpt-4o"}]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let (router, db) = setup().await;
+    let id = create_provider(&db, "openai", &mock_server.uri(), "first-key,second-key").await;
+
+    let req = post_request(
+        &format!("/api/providers/{id}/models"),
+        json!({"try_fix": false}),
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let models = json["data"]["models"].as_array().unwrap();
+    assert_eq!(models[0], "gpt-4o");
 }
 
 #[tokio::test]
@@ -176,7 +337,10 @@ async fn fetch_models_openai_remote_error() {
     let (router, db) = setup().await;
     let id = create_provider(&db, "openai", &mock_server.uri(), "test-key").await;
 
-    let req = post_request(&format!("/api/providers/{id}/models"), json!({"try_fix": false}));
+    let req = post_request(
+        &format!("/api/providers/{id}/models"),
+        json!({"try_fix": false}),
+    );
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 }
@@ -346,7 +510,10 @@ async fn fetch_models_url_auto_fix_success() {
     let (router, db) = setup().await;
     let id = create_provider(&db, "openai", &mock_server.uri(), "test-key").await;
 
-    let req = post_request(&format!("/api/providers/{id}/models"), json!({"try_fix": true}));
+    let req = post_request(
+        &format!("/api/providers/{id}/models"),
+        json!({"try_fix": true}),
+    );
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -355,7 +522,12 @@ async fn fetch_models_url_auto_fix_success() {
     assert_eq!(models.len(), 1);
     assert_eq!(models[0], "fixed-model");
     // fixedBaseUrl should be present
-    assert!(json["data"]["fixed_base_url"].as_str().unwrap().contains("/v1"));
+    assert!(
+        json["data"]["fixed_base_url"]
+            .as_str()
+            .unwrap()
+            .contains("/v1")
+    );
 }
 
 #[tokio::test]
@@ -372,7 +544,10 @@ async fn fetch_models_url_auto_fix_not_triggered_when_success() {
     let (router, db) = setup().await;
     let id = create_provider(&db, "openai", &mock_server.uri(), "test-key").await;
 
-    let req = post_request(&format!("/api/providers/{id}/models"), json!({"try_fix": true}));
+    let req = post_request(
+        &format!("/api/providers/{id}/models"),
+        json!({"try_fix": true}),
+    );
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -397,7 +572,10 @@ async fn fetch_models_url_auto_fix_not_for_anthropic() {
     let id = create_provider(&db, "anthropic", &mock_server.uri(), "bad-key").await;
 
     // Even with tryFix=true, Anthropic should use fallback, not URL fix
-    let req = post_request(&format!("/api/providers/{id}/models"), json!({"try_fix": true}));
+    let req = post_request(
+        &format!("/api/providers/{id}/models"),
+        json!({"try_fix": true}),
+    );
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
@@ -440,6 +618,34 @@ async fn fetch_models_anonymous_returns_models_for_valid_input() {
 }
 
 #[tokio::test]
+async fn fetch_models_anonymous_uses_first_comma_separated_key() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .and(header("Authorization", "Bearer first-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "gpt-4o"}]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let (router, _db) = setup().await;
+    let req = post_request(
+        "/api/providers/fetch-models",
+        json!({
+            "platform": "openai",
+            "base_url": mock_server.uri(),
+            "api_key": "first-key,second-key"
+        }),
+    );
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let models = json["data"]["models"].as_array().unwrap();
+    assert_eq!(models[0], "gpt-4o");
+}
+
+#[tokio::test]
 async fn fetch_models_anonymous_rejects_empty_api_key() {
     let (router, _db) = setup().await;
     let req = post_request(
@@ -469,7 +675,9 @@ async fn fetch_models_anonymous_minimax_hardcoded() {
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["data"]["models"].as_array().unwrap().len(), 3);
+    let models = json["data"]["models"].as_array().unwrap();
+    assert!(models.iter().any(|model| model == "MiniMax-M3"));
+    assert!(models.iter().any(|model| model == "MiniMax-Text-01"));
 }
 
 #[tokio::test]

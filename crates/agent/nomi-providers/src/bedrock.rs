@@ -22,7 +22,6 @@ use crate::{LlmProvider, ProviderError};
 use nomi_config::compat::{self, ProviderCompat};
 
 pub struct BedrockProvider {
-    client: reqwest::Client,
     region: String,
     credentials: AwsCredentials,
     cache_enabled: bool,
@@ -48,7 +47,6 @@ impl BedrockProvider {
         compat: ProviderCompat,
     ) -> Self {
         Self {
-            client: crate::http_client(),
             region: region.to_string(),
             credentials,
             cache_enabled,
@@ -254,6 +252,7 @@ impl LlmProvider for BedrockProvider {
             .map_err(|e| ProviderError::Connection(format!("JSON serialize error: {}", e)))?;
 
         let credentials = self.resolve_credentials()?;
+        let client = crate::http_client();
 
         // Each attempt re-signs: SigV4 signatures embed a timestamp and are only
         // valid within a short window, so a retried request needs a fresh
@@ -307,7 +306,7 @@ impl LlmProvider for BedrockProvider {
         // Initial request with connect-failure retry (status/rate-limit errors
         // are surfaced immediately, same as the other providers).
         let response = crate::retry::with_initial_connect_retry(|| {
-            send_signed(&self.region, &self.client, &url, &body_bytes, &credentials)
+            send_signed(&self.region, &client, &url, &body_bytes, &credentials)
         })
         .await?;
 
@@ -316,7 +315,7 @@ impl LlmProvider for BedrockProvider {
         // Owned copies for the spawned task's mid-stream retry loop (it outlives
         // `&self`, so it cannot borrow region/client/credentials).
         let region = self.region.clone();
-        let client = self.client.clone();
+        let client = client.clone();
         let url_owned = url.clone();
 
         // AWS event stream uses binary framing.

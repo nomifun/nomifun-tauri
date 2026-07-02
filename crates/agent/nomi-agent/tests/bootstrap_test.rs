@@ -80,6 +80,48 @@ async fn bootstrap_registers_all_expected_tools() {
 }
 
 #[tokio::test]
+async fn bootstrap_spawn_gated_off_when_in_process_spawn_false() {
+    let mut config = minimal_config();
+    config.tools.in_process_spawn = false;
+
+    let result = AgentBootstrap::new(config, "/tmp/test-workspace", null_output())
+        .build()
+        .await
+        .unwrap();
+
+    let names = result.engine.tool_names();
+    assert!(
+        !names.iter().any(|n| n == "Spawn"),
+        "门控关闭时不得注册进程内 Spawn（桌面会话改走 nomi_spawn 编排扇出）"
+    );
+    // 其余内建工具不受影响。
+    assert!(names.iter().any(|n| n == "Read"));
+    assert!(names.iter().any(|n| n == "Bash"));
+}
+
+#[tokio::test]
+async fn bootstrap_builtin_allowlist_restricts_tools() {
+    let mut config = minimal_config();
+    config.tools.builtin_allowlist = vec!["Read".into(), "Grep".into(), "Glob".into()];
+
+    let result = AgentBootstrap::new(config, "/tmp/test-workspace", null_output())
+        .build()
+        .await
+        .unwrap();
+
+    let names = result.engine.tool_names();
+    assert!(names.iter().any(|n| n == "Read"));
+    assert!(names.iter().any(|n| n == "Grep"));
+    assert!(names.iter().any(|n| n == "Glob"));
+    for denied in &["Bash", "Write", "Edit", "Spawn", "Skill"] {
+        assert!(
+            !names.iter().any(|n| n == denied),
+            "白名单外的工具必须被过滤: {denied}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn bootstrap_plan_tools_when_enabled() {
     let mut config = minimal_config();
     config.plan.enabled = true;

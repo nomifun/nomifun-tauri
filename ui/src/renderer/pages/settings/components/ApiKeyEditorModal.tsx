@@ -1,7 +1,8 @@
-import { Button, Input, Modal, Spin, Tooltip } from '@arco-design/web-react';
+import { Button, Input, Message, Modal, Spin, Tooltip } from '@arco-design/web-react';
 import { CheckOne, CloseOne, Delete, Edit, Plus, DeleteFive, CheckSmall, Shield } from '@icon-park/react';
 import React, { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { parseApiKeyList, validateApiKeysForSave } from '@/common/utils/apiKeys';
 
 /**
  * API Key 状态
@@ -25,7 +26,7 @@ interface ApiKeyEditorModalProps {
   api_keys: string; // 逗号分隔的 API Keys
   onClose: () => void;
   onSave: (api_keys: string) => void;
-  onTestKey?: (key: string) => Promise<boolean>; // 测试单个 key 的回调
+  onTestKey: (key: string) => Promise<boolean>; // 测试单个 key 的回调
 }
 
 /**
@@ -35,14 +36,12 @@ interface ApiKeyEditorModalProps {
 const ApiKeyEditorModal: React.FC<ApiKeyEditorModalProps> = ({ visible, api_keys, onClose, onSave, onTestKey }) => {
   const { t } = useTranslation();
   const [keys, setKeys] = useState<ApiKeyItem[]>([]);
+  const [isSaving, setIsSaving] = useState(false);
 
   // 初始化 keys
   useEffect(() => {
     if (visible) {
-      const keyList = api_keys
-        .split(',')
-        .map((k) => k.trim())
-        .filter(Boolean);
+      const keyList = parseApiKeyList(api_keys);
       if (keyList.length === 0) {
         // 默认添加一个空的输入框
         setKeys([{ id: crypto.randomUUID(), value: '', status: 'pending', editing: true }]);
@@ -77,8 +76,6 @@ const ApiKeyEditorModal: React.FC<ApiKeyEditorModalProps> = ({ visible, api_keys
   // 测试单个 key 的核心逻辑 / Core logic for testing a single key
   const executeKeyTest = useCallback(
     async (id: string, value: string) => {
-      if (!onTestKey) return;
-
       setKeys((prev) => prev.map((k) => (k.id === id ? { ...k, status: 'testing' } : k)));
 
       try {
@@ -126,14 +123,41 @@ const ApiKeyEditorModal: React.FC<ApiKeyEditorModalProps> = ({ visible, api_keys
   }, []);
 
   // 保存
-  const handleSave = useCallback(() => {
-    const validKeys = keys
+  const handleSave = useCallback(async () => {
+    const apiKeys = keys
       .map((k) => k.value.trim())
       .filter(Boolean)
       .join(',');
-    onSave(validKeys);
-    onClose();
-  }, [keys, onSave, onClose]);
+
+    setIsSaving(true);
+    try {
+      setKeys((prev) => prev.map((key) => (key.value.trim() ? { ...key, status: 'testing' } : key)));
+      const validation = await validateApiKeysForSave(apiKeys, onTestKey);
+      const invalidIndexes = new Set(validation.invalidIndexes);
+
+      setKeys((prev) => {
+        let nonEmptyIndex = -1;
+        return prev.map((key) => {
+          if (!key.value.trim()) return key;
+          nonEmptyIndex += 1;
+          return {
+            ...key,
+            status: invalidIndexes.has(nonEmptyIndex) ? 'invalid' : 'valid',
+          };
+        });
+      });
+
+      if (!validation.valid) {
+        Message.warning(t('settings.removeInvalidApiKeysBeforeSave', { count: validation.invalidIndexes.length }));
+        return;
+      }
+
+      onSave(validation.normalized);
+      onClose();
+    } finally {
+      setIsSaving(false);
+    }
+  }, [keys, onTestKey, onSave, onClose, t]);
 
   // 是否有多个 key
   const hasMultipleKeys = keys.filter((k) => k.value.trim()).length > 1;
@@ -273,7 +297,7 @@ const ApiKeyEditorModal: React.FC<ApiKeyEditorModalProps> = ({ visible, api_keys
 
         {/* 确认按钮 */}
         <div className='flex justify-end pt-8px'>
-          <Button type='primary' onClick={handleSave}>
+          <Button type='primary' onClick={handleSave} loading={isSaving}>
             {t('common.confirm')}
           </Button>
         </div>

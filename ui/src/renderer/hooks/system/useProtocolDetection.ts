@@ -48,7 +48,7 @@ interface UseProtocolDetectionResult {
  * Used to auto-detect the protocol type used by an API endpoint
  *
  * @param base_url - Base URL
- * @param api_key - API Key（可以是逗号或换行分隔的多个 Key）
+ * @param api_key - API Key（多个 Key 使用英文逗号分隔）
  * @param options - 配置选项
  */
 function useProtocolDetection(

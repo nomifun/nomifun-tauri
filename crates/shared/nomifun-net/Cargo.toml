@@ -8,3 +8,8 @@ repository.workspace = true
 [dependencies]
 reqwest.workspace = true
 tracing.workspace = true
+
+# Native registry access for Windows system-proxy detection, replacing a `reg`
+# subprocess: no console-window flash, no blocking spawn, correct UTF-16 decode.
+[target.'cfg(windows)'.dependencies]
+windows-registry = "0.6"

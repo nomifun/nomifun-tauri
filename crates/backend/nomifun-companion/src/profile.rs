@@ -202,6 +202,38 @@ impl Default for SharedEvolveConfig {
     }
 }
 
+/// Session-window archiving settings (伙伴会话窗口归档): when a companion's chat
+/// window goes idle for `idle_minutes`, compress it into a day-partitioned
+/// digest, then reset the live engine context so the next window starts small.
+/// Default OFF (opt-in), mirroring the learn loop — these background LLM loops
+/// cost tokens and (here) reset live context, so the user opts in explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SharedArchiveConfig {
+    /// Master switch. Off = the archiver is a complete no-op (companion behaves
+    /// exactly as before this feature).
+    pub enabled: bool,
+    /// Close & archive a window after this many minutes with no activity.
+    pub idle_minutes: u32,
+    /// Skip summarizing (roll boundary only, no digest, no reset) windows whose
+    /// total content is shorter than this many chars — avoids burning tokens on
+    /// trivial "hi/bye" sessions.
+    pub min_chars: usize,
+    /// How many recent day-digests to inject into a new window's system prompt.
+    pub inject_recent_days: u32,
+}
+
+impl Default for SharedArchiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            idle_minutes: 30,
+            min_chars: 60,
+            inject_recent_days: 3,
+        }
+    }
+}
+
 /// Cross-companion shared configuration persisted as `companion/shared/config.json`.
 /// Deliberately user-writable wholesale (full-object `PUT /api/companion/config`),
 /// so nothing registry-owned (e.g. the companion-seq watermark, which lives in
@@ -213,6 +245,15 @@ pub struct SharedCompanionConfig {
     pub learn: SharedLearnConfig,
     #[serde(default)]
     pub evolve: SharedEvolveConfig,
+    #[serde(default)]
+    pub archive: SharedArchiveConfig,
+    /// 智能编排（默认 OFF, opt-in）：开启后，本地伙伴会话获得"调度官"能力提示——
+    /// 遇到复杂/多步大任务时用 `nomi_run_create` 把活拆给隔离子 agent 并行处理，
+    /// 伙伴只负责调度与汇总，保持自己的对话上下文清爽（与会话归档协同：主线程只留
+    /// 总结、更易归档）。工具本身随桌面网关（desktopGateway）提供；远程 IM 会话不注入
+    /// （caps_orchestrator 对 Remote 硬拒）。
+    #[serde(default)]
+    pub smart_orchestration: bool,
     /// Which companion new/unattributed activity defaults to.
     pub default_companion_id: String,
     /// Opt-in (default None = off): when set to a directory path, companion

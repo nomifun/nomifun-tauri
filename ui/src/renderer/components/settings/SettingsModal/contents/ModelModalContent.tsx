@@ -6,9 +6,10 @@
 
 import { ipcBridge } from '@/common';
 import type { IProvider } from '@/common/config/storage';
+import { prefixedId } from '@/common/utils';
 import { Button, Divider, Message, Popconfirm, Popover, Input, Collapse, Tag, Switch, Tooltip } from '@arco-design/web-react';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
-import { DeleteFour, Info, Minus, Plus, Write, Heartbeat } from '@icon-park/react';
+import { Copy, DeleteFour, Info, Minus, Plus, Write, Heartbeat } from '@icon-park/react';
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import AddModelModal from '@/renderer/pages/settings/components/AddModelModal';
@@ -21,6 +22,7 @@ import { useContainerWidth } from '@/renderer/hooks/ui/useContainerWidth';
 import { useSettingsViewMode } from '../settingsViewContext';
 import { consumePendingDeepLink } from '@/renderer/hooks/system/useDeepLink';
 import { ContextLimitSelect, formatContextLimit } from '@/renderer/pages/settings/components/ContextLimitSelect';
+import { cloneProviderConfig } from '@/renderer/utils/model/providerClone';
 import '../model-provider.css';
 
 /**
@@ -308,6 +310,18 @@ const ModelModalContent: React.FC = () => {
         console.error('Failed to delete provider:', error);
         message.error(t('settings.saveModelConfigFailed'));
       });
+  };
+
+  const duplicatePlatform = (platform: IProvider) => {
+    const copied = cloneProviderConfig(
+      platform,
+      prefixedId('prov'),
+      t('settings.providerCopySuffix', { defaultValue: '副本' })
+    );
+    updatePlatform(copied, () => {
+      setCollapseKey((prev) => ({ ...prev, [copied.id]: true }));
+      message.success(t('settings.providerConfigCopied', { name: copied.name }));
+    });
   };
 
   // 切换供应商启用状态（全选 ↔ 全不选）
@@ -629,6 +643,14 @@ const ModelModalContent: React.FC = () => {
                               icon={<Write size='14' />}
                               onClick={() => editModalCtrl.open({ data: platform })}
                             />
+                            <Tooltip content={t('settings.copyProviderConfig', { defaultValue: '复制整组配置' })}>
+                              <Button
+                                size='mini'
+                                className='model-provider-action-btn !w-28px !h-28px !min-w-28px text-t-secondary hover:text-t-primary'
+                                icon={<Copy theme='outline' size='14' />}
+                                onClick={() => duplicatePlatform(platform)}
+                              />
+                            </Tooltip>
                           </div>
                         </div>
                       </div>

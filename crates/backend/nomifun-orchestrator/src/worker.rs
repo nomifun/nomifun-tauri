@@ -113,6 +113,28 @@ pub trait WorkerRunner: Send + Sync {
     async fn last_error_retryable(&self, _conversation_id: &str) -> bool {
         false
     }
+
+    /// 带角色的执行入口：默认忽略 `role` 委托给 [`Self::run`]（既有 mock/测试
+    /// runner 零改动）。生产 [`ConversationWorkerRunner`] 覆写本方法，把受限
+    /// 角色（searcher/reviewer/verifier）映射为 per-node 工具白名单 + 网关收缩。
+    /// 引擎 dispatch 统一走本方法并传 `task.role`。
+    #[allow(clippy::too_many_arguments)]
+    async fn run_restricted(
+        &self,
+        role: Option<&str>,
+        member: &FleetMember,
+        workspace_dir: Option<&str>,
+        run_id: &str,
+        task_id: &str,
+        brief: &str,
+        task_spec: &str,
+        timeout: Duration,
+        on_started: Box<dyn FnOnce(i64) + Send>,
+    ) -> Result<WorkerOutcome, AppError> {
+        let _ = role;
+        self.run(member, workspace_dir, run_id, task_id, brief, task_spec, timeout, on_started)
+            .await
+    }
 }
 
 /// Production [`WorkerRunner`]: runs the task on a real nomi conversation via
@@ -161,6 +183,23 @@ impl WorkerRunner for ConversationWorkerRunner {
         timeout: Duration,
         on_started: Box<dyn FnOnce(i64) + Send>,
     ) -> Result<WorkerOutcome, AppError> {
+        // 无角色入口：委托给带角色版本（生产逻辑在 run_restricted 里）。
+        self.run_restricted(None, member, workspace_dir, run_id, task_id, brief, task_spec, timeout, on_started)
+            .await
+    }
+
+    async fn run_restricted(
+        &self,
+        role: Option<&str>,
+        member: &FleetMember,
+        workspace_dir: Option<&str>,
+        run_id: &str,
+        task_id: &str,
+        brief: &str,
+        task_spec: &str,
+        timeout: Duration,
+        on_started: Box<dyn FnOnce(i64) + Send>,
+    ) -> Result<WorkerOutcome, AppError> {
         // P1 supports Nomi-engine members: both provider_id and model are required.
         // Non-Nomi / ACP members (which carry their model differently) are out of
         // P1 scope — reject loudly rather than silently producing an empty pwm.
@@ -183,6 +222,7 @@ impl WorkerRunner for ConversationWorkerRunner {
             member.system_prompt.as_deref(),
             &member.enabled_skills,
             &member.disabled_builtin_skills,
+            role,
         );
 
         // Create the worker conversation. yolo: unattended orchestrator runs have
@@ -367,10 +407,15 @@ fn build_worker_extra(
     persona: Option<&str>,
     enabled_skills: &[String],
     disabled_builtin_skills: &[String],
+    role: Option<&str>,
 ) -> Value {
+    // 受限角色（searcher/reviewer 只读、verifier 只读+Bash）：收缩引擎工具白名单，
+    // 且不授桌面网关 —— 只读 worker 拿全量 nomi_* 桌面控制等于静默升权。
+    // 其余（implementer / planner 的中文角色标签 / 无角色）保持现状全量能力。
+    let restricted = role_allowed_tools(role);
     let mut extra = json!({
         "session_mode": "yolo",
-        "desktopGateway": true,
+        "desktopGateway": restricted.is_none(),
         "orchestrator_run_id": run_id,
         "orchestrator_task_id": task_id,
         "system_prompt": brief,
@@ -380,6 +425,9 @@ fn build_worker_extra(
         "preset_enabled_skills": enabled_skills,
         "exclude_auto_inject_skills": disabled_builtin_skills,
     });
+    if let Some(tools) = restricted {
+        extra["allowed_tools"] = json!(tools);
+    }
     // Persona: assistant rule text appended after the brief by the nomi factory.
     if let Some(persona) = persona.map(str::trim).filter(|s| !s.is_empty()) {
         extra["preset_rules"] = json!(persona);
@@ -388,6 +436,17 @@ fn build_worker_extra(
         extra["workspace"] = json!(ws);
     }
     extra
+}
+
+/// 受限角色 → 引擎工具白名单（与进程内 Spawn 的 role_tools 语义一致）。
+/// `None` = 不限制（implementer / 未知 / planner 的中文角色标签 / 无角色）——
+/// 只有显式的英文受限角色才收缩，规划器产出的中文 role 永不误伤。
+fn role_allowed_tools(role: Option<&str>) -> Option<Vec<&'static str>> {
+    match role.map(|r| r.to_ascii_lowercase()).as_deref() {
+        Some("searcher" | "scout" | "reviewer") => Some(vec!["Read", "Grep", "Glob"]),
+        Some("verifier" | "tester") => Some(vec!["Read", "Grep", "Glob", "Bash"]),
+        _ => None,
+    }
 }
 
 /// Walk a serialized message list (desc-ordered) and return the newest assistant
@@ -634,7 +693,7 @@ mod tests {
 
     #[test]
     fn build_worker_extra_carries_correlation_keys_and_brief() {
-        let extra = build_worker_extra("run_abc", "task_xyz", "you are a worker", None, None, &[], &[]);
+        let extra = build_worker_extra("run_abc", "task_xyz", "you are a worker", None, None, &[], &[], None);
         assert_eq!(extra["session_mode"], "yolo");
         assert_eq!(extra["desktopGateway"], true);
         assert_eq!(extra["orchestrator_run_id"], "run_abc");
@@ -646,15 +705,43 @@ mod tests {
         assert!(extra.get("preset_rules").is_none());
     }
 
+    // 受限角色 → 引擎工具白名单（与进程内 Spawn role_tools 语义一致）。
+    #[test]
+    fn role_allowed_tools_maps_restricted_roles() {
+        assert_eq!(role_allowed_tools(Some("searcher")), Some(vec!["Read", "Grep", "Glob"]));
+        assert_eq!(role_allowed_tools(Some("Reviewer")), Some(vec!["Read", "Grep", "Glob"])); // 大小写不敏感
+        assert_eq!(role_allowed_tools(Some("verifier")), Some(vec!["Read", "Grep", "Glob", "Bash"]));
+        // implementer / planner 的中文角色标签 / 无角色 → 不限制（绝不误伤）。
+        assert_eq!(role_allowed_tools(Some("implementer")), None);
+        assert_eq!(role_allowed_tools(Some("前端")), None);
+        assert_eq!(role_allowed_tools(None), None);
+    }
+
+    // 受限角色：带 allowed_tools 白名单，且不授桌面网关（只读 worker 拿全量
+    // nomi_* 桌面控制 = 静默升权）。无角色/implementer：现状完全不变。
+    #[test]
+    fn build_worker_extra_restricted_role_shrinks_tools_and_gateway() {
+        let extra = build_worker_extra("run_abc", "task_xyz", "brief", None, None, &[], &[], Some("searcher"));
+        assert_eq!(extra["desktopGateway"], false, "受限角色不得静默升权到全量网关");
+        assert_eq!(extra["allowed_tools"], json!(["Read", "Grep", "Glob"]));
+
+        let verify = build_worker_extra("run_abc", "task_xyz", "brief", None, None, &[], &[], Some("verifier"));
+        assert_eq!(verify["allowed_tools"], json!(["Read", "Grep", "Glob", "Bash"]));
+
+        let full = build_worker_extra("run_abc", "task_xyz", "brief", None, None, &[], &[], Some("implementer"));
+        assert_eq!(full["desktopGateway"], true);
+        assert!(full.get("allowed_tools").is_none());
+    }
+
     #[test]
     fn build_worker_extra_includes_trimmed_workspace() {
-        let extra = build_worker_extra("r", "t", "b", Some("  /tmp/ws  "), None, &[], &[]);
+        let extra = build_worker_extra("r", "t", "b", Some("  /tmp/ws  "), None, &[], &[], None);
         assert_eq!(extra["workspace"], "/tmp/ws");
     }
 
     #[test]
     fn build_worker_extra_ignores_blank_workspace() {
-        let extra = build_worker_extra("r", "t", "b", Some("   "), None, &[], &[]);
+        let extra = build_worker_extra("r", "t", "b", Some("   "), None, &[], &[], None);
         assert!(extra.get("workspace").is_none());
     }
 
@@ -671,6 +758,7 @@ mod tests {
             Some("你是一名严谨的研究员，始终引用来源。"),
             &[],
             &[],
+            None,
         );
         // Brief stays as the system_prompt; persona rides as preset_rules.
         assert_eq!(extra["system_prompt"], "supervisor brief");
@@ -680,12 +768,12 @@ mod tests {
     // A blank/whitespace-only persona is dropped — no preset_rules key.
     #[test]
     fn build_worker_extra_drops_blank_persona() {
-        let empty = build_worker_extra("r", "t", "b", None, Some(""), &[], &[]);
+        let empty = build_worker_extra("r", "t", "b", None, Some(""), &[], &[], None);
         assert!(empty.get("preset_rules").is_none());
-        let blank = build_worker_extra("r", "t", "b", None, Some("   \n  "), &[], &[]);
+        let blank = build_worker_extra("r", "t", "b", None, Some("   \n  "), &[], &[], None);
         assert!(blank.get("preset_rules").is_none());
         // Persona is trimmed before being stored.
-        let padded = build_worker_extra("r", "t", "b", None, Some("  persona  "), &[], &[]);
+        let padded = build_worker_extra("r", "t", "b", None, Some("  persona  "), &[], &[], None);
         assert_eq!(padded["preset_rules"], "persona");
     }
 
@@ -696,7 +784,7 @@ mod tests {
     fn build_worker_extra_forwards_skill_lists_as_request_only_keys() {
         let enabled = vec!["web_search".to_string(), "code_run".to_string()];
         let disabled = vec!["browser".to_string()];
-        let extra = build_worker_extra("r", "t", "b", None, None, &enabled, &disabled);
+        let extra = build_worker_extra("r", "t", "b", None, None, &enabled, &disabled, None);
         assert_eq!(
             extra["preset_enabled_skills"],
             json!(["web_search", "code_run"]),
@@ -713,7 +801,7 @@ mod tests {
     // as "no preset / no exclusion" (no behavior change for bare members).
     #[test]
     fn build_worker_extra_emits_empty_skill_arrays_when_member_has_none() {
-        let extra = build_worker_extra("r", "t", "b", None, None, &[], &[]);
+        let extra = build_worker_extra("r", "t", "b", None, None, &[], &[], None);
         assert_eq!(extra["preset_enabled_skills"], json!([]));
         assert_eq!(extra["exclude_auto_inject_skills"], json!([]));
     }

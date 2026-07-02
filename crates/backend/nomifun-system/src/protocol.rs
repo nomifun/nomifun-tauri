@@ -88,12 +88,26 @@ enum ProbeOutcome {
 /// Service for detecting API endpoint protocol type.
 #[derive(Clone)]
 pub struct ProtocolDetectionService {
-    http_client: reqwest::Client,
+    http_client: HttpClientFactory,
 }
+
+type HttpClientFactory = Arc<dyn Fn() -> reqwest::Client + Send + Sync>;
 
 impl ProtocolDetectionService {
     pub fn new(http_client: reqwest::Client) -> Self {
-        Self { http_client }
+        Self {
+            http_client: Arc::new(move || http_client.clone()),
+        }
+    }
+
+    pub fn new_dynamic() -> Self {
+        Self {
+            http_client: Arc::new(nomifun_net::http_client),
+        }
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        (self.http_client)()
     }
 
     pub async fn detect_protocol(&self, req: &DetectProtocolRequest) -> Result<ProtocolDetectionResponse, AppError> {
@@ -226,6 +240,7 @@ impl ProtocolDetectionService {
     }
 
     async fn probe_openai(&self, base: &str, api_key: &str, timeout: Duration) -> Result<ProbeOutcome, AppError> {
+        let client = self.http_client();
         let urls = [
             (format!("{base}/models"), None),
             (format!("{base}/v1/models"), Some(format!("{base}/v1"))),
@@ -234,8 +249,7 @@ impl ProtocolDetectionService {
         let mut last_auth_failure: Option<Option<String>> = None;
 
         for (url, fixed) in &urls {
-            let resp = self
-                .http_client
+            let resp = client
                 .get(url)
                 .header("Authorization", format!("Bearer {api_key}"))
                 .timeout(timeout)
@@ -270,9 +284,9 @@ impl ProtocolDetectionService {
     }
 
     async fn probe_anthropic(&self, base: &str, api_key: &str, timeout: Duration) -> Result<ProbeOutcome, AppError> {
+        let client = self.http_client();
         let url = format!("{base}/v1/models");
-        let resp = self
-            .http_client
+        let resp = client
             .get(&url)
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
@@ -301,9 +315,9 @@ impl ProtocolDetectionService {
     }
 
     async fn probe_gemini(&self, base: &str, api_key: &str, timeout: Duration) -> Result<ProbeOutcome, AppError> {
+        let client = self.http_client();
         let url = format!("{base}/v1beta/models?key={api_key}");
-        let resp = self
-            .http_client
+        let resp = client
             .get(&url)
             .timeout(timeout)
             .send()
@@ -348,7 +362,7 @@ impl ProtocolDetectionService {
         let mut set = JoinSet::new();
 
         for (i, key) in keys.iter().enumerate() {
-            let client = self.http_client.clone();
+            let make_client = Arc::clone(&self.http_client);
             let key = key.clone();
             let base = base.clone();
             let sem = sem.clone();
@@ -356,6 +370,7 @@ impl ProtocolDetectionService {
             set.spawn(async move {
                 let _permit = sem.acquire().await;
                 let start = Instant::now();
+                let client = make_client();
                 let ok = test_single_key(&client, protocol, &base, &key, timeout).await;
                 let latency = start.elapsed().as_millis() as i64;
 

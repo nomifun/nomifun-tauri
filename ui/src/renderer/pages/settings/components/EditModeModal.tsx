@@ -1,14 +1,15 @@
 import type { IProvider } from '@/common/config/storage';
 import ModalHOC from '@/renderer/utils/ui/ModalHOC';
-import { Form, Input, Message, Select, Tag } from '@arco-design/web-react';
+import { Form, Input, Select, Tag } from '@arco-design/web-react';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
-import React, { useEffect, useMemo } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import NomiModal from '@/renderer/components/base/NomiModal';
 import { LinkCloud } from '@icon-park/react';
 import { ipcBridge } from '@/common';
 import useModeModeList from '@renderer/hooks/agent/useModeModeList';
 import { getProviderLogo } from '@/renderer/utils/model/modelPlatforms';
+import { normalizeApiKeyList, validateApiKeysForSave } from '@/common/utils/apiKeys';
 
 /**
  * 供应商 Logo 组件
@@ -27,6 +28,7 @@ const EditModeModal = ModalHOC<{ data?: IProvider; onChange(data: IProvider): vo
     const { data } = props;
     const [form] = Form.useForm();
     const [message, messageContext] = useArcoMessage();
+    const [isSaving, setIsSaving] = useState(false);
 
     // Watch bedrockAuthMethod only for UI conditional rendering (not for auto-refresh)
     const bedrockAuthMethod = Form.useWatch('bedrockAuthMethod', form);
@@ -74,6 +76,19 @@ const EditModeModal = ModalHOC<{ data?: IProvider; onChange(data: IProvider): vo
       }
     }, [data, form]);
 
+    const testApiKeyForProvider = async (key: string, baseUrl: string) => {
+      try {
+        const res = await ipcBridge.mode.detectProtocol.invoke({
+          base_url: baseUrl,
+          api_key: key,
+          timeout: 10000,
+        });
+        return res?.success === true;
+      } catch {
+        return false;
+      }
+    };
+
     return (
       <NomiModal
         visible={modalProps.visible}
@@ -91,9 +106,28 @@ const EditModeModal = ModalHOC<{ data?: IProvider; onChange(data: IProvider): vo
             const values = await form.validate();
             const { context_limit: _contextLimit, model_context_limits: _modelContextLimits, ...formValues } = values;
             const nextModels = Array.isArray(values.model) ? values.model : [values.model];
+            const providerBaseUrl = values.base_url ?? data?.base_url ?? '';
+            let normalizedApiKey = isBedrock ? '' : normalizeApiKeyList(values.api_key);
+
+            if (!isBedrock && !isFullUrl) {
+              setIsSaving(true);
+              const validation = await validateApiKeysForSave(values.api_key, (key) =>
+                testApiKeyForProvider(key, providerBaseUrl)
+              );
+              form.setFieldValue('api_key', validation.normalized);
+              if (!validation.valid) {
+                message.error(
+                  t('settings.removeInvalidApiKeysBeforeSave', { count: validation.invalidIndexes.length })
+                );
+                return;
+              }
+              normalizedApiKey = validation.normalized;
+            }
+
             const updatedProvider: IProvider = {
               ...data,
               ...formValues,
+              api_key: normalizedApiKey,
               // Ensure models is always an array
               models: nextModels,
               context_limit: data?.context_limit,
@@ -120,8 +154,11 @@ const EditModeModal = ModalHOC<{ data?: IProvider; onChange(data: IProvider): vo
             modalCtrl.close();
           } catch {
             // Validation failed — Arco Form highlights invalid fields automatically
+          } finally {
+            setIsSaving(false);
           }
         }}
+        confirmLoading={modalProps.confirmLoading || isSaving}
         okText={t('common.save')}
         cancelText={t('common.cancel')}
       >

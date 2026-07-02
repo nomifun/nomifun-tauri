@@ -5,6 +5,7 @@
  */
 
 import { AuthType } from '@/common/api/authType';
+import { parseApiKeyList } from '@/common/utils/apiKeys';
 
 /**
  * Multi-API Key Manager with Time-based Blacklisting
@@ -40,11 +41,7 @@ export class ApiKeyManager {
   }
 
   private parseKeys(keysString: string): string[] {
-    if (!keysString) return [];
-    return keysString
-      .split(/[,\n]/)
-      .map((k) => k.trim())
-      .filter((k) => k.length > 0);
+    return parseApiKeyList(keysString);
   }
 
   private initializeWithRandomKey(): void {

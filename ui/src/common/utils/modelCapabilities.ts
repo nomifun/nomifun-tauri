@@ -10,12 +10,12 @@ import type { IProvider, ModelType } from '@/common/config/storage';
  * Capability matching regex patterns
  */
 export const CAPABILITY_PATTERNS: Record<ModelType, RegExp> = {
-  text: /gpt|claude|gemini|qwen|llama|mistral|deepseek/i,
-  vision: /4o|claude-3|gemini-.*-pro|gemini-.*-flash|gemini-2\.0|qwen-vl|llava|vision/i,
-  function_calling: /gpt-4|claude-3|gemini|qwen|deepseek/i,
+  text: /gpt|claude|gemini|qwen|llama|mistral|deepseek|mimo/i,
+  vision: /4o|claude-3|gemini-.*-pro|gemini-.*-flash|gemini-2\.0|qwen-vl|llava|vision|mimo-v2\.5$/i,
+  function_calling: /gpt-4|claude-3|gemini|qwen|deepseek|mimo/i,
   image_generation: /flux|diffusion|stabilityai|sd-|dall|cogview|janus|midjourney|mj-|imagen/i,
   web_search: /search|perplexity/i,
-  reasoning: /o1-|reasoning|think/i,
+  reasoning: /o1-|reasoning|think|mimo-v2\.5/i,
   embedding: /(?:^text-|embed|bge-|e5-|LLM2Vec|retrieval|uae-|gte-|jina-clip|jina-embeddings|voyage-)/i,
   rerank: /(?:rerank|re-rank|re-ranker|re-ranking|retrieval|retriever)/i,
   excludeFromPrimary: /dall-e|flux|stable-diffusion|midjourney|flash-image|image|embed|rerank/i,

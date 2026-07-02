@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 nomifun-common.workspace = true
 nomifun-db.workspace = true
+nomifun-net.workspace = true
 nomifun-api-types.workspace = true
 nomifun-auth.workspace = true
 nomifun-requirement.workspace = true

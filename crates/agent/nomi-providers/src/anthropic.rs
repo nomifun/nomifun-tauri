@@ -10,7 +10,6 @@ use crate::{LlmProvider, ProviderError};
 use nomi_config::compat::ProviderCompat;
 
 pub struct AnthropicProvider {
-    client: reqwest::Client,
     api_key: String,
     base_url: String,
     cache_enabled: bool,
@@ -20,7 +19,6 @@ pub struct AnthropicProvider {
 impl AnthropicProvider {
     pub fn new(api_key: &str, base_url: &str, compat: ProviderCompat) -> Self {
         Self {
-            client: crate::http_client(),
             api_key: api_key.to_string(),
             base_url: base_url.to_string(),
             cache_enabled: true,
@@ -97,12 +95,12 @@ impl LlmProvider for AnthropicProvider {
     ) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
         let url = format!("{}/v1/messages", self.base_url);
         let body = self.build_request_body(request);
+        let client = crate::http_client();
 
         tracing::debug!(target: "nomi_providers", body = %serde_json::to_string_pretty(&body).unwrap_or_default(), "outgoing request");
 
         let response = crate::retry::with_initial_connect_retry(|| async {
-            let response = self
-                .client
+            let response = client
                 .post(&url)
                 .headers(self.build_headers()?)
                 .json(&body)
@@ -129,7 +127,7 @@ impl LlmProvider for AnthropicProvider {
         .await?;
 
         let (tx, rx) = mpsc::channel(64);
-        let client = self.client.clone();
+        let client = client.clone();
         let headers = self.build_headers()?;
         let url_clone = url.clone();
 

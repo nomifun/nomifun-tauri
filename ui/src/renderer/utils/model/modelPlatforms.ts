@@ -22,7 +22,37 @@ const buildLogoAssetUrl = (path: string): string => {
  * 平台类型
  * Platform type
  */
-export type PlatformType = 'gemini' | 'gemini-vertex-ai' | 'anthropic' | 'custom' | 'new-api' | 'bedrock';
+export type PlatformType =
+  | 'gemini'
+  | 'gemini-vertex-ai'
+  | 'anthropic'
+  | 'custom'
+  | 'new-api'
+  | 'bedrock'
+  | 'deepseek'
+  | 'mimo'
+  | 'mimo-token-plan-cn'
+  | 'mimo-token-plan-sgp'
+  | 'mimo-token-plan-ams'
+  | 'minimax'
+  | 'minimax-code'
+  | 'minimax-coding-plan'
+  | 'dashscope'
+  | 'dashscope-coding'
+  | 'siliconflow'
+  | 'zhipu'
+  | 'glm-coding-plan'
+  | 'moonshot-cn'
+  | 'moonshot-global'
+  | 'ark'
+  | 'ark-coding-plan'
+  | 'qianfan'
+  | 'qianfan-coding-plan'
+  | 'hunyuan'
+  | 'lingyi'
+  | 'stepfun'
+  | 'stepfun-plan'
+  | (string & {});
 
 /**
  * 模型平台配置接口
@@ -107,14 +137,56 @@ export const MODEL_PLATFORMS: PlatformConfig[] = [
     name: 'DeepSeek',
     value: 'DeepSeek',
     logo: buildLogoAssetUrl('ai-major/deepseek.svg'),
-    platform: 'custom',
+    platform: 'deepseek',
     base_url: 'https://api.deepseek.com/v1',
+  },
+  {
+    name: 'Xiaomi MiMo',
+    value: 'MiMo',
+    logo: buildLogoAssetUrl('ai-china/mimo.svg'),
+    platform: 'mimo',
+    base_url: 'https://api.xiaomimimo.com/v1',
+  },
+  {
+    name: 'Xiaomi MiMo Token Plan (CN)',
+    value: 'MiMo-Token-Plan-CN',
+    logo: buildLogoAssetUrl('ai-china/mimo.svg'),
+    platform: 'mimo-token-plan-cn',
+    base_url: 'https://token-plan-cn.xiaomimimo.com/v1',
+  },
+  {
+    name: 'Xiaomi MiMo Token Plan (SGP)',
+    value: 'MiMo-Token-Plan-SGP',
+    logo: buildLogoAssetUrl('ai-china/mimo.svg'),
+    platform: 'mimo-token-plan-sgp',
+    base_url: 'https://token-plan-sgp.xiaomimimo.com/v1',
+  },
+  {
+    name: 'Xiaomi MiMo Token Plan (AMS)',
+    value: 'MiMo-Token-Plan-AMS',
+    logo: buildLogoAssetUrl('ai-china/mimo.svg'),
+    platform: 'mimo-token-plan-ams',
+    base_url: 'https://token-plan-ams.xiaomimimo.com/v1',
   },
   {
     name: 'MiniMax',
     value: 'MiniMax',
     logo: buildLogoAssetUrl('ai-china/minimax.png'),
-    platform: 'custom',
+    platform: 'minimax',
+    base_url: 'https://api.minimaxi.com/v1',
+  },
+  {
+    name: 'MiniMax Code',
+    value: 'MiniMax-Code',
+    logo: buildLogoAssetUrl('ai-china/minimax.png'),
+    platform: 'minimax-code',
+    base_url: 'https://api.minimax.io/v1',
+  },
+  {
+    name: 'MiniMax Token / Coding Plan',
+    value: 'MiniMax-Coding-Plan',
+    logo: buildLogoAssetUrl('ai-china/minimax.png'),
+    platform: 'minimax-coding-plan',
     base_url: 'https://api.minimaxi.com/v1',
   },
   {
@@ -135,49 +207,56 @@ export const MODEL_PLATFORMS: PlatformConfig[] = [
     name: 'Dashscope',
     value: 'Dashscope',
     logo: buildLogoAssetUrl('ai-china/qwen.svg'),
-    platform: 'custom',
+    platform: 'dashscope',
     base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
   },
   {
     name: 'Dashscope Coding Plan',
     value: 'Dashscope-Coding',
     logo: buildLogoAssetUrl('ai-china/qwen.svg'),
-    platform: 'custom',
+    platform: 'dashscope-coding',
     base_url: 'https://coding.dashscope.aliyuncs.com/v1',
   },
   {
     name: 'SiliconFlow-CN',
     value: 'SiliconFlow-CN',
     logo: buildLogoAssetUrl('ai-cloud/siliconflow.png'),
-    platform: 'custom',
+    platform: 'siliconflow',
     base_url: 'https://api.siliconflow.cn/v1',
   },
   {
     name: 'SiliconFlow',
     value: 'SiliconFlow',
     logo: buildLogoAssetUrl('ai-cloud/siliconflow.png'),
-    platform: 'custom',
+    platform: 'siliconflow',
     base_url: 'https://api.siliconflow.com/v1',
   },
   {
     name: 'Zhipu',
     value: 'Zhipu',
     logo: buildLogoAssetUrl('ai-china/zhipu.svg'),
-    platform: 'custom',
+    platform: 'zhipu',
     base_url: 'https://open.bigmodel.cn/api/paas/v4',
+  },
+  {
+    name: 'GLM Coding Plan',
+    value: 'GLM-Coding-Plan',
+    logo: buildLogoAssetUrl('ai-china/zhipu.svg'),
+    platform: 'glm-coding-plan',
+    base_url: 'https://open.bigmodel.cn/api/coding/paas/v4',
   },
   {
     name: 'Moonshot (China)',
     value: 'Moonshot',
     logo: buildLogoAssetUrl('ai-china/kimi.svg'),
-    platform: 'custom',
+    platform: 'moonshot-cn',
     base_url: 'https://api.moonshot.cn/v1',
   },
   {
     name: 'Moonshot (Global)',
     value: 'Moonshot-Global',
     logo: buildLogoAssetUrl('ai-china/kimi.svg'),
-    platform: 'custom',
+    platform: 'moonshot-global',
     base_url: 'https://api.moonshot.ai/v1',
   },
   {
@@ -188,31 +267,45 @@ export const MODEL_PLATFORMS: PlatformConfig[] = [
     base_url: 'https://api.x.ai/v1',
   },
   {
-    name: 'Ark',
+    name: 'Doubao / Ark',
     value: 'Ark',
     logo: buildLogoAssetUrl('ai-china/volcengine.svg'),
-    platform: 'custom',
+    platform: 'ark',
     base_url: 'https://ark.cn-beijing.volces.com/api/v3',
+  },
+  {
+    name: 'Doubao / Ark Coding Plan',
+    value: 'Ark-Coding-Plan',
+    logo: buildLogoAssetUrl('ai-china/volcengine.svg'),
+    platform: 'ark-coding-plan',
+    base_url: 'https://ark.cn-beijing.volces.com/api/coding/v3',
   },
   {
     name: 'Qianfan',
     value: 'Qianfan',
     logo: buildLogoAssetUrl('ai-china/baidu.svg'),
-    platform: 'custom',
+    platform: 'qianfan',
     base_url: 'https://qianfan.baidubce.com/v2',
+  },
+  {
+    name: 'Qianfan Coding Plan',
+    value: 'Qianfan-Coding-Plan',
+    logo: buildLogoAssetUrl('ai-china/baidu.svg'),
+    platform: 'qianfan-coding-plan',
+    base_url: 'https://qianfan.baidubce.com/v2/coding',
   },
   {
     name: 'Hunyuan',
     value: 'Hunyuan',
     logo: buildLogoAssetUrl('ai-china/tencent.svg'),
-    platform: 'custom',
+    platform: 'hunyuan',
     base_url: 'https://api.hunyuan.cloud.tencent.com/v1',
   },
   {
     name: 'Lingyi',
     value: 'Lingyi',
     logo: buildLogoAssetUrl('ai-china/lingyiwanwu.svg'),
-    platform: 'custom',
+    platform: 'lingyi',
     base_url: 'https://api.lingyiwanwu.com/v1',
   },
   {
@@ -254,8 +347,15 @@ export const MODEL_PLATFORMS: PlatformConfig[] = [
     name: 'StepFun',
     value: 'StepFun',
     logo: buildLogoAssetUrl('ai-china/stepfun.svg'),
-    platform: 'custom',
+    platform: 'stepfun',
     base_url: 'https://api.stepfun.com/v1',
+  },
+  {
+    name: 'StepFun Step Plan',
+    value: 'StepFun-Plan',
+    logo: buildLogoAssetUrl('ai-china/stepfun.svg'),
+    platform: 'stepfun-plan',
+    base_url: 'https://api.stepfun.com/step_plan/v1',
   },
 ];
 

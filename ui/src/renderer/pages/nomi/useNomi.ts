@@ -22,6 +22,8 @@ const mergeSharedConfig = (prev: ICompanionSharedConfig, patch: ICompanionShared
   ...(patch.collect ? { collect: { ...prev.collect, ...patch.collect } } : {}),
   ...(patch.learn ? { learn: { ...prev.learn, ...patch.learn } } : {}),
   ...(patch.evolve ? { evolve: { ...prev.evolve, ...patch.evolve } } : {}),
+  ...(patch.archive ? { archive: { ...prev.archive, ...patch.archive } } : {}),
+  ...(patch.smart_orchestration !== undefined ? { smart_orchestration: patch.smart_orchestration } : {}),
 });
 
 /** Optimistic RFC 7396-style merge of a companion-profile patch (client mirror). */

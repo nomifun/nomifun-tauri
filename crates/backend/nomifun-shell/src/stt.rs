@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use nomifun_api_types::{SpeechToTextConfig, SpeechToTextProvider, SpeechToTextResult};
 use reqwest::Client;
 
@@ -5,12 +7,26 @@ use crate::error::SttError;
 use crate::{stt_deepgram, stt_openai};
 
 pub struct SttService {
-    client: Client,
+    client: HttpClientFactory,
 }
+
+type HttpClientFactory = Arc<dyn Fn() -> Client + Send + Sync>;
 
 impl SttService {
     pub fn new(client: Client) -> Self {
-        Self { client }
+        Self {
+            client: Arc::new(move || client.clone()),
+        }
+    }
+
+    pub fn new_dynamic() -> Self {
+        Self {
+            client: Arc::new(nomifun_net::http_client),
+        }
+    }
+
+    fn client(&self) -> Client {
+        (self.client)()
     }
 
     pub async fn transcribe(
@@ -25,11 +41,12 @@ impl SttService {
             return Err(SttError::Disabled);
         }
 
+        let client = self.client();
         match config.provider {
             SpeechToTextProvider::Openai => {
                 let openai_config = config.openai.as_ref().ok_or(SttError::OpenaiNotConfigured)?;
                 stt_openai::transcribe(
-                    &self.client,
+                    &client,
                     openai_config,
                     audio_data,
                     file_name,
@@ -40,7 +57,7 @@ impl SttService {
             }
             SpeechToTextProvider::Deepgram => {
                 let deepgram_config = config.deepgram.as_ref().ok_or(SttError::DeepgramNotConfigured)?;
-                stt_deepgram::transcribe(&self.client, deepgram_config, audio_data, mime_type, language_hint).await
+                stt_deepgram::transcribe(&client, deepgram_config, audio_data, mime_type, language_hint).await
             }
         }
     }

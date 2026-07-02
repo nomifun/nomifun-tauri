@@ -2,6 +2,7 @@ mod protocol;
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::sync::Arc;
 use std::time::Duration;
 
 use nomifun_api_types::{McpConnectionTestErrorCode, McpConnectionTestResult};
@@ -35,16 +36,29 @@ const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// or an error.  Supports stdio, HTTP (Streamable HTTP), and SSE transports.
 #[derive(Clone)]
 pub struct McpConnectionTestService {
-    http_client: reqwest::Client,
+    http_client: HttpClientFactory,
     timeout: Duration,
 }
+
+type HttpClientFactory = Arc<dyn Fn() -> reqwest::Client + Send + Sync>;
 
 impl McpConnectionTestService {
     pub fn new(http_client: reqwest::Client) -> Self {
         Self {
-            http_client,
+            http_client: Arc::new(move || http_client.clone()),
             timeout: CONNECTION_TIMEOUT,
         }
+    }
+
+    pub fn new_dynamic() -> Self {
+        Self {
+            http_client: Arc::new(nomifun_net::http_client),
+            timeout: CONNECTION_TIMEOUT,
+        }
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        (self.http_client)()
     }
 
     /// Override the connection test timeout (default: 30s).
@@ -117,6 +131,7 @@ impl McpConnectionTestService {
     }
 
     async fn test_http_inner(&self, url: &str, headers: &HashMap<String, String>) -> McpConnectionTestResult {
+        let client = self.http_client();
         let mut req_headers = build_http_headers(headers);
         req_headers.insert(
             reqwest::header::CONTENT_TYPE,
@@ -129,7 +144,7 @@ impl McpConnectionTestService {
 
         // 1. initialize
         let init_resp = match self
-            .http_post_mcp(url, &req_headers, &build_initialize_request(1))
+            .http_post_mcp(&client, url, &req_headers, &build_initialize_request(1))
             .await
         {
             Ok(r) => r,
@@ -147,8 +162,7 @@ impl McpConnectionTestService {
         }
 
         // 2. initialized notification (fire-and-forget)
-        let _ = self
-            .http_client
+        let _ = client
             .post(url)
             .headers(req_headers.clone())
             .json(&build_initialized_notification())
@@ -157,7 +171,7 @@ impl McpConnectionTestService {
 
         // 3. tools/list
         let tools_resp = match self
-            .http_post_mcp(url, &req_headers, &build_tools_list_request(2))
+            .http_post_mcp(&client, url, &req_headers, &build_tools_list_request(2))
             .await
         {
             Ok(r) => r,
@@ -176,12 +190,12 @@ impl McpConnectionTestService {
     /// (connection error, 401, non-success status).
     async fn http_post_mcp(
         &self,
+        client: &reqwest::Client,
         url: &str,
         headers: &reqwest::header::HeaderMap,
         body: &JsonRpcRequest,
     ) -> Result<HttpMcpResponse, McpConnectionTestResult> {
-        let resp = self
-            .http_client
+        let resp = client
             .post(url)
             .headers(headers.clone())
             .json(body)
@@ -232,11 +246,11 @@ impl McpConnectionTestService {
     }
 
     async fn test_sse_inner(&self, url: &str, headers: &HashMap<String, String>) -> McpConnectionTestResult {
+        let client = self.http_client();
         let mut req_headers = build_http_headers(headers);
 
         // 1. Open SSE connection
-        let resp = match self
-            .http_client
+        let resp = match client
             .get(url)
             .headers(req_headers.clone())
             .header(reqwest::header::ACCEPT, "text/event-stream")
@@ -272,13 +286,14 @@ impl McpConnectionTestService {
             "application/json".parse().expect("valid header"),
         );
 
-        let result = self.run_sse_protocol(url, &req_headers, &mut event_rx).await;
+        let result = self.run_sse_protocol(&client, url, &req_headers, &mut event_rx).await;
         reader_handle.abort();
         result
     }
 
     async fn run_sse_protocol(
         &self,
+        client: &reqwest::Client,
         base_url: &str,
         headers: &reqwest::header::HeaderMap,
         event_rx: &mut mpsc::Receiver<SseEvent>,
@@ -296,7 +311,7 @@ impl McpConnectionTestService {
         };
 
         // 4. initialize
-        if let Err(e) = self.sse_post(&endpoint, headers, &build_initialize_request(1)).await {
+        if let Err(e) = self.sse_post(client, &endpoint, headers, &build_initialize_request(1)).await {
             return error_result(
                 McpConnectionTestErrorCode::ProtocolError,
                 format!("Failed to send initialize: {e}"),
@@ -319,11 +334,11 @@ impl McpConnectionTestService {
 
         // 5. initialized notification
         let _ = self
-            .sse_post(&endpoint, headers, &build_initialized_notification())
+            .sse_post(client, &endpoint, headers, &build_initialized_notification())
             .await;
 
         // 6. tools/list
-        if let Err(e) = self.sse_post(&endpoint, headers, &build_tools_list_request(2)).await {
+        if let Err(e) = self.sse_post(client, &endpoint, headers, &build_tools_list_request(2)).await {
             return error_result(
                 McpConnectionTestErrorCode::ProtocolError,
                 format!("Failed to send tools/list: {e}"),
@@ -350,11 +365,12 @@ impl McpConnectionTestService {
     /// POST a JSON-RPC message to an SSE endpoint (fire-and-forget semantics).
     async fn sse_post<T: Serialize>(
         &self,
+        client: &reqwest::Client,
         endpoint: &str,
         headers: &reqwest::header::HeaderMap,
         body: &T,
     ) -> Result<(), String> {
-        self.http_client
+        client
             .post(endpoint)
             .headers(headers.clone())
             .json(body)

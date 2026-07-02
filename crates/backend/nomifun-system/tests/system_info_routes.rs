@@ -30,9 +30,13 @@ use nomifun_system::{
 
 const TEST_KEY: [u8; 32] = [0x42; 32];
 
+fn test_http_client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
+}
+
 fn build_state(db: &nomifun_db::Database, version_check_service: VersionCheckService) -> SystemRouterState {
     let provider_repo = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
-    let http_client = reqwest::Client::new();
+    let http_client = test_http_client();
     SystemRouterState {
         settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(db.pool().clone()))),
         client_pref_service: ClientPrefService::new(Arc::new(SqliteClientPreferenceRepository::new(db.pool().clone()))),
@@ -46,7 +50,7 @@ fn build_state(db: &nomifun_db::Database, version_check_service: VersionCheckSer
 
 async fn setup() -> axum::Router {
     let db = init_database_memory().await.unwrap();
-    let http_client = reqwest::Client::new();
+    let http_client = test_http_client();
     let vcs = VersionCheckService::new(http_client, "1.0.0".to_owned());
     let state = build_state(&db, vcs);
     system_routes(state)
@@ -54,7 +58,7 @@ async fn setup() -> axum::Router {
 
 async fn setup_with_mock(current_version: &str, mock_server: &MockServer) -> axum::Router {
     let db = init_database_memory().await.unwrap();
-    let http_client = reqwest::Client::new();
+    let http_client = test_http_client();
     let vcs = VersionCheckService::with_api_base(http_client, current_version.to_owned(), mock_server.uri());
     let state = build_state(&db, vcs);
     system_routes(state)

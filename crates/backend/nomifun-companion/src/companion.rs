@@ -26,13 +26,17 @@ use crate::store::{CompanionThread, MEMORY_KINDS, MemoryFilter, MemoryScope, Com
 
 /// All companion conversations are owned by the local default user (the
 /// desktop --local single-user model; same constant the cron executor uses).
-const COMPANION_USER_ID: &str = "system_default_user";
+pub(crate) const COMPANION_USER_ID: &str = "system_default_user";
 
 /// Per-companion runtime-state key holding that companion's active companion thread.
 pub(crate) const ACTIVE_THREAD_KEY: &str = "companion_active_thread";
 
 const MEMORY_CHAR_BUDGET: usize = 6000;
 const MEMORY_PER_KIND: i64 = 5;
+/// How many recent day-digests to inject into a new window's system prompt, and
+/// the char budget for that block (separate from the memory snapshot budget).
+const DIGEST_INJECT_COUNT: i64 = 3;
+const DIGEST_CHAR_BUDGET: usize = 2000;
 
 /// "YYYY-MM-DD" (local time) for memory timestamps surfaced to the model —
 /// dating each memory lets the companion treat old task/requirement entries as
@@ -70,6 +74,7 @@ pub async fn build_companion_system_prompt(
     store: &CompanionStore,
     profile: &CompanionProfileConfig,
     channel_platform: Option<&str>,
+    smart_orchestration: bool,
 ) -> String {
     let memories = store
         .memories_for_injection(&profile.id, MEMORY_PER_KIND, MEMORY_CHAR_BUDGET)
@@ -140,6 +145,20 @@ pub async fn build_companion_system_prompt(
          nomi_knowledge_set_binding 把库绑定到目标会话/终端/你自己（kind=\"companion\"）。绑定变更在目标下次任务启动时生效。\n\
          - 分工边界：全局记忆（nomi_memory_*）只放轻量的个人事实与偏好；知识库放成体系、可检索的领域资料。闲聊琐事不要建库。",
     );
+    // 智能编排能力提示（本地会话且开关开启时）：让伙伴把复杂大任务拆给隔离子 agent，
+    // 自己只调度+汇总，保持对话上下文清爽（与会话归档协同）。远程 IM 不注入（工具对 Remote 硬拒）。
+    if smart_orchestration && !remote {
+        system.push_str(
+            "\n\n## 复杂任务：调度子 agent（智能编排）\n\
+             遇到复杂、多步骤或工作量大的任务时，不要自己一股脑埋头做——用 nomi_run_create(goal) 把目标\
+             交给编排引擎：它会自动拆解成子任务、分派给隔离的子 agent 并行执行；你只负责\
+             把主人的需求说清楚、用 nomi_run_status / nomi_run_result 跟进并向主人汇总结果。\
+             这样重活不会挤占你和主人的对话上下文，你始终保持清爽。\
+             如果只是几个相互独立的小任务要并行跑，用 nomi_spawn(tasks) 更快：不经规划直接开工，\
+             主人能在画布上看到每个子任务的进展。\
+             简单、单步、几句话能答的事，直接自己做，别为小事起编排。",
+        );
+    }
     if !memories.is_empty() {
         system.push_str(
             "\n\n## 你对主人的记忆（节选，可用 recall_memories 查更多）\n\
@@ -149,6 +168,28 @@ pub async fn build_companion_system_prompt(
         );
         for m in &memories {
             system.push_str(&format!("- [{}|{}] {}\n", format_date(m.created_at), m.kind, m.content));
+        }
+    }
+    // Recent day-digests (伙伴会话窗口归档): give a freshly-reset window continuity
+    // without replaying raw transcript. Local sessions only — remote (IM) prompts
+    // stay identity-only and lean. Naturally empty when archiving is off (there are
+    // no archived windows), so this costs nothing until the feature is enabled.
+    if !remote
+        && let Ok(digests) = store.list_digests(&profile.id, DIGEST_INJECT_COUNT).await
+        && !digests.is_empty()
+    {
+        system.push_str(
+            "\n\n## 最近的会话回顾（按天归档的日记，帮你记起最近和主人聊过什么，仅供理解上下文）\n",
+        );
+        let mut used = 0usize;
+        for d in &digests {
+            let Some(summary) = &d.digest else { continue };
+            let line = format!("- [{}] {}\n", format_date(d.started_at), summary.trim());
+            used += line.len();
+            if used > DIGEST_CHAR_BUDGET {
+                break;
+            }
+            system.push_str(&line);
         }
     }
     system
@@ -505,7 +546,8 @@ impl CompanionThreads {
         if !profile.model.is_configured() {
             return Err(AppError::BadRequest("companion model not configured".into()));
         }
-        let system_prompt = build_companion_system_prompt(&self.store, &profile, None).await;
+        let smart_orchestration = self.config.read().await.smart_orchestration;
+        let system_prompt = build_companion_system_prompt(&self.store, &profile, None, smart_orchestration).await;
         let title = title
             .filter(|t| !t.trim().is_empty())
             .unwrap_or_else(|| format!("和 {} 聊天", profile.name));
@@ -945,7 +987,7 @@ mod tests {
         let store = CompanionStore::open_memory().await.unwrap();
         let profile = CompanionProfileConfig::new("毛球", "ink");
         for platform in [None, Some("telegram")] {
-            let prompt = build_companion_system_prompt(&store, &profile, platform).await;
+            let prompt = build_companion_system_prompt(&store, &profile, platform, false).await;
             assert!(
                 !prompt.contains("用中文"),
                 "{platform:?}: persona must not force Chinese: {prompt}"
@@ -967,7 +1009,7 @@ mod tests {
             preset: "calm".into(),
             custom: "叫主人「老大」".into(),
         };
-        let prompt = build_companion_system_prompt(&store, &profile, None).await;
+        let prompt = build_companion_system_prompt(&store, &profile, None, false).await;
         assert!(prompt.contains("你是 毛球"));
         assert!(!prompt.contains("你是 nomi"));
         assert!(prompt.contains("沉稳温柔"));
@@ -995,13 +1037,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn companion_system_prompt_injects_recent_day_digests_local_only() {
+        let store = CompanionStore::open_memory().await.unwrap();
+        let profile = CompanionProfileConfig::new("毛球", "ink");
+        // Seed one archived day-digest for this companion.
+        let w = store.ensure_open_window(&profile.id, "conv1", 0).await.unwrap();
+        store
+            .close_window(&w.id, "archived", Some("今天陪主人修了一下午 Rust 编译错误"), None, 20)
+            .await
+            .unwrap();
+
+        // Local session gets the day-digest recap block.
+        let local = build_companion_system_prompt(&store, &profile, None, false).await;
+        assert!(local.contains("最近的会话回顾"), "local prompt must inject recent day-digests");
+        assert!(local.contains("今天陪主人修了一下午 Rust 编译错误"));
+
+        // Remote (IM) prompt stays identity-only — no day-digest recap.
+        let remote = build_companion_system_prompt(&store, &profile, Some("telegram"), false).await;
+        assert!(!remote.contains("最近的会话回顾"), "remote prompt must not inject day-digests");
+    }
+
+    #[tokio::test]
+    async fn companion_system_prompt_smart_orchestration_nudge_local_only() {
+        let store = CompanionStore::open_memory().await.unwrap();
+        let profile = CompanionProfileConfig::new("毛球", "ink");
+
+        // Off → no orchestration nudge.
+        let off = build_companion_system_prompt(&store, &profile, None, false).await;
+        assert!(!off.contains("调度子 agent"), "no nudge when smart-orchestration is off");
+
+        // On + local → nudge present, teaching nomi_run_create delegation.
+        let on = build_companion_system_prompt(&store, &profile, None, true).await;
+        assert!(on.contains("调度子 agent"), "local prompt must teach subagent delegation when enabled");
+        assert!(on.contains("nomi_run_create"));
+        assert!(on.contains("nomi_spawn"), "must teach the flat fan-out verb for independent small tasks");
+
+        // On + remote → still no nudge (orchestration tools deny Remote).
+        let remote = build_companion_system_prompt(&store, &profile, Some("telegram"), true).await;
+        assert!(!remote.contains("调度子 agent"), "remote must never get the orchestration nudge");
+    }
+
+    #[tokio::test]
     async fn companion_system_prompt_teaches_knowledge_curation() {
         let store = CompanionStore::open_memory().await.unwrap();
         let profile = CompanionProfileConfig::new("毛球", "ink");
         // Both local companion threads and remote (IM) master sessions carry
         // the gateway tools, so both flavors must teach the curation flow.
         for platform in [None, Some("telegram")] {
-            let prompt = build_companion_system_prompt(&store, &profile, platform).await;
+            let prompt = build_companion_system_prompt(&store, &profile, platform, false).await;
             assert!(prompt.contains("## 知识沉淀技巧"), "{platform:?}");
             // The action sequence names every tool in pipeline order.
             let seq = ["nomi_knowledge_create_base", "nomi_knowledge_write_file", "nomi_knowledge_autogen", "nomi_knowledge_set_binding"];
@@ -1032,7 +1115,7 @@ mod tests {
         store.insert_memory("profile", "主人是 Rust 工程师", &[], 0.9, "learn").await.unwrap();
         let profile = CompanionProfileConfig::new("毛球", "ink");
 
-        let remote = build_companion_system_prompt(&store, &profile, Some("telegram")).await;
+        let remote = build_companion_system_prompt(&store, &profile, Some("telegram"), false).await;
         // No proactive-dispatch framing.
         assert!(!remote.contains("总管家"), "remote must not frame the partner as 总管家");
         assert!(!remote.contains("nomi_send_to_conversation"), "remote must not advertise task dispatch");
@@ -1046,7 +1129,7 @@ mod tests {
         assert!(!remote.contains("昨天聊了部署"), "episode memory must be filtered out of the remote snapshot");
 
         // Local mode is unchanged: still the 总管家, full snapshot incl. task.
-        let local = build_companion_system_prompt(&store, &profile, None).await;
+        let local = build_companion_system_prompt(&store, &profile, None, false).await;
         assert!(local.contains("总管家"), "local desktop companion stays the 总管家");
         assert!(local.contains("上周让你做导出功能"), "local snapshot still includes task memories");
     }

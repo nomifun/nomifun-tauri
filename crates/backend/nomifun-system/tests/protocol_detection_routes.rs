@@ -29,7 +29,7 @@ const TEST_KEY: [u8; 32] = [0x42; 32];
 
 fn build_state(db: &nomifun_db::Database) -> SystemRouterState {
     let provider_repo = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
-    let http_client = reqwest::Client::new();
+    let http_client = reqwest::Client::builder().no_proxy().build().unwrap();
     SystemRouterState {
         settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(db.pool().clone()))),
         client_pref_service: ClientPrefService::new(Arc::new(SqliteClientPreferenceRepository::new(db.pool().clone()))),

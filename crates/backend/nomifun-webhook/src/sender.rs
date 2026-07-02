@@ -3,6 +3,8 @@
 //! Signing + payload construction are pure functions so they can be unit-tested
 //! without a live HTTP server; `send_card` performs the actual POST.
 
+use std::sync::Arc;
+
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use nomifun_api_types::WebhookPlatform;
@@ -35,13 +37,15 @@ pub trait WebhookSender: Send + Sync {
 /// (Lark interactive card / Slack text / generic HTTP JSON) and POSTs it.
 #[derive(Clone)]
 pub struct DefaultWebhookSender {
-    client: reqwest::Client,
+    client: HttpClientFactory,
 }
+
+type HttpClientFactory = Arc<dyn Fn() -> reqwest::Client + Send + Sync>;
 
 impl Default for DefaultWebhookSender {
     fn default() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: Arc::new(nomifun_net::http_client),
         }
     }
 }
@@ -49,6 +53,16 @@ impl Default for DefaultWebhookSender {
 impl DefaultWebhookSender {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_client(client: reqwest::Client) -> Self {
+        Self {
+            client: Arc::new(move || client.clone()),
+        }
+    }
+
+    fn client(&self) -> reqwest::Client {
+        (self.client)()
     }
 }
 
@@ -138,8 +152,8 @@ impl WebhookSender for DefaultWebhookSender {
             WebhookPlatform::Slack => build_slack_body(title, fields),
             WebhookPlatform::Http => build_http_body(title, fields),
         };
-        let resp = self
-            .client
+        let client = self.client();
+        let resp = client
             .post(url)
             .json(&body)
             .send()

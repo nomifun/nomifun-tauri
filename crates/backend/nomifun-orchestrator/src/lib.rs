@@ -33,7 +33,7 @@ pub use events::OrchestratorRunEventEmitter;
 pub use plan::{LeadDeltaKind, LeadThinkingSink, LeadThinkingThrottle, LlmPlanProducer, PlanProducer};
 pub use routes::orchestrator_routes;
 pub use router::{rank_members, score_member, ScoredCandidate};
-pub use run_service::{spawn_plan_and_start, RunService};
+pub use run_service::{spawn_plan_and_start, spawn_plan_flat_and_start, RunService};
 pub use service::{FleetService, WorkspaceService};
 pub use state::OrchestratorRouterState;
 pub use worker::{ConversationWorkerRunner, MockWorkerRunner, WorkerOutcome, WorkerRunner};

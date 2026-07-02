@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 nomifun-common.workspace = true
 nomifun-api-types.workspace = true
+nomifun-net.workspace = true
 nomifun-system.workspace = true
 nomifun-runtime.workspace = true
 async-trait.workspace = true

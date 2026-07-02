@@ -141,6 +141,12 @@ pub struct NomiResolvedConfig {
     /// session left by a prior conversation that reused this integer id. `None`
     /// = caller did not supply it (validation skipped — legacy/safe).
     pub owner_token: Option<String>,
+    /// 是否注册进程内 Spawn 工具（工厂按 `engine_spawn_enabled` 计算：本地桌面
+    /// 网关会话 false —— 改走可视化的 nomi_spawn 编排扇出；其余 true）。
+    pub in_process_spawn: bool,
+    /// Per-session 工具白名单（空 = 不限制），源自 `NomiBuildExtra.allowed_tools`，
+    /// 由 manager 灌进 `config.tools.builtin_allowlist`。
+    pub allowed_tools: Vec<String>,
 }
 
 /// **P3-X2**: the shared browser secret vault location + its machine-bound key

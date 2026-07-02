@@ -335,7 +335,7 @@ bun run check      # 前端 typecheck + i18n + 主题 + 脚本登记 门禁
 bun run test       # Rust 测试（日常可用 test:fast 跑 nextest）
 ```
 
-优先使用脚本入口而非裸 `cargo`/`vite` —— 它们附带了构建目录清理与一致性检查。第一次接触代码库？请读 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`docs/contributing/development.zh.md`](docs/contributing/development.zh.md)。
+优先使用脚本入口而非裸 `cargo`/`vite` —— 它们附带了构建目录清理与一致性检查。第一次接触代码库？请读 [`CONTRIBUTING.zh-CN.md`](CONTRIBUTING.zh-CN.md)、[`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`docs/contributing/development.zh.md`](docs/contributing/development.zh.md)。
 
 <details>
 <summary><b>完整脚本目录</b></summary>
@@ -406,7 +406,7 @@ NomiFun 目前处于 **pre-1.0**，且为兼职开发，所以还有很多正在
 
 NomiFun 非常需要你的加入来壮大 —— 代码贡献、社区运营、技术布道都热烈欢迎。如果你对这个项目有热情，请[联系我们](#-联系我们--社区)，与我们一起共建 NomiFun 的生态。
 
-- 阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md) 完成环境搭建、了解检查阶梯。
+- 阅读 [`CONTRIBUTING.zh-CN.md`](CONTRIBUTING.zh-CN.md) 完成环境搭建、了解检查阶梯；英文版见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。
 - 友善相待 —— 见 [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)。
 - 发现漏洞？请按 [`SECURITY.md`](SECURITY.md) 操作。
 - 从 [open issues](https://github.com/nomifun/nomifun-tauri/issues) 找一个起点。

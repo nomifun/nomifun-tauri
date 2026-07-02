@@ -1,4 +1,5 @@
 import { ipcBridge } from '@/common';
+import { normalizeApiKeyList } from '@/common/utils/apiKeys';
 import useSWR from 'swr';
 
 // Gemini 模型排序函数：Pro 优先，版本号降序
@@ -56,7 +57,7 @@ const useModeModeList = (
       if (hasUsableCredentials) {
         const res = await ipcBridge.mode.fetchModelList.invoke({
           base_url,
-          api_key: api_key ?? '',
+          api_key: normalizeApiKeyList(api_key),
           try_fix,
           platform,
           bedrock_config,

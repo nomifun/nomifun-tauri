@@ -1,19 +1,19 @@
 {
-  "version": "0.1.15",
-  "notes": "- 修复角色沉淀卡片滚动布局，避免卡片换行导致阅读割裂。\n- 改进本地目录知识库不可用提示与创建校验。\n- 更新 README 功能亮点和宣传视频链接。\n- 移除过时的自定义形象拖拽提示、Agent Team 开关，并优化伙伴远程/侧栏体验。",
-  "pub_date": "2026-07-02T03:28:29.589Z",
+  "version": "0.1.17",
+  "notes": "- Subagent flat parallel orchestration (nomi_spawn): a lead or companion can now\n  fan out independent subtasks that run in parallel, visualized live on the\n  canvas; supervised nodes start immediately and Remote spawns are denied.\n  Unifies subagent visualization onto a single flat-run base.\n- Flat planning path (plan_flat): skip the planner LLM for straightforward\n  fan-outs and start execution directly.\n- Restricted-role workers: per-node tool allowlists plus gateway narrowing so\n  spawned workers only get the tools they need; in-process spawn gating and a\n  builtin-tool allowlist (defaults preserve existing behavior).\n- Smart orchestration for normal conversations: a global toggle that lets\n  ordinary chats automatically fan out subagents.\n- Companion session archiving and review: companion conversation windows are\n  archived (data model, archiver, context injection) with a review timeline\n  (\"on this day\") and an archive review API; companions gain smart orchestration.\n- Provider and API key management improvements: refreshed add-platform and\n  key-editor flows, provider cloning, a rotating API client, and\n  duplicate-provider detection.\n- Windows/Linux system proxy fixes: read the Windows system proxy via the\n  registry API, handle WinINet edge cases, detect the proxy on Windows and Linux,\n  refresh proxy config for outbound requests, bound detection cost, and remove a\n  console flash plus redundant registry reads.\n- Tool-argument robustness: tolerate providers that serialize nested tool\n  arguments as JSON strings, fixing Spawn and similar tool calls.\n- Packaging note: this release publishes the native Windows x64 installer and\n  updater assets. macOS and Linux packages are added from their own native build\n  machines.",
+  "pub_date": "2026-07-02T14:48:40.232Z",
   "platforms": {
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxOHdrTkFlS3IwRDRWYldXKytjTmtWdFRGODZNUXVJTVU0R1BLb1dJVWJIVmkzV1JqUXJMOFBYMnh5U0hRRlpnZXV3MU96cm5rSC9ia0JjQzh3aWVwaWdNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzMDAyMzE2CWZpbGU6Tm9taUZ1bl8wLjEuMTdfeDY0LXNldHVwLmV4ZQozMExLS0xoQkVLb3hCc3pMOS9nQUV4L0pIckhXL0liaTdaRDFBRW1sZHU4RHhUajZkUkxYWGJ3dFVSUE5SV0I3SlNtdVlEdGtlbHFFOEpyOTFjTklEQT09Cg==",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.1.17/NomiFun_0.1.17_x64-setup.exe"
+    },
     "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODVaSFdGQU1YcVJsNUxqUWlzUHhoaWhuQWRCRzh1T2ZrZ1k2UFNJS0YwZmUwTWR3dC9ZRmJMSVJMeXZ0RE40cG9LMUNnNHdpM1NPS1BCeGVUdGtZOUE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyOTYxMDY5CWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6CkFzK1gveUVSblBFN2FyS25pRVZEWTZTRG9YQnhValNNdDJienZlL0pQNmpMSGNQamsyRnpYdmNTMDJ5ZXJVK1NmYlhyWlZLQ3JrclFwV1Vqck15Y0NBPT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.1.15/NomiFun.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODJpVGZUejZjZERmZ3RONjlHb0k2S1pYbmUrVkJ5UHlram9kOG5Ea3lXa2hMbzhVS1N1T1JhZlRWYm4zcm5XTStTS05mZTBuMXo5S2hveGFOTFVKUUFFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzMDAzNTgxCWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6CjdycDZlTHRsUGR0N0ZnVmQ1ajh4WmZrcDk5UWY5ZEQ4c3Q2QzhDMHFDWTFvekZ5bTNTSVB4dUFzbDRqVnpxTy9iNDhNS1VYdWlvMjBSVVlZUW5PRUFRPT0K",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.1.17/NomiFun.app.tar.gz"
     },
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODVaSFdGQU1YcVJsNUxqUWlzUHhoaWhuQWRCRzh1T2ZrZ1k2UFNJS0YwZmUwTWR3dC9ZRmJMSVJMeXZ0RE40cG9LMUNnNHdpM1NPS1BCeGVUdGtZOUE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyOTYxMDY5CWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6CkFzK1gveUVSblBFN2FyS25pRVZEWTZTRG9YQnhValNNdDJienZlL0pQNmpMSGNQamsyRnpYdmNTMDJ5ZXJVK1NmYlhyWlZLQ3JrclFwV1Vqck15Y0NBPT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.1.15/NomiFun.app.tar.gz"
-    },
-    "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODN2bXVBNGdLT1VqZUVwK3pJcUlpYWdSbEw1RE5HQVVjOG5BcFFUa3V2d1BNK0hEWktSVkIvRXIzVjlveFJRRWJ2b21adnY5NUszejgwSnZLQ3JWb0FRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgyOTYyOTA4CWZpbGU6Tm9taUZ1bl8wLjEuMTVfeDY0LXNldHVwLmV4ZQp3TTJsdFhMSE9PMWs3NUYyK256cG5adEM5bnAxTExSUm5YeFp5RERVd09SY0YxVURvY3pTZHdpOUxhOXhnbGxYRU53OWhINlRlejZHUEw5MDRPYkVCQT09Cg==",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.1.15/NomiFun_0.1.15_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODJpVGZUejZjZERmZ3RONjlHb0k2S1pYbmUrVkJ5UHlram9kOG5Ea3lXa2hMbzhVS1N1T1JhZlRWYm4zcm5XTStTS05mZTBuMXo5S2hveGFOTFVKUUFFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzMDAzNTgxCWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6CjdycDZlTHRsUGR0N0ZnVmQ1ajh4WmZrcDk5UWY5ZEQ4c3Q2QzhDMHFDWTFvekZ5bTNTSVB4dUFzbDRqVnpxTy9iNDhNS1VYdWlvMjBSVVlZUW5PRUFRPT0K",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.1.17/NomiFun.app.tar.gz"
     }
   }
 }

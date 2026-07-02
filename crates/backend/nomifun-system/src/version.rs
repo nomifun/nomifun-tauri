@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use nomifun_api_types::{GitHubReleaseAsset, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 use nomifun_common::AppError;
 use serde::Deserialize;
@@ -8,17 +10,27 @@ const GITHUB_API_BASE: &str = "https://api.github.com";
 /// Service that checks GitHub Releases for available updates.
 #[derive(Clone)]
 pub struct VersionCheckService {
-    http_client: reqwest::Client,
+    http_client: HttpClientFactory,
     current_version: String,
     /// Base URL for GitHub API. Defaults to `https://api.github.com`.
     /// Configurable for testing with mock servers.
     api_base: String,
 }
 
+type HttpClientFactory = Arc<dyn Fn() -> reqwest::Client + Send + Sync>;
+
 impl VersionCheckService {
     pub fn new(http_client: reqwest::Client, current_version: String) -> Self {
         Self {
-            http_client,
+            http_client: Arc::new(move || http_client.clone()),
+            current_version,
+            api_base: GITHUB_API_BASE.to_owned(),
+        }
+    }
+
+    pub fn new_dynamic(current_version: String) -> Self {
+        Self {
+            http_client: Arc::new(nomifun_net::http_client),
             current_version,
             api_base: GITHUB_API_BASE.to_owned(),
         }
@@ -28,10 +40,14 @@ impl VersionCheckService {
     #[doc(hidden)]
     pub fn with_api_base(http_client: reqwest::Client, current_version: String, api_base: String) -> Self {
         Self {
-            http_client,
+            http_client: Arc::new(move || http_client.clone()),
             current_version,
             api_base,
         }
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        (self.http_client)()
     }
 
     /// Check for updates against GitHub Releases.
@@ -76,14 +92,14 @@ impl VersionCheckService {
 
         let mut all_releases = Vec::new();
         let mut page = 1u32;
+        let http_client = self.http_client();
 
         loop {
             let url = format!(
                 "{}/repos/{repo}/releases?per_page={PER_PAGE}&page={page}",
                 self.api_base
             );
-            let resp = self
-                .http_client
+            let resp = http_client
                 .get(&url)
                 .header("Accept", "application/vnd.github+json")
                 .header("User-Agent", "nomicore")

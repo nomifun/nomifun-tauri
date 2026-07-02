@@ -6,6 +6,8 @@ pub mod retry;
 pub mod vertex;
 
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -82,11 +84,27 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// stall into a silent freeze (no output, no error).
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
+#[cfg(test)]
+static HTTP_CLIENT_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_http_client_build_count() {
+    HTTP_CLIENT_BUILD_COUNT.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn http_client_build_count() -> usize {
+    HTTP_CLIENT_BUILD_COUNT.load(Ordering::SeqCst)
+}
+
 /// Shared reqwest client for all LLM providers, configured with connection and
 /// idle-read timeouts. A stalled upstream produces a `reqwest` timeout error,
 /// which the SSE loop converts into `LlmEvent::Error` (surfaced to the user as
 /// `Nomi agent error: ...`) instead of an indefinite hang.
 pub(crate) fn http_client() -> reqwest::Client {
+    #[cfg(test)]
+    HTTP_CLIENT_BUILD_COUNT.fetch_add(1, Ordering::SeqCst);
+
     let builder = reqwest::Client::builder()
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .read_timeout(HTTP_READ_TIMEOUT);

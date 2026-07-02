@@ -18,7 +18,7 @@
 | 理解当前架构 | [architecture/overview.zh.md](architecture/overview.zh.md) |
 | 构建或打包项目 | [contributing/building-and-packaging.zh.md](contributing/building-and-packaging.zh.md) |
 | 查询参数、环境变量或 API 分组 | [reference/](reference/) |
-| 参与贡献 | [../CONTRIBUTING.md](../CONTRIBUTING.md) |
+| 参与贡献 | [../CONTRIBUTING.zh-CN.md](../CONTRIBUTING.zh-CN.md)、[../CONTRIBUTING.md](../CONTRIBUTING.md) |
 | 社区行为准则 | [../CODE_OF_CONDUCT.md](../CODE_OF_CONDUCT.md) |
 | 报告安全问题 | [../SECURITY.md](../SECURITY.md) |
 | 版本记录与发布流程 | [../CHANGELOG.md](../CHANGELOG.md)、[../RELEASING.md](../RELEASING.md) |

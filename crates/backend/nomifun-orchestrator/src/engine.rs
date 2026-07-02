@@ -1236,6 +1236,9 @@ async fn dispatch_task(
     let task_id_for_started = task.id.clone();
     let task_id_for_fut = task.id.clone();
     let spec = task.spec.clone();
+    // 任务角色随 dispatch 下发：受限角色（searcher/reviewer/verifier）在 worker
+    // 侧收缩为 per-node 工具白名单 + 网关收缩（run_restricted）。
+    let task_role = task.role.clone();
     let timeout = deps.worker_timeout;
 
     let fut: WorkerFuture = Box::pin(async move {
@@ -1270,7 +1273,8 @@ async fn dispatch_task(
             });
         });
         let outcome = worker
-            .run(
+            .run_restricted(
+                task_role.as_deref(),
                 &member,
                 workspace_dir.as_deref(),
                 &run_id_for_run,

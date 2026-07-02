@@ -20,8 +20,18 @@ pub(crate) async fn fetch_for_platform(
         "bedrock" => fetch_bedrock(config).await,
         "vertex-ai" => Ok(vertex_ai_models()),
         "new-api" => fetch_new_api(client, &config.base_url, &config.api_key).await,
+        "mimo" | "mimo-token-plan-cn" | "mimo-token-plan-sgp" | "mimo-token-plan-ams" => {
+            Ok(mimo_models())
+        }
         "minimax" => Ok(minimax_models()),
-        "dashscope-coding" => fetch_dashscope_coding(client, &config.base_url, &config.api_key).await,
+        "minimax-code" | "minimax-coding-plan" => Ok(minimax_code_models()),
+        "ark-coding-plan" => Ok(ark_coding_plan_models()),
+        "stepfun-plan" => Ok(stepfun_plan_models()),
+        "dashscope-coding" => {
+            fetch_dashscope_coding(client, &config.base_url, &config.api_key).await
+        }
+        "glm-coding-plan" => Ok(glm_coding_plan_models()),
+        "qianfan-coding-plan" => Ok(qianfan_coding_plan_models()),
         _ => fetch_openai_compatible(client, &config.base_url, &config.api_key).await,
     }
 }
@@ -87,7 +97,11 @@ const ANTHROPIC_FALLBACK_MODELS: &[&str] = &[
     "claude-3-7-sonnet-20250219",
 ];
 
-async fn fetch_anthropic(client: &reqwest::Client, base_url: &str, api_key: &str) -> Result<Vec<ModelInfo>, AppError> {
+async fn fetch_anthropic(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<ModelInfo>, AppError> {
     let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
     let result = client
         .get(&url)
@@ -99,10 +113,9 @@ async fn fetch_anthropic(client: &reqwest::Client, base_url: &str, api_key: &str
 
     match result {
         Ok(resp) if resp.status().is_success() => {
-            let body: AnthropicModelsResponse = resp
-                .json()
-                .await
-                .map_err(|e| AppError::BadGateway(format!("Failed to parse Anthropic response: {e}")))?;
+            let body: AnthropicModelsResponse = resp.json().await.map_err(|e| {
+                AppError::BadGateway(format!("Failed to parse Anthropic response: {e}"))
+            })?;
             Ok(body.data.into_iter().map(|m| ModelInfo::Id(m.id)).collect())
         }
         Ok(resp) => {
@@ -135,16 +148,22 @@ struct GeminiModel {
 
 const GEMINI_FALLBACK_MODELS: &[&str] = &["gemini-2.5-pro", "gemini-2.5-flash"];
 
-async fn fetch_gemini(client: &reqwest::Client, base_url: &str, api_key: &str) -> Result<Vec<ModelInfo>, AppError> {
-    let url = format!("{}/v1beta/models?key={api_key}", base_url.trim_end_matches('/'));
+async fn fetch_gemini(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<ModelInfo>, AppError> {
+    let url = format!(
+        "{}/v1beta/models?key={api_key}",
+        base_url.trim_end_matches('/')
+    );
     let result = client.get(&url).timeout(REQUEST_TIMEOUT).send().await;
 
     match result {
         Ok(resp) if resp.status().is_success() => {
-            let body: GeminiModelsResponse = resp
-                .json()
-                .await
-                .map_err(|e| AppError::BadGateway(format!("Failed to parse Gemini response: {e}")))?;
+            let body: GeminiModelsResponse = resp.json().await.map_err(|e| {
+                AppError::BadGateway(format!("Failed to parse Gemini response: {e}"))
+            })?;
             let models = body
                 .models
                 .into_iter()
@@ -244,18 +263,78 @@ fn vertex_ai_models() -> Vec<ModelInfo> {
 }
 
 fn minimax_models() -> Vec<ModelInfo> {
-    vec![
-        ModelInfo::Id("MiniMax-Text-01".into()),
-        ModelInfo::Id("abab6.5s-chat".into()),
-        ModelInfo::Id("abab6.5-chat".into()),
-    ]
+    let mut models = minimax_code_models();
+    models.extend(fallback_models(&[
+        "MiniMax-Text-01",
+        "abab6.5s-chat",
+        "abab6.5-chat",
+    ]));
+    models
+}
+
+fn mimo_models() -> Vec<ModelInfo> {
+    fallback_models(&["mimo-v2.5-pro", "mimo-v2.5"])
+}
+
+fn minimax_code_models() -> Vec<ModelInfo> {
+    fallback_models(&[
+        "MiniMax-M3",
+        "MiniMax-M2.7",
+        "MiniMax-M2.7-highspeed",
+        "MiniMax-M2.5",
+        "MiniMax-M2.5-highspeed",
+        "MiniMax-M2.1",
+        "MiniMax-M2.1-highspeed",
+        "MiniMax-M2",
+    ])
+}
+
+fn ark_coding_plan_models() -> Vec<ModelInfo> {
+    fallback_models(&["ark-code-latest"])
+}
+
+fn stepfun_plan_models() -> Vec<ModelInfo> {
+    fallback_models(&[
+        "step-3.7-flash",
+        "step-router-v1",
+        "step-3.5-flash-2603",
+        "step-3.5-flash",
+    ])
+}
+
+fn glm_coding_plan_models() -> Vec<ModelInfo> {
+    fallback_models(&["glm-5.2", "glm-5", "glm-4.7"])
+}
+
+fn qianfan_coding_plan_models() -> Vec<ModelInfo> {
+    fallback_models(&[
+        "qianfan-code-latest",
+        "qwen3.7-plus",
+        "qwen3.6-plus",
+        "qwen3.5-plus",
+        "qwen3-max-2026-01-23",
+        "qwen3-coder-next",
+        "qwen3-coder-plus",
+        "kimi-k2.5",
+        "deepseek-v3.2",
+        "glm-5",
+        "minimax-m2.5",
+        "MiniMax-M2.5",
+        "ernie-4.5-turbo-20260402",
+        "deepseek-v4-flash",
+        "glm-5.1",
+    ])
 }
 
 // ---------------------------------------------------------------------------
 // new-api (OpenAI-compatible with /v1 enforcement)
 // ---------------------------------------------------------------------------
 
-async fn fetch_new_api(client: &reqwest::Client, base_url: &str, api_key: &str) -> Result<Vec<ModelInfo>, AppError> {
+async fn fetch_new_api(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<ModelInfo>, AppError> {
     let normalized = ensure_v1_path(base_url);
     fetch_openai_compatible(client, &normalized, api_key).await
 }
@@ -313,14 +392,19 @@ async fn fetch_dashscope_coding(
 // ---------------------------------------------------------------------------
 
 fn fallback_models(ids: &[&str]) -> Vec<ModelInfo> {
-    ids.iter().map(|id| ModelInfo::Id((*id).to_string())).collect()
+    ids.iter()
+        .map(|id| ModelInfo::Id((*id).to_string()))
+        .collect()
 }
 
 fn check_response_status(resp: &reqwest::Response) -> Result<(), AppError> {
     if resp.status().is_success() {
         return Ok(());
     }
-    Err(AppError::BadGateway(format!("Remote API returned {}", resp.status())))
+    Err(AppError::BadGateway(format!(
+        "Remote API returned {}",
+        resp.status()
+    )))
 }
 
 fn remote_error(e: &reqwest::Error) -> AppError {
@@ -345,12 +429,18 @@ mod tests {
 
     #[test]
     fn ensure_v1_path_missing() {
-        assert_eq!(ensure_v1_path("https://api.example.com"), "https://api.example.com/v1");
+        assert_eq!(
+            ensure_v1_path("https://api.example.com"),
+            "https://api.example.com/v1"
+        );
     }
 
     #[test]
     fn ensure_v1_path_trailing_slash() {
-        assert_eq!(ensure_v1_path("https://api.example.com/"), "https://api.example.com/v1");
+        assert_eq!(
+            ensure_v1_path("https://api.example.com/"),
+            "https://api.example.com/v1"
+        );
     }
 
     #[test]
@@ -372,8 +462,34 @@ mod tests {
     #[test]
     fn minimax_returns_expected_models() {
         let models = minimax_models();
-        assert_eq!(models.len(), 3);
-        assert_eq!(models[0], ModelInfo::Id("MiniMax-Text-01".into()));
+        assert!(models.contains(&ModelInfo::Id("MiniMax-M3".into())));
+        assert!(models.contains(&ModelInfo::Id("MiniMax-M2.7".into())));
+        assert!(models.contains(&ModelInfo::Id("MiniMax-M2.5".into())));
+        assert!(models.contains(&ModelInfo::Id("MiniMax-Text-01".into())));
+    }
+
+    #[test]
+    fn mimo_models_include_current_chat_and_agent_models() {
+        let models = mimo_models();
+        assert!(models.contains(&ModelInfo::Id("mimo-v2.5-pro".into())));
+        assert!(models.contains(&ModelInfo::Id("mimo-v2.5".into())));
+    }
+
+    #[test]
+    fn minimax_code_plan_models_include_current_coding_models() {
+        assert!(minimax_code_models().contains(&ModelInfo::Id("MiniMax-M3".into())));
+        assert!(minimax_code_models().contains(&ModelInfo::Id("MiniMax-M2.7-highspeed".into())));
+        assert!(minimax_code_models().contains(&ModelInfo::Id("MiniMax-M2.1".into())));
+    }
+
+    #[test]
+    fn coding_plan_fallbacks_include_default_router_models() {
+        assert!(ark_coding_plan_models().contains(&ModelInfo::Id("ark-code-latest".into())));
+        assert!(stepfun_plan_models().contains(&ModelInfo::Id("step-router-v1".into())));
+        assert!(glm_coding_plan_models().contains(&ModelInfo::Id("glm-5.2".into())));
+        assert!(
+            qianfan_coding_plan_models().contains(&ModelInfo::Id("qianfan-code-latest".into()))
+        );
     }
 
     #[test]

@@ -3,14 +3,18 @@ mod url_fixer;
 
 use std::sync::Arc;
 
-use nomifun_api_types::{BedrockConfig, FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse};
+use nomifun_api_types::{
+    BedrockConfig, FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse,
+};
 use nomifun_common::{AppError, decrypt_string};
 use nomifun_db::IProviderRepository;
 
 use crate::provider::deserialize_opt;
 
+type HttpClientFactory = Arc<dyn Fn() -> reqwest::Client + Send + Sync>;
+
 /// Internal configuration extracted from a provider row for model fetching.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct FetchConfig {
     pub platform: String,
     pub base_url: String,
@@ -23,16 +27,32 @@ pub(crate) struct FetchConfig {
 pub struct ModelFetchService {
     repo: Arc<dyn IProviderRepository>,
     encryption_key: [u8; 32],
-    http_client: reqwest::Client,
+    http_client: HttpClientFactory,
 }
 
 impl ModelFetchService {
-    pub fn new(repo: Arc<dyn IProviderRepository>, encryption_key: [u8; 32], http_client: reqwest::Client) -> Self {
+    pub fn new(
+        repo: Arc<dyn IProviderRepository>,
+        encryption_key: [u8; 32],
+        http_client: reqwest::Client,
+    ) -> Self {
         Self {
             repo,
             encryption_key,
-            http_client,
+            http_client: Arc::new(move || http_client.clone()),
         }
+    }
+
+    pub fn new_dynamic(repo: Arc<dyn IProviderRepository>, encryption_key: [u8; 32]) -> Self {
+        Self {
+            repo,
+            encryption_key,
+            http_client: Arc::new(nomifun_net::http_client),
+        }
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        (self.http_client)()
     }
 
     /// Fetch models for a provider by ID. If `try_fix` is true and the
@@ -66,14 +86,22 @@ impl ModelFetchService {
 
     /// Shared fetch+try_fix branch used by both the by-id and anonymous
     /// entry points.
-    async fn fetch_with_config(&self, config: &FetchConfig, try_fix: bool) -> Result<FetchModelsResponse, AppError> {
-        match fetchers::fetch_for_platform(&self.http_client, config).await {
+    async fn fetch_with_config(
+        &self,
+        config: &FetchConfig,
+        try_fix: bool,
+    ) -> Result<FetchModelsResponse, AppError> {
+        let config = config.with_primary_api_key()?;
+        let http_client = self.http_client();
+        match fetchers::fetch_for_platform(&http_client, &config).await {
             Ok(models) => Ok(FetchModelsResponse {
                 models,
                 fixed_base_url: None,
             }),
             Err(err) if try_fix && supports_url_fix(&config.platform) => {
-                url_fixer::try_fix_url(&self.http_client, config).await.map_err(|_| err)
+                url_fixer::try_fix_url(&http_client, &config)
+                    .await
+                    .map_err(|_| err)
             }
             Err(err) => Err(err),
         }
@@ -92,13 +120,30 @@ impl ModelFetchService {
             return Err(AppError::BadRequest("API key is empty".into()));
         }
 
-        let bedrock_config: Option<BedrockConfig> = deserialize_opt(&row.bedrock_config, "bedrock_config")?;
+        let bedrock_config: Option<BedrockConfig> =
+            deserialize_opt(&row.bedrock_config, "bedrock_config")?;
 
         Ok(FetchConfig {
             platform: row.platform,
             base_url: row.base_url,
             api_key,
             bedrock_config,
+        })
+    }
+}
+
+impl FetchConfig {
+    fn with_primary_api_key(&self) -> Result<Self, AppError> {
+        if self.platform == "bedrock" {
+            return Ok(self.clone());
+        }
+
+        let api_key = primary_api_key(&self.api_key)
+            .ok_or_else(|| AppError::BadRequest("apiKey is required".into()))?;
+
+        Ok(Self {
+            api_key,
+            ..self.clone()
         })
     }
 }
@@ -119,11 +164,34 @@ fn validate_anonymous_request(req: &FetchModelsAnonymousRequest) -> Result<(), A
     Ok(())
 }
 
+fn primary_api_key(raw: &str) -> Option<String> {
+    raw.split([',', '\n'])
+        .map(str::trim)
+        .find(|key| !key.is_empty())
+        .map(str::to_owned)
+}
+
 /// Platforms that support URL auto-fix (OpenAI-compatible).
 fn supports_url_fix(platform: &str) -> bool {
     !matches!(
         platform,
-        "anthropic" | "claude" | "gemini" | "bedrock" | "vertex-ai" | "minimax" | "dashscope-coding"
+        "anthropic"
+            | "claude"
+            | "gemini"
+            | "bedrock"
+            | "vertex-ai"
+            | "mimo"
+            | "mimo-token-plan-cn"
+            | "mimo-token-plan-sgp"
+            | "mimo-token-plan-ams"
+            | "minimax"
+            | "minimax-code"
+            | "minimax-coding-plan"
+            | "ark-coding-plan"
+            | "stepfun-plan"
+            | "dashscope-coding"
+            | "glm-coding-plan"
+            | "qianfan-coding-plan"
     )
 }
 
@@ -142,7 +210,12 @@ mod tests {
         (svc, db)
     }
 
-    async fn create_provider(db: &nomifun_db::Database, platform: &str, base_url: &str, api_key: &str) -> String {
+    async fn create_provider(
+        db: &nomifun_db::Database,
+        platform: &str,
+        base_url: &str,
+        api_key: &str,
+    ) -> String {
         let repo = SqliteProviderRepository::new(db.pool().clone());
         let encrypted = encrypt_string(api_key, &TEST_KEY).unwrap();
         let row = repo
@@ -183,8 +256,18 @@ mod tests {
         assert!(!supports_url_fix("gemini"));
         assert!(!supports_url_fix("bedrock"));
         assert!(!supports_url_fix("vertex-ai"));
+        assert!(!supports_url_fix("mimo"));
+        assert!(!supports_url_fix("mimo-token-plan-cn"));
+        assert!(!supports_url_fix("mimo-token-plan-sgp"));
+        assert!(!supports_url_fix("mimo-token-plan-ams"));
         assert!(!supports_url_fix("minimax"));
+        assert!(!supports_url_fix("minimax-code"));
+        assert!(!supports_url_fix("minimax-coding-plan"));
+        assert!(!supports_url_fix("ark-coding-plan"));
+        assert!(!supports_url_fix("stepfun-plan"));
         assert!(!supports_url_fix("dashscope-coding"));
+        assert!(!supports_url_fix("glm-coding-plan"));
+        assert!(!supports_url_fix("qianfan-coding-plan"));
     }
 
     #[tokio::test]
@@ -229,7 +312,14 @@ mod tests {
         let id = create_provider(&db, "minimax", "https://unused", "fake-key").await;
         let req = FetchModelsRequest { try_fix: false };
         let resp = svc.fetch_models(&id, &req).await.unwrap();
-        assert_eq!(resp.models.len(), 3);
+        assert!(
+            resp.models
+                .contains(&nomifun_api_types::ModelInfo::Id("MiniMax-M3".into()))
+        );
+        assert!(
+            resp.models
+                .contains(&nomifun_api_types::ModelInfo::Id("MiniMax-Text-01".into()))
+        );
     }
 
     #[tokio::test]
@@ -251,7 +341,14 @@ mod tests {
             try_fix: false,
         };
         let resp = svc.fetch_models_anonymous(&req).await.unwrap();
-        assert_eq!(resp.models.len(), 3);
+        assert!(
+            resp.models
+                .contains(&nomifun_api_types::ModelInfo::Id("MiniMax-M3".into()))
+        );
+        assert!(
+            resp.models
+                .contains(&nomifun_api_types::ModelInfo::Id("MiniMax-Text-01".into()))
+        );
         assert!(resp.fixed_base_url.is_none());
     }
 

@@ -289,15 +289,14 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
     let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
     let pool = services.database.pool().clone();
     let provider_repo = Arc::new(SqliteProviderRepository::new(pool.clone()));
-    let http_client = outbound_http_client();
 
     SystemRouterState {
         settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(pool.clone()))),
         client_pref_service: ClientPrefService::new(Arc::new(SqliteClientPreferenceRepository::new(pool))),
         provider_service: ProviderService::new(provider_repo.clone(), encryption_key),
-        model_fetch_service: ModelFetchService::new(provider_repo, encryption_key, http_client.clone()),
-        protocol_detection_service: ProtocolDetectionService::new(http_client.clone()),
-        version_check_service: VersionCheckService::new(http_client, env!("CARGO_PKG_VERSION").to_owned()),
+        model_fetch_service: ModelFetchService::new_dynamic(provider_repo, encryption_key),
+        protocol_detection_service: ProtocolDetectionService::new_dynamic(),
+        version_check_service: VersionCheckService::new_dynamic(env!("CARGO_PKG_VERSION").to_owned()),
         data_dir: services.data_dir.clone(),
     }
 }
@@ -429,13 +428,12 @@ pub fn build_mcp_state(services: &AppServices) -> McpRouterState {
     let oauth_token_repo: Arc<dyn nomifun_db::IOAuthTokenRepository> = Arc::new(
         nomifun_db::SqliteOAuthTokenRepository::new(services.database.pool().clone()),
     );
-    let http_client = outbound_http_client();
 
     McpRouterState {
         config_service: McpConfigService::new(repo.clone()),
         sync_service: McpSyncService::new(repo, adapters),
-        connection_test_service: McpConnectionTestService::new(http_client.clone()),
-        oauth_service: nomifun_mcp::McpOAuthService::new(oauth_token_repo, http_client),
+        connection_test_service: McpConnectionTestService::new_dynamic(),
+        oauth_service: nomifun_mcp::McpOAuthService::new_dynamic(oauth_token_repo),
     }
 }
 
@@ -1381,7 +1379,7 @@ pub fn build_shell_state(services: &AppServices) -> ShellRouterState {
         shell_service: Arc::new(nomifun_shell::ShellService::new(Arc::new(
             nomifun_shell::DefaultSystemOpener,
         ))),
-        stt_service: Arc::new(nomifun_shell::SttService::new(outbound_http_client())),
+        stt_service: Arc::new(nomifun_shell::SttService::new_dynamic()),
         client_pref_service,
     }
 }

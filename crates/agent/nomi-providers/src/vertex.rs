@@ -17,7 +17,6 @@ use crate::{LlmProvider, ProviderError};
 use nomi_config::compat::ProviderCompat;
 
 pub struct VertexProvider {
-    client: reqwest::Client,
     project_id: String,
     region: String,
     auth: GcpAuth,
@@ -48,7 +47,6 @@ impl VertexProvider {
         compat: ProviderCompat,
     ) -> Self {
         Self {
-            client: crate::http_client(),
             project_id: project_id.to_string(),
             region: region.to_string(),
             auth,
@@ -174,8 +172,8 @@ impl VertexProvider {
             .map_err(|e| ProviderError::Connection(format!("JWT encode error: {}", e)))?;
 
         // Exchange JWT for access token
-        let resp = self
-            .client
+        let client = crate::http_client();
+        let resp = client
             .post(&sa.token_uri)
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
@@ -211,8 +209,8 @@ impl VertexProvider {
             .map_err(|e| ProviderError::Connection(format!("Failed to parse ADC: {}", e)))?;
 
         // Use refresh token to get access token
-        let resp = self
-            .client
+        let client = crate::http_client();
+        let resp = client
             .post("https://oauth2.googleapis.com/token")
             .form(&[
                 ("client_id", adc.client_id.as_str()),
@@ -233,8 +231,8 @@ impl VertexProvider {
     }
 
     async fn get_metadata_token(&self) -> Result<(String, u64), ProviderError> {
-        let resp = self
-            .client
+        let client = crate::http_client();
+        let resp = client
             .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
             .header("Metadata-Flavor", "Google")
             .send()
@@ -262,6 +260,7 @@ impl LlmProvider for VertexProvider {
         tracing::debug!(target: "nomi_providers", body = %serde_json::to_string_pretty(&body).unwrap_or_default(), "outgoing request");
 
         let access_token = self.get_access_token().await?;
+        let client = crate::http_client();
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -272,8 +271,7 @@ impl LlmProvider for VertexProvider {
         );
 
         let response = crate::retry::with_initial_connect_retry(|| async {
-            let response = self
-                .client
+            let response = client
                 .post(&url)
                 .headers(headers.clone())
                 .json(&body)
@@ -300,7 +298,7 @@ impl LlmProvider for VertexProvider {
         .await?;
 
         let (tx, rx) = mpsc::channel(64);
-        let client = self.client.clone();
+        let client = client.clone();
         let url_clone = url.clone();
         let headers_clone = {
             let mut h = HeaderMap::new();

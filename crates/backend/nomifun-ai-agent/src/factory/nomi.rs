@@ -138,15 +138,25 @@ pub(super) async fn build(
     );
 
     // Orchestration lead (会话 entry "auto/range" models → extra.orchestrator_role
-    // == "lead"): prepend the server-authored 编排主管 system prompt so the
-    // conversation decomposes complex requirements via `nomi_run_create`. Composed
-    // LAST so the 主管 prompt leads, with the full preset/persona/knowledge prompt
-    // preserved after the separator. Tool availability is NOT granted here — the
-    // orchestration tools ride the independently-gated desktop gateway; a
-    // client-supplied role can only shape the prompt, never self-authorize tools.
+    // == "lead", OR the global 智能编排 preference for a plain desktop session):
+    // prepend the server-authored 编排主管 system prompt so the conversation
+    // decomposes complex requirements via `nomi_run_create`. Composed LAST so the
+    // 主管 prompt leads, with the full preset/persona/knowledge prompt preserved
+    // after the separator. Tool availability is NOT granted here — the
+    // orchestration tools ride the desktop gateway that every locally-trusted
+    // desktop session is already granted server-side; this only shapes the prompt
+    // (no capability or approval-mode change). Companions use their own in-persona
+    // nudge; remote/IM never auto-fan-out.
+    let auto_orchestration = read_bool_pref(&deps, PREF_AUTO_ORCHESTRATION, false).await;
+    let lead = is_orchestration_lead(
+        overrides.orchestrator_role.as_deref(),
+        auto_orchestration,
+        overrides.companion,
+        overrides.channel_platform.is_some(),
+    );
     overrides.system_prompt = compose_lead_prompt(
         overrides.system_prompt.take(),
-        overrides.orchestrator_role.as_deref(),
+        if lead { Some("lead") } else { None },
     );
 
     // Companion-owned sessions (local 桌面伙伴 chat + IM channel master) must
@@ -205,27 +215,28 @@ pub(super) async fn build(
     // (legacy ones migrated forward by stamping the token). See Session::owner_token.
     let owner_token: Option<String> = options.conversation_created_at.map(|c| c.to_string());
     let conv_created_ms = options.conversation_created_at;
-    let accept_owned = |mut session: nomi_agent::session::Session| -> Option<nomi_agent::session::Session> {
-        if !nomi_agent::session::session_belongs_to(
-            session.owner_token.as_deref(),
-            session.created_at.timestamp_millis(),
-            owner_token.as_deref(),
-            conv_created_ms,
-        ) {
-            warn!(
-                conversation_id = %ctx.conversation_id,
-                session_id = %session.id,
-                "Discarding stale nomi session (belongs to a prior conversation that reused this id); starting fresh"
-            );
-            return None;
-        }
-        // Matching or legacy(None) stamp that postdates the conversation: accept,
-        // migrating legacy forward by stamping the owner token.
-        if session.owner_token.is_none() {
-            session.owner_token = owner_token.clone();
-        }
-        Some(session)
-    };
+    let accept_owned =
+        |mut session: nomi_agent::session::Session| -> Option<nomi_agent::session::Session> {
+            if !nomi_agent::session::session_belongs_to(
+                session.owner_token.as_deref(),
+                session.created_at.timestamp_millis(),
+                owner_token.as_deref(),
+                conv_created_ms,
+            ) {
+                warn!(
+                    conversation_id = %ctx.conversation_id,
+                    session_id = %session.id,
+                    "Discarding stale nomi session (belongs to a prior conversation that reused this id); starting fresh"
+                );
+                return None;
+            }
+            // Matching or legacy(None) stamp that postdates the conversation: accept,
+            // migrating legacy forward by stamping the owner token.
+            if session.owner_token.is_none() {
+                session.owner_token = owner_token.clone();
+            }
+            Some(session)
+        };
 
     let resume_session = {
         let session_mgr = SessionManager::new(session_directory.clone(), 100);
@@ -420,6 +431,13 @@ pub(super) async fn build(
         // Owning conversation instance identity — the nomi manager stamps it
         // onto the session after build so a future reused id is rejected.
         owner_token: owner_token.clone(),
+        // 进程内 Spawn 门控：本地桌面网关会话关闭（改走 nomi_spawn 可视化扇出）。
+        in_process_spawn: engine_spawn_enabled(
+            overrides.desktop_gateway,
+            overrides.channel_platform.as_deref(),
+        ),
+        // Per-session 工具白名单（受限角色的编排 worker；普通会话恒空）。
+        allowed_tools: overrides.allowed_tools.clone(),
     };
 
     let knowledge_kb_ids: Vec<String> = overrides
@@ -526,6 +544,10 @@ const PREF_BROWSER_SILENT: &str = "agent.browserUse.silent";
 const PREF_BROWSER_SOURCE: &str = "agent.browserUse.source";
 /// 浏览器来源 host default（无设置行/无 client_prefs 时）：内置/下载的 Chrome for Testing。
 const BROWSER_SOURCE_DEFAULT: &str = "managed";
+/// 全局「智能编排」开关（client preference）。为真时，普通桌面会话默认成为编排 lead（注入
+/// 主管 prompt，鼓励对复杂需求 `nomi_run_create` 扇出）。伙伴走各自的 smart_orchestration
+/// 人格提示、远程会话不参与，故此处仅对「非伙伴、非远程」的桌面会话生效。默认 OFF（opt-in）。
+const PREF_AUTO_ORCHESTRATION: &str = "nomi.autoOrchestration";
 
 /// Read a boolean `client_preferences` toggle live, falling back to
 /// `host_default` when there is no setting row (fresh install) or no
@@ -594,11 +616,15 @@ async fn read_app_language(settings_repo: Option<&Arc<dyn ISettingsRepository>>)
 /// `zh-CN` selects Chinese (supported set lives in `nomifun-system`).
 fn reply_language_directive(lang: &str) -> &'static str {
     match lang {
-        "zh-CN" => "【回复语言】无论上文的指令或记忆使用何种语言，都请始终用简体中文回复主人——\
-                    除非主人主动用其他语言和你说话，或明确要求你换一种语言。",
-        _ => "[Reply language] Regardless of the language used in the instructions or memories \
+        "zh-CN" => {
+            "【回复语言】无论上文的指令或记忆使用何种语言，都请始终用简体中文回复主人——\
+                    除非主人主动用其他语言和你说话，或明确要求你换一种语言。"
+        }
+        _ => {
+            "[Reply language] Regardless of the language used in the instructions or memories \
               above, always reply to the owner in English — unless the owner writes to you in \
-              another language or explicitly asks you to switch.",
+              another language or explicitly asks you to switch."
+        }
     }
 }
 
@@ -647,7 +673,27 @@ fn append_knowledge_context(
 /// directory are supplied to the orchestration tools at runtime, so the prompt
 /// instructs the lead not to ask for them. Kept as a `const` so the composition
 /// is unit-testable without standing up the async factory.
-pub(crate) const LEAD_ORCHESTRATOR_PROMPT: &str = "你是 NomiFun 的编排主管。用户已在本会话限定可用模型范围（见运行上下文）。对简单或单步需求：直接作答。对复杂、可拆分为多个并行/有依赖子任务的需求：调用工具 `nomi_run_create(goal)` 把需求拆成任务 DAG 并行执行（模型范围与工作目录会自动取用），随后用 `nomi_run_status`/`nomi_run_result` 跟进并向用户汇报进展与产出。不要询问 workspace 或 fleet——它们已不存在。";
+pub(crate) const LEAD_ORCHESTRATOR_PROMPT: &str = "你是 NomiFun 的编排主管。用户已在本会话限定可用模型范围（见运行上下文）。对简单或单步需求：直接作答。对复杂、可拆分为多个并行/有依赖子任务的需求：调用工具 `nomi_run_create(goal)` 把需求拆成任务 DAG 并行执行（模型范围与工作目录会自动取用），随后用 `nomi_run_status`/`nomi_run_result` 跟进并向用户汇报进展与产出。对多个相互独立、无需拆解的并行小任务：改用 `nomi_spawn(tasks)` 直接并行扇出（无需规划、立即执行、每个子任务在画布上可见）。不要询问 workspace 或 fleet——它们已不存在。";
+
+/// 进程内 Spawn 门控（纯函数，可单测）：本地桌面网关会话（desktop_gateway 且非
+/// IM 渠道）禁用进程内 Spawn —— 子 agent 改走 nomi_spawn 编排扇出（每个子任务
+/// 在 DAG 画布上有状态与转录，不再静默）；IM 渠道 master（nomi_spawn 对 Remote
+/// 面拒绝，禁了就没有扇出手段）与其余会话保留进程内 Spawn。
+pub(crate) fn engine_spawn_enabled(desktop_gateway: bool, channel_platform: Option<&str>) -> bool {
+    !(desktop_gateway && channel_platform.is_none())
+}
+
+/// Decide whether a session should act as an orchestration lead (and thus get
+/// the 主管 prompt). Pure so the policy is unit-testable.
+///
+/// - An explicit `extra.orchestrator_role == "lead"` always wins (WebUI-set / per-session).
+/// - Otherwise the global 智能编排 preference (`nomi.autoOrchestration`) turns
+///   plain desktop sessions into leads by default — but NOT companions (they use
+///   their own in-persona `smart_orchestration` nudge) and NOT remote/IM sessions
+///   (`caps_orchestrator` denies Remote, so a lead prompt there would be a dead end).
+pub(crate) fn is_orchestration_lead(role: Option<&str>, auto_pref: bool, is_companion: bool, is_remote: bool) -> bool {
+    role == Some("lead") || (auto_pref && !is_companion && !is_remote)
+}
 
 /// Compose the 主管 system prompt onto whatever base prompt the assembly has
 /// produced (preset rules + companion persona + knowledge context), when the
@@ -705,6 +751,8 @@ pub(crate) fn map_nomi_provider(
 /// Mirrors the frontend `envBuilder.ts` logic:
 /// - Strips trailing `/v1` from base_url (nomi appends its own path)
 /// - Gemini: prepends `/v1beta/openai` and overrides `api_path`
+/// - Domestic OpenAI-compatible providers with nonstandard version paths keep
+///   their configured base URL and append `/chat/completions`
 /// - OpenAI official (`api.openai.com`): sets `max_completion_tokens`
 pub(crate) fn resolve_nomi_url_and_compat(
     platform: &str,
@@ -727,6 +775,12 @@ pub(crate) fn resolve_nomi_url_and_compat(
         return (Some(base), compat);
     }
 
+    if uses_configured_openai_chat_base(platform) {
+        let base = raw_base_url.trim_end_matches('/').to_owned();
+        compat.api_path = Some("/chat/completions".to_owned());
+        return (Some(base).filter(|u| !u.is_empty()), compat);
+    }
+
     let normalized = normalize_nomi_base_url(raw_base_url);
     let base_url = Some(normalized).filter(|u| !u.is_empty());
 
@@ -735,6 +789,21 @@ pub(crate) fn resolve_nomi_url_and_compat(
     }
 
     (base_url, compat)
+}
+
+fn uses_configured_openai_chat_base(platform: &str) -> bool {
+    matches!(
+        platform,
+        "ark"
+            | "ark-coding-plan"
+            | "stepfun"
+            | "stepfun-plan"
+            | "dashscope-coding"
+            | "zhipu"
+            | "glm-coding-plan"
+            | "qianfan"
+            | "qianfan-coding-plan"
+    )
 }
 
 fn is_openai_host(url: &str) -> bool {
@@ -1163,7 +1232,10 @@ mod tests {
         // en-US, unknown codes, and the empty string all resolve to English.
         for lang in ["en-US", "fr-FR", "zh-TW", ""] {
             let d = reply_language_directive(lang);
-            assert!(d.contains("in English"), "{lang} should map to English: {d}");
+            assert!(
+                d.contains("in English"),
+                "{lang} should map to English: {d}"
+            );
             assert!(!d.contains("简体中文"), "{lang} must not select Chinese");
         }
     }
@@ -1173,14 +1245,20 @@ mod tests {
         // No repo wired (tests / standalone composition).
         assert_eq!(read_app_language(None).await, "en-US");
         // No persisted row yet (fresh install).
-        assert_eq!(read_app_language(Some(&settings_repo(Ok(None)))).await, "en-US");
+        assert_eq!(
+            read_app_language(Some(&settings_repo(Ok(None)))).await,
+            "en-US"
+        );
         // Blank stored value.
         assert_eq!(
             read_app_language(Some(&settings_repo(Ok(Some(settings_row("   ")))))).await,
             "en-US"
         );
         // Read error.
-        assert_eq!(read_app_language(Some(&settings_repo(Err(())))).await, "en-US");
+        assert_eq!(
+            read_app_language(Some(&settings_repo(Err(())))).await,
+            "en-US"
+        );
     }
 
     #[tokio::test]
@@ -1476,6 +1554,55 @@ mod tests {
     }
 
     #[test]
+    fn resolve_domestic_openai_compatible_platforms_use_configured_chat_base() {
+        for (platform, base) in [
+            ("ark", "https://ark.cn-beijing.volces.com/api/v3"),
+            ("stepfun", "https://api.stepfun.com/v1"),
+            ("zhipu", "https://open.bigmodel.cn/api/paas/v4"),
+            ("qianfan", "https://qianfan.baidubce.com/v2"),
+        ] {
+            let (base_url, compat) = resolve_nomi_url_and_compat(platform, base, "openai", false);
+            assert_eq!(base_url.as_deref(), Some(base), "platform={platform}");
+            assert_eq!(
+                compat.api_path.as_deref(),
+                Some("/chat/completions"),
+                "platform={platform}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_coding_plan_platforms_use_chat_completions_at_configured_base() {
+        for (platform, base) in [
+            (
+                "ark-coding-plan",
+                "https://ark.cn-beijing.volces.com/api/coding/v3",
+            ),
+            ("stepfun-plan", "https://api.stepfun.com/step_plan/v1"),
+            (
+                "dashscope-coding",
+                "https://coding.dashscope.aliyuncs.com/v1",
+            ),
+            (
+                "glm-coding-plan",
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+            ),
+            (
+                "qianfan-coding-plan",
+                "https://qianfan.baidubce.com/v2/coding",
+            ),
+        ] {
+            let (base_url, compat) = resolve_nomi_url_and_compat(platform, base, "openai", false);
+            assert_eq!(base_url.as_deref(), Some(base), "platform={platform}");
+            assert_eq!(
+                compat.api_path.as_deref(),
+                Some("/chat/completions"),
+                "platform={platform}"
+            );
+        }
+    }
+
+    #[test]
     fn resolve_mcp_servers_ignores_guide_configs() {
         let overrides = NomiBuildExtra {
             guide_mcp_config: Some(GuideMcpConfig {
@@ -1698,6 +1825,10 @@ mod tests {
             composed.contains("nomi_run_create"),
             "lead prompt must name the orchestration tool: {composed}"
         );
+        assert!(
+            composed.contains("nomi_spawn"),
+            "lead prompt must teach the flat fan-out verb for independent small tasks: {composed}"
+        );
         // Composition, not replacement: the provided base survives.
         assert!(
             composed.contains("Be concise."),
@@ -1732,6 +1863,32 @@ mod tests {
         // Non-lead with no base stays None (no injection).
         assert_eq!(compose_lead_prompt(None, None), None);
         assert_eq!(compose_lead_prompt(None, Some("member")), None);
+    }
+
+    #[test]
+    fn engine_spawn_enabled_policy() {
+        // 本地桌面网关会话（普通/伙伴）→ 禁进程内 Spawn（改走 nomi_spawn 可视化扇出）。
+        assert!(!engine_spawn_enabled(true, None));
+        // IM 渠道 master 会话：nomi_spawn 对 Remote 面拒绝，保留进程内 Spawn。
+        assert!(engine_spawn_enabled(true, Some("telegram")));
+        // 无网关会话 → 保留。
+        assert!(engine_spawn_enabled(false, None));
+    }
+
+    #[test]
+    fn is_orchestration_lead_policy() {
+        // Explicit role wins regardless of preference/companion/remote.
+        assert!(is_orchestration_lead(Some("lead"), false, false, false));
+        assert!(is_orchestration_lead(Some("lead"), false, true, false));
+        // Global 智能编排 preference makes a plain desktop session a lead.
+        assert!(is_orchestration_lead(None, true, false, false));
+        // …but never a companion (它有自己的 smart_orchestration 人设提示)…
+        assert!(!is_orchestration_lead(None, true, true, false));
+        // …nor a remote/IM session (caps_orchestrator denies Remote).
+        assert!(!is_orchestration_lead(None, true, false, true));
+        // Preference off + no explicit role → not a lead.
+        assert!(!is_orchestration_lead(None, false, false, false));
+        assert!(!is_orchestration_lead(Some("member"), false, false, false));
     }
 
     #[test]
@@ -1851,7 +2008,7 @@ mod tests {
         // external-IM-channel write policy. Before the fix this field was never
         // threaded, so the reconstructed binding defaulted it to false and
         // channel write-back was permanently Disabled on the nomi engine.
-        use nomifun_knowledge::{resolve_write_policy, KnowledgeBinding, WriteMode, WriteSurface};
+        use nomifun_knowledge::{KnowledgeBinding, WriteMode, WriteSurface, resolve_write_policy};
 
         // Absent in JSON → serde default false (the previous, broken behavior).
         let off: NomiBuildExtra = serde_json::from_value(serde_json::json!({

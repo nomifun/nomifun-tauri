@@ -47,6 +47,66 @@ pub fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Normalize a model-supplied tool `input` against the tool's JSON `schema`.
+///
+/// Many LLM providers — especially OpenAI-compatible / non-Anthropic models —
+/// serialize *nested* tool arguments as JSON **strings** instead of real JSON,
+/// e.g. `{"tasks": "[{...}]"}` rather than `{"tasks": [{...}]}`. That string then
+/// fails every `.as_array()` / `.as_object()` a tool does on the field, so a
+/// perfectly valid call is rejected ("Missing or invalid 'tasks' array") through
+/// no fault of the user's. This applies to *any* tool with a nested array/object
+/// argument, so it is fixed once, centrally, for all tools.
+///
+/// For each top-level property the schema declares as `array` or `object`, if
+/// the model passed a string that parses back to that exact shape, replace it
+/// with the parsed value. As a last resort, unwrap a fully-stringified argument
+/// object (`input` itself being a JSON-object string).
+///
+/// Conservative and non-lossy: only rewrites `string -> (array|object)` when the
+/// schema asks for that shape AND the string parses to it. A property the schema
+/// types as `string` is never touched, even if its value looks like JSON; an
+/// unparseable or wrong-shape string is left exactly as-is so the tool still
+/// produces its own precise validation error.
+pub fn coerce_input_to_schema(schema: &JsonSchema, input: Value) -> Value {
+    // Last resort: the whole argument object arrived as a JSON string.
+    let mut input = match input {
+        Value::String(ref s) => match serde_json::from_str::<Value>(s) {
+            Ok(parsed @ Value::Object(_)) => parsed,
+            _ => return input,
+        },
+        other => other,
+    };
+
+    let Some(props) = schema.get("properties").and_then(Value::as_object) else {
+        return input;
+    };
+    let Some(obj) = input.as_object_mut() else {
+        return input;
+    };
+
+    for (key, prop_schema) in props {
+        let Some(expected) = prop_schema.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        if expected != "array" && expected != "object" {
+            continue;
+        }
+        // Copy the string out (releasing the borrow) so the insert below can mutate `obj`.
+        let Some(s) = obj.get(key).and_then(Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        if let Ok(parsed) = serde_json::from_str::<Value>(&s) {
+            let matches = (expected == "array" && parsed.is_array())
+                || (expected == "object" && parsed.is_object());
+            if matches {
+                obj.insert(key.clone(), parsed);
+            }
+        }
+    }
+    input
+}
+
+
 /// Write `content` to `file_path` atomically: write to a uniquely-named temp
 /// file in the same directory, then rename it over the target. Rename is atomic
 /// on the same filesystem, so a crash or a concurrent reader never observes a
@@ -176,5 +236,73 @@ mod tests {
         let s = "aaa🦀bbb";
         assert_eq!(truncate_utf8(s, 4), "aaa");
         assert_eq!(truncate_utf8(s, 7), "aaa🦀");
+    }
+
+    #[test]
+    fn coerce_parses_stringified_array_property() {
+        // The reported bug: a provider sent `tasks` as a JSON string.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "tasks": { "type": "array" } },
+            "required": ["tasks"]
+        });
+        let input = serde_json::json!({ "tasks": "[{\"name\":\"a\",\"prompt\":\"p\"}]" });
+        let out = coerce_input_to_schema(&schema, input);
+        assert!(out["tasks"].is_array(), "stringified array must be parsed back");
+        assert_eq!(out["tasks"][0]["name"], "a");
+        assert_eq!(out["tasks"][0]["prompt"], "p");
+    }
+
+    #[test]
+    fn coerce_parses_stringified_object_property() {
+        let schema = serde_json::json!({ "properties": { "config": { "type": "object" } } });
+        let out = coerce_input_to_schema(&schema, serde_json::json!({ "config": "{\"a\":1}" }));
+        assert!(out["config"].is_object());
+        assert_eq!(out["config"]["a"], 1);
+    }
+
+    #[test]
+    fn coerce_leaves_proper_values_untouched() {
+        let schema = serde_json::json!({ "properties": { "tasks": { "type": "array" } } });
+        let input = serde_json::json!({ "tasks": [{ "name": "a" }] });
+        assert_eq!(coerce_input_to_schema(&schema, input.clone()), input);
+    }
+
+    #[test]
+    fn coerce_never_mangles_string_typed_props_or_bad_json() {
+        // A `string`-typed prop that merely looks like JSON must NOT be parsed;
+        // an unparseable / wrong-shape string for an array prop is left as-is so
+        // the tool still emits its own precise error.
+        let schema = serde_json::json!({
+            "properties": {
+                "note": { "type": "string" },
+                "tasks": { "type": "array" }
+            }
+        });
+        let input = serde_json::json!({ "note": "[1,2,3]", "tasks": "not json" });
+        assert_eq!(coerce_input_to_schema(&schema, input.clone()), input);
+
+        // A string that parses to the WRONG shape (object where array expected) is left as-is.
+        let obj_for_array = serde_json::json!({ "tasks": "{\"x\":1}" });
+        assert_eq!(coerce_input_to_schema(&schema, obj_for_array.clone()), obj_for_array);
+    }
+
+    #[test]
+    fn coerce_unwraps_fully_stringified_argument_object() {
+        let schema = serde_json::json!({ "properties": { "tasks": { "type": "array" } } });
+        let input = serde_json::json!("{\"tasks\":[{\"name\":\"a\",\"prompt\":\"p\"}]}");
+        let out = coerce_input_to_schema(&schema, input);
+        assert!(out["tasks"].is_array());
+        assert_eq!(out["tasks"][0]["name"], "a");
+    }
+
+    #[test]
+    fn coerce_is_noop_without_schema_properties_or_on_non_object_input() {
+        let schema = serde_json::json!({ "type": "object" }); // no properties
+        let input = serde_json::json!({ "tasks": "[1]" });
+        assert_eq!(coerce_input_to_schema(&schema, input.clone()), input);
+        // Non-object, non-string input passes through.
+        let arr = serde_json::json!([1, 2, 3]);
+        assert_eq!(coerce_input_to_schema(&schema, arr.clone()), arr);
     }
 }

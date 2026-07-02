@@ -12,7 +12,6 @@ use crate::{LlmProvider, ProviderError};
 use nomi_config::compat::ProviderCompat;
 
 pub struct OpenAIProvider {
-    client: reqwest::Client,
     api_key: String,
     base_url: String,
     compat: ProviderCompat,
@@ -21,7 +20,6 @@ pub struct OpenAIProvider {
 impl OpenAIProvider {
     pub fn new(api_key: &str, base_url: &str, compat: ProviderCompat) -> Self {
         Self {
-            client: crate::http_client(),
             api_key: api_key.to_string(),
             base_url: base_url.to_string(),
             compat,
@@ -601,12 +599,12 @@ impl LlmProvider for OpenAIProvider {
         let url = format!("{}{}", self.base_url, self.compat.api_path());
         let body = self.build_request_body(request);
         let headers = self.build_headers()?;
+        let client = crate::http_client();
 
         tracing::debug!(target: "nomi_providers", body = %serde_json::to_string_pretty(&body).unwrap_or_default(), "outgoing request");
 
         let response = crate::retry::with_initial_connect_retry(|| async {
-            let response = self
-                .client
+            let response = client
                 .post(&url)
                 .headers(headers.clone())
                 .json(&body)
@@ -635,7 +633,7 @@ impl LlmProvider for OpenAIProvider {
 
         let (tx, rx) = mpsc::channel(64);
         let auto_tool_id = self.compat.auto_tool_id();
-        let client = self.client.clone();
+        let client = client.clone();
         let url_clone = url.clone();
 
         tokio::spawn(async move {
@@ -1036,6 +1034,58 @@ mod tests {
 
     fn openai_compat() -> ProviderCompat {
         ProviderCompat::openai_defaults()
+    }
+
+    fn simple_request() -> LlmRequest {
+        LlmRequest {
+            model: "gpt-4o-mini".into(),
+            system: String::new(),
+            messages: vec![Message::new(
+                Role::User,
+                vec![ContentBlock::Text {
+                    text: "hello".into(),
+                }],
+            )],
+            tools: vec![],
+            max_tokens: 16,
+            thinking: None,
+            reasoning_effort: None,
+        }
+    }
+
+    async fn drain_stream(mut rx: tokio::sync::mpsc::Receiver<LlmEvent>) {
+        while rx.recv().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn stream_builds_http_client_for_each_call() {
+        use crate::{http_client_build_count, reset_http_client_build_count};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let provider = OpenAIProvider::new("key", &server.uri(), openai_compat());
+        reset_http_client_build_count();
+
+        drain_stream(provider.stream(&simple_request()).await.unwrap()).await;
+        assert_eq!(http_client_build_count(), 1);
+
+        drain_stream(provider.stream(&simple_request()).await.unwrap()).await;
+        assert_eq!(http_client_build_count(), 2);
     }
 
     // --- max_tokens_field ---

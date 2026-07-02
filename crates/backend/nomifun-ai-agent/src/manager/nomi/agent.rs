@@ -241,6 +241,10 @@ impl NomiAgentManager {
         if config_extra.browser_use {
             config.tools.browser.enabled = true;
         }
+        // 进程内 Spawn 门控 + per-session 工具白名单（工厂已算好；bootstrap 消费：
+        // 门控包住 SpawnTool 注册，白名单在全部注册后 retain_named 收口）。
+        config.tools.in_process_spawn = config_extra.in_process_spawn;
+        config.tools.builtin_allowlist = config_extra.allowed_tools.clone();
         // F1-sec: 把会话的 evaluate「全权模式」LIVE 值灌进 BrowserConfig.full_power（bootstrap 据它
         // 构造 BrowserTool::with_policy 的 evaluate gate）。默认 false（default-deny）。
         config.tools.browser.full_power = config_extra.browser_full_power;
@@ -1019,6 +1023,8 @@ mod tests {
             goal: None,
             browser_secret_vault: None,
             owner_token: None,
+            in_process_spawn: true,
+            allowed_tools: Vec::new(),
         }    }
 
     #[tokio::test]

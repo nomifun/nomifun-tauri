@@ -336,7 +336,7 @@ bun run check      # frontend typecheck + i18n + theme + script-registry gate
 bun run test       # Rust tests (use test:fast for nextest)
 ```
 
-Prefer the scripted entry points over plain `cargo`/`vite` — they include build-dir pruning and consistency checks. New to the codebase? Read [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`docs/contributing/development.md`](docs/contributing/development.md).
+Prefer the scripted entry points over plain `cargo`/`vite` — they include build-dir pruning and consistency checks. New to the codebase? Read [`CONTRIBUTING.md`](CONTRIBUTING.md), [`CONTRIBUTING.zh-CN.md`](CONTRIBUTING.zh-CN.md), and [`docs/contributing/development.md`](docs/contributing/development.md).
 
 ### 📦 Desktop packaging
 
@@ -473,7 +473,7 @@ NomiFun is **pre-1.0** and built part-time, so there's a lot still in flight. On
 
 NomiFun very much needs your help to grow — code contributions, community building, and evangelism are all hugely welcome. If you have passion for this project, please [reach out](#-contact--community) and build the NomiFun ecosystem with us.
 
-- Read [`CONTRIBUTING.md`](CONTRIBUTING.md) to get set up and learn the check ladder.
+- Read [`CONTRIBUTING.md`](CONTRIBUTING.md) to get set up and learn the check ladder. Simplified Chinese: [`CONTRIBUTING.zh-CN.md`](CONTRIBUTING.zh-CN.md).
 - Be excellent to each other — see [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
 - Found a vulnerability? Follow [`SECURITY.md`](SECURITY.md).
 - Browse [open issues](https://github.com/nomifun/nomifun-tauri/issues) for a place to start.

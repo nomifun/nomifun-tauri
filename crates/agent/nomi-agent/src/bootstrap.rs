@@ -577,20 +577,25 @@ impl AgentBootstrap {
             skill_checker,
         )));
 
-        let spawner = Arc::new(
-            crate::spawner::AgentSpawner::new(
-                provider.clone(),
-                self.config.clone(),
-                cwd_path.to_path_buf(),
-            )
-            .with_token_budget(
-                self.config
-                    .tools
-                    .subagent_token_budget
-                    .map(|limit| Arc::new(crate::spawner::TokenBudget::new(limit))),
-            ),
-        );
-        registry.register(Box::new(crate::spawn_tool::SpawnTool::new(spawner)));
+        // 进程内 Spawn 门控（默认开）：桌面后端会话由工厂置 false —— 子 agent
+        // 改走可视化的 nomi_spawn 编排扇出（DAG 画布/转录）；CLI/独立模式保持
+        // 进程内 Spawn（其唯一扇出手段）。
+        if self.config.tools.in_process_spawn {
+            let spawner = Arc::new(
+                crate::spawner::AgentSpawner::new(
+                    provider.clone(),
+                    self.config.clone(),
+                    cwd_path.to_path_buf(),
+                )
+                .with_token_budget(
+                    self.config
+                        .tools
+                        .subagent_token_budget
+                        .map(|limit| Arc::new(crate::spawner::TokenBudget::new(limit))),
+                ),
+            );
+            registry.register(Box::new(crate::spawn_tool::SpawnTool::new(spawner)));
+        }
 
         let plan_active_flag = Arc::new(AtomicBool::new(false));
         if self.config.plan.enabled {
@@ -755,6 +760,11 @@ impl AgentBootstrap {
         // codex-style stateless todo checklist tool. Always registered (not
         // deferred), surfaced to the frontend via the Plan event bridge.
         registry.register(Box::new(nomi_tools::update_plan::UpdatePlanTool::new()));
+
+        // Per-node 工具白名单（受限角色的编排 worker）：非空时只保留白名单内的
+        // 工具（含 MCP 代理）。放在全部注册之后、ToolSearch 快照与引擎构造之前
+        // —— registry 没有 unregister，这是唯一收口点。空 = 不限制（默认）。
+        registry.retain_named(&self.config.tools.builtin_allowlist);
 
         let tool_defs_snapshot = registry.to_tool_defs();
         registry.register(Box::new(nomi_tools::tool_search::ToolSearchTool::new(

@@ -68,18 +68,32 @@ struct PendingLogin {
 #[derive(Clone)]
 pub struct McpOAuthService {
     token_repo: Arc<dyn IOAuthTokenRepository>,
-    http_client: reqwest::Client,
+    http_client: HttpClientFactory,
     /// Mutex protecting the pending login state (only one login at a time).
     pending: Arc<Mutex<Option<PendingLogin>>>,
 }
+
+type HttpClientFactory = Arc<dyn Fn() -> reqwest::Client + Send + Sync>;
 
 impl McpOAuthService {
     pub fn new(token_repo: Arc<dyn IOAuthTokenRepository>, http_client: reqwest::Client) -> Self {
         Self {
             token_repo,
-            http_client,
+            http_client: Arc::new(move || http_client.clone()),
             pending: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn new_dynamic(token_repo: Arc<dyn IOAuthTokenRepository>) -> Self {
+        Self {
+            token_repo,
+            http_client: Arc::new(nomifun_net::http_client),
+            pending: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn http_client(&self) -> reqwest::Client {
+        (self.http_client)()
     }
 
     // -----------------------------------------------------------------------
@@ -292,8 +306,8 @@ impl McpOAuthService {
 
     /// Fetch and parse OAuth server metadata from a URL.
     async fn fetch_metadata(&self, url: &str) -> Result<OAuthServerMetadata, McpError> {
-        let resp = self
-            .http_client
+        let client = self.http_client();
+        let resp = client
             .get(url)
             .send()
             .await

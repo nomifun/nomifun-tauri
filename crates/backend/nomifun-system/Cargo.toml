@@ -7,6 +7,7 @@ edition.workspace = true
 nomifun-auth.workspace = true
 nomifun-common.workspace = true
 nomifun-db.workspace = true
+nomifun-net.workspace = true
 nomifun-api-types.workspace = true
 axum.workspace = true
 serde.workspace = true

@@ -1,5 +1,6 @@
 import { ApiKeyManager } from './ApiKeyManager';
 import type { AuthType } from '@/common/api/authType';
+import { normalizeApiKeyList, parseApiKeyList } from '@/common/utils/apiKeys';
 
 export interface UnifiedChatCompletionResponse {
   id: string;
@@ -53,15 +54,17 @@ export abstract class RotatingApiClient<T> {
     createClientFn: (api_key: string) => T,
     options: RotatingApiClientOptions = {}
   ) {
-    this.originalApiKeys = api_keys;
+    const parsedApiKeys = parseApiKeyList(api_keys);
+    const normalizedApiKeys = normalizeApiKeyList(api_keys);
+    this.originalApiKeys = parsedApiKeys[0] ?? api_keys.trim();
     this.createClientFn = createClientFn;
     this.options = {
       maxRetries: options.maxRetries ?? DEFAULT_MAX_RETRIES,
       retryDelay: options.retryDelay ?? DEFAULT_RETRY_DELAY,
     };
 
-    if (api_keys && (api_keys.includes(',') || api_keys.includes('\n'))) {
-      this.apiKeyManager = new ApiKeyManager(api_keys, authType);
+    if (parsedApiKeys.length > 1) {
+      this.apiKeyManager = new ApiKeyManager(normalizedApiKeys, authType);
     }
 
     this.initializeClient();
@@ -100,14 +103,11 @@ export abstract class RotatingApiClient<T> {
   }
 
   private isSingleKey(): boolean {
-    return !this.originalApiKeys.includes(',') && !this.originalApiKeys.includes('\n');
+    return parseApiKeyList(this.originalApiKeys).length <= 1;
   }
 
   private parseMultipleKeys(): string[] {
-    return this.originalApiKeys
-      .split(/[,\n]/)
-      .map((key) => key.trim())
-      .filter((key) => key);
+    return parseApiKeyList(this.originalApiKeys);
   }
 
   protected isRetryableError(error: unknown): boolean {

@@ -2,10 +2,11 @@ import type { IProvider } from '@/common/config/storage';
 import type { ProtocolDetectionResponse, ProtocolType } from '@/common/utils/protocolDetector';
 import { ipcBridge } from '@/common';
 import { prefixedId } from '@/common/utils';
+import { normalizeApiKeyList, validateApiKeysForSave } from '@/common/utils/apiKeys';
 import { isGoogleApisHost } from '@/common/utils/urlValidation';
 import ModalHOC from '@/renderer/utils/ui/ModalHOC';
 import { copyText } from '@/renderer/utils/ui/clipboard';
-import { Button, Form, Input, Message, Popover, Select, Switch } from '@arco-design/web-react';
+import { Button, Form, Input, Popover, Select, Switch } from '@arco-design/web-react';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 import { LinkCloud, Edit, Search, Loading, Info, Copy } from '@icon-park/react';
 import React, { useEffect, useMemo, useState } from 'react';
@@ -241,6 +242,7 @@ const AddPlatformModal = ModalHOC<{
   const { t } = useTranslation();
   const [form] = Form.useForm();
   const [api_keyEditorVisible, setApiKeyEditorVisible] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
   // 用于追踪上次检测时的输入值，避免重复检测
   // Track last detection input to avoid redundant detection
   const [lastDetectionInput, setLastDetectionInput] = useState<{ base_url: string; api_key: string } | null>(null);
@@ -384,10 +386,23 @@ const AddPlatformModal = ModalHOC<{
   const fixBaseUrl = modelListState.data?.fix_base_url;
   const showBaseUrlSuggestion = !!fixBaseUrl && fixBaseUrl !== base_url && fixBaseUrl !== dismissedFixUrl;
 
+  const testApiKeyForProvider = async (key: string, baseUrl: string) => {
+    try {
+      const res = await ipcBridge.mode.detectProtocol.invoke({
+        base_url: baseUrl,
+        api_key: key,
+        timeout: 10000,
+      });
+      return res?.success === true;
+    } catch {
+      return false;
+    }
+  };
+
   const handleSubmit = () => {
     form
       .validate()
-      .then((values) => {
+      .then(async (values) => {
         // 优先使用用户填写的供应商名称，留空时回退到平台预设名称
         // Prefer the user-entered provider name; fall back to the platform preset when blank
         const presetName = selectedPlatform?.i18nKey
@@ -396,14 +411,35 @@ const AddPlatformModal = ModalHOC<{
         const name = String(values.name ?? '').trim() || presetName;
         const contextLimit =
           typeof values.context_limit === 'number' && values.context_limit > 0 ? values.context_limit : undefined;
+        const providerPlatform = selectedPlatform?.platform ?? 'custom';
+        const providerBaseUrl = isBedrock ? '' : values.base_url || selectedPlatform?.base_url || '';
+        let normalizedApiKey = '';
+
+        if (!isBedrock && !isFullUrl) {
+          setIsSaving(true);
+          const validation = await validateApiKeysForSave(values.api_key, (key) =>
+            testApiKeyForProvider(key, providerBaseUrl)
+          );
+          form.setFieldValue('api_key', validation.normalized);
+          if (!validation.valid) {
+            message.error(
+              t('settings.removeInvalidApiKeysBeforeSave', { count: validation.invalidIndexes.length })
+            );
+            return;
+          }
+          normalizedApiKey = validation.normalized;
+        } else {
+          normalizedApiKey = isBedrock ? '' : normalizeApiKeyList(values.api_key);
+        }
+
         const provider: IProvider = {
           id: prefixedId('prov'),
-          platform: selectedPlatform?.platform ?? 'custom',
+          platform: providerPlatform,
           name,
           // 优先使用用户输入的 base_url，否则使用平台预设值
           // Prefer user input base_url, fallback to platform preset
-          base_url: isBedrock ? '' : values.base_url || selectedPlatform?.base_url || '',
-          api_key: isBedrock ? '' : values.api_key,
+          base_url: providerBaseUrl,
+          api_key: normalizedApiKey,
           models: [values.model],
           is_full_url: isFullUrl,
           model_context_limits: contextLimit ? { [values.model]: contextLimit } : undefined,
@@ -435,6 +471,9 @@ const AddPlatformModal = ModalHOC<{
       })
       .catch(() => {
         // validation failed
+      })
+      .finally(() => {
+        setIsSaving(false);
       });
   };
 
@@ -451,7 +490,7 @@ const AddPlatformModal = ModalHOC<{
         overflow: 'auto',
       }}
       onOk={handleSubmit}
-      confirmLoading={modalProps.confirmLoading}
+      confirmLoading={modalProps.confirmLoading || isSaving}
       okText={t('common.confirm')}
       cancelText={t('common.cancel')}
     >
@@ -881,16 +920,7 @@ const AddPlatformModal = ModalHOC<{
           void modelListState.mutate();
         }}
         onTestKey={async (key) => {
-          try {
-            const res = await ipcBridge.mode.fetchModelList.invoke({
-              base_url: actualBaseUrl,
-              api_key: key,
-              platform: selectedPlatform?.platform ?? 'custom',
-            });
-            return Array.isArray(res?.models) && res.models.length > 0;
-          } catch {
-            return false;
-          }
+          return testApiKeyForProvider(key, actualBaseUrl);
         }}
       />
     </NomiModal>

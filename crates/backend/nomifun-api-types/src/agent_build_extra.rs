@@ -323,6 +323,11 @@ pub struct NomiBuildExtra {
     /// default for every existing conversation) is a no-op.
     #[serde(default)]
     pub orchestrator_role: Option<String>,
+    /// Per-session 工具白名单（受限角色的编排 worker 用）。非空时引擎只保留
+    /// 名单内的工具（bootstrap `retain_named`）。后端（orchestrator worker 的
+    /// `build_worker_extra`）设置；普通会话恒空 = 不限制。
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
 }
 
 fn default_nomi_max_tokens() -> u32 {

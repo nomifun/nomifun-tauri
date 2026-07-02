@@ -294,6 +294,22 @@ impl RunService {
         self.emitter
             .emit_lead_thinking(run_id, "plan", "phase", None, Some("decomposing"), false);
 
+        self.persist_dag_and_activate(run_id, &run, &members, dag).await
+    }
+
+    /// plan() 的「落库半段」：cycle guard → 建任务 → 连边 → 分派 assignment →
+    /// planUpdated → autonomy 门 → emit_run_status。与 planner 完全解耦，
+    /// plan()（LLM 产 DAG）与 plan_flat()（调用方显式任务列表）共用；行为与
+    /// 拆分前逐字节一致。`assigning` 阶段叙事保留在此（两条路径都要刷画布）。
+    async fn persist_dag_and_activate(
+        &self,
+        run_id: &str,
+        run: &nomifun_db::models::OrchRunRow,
+        members: &[FleetMember],
+        dag: PlannedDag,
+    ) -> Result<(), AppError> {
+        #[allow(unused_mut)]
+        let mut dag = dag;
         // CYCLE GUARD (symmetric with `adjust`'s `reconcile_plan_has_cycle`): the
         // planner's `depends_on` indices are range-validated when wiring edges below,
         // but a back-referencing planner output (e.g. task 0 depends_on [2], task 2
@@ -445,6 +461,24 @@ impl RunService {
             .map_err(OrchestratorError::from)?;
         self.emitter.emit_run_status(run_id, next_status);
         Ok(())
+    }
+
+    /// 扁平 fan-out 规划（nomi_spawn）：跳过 planner LLM，直接把调用方给的任务
+    /// 列表落库并激活。任务为空 → BadRequest（否则 run 会立即被判 stuck）。
+    /// depends_on（如 synthesize 汇总节点）照常落边；autonomy 门与 plan() 一致
+    /// （扁平 run 由前门以 supervised 创建 → 直接 running）。
+    pub async fn plan_flat(&self, run_id: &str, tasks: Vec<PlannedTask>) -> Result<(), AppError> {
+        if tasks.is_empty() {
+            return Err(AppError::BadRequest("plan_flat requires at least one task".into()));
+        }
+        let run = self
+            .run_repo
+            .get_run(run_id)
+            .await
+            .map_err(OrchestratorError::from)?
+            .ok_or_else(|| OrchestratorError::NotFound(format!("run {run_id}")))?;
+        let members: Vec<FleetMember> = decode_fleet_snapshot(run_id, &run.fleet_snapshot);
+        self.persist_dag_and_activate(run_id, &run, &members, PlannedDag { tasks }).await
     }
 
     /// Route + persist ONE task's auto-assignment (the LLM-primary + Router-veto
@@ -1811,6 +1845,29 @@ pub fn spawn_plan_and_start(
         if autonomy != "interactive" {
             engine.start(run_id);
         }
+    });
+}
+
+/// nomi_spawn 的后台编排：plan_flat（无 planner）→ engine.start。扁平 run 恒为
+/// 非 interactive（前门以 supervised 创建），故 plan_flat 成功即直接启动引擎。
+/// 与 [`spawn_plan_and_start`] 同样 fail-soft：失败只 warn，run 留在 `planning`
+/// 可重试，绝不在 detached task 里 panic。
+pub fn spawn_plan_flat_and_start(
+    run_service: Arc<RunService>,
+    engine: crate::engine::RunEngine,
+    run_id: String,
+    tasks: Vec<PlannedTask>,
+) {
+    tokio::spawn(async move {
+        if let Err(err) = run_service.plan_flat(&run_id, tasks).await {
+            tracing::warn!(
+                run_id = %run_id,
+                error = %err,
+                "flat planning failed; run left in `planning` (re-plannable)"
+            );
+            return;
+        }
+        engine.start(run_id);
     });
 }
 
@@ -3298,6 +3355,91 @@ mod tests {
             provider_id: provider_id.to_string(),
             model: model.to_string(),
         }
+    }
+
+    // ----- plan_flat（nomi_spawn 扁平 fan-out，跳过 planner）-----
+
+    fn flat_task(title: &str, spec: &str) -> PlannedTask {
+        PlannedTask {
+            title: title.to_string(),
+            spec: spec.to_string(),
+            task_profile: None,
+            depends_on: vec![],
+            member_index: None,
+            rationale: None,
+            role: None,
+            kind: "agent".to_string(),
+            pattern_config: None,
+        }
+    }
+
+    /// supervised 的 adhoc run（nomi_spawn 前门的形状：单模型、无审批门）。
+    async fn flat_run(svc: &RunService) -> String {
+        let req = CreateAdhocRunRequest {
+            goal: "并行执行子任务".to_string(),
+            work_dir: None,
+            model_range: ModelRange::Single {
+                model: model_ref("prov_a", "model-a"),
+            },
+            pinned_roles: vec![],
+            role_members: vec![],
+            autonomy: Some("supervised".to_string()),
+            max_parallel: None,
+            lead_conv_id: None,
+            lead_model: None,
+        };
+        svc.create_adhoc("u1", req).await.expect("create_adhoc").id
+    }
+
+    #[tokio::test]
+    async fn plan_flat_persists_tasks_assignments_and_activates() {
+        let (svc, _repo) = adhoc_service().await;
+        let run_id = flat_run(&svc).await;
+
+        svc.plan_flat(&run_id, vec![flat_task("查 A", "搜索模块 A 的用法"), flat_task("查 B", "搜索模块 B 的用法")])
+            .await
+            .expect("plan_flat");
+
+        let detail = svc.get_detail(&run_id).await.expect("detail");
+        assert_eq!(detail.tasks.len(), 2);
+        assert!(detail.deps.is_empty(), "扁平 run 无依赖边");
+        assert_eq!(detail.run.status, "running", "supervised 直接 running（autonomy 门复用）");
+        for t in &detail.tasks {
+            assert_eq!(t.status, "pending");
+        }
+        // 每个任务必须有 assignment（引擎 dispatch 需要）。
+        assert_eq!(detail.assignments.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn plan_flat_rejects_empty_tasks() {
+        let (svc, _repo) = adhoc_service().await;
+        let run_id = flat_run(&svc).await;
+        let err = svc.plan_flat(&run_id, vec![]).await.expect_err("empty must reject");
+        assert!(
+            matches!(err, AppError::BadRequest(_)),
+            "空任务列表必须拒绝，否则 run 立即 stuck: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_flat_persists_synthesis_dep_edges() {
+        // 携带 depends_on 的 synthesis 任务（nomi_spawn synthesize=true 的形状）也能落边。
+        let (svc, _repo) = adhoc_service().await;
+        let run_id = flat_run(&svc).await;
+        let mut synth = flat_task("综合", "汇总各子任务产出并标注冲突");
+        synth.kind = "synthesis".to_string();
+        synth.depends_on = vec![0, 1];
+        synth.role = Some("reviewer".to_string());
+        svc.plan_flat(&run_id, vec![flat_task("A", "a"), flat_task("B", "b"), synth])
+            .await
+            .expect("plan_flat");
+        let detail = svc.get_detail(&run_id).await.expect("detail");
+        assert_eq!(detail.tasks.len(), 3);
+        assert_eq!(detail.deps.len(), 2, "synthesis 依赖两个上游");
+        // role 持久化到任务行（worker 端据此收缩工具）。
+        let synth_task = detail.tasks.iter().find(|t| t.kind == "synthesis").expect("synthesis task");
+        assert_eq!(synth_task.role.as_deref(), Some("reviewer"));
     }
 
     // (a) create_adhoc with a `range` of two models persists the run, snapshots
