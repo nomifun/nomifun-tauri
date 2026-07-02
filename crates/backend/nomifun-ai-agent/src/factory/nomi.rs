@@ -24,15 +24,10 @@ pub(super) async fn build(
 ) -> Result<AgentInstance, AppError> {
     let mut overrides: NomiBuildExtra = serde_json::from_value(options.extra).unwrap_or_default();
 
-    // 对外服务钳制（execution-time 后端权威闸）：exposure 的权威来源有二——
-    // ① 入口显式盖章（`extra.exposure`，未来 Remote/渠道公开令牌用）；
-    // ② 绑定伙伴自身档位（LIVE 读，翻档下一轮即生效，不吃 stale extra）。
-    // 取二者更严者；`PublicService` 会话在任何其它处理之前被硬性收窄——关网关 /
-    // computer / browser / spawn，工具收敛到安全白名单。覆盖任何 client/host 传入值。
-    if let Some(provider) = deps.companion_prompt.as_ref() {
-        let companion_exposure = provider.exposure(overrides.companion_id.as_deref()).await;
-        overrides.exposure = overrides.exposure.stricter(companion_exposure);
-    }
+    // 对外服务钳制（execution-time 后端权威闸）：exposure 的权威来源是入口显式盖章
+    // （`extra.exposure`，Remote/渠道公开令牌用）与下面的对外伙伴 id。取更严者；
+    // `PublicService` 会话在任何其它处理之前被硬性收窄——关网关 / computer / browser /
+    // spawn，工具收敛到安全白名单。覆盖任何 client/host 传入值。
     // 对外伙伴（public agent）会话：`extra.public_agent_id` 置位即标记为对外服务。
     // 安全边界不依赖运行时解析——只要 id 存在就把档位升到 `PublicService`（fail-safe：
     // 即便伙伴已删/解析失败，会话仍被硬钳）。随后 best-effort 解析运行时供人格/知识库。

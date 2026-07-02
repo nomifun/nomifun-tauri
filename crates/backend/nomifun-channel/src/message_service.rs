@@ -47,13 +47,6 @@ pub trait MasterAgentProfile: Send + Sync {
     /// rather than leaking a standalone conversation.
     async fn ensure_companion_session(&self, companion_id: &str) -> Option<i64>;
 
-    /// Best-effort audit hook for a companion-bound inbound channel turn. Called
-    /// once per inbound turn routed into a companion's session. The impl records
-    /// an audit entry ONLY when the companion is a `PublicService` "外呼员工"
-    /// (it reads the live exposure tier); a no-op default keeps other impls
-    /// (tests, non-companion hosts) unaffected. Must never fail the turn.
-    async fn audit_companion_turn(&self, _companion_id: &str, _platform: &str, _text: &str) {}
-
     // ── 对外伙伴 / public agent (a platform bot serves EITHER a companion OR a
     //    public agent, never both) ──────────────────────────────────────────
 
@@ -262,14 +255,6 @@ impl ChannelMessageService {
                 None => self.create_conversation_for_session(session, platform).await?,
             }
         };
-
-        // Best-effort audit of a companion-bound inbound turn. The provider impl
-        // gates on the companion's live exposure (only PublicService "外呼员工"
-        // turns are recorded); a no-op for private companions and unconfigured
-        // hosts. Never fails the turn.
-        if let (Some(profile), Some(cid)) = (self.master_profile.as_ref(), companion_id.as_deref()) {
-            profile.audit_companion_turn(cid, &platform.to_string(), text).await;
-        }
 
         // Tag this turn with its origin platform ONLY when it rides a
         // companion's shared single session (companion_id resolved): that

@@ -521,15 +521,6 @@ impl nomifun_channel::message_service::MasterAgentProfile for CompanionMasterAge
         }
     }
 
-    async fn audit_companion_turn(&self, companion_id: &str, platform: &str, text: &str) {
-        // Delegates to the companion service, which gates on the companion's
-        // live exposure (only PublicService "外呼员工" turns are recorded) and
-        // appends best-effort. Never fails the turn.
-        self.companion_service
-            .record_public_service_turn(companion_id, "channel", Some(platform.to_owned()), text)
-            .await;
-    }
-
     async fn master_public_agent_id(&self, platform: &str) -> Option<String> {
         // The platform's bound public agent, but ONLY when it is a live, ENABLED
         // agent. A stale binding (deleted agent) or a disabled/paused agent

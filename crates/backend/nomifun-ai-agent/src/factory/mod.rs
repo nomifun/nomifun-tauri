@@ -49,19 +49,6 @@ pub trait CompanionPromptProvider: Send + Sync {
         companion_id: Option<&str>,
         channel_platform: Option<&str>,
     ) -> Option<String>;
-
-    /// The bound companion's exposure tier, read LIVE at every agent build so
-    /// flipping a companion to/from public service takes effect on its next turn
-    /// (no stale session extra). `None` / unknown id / non-companion sessions →
-    /// `Private` (today's full-capability behavior). A `PublicService` companion
-    /// causes the factory to hard-clamp the session to safe tools only.
-    async fn exposure(
-        &self,
-        companion_id: Option<&str>,
-    ) -> nomifun_api_types::ExposureMode {
-        let _ = companion_id;
-        nomifun_api_types::ExposureMode::Private
-    }
 }
 
 /// Runtime persona/policy/model resolved for a 对外伙伴 (public agent / public

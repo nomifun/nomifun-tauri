@@ -256,9 +256,6 @@ pub fn migrate_legacy_layout(data_dir: &Path) -> std::io::Result<Option<String>>
             custom_figure: None,
         },
         created_at: now_ms(),
-        // Legacy single-companion installs migrate to a full-capability private
-        // companion (today's behavior); opting into public service is explicit.
-        exposure: nomifun_api_types::ExposureMode::Private,
     };
     profile.save(&staging_companions.join(&companion_id))?;
 
