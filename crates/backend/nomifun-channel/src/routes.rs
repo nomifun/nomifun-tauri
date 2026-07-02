@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Json, State};
+use axum::extract::{Json, Path, State};
 use axum::routing::{get, post};
 use tracing::warn;
 
@@ -73,7 +73,14 @@ pub fn channel_routes(state: ChannelRouterState) -> Router {
         // Settings sync
         .route("/api/channel/settings/sync", post(sync_channel_settings))
         // Master-agent companion binding (persist + session reset in one step)
-        .route("/api/channel/settings/companion", post(set_channel_master_companion));
+        .route("/api/channel/settings/companion", post(set_channel_master_companion))
+        // 对外伙伴 (public agent) per-platform binding — consumed by a separate
+        // frontend; pinned request/response shapes. MUTUALLY EXCLUSIVE with the
+        // per-platform companion binding.
+        .route(
+            "/api/channels/{platform}/public-agent",
+            get(get_public_agent_binding).put(set_public_agent_binding),
+        );
 
     // WeChat QR login starter (feature-gated). Lives in the authenticated
     // channel group — the QR lifecycle then streams over the WebSocket as
@@ -678,6 +685,68 @@ async fn set_channel_master_companion(
         success: true,
         message: Some(format!("Companion binding updated for {platform_str}; sessions cleared")),
         error: None,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// 对外伙伴 (public agent) per-platform binding handlers
+// ---------------------------------------------------------------------------
+
+/// Request / response body for the public-agent binding endpoints. `null`
+/// `public_agent_id` means "unbound".
+#[derive(Debug, Deserialize, Serialize)]
+struct PublicAgentBindingBody {
+    public_agent_id: Option<String>,
+}
+
+/// `GET /api/channels/{platform}/public-agent` — the platform's bound public
+/// agent id (raw binding, regardless of the agent's live/enabled state).
+async fn get_public_agent_binding(
+    State(state): State<ChannelRouterState>,
+    Path(platform): Path<String>,
+) -> Result<Json<ApiResponse<PublicAgentBindingBody>>, AppError> {
+    let plugin = PluginType::from_str_opt(&platform)
+        .ok_or_else(|| AppError::BadRequest(format!("Invalid platform: {platform}")))?;
+
+    let public_agent_id = state.settings_service.get_master_agent_public_agent_id(plugin).await?;
+
+    Ok(Json(ApiResponse::ok(PublicAgentBindingBody { public_agent_id })))
+}
+
+/// `PUT /api/channels/{platform}/public-agent` — bind (or clear) the public
+/// agent that serves this platform's bot. A non-null id also clears the
+/// platform's companion binding (mutual exclusivity, handled in the settings
+/// service); `null` unbinds. Clears the platform's sessions so the next inbound
+/// message recreates conversations under the new binding.
+async fn set_public_agent_binding(
+    State(state): State<ChannelRouterState>,
+    Path(platform): Path<String>,
+    body: Result<Json<PublicAgentBindingBody>, JsonRejection>,
+) -> Result<Json<ApiResponse<PublicAgentBindingBody>>, AppError> {
+    let plugin = PluginType::from_str_opt(&platform)
+        .ok_or_else(|| AppError::BadRequest(format!("Invalid platform: {platform}")))?;
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+
+    let public_agent_id = req.public_agent_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    // Validate a non-empty binding against the live public-agent roster: a typo'd
+    // or already-deleted id must 400 here instead of being persisted. Clearing
+    // (null / empty) needs no validation. Skipped when no profile is wired.
+    if let Some(id) = public_agent_id
+        && let Some(profile) = &state.master_profile
+        && !profile.public_agent_exists(id).await
+    {
+        return Err(AppError::BadRequest(format!("public agent '{id}' not found")));
+    }
+
+    state.settings_service.set_master_agent_public_agent_id(plugin, public_agent_id).await?;
+
+    // Same reset semantics as the companion binding route: clear sessions so the
+    // next inbound message opens a conversation under the new binding.
+    state.session_manager.clear_all_sessions().await?;
+
+    Ok(Json(ApiResponse::ok(PublicAgentBindingBody {
+        public_agent_id: public_agent_id.map(str::to_owned),
     })))
 }
 

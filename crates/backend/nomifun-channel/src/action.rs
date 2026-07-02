@@ -66,6 +66,11 @@ pub struct ActionExecutor {
     /// Opt-in IM → requirement creator. `None` (default) keeps the normal AI
     /// dispatch path unchanged.
     requirement_creator: Option<Arc<dyn nomifun_common::RequirementCreator>>,
+    /// The owner/system identity under which auto-served strangers run on a
+    /// public-agent-bound platform (the `PublicService` clamp is the boundary,
+    /// not the user id; per-chat conversations give per-stranger isolation).
+    /// Defaults to the same system fallback `ChannelMessageService` uses.
+    owner_user_id: String,
 }
 
 /// Derive a requirement `(title, content)` from an inbound message's text:
@@ -97,6 +102,7 @@ impl ActionExecutor {
             settings,
             default_agent_type: default_agent_type.to_owned(),
             requirement_creator: None,
+            owner_user_id: "system_default_user".to_owned(),
         }
     }
 
@@ -107,6 +113,14 @@ impl ActionExecutor {
         creator: Option<Arc<dyn nomifun_common::RequirementCreator>>,
     ) -> Self {
         self.requirement_creator = creator;
+        self
+    }
+
+    /// Set the owner/system identity used to auto-serve strangers on
+    /// public-agent-bound platforms. Production wires the primary WebUI user
+    /// (the same id `ChannelMessageService` sends turns as).
+    pub fn with_owner_user_id(mut self, owner_user_id: impl Into<String>) -> Self {
+        self.owner_user_id = owner_user_id.into();
         self
     }
 
@@ -138,10 +152,28 @@ impl ActionExecutor {
         let internal_user_id = match internal_user_id {
             Some(id) => id,
             None => {
-                let response = self
-                    .handle_unauthorized(user_id, &platform_type, channel_id, &msg.user.display_name)
-                    .await?;
-                return Ok(MessageResult::Action(response));
+                // 对外伙伴自动接待 (SECURITY-CRITICAL): a platform bound to a PUBLIC
+                // AGENT auto-serves unknown senders with NO pairing code — the
+                // public-agent session is hard-clamped to `PublicService` (safe
+                // tools only), which is the whole point of the feature. Auto-served
+                // strangers run under the owner/system identity (the clamp is the
+                // boundary, not the user id); their per-chat conversation gives
+                // per-stranger isolation. This bypass is gated STRICTLY on the
+                // platform being bound to a public agent — companion-bound and
+                // unbound platforms keep the pairing approval gate UNCHANGED.
+                if self
+                    .settings
+                    .get_master_agent_public_agent_id(msg.platform)
+                    .await?
+                    .is_some()
+                {
+                    self.owner_user_id.clone()
+                } else {
+                    let response = self
+                        .handle_unauthorized(user_id, &platform_type, channel_id, &msg.user.display_name)
+                        .await?;
+                    return Ok(MessageResult::Action(response));
+                }
             }
         };
 
@@ -970,6 +1002,46 @@ mod action_tests {
         }
     }
 
+    /// Read-only pref repo seeded with fixed `(key, value)` rows — lets the
+    /// pairing-bypass tests stand up a platform bound to a public agent (or a
+    /// companion) without a real DB.
+    struct SeededPrefRepo {
+        data: Vec<(String, String)>,
+    }
+
+    impl SeededPrefRepo {
+        fn new(entries: &[(&str, &str)]) -> Self {
+            Self {
+                data: entries.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl IClientPreferenceRepository for SeededPrefRepo {
+        async fn get_all(&self) -> Result<Vec<ClientPreference>, DbError> {
+            Ok(self
+                .data
+                .iter()
+                .map(|(k, v)| ClientPreference { key: k.clone(), value: v.clone(), updated_at: 0 })
+                .collect())
+        }
+        async fn get_by_keys(&self, keys: &[&str]) -> Result<Vec<ClientPreference>, DbError> {
+            Ok(self
+                .data
+                .iter()
+                .filter(|(k, _)| keys.contains(&k.as_str()))
+                .map(|(k, v)| ClientPreference { key: k.clone(), value: v.clone(), updated_at: 0 })
+                .collect())
+        }
+        async fn upsert_batch(&self, _entries: &[(&str, &str)]) -> Result<(), DbError> {
+            Ok(())
+        }
+        async fn delete_keys(&self, _keys: &[&str]) -> Result<(), DbError> {
+            Ok(())
+        }
+    }
+
     // ── Test helpers ───────────────────────────────────────────────────
 
     fn setup() -> (ActionExecutor, Arc<MockRepo>) {
@@ -978,6 +1050,19 @@ mod action_tests {
         let pairing = Arc::new(PairingService::new(repo.clone(), broadcaster));
         let session_mgr = Arc::new(SessionManager::new(repo.clone()));
         let pref_repo: Arc<dyn IClientPreferenceRepository> = Arc::new(MockPrefRepo);
+        let settings = Arc::new(ChannelSettingsService::new(pref_repo));
+        let executor = ActionExecutor::new(pairing, session_mgr, settings, "gemini");
+        (executor, repo)
+    }
+
+    /// Like `setup()` but with the settings service backed by seeded preference
+    /// rows (used to bind a platform to a public agent / companion).
+    fn setup_with_prefs(entries: &[(&str, &str)]) -> (ActionExecutor, Arc<MockRepo>) {
+        let repo = Arc::new(MockRepo::new());
+        let broadcaster = Arc::new(MockBroadcaster);
+        let pairing = Arc::new(PairingService::new(repo.clone(), broadcaster));
+        let session_mgr = Arc::new(SessionManager::new(repo.clone()));
+        let pref_repo: Arc<dyn IClientPreferenceRepository> = Arc::new(SeededPrefRepo::new(entries));
         let settings = Arc::new(ChannelSettingsService::new(pref_repo));
         let executor = ActionExecutor::new(pairing, session_mgr, settings, "gemini");
         (executor, repo)
@@ -1080,6 +1165,59 @@ mod action_tests {
             }
             _ => panic!("Expected Dispatched result for authorized user"),
         }
+    }
+
+    // ── 对外伙伴 pairing bypass (public-agent-bound platforms only) ─────────
+
+    /// A platform BOUND to a public agent auto-serves an unknown sender with NO
+    /// pairing code — the public-agent session is hard-clamped, so this is safe.
+    #[tokio::test]
+    async fn public_agent_bound_platform_auto_serves_unknown_sender() {
+        // No authorized user; the platform is bound to a public agent.
+        let (executor, _repo) =
+            setup_with_prefs(&[("assistant.telegram.publicAgentId", "\"pubagent_1\"")]);
+
+        let msg = make_text_message("tg_stranger", "chat_1", "hi", PluginType::Telegram);
+        let result = executor.handle_incoming_message(&msg, "tg-1").await.unwrap();
+
+        match result {
+            MessageResult::Dispatched { session_id, .. } => assert!(!session_id.is_empty()),
+            other => panic!("stranger on a public-agent platform must be auto-served, got {other:?}"),
+        }
+    }
+
+    /// The bypass is STRICTLY gated on a public-agent binding: a COMPANION-bound
+    /// platform still gates unknown senders behind pairing (never loosened).
+    #[tokio::test]
+    async fn companion_bound_platform_still_gates_unknown_sender() {
+        // Companion bound, but NO public-agent binding → pairing gate intact.
+        let (executor, _repo) =
+            setup_with_prefs(&[("assistant.telegram.companionId", "\"companion_1\"")]);
+
+        let msg = make_text_message("tg_stranger", "chat_1", "hi", PluginType::Telegram);
+        let result = executor.handle_incoming_message(&msg, "tg-1").await.unwrap();
+
+        match result {
+            MessageResult::Action(resp) => {
+                let text = resp.text.unwrap();
+                assert!(text.contains("pairing code"), "companion platform must still require pairing");
+            }
+            other => panic!("companion-bound platform must gate strangers, got {other:?}"),
+        }
+    }
+
+    /// An UNBOUND platform keeps the pairing gate for unknown senders (control).
+    #[tokio::test]
+    async fn unbound_platform_still_gates_unknown_sender() {
+        let (executor, _repo) = setup();
+
+        let msg = make_text_message("tg_stranger", "chat_1", "hi", PluginType::Telegram);
+        let result = executor.handle_incoming_message(&msg, "tg-1").await.unwrap();
+
+        assert!(
+            matches!(result, MessageResult::Action(_)),
+            "unbound platform must gate an unknown sender behind pairing"
+        );
     }
 
     // ── Platform action tests ──────────────────────────────────────────

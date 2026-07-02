@@ -171,6 +171,11 @@ impl ChannelSettingsService {
     /// (key `assistant.{platform}.companionId`). `None` / empty string deletes the
     /// key — back to "default companion" semantics.
     ///
+    /// MUTUAL EXCLUSIVITY: a platform bot serves EITHER a companion OR a public
+    /// agent, never both — so writing a companion binding also clears that
+    /// platform's public-agent binding (see `set_master_agent_public_agent_id`
+    /// for the symmetric clear).
+    ///
     /// Persistence only: the channel routes layer pairs this with the same
     /// session reset as the masterAgent switch so the next inbound message
     /// recreates conversations under the new binding.
@@ -184,6 +189,71 @@ impl ChannelSettingsService {
             Some(id) => {
                 let value = serde_json::Value::String(id.to_owned()).to_string();
                 self.pref_repo.upsert_batch(&[(&key, &value)]).await?;
+                // Mutual exclusivity: binding a companion drops any public-agent
+                // binding on this platform.
+                self.pref_repo
+                    .delete_keys(&[&master_agent_public_agent_key(platform)])
+                    .await?;
+            }
+            None => {
+                self.pref_repo.delete_keys(&[&key]).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads the 对外伙伴 (public agent) bound to a platform's master agent from
+    /// `client_preferences` (key `assistant.{platform}.publicAgentId`). Mirrors
+    /// [`Self::get_master_agent_companion_id`]: `None` when the key is absent or
+    /// stores an empty string; tolerates both a JSON string (`"pubagent_x"`) and a
+    /// raw unquoted value.
+    pub async fn get_master_agent_public_agent_id(
+        &self,
+        platform: PluginType,
+    ) -> Result<Option<String>, ChannelError> {
+        let key = master_agent_public_agent_key(platform);
+        let prefs = self.pref_repo.get_by_keys(&[&key]).await?;
+
+        let Some(pref) = prefs.into_iter().next() else {
+            return Ok(None);
+        };
+
+        let raw = match serde_json::from_str::<serde_json::Value>(&pref.value) {
+            Ok(serde_json::Value::String(s)) => s,
+            Ok(serde_json::Value::Null) => String::new(),
+            Ok(_) => pref.value,
+            Err(_) => pref.value,
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(trimmed.to_owned()))
+    }
+
+    /// Writes (or clears) the 对外伙伴 (public agent) bound to a platform's master
+    /// agent (key `assistant.{platform}.publicAgentId`). `None` / empty string
+    /// deletes the key.
+    ///
+    /// MUTUAL EXCLUSIVITY: a platform bot serves EITHER a public agent OR a
+    /// companion, never both — so writing a public-agent binding also clears that
+    /// platform's companion binding (the symmetric clear lives in
+    /// [`Self::set_master_agent_companion_id`]).
+    pub async fn set_master_agent_public_agent_id(
+        &self,
+        platform: PluginType,
+        public_agent_id: Option<&str>,
+    ) -> Result<(), ChannelError> {
+        let key = master_agent_public_agent_key(platform);
+        match public_agent_id.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(id) => {
+                let value = serde_json::Value::String(id.to_owned()).to_string();
+                self.pref_repo.upsert_batch(&[(&key, &value)]).await?;
+                // Mutual exclusivity: binding a public agent drops any companion
+                // binding on this platform.
+                self.pref_repo
+                    .delete_keys(&[&master_agent_companion_key(platform)])
+                    .await?;
             }
             None => {
                 self.pref_repo.delete_keys(&[&key]).await?;
@@ -199,6 +269,10 @@ fn agent_key(platform: PluginType) -> String {
 
 fn master_agent_companion_key(platform: PluginType) -> String {
     format!("assistant.{platform}.companionId")
+}
+
+fn master_agent_public_agent_key(platform: PluginType) -> String {
+    format!("assistant.{platform}.publicAgentId")
 }
 
 fn model_key(platform: PluginType) -> String {
@@ -549,6 +623,97 @@ mod tests {
             .await
             .unwrap();
         assert!(svc.get_master_agent_companion_id(PluginType::Dingtalk).await.unwrap().is_none());
+    }
+
+    // ── get/set_master_agent_public_agent_id + mutual exclusivity ───────
+
+    #[tokio::test]
+    async fn public_agent_id_returns_none_when_no_pref() {
+        let repo = Arc::new(MockPrefRepo::new());
+        let svc = ChannelSettingsService::new(repo);
+        assert!(
+            svc.get_master_agent_public_agent_id(PluginType::Telegram)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn public_agent_id_set_get_roundtrip_and_clear() {
+        let repo = Arc::new(MockPrefRepo::new());
+        let svc = ChannelSettingsService::new(repo);
+
+        svc.set_master_agent_public_agent_id(PluginType::Telegram, Some("pubagent_1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            svc.get_master_agent_public_agent_id(PluginType::Telegram)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("pubagent_1")
+        );
+
+        // None clears the binding.
+        svc.set_master_agent_public_agent_id(PluginType::Telegram, None)
+            .await
+            .unwrap();
+        assert!(
+            svc.get_master_agent_public_agent_id(PluginType::Telegram)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A platform bot serves EITHER a companion OR a public agent, never both:
+    /// setting one binding clears the other, in both directions.
+    #[tokio::test]
+    async fn companion_and_public_agent_bindings_are_mutually_exclusive() {
+        let repo = Arc::new(MockPrefRepo::new());
+        let svc = ChannelSettingsService::new(repo);
+
+        // Companion first.
+        svc.set_master_agent_companion_id(PluginType::Telegram, Some("companion_1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            svc.get_master_agent_companion_id(PluginType::Telegram).await.unwrap().as_deref(),
+            Some("companion_1")
+        );
+
+        // Binding a public agent clears the companion binding.
+        svc.set_master_agent_public_agent_id(PluginType::Telegram, Some("pubagent_1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            svc.get_master_agent_public_agent_id(PluginType::Telegram)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("pubagent_1")
+        );
+        assert!(
+            svc.get_master_agent_companion_id(PluginType::Telegram).await.unwrap().is_none(),
+            "setting a public agent must clear the companion binding"
+        );
+
+        // Binding a companion again clears the public-agent binding.
+        svc.set_master_agent_companion_id(PluginType::Telegram, Some("companion_2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            svc.get_master_agent_companion_id(PluginType::Telegram).await.unwrap().as_deref(),
+            Some("companion_2")
+        );
+        assert!(
+            svc.get_master_agent_public_agent_id(PluginType::Telegram)
+                .await
+                .unwrap()
+                .is_none(),
+            "setting a companion must clear the public-agent binding"
+        );
     }
 
     // ── resolved_model_to_provider ────────────────────────────────────
