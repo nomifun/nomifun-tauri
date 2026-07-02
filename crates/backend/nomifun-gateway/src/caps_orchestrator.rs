@@ -47,7 +47,7 @@
 use std::sync::Arc;
 
 use nomifun_api_types::{
-    CreateAdhocRunRequest, FleetMember, ModelRange, ModelRef, RunDetail, derive_capability,
+    CreateAdhocRunRequest, FleetMember, ModelRange, ModelRef, PlannedTask, RunDetail, derive_capability,
 };
 use nomifun_common::generate_prefixed_id;
 use schemars::JsonSchema;
@@ -114,6 +114,31 @@ struct RunStatusParams {
 struct RunResultParams {
     /// The run id (from nomi_run_create).
     run_id: String,
+}
+
+/// One task in a `nomi_spawn` flat fan-out.
+#[derive(Deserialize, JsonSchema)]
+struct SpawnTaskParam {
+    /// Short descriptive name (becomes the task/node title on the canvas).
+    name: String,
+    /// The instruction for this sub-agent.
+    prompt: String,
+    /// Optional restricted role: searcher/reviewer (read-only tools) or
+    /// verifier (read-only + Bash). Omit for full tools.
+    #[serde(default)]
+    role: Option<String>,
+}
+
+/// Fan several INDEPENDENT sub-agent tasks out in parallel — no planner LLM, no
+/// approval gate; each task runs as a visible worker on the orchestration canvas.
+#[derive(Deserialize, JsonSchema)]
+struct SpawnParams {
+    /// 1-8 independent tasks to run in parallel.
+    tasks: Vec<SpawnTaskParam>,
+    /// When true (and ≥2 tasks), append a read-only synthesis task that
+    /// consolidates all outputs and flags conflicts.
+    #[serde(default)]
+    synthesize: Option<bool>,
 }
 
 // ── handlers ──────────────────────────────────────────────────────────────
@@ -664,6 +689,139 @@ async fn result(deps: Arc<GatewayDeps>, p: RunResultParams) -> Value {
     }
 }
 
+/// `nomi_spawn` 的任务数上限：对齐进程内 Spawn（5）与其全局并发上限（8）的量级，
+/// 超过应改用 nomi_run_create 让 planner 规划分批。
+const MAX_SPAWN_TASKS: usize = 8;
+
+/// Flat fan-out (`nomi_spawn`): create a run, link it to the calling
+/// conversation, persist the caller's EXPLICIT task list via `plan_flat` (no
+/// planner LLM), and start the engine — all with `supervised` autonomy so it
+/// runs immediately (no approval park; that gate is for planner-drafted teams).
+/// Each task becomes a real worker conversation, visible on the orchestration
+/// canvas (status / live transcript / output per agent).
+async fn spawn(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: SpawnParams) -> Value {
+    let user = match require_user(&ctx) {
+        Ok(u) => u.to_owned(),
+        Err(e) => return e,
+    };
+    if p.tasks.is_empty() {
+        return json!({ "error": "nomi_spawn requires at least one task" });
+    }
+    if p.tasks.len() > MAX_SPAWN_TASKS {
+        return json!({ "error": format!("too many tasks: {} (max {MAX_SPAWN_TASKS}); use nomi_run_create for larger goals", p.tasks.len()) });
+    }
+
+    // 模型解析：会话策展的「主模型+协作模型」优先，缺省 Auto 全量展开（与 create 一致）。
+    let model_range = read_conversation_model_range(&deps, &user, &ctx.conversation_id)
+        .await
+        .unwrap_or(ModelRange::Auto);
+    let lead_model: Option<ModelRef> = match &model_range {
+        ModelRange::Single { model } => Some(model.clone()),
+        ModelRange::Range { models } => models.first().cloned(),
+        ModelRange::Auto => None,
+    };
+    let model_range = if matches!(model_range, ModelRange::Auto) {
+        let summaries = match load_provider_summaries(&deps).await {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        match expand_auto_range(&summaries) {
+            Ok(r) => r,
+            Err(e) => return e,
+        }
+    } else {
+        model_range
+    };
+
+    let lead_conv_id = parse_lead_conv_id(&ctx.conversation_id);
+    let n = p.tasks.len();
+    let goal = format!(
+        "并行执行 {n} 个子任务：{}",
+        p.tasks.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join("、")
+    );
+    // 扁平扇出恒 supervised：即时并行、无审批门。绝不走 default_autonomy 的
+    // interactive 桌面默认（那是给 planner 拆的团队审批用的；nomi_spawn 的任务
+    // 是调用方显式给出的，park 在批准门会回归进程内 Spawn 的静默卡死体验）。
+    let req = build_adhoc_request(
+        goal,
+        None,
+        model_range,
+        Some("supervised".to_string()),
+        Vec::new(),
+        lead_conv_id,
+        lead_model,
+    );
+
+    let run = match deps.orchestrator_run_service.create_adhoc(&user, req).await {
+        Ok(run) => run,
+        Err(e) => return json!({ "error": e.to_string() }),
+    };
+
+    // Path A link write-back（与 create 相同的 best-effort 语义）。
+    if !ctx.conversation_id.is_empty() {
+        if let Err(e) = deps
+            .conversation_service
+            .link_orchestrator_run(&ctx.conversation_id, &run.id)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                conversation_id = %ctx.conversation_id,
+                run_id = %run.id,
+                "failed to link flat fan-out run to calling conversation; run still created"
+            );
+        }
+    }
+
+    // 组装扁平任务（+ 可选只读综合节点，语义对齐进程内 Spawn 的 synthesize）。
+    let synthesize = p.synthesize.unwrap_or(false);
+    let mut tasks: Vec<PlannedTask> = p
+        .tasks
+        .into_iter()
+        .map(|t| PlannedTask {
+            title: t.name,
+            spec: t.prompt,
+            task_profile: None,
+            depends_on: vec![],
+            member_index: None,
+            rationale: None,
+            role: t.role,
+            kind: "agent".to_string(),
+            pattern_config: None,
+        })
+        .collect();
+    if synthesize && n >= 2 {
+        tasks.push(PlannedTask {
+            title: "综合汇总".to_string(),
+            spec: "综合上游各子任务的产出为一份结论，显式标注子任务之间的冲突或分歧（无则写「无」）。"
+                .to_string(),
+            task_profile: None,
+            depends_on: (0..n).collect(),
+            member_index: None,
+            rationale: None,
+            // 只读综合（对齐进程内 Spawn 的 reviewer 语义；worker 端收缩工具）。
+            role: Some("reviewer".to_string()),
+            kind: "synthesis".to_string(),
+            pattern_config: None,
+        });
+    }
+
+    // 后台 plan_flat → engine.start（fail-soft），工具立即返回 —— 画布经 WS 实时
+    // 点亮（与 create 的 Path A spawn_plan_and_start 同样的不阻塞 lead turn 设计）。
+    nomifun_orchestrator::spawn_plan_flat_and_start(
+        deps.orchestrator_run_service.clone(),
+        deps.orchestrator_run_engine.as_ref().clone(),
+        run.id.clone(),
+        tasks,
+    );
+    ok(json!({
+        "run_id": run.id,
+        "status": "running",
+        "task_count": n,
+        "message": "子任务已在编排画布并行执行（用户能实时看到每个子 agent 的状态与产出）。用 nomi_run_status 跟进、nomi_run_result 取汇总，然后向用户总结。",
+    }))
+}
+
 // ── result projections (RunDetail → compact LLM-friendly shape) ───────────
 
 /// Run status + per-task {id, title, status}.
@@ -711,6 +869,19 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
         )
         .deny_on(ORCHESTRATOR_DENY_SURFACES),
         |deps, ctx, p| create(deps, ctx, p),
+    ));
+
+    // 1b. Flat fan-out（write）：跳过 planner 的并行子 agent 扇出，画布可视化、
+    //     supervised 即跑。与 create 同域同 deny：Desktop-only。
+    out.push(Capability::new::<SpawnParams, _, _>(
+        CapabilityMeta::new(
+            "nomi_spawn",
+            "orchestrator",
+            "Run several INDEPENDENT sub-agent tasks in parallel with live visualization: each task becomes a visible worker on the orchestration canvas (the user sees per-agent status, live transcript, and output). No planner, no approval gate — starts immediately. Params: tasks (1-8 of {name, prompt, role?}; role searcher/reviewer = read-only tools, verifier = read-only+Bash, omit = full tools), synthesize (optional; true appends a read-only consolidation task). For complex goals needing decomposition or dependencies use nomi_run_create instead. Returns run_id; follow up with nomi_run_status / nomi_run_result.",
+            DangerTier::Write,
+        )
+        .deny_on(ORCHESTRATOR_DENY_SURFACES),
+        |deps, ctx, p| spawn(deps, ctx, p),
     ));
 
     // 2. Run status (read). Desktop-only: deny on Remote — the read takes a bare
@@ -992,7 +1163,7 @@ mod tests {
     #[test]
     fn orchestrator_tools_registered_and_visible_on_desktop() {
         let reg = Registry::global();
-        for name in ["nomi_run_create", "nomi_run_status", "nomi_run_result"] {
+        for name in ["nomi_run_create", "nomi_spawn", "nomi_run_status", "nomi_run_result"] {
             assert!(
                 reg.contains(name),
                 "orchestrator tool {name} is not registered"
@@ -1023,7 +1194,7 @@ mod tests {
             .iter()
             .map(|s| s.name)
             .collect();
-        for name in ["nomi_run_create", "nomi_run_status", "nomi_run_result"] {
+        for name in ["nomi_run_create", "nomi_spawn", "nomi_run_status", "nomi_run_result"] {
             // Not advertised on the Remote surface.
             assert!(
                 !remote.contains(&name),
