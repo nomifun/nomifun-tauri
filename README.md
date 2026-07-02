@@ -90,14 +90,10 @@ See [`SECURITY.md`](SECURITY.md) for the deployment threat model and responsible
 <p>
   🎬 <b>Demo videos:</b>
   China:
-  <a href="https://www.douyin.com/user/self?from_tab_name=main&modal_id=7657100052061523209">Douyin</a>
-  ·
   <a href="https://www.bilibili.com/video/BV1kwKZ6UE5X/">Bilibili</a>
   &nbsp;|&nbsp;
   International:
   <a href="https://youtu.be/AsEToBDFR9s">YouTube</a>
-  ·
-  <a href="https://x.com/colir0/status/2072001821640437776?s=20">X</a>
 </p>
 
 <p>
@@ -521,9 +517,9 @@ We'd love to hear from you. The fastest way to reach us is GitHub; the social ch
 | ✉️ **Email** | `hello@nomifun.com` <sub>(provisional — being finalized)</sub> |
 | 📕 **小红书 / RED** | [NomiFun](https://xhslink.com/m/4x6ti8n6cA1) |
 | 📺 **Bilibili** | [NomiFun](https://b23.tv/0UhgKDh) · [demo video](https://www.bilibili.com/video/BV1kwKZ6UE5X/) |
-| 🎵 **抖音 / Douyin** | [NomiFun](https://v.douyin.com/MDT5QVdYaJk/) · [demo video](https://www.douyin.com/user/self?from_tab_name=main&modal_id=7657100052061523209) |
+| 🎵 **抖音 / Douyin** | [NomiFun](https://v.douyin.com/MDT5QVdYaJk/) |
 | ▶️ **YouTube** | [@NomiFun-o2y](https://www.youtube.com/@NomiFun-o2y) · [demo video](https://youtu.be/AsEToBDFR9s) |
-| 𝕏 **X (Twitter)** | [@colir0](https://x.com/colir0) · [demo post](https://x.com/colir0/status/2072001821640437776?s=20) |
+| 𝕏 **X (Twitter)** | [@colir0](https://x.com/colir0) |
 | 🎬 **TikTok** | [@colir0luo](https://www.tiktok.com/@colir0luo) |
 
 **Join the chat groups** — scan to join:

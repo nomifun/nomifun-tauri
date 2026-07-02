@@ -38,7 +38,9 @@ describe('Guid resource cards placement', () => {
     const source = readSource(new URL('./GuidResourceCards.tsx', import.meta.url));
 
     expect(source.includes('https://www.nomifun.com/docs')).toBe(true);
-    expect(source.includes('https://youtu.be/gEDo5H0H0Pg')).toBe(true);
+    expect(source.includes('https://www.bilibili.com/video/BV1kwKZ6UE5X/')).toBe(true);
+    expect(source.includes('https://youtu.be/AsEToBDFR9s')).toBe(true);
+    expect(source.includes('https://youtu.be/gEDo5H0H0Pg')).toBe(false);
     expect(source.includes('https://www.nomifun.com/contact')).toBe(true);
     expect(source.includes('https://github.com/nomifun/nomifun-tauri/issues')).toBe(false);
     expect(source.includes('RECENT_PROMPT_LIMIT')).toBe(false);
