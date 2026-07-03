@@ -375,6 +375,12 @@
       "vscode": "VS Code",
       "terminal": "Terminal",
       "explorer": "File Explorer"
+    },
+    "bindWorkspace": {
+      "label": "Set working directory",
+      "hint": "Bind a folder on your disk — the agent will use it as its main workspace.",
+      "success": "Working directory bound. The agent will now work in this folder.",
+      "failed": "Failed to bind the working directory. Please try again."
     }
   },
   "minimap": {

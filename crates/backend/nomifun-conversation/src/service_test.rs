@@ -943,6 +943,52 @@ async fn update_model() {
 }
 
 #[tokio::test]
+async fn update_workspace_change_recycles_agent() {
+    // Binding a session to a different working directory must recycle the
+    // cached agent so the new cwd (and its surface-scoped file authority) takes
+    // effect on the next message — same rationale as the model-change recycle.
+    // A no-op workspace update must NOT recycle.
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+
+    let create_req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "nomi",
+        "model": { "provider_id": "p1", "model": "m1" },
+        "extra": { "workspace": "/project" }
+    }))
+    .unwrap();
+    let conv = svc.create("user_1", create_req).await.unwrap();
+
+    // A fresh mock passed to `update` receives the kill (update uses the passed
+    // task manager, not the service's internal one).
+    let mock = Arc::new(MockTaskManager::new());
+    let mgr: Arc<dyn IWorkerTaskManager> = mock.clone();
+
+    let repoint: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": { "workspace": "/other/project" }
+    }))
+    .unwrap();
+    let updated = svc.update("user_1", &conv.id.to_string(), repoint, &mgr).await.unwrap();
+    assert_eq!(updated.extra["workspace"], "/other/project");
+    assert_eq!(mock.kill_count(), 1, "workspace change must recycle the agent");
+
+    // Re-applying the SAME workspace is a no-op → no further recycle.
+    let same: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": { "workspace": "/other/project" }
+    }))
+    .unwrap();
+    svc.update("user_1", &conv.id.to_string(), same, &mgr).await.unwrap();
+    assert_eq!(mock.kill_count(), 1, "no-op workspace update must not recycle");
+
+    // A non-workspace extra change must also not recycle.
+    let other: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": { "some_flag": true }
+    }))
+    .unwrap();
+    svc.update("user_1", &conv.id.to_string(), other, &mgr).await.unwrap();
+    assert_eq!(mock.kill_count(), 1, "non-workspace extra change must not recycle");
+}
+
+#[tokio::test]
 async fn update_not_found() {
     let (svc, _broadcaster, _repo, task_mgr) = make_service();
     let req: UpdateConversationRequest = serde_json::from_value(json!({ "name": "x" })).unwrap();

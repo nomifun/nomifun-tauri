@@ -129,6 +129,7 @@ impl ProviderHealthCheckService {
             // 健康探针一回合、不用工具：不必构造进程内 Spawn。
             in_process_spawn: false,
             allowed_tools: Vec::new(),
+            write_root: None,
         })
     }
 }
@@ -558,6 +559,7 @@ mod tests {
             owner_token: None,
             in_process_spawn: false,
             allowed_tools: Vec::new(),
+            write_root: None,
         };
 
         assert!(should_use_openai_model_probe("custom", &config));

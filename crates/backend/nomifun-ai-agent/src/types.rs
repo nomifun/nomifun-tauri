@@ -147,6 +147,12 @@ pub struct NomiResolvedConfig {
     /// Per-session 工具白名单（空 = 不限制），源自 `NomiBuildExtra.allowed_tools`，
     /// 由 manager 灌进 `config.tools.builtin_allowlist`。
     pub allowed_tools: Vec<String>,
+    /// 原生文件工具（Write/Edit/ApplyPatch）的写根钳制，按会话**信任面**解析：
+    /// 本地桌面（`Private` 且非渠道）= `None`（OS 用户全权，不钳制，今日行为）；
+    /// 渠道 / 远程 / 对外 = `Some(workspace)`（收窄到会话工作区，堵住对外面过度开放）。
+    /// manager 灌进 `config.tools.write_root`。与 gateway file-service 的
+    /// `PathAuthority` 同一信任模型（见 file-access-authority spec）。
+    pub write_root: Option<String>,
 }
 
 /// **P3-X2**: the shared browser secret vault location + its machine-bound key

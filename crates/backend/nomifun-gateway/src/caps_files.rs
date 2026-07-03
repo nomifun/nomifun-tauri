@@ -25,6 +25,8 @@ use crate::deps::{CallerCtx, GatewayDeps};
 use crate::registry::{Capability, CapabilityMeta, DangerTier, Surface};
 use crate::server::ok;
 
+use nomifun_file::PathAuthority;
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
 /// Cap read_file output to avoid blowing up the LLM context.
@@ -101,8 +103,31 @@ struct ShellOpenExternalParams {
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
-async fn read_file(deps: Arc<GatewayDeps>, _ctx: CallerCtx, p: ReadFileParams) -> Value {
-    match deps.file_service.read_file(&p.path, None).await {
+/// Resolve the filesystem authority for a file operation from the caller's trust
+/// surface. A trusted local **Desktop** session (the machine owner driving their
+/// own agent) gets [`PathAuthority::Unrestricted`] — the OS user's own
+/// permissions are the only boundary, so the agent can operate on any path the
+/// user asks for (e.g. `C:\code\...` outside the sandbox roots). External
+/// **Channel/Remote** sessions return `None`, keeping the file service's default
+/// `allowed_roots` confinement (unchanged, fail-safe for untrusted strangers).
+///
+/// This governs only WHERE a file op may act. WHETHER it may run (the
+/// destructive/sensitive confirmation gate) stays with the DangerTier matrix in
+/// `registry::decide`, orthogonal to authority — a Desktop `remove` is still
+/// confirm-gated even though it is unrestricted in path.
+fn file_authority(ctx: &CallerCtx) -> Option<PathAuthority> {
+    match ctx.surface() {
+        Surface::Desktop => Some(PathAuthority::Unrestricted),
+        Surface::Channel | Surface::Remote => None,
+    }
+}
+
+async fn read_file(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: ReadFileParams) -> Value {
+    let result = match file_authority(&ctx) {
+        Some(auth) => deps.file_service.read_file_scoped(&p.path, &auth).await,
+        None => deps.file_service.read_file(&p.path, None).await,
+    };
+    match result {
         Ok(Some(content)) => {
             if content.len() > READ_FILE_MAX_BYTES {
                 let truncated = &content[..content.floor_char_boundary(READ_FILE_MAX_BYTES)];
@@ -121,19 +146,31 @@ async fn read_file(deps: Arc<GatewayDeps>, _ctx: CallerCtx, p: ReadFileParams) -
     }
 }
 
-async fn write_file(deps: Arc<GatewayDeps>, _ctx: CallerCtx, p: WriteFileParams) -> Value {
-    match deps
-        .file_service
-        .write_file(&p.path, p.content.as_bytes(), &p.workspace)
-        .await
-    {
+async fn write_file(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: WriteFileParams) -> Value {
+    let result = match file_authority(&ctx) {
+        Some(auth) => {
+            deps.file_service
+                .write_file_scoped(&p.path, p.content.as_bytes(), &p.workspace, &auth)
+                .await
+        }
+        None => {
+            deps.file_service
+                .write_file(&p.path, p.content.as_bytes(), &p.workspace)
+                .await
+        }
+    };
+    match result {
         Ok(_) => ok(json!({ "written": true, "path": p.path })),
         Err(e) => json!({ "error": e.to_string() }),
     }
 }
 
-async fn browse(deps: Arc<GatewayDeps>, _ctx: CallerCtx, p: BrowseParams) -> Value {
-    match deps.file_service.get_files_by_dir(&p.dir, &p.root).await {
+async fn browse(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: BrowseParams) -> Value {
+    let result = match file_authority(&ctx) {
+        Some(auth) => deps.file_service.get_files_by_dir_scoped(&p.dir, &p.root, &auth).await,
+        None => deps.file_service.get_files_by_dir(&p.dir, &p.root).await,
+    };
+    match result {
         Ok(entries) => {
             let items: Vec<Value> = entries
                 .iter()
@@ -154,10 +191,14 @@ async fn browse(deps: Arc<GatewayDeps>, _ctx: CallerCtx, p: BrowseParams) -> Val
 
 async fn list_workspace_files(
     deps: Arc<GatewayDeps>,
-    _ctx: CallerCtx,
+    ctx: CallerCtx,
     p: ListWorkspaceFilesParams,
 ) -> Value {
-    match deps.file_service.list_workspace_files(&p.root).await {
+    let result = match file_authority(&ctx) {
+        Some(auth) => deps.file_service.list_workspace_files_scoped(&p.root, &auth).await,
+        None => deps.file_service.list_workspace_files(&p.root).await,
+    };
+    match result {
         Ok(files) => {
             let items: Vec<Value> = files
                 .iter()
@@ -175,8 +216,12 @@ async fn list_workspace_files(
     }
 }
 
-async fn get_metadata(deps: Arc<GatewayDeps>, _ctx: CallerCtx, p: GetMetadataParams) -> Value {
-    match deps.file_service.get_file_metadata(&p.path, None).await {
+async fn get_metadata(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: GetMetadataParams) -> Value {
+    let result = match file_authority(&ctx) {
+        Some(auth) => deps.file_service.get_file_metadata_scoped(&p.path, &auth).await,
+        None => deps.file_service.get_file_metadata(&p.path, None).await,
+    };
+    match result {
         Ok(meta) => ok(json!({
             "name": meta.name,
             "path": meta.path,
@@ -189,15 +234,23 @@ async fn get_metadata(deps: Arc<GatewayDeps>, _ctx: CallerCtx, p: GetMetadataPar
     }
 }
 
-async fn remove(deps: Arc<GatewayDeps>, _ctx: CallerCtx, p: RemoveParams) -> Value {
-    match deps.file_service.remove_entry(&p.path, &p.workspace).await {
+async fn remove(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: RemoveParams) -> Value {
+    let result = match file_authority(&ctx) {
+        Some(auth) => deps.file_service.remove_entry_scoped(&p.path, &p.workspace, &auth).await,
+        None => deps.file_service.remove_entry(&p.path, &p.workspace).await,
+    };
+    match result {
         Ok(()) => ok(json!({ "removed": true, "path": p.path })),
         Err(e) => json!({ "error": e.to_string() }),
     }
 }
 
-async fn rename(deps: Arc<GatewayDeps>, _ctx: CallerCtx, p: RenameParams) -> Value {
-    match deps.file_service.rename_entry(&p.path, &p.new_name).await {
+async fn rename(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: RenameParams) -> Value {
+    let result = match file_authority(&ctx) {
+        Some(auth) => deps.file_service.rename_entry_scoped(&p.path, &p.new_name, &auth).await,
+        None => deps.file_service.rename_entry(&p.path, &p.new_name).await,
+    };
+    match result {
         Ok(new_path) => ok(json!({ "renamed": true, "new_path": new_path })),
         Err(e) => json!({ "error": e.to_string() }),
     }
@@ -234,7 +287,7 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
         CapabilityMeta::new(
             "nomi_fs_write_file",
             "files",
-            "Write (create or overwrite) a file with the given UTF-8 content. The path must be within an allowed workspace root.",
+            "Write (create or overwrite) a file with the given UTF-8 content. On a local desktop session this can target any path the OS user can write; on external channel/remote sessions it is confined to the session's allowed roots.",
             DangerTier::Write,
         )
         .deny_on(&[Surface::Channel]),
@@ -352,3 +405,24 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
 // FileWatchService and SnapshotService methods are NOT included — they are
 // session-lifecycle services (start/stop watch, git-style staging) that belong
 // to the UI interaction layer, not agent tool primitives.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_authority_unrestricted_for_desktop_only() {
+        // Trusted local desktop owner → OS-user authority.
+        let desktop = CallerCtx::default();
+        assert!(
+            matches!(file_authority(&desktop), Some(PathAuthority::Unrestricted)),
+            "desktop must get Unrestricted"
+        );
+        // External IM channel stranger → keep the default allowed_roots confinement.
+        let channel = CallerCtx { channel_platform: Some("lark".into()), ..Default::default() };
+        assert!(file_authority(&channel).is_none(), "channel must not be unrestricted");
+        // Remote front-door consumer → likewise confined.
+        let remote = CallerCtx { remote: true, ..Default::default() };
+        assert!(file_authority(&remote).is_none(), "remote must not be unrestricted");
+    }
+}

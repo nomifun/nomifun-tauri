@@ -117,6 +117,7 @@ fn make_nomi_config() -> NomiResolvedConfig {
         owner_token: None,
         in_process_spawn: true,
         allowed_tools: Vec::new(),
+        write_root: None,
     }
 }
 

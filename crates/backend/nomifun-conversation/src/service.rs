@@ -967,6 +967,23 @@ impl ConversationService {
             existing.model.as_deref() != Some(new_json.as_str())
         });
 
+        // A workspace repoint (e.g. binding a temporary session to a real
+        // project directory) changes the agent's cwd — and, via the surface
+        // scope, its native/gateway file authority. The cached agent baked the
+        // old cwd at build time, so it must be recycled for the change to take
+        // effect on the next message (same rationale as the model-change kill
+        // below). Detected by comparing the pre/post merged `extra.workspace`.
+        let workspace_changed = req.extra.as_ref().is_some_and(|e| e.get("workspace").is_some()) && {
+            let ws_of = |raw: &str| -> Option<String> {
+                serde_json::from_str::<serde_json::Value>(raw)
+                    .ok()
+                    .and_then(|v| v.get("workspace").and_then(|w| w.as_str()).map(str::to_owned))
+            };
+            let old_ws = ws_of(&existing.extra);
+            let new_ws = merged_extra.as_deref().and_then(ws_of);
+            old_ws != new_ws
+        };
+
         let model_json = req
             .model
             .as_ref()
@@ -990,13 +1007,14 @@ impl ConversationService {
 
         self.conversation_repo.update(parse_conv_id(id)?, &updates).await?;
 
-        if model_changed {
+        if model_changed || workspace_changed {
             info!(
-                model_changed = true,
-                "Conversation updated, killing agent task due to model change"
+                model_changed,
+                workspace_changed,
+                "Conversation updated, killing agent task so the change takes effect on the next message"
             );
             if let Err(e) = task_manager.kill(id, None) {
-                warn!(error = %ErrorChain(&e), "Failed to kill agent after model change");
+                warn!(error = %ErrorChain(&e), "Failed to kill agent after model/workspace change");
             }
         }
 

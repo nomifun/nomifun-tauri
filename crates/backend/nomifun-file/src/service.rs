@@ -13,7 +13,10 @@ use nomifun_api_types::WebSocketMessage;
 use nomifun_common::AppError;
 use nomifun_realtime::EventBroadcaster;
 
-use crate::path_safety::{has_traversal, validate_path, validate_path_for_write, validate_path_with_extra_root};
+use crate::path_safety::{
+    PathAuthority, has_traversal, validate_path, validate_path_authority, validate_path_for_write,
+    validate_path_for_write_authority, validate_path_with_extra_root,
+};
 use crate::types::{
     ContentUpdateEvent, ContentUpdateOperation, CopyResult, DirOrFile, FileMetadata, WorkspaceFlatFile, ZipEntry,
 };
@@ -96,6 +99,43 @@ impl FileService {
         roots
     }
 
+    /// The default [`PathAuthority`] for the non-scoped trait methods: confine
+    /// to the service's construction-time `allowed_roots`, optionally widened
+    /// by a request-scoped `extra` root. This reproduces the historical
+    /// `allowed_roots ∪ extra_root` behaviour exactly, so the non-scoped
+    /// methods (UI file routes, internal callers) are byte-for-byte unchanged.
+    fn base_authority(&self, extra: Option<&Path>) -> PathAuthority {
+        let mut roots = self.allowed_roots.clone();
+        if let Some(extra) = extra {
+            roots.push(extra.to_path_buf());
+        }
+        PathAuthority::Confined(roots)
+    }
+
+    /// Whether a (possibly non-existent) `path` textually falls under the given
+    /// authority — used by the read fallback to distinguish "allowed but not
+    /// found" (→ `Ok(None)`) from "forbidden" (→ error). `Unrestricted` always
+    /// qualifies; `Confined` mirrors [`Self::path_uses_allowed_root`].
+    fn path_uses_authority(&self, path: &Path, authority: &PathAuthority) -> bool {
+        match authority {
+            PathAuthority::Unrestricted => true,
+            PathAuthority::Confined(roots) => {
+                let candidate = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    match std::env::current_dir() {
+                        Ok(current_dir) => current_dir.join(path),
+                        Err(_) => path.to_path_buf(),
+                    }
+                };
+                roots
+                    .iter()
+                    .filter_map(|root| std::fs::canonicalize(root).ok())
+                    .any(|root| candidate.starts_with(root))
+            }
+        }
+    }
+
     fn path_uses_allowed_root(&self, path: &Path, extra_root: Option<&Path>) -> bool {
         let candidate = if path.is_absolute() {
             path.to_path_buf()
@@ -114,10 +154,216 @@ impl FileService {
             .any(|root| candidate.starts_with(root))
     }
 
+    // -- Authority-aware cores (shared by the non-scoped + `*_scoped` trait
+    //    methods). The only difference between the two is the [`PathAuthority`]
+    //    passed in; the I/O below is identical, so it lives here once. --
+
+    async fn get_files_by_dir_impl(
+        &self,
+        dir: &str,
+        root: &str,
+        authority: &PathAuthority,
+    ) -> Result<Vec<DirOrFile>, AppError> {
+        let canonical_dir = validate_path_authority(dir, authority)?;
+        let canonical_root = validate_path_authority(root, authority)?;
+        self.build_dir_tree(&canonical_dir, &canonical_root).await
+    }
+
+    async fn list_workspace_files_impl(
+        &self,
+        root: &str,
+        authority: &PathAuthority,
+    ) -> Result<Vec<WorkspaceFlatFile>, AppError> {
+        let canonical_root = validate_path_authority(root, authority)?;
+        let cache_key = canonical_root.to_string_lossy().into_owned();
+
+        if let Some(cached) = self.workspace_files_cache.get(&cache_key) {
+            return Ok(cached.clone());
+        }
+
+        let root_owned = canonical_root.clone();
+        let files = tokio::task::spawn_blocking(move || list_workspace_files_sync(&root_owned))
+            .await
+            .map_err(|e| AppError::Internal(format!("workspace file listing task failed: {e}")))??;
+
+        self.workspace_files_cache.insert(cache_key, files.clone());
+        Ok(files)
+    }
+
+    async fn get_file_metadata_impl(
+        &self,
+        path: &str,
+        authority: &PathAuthority,
+    ) -> Result<FileMetadata, AppError> {
+        let canonical = validate_path_authority(path, authority)?;
+        let result = tokio::task::spawn_blocking(move || get_file_metadata_sync(&canonical))
+            .await
+            .map_err(|e| AppError::Internal(format!("file metadata task failed: {e}")))??;
+        Ok(result)
+    }
+
+    async fn read_file_impl(
+        &self,
+        path: &str,
+        authority: &PathAuthority,
+    ) -> Result<Option<String>, AppError> {
+        if has_traversal(path) {
+            return Err(AppError::BadRequest(format!(
+                "path '{}' contains invalid traversal patterns",
+                path
+            )));
+        }
+
+        let canonical = match validate_path_authority(path, authority) {
+            Ok(c) => c,
+            Err(err) => {
+                // Path does not exist yet but WOULD be within authority → "not
+                // found" rather than "forbidden" (matches the historical
+                // read fallback semantics).
+                if matches!(err, AppError::BadRequest(_))
+                    && validate_path_for_write_authority(path, authority).is_ok()
+                {
+                    return Ok(None);
+                }
+                if matches!(err, AppError::BadRequest(_)) && self.path_uses_authority(Path::new(path), authority) {
+                    return Ok(None);
+                }
+                return Err(err);
+            }
+        };
+
+        tokio::task::spawn_blocking(move || read_file_sync(&canonical))
+            .await
+            .map_err(|e| AppError::Internal(format!("read file task failed: {e}")))?
+    }
+
+    async fn write_file_impl(
+        &self,
+        path: &str,
+        data: &[u8],
+        workspace: &str,
+        authority: &PathAuthority,
+    ) -> Result<bool, AppError> {
+        if has_traversal(path) {
+            return Err(AppError::BadRequest(format!(
+                "path '{}' contains invalid traversal patterns",
+                path
+            )));
+        }
+
+        let canonical = validate_path_for_write_authority(path, authority)?;
+
+        let path_owned = canonical.clone();
+        let data_owned = data.to_vec();
+        tokio::task::spawn_blocking(move || write_file_sync(&path_owned, &data_owned))
+            .await
+            .map_err(|e| AppError::Internal(format!("write file task failed: {e}")))??;
+
+        let workspace_path = Path::new(workspace);
+        let relative_path = rel_to_api_string(
+            canonical
+                .strip_prefix(std::fs::canonicalize(workspace_path).unwrap_or_else(|_| workspace_path.to_path_buf()))
+                .unwrap_or(&canonical),
+        );
+
+        let content = String::from_utf8(data.to_vec()).ok();
+        let event = ContentUpdateEvent {
+            file_path: canonical.to_string_lossy().into_owned(),
+            content,
+            workspace: workspace.to_owned(),
+            relative_path,
+            operation: ContentUpdateOperation::Write,
+        };
+        let payload = serde_json::to_value(&event).unwrap_or_default();
+        let msg = WebSocketMessage::new("fileStream.contentUpdate", payload);
+        self.broadcaster.broadcast(msg);
+
+        if let Ok(canonical_ws) = std::fs::canonicalize(workspace_path) {
+            self.invalidate_cache(&canonical_ws.to_string_lossy());
+        }
+
+        Ok(true)
+    }
+
+    async fn remove_entry_impl(
+        &self,
+        path: &str,
+        workspace: &str,
+        authority: &PathAuthority,
+    ) -> Result<(), AppError> {
+        if has_traversal(path) {
+            return Err(AppError::BadRequest(format!(
+                "path '{}' contains invalid traversal patterns",
+                path
+            )));
+        }
+
+        let canonical = validate_path_authority(path, authority)?;
+
+        let path_owned = canonical.clone();
+        tokio::task::spawn_blocking(move || remove_entry_sync(&path_owned))
+            .await
+            .map_err(|e| AppError::Internal(format!("remove entry task failed: {e}")))??;
+
+        let workspace_path = Path::new(workspace);
+        let relative_path = rel_to_api_string(
+            canonical
+                .strip_prefix(std::fs::canonicalize(workspace_path).unwrap_or_else(|_| workspace_path.to_path_buf()))
+                .unwrap_or(&canonical),
+        );
+
+        let event = ContentUpdateEvent {
+            file_path: canonical.to_string_lossy().into_owned(),
+            content: None,
+            workspace: workspace.to_owned(),
+            relative_path,
+            operation: ContentUpdateOperation::Delete,
+        };
+        let payload = serde_json::to_value(&event).unwrap_or_default();
+        let msg = WebSocketMessage::new("fileStream.contentUpdate", payload);
+        self.broadcaster.broadcast(msg);
+
+        if let Ok(canonical_ws) = std::fs::canonicalize(workspace_path) {
+            self.invalidate_cache(&canonical_ws.to_string_lossy());
+        }
+
+        Ok(())
+    }
+
+    async fn rename_entry_impl(
+        &self,
+        path: &str,
+        new_name: &str,
+        authority: &PathAuthority,
+    ) -> Result<String, AppError> {
+        if has_traversal(path) {
+            return Err(AppError::BadRequest(format!(
+                "path '{}' contains invalid traversal patterns",
+                path
+            )));
+        }
+
+        if new_name.contains('/') || new_name.contains('\\') {
+            return Err(AppError::BadRequest(format!(
+                "new name '{}' must not contain path separators",
+                new_name
+            )));
+        }
+
+        let canonical = validate_path_authority(path, authority)?;
+
+        let new_name_owned = new_name.to_owned();
+        let path_owned = canonical;
+        let new_path: PathBuf = tokio::task::spawn_blocking(move || rename_entry_sync(&path_owned, &new_name_owned))
+            .await
+            .map_err(|e| AppError::Internal(format!("rename entry task failed: {e}")))??;
+
+        Ok(new_path.to_string_lossy().into_owned())
+    }
+
     /// List immediate children of `dir`, building a single-level tree.
     /// Each child directory also lists *its* children (depth = 2 from `dir`).
-    async fn build_dir_tree(&self, dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, AppError> {
-        let dir_owned = dir.to_path_buf();
+    async fn build_dir_tree(&self, dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, AppError> {        let dir_owned = dir.to_path_buf();
         let root_owned = root.to_path_buf();
 
         tokio::task::spawn_blocking(move || build_dir_tree_sync(&dir_owned, &root_owned))
@@ -594,74 +840,50 @@ fn write_zip_entries(
 #[async_trait::async_trait]
 impl crate::traits::IFileService for FileService {
     async fn get_files_by_dir(&self, dir: &str, root: &str) -> Result<Vec<DirOrFile>, AppError> {
-        let roots = self.allowed_roots_refs();
-        let canonical_dir = validate_path(dir, &roots)?;
-        let canonical_root = validate_path(root, &roots)?;
+        self.get_files_by_dir_impl(dir, root, &self.base_authority(None)).await
+    }
 
-        self.build_dir_tree(&canonical_dir, &canonical_root).await
+    async fn get_files_by_dir_scoped(
+        &self,
+        dir: &str,
+        root: &str,
+        authority: &PathAuthority,
+    ) -> Result<Vec<DirOrFile>, AppError> {
+        self.get_files_by_dir_impl(dir, root, authority).await
     }
 
     async fn list_workspace_files(&self, root: &str) -> Result<Vec<WorkspaceFlatFile>, AppError> {
-        let roots = self.allowed_roots_refs();
-        let canonical_root = validate_path(root, &roots)?;
-        let cache_key = canonical_root.to_string_lossy().into_owned();
+        self.list_workspace_files_impl(root, &self.base_authority(None)).await
+    }
 
-        // Check cache first
-        if let Some(cached) = self.workspace_files_cache.get(&cache_key) {
-            return Ok(cached.clone());
-        }
-
-        let root_owned = canonical_root.clone();
-        let files = tokio::task::spawn_blocking(move || list_workspace_files_sync(&root_owned))
-            .await
-            .map_err(|e| AppError::Internal(format!("workspace file listing task failed: {e}")))??;
-
-        // Store in cache
-        self.workspace_files_cache.insert(cache_key, files.clone());
-
-        Ok(files)
+    async fn list_workspace_files_scoped(
+        &self,
+        root: &str,
+        authority: &PathAuthority,
+    ) -> Result<Vec<WorkspaceFlatFile>, AppError> {
+        self.list_workspace_files_impl(root, authority).await
     }
 
     async fn get_file_metadata(&self, path: &str, extra_root: Option<&Path>) -> Result<FileMetadata, AppError> {
-        let roots = self.allowed_roots_refs();
-        let canonical = validate_path_with_extra_root(path, &roots, extra_root)?;
+        self.get_file_metadata_impl(path, &self.base_authority(extra_root)).await
+    }
 
-        let result = tokio::task::spawn_blocking(move || get_file_metadata_sync(&canonical))
-            .await
-            .map_err(|e| AppError::Internal(format!("file metadata task failed: {e}")))??;
-
-        Ok(result)
+    async fn get_file_metadata_scoped(
+        &self,
+        path: &str,
+        authority: &PathAuthority,
+    ) -> Result<FileMetadata, AppError> {
+        self.get_file_metadata_impl(path, authority).await
     }
 
     // -- File read/write (task 7.4) --
 
     async fn read_file(&self, path: &str, extra_root: Option<&Path>) -> Result<Option<String>, AppError> {
-        if has_traversal(path) {
-            return Err(AppError::BadRequest(format!(
-                "path '{}' contains invalid traversal patterns",
-                path
-            )));
-        }
+        self.read_file_impl(path, &self.base_authority(extra_root)).await
+    }
 
-        let roots = self.allowed_roots_refs();
-        let canonical = match validate_path_with_extra_root(path, &roots, extra_root) {
-            Ok(c) => c,
-            Err(err) => {
-                if matches!(err, AppError::BadRequest(_))
-                    && validate_path_for_write(path, &self.allowed_roots_with_extra(extra_root)).is_ok()
-                {
-                    return Ok(None);
-                }
-                if matches!(err, AppError::BadRequest(_)) && self.path_uses_allowed_root(Path::new(path), extra_root) {
-                    return Ok(None);
-                }
-                return Err(err);
-            }
-        };
-
-        tokio::task::spawn_blocking(move || read_file_sync(&canonical))
-            .await
-            .map_err(|e| AppError::Internal(format!("read file task failed: {e}")))?
+    async fn read_file_scoped(&self, path: &str, authority: &PathAuthority) -> Result<Option<String>, AppError> {
+        self.read_file_impl(path, authority).await
     }
 
     async fn read_file_buffer(&self, path: &str, extra_root: Option<&Path>) -> Result<Option<Vec<u8>>, AppError> {
@@ -694,50 +916,17 @@ impl crate::traits::IFileService for FileService {
     }
 
     async fn write_file(&self, path: &str, data: &[u8], workspace: &str) -> Result<bool, AppError> {
-        if has_traversal(path) {
-            return Err(AppError::BadRequest(format!(
-                "path '{}' contains invalid traversal patterns",
-                path
-            )));
-        }
+        self.write_file_impl(path, data, workspace, &self.base_authority(None)).await
+    }
 
-        let roots = self.allowed_roots_refs();
-        let canonical = validate_path_for_write(path, &roots)?;
-
-        let path_owned = canonical.clone();
-        let data_owned = data.to_vec();
-        tokio::task::spawn_blocking(move || write_file_sync(&path_owned, &data_owned))
-            .await
-            .map_err(|e| AppError::Internal(format!("write file task failed: {e}")))??;
-
-        // Compute relative path from workspace
-        let workspace_path = Path::new(workspace);
-        let relative_path = rel_to_api_string(
-            canonical
-                .strip_prefix(std::fs::canonicalize(workspace_path).unwrap_or_else(|_| workspace_path.to_path_buf()))
-                .unwrap_or(&canonical),
-        );
-
-        // Build and broadcast contentUpdate event
-        let content = String::from_utf8(data.to_vec()).ok();
-        let event = ContentUpdateEvent {
-            file_path: canonical.to_string_lossy().into_owned(),
-            content,
-            workspace: workspace.to_owned(),
-            relative_path,
-            operation: ContentUpdateOperation::Write,
-        };
-        let payload = serde_json::to_value(&event).unwrap_or_default();
-        let msg = WebSocketMessage::new("fileStream.contentUpdate", payload);
-        self.broadcaster.broadcast(msg);
-
-        // Invalidate workspace files cache since a file may have been
-        // created or its content changed
-        if let Ok(canonical_ws) = std::fs::canonicalize(workspace_path) {
-            self.invalidate_cache(&canonical_ws.to_string_lossy());
-        }
-
-        Ok(true)
+    async fn write_file_scoped(
+        &self,
+        path: &str,
+        data: &[u8],
+        workspace: &str,
+        authority: &PathAuthority,
+    ) -> Result<bool, AppError> {
+        self.write_file_impl(path, data, workspace, authority).await
     }
 
     async fn copy_files_to_workspace(
@@ -796,74 +985,29 @@ impl crate::traits::IFileService for FileService {
     }
 
     async fn remove_entry(&self, path: &str, workspace: &str) -> Result<(), AppError> {
-        if has_traversal(path) {
-            return Err(AppError::BadRequest(format!(
-                "path '{}' contains invalid traversal patterns",
-                path
-            )));
-        }
+        self.remove_entry_impl(path, workspace, &self.base_authority(None)).await
+    }
 
-        let roots = self.allowed_roots_refs();
-        let canonical = validate_path(path, &roots)?;
-
-        let path_owned = canonical.clone();
-        tokio::task::spawn_blocking(move || remove_entry_sync(&path_owned))
-            .await
-            .map_err(|e| AppError::Internal(format!("remove entry task failed: {e}")))??;
-
-        // Compute relative path from workspace
-        let workspace_path = Path::new(workspace);
-        let relative_path = rel_to_api_string(
-            canonical
-                .strip_prefix(std::fs::canonicalize(workspace_path).unwrap_or_else(|_| workspace_path.to_path_buf()))
-                .unwrap_or(&canonical),
-        );
-
-        // Broadcast contentUpdate delete event
-        let event = ContentUpdateEvent {
-            file_path: canonical.to_string_lossy().into_owned(),
-            content: None,
-            workspace: workspace.to_owned(),
-            relative_path,
-            operation: ContentUpdateOperation::Delete,
-        };
-        let payload = serde_json::to_value(&event).unwrap_or_default();
-        let msg = WebSocketMessage::new("fileStream.contentUpdate", payload);
-        self.broadcaster.broadcast(msg);
-
-        // Invalidate workspace files cache
-        if let Ok(canonical_ws) = std::fs::canonicalize(workspace_path) {
-            self.invalidate_cache(&canonical_ws.to_string_lossy());
-        }
-
-        Ok(())
+    async fn remove_entry_scoped(
+        &self,
+        path: &str,
+        workspace: &str,
+        authority: &PathAuthority,
+    ) -> Result<(), AppError> {
+        self.remove_entry_impl(path, workspace, authority).await
     }
 
     async fn rename_entry(&self, path: &str, new_name: &str) -> Result<String, AppError> {
-        if has_traversal(path) {
-            return Err(AppError::BadRequest(format!(
-                "path '{}' contains invalid traversal patterns",
-                path
-            )));
-        }
+        self.rename_entry_impl(path, new_name, &self.base_authority(None)).await
+    }
 
-        if new_name.contains('/') || new_name.contains('\\') {
-            return Err(AppError::BadRequest(format!(
-                "new name '{}' must not contain path separators",
-                new_name
-            )));
-        }
-
-        let roots = self.allowed_roots_refs();
-        let canonical = validate_path(path, &roots)?;
-
-        let new_name_owned = new_name.to_owned();
-        let path_owned = canonical;
-        let new_path: PathBuf = tokio::task::spawn_blocking(move || rename_entry_sync(&path_owned, &new_name_owned))
-            .await
-            .map_err(|e| AppError::Internal(format!("rename entry task failed: {e}")))??;
-
-        Ok(new_path.to_string_lossy().into_owned())
+    async fn rename_entry_scoped(
+        &self,
+        path: &str,
+        new_name: &str,
+        authority: &PathAuthority,
+    ) -> Result<String, AppError> {
+        self.rename_entry_impl(path, new_name, authority).await
     }
 
     async fn create_temp_file(&self, file_name: &str) -> Result<String, AppError> {

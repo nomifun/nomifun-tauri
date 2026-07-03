@@ -375,6 +375,12 @@
       "vscode": "VS Code",
       "terminal": "终端",
       "explorer": "文件资源管理器"
+    },
+    "bindWorkspace": {
+      "label": "设置工作目录",
+      "hint": "绑定磁盘上的一个文件夹，Agent 将以此目录为主工作区。",
+      "success": "已绑定工作目录，Agent 将在该目录中工作。",
+      "failed": "绑定工作目录失败，请重试。"
     }
   },
   "minimap": {

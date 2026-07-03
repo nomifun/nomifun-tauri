@@ -100,6 +100,74 @@ pub fn has_traversal(path: &str) -> bool {
             .any(|component| matches!(component, Component::ParentDir))
 }
 
+/// The filesystem authority a single file operation runs under, resolved
+/// per-call from the caller's **trust surface** (see the gateway
+/// `CallerCtx::surface`): a trusted local desktop session (the machine owner
+/// driving their own agent) gets [`PathAuthority::Unrestricted`] — the OS
+/// user's own permissions are the only boundary; external channel / remote
+/// sessions get [`PathAuthority::Confined`] to their session workspace.
+///
+/// This unifies the two historically-divergent file-access boundaries (the
+/// native `nomi-tools` write-root and this crate's `allowed_roots` sandbox)
+/// under a single, surface-scoped model. Traversal / NUL bytes are rejected in
+/// BOTH modes — `Unrestricted` removes root *containment*, not path hygiene.
+#[derive(Debug, Clone)]
+pub enum PathAuthority {
+    /// No sandbox-root containment: the OS user's own filesystem permissions
+    /// are the boundary. For the trusted local owner (desktop surface).
+    Unrestricted,
+    /// The path must resolve within one of these roots (the historical
+    /// `allowed_roots` behaviour). For untrusted / external surfaces, or the
+    /// default the UI/file-routes pass (`allowed_roots ∪ workspace`).
+    Confined(Vec<PathBuf>),
+}
+
+/// Authority-aware variant of [`validate_path`]: the target must exist.
+///
+/// - [`PathAuthority::Unrestricted`] → canonicalise only (no root check).
+/// - [`PathAuthority::Confined`] → identical to [`validate_path`] against the
+///   confined roots.
+pub fn validate_path_authority(path: &str, authority: &PathAuthority) -> Result<PathBuf, AppError> {
+    match authority {
+        PathAuthority::Unrestricted => std::fs::canonicalize(path)
+            .map_err(|e| AppError::BadRequest(format!("cannot resolve path '{}': {}", path, e))),
+        PathAuthority::Confined(roots) => {
+            let refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+            validate_path(path, &refs)
+        }
+    }
+}
+
+/// Authority-aware variant of [`validate_path_for_write`]: the target need not
+/// exist yet (its parent directory must).
+///
+/// - [`PathAuthority::Unrestricted`] → canonicalise the parent (no root check),
+///   re-append the file name.
+/// - [`PathAuthority::Confined`] → identical to [`validate_path_for_write`].
+pub fn validate_path_for_write_authority(
+    path: &str,
+    authority: &PathAuthority,
+) -> Result<PathBuf, AppError> {
+    match authority {
+        PathAuthority::Unrestricted => {
+            let p = Path::new(path);
+            let parent = p
+                .parent()
+                .ok_or_else(|| AppError::BadRequest(format!("path '{}' has no parent directory", path)))?;
+            let file_name = p
+                .file_name()
+                .ok_or_else(|| AppError::BadRequest(format!("path '{}' has no file name component", path)))?;
+            let canonical_parent = std::fs::canonicalize(parent)
+                .map_err(|e| AppError::BadRequest(format!("cannot resolve parent of '{}': {}", path, e)))?;
+            Ok(canonical_parent.join(file_name))
+        }
+        PathAuthority::Confined(roots) => {
+            let refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+            validate_path_for_write(path, &refs)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,5 +330,52 @@ mod tests {
         let result = validate_path_with_extra_root(file.to_str().unwrap(), &[sandbox.path()], Some(workspace.path()));
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), fs::canonicalize(file).unwrap());
+    }
+
+    #[test]
+    fn authority_unrestricted_allows_any_existing_path() {
+        // A path in a directory that is NOT an allowed root is accepted under
+        // Unrestricted (the trusted local owner's OS permissions are the boundary).
+        let outside = tempfile::tempdir().unwrap();
+        let file = outside.path().join("owned.txt");
+        fs::write(&file, "x").unwrap();
+        let result = validate_path_authority(file.to_str().unwrap(), &PathAuthority::Unrestricted);
+        assert!(result.is_ok(), "unrestricted must allow any existing path");
+        assert_eq!(result.unwrap(), fs::canonicalize(&file).unwrap());
+    }
+
+    #[test]
+    fn authority_unrestricted_write_allows_new_file_outside_roots() {
+        let outside = tempfile::tempdir().unwrap();
+        let new_file = outside.path().join("new.txt"); // parent exists, file doesn't
+        let result = validate_path_for_write_authority(new_file.to_str().unwrap(), &PathAuthority::Unrestricted);
+        assert!(result.is_ok(), "unrestricted write must allow a new file anywhere the parent exists");
+        assert!(result.unwrap().ends_with("new.txt"));
+    }
+
+    #[test]
+    fn authority_confined_matches_allowed_roots_behaviour() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let inside = sandbox.path().join("ok.txt");
+        let evil = outside.path().join("evil.txt");
+        fs::write(&inside, "hi").unwrap();
+        fs::write(&evil, "no").unwrap();
+
+        let authority = PathAuthority::Confined(vec![sandbox.path().to_path_buf()]);
+        assert!(validate_path_authority(inside.to_str().unwrap(), &authority).is_ok());
+        let err = validate_path_authority(evil.to_str().unwrap(), &authority).unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)), "confined must reject outside root: {err}");
+    }
+
+    #[test]
+    fn authority_confined_write_rejects_outside_root() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("evil.txt");
+        let authority = PathAuthority::Confined(vec![sandbox.path().to_path_buf()]);
+        assert!(validate_path_for_write_authority(target.to_str().unwrap(), &authority).is_err());
+        let inside = sandbox.path().join("ok.txt");
+        assert!(validate_path_for_write_authority(inside.to_str().unwrap(), &authority).is_ok());
     }
 }

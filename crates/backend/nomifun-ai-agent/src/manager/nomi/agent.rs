@@ -245,6 +245,14 @@ impl NomiAgentManager {
         // 门控包住 SpawnTool 注册，白名单在全部注册后 retain_named 收口）。
         config.tools.in_process_spawn = config_extra.in_process_spawn;
         config.tools.builtin_allowlist = config_extra.allowed_tools.clone();
+        // 原生文件工具写根钳制（Write/Edit/ApplyPatch），按会话信任面由工厂解析：
+        // 本地桌面 = None（不钳制，OS 用户全权，今日行为）；渠道/远程/对外 =
+        // Some(workspace)（收窄到会话工作区）。仅在有非空值时覆盖，故桌面会话保留
+        // Config::resolve 的默认（空 = 不钳制），且用户在 config.toml 里显式设置的
+        // write_root 不被无谓清空。与 gateway file-service 的 PathAuthority 同源。
+        if let Some(root) = config_extra.write_root.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            config.tools.write_root = root.to_owned();
+        }
         // C3-fix: snapshot the per-session native allowlist. bootstrap applies it
         // via `retain_named` at build time, but the memory / knowledge / companion
         // / requirement tools below are registered AFTER build directly on
@@ -1048,6 +1056,7 @@ mod tests {
             owner_token: None,
             in_process_spawn: true,
             allowed_tools: Vec::new(),
+            write_root: None,
         }    }
 
     #[tokio::test]

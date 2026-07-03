@@ -2,6 +2,7 @@ import { WORKSPACE_HEADER_HEIGHT } from '@/renderer/pages/conversation/utils/lay
 import { dispatchWorkspaceToggleEvent } from '@/renderer/utils/workspace/workspaceEvents';
 import { ExpandLeft, ExpandRight } from '@icon-park/react';
 import React from 'react';
+import WorkspaceBindButton from './WorkspaceBindButton';
 import WorkspaceOpenButton from './WorkspaceOpenButton';
 
 type WorkspaceHeaderProps = {
@@ -13,10 +14,16 @@ type WorkspaceHeaderProps = {
   workspacePath?: string;
   /**
    * Authoritative temp-workspace flag from
-   * `conversation.extra.is_temporary_workspace`. Passed straight through
-   * to `WorkspaceOpenButton`, which hides for temp workspaces.
+   * `conversation.extra.is_temporary_workspace`. Drives which right-side action
+   * renders: temp sessions get {@link WorkspaceBindButton}, bound workspaces get
+   * {@link WorkspaceOpenButton}.
    */
   isTemporaryWorkspace?: boolean;
+  /**
+   * Conversation this panel belongs to. Required by {@link WorkspaceBindButton}
+   * to redirect a temporary session's workspace via a PATCH.
+   */
+  conversation_id?: number;
 };
 
 // Compact header bar for the workspace side panel with optional collapse toggle
@@ -28,6 +35,7 @@ const WorkspacePanelHeader: React.FC<WorkspaceHeaderProps> = ({
   togglePlacement = 'right',
   workspacePath,
   isTemporaryWorkspace = false,
+  conversation_id,
 }) => (
   <div
     className='workspace-panel-header flex items-center justify-start px-12px py-4px gap-12px border-b border-[var(--bg-3)]'
@@ -45,10 +53,16 @@ const WorkspacePanelHeader: React.FC<WorkspaceHeaderProps> = ({
     )}
     <div className='flex-1 truncate'>{children}</div>
 
-    {/* Open workspace button - shown when workspace path is provided */}
-    {workspacePath && !collapsed && (
-      <WorkspaceOpenButton workspacePath={workspacePath} isTemporary={isTemporaryWorkspace} />
-    )}
+    {/* Right-side workspace action. Temporary sessions offer a "bind a real
+        directory" entry so the agent can work inside a project on disk; bound
+        workspaces offer the "open in external tool" button. Each guards for the
+        desktop shell internally, so nothing renders in WebUI/browser mode. */}
+    {!collapsed &&
+      (isTemporaryWorkspace ? (
+        <WorkspaceBindButton conversation_id={conversation_id} />
+      ) : (
+        workspacePath && <WorkspaceOpenButton workspacePath={workspacePath} isTemporary={false} />
+      ))}
 
     {showToggle && togglePlacement === 'right' && (
       <button type='button' className='workspace-header__toggle' aria-label='Toggle workspace' onClick={onToggle}>

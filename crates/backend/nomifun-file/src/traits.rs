@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use nomifun_common::{AppError, FileChangeOperation};
 
+use crate::path_safety::PathAuthority;
 use crate::types::{CompareResult, CopyResult, DirOrFile, FileMetadata, SnapshotInfo, WorkspaceFlatFile, ZipEntry};
 
 /// Core file operations: directory browsing, file read/write, management,
@@ -100,6 +101,71 @@ pub trait IFileService: Send + Sync {
     /// Cancel an in-progress ZIP operation by its `request_id`.
     /// Returns `true` if a matching operation was found and cancelled.
     async fn cancel_zip(&self, request_id: &str) -> bool;
+
+    // -- Surface-scoped variants (trust-aware path authority) ----------------
+    //
+    // These mirror the path-scoped operations above but take an explicit
+    // [`PathAuthority`] resolved from the caller's trust surface, instead of
+    // implicitly confining to the service's construction-time `allowed_roots`.
+    // A trusted local desktop caller passes `Unrestricted` (OS-user authority);
+    // an external channel/remote caller passes `Confined([workspace])`. The
+    // non-scoped methods above are equivalent to calling these with
+    // `Confined(allowed_roots ∪ workspace)`, so existing callers are unchanged.
+
+    /// [`get_files_by_dir`](Self::get_files_by_dir) under an explicit authority.
+    async fn get_files_by_dir_scoped(
+        &self,
+        dir: &str,
+        root: &str,
+        authority: &PathAuthority,
+    ) -> Result<Vec<DirOrFile>, AppError>;
+
+    /// [`list_workspace_files`](Self::list_workspace_files) under an explicit authority.
+    async fn list_workspace_files_scoped(
+        &self,
+        root: &str,
+        authority: &PathAuthority,
+    ) -> Result<Vec<WorkspaceFlatFile>, AppError>;
+
+    /// [`get_file_metadata`](Self::get_file_metadata) under an explicit authority.
+    async fn get_file_metadata_scoped(
+        &self,
+        path: &str,
+        authority: &PathAuthority,
+    ) -> Result<FileMetadata, AppError>;
+
+    /// [`read_file`](Self::read_file) under an explicit authority.
+    async fn read_file_scoped(
+        &self,
+        path: &str,
+        authority: &PathAuthority,
+    ) -> Result<Option<String>, AppError>;
+
+    /// [`write_file`](Self::write_file) under an explicit authority. `workspace`
+    /// is used only for the `contentUpdate` event's relative-path scoping.
+    async fn write_file_scoped(
+        &self,
+        path: &str,
+        data: &[u8],
+        workspace: &str,
+        authority: &PathAuthority,
+    ) -> Result<bool, AppError>;
+
+    /// [`remove_entry`](Self::remove_entry) under an explicit authority.
+    async fn remove_entry_scoped(
+        &self,
+        path: &str,
+        workspace: &str,
+        authority: &PathAuthority,
+    ) -> Result<(), AppError>;
+
+    /// [`rename_entry`](Self::rename_entry) under an explicit authority.
+    async fn rename_entry_scoped(
+        &self,
+        path: &str,
+        new_name: &str,
+        authority: &PathAuthority,
+    ) -> Result<String, AppError>;
 }
 
 /// File system watching: single-file changes and workspace Office file

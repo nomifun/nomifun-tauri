@@ -375,6 +375,7 @@ const ChatLayoutInner: React.FC<ChatLayoutProps> = (props) => {
               togglePlacement={layout?.isMobile ? 'left' : 'right'}
               workspacePath={workspacePath}
               isTemporaryWorkspace={isTemporaryWorkspace}
+              conversation_id={conversation_id}
             >
               {props.siderTitle}
             </WorkspacePanelHeader>
@@ -395,6 +396,7 @@ const ChatLayoutInner: React.FC<ChatLayoutProps> = (props) => {
             sider={props.sider}
             workspacePath={workspacePath}
             isTemporaryWorkspace={isTemporaryWorkspace}
+            conversation_id={conversation_id}
           />
         )}
 

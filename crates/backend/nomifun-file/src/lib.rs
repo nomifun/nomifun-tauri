@@ -9,7 +9,7 @@ pub mod types;
 pub mod watch_service;
 pub mod workspace_listing;
 
-pub use path_safety::{has_traversal, validate_path, validate_path_for_write};
+pub use path_safety::{PathAuthority, has_traversal, validate_path, validate_path_for_write};
 pub use routes::{FileRouterState, file_routes};
 pub use service::FileService;
 pub use snapshot_service::SnapshotService;
