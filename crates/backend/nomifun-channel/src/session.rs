@@ -163,6 +163,20 @@ impl SessionManager {
         Ok(self.repo.get_session(session_id).await?)
     }
 
+    /// The 对外伙伴 (public agent) bound to a bot channel row (`None` when the
+    /// row is unbound or absent). Per-bot: reads `assistant_plugins.public_agent_id`
+    /// for `channel_id`. Used by the inbound path to decide whether a bot
+    /// auto-serves unknown senders (public-agent-bound bots do; companion-bound
+    /// and unbound bots keep the pairing gate).
+    pub async fn channel_public_agent_id(&self, channel_id: &str) -> Result<Option<String>, ChannelError> {
+        Ok(self
+            .repo
+            .get_plugin(channel_id)
+            .await?
+            .and_then(|row| row.public_agent_id)
+            .filter(|s| !s.trim().is_empty()))
+    }
+
     /// Persists the conversation binding for a session.
     ///
     /// Called after a new conversation is created for this session,
@@ -227,6 +241,9 @@ mod tests {
             Ok(())
         }
         async fn update_plugin_companion(&self, _id: &str, _companion_id: Option<&str>) -> Result<(), DbError> {
+            Ok(())
+        }
+        async fn update_plugin_public_agent(&self, _id: &str, _public_agent_id: Option<&str>) -> Result<(), DbError> {
             Ok(())
         }
         async fn update_plugin_bot_key(&self, _id: &str, _bot_key: &str) -> Result<(), DbError> {

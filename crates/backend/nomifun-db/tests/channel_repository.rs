@@ -28,6 +28,7 @@ fn make_plugin(id: &str, plugin_type: &str) -> ChannelPluginRow {
         status: None,
         last_connected: None,
         companion_id: None,
+        public_agent_id: None,
         bot_key: None,
         created_at: now,
         updated_at: now,

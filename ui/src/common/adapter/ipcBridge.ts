@@ -2124,6 +2124,7 @@ function toPluginStatus(raw: RawPluginStatus): IChannelPluginStatus {
     botUsername: raw.bot_username as string | undefined,
     hasToken: (raw.has_token ?? false) as boolean,
     companionId: raw.companion_id as string | undefined,
+    publicAgentId: raw.public_agent_id as string | null | undefined,
     botKey: raw.bot_key as string | undefined,
     isExtension: raw.is_extension as boolean | undefined,
     extensionMeta: raw.extension_meta as IChannelPluginStatus['extensionMeta'],
@@ -2176,11 +2177,12 @@ export const channel = {
    * 启用/更新机器人渠道。寻址契约（对应后端 EnableChannelSpec）：
    * - `plugin_id` 指向已有渠道行（legacy 调用传平台名）→ 更新该行；
    * - 省略 `plugin_id` 并给 `plugin_type` → 新建一行（每宠多机器人路径）；
-   * - `companion_id` 把机器人绑到伙伴；同一机器人(bot_key)已绑他宠时后端 409。
+   * - `companion_id` 把机器人绑到桌面伙伴，`public_agent_id` 把它绑到对外伙伴
+   *   （二者互斥）；同一机器人(bot_key)已绑其他对象时后端 409。
    */
   enablePlugin: httpPost<
     void,
-    { plugin_id?: string; plugin_type?: string; companion_id?: string; config: Record<string, unknown> }
+    { plugin_id?: string; plugin_type?: string; companion_id?: string; public_agent_id?: string; config: Record<string, unknown> }
   >('/api/channel/plugins/enable'),
   disablePlugin: httpPost<void, { plugin_id: string }>('/api/channel/plugins/disable'),
   /** 删除渠道行：停实例 + 清该渠道会话 + 删行（会话所产生的对话保留）。 */
@@ -2210,6 +2212,16 @@ export const channel = {
    */
   setMasterAgentCompanion: httpPost<void, { platform?: string; plugin_id?: string; companion_id?: string | null }>(
     '/api/channel/settings/companion'
+  ),
+  /**
+   * Bind one public agent (对外伙伴) as the master-agent greeter for a channel row.
+   * Symmetric to {@link setMasterAgentCompanion} but for public agents — a channel
+   * bot serves EITHER a companion OR a public agent (mutually exclusive). Atomic on
+   * the backend: persists the binding AND resets only this channel row's sessions.
+   * A `null` `public_agent_id` clears the binding.
+   */
+  setMasterAgentPublicAgent: httpPost<void, { plugin_id: string; public_agent_id: string | null }>(
+    '/api/channel/settings/public-agent'
   ),
   /**
    * 启动微信扫码登录流程。后端立即返回，二维码生命周期事件经 WebSocket 的
@@ -3626,6 +3638,123 @@ export interface IConnectorIdentity {
   tenant_name?: string;
   scopes_available: string[];
 }
+
+// ---------------------------------------------------------------------------
+// Public Companion (对外伙伴) — an enterprise-grade agent that safely serves
+// STRANGERS (customer service): narrow-but-deep, Q&A + knowledge retrieval only,
+// all dangerous capabilities off. A SEPARATE first-class domain from the desktop
+// 伙伴 (companion): its own data, config, console, and audit trail — never mixed
+// into the desktop-companion roster or the conversation sidebar.
+//
+// Routed to /api/public-agents (hand-defined against the pinned backend contract).
+// ---------------------------------------------------------------------------
+
+/** Which model a public companion answers strangers with (independent of desktop 伙伴). */
+export interface IPublicAgentModel {
+  provider_id: string;
+  model: string;
+  /** Optional display/override model id the backend may resolve; unset = use `model`. */
+  use_model?: string;
+}
+
+/** One public companion — an enterprise customer-service agent. */
+export interface IPublicAgent {
+  id: string;
+  /** Local auto-increment ordinal; null on backends that don't assign one. */
+  seq: number | null;
+  name: string;
+  /** 开场白 / 欢迎语 shown when a stranger opens a conversation. */
+  greeting: string;
+  /** 语气规范 — tone/voice guidance the agent must follow. */
+  tone: string;
+  model: IPublicAgentModel;
+  /** Platform knowledge-base ids this agent may retrieve from. */
+  knowledge_base_ids: string[];
+  /** 严格模式：only answer from bound knowledge bases (no free-form/general answers). */
+  grounded_mode: boolean;
+  /** 服务守则 — business scope / off-limits topics / compliance phrasing. */
+  service_policy: string;
+  /** How many days of audit entries to retain before auto-pruning. */
+  audit_retention_days: number;
+  /** Whether this agent is live (serving strangers) or paused. */
+  enabled: boolean;
+  /** Epoch milliseconds. */
+  created_at: number;
+}
+
+/** Where a public-companion audit entry originated. */
+export type PublicAgentAuditSurface = 'channel' | 'desktop' | 'remote';
+/** What an audit-log row records: a served conversation turn, or an exposure/config change. */
+export type PublicAgentAuditKind = 'turn' | 'exposure_change';
+
+/** One reverse-chronological audit-log row for a public companion. */
+export interface IPublicAgentAuditEntry {
+  id: string;
+  /** Epoch milliseconds. */
+  at: number;
+  surface: PublicAgentAuditSurface;
+  /** IM platform when `surface === 'channel'` (e.g. "telegram"); null otherwise. */
+  channel_platform: string | null;
+  kind: PublicAgentAuditKind;
+  detail: string;
+}
+
+/** A page of audit entries (newest-first) plus the cursor for the next page. */
+export interface IPublicAgentAuditPage {
+  entries: IPublicAgentAuditEntry[];
+  /** `at` (epoch ms) to pass as `cursor` for the next page, or null when exhausted. */
+  next_cursor: number | null;
+}
+
+/** Editable fields on a public companion (all optional — PATCH is a partial merge). */
+export type IPublicAgentPatch = Partial<{
+  name: string;
+  greeting: string;
+  tone: string;
+  model: IPublicAgentModel;
+  knowledge_base_ids: string[];
+  grounded_mode: boolean;
+  service_policy: string;
+  audit_retention_days: number;
+  enabled: boolean;
+}>;
+
+export const publicAgent = {
+  /** Roster of public companions. */
+  list: httpGet<IPublicAgent[], void>('/api/public-agents'),
+  /** Create a new public companion (name only; everything else defaults server-side). */
+  create: httpPost<IPublicAgent, { name: string }>('/api/public-agents'),
+  /** One public companion by id. */
+  get: httpGet<IPublicAgent, { id: string }>((p) => `/api/public-agents/${p.id}`),
+  /** RFC 7396-style partial merge over the editable fields. Returns the updated agent. */
+  patch: httpPatch<IPublicAgent, { id: string; patch: IPublicAgentPatch }>(
+    (p) => `/api/public-agents/${p.id}`,
+    (p) => p.patch
+  ),
+  /** Delete a public companion (204). */
+  remove: httpDelete<void, { id: string }>((p) => `/api/public-agents/${p.id}`),
+  /**
+   * Reverse-chronological (newest-first) audit page. Cursor-paginated by `at` (epoch ms):
+   * pass the previous page's `next_cursor` as `cursor` to load older entries. Degrades to
+   * an empty page when the backend hasn't shipped the endpoint yet (404 silenced).
+   */
+  listAudit: httpGet<
+    IPublicAgentAuditPage,
+    { id: string; limit?: number; cursor?: number | null; q?: string; kind?: PublicAgentAuditKind; days?: number }
+  >((p) => {
+    const params = new URLSearchParams();
+    params.set('limit', String(p.limit ?? 50));
+    if (p.cursor != null) params.set('cursor', String(p.cursor));
+    if (p.q) params.set('q', p.q);
+    if (p.kind) params.set('kind', p.kind);
+    if (p.days != null) params.set('days', String(p.days));
+    return `/api/public-agents/${p.id}/audit?${params.toString()}`;
+  }, { silentStatuses: [404] }),
+  /** Purge audit entries older than N days. Returns how many days were cleared. */
+  clearAudit: httpDelete<{ deleted_days: number }, { id: string; older_than_days: number }>(
+    (p) => `/api/public-agents/${p.id}/audit?older_than_days=${p.older_than_days}`
+  ),
+};
 
 export const knowledge = {
   listBases: httpGet<IKnowledgeBase[], void>('/api/knowledge/bases'),

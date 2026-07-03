@@ -189,7 +189,7 @@ const TelegramConfigForm: React.FC<TelegramConfigFormProps> = ({
       // enablePlugin returns void; success if no throw
       await channel.enablePlugin.invoke(
         channelTarget
-          ? { plugin_id: channelTarget.channelId, plugin_type: 'telegram', companion_id: channelTarget.companionId, config }
+          ? { plugin_id: channelTarget.channelId, plugin_type: 'telegram', ...(channelTarget.publicAgentId ? { public_agent_id: channelTarget.publicAgentId } : { companion_id: channelTarget.companionId }), config }
           : { plugin_id: 'telegram', config }
       );
 

@@ -1,0 +1,14 @@
+-- 027 对外伙伴 (public agent) per-bot binding.
+--
+-- A bot channel now serves EXACTLY ONE of: a companion, a public agent, or
+-- nothing — the same per-bot granularity companion binding already has. This
+-- retires the former per-platform public-agent binding (a `client_preference`
+-- pref `assistant.{platform}.publicAgentId`) that hijacked every bot on a
+-- platform. Row-level mutual exclusivity (setting one binding clears the other)
+-- is enforced in the repository/manager layer.
+--
+-- Nullable, no default → every pre-existing row reads NULL (unbound), so there
+-- is zero behavioural regression. Pure ADD COLUMN (O(1), no table rebuild).
+-- Additive on purpose: editing 001_baseline would change its checksum and trip
+-- the pre-baseline rebuild path (database.rs).
+ALTER TABLE assistant_plugins ADD COLUMN public_agent_id TEXT;

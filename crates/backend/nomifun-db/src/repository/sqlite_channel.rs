@@ -38,8 +38,8 @@ impl IChannelRepository for SqliteChannelRepository {
     async fn upsert_plugin(&self, row: &ChannelPluginRow) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO assistant_plugins \
-                (id, type, name, enabled, config, status, last_connected, companion_id, bot_key, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                (id, type, name, enabled, config, status, last_connected, companion_id, public_agent_id, bot_key, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(id) DO UPDATE SET \
                 type = excluded.type, \
                 name = excluded.name, \
@@ -48,6 +48,7 @@ impl IChannelRepository for SqliteChannelRepository {
                 status = excluded.status, \
                 last_connected = excluded.last_connected, \
                 companion_id = excluded.companion_id, \
+                public_agent_id = excluded.public_agent_id, \
                 bot_key = excluded.bot_key, \
                 updated_at = excluded.updated_at",
         )
@@ -59,6 +60,7 @@ impl IChannelRepository for SqliteChannelRepository {
         .bind(&row.status)
         .bind(row.last_connected)
         .bind(&row.companion_id)
+        .bind(&row.public_agent_id)
         .bind(&row.bot_key)
         .bind(row.created_at)
         .bind(row.updated_at)
@@ -120,12 +122,45 @@ impl IChannelRepository for SqliteChannelRepository {
     }
 
     async fn update_plugin_companion(&self, id: &str, companion_id: Option<&str>) -> Result<(), DbError> {
-        let result = sqlx::query("UPDATE assistant_plugins SET companion_id = ?, updated_at = ? WHERE id = ?")
-            .bind(companion_id)
-            .bind(nomifun_common::now_ms())
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        // Row-level mutual exclusivity: binding a companion (non-null) clears any
+        // public-agent binding on the same row. Clearing (`None`) leaves the
+        // public-agent binding untouched.
+        let result = sqlx::query(
+            "UPDATE assistant_plugins \
+             SET companion_id = ?, \
+                 public_agent_id = CASE WHEN ? IS NOT NULL THEN NULL ELSE public_agent_id END, \
+                 updated_at = ? \
+             WHERE id = ?",
+        )
+        .bind(companion_id)
+        .bind(companion_id)
+        .bind(nomifun_common::now_ms())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("Plugin '{id}' not found")));
+        }
+        Ok(())
+    }
+
+    async fn update_plugin_public_agent(&self, id: &str, public_agent_id: Option<&str>) -> Result<(), DbError> {
+        // Row-level mutual exclusivity: binding a public agent (non-null) clears
+        // any companion binding on the same row. Clearing (`None`) leaves the
+        // companion binding untouched.
+        let result = sqlx::query(
+            "UPDATE assistant_plugins \
+             SET public_agent_id = ?, \
+                 companion_id = CASE WHEN ? IS NOT NULL THEN NULL ELSE companion_id END, \
+                 updated_at = ? \
+             WHERE id = ?",
+        )
+        .bind(public_agent_id)
+        .bind(public_agent_id)
+        .bind(nomifun_common::now_ms())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("Plugin '{id}' not found")));
         }
@@ -505,6 +540,7 @@ mod tests {
             status: None,
             last_connected: None,
             companion_id: None,
+            public_agent_id: None,
             bot_key: None,
             created_at: now,
             updated_at: now,
@@ -610,6 +646,7 @@ mod tests {
             status: Some("running".into()),
             last_connected: Some(now),
             companion_id: None,
+            public_agent_id: None,
             bot_key: None,
             created_at: now,
             updated_at: now,
@@ -697,6 +734,7 @@ mod tests {
             status: None,
             last_connected: None,
             companion_id: Some(companion.into()),
+            public_agent_id: None,
             bot_key: Some("cli_same_app".into()),
             created_at: now,
             updated_at: now,
@@ -725,6 +763,7 @@ mod tests {
                 status: None,
                 last_connected: None,
                 companion_id: None,
+                public_agent_id: None,
                 bot_key: Some(key.into()),
                 created_at: now,
                 updated_at: now,
@@ -751,6 +790,52 @@ mod tests {
 
         let err = repo.update_plugin_companion("nope", Some("companion_x")).await.unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn update_plugin_public_agent_roundtrip_and_clear() {
+        let (repo, _db) = setup().await;
+        repo.upsert_plugin(&sample_plugin()).await.unwrap();
+
+        repo.update_plugin_public_agent("tg-1", Some("pubagent_x")).await.unwrap();
+        assert_eq!(
+            repo.get_plugin("tg-1").await.unwrap().unwrap().public_agent_id.as_deref(),
+            Some("pubagent_x")
+        );
+
+        repo.update_plugin_public_agent("tg-1", None).await.unwrap();
+        assert!(repo.get_plugin("tg-1").await.unwrap().unwrap().public_agent_id.is_none());
+
+        let err = repo.update_plugin_public_agent("nope", Some("pubagent_x")).await.unwrap_err();
+        assert!(matches!(err, DbError::NotFound(_)));
+    }
+
+    /// A bot row serves EITHER a companion OR a public agent, never both:
+    /// setting one binding clears the other, in both directions.
+    #[tokio::test]
+    async fn companion_and_public_agent_bindings_are_mutually_exclusive_on_a_row() {
+        let (repo, _db) = setup().await;
+        repo.upsert_plugin(&sample_plugin()).await.unwrap();
+
+        // Bind a companion, then bind a public agent → companion is cleared.
+        repo.update_plugin_companion("tg-1", Some("companion_1")).await.unwrap();
+        repo.update_plugin_public_agent("tg-1", Some("pubagent_1")).await.unwrap();
+        let row = repo.get_plugin("tg-1").await.unwrap().unwrap();
+        assert_eq!(row.public_agent_id.as_deref(), Some("pubagent_1"));
+        assert!(row.companion_id.is_none(), "binding a public agent must clear the companion");
+
+        // Bind a companion again → public agent is cleared.
+        repo.update_plugin_companion("tg-1", Some("companion_2")).await.unwrap();
+        let row = repo.get_plugin("tg-1").await.unwrap().unwrap();
+        assert_eq!(row.companion_id.as_deref(), Some("companion_2"));
+        assert!(row.public_agent_id.is_none(), "binding a companion must clear the public agent");
+
+        // Clearing one binding does NOT touch the other.
+        repo.update_plugin_public_agent("tg-1", Some("pubagent_2")).await.unwrap();
+        repo.update_plugin_public_agent("tg-1", None).await.unwrap();
+        let row = repo.get_plugin("tg-1").await.unwrap().unwrap();
+        assert!(row.public_agent_id.is_none());
+        assert!(row.companion_id.is_none());
     }
 
     #[tokio::test]
@@ -1066,6 +1151,7 @@ mod tests {
             status: None,
             last_connected: None,
             companion_id: None,
+            public_agent_id: None,
             bot_key: None,
             created_at: now,
             updated_at: now,

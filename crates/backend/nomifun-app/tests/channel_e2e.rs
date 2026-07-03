@@ -25,6 +25,7 @@ async fn seed_telegram_channel(repo: &std::sync::Arc<dyn nomifun_db::IChannelRep
         status: None,
         last_connected: None,
         companion_id: None,
+        public_agent_id: None,
         bot_key: None,
         created_at: now_ms(),
         updated_at: now_ms(),

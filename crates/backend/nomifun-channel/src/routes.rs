@@ -73,7 +73,11 @@ pub fn channel_routes(state: ChannelRouterState) -> Router {
         // Settings sync
         .route("/api/channel/settings/sync", post(sync_channel_settings))
         // Master-agent companion binding (persist + session reset in one step)
-        .route("/api/channel/settings/companion", post(set_channel_master_companion));
+        .route("/api/channel/settings/companion", post(set_channel_master_companion))
+        // 对外伙伴 (public agent) per-bot binding (persist + session reset in one
+        // step). Mirrors the per-bot companion binding; row-level mutually
+        // exclusive with it.
+        .route("/api/channel/settings/public-agent", post(set_channel_public_agent));
 
     // WeChat QR login starter (feature-gated). Lives in the authenticated
     // channel group — the QR lifecycle then streams over the WebSocket as
@@ -174,6 +178,8 @@ struct ChannelPluginStatusView {
     #[serde(skip_serializing_if = "Option::is_none")]
     companion_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    public_agent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     bot_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     created_at: Option<i64>,
@@ -216,6 +222,7 @@ impl ChannelPluginStatusView {
             status: status.status,
             last_connected: status.last_connected,
             companion_id: status.companion_id,
+            public_agent_id: status.public_agent_id,
             bot_key: status.bot_key,
             created_at: Some(status.created_at),
             updated_at: Some(status.updated_at),
@@ -237,6 +244,7 @@ impl ChannelPluginStatusView {
             status: Some("stopped".to_string()),
             last_connected: None,
             companion_id: None,
+            public_agent_id: None,
             bot_key: None,
             created_at: None,
             updated_at: None,
@@ -258,6 +266,7 @@ impl ChannelPluginStatusView {
             status: Some("stopped".to_string()),
             last_connected: None,
             companion_id: None,
+            public_agent_id: None,
             bot_key: None,
             created_at: None,
             updated_at: None,
@@ -331,10 +340,21 @@ async fn enable_plugin(
         return Err(AppError::BadRequest(format!("companion '{companion_id}' not found")));
     }
 
+    // A non-empty public_agent_id must name a LIVE public agent (validated
+    // against the roster, mirroring the companion check). Row-level mutual
+    // exclusivity (public agent clears companion) is applied in the manager.
+    if let Some(public_agent_id) = req.public_agent_id.as_deref().filter(|s| !s.is_empty())
+        && let Some(profile) = &state.master_profile
+        && !profile.public_agent_exists(public_agent_id).await
+    {
+        return Err(AppError::BadRequest(format!("public agent '{public_agent_id}' not found")));
+    }
+
     let spec = EnableChannelSpec {
         plugin_id: req.plugin_id.clone().filter(|s| !s.is_empty()),
         plugin_type: req.plugin_type.clone(),
         companion_id: req.companion_id.clone(),
+        public_agent_id: req.public_agent_id.clone(),
     };
 
     match state
@@ -677,6 +697,63 @@ async fn set_channel_master_companion(
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
         message: Some(format!("Companion binding updated for {platform_str}; sessions cleared")),
+        error: None,
+    })))
+}
+
+// ---------------------------------------------------------------------------
+// 对外伙伴 (public agent) per-bot binding handler
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /api/channel/settings/public-agent`.
+///
+/// Rebinds one bot channel's 对外伙伴 (public agent) — writes
+/// `assistant_plugins.public_agent_id` and clears only that channel's sessions.
+/// `public_agent_id: None` / empty string clears the binding (unbinds). Mirrors
+/// the per-bot companion binding; row-level mutually exclusive with it.
+#[derive(Debug, Deserialize)]
+struct SetChannelPublicAgentRequest {
+    #[serde(default, alias = "pluginId")]
+    plugin_id: String,
+    #[serde(default, alias = "publicAgentId")]
+    public_agent_id: Option<String>,
+}
+
+/// `POST /api/channel/settings/public-agent` — bind (or clear) the 对外伙伴
+/// (public agent) that serves a bot channel. A non-null id is validated against
+/// the live roster and, on success, clears that bot's companion binding (row-level
+/// mutual exclusivity, enforced in the repository layer). `null`/empty unbinds.
+/// Clears the channel's sessions so the next inbound message recreates
+/// conversations under the new binding.
+async fn set_channel_public_agent(
+    State(state): State<ChannelRouterState>,
+    body: Result<Json<SetChannelPublicAgentRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<BridgeResponse>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+
+    let plugin_id = req.plugin_id.trim();
+    if plugin_id.is_empty() {
+        return Err(AppError::BadRequest("plugin_id is required".into()));
+    }
+
+    // Validate a non-empty binding against the live public-agent roster: a typo'd
+    // or already-deleted id must 400 here instead of being persisted. Clearing
+    // (null / empty) needs no validation. Skipped when no profile is wired.
+    if let Some(public_agent_id) = req.public_agent_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        && let Some(profile) = &state.master_profile
+        && !profile.public_agent_exists(public_agent_id).await
+    {
+        return Err(AppError::BadRequest(format!("public agent '{public_agent_id}' not found")));
+    }
+
+    let public_agent_id = req.public_agent_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    state.manager.rebind_channel_public_agent(plugin_id, public_agent_id).await?;
+
+    Ok(Json(ApiResponse::ok(BridgeResponse {
+        success: true,
+        message: Some(format!(
+            "Public agent binding updated for channel {plugin_id}; channel sessions cleared"
+        )),
         error: None,
     })))
 }

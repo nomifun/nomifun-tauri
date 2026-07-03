@@ -102,6 +102,10 @@ pub struct AppServices {
     /// factory so the factory can register the companion memory tools for
     /// companionSession conversations; the router reuses this same instance.
     pub companion_service: Arc<nomifun_companion::CompanionService>,
+    /// Singleton public-companion (对外伙伴) service — the enterprise external-
+    /// service domain, entirely separate from `companion_service`. Owns its own
+    /// `public-agents/` store, roster, and day-partitioned audit.
+    pub public_agent_service: Arc<nomifun_public_agent::PublicAgentService>,
     /// Singleton knowledge service (knowledge base platform). Shared between
     /// the `/api/knowledge/*` routes and the `ConversationService`, which
     /// mounts bound bases into session workspaces at task start.
@@ -566,6 +570,11 @@ impl AppServices {
         .await
         .map_err(|e| anyhow::anyhow!("companion service start failed: {e}"))?;
 
+        // Public-companion (对外伙伴) domain — its own store under public-agents/.
+        // No completer / event bus / memory: it is a controlled enterprise service
+        // agent, not a growing personal companion.
+        let public_agent_service = nomifun_public_agent::PublicAgentService::start(&data_dir);
+
         // Headless seed: bind a Remote access token to the default companion so an
         // operator can configure the front door via env on a headless server.
         // (Desktop mints per-companion tokens via /api/webui/companions/{id}/access-token.)
@@ -659,6 +668,9 @@ impl AppServices {
             companion_prompt: Some(
                 companion_service.clone() as Arc<dyn nomifun_ai_agent::CompanionPromptProvider>
             ),
+            public_agent_provider: Some(
+                public_agent_service.clone() as Arc<dyn nomifun_ai_agent::PublicAgentProvider>
+            ),
         });
 
         // Agent factory is now wired. Future extension/custom agents
@@ -702,6 +714,7 @@ impl AppServices {
             _gateway_mcp_server: gateway_mcp_server,
             _knowledge_mcp_server: knowledge_mcp_server,
             companion_service,
+            public_agent_service,
             knowledge_service,
         })
     }

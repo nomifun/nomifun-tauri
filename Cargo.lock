@@ -5296,6 +5296,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
+ "sys-locale",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -5359,6 +5360,7 @@ dependencies = [
  "nomifun-office",
  "nomifun-orchestrator",
  "nomifun-public",
+ "nomifun-public-agent",
  "nomifun-realtime",
  "nomifun-requirement",
  "nomifun-runtime",
@@ -5866,6 +5868,23 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower",
+ "tracing",
+]
+
+[[package]]
+name = "nomifun-public-agent"
+version = "0.1.17"
+dependencies = [
+ "async-trait",
+ "axum",
+ "nomifun-ai-agent",
+ "nomifun-api-types",
+ "nomifun-auth",
+ "nomifun-common",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 
@@ -9068,6 +9087,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "sys-locale"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eab9a99a024a169fe8a903cf9d4a3b3601109bcc13bd9e3c6fff259138626c4"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

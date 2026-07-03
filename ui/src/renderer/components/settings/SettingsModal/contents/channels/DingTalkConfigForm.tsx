@@ -197,7 +197,7 @@ const DingTalkConfigForm: React.FC<DingTalkConfigFormProps> = ({
       };
       await channel.enablePlugin.invoke(
         channelTarget
-          ? { plugin_id: channelTarget.channelId, plugin_type: 'dingtalk', companion_id: channelTarget.companionId, config }
+          ? { plugin_id: channelTarget.channelId, plugin_type: 'dingtalk', ...(channelTarget.publicAgentId ? { public_agent_id: channelTarget.publicAgentId } : { companion_id: channelTarget.companionId }), config }
           : { plugin_id: 'dingtalk', config }
       );
 

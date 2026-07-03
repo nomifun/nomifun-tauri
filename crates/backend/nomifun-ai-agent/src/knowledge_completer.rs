@@ -109,6 +109,22 @@ pub(crate) fn first_enabled_model(models_json: &str, model_enabled_json: Option<
         .find(|m| !m.is_empty() && enabled.get(m).copied().unwrap_or(true))
 }
 
+/// Resolve the app's DEFAULT `(provider_id, model)`: the first enabled provider
+/// (creation order) and its first enabled model. `None` when no enabled
+/// provider/model is configured. The shared "what model would the app use by
+/// default" resolution — reused wherever a caller has no explicit model (e.g. a
+/// public agent whose own model field is unset, so it answers as soon as ANY
+/// provider is configured, no per-agent setup required).
+pub async fn resolve_default_model(
+    provider_repo: &std::sync::Arc<dyn IProviderRepository>,
+) -> Option<(String, String)> {
+    let providers = provider_repo.list().await.ok()?;
+    providers
+        .iter()
+        .filter(|p| p.enabled)
+        .find_map(|p| first_enabled_model(&p.models, p.model_enabled.as_deref()).map(|m| (p.id.clone(), m)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +209,20 @@ mod tests {
         ]);
         let (provider_id, model) = c.resolve_default_model().await.unwrap();
         assert_eq!((provider_id.as_str(), model.as_str()), ("p2", "m2"));
+    }
+
+    #[tokio::test]
+    async fn resolve_default_model_free_fn_picks_first_enabled_else_none() {
+        let repo: Arc<dyn IProviderRepository> = Arc::new(ListOnlyRepo(vec![
+            provider("p1", false, r#"["m0"]"#, None),
+            provider("p2", true, r#"["m1","m2"]"#, Some(r#"{"m1":false}"#)),
+        ]));
+        assert_eq!(resolve_default_model(&repo).await, Some(("p2".to_owned(), "m2".to_owned())));
+        // No enabled provider/model → None (a public agent then truthfully reports
+        // no model rather than pretending one exists).
+        let none: Arc<dyn IProviderRepository> =
+            Arc::new(ListOnlyRepo(vec![provider("p", false, r#"["m"]"#, None)]));
+        assert_eq!(resolve_default_model(&none).await, None);
     }
 
     #[tokio::test]

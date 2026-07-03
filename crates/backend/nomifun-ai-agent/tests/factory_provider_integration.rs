@@ -76,6 +76,7 @@ fn make_factory(
         client_prefs: None,
         settings_repo: None,
         companion_prompt: None,
+        public_agent_provider: None,
         companion_skill_sink: None,
         skill_manager: AcpSkillManager::new(skill_paths),
         remote_agent_repo,

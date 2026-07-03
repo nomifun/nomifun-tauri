@@ -21,6 +21,10 @@ pub struct ChannelPluginRow {
     /// Companion bound to this bot. UNIQUE(type, bot_key) guarantees a bot is
     /// never bound to more than one companion.
     pub companion_id: Option<String>,
+    /// 对外伙伴 (public agent) bound to this bot. Row-level mutually exclusive
+    /// with `companion_id`: a bot serves EITHER a companion OR a public agent OR
+    /// nothing, never both (enforced in the repository/manager layer).
+    pub public_agent_id: Option<String>,
     /// Platform-level bot identity (lark app_id, telegram bot id, ...),
     /// extracted from credentials on enable/restore.
     pub bot_key: Option<String>,

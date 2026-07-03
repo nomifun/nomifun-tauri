@@ -45,6 +45,7 @@ use nomifun_orchestrator::{
     RunEngineDeps, RunOutcome, RunService, WorkerRunner,
 };
 use nomifun_companion::CompanionRouterState;
+use nomifun_public_agent::PublicAgentRouterState;
 use nomifun_realtime::{NoopMessageRouter, WsHandlerState};
 use nomifun_requirement::RequirementRouterState;
 use nomifun_shell::ShellRouterState;
@@ -82,6 +83,7 @@ pub struct ModuleStates {
     pub idmm: IdmmRouterState,
     pub knowledge: KnowledgeRouterState,
     pub companion: CompanionRouterState,
+    pub public_agent: PublicAgentRouterState,
     pub webhook: WebhookRouterState,
     /// 智能编排 (orchestration): fleet + workspace CRUD state (P0).
     pub orchestrator: OrchestratorRouterState,
@@ -214,6 +216,7 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
         idmm: idmm_state,
         knowledge: KnowledgeRouterState::new(services.knowledge_service.clone()),
         companion: companion_state,
+        public_agent: PublicAgentRouterState::new(services.public_agent_service.clone()),
         webhook: build_webhook_state(services),
         // P3b: arm IDMM supervision on the orchestrator engine's DEDICATED
         // ConversationService (the one worker turns run on) by handing it the
@@ -446,9 +449,19 @@ pub fn build_mcp_state(services: &AppServices) -> McpRouterState {
 /// Master-mode sessions with no per-platform model fall back to the bound
 /// companion's configured model (the companion IS the master agent — its model
 /// choice travels with it to remote sessions).
+///
+/// It ALSO backs the 对外伙伴 (public agent) side of the same trait: a platform
+/// bound to a public agent (mutually exclusive with a companion binding) resolves
+/// its live/enabled state + model here so the channel layer can serve strangers
+/// via a `PublicService`-clamped per-chat session.
 struct CompanionMasterAgentProfile {
     companion_service: Arc<nomifun_companion::CompanionService>,
     channel_settings: Arc<nomifun_channel::channel_settings::ChannelSettingsService>,
+    public_agent_service: Arc<nomifun_public_agent::PublicAgentService>,
+    /// Provider catalog, used to resolve the app's DEFAULT model when a public
+    /// agent has no model of its own — so it answers as soon as ANY provider is
+    /// configured (no per-agent model setup required).
+    provider_repo: Arc<dyn IProviderRepository>,
 }
 
 #[async_trait::async_trait]
@@ -511,6 +524,53 @@ impl nomifun_channel::message_service::MasterAgentProfile for CompanionMasterAge
             }
         }
     }
+
+    async fn public_agent_servable(&self, id: &str) -> bool {
+        // Servable = the public agent exists AND is enabled. A deleted agent or a
+        // disabled/paused one is NOT servable, so the channel layer refuses the
+        // turn rather than serving a dead agent. The bot→agent binding itself is
+        // per-bot (the channel row's `public_agent_id`); this is a pure by-id
+        // liveness check.
+        matches!(self.public_agent_service.get(id).await, Ok(cfg) if cfg.enabled)
+    }
+
+    async fn public_agent_exists(&self, id: &str) -> bool {
+        self.public_agent_service.exists(id).await
+    }
+
+    async fn public_agent_model(&self, id: &str) -> Option<nomifun_common::ProviderWithModel> {
+        // The agent's OWN configured model wins.
+        if let Ok(cfg) = self.public_agent_service.get(id).await {
+            if cfg.model.is_configured() {
+                return Some(nomifun_common::ProviderWithModel {
+                    provider_id: cfg.model.provider_id.clone(),
+                    model: cfg.model.model.clone(),
+                    // Prefer the explicit concrete model id; fall back to the label so a
+                    // usable id always reaches the provider.
+                    use_model: cfg.model.use_model.clone().or_else(|| Some(cfg.model.model.clone())),
+                });
+            }
+        }
+        // Otherwise fall back to the app's DEFAULT model (first enabled provider +
+        // model). This is what makes a public agent "just work" the moment any
+        // provider (e.g. StepFun) is configured, without per-agent model setup —
+        // the owner can still pin a specific model in the console. `None` only
+        // when the machine has NO enabled provider/model at all.
+        let (provider_id, model) = nomifun_ai_agent::resolve_default_model(&self.provider_repo).await?;
+        Some(nomifun_common::ProviderWithModel {
+            provider_id,
+            model: model.clone(),
+            use_model: Some(model),
+        })
+    }
+
+    async fn record_public_agent_turn(&self, id: &str, platform: &str, text: &str) {
+        // Best-effort audit into the public agent's own day-partitioned log
+        // (never fails the turn).
+        self.public_agent_service
+            .record_turn(id, "channel", Some(platform), text)
+            .await;
+    }
 }
 
 /// Build the default `ChannelRouterState` and orchestrator components.
@@ -556,6 +616,18 @@ pub async fn build_channel_state(
     let channel_settings = Arc::new(nomifun_channel::channel_settings::ChannelSettingsService::new(
         pref_repo,
     ));
+
+    // The owner/system identity: the primary WebUI user when one exists, else the
+    // system fallback. Used as the conversation owner for channel turns AND as the
+    // identity auto-served strangers run under on a public-agent-bound platform.
+    let owner_user_id = services
+        .user_repo
+        .get_primary_webui_user()
+        .await
+        .ok()
+        .flatten()
+        .map(|u| u.id)
+        .unwrap_or_else(|| "system_default_user".to_string());
 
     // Build orchestrator dependencies. The fallback agent type for the
     // `agent.select` action mirrors `ChannelSettingsService`'s default
@@ -613,23 +685,17 @@ pub async fn build_channel_state(
         conversation_svc.with_delete_hook(hook);
     }
 
-    let owner_user_id = services
-        .user_repo
-        .get_primary_webui_user()
-        .await
-        .ok()
-        .flatten()
-        .map(|u| u.id)
-        .unwrap_or_else(|| "system_default_user".to_string());
-
-    // Master-agent profile (the companion): per-platform companion binding + model
-    // resolution for master-mode sessions, and companion-id validation for the
-    // binding write route. One instance shared by the message service and
-    // the router state.
+    // Master-agent profile: per-platform companion binding + model resolution for
+    // master-mode sessions and companion-id validation for the binding write
+    // route, PLUS the 对外伙伴 (public agent) resolution/validation/audit for the
+    // symmetric public-agent binding. One instance shared by the message service
+    // and the router state.
     let master_profile: Arc<dyn nomifun_channel::message_service::MasterAgentProfile> =
         Arc::new(CompanionMasterAgentProfile {
             companion_service: services.companion_service.clone(),
             channel_settings: Arc::clone(&channel_settings),
+            public_agent_service: services.public_agent_service.clone(),
+            provider_repo: services.provider_repo.clone(),
         });
 
     let message_service = Arc::new(

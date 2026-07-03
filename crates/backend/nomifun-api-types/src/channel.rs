@@ -23,6 +23,10 @@ pub struct EnablePluginRequest {
     pub plugin_type: Option<String>,
     #[serde(default, alias = "companionId")]
     pub companion_id: Option<String>,
+    /// 对外伙伴 (public agent) to bind this bot to. Mutually exclusive with
+    /// `companion_id` — a bot serves EITHER a companion OR a public agent.
+    #[serde(default, alias = "publicAgentId")]
+    pub public_agent_id: Option<String>,
 }
 
 /// Request body for `POST /api/channel/plugins/disable`.
@@ -132,6 +136,10 @@ pub struct PluginStatusResponse {
     /// Companion bound to this bot channel (one bot ↔ at most one companion).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub companion_id: Option<String>,
+    /// 对外伙伴 (public agent) bound to this bot channel. Row-level mutually
+    /// exclusive with `companion_id`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_agent_id: Option<String>,
     /// Platform-level bot identity (lark app_id, telegram bot id, ...).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bot_key: Option<String>,

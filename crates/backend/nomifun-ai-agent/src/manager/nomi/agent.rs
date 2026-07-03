@@ -245,6 +245,14 @@ impl NomiAgentManager {
         // 门控包住 SpawnTool 注册，白名单在全部注册后 retain_named 收口）。
         config.tools.in_process_spawn = config_extra.in_process_spawn;
         config.tools.builtin_allowlist = config_extra.allowed_tools.clone();
+        // C3-fix: snapshot the per-session native allowlist. bootstrap applies it
+        // via `retain_named` at build time, but the memory / knowledge / companion
+        // / requirement tools below are registered AFTER build directly on
+        // `engine.registry_mut()`, so they would bypass the allowlist. We re-apply
+        // it once more after all post-build registration (see below). Empty = no-op
+        // = unrestricted (normal sessions), so this is inert unless a restricted
+        // session (orchestrator worker / PublicService exposure) pinned an allowlist.
+        let native_allowlist = config_extra.allowed_tools.clone();
         // F1-sec: 把会话的 evaluate「全权模式」LIVE 值灌进 BrowserConfig.full_power（bootstrap 据它
         // 构造 BrowserTool::with_policy 的 evaluate gate）。默认 false（default-deny）。
         config.tools.browser.full_power = config_extra.browser_full_power;
@@ -445,6 +453,21 @@ impl NomiAgentManager {
                 );
             }
         }
+        // C3-fix: all post-build native tools are now registered. Re-apply the
+        // per-session native allowlist so it actually constrains the memory /
+        // knowledge / companion / requirement tools registered above (they were
+        // added after bootstrap's own `retain_named`). Empty allowlist = no-op =
+        // unrestricted, so normal sessions are unaffected; a PublicService or
+        // orchestrator-worker session keeps ONLY its whitelisted tools.
+        if !native_allowlist.is_empty() {
+            engine.registry_mut().retain_named(&native_allowlist);
+            debug!(
+                conversation_id = %conversation_id,
+                allow = ?native_allowlist,
+                "C3: re-applied native allowlist after post-build tool registration"
+            );
+        }
+
         if !is_resume && let Err(e) = engine.init_session(&provider_label, &workspace, Some(&conversation_id)) {
             error!(
                 conversation_id = %conversation_id,

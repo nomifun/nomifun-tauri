@@ -38,6 +38,7 @@ nomifun-orchestrator = { path = "crates/backend/nomifun-orchestrator" }
 nomifun-terminal = { path = "crates/backend/nomifun-terminal" }
 nomifun-assistant = { path = "crates/backend/nomifun-assistant" }
 nomifun-secret = { path = "crates/backend/nomifun-secret" }
+nomifun-public-agent = { path = "crates/backend/nomifun-public-agent" }
 nomifun-app = { path = "crates/backend/nomifun-app" }
 
 # --- Internal crates: shared ---
@@ -112,6 +113,7 @@ prost = "0.13"
 semver = "1"
 dirs = "6"
 regex = "1"
+sys-locale = "0.3"
 
 # --- File system ---
 include_dir = "0.7"

@@ -75,7 +75,7 @@ const MattermostConfigForm: React.FC<MattermostConfigFormProps> = ({ pluginStatu
 
   const handleAutoEnable = async () => {
     const config = { credentials: { token: token.trim(), server_url: serverUrl.trim() } };
-    await channel.enablePlugin.invoke(channelTarget ? { plugin_id: channelTarget.channelId, plugin_type: 'mattermost', companion_id: channelTarget.companionId, config } : { plugin_id: 'mattermost', config });
+    await channel.enablePlugin.invoke(channelTarget ? { plugin_id: channelTarget.channelId, plugin_type: 'mattermost', ...(channelTarget.publicAgentId ? { public_agent_id: channelTarget.publicAgentId } : { companion_id: channelTarget.companionId }), config } : { plugin_id: 'mattermost', config });
     Message.success(t('settings.mattermost.pluginEnabled', 'Mattermost bot enabled'));
     const plugins = await channel.getPluginStatus.invoke();
     if (plugins) {

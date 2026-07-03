@@ -75,7 +75,7 @@ const QQBotConfigForm: React.FC<QQBotConfigFormProps> = ({ pluginStatus, channel
 
   const handleAutoEnable = async () => {
     const config = { credentials: { client_id: appId.trim(), client_secret: clientSecret.trim() } };
-    await channel.enablePlugin.invoke(channelTarget ? { plugin_id: channelTarget.channelId, plugin_type: 'qqbot', companion_id: channelTarget.companionId, config } : { plugin_id: 'qqbot', config });
+    await channel.enablePlugin.invoke(channelTarget ? { plugin_id: channelTarget.channelId, plugin_type: 'qqbot', ...(channelTarget.publicAgentId ? { public_agent_id: channelTarget.publicAgentId } : { companion_id: channelTarget.companionId }), config } : { plugin_id: 'qqbot', config });
     Message.success(t('settings.qqbot.pluginEnabled', 'QQ bot enabled'));
     const plugins = await channel.getPluginStatus.invoke();
     if (plugins) {

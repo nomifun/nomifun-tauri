@@ -208,7 +208,7 @@ const LarkConfigForm: React.FC<LarkConfigFormProps> = ({
       };
       await channel.enablePlugin.invoke(
         channelTarget
-          ? { plugin_id: channelTarget.channelId, plugin_type: 'lark', companion_id: channelTarget.companionId, config }
+          ? { plugin_id: channelTarget.channelId, plugin_type: 'lark', ...(channelTarget.publicAgentId ? { public_agent_id: channelTarget.publicAgentId } : { companion_id: channelTarget.companionId }), config }
           : { plugin_id: 'lark', config }
       );
 

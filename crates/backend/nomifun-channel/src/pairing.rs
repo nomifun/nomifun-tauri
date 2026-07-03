@@ -207,6 +207,48 @@ impl PairingService {
         Ok(user.map(|u| u.id))
     }
 
+    /// Get-or-create the internal `assistant_users` id for a platform sender on
+    /// this bot channel, WITHOUT a pairing code — used by the public-agent
+    /// auto-serve path (a bot bound to a public agent serves strangers directly
+    /// because the session is hard-clamped). Returns the `achu_` id, which
+    /// `assistant_sessions.user_id` foreign-keys to. Idempotent: a returning
+    /// stranger reuses their row. NOT used for companion/unbound bots — those
+    /// still require explicit pairing approval.
+    pub async fn ensure_channel_user(
+        &self,
+        platform_user_id: &str,
+        platform_type: &str,
+        channel_id: &str,
+        display_name: &str,
+    ) -> Result<String, ChannelError> {
+        if let Some(user) = self
+            .repo
+            .get_user_by_platform(platform_user_id, platform_type, channel_id)
+            .await?
+        {
+            return Ok(user.id);
+        }
+        let user_id = generate_prefixed_id("achu");
+        let user_row = AssistantUserRow {
+            id: user_id.clone(),
+            platform_user_id: platform_user_id.to_owned(),
+            platform_type: platform_type.to_owned(),
+            channel_id: Some(channel_id.to_owned()),
+            display_name: Some(display_name.to_owned()),
+            authorized_at: now_ms(),
+            last_active: None,
+            session_id: None,
+        };
+        self.repo.create_user(&user_row).await?;
+        info!(
+            user_id = %user_id,
+            platform_user_id = %platform_user_id,
+            channel_id = %channel_id,
+            "public-agent channel auto-registered a stranger (no pairing)"
+        );
+        Ok(user_id)
+    }
+
     /// Starts a background task that periodically cleans up expired
     /// pairing codes. Returns a `JoinHandle` that can be used to cancel
     /// the task on shutdown.
@@ -356,6 +398,9 @@ mod tests {
             Ok(())
         }
         async fn update_plugin_companion(&self, _id: &str, _companion_id: Option<&str>) -> Result<(), DbError> {
+            Ok(())
+        }
+        async fn update_plugin_public_agent(&self, _id: &str, _public_agent_id: Option<&str>) -> Result<(), DbError> {
             Ok(())
         }
         async fn update_plugin_bot_key(&self, _id: &str, _bot_key: &str) -> Result<(), DbError> {

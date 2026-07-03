@@ -77,7 +77,7 @@ const NostrConfigForm: React.FC<NostrConfigFormProps> = ({ pluginStatus, channel
 
   const handleAutoEnable = async () => {
     const config = { credentials: { nostr_private_key: privateKey.trim(), nostr_relays: relays.trim() } };
-    await channel.enablePlugin.invoke(channelTarget ? { plugin_id: channelTarget.channelId, plugin_type: 'nostr', companion_id: channelTarget.companionId, config } : { plugin_id: 'nostr', config });
+    await channel.enablePlugin.invoke(channelTarget ? { plugin_id: channelTarget.channelId, plugin_type: 'nostr', ...(channelTarget.publicAgentId ? { public_agent_id: channelTarget.publicAgentId } : { companion_id: channelTarget.companionId }), config } : { plugin_id: 'nostr', config });
     Message.success(t('settings.nostr.pluginEnabled', 'Nostr bot enabled'));
     const plugins = await channel.getPluginStatus.invoke();
     if (plugins) {

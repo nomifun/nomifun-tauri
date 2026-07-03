@@ -71,6 +71,7 @@ nomifun-idmm.workspace = true
 nomifun-knowledge.workspace = true
 nomifun-orchestrator.workspace = true
 nomifun-companion.workspace = true
+nomifun-public-agent.workspace = true
 nomifun-gateway.workspace = true
 nomifun-public.workspace = true
 nomifun-webhook.workspace = true

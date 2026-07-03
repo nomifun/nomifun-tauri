@@ -434,6 +434,7 @@ async fn bind_channel_to_companion(repo: &Arc<SqliteChannelRepository>, channel_
         status: None,
         last_connected: None,
         companion_id: Some(companion_id.to_owned()),
+        public_agent_id: None,
         bot_key: Some("42".to_owned()),
         created_at: now,
         updated_at: now,
@@ -525,5 +526,142 @@ async fn companion_without_model_refuses_turn() {
         .send_to_agent(&bound, "hi", PluginType::Telegram)
         .await
         .expect_err("a model-less companion must refuse the turn");
+    assert!(matches!(err, ChannelError::CompanionNotReady(_)));
+}
+
+/// Binds a bot channel row to a 对外伙伴 (public agent) — the per-bot binding the
+/// dispatch reads via `session.channel_id` → `get_plugin` → `row.public_agent_id`.
+async fn bind_channel_to_public_agent(repo: &Arc<SqliteChannelRepository>, channel_id: &str, public_agent_id: &str) {
+    use nomifun_db::IChannelRepository;
+    let now = nomifun_common::now_ms();
+    repo.upsert_plugin(&nomifun_db::models::ChannelPluginRow {
+        id: channel_id.to_owned(),
+        r#type: "telegram".to_owned(),
+        name: "Telegram Bot".to_owned(),
+        enabled: true,
+        config: "enc".to_owned(),
+        status: None,
+        last_connected: None,
+        companion_id: None,
+        public_agent_id: Some(public_agent_id.to_owned()),
+        bot_key: Some("43".to_owned()),
+        created_at: now,
+        updated_at: now,
+    })
+    .await
+    .unwrap();
+}
+
+// ── 对外伙伴 / public-agent channel routing ─────────────────────────────────
+
+/// Profile stub for public-agent routing: `servable` is what
+/// `public_agent_servable` returns (true ⇒ alive + enabled), and `model` is the
+/// agent's answering model. Companion methods are inert (a public-agent bot must
+/// never touch the companion path).
+struct PublicStubProfile {
+    servable: bool,
+    model: Option<nomifun_common::ProviderWithModel>,
+}
+
+#[async_trait]
+impl nomifun_channel::message_service::MasterAgentProfile for PublicStubProfile {
+    async fn companion_model(&self, _companion_id: &str) -> Option<nomifun_common::ProviderWithModel> {
+        None
+    }
+    async fn master_companion_id(&self, _platform: &str) -> Option<String> {
+        // If the public-agent path ever fell through to the companion path, this
+        // would host the turn — the tests assert that never happens.
+        Some("companion_should_not_be_used".to_owned())
+    }
+    async fn companion_exists(&self, _companion_id: &str) -> bool {
+        true
+    }
+    async fn ensure_companion_session(&self, _companion_id: &str) -> Option<i64> {
+        panic!("public-agent bot must NOT route into a companion session");
+    }
+    async fn public_agent_servable(&self, _id: &str) -> bool {
+        self.servable
+    }
+    async fn public_agent_model(&self, _id: &str) -> Option<nomifun_common::ProviderWithModel> {
+        self.model.clone()
+    }
+}
+
+/// (a) A public-agent-bound bot's turn builds an ISOLATED per-chat nomi
+/// conversation carrying `public_agent_id` + `channelPlatform` + the public
+/// agent's model, and NO `companionId` / `desktopGateway` (no gateway for public
+/// agents). The companion path is never taken.
+#[tokio::test]
+async fn public_agent_bound_platform_builds_clamped_session() {
+    let db = init_database_memory().await.unwrap();
+    let stack = build_stack(db.pool().clone());
+
+    // The routing reads the BOT ROW's public_agent_id (per-bot), via channel_id.
+    bind_channel_to_public_agent(&stack.channel_repo, "achn_pa", "pubagent_1").await;
+
+    let model = nomifun_common::ProviderWithModel {
+        provider_id: "prov_pa".to_owned(),
+        model: "pa-model".to_owned(),
+        use_model: Some("pa-model-v1".to_owned()),
+    };
+    let message_svc = stack.message_svc.with_master_profile(Arc::new(PublicStubProfile {
+        servable: true,
+        model: Some(model),
+    }));
+
+    let mut session = make_session(None);
+    session.channel_id = Some("achn_pa".to_owned());
+    let sent = message_svc
+        .send_to_agent(&session, "你好", PluginType::Telegram)
+        .await
+        .unwrap();
+    wait_until_idle(&stack.conversation_svc, &sent.conversation_id).await;
+
+    let conv = stack
+        .conversation_svc
+        .get("system_default_user", &sent.conversation_id)
+        .await
+        .unwrap();
+
+    assert_eq!(conv.r#type, AgentType::Nomi);
+    assert_eq!(conv.extra["public_agent_id"], serde_json::json!("pubagent_1"));
+    assert_eq!(conv.extra["channelPlatform"], serde_json::json!("telegram"));
+    assert!(
+        conv.extra.get("companionId").is_none(),
+        "public agent must not carry a companion"
+    );
+    assert!(
+        conv.extra.get("desktopGateway").is_none(),
+        "public agent gets NO gateway"
+    );
+    let m = conv.model.expect("public-agent conversation must carry a model");
+    assert_eq!(m.provider_id, "prov_pa");
+    assert_eq!(m.use_model.as_deref(), Some("pa-model-v1"));
+}
+
+/// A public-agent-bound bot whose agent is disabled/missing refuses with a
+/// friendly notice — it MUST NOT fall through to the companion path (the stub's
+/// `ensure_companion_session` panics if it does).
+#[tokio::test]
+async fn public_agent_bound_but_disabled_refuses_without_companion_fallthrough() {
+    use nomifun_channel::error::ChannelError;
+
+    let db = init_database_memory().await.unwrap();
+    let stack = build_stack(db.pool().clone());
+
+    bind_channel_to_public_agent(&stack.channel_repo, "achn_pa", "pubagent_1").await;
+
+    // servable = false models a disabled/deleted agent.
+    let message_svc = stack.message_svc.with_master_profile(Arc::new(PublicStubProfile {
+        servable: false,
+        model: None,
+    }));
+
+    let mut session = make_session(None);
+    session.channel_id = Some("achn_pa".to_owned());
+    let err = message_svc
+        .send_to_agent(&session, "你好", PluginType::Telegram)
+        .await
+        .expect_err("a disabled public agent must refuse the turn");
     assert!(matches!(err, ChannelError::CompanionNotReady(_)));
 }

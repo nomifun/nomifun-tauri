@@ -107,7 +107,7 @@ const DiscordConfigForm: React.FC<DiscordConfigFormProps> = ({ pluginStatus, cha
   const handleAutoEnable = async () => {
     try {
       const config = { credentials: { token: discordToken.trim() } };
-      await channel.enablePlugin.invoke(channelTarget ? { plugin_id: channelTarget.channelId, plugin_type: 'discord', companion_id: channelTarget.companionId, config } : { plugin_id: 'discord', config });
+      await channel.enablePlugin.invoke(channelTarget ? { plugin_id: channelTarget.channelId, plugin_type: 'discord', ...(channelTarget.publicAgentId ? { public_agent_id: channelTarget.publicAgentId } : { companion_id: channelTarget.companionId }), config } : { plugin_id: 'discord', config });
       Message.success(t('settings.discord.pluginEnabled', 'Discord bot enabled'));
       const plugins = await channel.getPluginStatus.invoke();
       if (plugins) {

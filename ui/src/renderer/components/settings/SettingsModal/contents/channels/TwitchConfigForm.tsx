@@ -75,7 +75,7 @@ const TwitchConfigForm: React.FC<TwitchConfigFormProps> = ({ pluginStatus, chann
 
   const handleAutoEnable = async () => {
     const config = { credentials: { token: token.trim(), twitch_channel: twitchChannel.trim() } };
-    await channel.enablePlugin.invoke(channelTarget ? { plugin_id: channelTarget.channelId, plugin_type: 'twitch', companion_id: channelTarget.companionId, config } : { plugin_id: 'twitch', config });
+    await channel.enablePlugin.invoke(channelTarget ? { plugin_id: channelTarget.channelId, plugin_type: 'twitch', ...(channelTarget.publicAgentId ? { public_agent_id: channelTarget.publicAgentId } : { companion_id: channelTarget.companionId }), config } : { plugin_id: 'twitch', config });
     Message.success(t('settings.twitch.pluginEnabled', 'Twitch bot enabled'));
     const plugins = await channel.getPluginStatus.invoke();
     if (plugins) {

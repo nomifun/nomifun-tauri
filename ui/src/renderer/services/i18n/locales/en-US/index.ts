@@ -29,6 +29,7 @@ import webhook from './webhook.json';
 import autowork from './autowork.json';
 import nomi from './nomi.json';
 import knowledge from './knowledge.json';
+import publicCompanion from './publicCompanion.json';
 import sessionList from './sessionList.json';
 import modelFailover from './modelFailover.json';
 import orchestrator from './orchestrator.json';
@@ -60,6 +61,7 @@ export default {
   autowork,
   nomi,
   knowledge,
+  publicCompanion,
   sessionList,
   modelFailover,
   orchestrator,

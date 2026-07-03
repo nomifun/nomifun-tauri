@@ -65,11 +65,15 @@ pub type PluginFactory = Box<dyn Fn(PluginType) -> Option<Box<dyn ChannelPlugin>
 /// - `plugin_id` unset + `plugin_type` set: create a new row with a
 ///   generated `achn_` id — this is the per-companion multi-bot path.
 /// - `companion_id`: bind the bot to a companion; `None` keeps the row's binding.
+/// - `public_agent_id`: bind the bot to a 对外伙伴 (public agent); `None` keeps
+///   the row's binding. Row-level MUTUALLY EXCLUSIVE with `companion_id` — an
+///   explicit non-empty value for one clears the other on the persisted row.
 #[derive(Debug, Default, Clone)]
 pub struct EnableChannelSpec {
     pub plugin_id: Option<String>,
     pub plugin_type: Option<String>,
     pub companion_id: Option<String>,
+    pub public_agent_id: Option<String>,
 }
 
 impl EnableChannelSpec {
@@ -205,26 +209,34 @@ impl ChannelManager {
             Some(id) => self.repo.get_plugin(id).await?,
             None => None,
         };
-        let (row_id, plugin_type, created_at, prior_companion) = match (&existing, spec.plugin_id.as_deref()) {
-            (Some(row), _) => {
-                let pt = PluginType::from_str_opt(&row.r#type)
-                    .ok_or_else(|| ChannelError::InvalidPluginType(row.r#type.clone()))?;
-                (row.id.clone(), pt, row.created_at, row.companion_id.clone())
-            }
-            (None, Some(id)) => {
-                let pt = PluginType::from_str_opt(id).ok_or_else(|| ChannelError::InvalidPluginType(id.to_owned()))?;
-                (id.to_owned(), pt, now_ms(), None)
-            }
-            (None, None) => {
-                let type_str = spec
-                    .plugin_type
-                    .as_deref()
-                    .ok_or_else(|| ChannelError::InvalidConfig("plugin_type is required to create a channel".into()))?;
-                let pt = PluginType::from_str_opt(type_str)
-                    .ok_or_else(|| ChannelError::InvalidPluginType(type_str.to_owned()))?;
-                (generate_prefixed_id("achn"), pt, now_ms(), None)
-            }
-        };
+        let (row_id, plugin_type, created_at, prior_companion, prior_public_agent) =
+            match (&existing, spec.plugin_id.as_deref()) {
+                (Some(row), _) => {
+                    let pt = PluginType::from_str_opt(&row.r#type)
+                        .ok_or_else(|| ChannelError::InvalidPluginType(row.r#type.clone()))?;
+                    (
+                        row.id.clone(),
+                        pt,
+                        row.created_at,
+                        row.companion_id.clone(),
+                        row.public_agent_id.clone(),
+                    )
+                }
+                (None, Some(id)) => {
+                    let pt =
+                        PluginType::from_str_opt(id).ok_or_else(|| ChannelError::InvalidPluginType(id.to_owned()))?;
+                    (id.to_owned(), pt, now_ms(), None, None)
+                }
+                (None, None) => {
+                    let type_str = spec
+                        .plugin_type
+                        .as_deref()
+                        .ok_or_else(|| ChannelError::InvalidConfig("plugin_type is required to create a channel".into()))?;
+                    let pt = PluginType::from_str_opt(type_str)
+                        .ok_or_else(|| ChannelError::InvalidPluginType(type_str.to_owned()))?;
+                    (generate_prefixed_id("achn"), pt, now_ms(), None, None)
+                }
+            };
 
         // Parse and validate config structure
         let config: PluginConfig = serde_json::from_value(config_value.clone())
@@ -260,14 +272,27 @@ impl ChannelManager {
         let encrypted_config = encrypt_string(&config_json, &self.encryption_key)
             .map_err(|e| ChannelError::EncryptionFailed(e.to_string()))?;
 
-        // Persist to DB
-        let companion_id = spec
+        // Persist to DB. Row-level mutual exclusivity: a bot serves EITHER a
+        // companion OR a 对外伙伴 (public agent) OR nothing. An explicit non-empty
+        // binding for one side clears the other; when the spec sets neither, the
+        // row's prior (already-exclusive) bindings are preserved.
+        let spec_companion = spec
             .companion_id
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .or(prior_companion);
+            .filter(|s| !s.is_empty());
+        let spec_public_agent = spec
+            .public_agent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let (companion_id, public_agent_id) = if let Some(pa) = spec_public_agent {
+            (None, Some(pa.to_owned()))
+        } else if let Some(comp) = spec_companion {
+            (Some(comp.to_owned()), None)
+        } else {
+            (prior_companion, prior_public_agent)
+        };
         let row = ChannelPluginRow {
             id: row_id.clone(),
             r#type: plugin_type.to_string(),
@@ -277,6 +302,7 @@ impl ChannelManager {
             status: Some(PluginStatus::Created.to_string()),
             last_connected: None,
             companion_id,
+            public_agent_id,
             bot_key,
             created_at,
             updated_at: now_ms(),
@@ -347,6 +373,7 @@ impl ChannelManager {
             status: Some(PluginStatus::Stopped.to_string()),
             last_connected: existing.as_ref().and_then(|row| row.last_connected),
             companion_id: existing.as_ref().and_then(|row| row.companion_id.clone()),
+            public_agent_id: existing.as_ref().and_then(|row| row.public_agent_id.clone()),
             bot_key: existing.as_ref().and_then(|row| row.bot_key.clone()),
             created_at: existing.as_ref().map(|row| row.created_at).unwrap_or(now),
             updated_at: now,
@@ -413,6 +440,25 @@ impl ChannelManager {
         self.repo.delete_sessions_by_channel(plugin_id).await?;
         self.broadcast_status_change(plugin_id).await;
         info!(plugin_id = %plugin_id, companion_id = ?companion_id, "channel companion rebound; channel sessions cleared");
+        Ok(())
+    }
+
+    /// Rebinds (or clears) the 对外伙伴 (public agent) of a channel row and clears
+    /// only that channel's sessions so the next inbound message recreates its
+    /// conversation under the new binding.
+    ///
+    /// Row-level mutual exclusivity: setting a non-null `public_agent_id` also
+    /// clears that bot's `companion_id` (enforced in the repository layer), so a
+    /// bot serves EITHER a companion OR a public agent, never both.
+    pub async fn rebind_channel_public_agent(
+        &self,
+        plugin_id: &str,
+        public_agent_id: Option<&str>,
+    ) -> Result<(), ChannelError> {
+        self.repo.update_plugin_public_agent(plugin_id, public_agent_id).await?;
+        self.repo.delete_sessions_by_channel(plugin_id).await?;
+        self.broadcast_status_change(plugin_id).await;
+        info!(plugin_id = %plugin_id, public_agent_id = ?public_agent_id, "channel public agent rebound; channel sessions cleared");
         Ok(())
     }
 
@@ -903,6 +949,7 @@ impl ChannelManager {
             status: live_status.or_else(|| row.status.clone()),
             last_connected: row.last_connected,
             companion_id: row.companion_id.clone(),
+            public_agent_id: row.public_agent_id.clone(),
             bot_key: row.bot_key.clone(),
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -1059,6 +1106,23 @@ mod tests {
             let mut plugins = self.plugins.lock().unwrap();
             if let Some(p) = plugins.iter_mut().find(|p| p.id == id) {
                 p.companion_id = companion_id.map(str::to_owned);
+                if companion_id.is_some() {
+                    p.public_agent_id = None;
+                }
+                p.updated_at = now_ms();
+                Ok(())
+            } else {
+                Err(DbError::NotFound(id.into()))
+            }
+        }
+
+        async fn update_plugin_public_agent(&self, id: &str, public_agent_id: Option<&str>) -> Result<(), DbError> {
+            let mut plugins = self.plugins.lock().unwrap();
+            if let Some(p) = plugins.iter_mut().find(|p| p.id == id) {
+                p.public_agent_id = public_agent_id.map(str::to_owned);
+                if public_agent_id.is_some() {
+                    p.companion_id = None;
+                }
                 p.updated_at = now_ms();
                 Ok(())
             } else {
@@ -1386,6 +1450,7 @@ mod tests {
             status: Some("running".into()),
             last_connected: Some(now),
             companion_id: None,
+            public_agent_id: None,
             bot_key: None,
             created_at: now,
             updated_at: now,
@@ -1605,6 +1670,7 @@ mod tests {
             status: Some("stopped".into()),
             last_connected: None,
             companion_id: None,
+            public_agent_id: None,
             bot_key: None,
             created_at: now_ms(),
             updated_at: now_ms(),
@@ -1683,6 +1749,7 @@ mod tests {
             status: Some("stopped".into()),
             last_connected: None,
             companion_id: None,
+            public_agent_id: None,
             bot_key: None,
             created_at: now_ms(),
             updated_at: now_ms(),
@@ -1709,6 +1776,7 @@ mod tests {
             status: Some("stopped".into()),
             last_connected: None,
             companion_id: None,
+            public_agent_id: None,
             bot_key: None,
             created_at: now_ms(),
             updated_at: now_ms(),
@@ -1738,6 +1806,7 @@ mod tests {
                 status: None,
                 last_connected: None,
                 companion_id: None,
+                public_agent_id: None,
                 bot_key: None,
                 created_at: now_ms(),
                 updated_at: now_ms(),
@@ -1751,6 +1820,7 @@ mod tests {
                 status: None,
                 last_connected: None,
                 companion_id: None,
+                public_agent_id: None,
                 bot_key: None,
                 created_at: now_ms(),
                 updated_at: now_ms(),
@@ -1898,6 +1968,16 @@ mod tests {
             plugin_id: None,
             plugin_type: Some("lark".into()),
             companion_id: Some(companion.into()),
+            public_agent_id: None,
+        }
+    }
+
+    fn lark_public_agent_spec(public_agent_id: &str) -> EnableChannelSpec {
+        EnableChannelSpec {
+            plugin_id: None,
+            plugin_type: Some("lark".into()),
+            companion_id: None,
+            public_agent_id: Some(public_agent_id.into()),
         }
     }
 
@@ -2087,6 +2167,59 @@ mod tests {
         // Clearing the binding works too (and clears sessions again).
         mgr.rebind_channel_companion(&id, None).await.unwrap();
         assert!(repo.get_plugins()[0].companion_id.is_none());
+        assert_eq!(repo.cleared_channels().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn enable_with_public_agent_id_binds_row_and_clears_companion() {
+        let (mgr, repo, _bc) = make_manager();
+        let factory = make_factory();
+
+        // A brand-new bot bound to a public agent: the row carries public_agent_id
+        // and NO companion.
+        let id = mgr
+            .enable_plugin(&lark_public_agent_spec("pubagent_1"), &lark_config_with_app("cli_app_1"), &factory)
+            .await
+            .unwrap();
+        let row = repo.get_plugins().into_iter().find(|r| r.id == id).unwrap();
+        assert_eq!(row.public_agent_id.as_deref(), Some("pubagent_1"));
+        assert!(row.companion_id.is_none(), "a public-agent bot must not carry a companion");
+
+        // Re-enabling the SAME row with a companion spec flips it to companion and
+        // clears the public-agent binding (row-level mutual exclusivity).
+        let spec = EnableChannelSpec {
+            plugin_id: Some(id.clone()),
+            plugin_type: Some("lark".into()),
+            companion_id: Some("companion_a".into()),
+            public_agent_id: None,
+        };
+        mgr.enable_plugin(&spec, &lark_config_with_app("cli_app_1"), &factory).await.unwrap();
+        let row = repo.get_plugins().into_iter().find(|r| r.id == id).unwrap();
+        assert_eq!(row.companion_id.as_deref(), Some("companion_a"));
+        assert!(row.public_agent_id.is_none(), "binding a companion must clear the public agent");
+    }
+
+    #[tokio::test]
+    async fn rebind_channel_public_agent_updates_binding_and_clears_sessions_and_companion() {
+        let (mgr, repo, _bc) = make_manager();
+        let factory = make_factory();
+
+        // Start companion-bound, then rebind to a public agent.
+        let id = mgr
+            .enable_plugin(&lark_spec("companion_a"), &lark_config_with_app("cli_app_1"), &factory)
+            .await
+            .unwrap();
+        assert_eq!(repo.get_plugins()[0].companion_id.as_deref(), Some("companion_a"));
+
+        mgr.rebind_channel_public_agent(&id, Some("pubagent_z")).await.unwrap();
+        let row = repo.get_plugins().into_iter().find(|r| r.id == id).unwrap();
+        assert_eq!(row.public_agent_id.as_deref(), Some("pubagent_z"));
+        assert!(row.companion_id.is_none(), "rebinding to a public agent clears the companion");
+        assert_eq!(repo.cleared_channels(), vec![id.clone()]);
+
+        // Clearing the binding works too (and clears sessions again).
+        mgr.rebind_channel_public_agent(&id, None).await.unwrap();
+        assert!(repo.get_plugins()[0].public_agent_id.is_none());
         assert_eq!(repo.cleared_channels().len(), 2);
     }
 

@@ -620,6 +620,7 @@ async fn eq19_channel_status_merges_extension_meta_for_persisted_row() {
         status: Some("running".to_string()),
         last_connected: Some(now),
         companion_id: None,
+        public_agent_id: None,
         bot_key: None,
         created_at: now,
         updated_at: now,

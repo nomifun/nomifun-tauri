@@ -19,6 +19,7 @@ use nomifun_auth::{
 };
 use nomifun_channel::channel_routes;
 use nomifun_companion::{companion_public_routes, companion_routes};
+use nomifun_public_agent::public_agent_routes;
 use nomifun_conversation::{conversation_ops_routes, conversation_routes};
 use nomifun_cron::cron_routes;
 use nomifun_extension::{extension_routes, hub_routes, skill_routes};
@@ -369,6 +370,11 @@ pub fn create_router_with_all_state(
     let companion_authenticated = companion_routes(states.companion.clone())
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // 对外伙伴 (public companion) enterprise-service domain — its OWN routes,
+    // separate from the desktop companion. Protected by auth middleware.
+    let public_agent_authenticated = public_agent_routes(states.public_agent.clone())
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // Knowledge Base platform routes protected by auth middleware
     let knowledge_authenticated = knowledge_routes(states.knowledge)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -523,6 +529,7 @@ pub fn create_router_with_all_state(
         .merge(requirement_authenticated)
         .merge(idmm_authenticated)
         .merge(companion_authenticated)
+        .merge(public_agent_authenticated)
         .merge(knowledge_authenticated)
         .merge(webhook_authenticated)
         .merge(orchestrator_authenticated)

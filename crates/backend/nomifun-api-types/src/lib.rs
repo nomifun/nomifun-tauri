@@ -12,6 +12,7 @@ mod connection_test;
 mod conversation;
 mod cron;
 mod custom_agent;
+mod exposure;
 mod extension;
 mod file;
 mod idmm;
@@ -54,6 +55,7 @@ pub use agent_error::{
     AgentErrorCode, AgentErrorOwnership, AgentErrorResolution, AgentErrorResolutionKind,
     AgentErrorResolutionTarget, AgentStreamErrorData,
 };
+pub use exposure::{ExposureClamp, ExposureMode, SAFE_PUBLIC_SERVICE_TOOLS, exposure_clamp};
 pub use assistant::{
     AssistantResponse, AssistantSource, AssistantTagDimension, AssistantTagResponse,
     CreateAssistantRequest, CreateAssistantTagRequest, ImportAssistantsRequest,

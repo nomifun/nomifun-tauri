@@ -1,0 +1,19 @@
+[package]
+name = "nomifun-public-agent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nomifun-common.workspace = true
+nomifun-api-types.workspace = true
+nomifun-auth.workspace = true
+nomifun-ai-agent.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

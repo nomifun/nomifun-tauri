@@ -205,7 +205,7 @@ const WeixinConfigForm: React.FC<WeixinConfigFormProps> = ({
     // enablePlugin returns void; success if no throw
     await channel.enablePlugin.invoke(
       channelTarget
-        ? { plugin_id: channelTarget.channelId, plugin_type: 'weixin', companion_id: channelTarget.companionId, config }
+        ? { plugin_id: channelTarget.channelId, plugin_type: 'weixin', ...(channelTarget.publicAgentId ? { public_agent_id: channelTarget.publicAgentId } : { companion_id: channelTarget.companionId }), config }
         : { plugin_id: 'weixin', config }
     );
     Message.success(t('settings.weixin.pluginEnabled', 'WeChat channel enabled'));

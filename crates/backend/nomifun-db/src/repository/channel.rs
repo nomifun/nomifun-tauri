@@ -26,7 +26,16 @@ pub trait IChannelRepository: Send + Sync {
     async fn update_plugin_status(&self, id: &str, params: &UpdatePluginStatusParams) -> Result<(), DbError>;
 
     /// Updates the companion binding of a plugin row (`None` clears it).
+    ///
+    /// Row-level mutual exclusivity: setting a non-null `companion_id` also
+    /// clears any `public_agent_id` on the same row (a bot serves EITHER a
+    /// companion OR a public agent, never both).
     async fn update_plugin_companion(&self, id: &str, companion_id: Option<&str>) -> Result<(), DbError>;
+
+    /// Updates the 对外伙伴 (public agent) binding of a plugin row (`None`
+    /// clears it). Row-level mutual exclusivity: setting a non-null
+    /// `public_agent_id` also clears any `companion_id` on the same row.
+    async fn update_plugin_public_agent(&self, id: &str, public_agent_id: Option<&str>) -> Result<(), DbError>;
 
     /// Updates the bot identity key of a plugin row (backfill on restore).
     async fn update_plugin_bot_key(&self, id: &str, bot_key: &str) -> Result<(), DbError>;

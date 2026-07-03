@@ -51,6 +51,61 @@ pub trait CompanionPromptProvider: Send + Sync {
     ) -> Option<String>;
 }
 
+/// Runtime persona/policy/model resolved for a 对外伙伴 (public agent / public
+/// companion) session, sourced LIVE from the `PublicAgentConfig` at every agent
+/// build. Deliberately a small DTO owned by the runtime layer so the factory
+/// stays free of the `nomifun-public-agent` config types (which depend on this
+/// crate, not the other way around — no cycle). Mirrors the shape a
+/// `PublicService`-clamped session needs: identity + hard service directive +
+/// grounded switch + the scoped knowledge-base id set + the answering model.
+#[derive(Debug, Clone)]
+pub struct PublicAgentRuntime {
+    /// Owner-facing brand / display name.
+    pub name: String,
+    /// Opening / welcome message shown to strangers on first contact.
+    pub greeting: String,
+    /// Tone & style guidelines (free-text; injected into the persona prompt).
+    pub tone: String,
+    /// Service policy / 服务守则 (business scope, forbidden topics, compliance).
+    /// Injected as a HARD system directive.
+    pub service_policy: String,
+    /// Grounded (strict) mode: only answer from the bound knowledge bases.
+    pub grounded_mode: bool,
+    /// The bound platform knowledge-base ids. The factory feeds these verbatim
+    /// into the scoped `knowledge_search` tool so a turn can never widen the base
+    /// set beyond the agent's configuration (the retrieval security boundary).
+    pub knowledge_base_ids: Vec<String>,
+    /// The model the agent answers with (used by the channel layer to pick the
+    /// conversation model; the factory itself uses `options.model`).
+    pub model: nomifun_common::ProviderWithModel,
+}
+
+/// Resolves a public agent's LIVE runtime + records inbound turns for audit.
+/// Implemented by `nomifun_public_agent::PublicAgentService`. Read at every agent
+/// build so persona / policy / grounded / KB edits take effect on the next turn
+/// (no stale session extra). A public-agent session's exposure is clamped to
+/// `PublicService` by the factory purely from the presence of
+/// `extra.public_agent_id` — resolving the runtime only supplies the persona, so
+/// a deleted/unresolvable agent still yields a hard-clamped (persona-less) session.
+#[async_trait::async_trait]
+pub trait PublicAgentProvider: Send + Sync {
+    /// The public agent's runtime persona/policy/model/KB, or `None` when the id
+    /// names no live public agent.
+    async fn resolve_public_agent(&self, id: &str) -> Option<PublicAgentRuntime>;
+
+    /// Best-effort audit hook for an inbound public-agent turn (surface e.g.
+    /// "channel", platform e.g. "telegram"). Default no-op so non-audit impls
+    /// (tests) are unaffected. Must never fail the turn.
+    async fn record_public_agent_turn(
+        &self,
+        _id: &str,
+        _surface: &str,
+        _platform: Option<&str>,
+        _text: &str,
+    ) {
+    }
+}
+
 /// Dependencies needed by the agent factory to construct agents.
 pub struct AgentFactoryDeps {
     pub skill_manager: Arc<AcpSkillManager>,
@@ -156,6 +211,14 @@ pub struct AgentFactoryDeps {
     /// Optional persona prompt provider for companionSession conversations that
     /// carry no `extra.system_prompt` (channel master-agent sessions).
     pub companion_prompt: Option<Arc<dyn CompanionPromptProvider>>,
+    /// Optional 对外伙伴 (public agent) runtime provider. When `Some` AND a
+    /// session carries `extra.public_agent_id`, the factory sources the persona /
+    /// service policy / grounded switch / scoped knowledge bases from the live
+    /// `PublicAgentConfig`. The `PublicService` exposure clamp fires from the
+    /// id's presence alone (independent of this provider), so an unresolvable id
+    /// still yields a hard-clamped session. `None` (standalone / tests) leaves
+    /// public-agent resolution unwired.
+    pub public_agent_provider: Option<Arc<dyn PublicAgentProvider>>,
 }
 
 /// Build a production agent factory that dispatches to concrete agent types.
