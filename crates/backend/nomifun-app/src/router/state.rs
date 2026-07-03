@@ -630,11 +630,7 @@ pub async fn build_channel_state(
             nomifun_requirement::RequirementServiceSink::creator_arc(
                 services.requirement_service.clone(),
             ),
-        ))
-        // 对外伙伴 auto-serve: strangers on a public-agent-bound platform run under
-        // this owner/system identity (per-chat conversations give isolation; the
-        // PublicService clamp is the boundary).
-        .with_owner_user_id(owner_user_id.clone()),
+        )),
     );
 
     let conv_repo: Arc<dyn nomifun_db::IConversationRepository> = Arc::new(

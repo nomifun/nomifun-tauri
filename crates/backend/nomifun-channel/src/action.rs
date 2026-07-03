@@ -66,11 +66,6 @@ pub struct ActionExecutor {
     /// Opt-in IM → requirement creator. `None` (default) keeps the normal AI
     /// dispatch path unchanged.
     requirement_creator: Option<Arc<dyn nomifun_common::RequirementCreator>>,
-    /// The owner/system identity under which auto-served strangers run on a
-    /// public-agent-bound platform (the `PublicService` clamp is the boundary,
-    /// not the user id; per-chat conversations give per-stranger isolation).
-    /// Defaults to the same system fallback `ChannelMessageService` uses.
-    owner_user_id: String,
 }
 
 /// Derive a requirement `(title, content)` from an inbound message's text:
@@ -102,7 +97,6 @@ impl ActionExecutor {
             settings,
             default_agent_type: default_agent_type.to_owned(),
             requirement_creator: None,
-            owner_user_id: "system_default_user".to_owned(),
         }
     }
 
@@ -113,14 +107,6 @@ impl ActionExecutor {
         creator: Option<Arc<dyn nomifun_common::RequirementCreator>>,
     ) -> Self {
         self.requirement_creator = creator;
-        self
-    }
-
-    /// Set the owner/system identity used to auto-serve strangers on
-    /// public-agent-bound platforms. Production wires the primary WebUI user
-    /// (the same id `ChannelMessageService` sends turns as).
-    pub fn with_owner_user_id(mut self, owner_user_id: impl Into<String>) -> Self {
-        self.owner_user_id = owner_user_id.into();
         self
     }
 
@@ -168,7 +154,14 @@ impl ActionExecutor {
                     .await?
                     .is_some()
                 {
-                    self.owner_user_id.clone()
+                    // Auto-register the stranger as a channel user (no pairing code) so
+                    // the session FK (assistant_sessions.user_id → assistant_users.id) is
+                    // satisfied. The agent itself runs under the owner/system identity
+                    // (set in ChannelMessageService); the PublicService clamp is the real
+                    // boundary, and the per-chat conversation gives per-stranger isolation.
+                    self.pairing
+                        .ensure_channel_user(user_id, &platform_type, channel_id, &msg.user.display_name)
+                        .await?
                 } else {
                     let response = self
                         .handle_unauthorized(user_id, &platform_type, channel_id, &msg.user.display_name)
@@ -1210,6 +1203,18 @@ mod action_tests {
             MessageResult::Dispatched { session_id, .. } => assert!(!session_id.is_empty()),
             other => panic!("stranger on a public-agent bot must be auto-served, got {other:?}"),
         }
+
+        // Regression guard (FK 787): auto-serve must REGISTER the stranger in
+        // assistant_users, because assistant_sessions.user_id foreign-keys to it.
+        // The earlier bug returned the owner's `users` id (not an assistant_users
+        // id), which violated the FK on session creation.
+        assert!(
+            repo.get_user_by_platform("tg_stranger", "telegram", "tg-1")
+                .await
+                .unwrap()
+                .is_some(),
+            "auto-served stranger must be auto-registered as an assistant_users row (the session FK target)"
+        );
     }
 
     /// The bypass is STRICTLY gated on a public-agent binding: a COMPANION-bound
