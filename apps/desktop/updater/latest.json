@@ -1,19 +1,15 @@
 {
-  "version": "0.2.0",
-  "notes": "- Improved orchestration reliability and control: DAG node pre-configuration,\n  per-node model selection, explicit in-conversation approval before execution,\n  and fixes for broken DAG lines, orphaned running nodes, one-node planning, and\n  blank pending states.\n- Added graceful handling for providers/models that do not support image input:\n  image capability tracking, proactive image removal, retry without interrupting\n  the conversation, and a visible in-conversation notice.\n- Expanded browser-use controls with silent mode defaults, managed/system\n  browser source selection, persistent encrypted browser login, a one-click\n  browser login action, and screenshot context for silent approvals.\n- Fixed WebUI credential persistence across restarts and added per-model context\n  window configuration.\n- Polished updater error handling, local update test clients, README screenshots,\n  provider quick links, and contact assets.\n- Packaging note: this Mac-side release publishes macOS installer and updater\n  assets. Windows and Linux packages must be added later from their native build\n  machines.",
-  "pub_date": "2026-07-03T16:05:51.932Z",
+  "version": "0.2.1",
+  "notes": "- Reworked local file-access authority and workspace binding flows.\n- Fixed reusable bot binding recovery for channel connections.\n- Fixed Windows agent shell execution and updater metadata coverage.\n- Polished conversation error handling, sendbox editing shortcuts, and public companion localization.",
+  "pub_date": "2026-07-03T16:44:14.170Z",
   "platforms": {
-    "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODRWVVl3VCtkeUVlMERnRUhpMjMzS2x1OVRNczBPZ0IwVmNZSnZxQXFtcHFPTlc5R0JMbzY1SnZqczU3RGVVb1I5Qml6NGQva2RFTjZrcGlWcENpaFFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzMDk0NzUwCWZpbGU6Tm9taUZ1bl8wLjIuMF94NjQtc2V0dXAuZXhlCm1kVnVCUVhlVFBtMkJsaUM1dG1TMGl3elFIWStYMnpFMmhXUEJpNyttWWNwT2U4ZmNxYzNxNXF3dDMva1pLMVdMTGdUVE9WSG5GaVBzMUFldDVhb0J3PT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.0/NomiFun_0.2.0_x64-setup.exe"
-    },
     "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODMyd1dFU1EzeHo4dk5ET3hWWS9UQVgvNk1naFFzdUJMTmVwOGlTSmtEYVFQZzlsQ3lXdzBhVFRqWk1iY0ZJTER0WkI2TUtKSHJZOWt4cytHQ2hRMHdNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzMDU3NDQyCWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6CkFaY3I4bmhPVW9Ja1dkd09xNTlmYWpPeGpLVzV4ZkYxRENNNzhoRjlvbGpuc1hHY0hxMWFjN1Zpei9rVGRxR2RiZWttdldWTURNamlyaVdUMXlSbUJRPT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.0/NomiFun.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODdnUlcwbFp4elJLUmxIRmt0ZXArcERXZ212RlI2Q21pelNUa3JBSTZnT0E1eFNuejBtMTMydGVwLzU5bENPZ0NVYWM4SGFpUmFYOEpWRCtlRjNiblFZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzMDk2OTE5CWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6Clp6bzB1WGxEd2taRWw2bGE3QzlaNWtQTzRXR3Mza0dlRHlIZVlzUU5RVmZmZWhTdUZldE5pd2JRODZ1eVZqdUg2aEpRMVpWTitRd245d1B3WTRId0FRPT0K",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.1/NomiFun.app.tar.gz"
     },
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODMyd1dFU1EzeHo4dk5ET3hWWS9UQVgvNk1naFFzdUJMTmVwOGlTSmtEYVFQZzlsQ3lXdzBhVFRqWk1iY0ZJTER0WkI2TUtKSHJZOWt4cytHQ2hRMHdNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzMDU3NDQyCWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6CkFaY3I4bmhPVW9Ja1dkd09xNTlmYWpPeGpLVzV4ZkYxRENNNzhoRjlvbGpuc1hHY0hxMWFjN1Zpei9rVGRxR2RiZWttdldWTURNamlyaVdUMXlSbUJRPT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.0/NomiFun.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODdnUlcwbFp4elJLUmxIRmt0ZXArcERXZ212RlI2Q21pelNUa3JBSTZnT0E1eFNuejBtMTMydGVwLzU5bENPZ0NVYWM4SGFpUmFYOEpWRCtlRjNiblFZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzMDk2OTE5CWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6Clp6bzB1WGxEd2taRWw2bGE3QzlaNWtQTzRXR3Mza0dlRHlIZVlzUU5RVmZmZWhTdUZldE5pd2JRODZ1eVZqdUg2aEpRMVpWTitRd245d1B3WTRId0FRPT0K",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.1/NomiFun.app.tar.gz"
     }
   }
 }
