@@ -203,7 +203,7 @@ export const PlatformConfigBody: React.FC<{
       <div className='text-12px text-t-tertiary bg-fill-2 rd-10px px-14px py-10px'>
         {channelTarget?.publicAgentId
           ? t('publicCompanion.channels.modelFollowsAgent', {
-              defaultValue: '机器人使用该对外伙伴的对话模型,在「身份 & 话术」页配置',
+              defaultValue: '机器人使用该对外伙伴的对话模型,在「概览」页配置',
             })
           : '机器人使用该伙伴的对话模型,在「对话」页配置'}
       </div>

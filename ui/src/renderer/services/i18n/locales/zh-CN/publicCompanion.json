@@ -63,6 +63,12 @@
     "metricModel": "对话模型",
     "modelOk": "已配置",
     "modelUnset": "未配置",
+    "modelTitle": "对话模型",
+    "modelDesc": "对外伙伴回答陌生人所用的模型 —— 一切对话能力的前置条件。就地选择，立即生效。",
+    "modelReady": "已配置",
+    "modelDefault": "使用默认",
+    "modelDefaultHint": "尚未指定专属模型时，将自动使用系统默认模型作答；建议为它固定一个模型，保证回答稳定一致。",
+    "modelSaved": "对话模型已更新",
     "dangerTitle": "删除对外伙伴",
     "dangerDesc": "永久删除该对外伙伴及其审计记录。此操作不可撤销。",
     "deleteTitle": "删除对外伙伴？",
@@ -148,7 +154,7 @@
     "unbindConfirm": "解绑后该机器人不再由此对外伙伴接待,并重置该渠道的活跃会话。",
     "bindSuccess": "已改由「{{name}}」接待,该渠道会话已重置",
     "otherBots": "{{num}} 个机器人已绑定其他对象",
-    "modelFollowsAgent": "机器人使用该对外伙伴的对话模型,在「身份 & 话术」页配置",
+    "modelFollowsAgent": "机器人使用该对外伙伴的对话模型,在「概览」页配置",
     "footerHint": "为某个平台连接并绑定机器人后,该渠道的陌生人将由这位对外伙伴接待。机器人使用该对外伙伴的对话模型。"
   }
 }

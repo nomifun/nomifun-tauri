@@ -8,11 +8,9 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button, Input } from '@arco-design/web-react';
 import { Message, SpeakerOne, User } from '@icon-park/react';
-import type { IPublicAgent, IPublicAgentModel, IPublicAgentPatch } from '@/common/adapter/ipcBridge';
+import type { IPublicAgent, IPublicAgentPatch } from '@/common/adapter/ipcBridge';
 import type { ArcoMessageInstance } from '@renderer/utils/ui/useArcoMessage';
-import { useModelProviderList } from '@renderer/hooks/agent/useModelProviderList';
 import { SectionCard, FieldRow } from '../components';
-import PublicAgentModelPicker from '../PublicAgentModelPicker';
 
 interface Props {
   agent: IPublicAgent;
@@ -20,15 +18,14 @@ interface Props {
   message: ArcoMessageInstance;
 }
 
-/** 身份 & 话术 —— 名称、开场白、语气规范、对话模型。改动累积到草稿，统一保存。 */
+/** 身份 & 话术 —— 名称、开场白、语气规范。改动累积到草稿，统一保存。
+ *  对话模型不在此处：它是一切回复的前置条件，已上移到「概览」页就地可配。 */
 const IdentitySection: React.FC<Props> = ({ agent, patch, message }) => {
   const { t } = useTranslation();
-  const { providers, getAvailableModels } = useModelProviderList();
 
   const [name, setName] = useState(agent.name);
   const [greeting, setGreeting] = useState(agent.greeting);
   const [tone, setTone] = useState(agent.tone);
-  const [model, setModel] = useState<IPublicAgentModel>(agent.model);
   const [saving, setSaving] = useState(false);
 
   // Re-seed the draft whenever the authoritative agent changes (e.g. after a reload).
@@ -36,36 +33,17 @@ const IdentitySection: React.FC<Props> = ({ agent, patch, message }) => {
     setName(agent.name);
     setGreeting(agent.greeting);
     setTone(agent.tone);
-    setModel(agent.model);
-  }, [agent.id, agent.name, agent.greeting, agent.tone, agent.model]);
-
-  // If the agent has NO model configured yet, pre-select the machine's default
-  // (first provider + its first model) so the owner can enable it in one click
-  // (Save). Nothing is persisted until Save; the dropdown remains fully editable.
-  // This is the console counterpart to the create-time model seed — it recovers
-  // agents created before a model existed / before seeding.
-  useEffect(() => {
-    if (agent.model.provider_id || model.provider_id) return;
-    const provider = providers[0];
-    const first = provider ? (getAvailableModels(provider)[0] ?? '') : '';
-    if (provider && first) setModel({ provider_id: provider.id, model: first });
-  }, [providers, getAvailableModels, agent.model.provider_id, model.provider_id]);
+  }, [agent.id, agent.name, agent.greeting, agent.tone]);
 
   const dirty = useMemo(
-    () =>
-      name !== agent.name ||
-      greeting !== agent.greeting ||
-      tone !== agent.tone ||
-      model.provider_id !== agent.model.provider_id ||
-      model.model !== agent.model.model,
-    [name, greeting, tone, model, agent]
+    () => name !== agent.name || greeting !== agent.greeting || tone !== agent.tone,
+    [name, greeting, tone, agent]
   );
 
   const discard = () => {
     setName(agent.name);
     setGreeting(agent.greeting);
     setTone(agent.tone);
-    setModel(agent.model);
   };
 
   const save = async () => {
@@ -76,7 +54,7 @@ const IdentitySection: React.FC<Props> = ({ agent, patch, message }) => {
     }
     setSaving(true);
     try {
-      await patch({ name: trimmed, greeting, tone, model });
+      await patch({ name: trimmed, greeting, tone });
       message.success(t('common.saveSuccess', { defaultValue: '已保存' }));
     } catch (e) {
       message.error(e instanceof Error ? e.message : String(e));
@@ -132,13 +110,6 @@ const IdentitySection: React.FC<Props> = ({ agent, patch, message }) => {
                 defaultValue: '例如：始终礼貌、专业、简洁；多用「您」；不确定时坦诚说明并引导留下联系方式。',
               })}
             />
-          </FieldRow>
-
-          <FieldRow
-            label={t('publicCompanion.identity.modelLabel', { defaultValue: '对话模型' })}
-            hint={t('publicCompanion.identity.modelHint', { defaultValue: '对外伙伴回答陌生人时使用的模型。' })}
-          >
-            <PublicAgentModelPicker value={model} onChange={setModel} />
           </FieldRow>
         </div>
       </SectionCard>

@@ -27,7 +27,10 @@ import PolicySection from './sections/PolicySection';
 import AuditSection from './sections/AuditSection';
 import ChannelsSection from './sections/ChannelsSection';
 
-const SECTIONS = ['overview', 'identity', 'knowledge', 'policy', 'audit', 'channels'] as const;
+// Order = discoverability of the two setup essentials first: 概览 (which now hosts
+// the 对话模型 config — the hard prerequisite for every reply) then 渠道部署 (where
+// it goes live). Behaviour tabs (身份/知识/守则) follow; 审计 stays last (monitoring).
+const SECTIONS = ['overview', 'channels', 'identity', 'knowledge', 'policy', 'audit'] as const;
 type SectionKey = (typeof SECTIONS)[number];
 
 const iconOf = (key: SectionKey, size = 15): React.ReactNode => {
@@ -50,7 +53,7 @@ const iconOf = (key: SectionKey, size = 15): React.ReactNode => {
 
 /**
  * 对外伙伴专属管理页（/public-companions/:id）—— 左侧子导航 + 右侧分区：
- * 概览 / 身份&话术 / 知识库 / 服务守则 / 审计&分析 / 渠道部署。
+ * 概览(含对话模型) / 渠道部署 / 身份&话术 / 知识库 / 服务守则 / 审计&分析。
  */
 const PublicAgentDetailPage: React.FC = () => {
   const { t } = useTranslation();

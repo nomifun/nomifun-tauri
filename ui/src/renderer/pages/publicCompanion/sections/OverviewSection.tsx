@@ -4,14 +4,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Modal, Switch } from '@arco-design/web-react';
 import { BookOne, DataSheet, Delete, Message, SafeRetrieval } from '@icon-park/react';
-import type { IPublicAgent, IPublicAgentPatch } from '@/common/adapter/ipcBridge';
+import type { IPublicAgent, IPublicAgentModel, IPublicAgentPatch } from '@/common/adapter/ipcBridge';
 import type { ArcoMessageInstance } from '@renderer/utils/ui/useArcoMessage';
 import { ipcBridge } from '@/common';
 import { SectionCard, StatusPill } from '../components';
+import PublicAgentModelPicker from '../PublicAgentModelPicker';
 
 interface Props {
   agent: IPublicAgent;
@@ -41,6 +42,28 @@ const StatTile: React.FC<{ icon: React.ReactNode; value: React.ReactNode; label:
 const OverviewSection: React.FC<Props> = ({ agent, patch, message, onDeleted }) => {
   const { t } = useTranslation();
   const modelReady = Boolean(agent.model.provider_id && agent.model.model);
+
+  // 对话模型 is edited in-place here (the single authoritative entry for this
+  // domain). Persist the moment a COMPLETE (provider + model) selection changes —
+  // no separate Save step, mirroring the desktop companion's overview model入口.
+  const [model, setModel] = useState<IPublicAgentModel>(agent.model);
+  useEffect(() => {
+    setModel(agent.model);
+  }, [agent.id, agent.model.provider_id, agent.model.model]);
+
+  const onModelChange = async (next: IPublicAgentModel) => {
+    setModel(next); // reflect the in-progress selection (incl. provider-only interim)
+    const complete = Boolean(next.provider_id && next.model);
+    const changed = next.provider_id !== agent.model.provider_id || next.model !== agent.model.model;
+    if (!complete || !changed) return;
+    try {
+      await patch({ model: next });
+      message.success(t('publicCompanion.overview.modelSaved', { defaultValue: '对话模型已更新' }));
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : String(e));
+      setModel(agent.model); // revert the picker on failure
+    }
+  };
 
   const toggleEnabled = async (checked: boolean) => {
     try {
@@ -78,6 +101,55 @@ const OverviewSection: React.FC<Props> = ({ agent, patch, message, onDeleted }) 
 
   return (
     <div className='flex flex-col gap-16px'>
+      {/* 对话模型 —— 一切回复的前置条件，置顶就地可配（本域唯一入口）。未指定则用系统默认。 */}
+      <SectionCard
+        icon={<Message theme='outline' size='16' fill='currentColor' className='block' style={{ lineHeight: 0 }} />}
+        title={t('publicCompanion.overview.modelTitle', { defaultValue: '对话模型' })}
+        desc={t('publicCompanion.overview.modelDesc', {
+          defaultValue: '对外伙伴回答陌生人所用的模型 —— 一切对话能力的前置条件。就地选择，立即生效。',
+        })}
+        action={
+          modelReady ? (
+            <span className='inline-flex items-center gap-5px rd-full px-9px py-2px text-11px font-600 leading-none text-[rgb(var(--success-6))] bg-[rgba(var(--success-6),0.12)] border border-solid border-[rgba(var(--success-6),0.26)]'>
+              <span className='w-6px h-6px rd-full' style={{ background: 'rgb(var(--success-6))' }} />
+              {t('publicCompanion.overview.modelReady', { defaultValue: '已配置' })}
+            </span>
+          ) : (
+            <span className='inline-flex items-center gap-5px rd-full px-9px py-2px text-11px font-600 leading-none text-[rgb(var(--warning-6))] bg-[rgba(var(--warning-6),0.12)] border border-solid border-[rgba(var(--warning-6),0.28)]'>
+              <span className='w-6px h-6px rd-full' style={{ background: 'rgb(var(--warning-6))' }} />
+              {t('publicCompanion.overview.modelDefault', { defaultValue: '使用默认' })}
+            </span>
+          )
+        }
+      >
+        <div className='flex flex-col gap-10px'>
+          <PublicAgentModelPicker value={model} onChange={(m) => void onModelChange(m)} />
+          {!modelReady && (
+            <div
+              className='flex items-start gap-7px rd-10px px-11px py-9px text-12px leading-18px'
+              style={{
+                background: 'rgba(var(--warning-6),0.08)',
+                border: '1px solid rgba(var(--warning-6),0.20)',
+                color: 'var(--color-text-2)',
+              }}
+            >
+              <SafeRetrieval
+                theme='outline'
+                size='14'
+                fill='rgb(var(--warning-6))'
+                className='block shrink-0'
+                style={{ lineHeight: 0, marginTop: 1 }}
+              />
+              <span>
+                {t('publicCompanion.overview.modelDefaultHint', {
+                  defaultValue: '尚未指定专属模型时，将自动使用系统默认模型作答；建议为它固定一个模型，保证回答稳定一致。',
+                })}
+              </span>
+            </div>
+          )}
+        </div>
+      </SectionCard>
+
       {/* Status + toggle */}
       <SectionCard
         icon={<SafeRetrieval theme='outline' size='16' fill='currentColor' className='block' style={{ lineHeight: 0 }} />}
@@ -118,17 +190,6 @@ const OverviewSection: React.FC<Props> = ({ agent, patch, message, onDeleted }) 
           icon={<DataSheet theme='outline' size='17' fill='currentColor' className='block' style={{ lineHeight: 0 }} />}
           value={t('publicCompanion.overview.retentionDays', { defaultValue: '{{n}} 天', n: agent.audit_retention_days })}
           label={t('publicCompanion.overview.metricRetention', { defaultValue: '审计保留' })}
-        />
-        <StatTile
-          icon={<Message theme='outline' size='17' fill='currentColor' className='block' style={{ lineHeight: 0 }} />}
-          value={
-            modelReady ? (
-              <span className='text-[rgb(var(--success-6))]'>{t('publicCompanion.overview.modelOk', { defaultValue: '已配置' })}</span>
-            ) : (
-              <span className='text-[rgb(var(--warning-6))]'>{t('publicCompanion.overview.modelUnset', { defaultValue: '未配置' })}</span>
-            )
-          }
-          label={t('publicCompanion.overview.metricModel', { defaultValue: '对话模型' })}
         />
       </div>
 
