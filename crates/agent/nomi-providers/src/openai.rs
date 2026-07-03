@@ -544,6 +544,16 @@ struct StreamState {
     /// Deferred Done event: populated when finish_reason arrives, emitted on
     /// [DONE] so the final usage-only chunk has a chance to update token counts.
     pending_done: Option<LlmEvent>,
+    /// Accumulated `content` / `reasoning_content` text across the stream. Used
+    /// ONLY as a fallback at finish: some models (e.g. Qwen/Hermes-style, and
+    /// step reasoning models under load) intermittently emit a tool call as a
+    /// `<tool_call>…</tool_call>` block in the TEXT/REASONING channel instead of
+    /// the structured `tool_calls` field. Without recovery the turn dead-ends with
+    /// no action (looks "stuck"). When finish arrives with NO structured tool calls
+    /// we scan these buffers and parse any embedded call. The happy path (structured
+    /// tool_calls present) never touches this.
+    content_buf: String,
+    reasoning_buf: String,
 }
 
 impl StreamState {
@@ -553,6 +563,8 @@ impl StreamState {
             input_tokens: 0,
             output_tokens: 0,
             pending_done: None,
+            content_buf: String::new(),
+            reasoning_buf: String::new(),
         }
     }
 
@@ -761,6 +773,109 @@ async fn process_sse_stream(
     StreamOutcome::Ok
 }
 
+/// Fallback tool-call recovery: some models (Qwen/Hermes-style, and step
+/// reasoning models intermittently under load) emit a tool call as a
+/// `<tool_call>…</tool_call>` block in the TEXT/REASONING channel instead of the
+/// structured `tool_calls` field. This is only consulted when the structured
+/// accumulator is empty at finish, so it never affects the normal path. Reasoning
+/// is scanned first (step puts the call there), then content. Returns `None` when
+/// no parseable call is found (turn dead-ends as before — no regression).
+fn recover_text_tool_calls(state: &StreamState) -> Option<Vec<LlmEvent>> {
+    let mut calls = parse_text_tool_calls(&state.reasoning_buf);
+    if calls.is_empty() {
+        calls = parse_text_tool_calls(&state.content_buf);
+    }
+    if calls.is_empty() {
+        return None;
+    }
+    Some(
+        calls
+            .into_iter()
+            .map(|(name, input)| LlmEvent::ToolUse {
+                id: generate_call_id(),
+                name,
+                input,
+                extra: None,
+            })
+            .collect(),
+    )
+}
+
+/// Extract every `<tool_call>…</tool_call>` block from `text` and parse each into
+/// (name, arguments). Handles both the Hermes JSON form
+/// (`<tool_call>{"name":..,"arguments":{..}}</tool_call>`) and the Qwen XML form
+/// (`<tool_call><function=NAME><parameter=KEY>VALUE</parameter>…</function></tool_call>`).
+fn parse_text_tool_calls(text: &str) -> Vec<(String, Value)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<tool_call>") {
+        let after = &rest[start + "<tool_call>".len()..];
+        let (block, next) = match after.find("</tool_call>") {
+            Some(end) => (&after[..end], &after[end + "</tool_call>".len()..]),
+            None => (after, ""),
+        };
+        if let Some(call) = parse_one_tool_call(block.trim()) {
+            out.push(call);
+        }
+        rest = next;
+    }
+    out
+}
+
+fn parse_one_tool_call(block: &str) -> Option<(String, Value)> {
+    // Hermes JSON form.
+    if block.starts_with('{') {
+        let v: Value = serde_json::from_str(block).ok()?;
+        let name = v.get("name")?.as_str()?.trim().to_string();
+        if name.is_empty() {
+            return None;
+        }
+        let args = match v.get("arguments").cloned() {
+            Some(Value::String(s)) => {
+                serde_json::from_str(&s).unwrap_or(Value::Object(serde_json::Map::new()))
+            }
+            Some(other) => other,
+            None => Value::Object(serde_json::Map::new()),
+        };
+        return Some((name, args));
+    }
+    // Qwen XML form.
+    let name = str_between(block, "<function=", ">")?.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let mut args = serde_json::Map::new();
+    let mut rest = block;
+    while let Some(ps) = rest.find("<parameter=") {
+        let after = &rest[ps + "<parameter=".len()..];
+        let Some(key_end) = after.find('>') else { break };
+        let key = after[..key_end].trim().to_string();
+        let val_start = &after[key_end + 1..];
+        let (raw_val, next) = match val_start.find("</parameter>") {
+            Some(e) => (&val_start[..e], &val_start[e + "</parameter>".len()..]),
+            None => (val_start, ""),
+        };
+        let val_trim = raw_val.trim();
+        // Parse the value as JSON when it is (arrays/objects/numbers/bools); else
+        // keep the raw string.
+        let val = serde_json::from_str::<Value>(val_trim)
+            .unwrap_or_else(|_| Value::String(val_trim.to_string()));
+        if !key.is_empty() {
+            args.insert(key, val);
+        }
+        rest = next;
+    }
+    Some((name, Value::Object(args)))
+}
+
+/// The substring of `s` strictly between the first `start` and the next `end`
+/// after it, or `None` if either delimiter is absent.
+fn str_between<'a>(s: &'a str, start: &str, end: &str) -> Option<&'a str> {
+    let i = s.find(start)? + start.len();
+    let j = s[i..].find(end)? + i;
+    Some(&s[i..j])
+}
+
 fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id: bool) -> Vec<LlmEvent> {
     let mut events = Vec::new();
 
@@ -796,6 +911,7 @@ fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id: bool) -> V
     if let Some(reasoning) = delta["reasoning_content"].as_str()
         && !reasoning.is_empty()
     {
+        state.reasoning_buf.push_str(reasoning);
         events.push(LlmEvent::ThinkingDelta(reasoning.to_string()));
     }
 
@@ -803,6 +919,7 @@ fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id: bool) -> V
     if let Some(content) = delta["content"].as_str()
         && !content.is_empty()
     {
+        state.content_buf.push_str(content);
         events.push(LlmEvent::TextDelta(content.to_string()));
     }
 
@@ -856,6 +973,21 @@ fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id: bool) -> V
                         stop_reason: StopReason::ToolUse,
                         usage: TokenUsage::default(),
                     });
+                } else if let Some(recovered) = recover_text_tool_calls(state) {
+                    // FALLBACK: no STRUCTURED tool calls, but the model emitted a
+                    // `<tool_call>…</tool_call>` block in the text/reasoning channel
+                    // (Qwen/Hermes format — step reasoning models do this
+                    // intermittently under load). Recover + emit it so the turn ACTS
+                    // instead of dead-ending with no output (the "卡死" symptom).
+                    // Only reached when the structured accumulator is empty, so the
+                    // normal path is untouched.
+                    for ev in recovered {
+                        events.push(ev);
+                    }
+                    state.pending_done = Some(LlmEvent::Done {
+                        stop_reason: StopReason::ToolUse,
+                        usage: TokenUsage::default(),
+                    });
                 } else if finish_reason == "stop" {
                     state.pending_done = Some(LlmEvent::Done {
                         stop_reason: StopReason::EndTurn,
@@ -885,6 +1017,52 @@ fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id: bool) -> V
 
 #[cfg(test)]
 mod tests {
+    use super::{parse_text_tool_calls, StreamState};
+    use serde_json::json;
+
+    /// Qwen XML form (the exact shape step-3.7-flash emitted in session 18 that
+    /// dead-ended): a `<tool_call><function=NAME><parameter=KEY>JSON</parameter>`
+    /// block in the reasoning channel → recovered as a structured call.
+    #[test]
+    fn recovers_qwen_xml_tool_call_from_text() {
+        let text = "I will now spawn two sub-agents.<tool_call>\n<function=nomi_spawn>\n<parameter=tasks>\n[{\"name\": \"北京天气\", \"prompt\": \"查北京天气\"}, {\"name\": \"广州天气\", \"prompt\": \"查广州天气\"}]\n</parameter>\n</function>\n</tool_call>";
+        let calls = parse_text_tool_calls(text);
+        assert_eq!(calls.len(), 1, "one tool call recovered");
+        let (name, input) = &calls[0];
+        assert_eq!(name, "nomi_spawn");
+        let tasks = input.get("tasks").and_then(|v| v.as_array()).expect("tasks array parsed as JSON");
+        assert_eq!(tasks.len(), 2, "both tasks parsed");
+        assert_eq!(tasks[0]["name"], json!("北京天气"));
+    }
+
+    /// Hermes JSON form: `<tool_call>{"name":..,"arguments":{..}}</tool_call>`.
+    #[test]
+    fn recovers_hermes_json_tool_call_from_text() {
+        let text = "<tool_call>{\"name\": \"nomi_run_status\", \"arguments\": {\"run_id\": \"run_x\"}}</tool_call>";
+        let calls = parse_text_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "nomi_run_status");
+        assert_eq!(calls[0].1["run_id"], json!("run_x"));
+    }
+
+    /// Multiple blocks recovered; plain text with no block yields nothing (no false
+    /// positives — normal turns never trigger the fallback).
+    #[test]
+    fn multiple_blocks_and_no_false_positives() {
+        assert!(parse_text_tool_calls("just a normal answer, no tools here").is_empty());
+        assert!(parse_text_tool_calls("<tool_call>not json and no function tag</tool_call>").is_empty());
+        let two = "<tool_call><function=a><parameter=x>1</parameter></function></tool_call> then <tool_call><function=b><parameter=y>2</parameter></function></tool_call>";
+        assert_eq!(parse_text_tool_calls(two).len(), 2);
+    }
+
+    /// The buffers default empty and only fill from deltas — a fresh state recovers
+    /// nothing (guards against the fallback firing on an empty turn).
+    #[test]
+    fn empty_state_recovers_nothing() {
+        let state = StreamState::new();
+        assert!(super::recover_text_tool_calls(&state).is_none());
+    }
+
     #[tokio::test]
     async fn stream_without_done_sentinel_still_emits_done() {
         use super::{StreamOutcome, process_sse_stream};
