@@ -9,6 +9,7 @@ nomifun-common.workspace = true
 nomifun-db.workspace = true
 nomifun-net.workspace = true
 nomifun-api-types.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
