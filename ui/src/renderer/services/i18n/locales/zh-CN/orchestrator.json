@@ -162,6 +162,8 @@
       "resumeError": "继续 Run 失败：{{error}}",
       "replan": "重新规划",
       "replanOk": "已重新规划",
+      "planningHint": "规划中…",
+      "draining": "进行中 {{count}} · 排空中",
       "loadError": "加载 Run 详情失败",
       "planningTitle": "正在规划任务…",
       "planningDesc": "编队正在拆解目标并生成任务图，稍候即可看到节点。",

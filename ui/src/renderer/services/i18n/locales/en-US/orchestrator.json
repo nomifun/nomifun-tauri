@@ -162,6 +162,8 @@
       "resumeError": "Failed to resume run: {{error}}",
       "replan": "Re-plan",
       "replanOk": "Re-planned",
+      "planningHint": "Planning…",
+      "draining": "{{count}} in flight · draining",
       "loadError": "Failed to load run detail",
       "planningTitle": "Planning tasks…",
       "planningDesc": "The fleet is breaking the goal into a task graph — nodes will appear shortly.",
