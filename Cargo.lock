@@ -6002,6 +6002,7 @@ dependencies = [
 name = "nomifun-system"
 version = "0.2.1"
 dependencies = [
+ "async-trait",
  "aws-config",
  "aws-sdk-bedrock",
  "axum",
