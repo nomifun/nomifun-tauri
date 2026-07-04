@@ -20,7 +20,9 @@ export function featureRoute(feature: ProviderUsageFeature, targetId?: string): 
     case 'publicCompanion':
       return targetId ? `/public-companions/${targetId}` : '/public-companions';
     case 'smartDecision':
-      return '/nomi';
+      // IDMM global backup model lives in Global Model Config → IDMM tab,
+      // where backup_provider_id / backup_model can be cleared to unbind.
+      return '/models?section=global';
     case 'orchestrator':
       return '/guid';
   }

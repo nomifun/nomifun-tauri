@@ -12,7 +12,7 @@ describe('providerInUse helpers', () => {
     expect(featureRoute('desktopCompanion')).toBe('/companion');
     expect(featureRoute('publicCompanion', 'pa_1')).toBe('/public-companions/pa_1');
     expect(featureRoute('publicCompanion')).toBe('/public-companions');
-    expect(featureRoute('smartDecision')).toBe('/nomi');
+    expect(featureRoute('smartDecision')).toBe('/models?section=global');
     expect(featureRoute('orchestrator')).toBe('/guid');
   });
 
