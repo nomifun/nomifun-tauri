@@ -25,18 +25,33 @@
 //! actions must be serialized. The registry gives each companion key its own
 //! [`tokio::sync::Mutex`]; [`BrowserRegistry::execute`] holds that mutex for the
 //! whole tool call, so the same companion's `observe`/`act`/`navigate` never run
-//! concurrently. Different companion keys hold different mutexes (and different
-//! Chrome processes / `user-data-dir`s), so they run independently.
+//! concurrently. Different companion keys hold different mutexes AND — crucially —
+//! different Chrome processes with **distinct `--user-data-dir`s**: each slot's
+//! `BrowserTool` self-allocates a process-unique profile dir
+//! (`<data_dir>/profiles/<token>`, see `BrowserTool::profile_dir`), so two keys
+//! browsing concurrently never share one user-data-dir and never hit Chromium's
+//! process singleton (the old code passed only a per-key *workspace* — which the
+//! engine used solely for downloads — while every slot's profile collapsed onto one
+//! shared `<data_dir>/profile`, so concurrent keys collided; that is fixed).
+//!
+//! **Idle eviction (资源上界)**: the slot map was insert-only, so a finished
+//! `conversation:<id>` kept a live Chrome forever and nothing bounded the number of
+//! concurrent Chromes (Chromium's singleton used to be the accidental bound; once
+//! profiles are per-instance that bound is gone). [`BrowserRegistry::sweep_idle`],
+//! run opportunistically on every [`BrowserRegistry::slot`] access, evicts slots idle
+//! past [`SLOT_IDLE_TTL_MS`] — dropping the `BrowserTool` kills its Chrome and cleans
+//! its ephemeral profile dir.
 //!
 //! **User decision (去 per-pet 隔离): browser IDENTITY is globally shared.** The
-//! per-companion *engine slot* (separate Chrome process + serialization mutex) is
-//! kept — collapsing to one engine would turn per-companion serialization into a
-//! global one, a behavior change we avoid. But every slot points at the **same
-//! shared credential vault** (`nomifun_secret::pet_vault_path` now ignores its key
-//! and routes to `{data_dir}/browser-secrets/shared`), so `secret:NAME` /
-//! login / domain policy are SHARED across companions and sessions (consistent with
-//! the unified-memory model). Per-companion slots isolate only the live Chrome
-//! process, not the persisted identity.
+//! per-companion *engine slot* (separate Chrome process + serialization mutex + a
+//! per-instance profile dir) is kept — collapsing to one engine would turn
+//! per-companion serialization into a global one, a behavior change we avoid. But
+//! every slot points at the **same shared credential vault**
+//! (`nomifun_secret::pet_vault_path` now ignores its key and routes to
+//! `{data_dir}/browser-secrets/shared`), so `secret:NAME` / login / domain policy are
+//! SHARED across companions and sessions (consistent with the unified-memory model).
+//! Per-companion slots isolate the live Chrome process + its ephemeral profile, not
+//! the persisted identity (login state flows through the shared encrypted vault).
 //!
 //! ## Workspace layout (默认 ④)
 //!
@@ -75,6 +90,12 @@ struct CompanionBrowser {
     /// `execute` so observe/act/navigate for the SAME companion never overlap
     /// (the facade engine is `is_concurrency_safe = false`).
     lock: AsyncMutex<()>,
+    /// **Slot idle tracking (并发/资源上界)**: wall-clock ms of the last `execute` on
+    /// this slot. [`BrowserRegistry::sweep_idle`] evicts slots idle past
+    /// [`SLOT_IDLE_TTL_MS`] so a finished `conversation:<id>` no longer keeps a live
+    /// Chrome forever (the map was insert-only). Initialized to now on creation so a
+    /// just-built slot is never swept before its first use.
+    last_used_ms: std::sync::atomic::AtomicU64,
 }
 
 /// **P3-GW2**: a browser action held awaiting out-of-band approval. Stashed by the
@@ -200,14 +221,12 @@ impl BrowserRegistry {
 
     /// The per-companion workspace dir (`{data_dir}/browser-profiles/{key}`).
     /// Pure path join — no I/O (the engine materializes `downloads/` on demand).
-    /// The key is sanitized of path separators so a `conversation:<id>` (or any
-    /// caller-influenced id) can never escape the profiles root.
+    /// The key is **injectively** encoded (percent-encode of path separators/`:`) so a
+    /// `conversation:<id>` (or any caller-influenced id) can never escape the profiles
+    /// root AND two distinct keys never collapse onto one workspace (a lossy `:`→`_`
+    /// map would let `conversation:5` and a literal `conversation_5` mix downloads).
     pub fn workspace_for(&self, key: &str) -> PathBuf {
-        let safe: String = key
-            .chars()
-            .map(|c| if c == '/' || c == '\\' || c == ':' { '_' } else { c })
-            .collect();
-        self.data_dir.join("browser-profiles").join(safe)
+        self.data_dir.join("browser-profiles").join(sanitize_key(key))
     }
 
     /// Get (or lazily create) the slot for a key. The `BrowserTool` is constructed
@@ -218,6 +237,10 @@ impl BrowserRegistry {
     /// the GW2 confirm hook (TODO at the dispatch layer).
     fn slot(&self, key: &str) -> Arc<CompanionBrowser> {
         let mut map = self.slots.lock().expect("browser registry slots poisoned");
+        // 资源上界：顺手驱逐空闲过久的 slot（其 BrowserTool drop → 杀 Chrome + 清 ephemeral profile），
+        // 使存活 Chrome 收敛到「近期活跃」的 key，绝不像旧的 insert-only 那样让已结束会话永久占一个 Chrome。
+        let now = now_ms();
+        map.retain(|_, s| !is_idle(s.last_used_ms.load(std::sync::atomic::Ordering::Relaxed), now, SLOT_IDLE_TTL_MS));
         if let Some(existing) = map.get(key) {
             return existing.clone();
         }
@@ -239,9 +262,22 @@ impl BrowserRegistry {
         let slot = Arc::new(CompanionBrowser {
             tool: Arc::new(tool),
             lock: AsyncMutex::new(()),
+            // 初始化为 now，使刚建的 slot 不会在首次使用前被上面的 sweep 误删。
+            last_used_ms: std::sync::atomic::AtomicU64::new(now),
         });
         map.insert(key.to_string(), slot.clone());
         slot
+    }
+
+    /// **资源上界：驱逐空闲过久的 slot**（`now - last_used >= SLOT_IDLE_TTL_MS`）。被驱逐 slot 的
+    /// [`CompanionBrowser`] 从 map 移除；当其最后一个 `Arc` 释放（无在途调用持有）时，`BrowserTool`
+    /// drop → 引擎 drop → 杀 Chrome + 清 ephemeral profile。在途调用因持有 slot `Arc` 保活到调用结束，
+    /// 故驱逐对并发调用安全。由 [`Self::slot`] 在每次访问时顺带调用；也供测试直接调用。
+    pub fn sweep_idle(&self, now_ms: u64) {
+        let mut map = self.slots.lock().expect("browser registry slots poisoned");
+        map.retain(|_, s| {
+            !is_idle(s.last_used_ms.load(std::sync::atomic::Ordering::Relaxed), now_ms, SLOT_IDLE_TTL_MS)
+        });
     }
 
     /// Drive a browser tool call for `key`, serialized against that companion's
@@ -250,6 +286,8 @@ impl BrowserRegistry {
     /// [`ToolResult`] for the caller to render to JSON.
     pub async fn execute(&self, key: &str, input: Value) -> ToolResult {
         let slot = self.slot(key);
+        // 记录活跃时刻（防被 sweep_idle 驱逐；见 CompanionBrowser::last_used_ms）。
+        slot.last_used_ms.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
         // Hold the per-companion mutex for the whole call so the same companion's
         // observe/act/navigate never run concurrently against one engine.
         let _guard = slot.lock.lock().await;
@@ -343,6 +381,47 @@ fn inject_out_of_band(mut input: Value) -> Value {
     input
 }
 
+/// Slot idle time-to-live (ms): a companion/conversation slot untouched this long is
+/// evicted on the next registry access — its `BrowserTool` drops, killing the Chrome
+/// process and (ephemeral) profile dir. Bounds live Chromes to *recently active* keys
+/// (the map was previously insert-only → a finished `conversation:<id>` kept a live
+/// Chrome forever). Generous so a single long browser op is never evicted mid-call.
+const SLOT_IDLE_TTL_MS: u64 = 10 * 60 * 1000;
+
+/// Wall-clock milliseconds since the Unix epoch. A backwards clock only makes a slot
+/// look *younger*, never falsely idle. Used for slot idle tracking.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// **[pure] Is a slot idle (evictable)?** `now - last_used >= ttl`. Saturating so a
+/// backwards clock (last_used in the "future") reads as fresh, never falsely idle.
+fn is_idle(last_used_ms: u64, now_ms: u64, ttl_ms: u64) -> bool {
+    now_ms.saturating_sub(last_used_ms) >= ttl_ms
+}
+
+/// **[pure] Injectively encode a registry key into a filesystem-safe dir segment.**
+/// Percent-encodes `%` (first, so the escape is unambiguous) and the path separators
+/// `/ \ :`. Injective: distinct keys always map to distinct segments (no lossy
+/// `:`→`_` collapse that would let `conversation:5` and a literal `conversation_5`
+/// share a downloads dir), and neutralizes separators so a key can't escape the root.
+fn sanitize_key(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    for c in key.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            '/' => out.push_str("%2F"),
+            '\\' => out.push_str("%5C"),
+            ':' => out.push_str("%3A"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Render a facade [`ToolResult`] into the gateway's JSON envelope. An error
 /// result becomes `{"error": ...}`; a success result carries the text and any
 /// images (base64 PNG) so a remote master agent can relay/inspect them.
@@ -371,6 +450,31 @@ mod tests {
     }
 
     #[test]
+    fn is_idle_flags_slots_past_ttl() {
+        // now - last_used >= ttl → idle。
+        assert!(is_idle(1_000, 5_000, 3_000), "4s idle with 3s ttl → evictable");
+        assert!(!is_idle(1_000, 3_000, 3_000) || is_idle(1_000, 4_000, 3_000)); // 边界附近
+        assert!(!is_idle(4_000, 5_000, 3_000), "1s idle with 3s ttl → not evictable");
+        // 时钟回拨（last_used 在未来）→ 饱和减为 0 → 视为新，不误删。
+        assert!(!is_idle(9_000, 5_000, 3_000), "future last_used reads as fresh");
+    }
+
+    #[test]
+    fn sweep_idle_evicts_stale_slots_keeps_fresh() {
+        use std::sync::atomic::Ordering;
+        let r = registry();
+        // 建两个 slot（不启动 Chrome——slot() 只懒构 tool）。
+        let stale = r.slot("companion_stale");
+        let _fresh = r.slot("companion_fresh");
+        // 把 stale 的 last_used 设到很久以前 → 应被 sweep 驱逐；fresh 保持 now。
+        stale.last_used_ms.store(0, Ordering::Relaxed);
+        r.sweep_idle(now_ms());
+        let map = r.slots.lock().unwrap();
+        assert!(!map.contains_key("companion_stale"), "stale slot must be evicted");
+        assert!(map.contains_key("companion_fresh"), "fresh slot must survive");
+    }
+
+    #[test]
     fn key_prefers_companion_then_conversation_then_default() {
         assert_eq!(BrowserRegistry::key_for(Some("companion_x"), "5"), "companion_x");
         // Whitespace-only companion id is treated as absent.
@@ -386,16 +490,22 @@ mod tests {
         let b = r.workspace_for("companion_b");
         assert_ne!(a, b, "different companions must get different workspaces");
         assert!(a.ends_with(PathBuf::from("browser-profiles").join("companion_a")));
-        // A conversation key's ':' / separators are sanitized so it stays under
-        // the profiles root (no traversal).
+        // 键消毒是**单射**（percent-encode）：`conversation:5` 与字面 `conversation_5` 绝不塌成同一目录
+        //（旧的 `:`→`_` 有损映射会塌，导致两会话下载/截图互相混淆）。
         let conv = r.workspace_for("conversation:5");
         assert!(
-            conv.ends_with(PathBuf::from("browser-profiles").join("conversation_5")),
+            conv.ends_with(PathBuf::from("browser-profiles").join("conversation%3A5")),
             "got {conv:?}"
         );
+        assert_ne!(
+            r.workspace_for("conversation:5"),
+            r.workspace_for("conversation_5"),
+            "key sanitization must be injective (distinct keys → distinct dirs)"
+        );
+        // 路径分隔符被中和（无 traversal），且仍单射。
         let evil = r.workspace_for("../../etc");
         assert!(
-            evil.ends_with(PathBuf::from("browser-profiles").join(".._.._etc")),
+            evil.ends_with(PathBuf::from("browser-profiles").join("..%2F..%2Fetc")),
             "path separators in a key must be neutralized: {evil:?}"
         );
     }

@@ -150,6 +150,16 @@ pub struct BrowserTool {
     /// fallback + the dedicated user-data-dir parent). Never the user's real
     /// browser profile.
     data_dir: PathBuf,
+    /// **并发隔离基石：本 facade 专属的 Chromium `--user-data-dir`**（`<data_dir>/profiles/<token>`）。
+    ///
+    /// 每个 `BrowserTool` 实例分配一个**进程内唯一**目录（token = pid + 单调计数 + 纳秒），使任意两个
+    /// 并发存活的引擎（不同会话 / 网关每 key / stdio 桥 / 编排子节点）**绝不共享同一 user-data-dir**——
+    /// 根治 Chromium 进程单例碰撞（第二个 chrome 转发命令行后退出 → CDP 断裂 → 节点失败）。**同一 facade
+    /// 生命周期内稳定**（`engine()` 因 SessionLost 自愈重启复用同一目录；此刻旧 chrome 已死，目录空闲）。
+    /// 灌进 [`nomi_browser_engine::EngineConfig::user_data_dir`]（配 `ephemeral_profile=true` → 引擎 Drop
+    /// 时清理）。登录态跨会话持久经**加密 vault 播种**（非依赖共享磁盘 profile）。红线不变：在我们自己的
+    /// `data_dir` 下，绝不指向用户真实 profile。
+    profile_dir: PathBuf,
     /// **P3-G2: per-session/per-pet 隔离 workspace 目录**（裁决⑨ / 默认④），灌进
     /// [`EngineConfig::workspace_dir`]。引擎据它把下载（E4）落进 `<workspace>/downloads`
     /// （[`nomi_browser_engine::download::download_dir`]）——**绝不**落用户真实 Downloads。
@@ -191,6 +201,14 @@ pub struct BrowserTool {
     /// retry per call — the same failure-cache discipline as `ComputerTool`'s
     /// accessibility engine.
     pub(crate) engine: Mutex<Option<Result<Arc<dyn BrowserEngine>, String>>>,
+    /// **Per-facade engine-construction gate (并发隔离)**. Held across the async
+    /// `create_engine().await` so concurrent *first* calls on one `BrowserTool`
+    /// (e.g. the MCP stdio bridge shares one `Arc<BrowserTool>` and calls `execute`
+    /// with zero upstream serialization) launch **at most one** Chrome against this
+    /// facade's single [`Self::profile_dir`] — never two processes racing the same
+    /// user-data-dir. `engine()` double-checks the cache after acquiring it, so a
+    /// waiter reuses the engine the first caller built instead of building its own.
+    engine_build_gate: tokio::sync::Mutex<()>,
     /// The most recent `observe` snapshot, kept for provenance/diagnostics and
     /// resolving `[ref=f<seq>e<n>]` actions against the generation they were
     /// produced for. F1 also reads its `url` as the **current origin** for the
@@ -353,6 +371,28 @@ pub struct BrowserTool {
     visual_locator: crate::visual_fallback::VisualLocatorRef,
 }
 
+/// Monotonic counter for per-facade user-data-dir tokens (unique within a process).
+static PROFILE_DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// **Allocate a process-unique Chromium `--user-data-dir`** under `<data_dir>/profiles/`.
+///
+/// Token = `pid-seq-nanos`: unique across facades (monotonic `seq`), across processes
+/// (`pid` — the MCP stdio bridge is a separate process), and practically collision-free
+/// vs a leftover dir from a prior run (`nanos` wall-clock; startup GC also sweeps stale
+/// dirs). This is what makes concurrent browser engines structurally unable to share one
+/// profile → no Chromium process-singleton handoff/exit. Pure path join (no I/O; the
+/// engine `create_dir_all`s it at launch). Red line: under our own `data_dir`, never the
+/// user's real profile.
+fn allocate_profile_dir(data_dir: &std::path::Path) -> PathBuf {
+    let seq = PROFILE_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let token = format!("{}-{}-{}", std::process::id(), seq, nanos);
+    data_dir.join("profiles").join(token)
+}
+
 impl BrowserTool {
     /// Construct the tool from the browser config. Reads `headless` (inverted to
     /// `headful`) and derives the engine data directory; does NOT launch a
@@ -427,9 +467,13 @@ impl BrowserTool {
     /// `encryption_key`). P2 ships `None` (empty vault → `secret:NAME` fails
     /// closed); the interception path + origin gate are complete and wired.
     pub fn with_data_dir(data_dir: PathBuf, headful: bool) -> Self {
+        // 并发隔离：每个 facade 分配进程内唯一 user-data-dir（<data_dir>/profiles/<token>），
+        // 使任意两个并发存活引擎绝不共享 profile（根治 Chromium 进程单例碰撞）。
+        let profile_dir = allocate_profile_dir(&data_dir);
         Self {
             description: format!("{DESCRIPTION}{}", capabilities_note(&default_capabilities())),
             data_dir,
+            profile_dir,
             // P3-G2: 默认无 per-pet workspace（仅有 BrowserConfig 的调用方 / 测试）。bootstrap 经
             // `with_policy` 传会话 workspace；引擎兜底落 <data_dir>/downloads（仍隔离，非用户 Downloads）。
             workspace_dir: None,
@@ -443,6 +487,8 @@ impl BrowserTool {
             // 持久登录节流保存：初始 None（首次导航即落一次 vault）。
             last_persist_login: Mutex::new(None),
             engine: Mutex::new(None),
+            // 并发隔离：per-facade 引擎构造锁（详见字段文档）。
+            engine_build_gate: tokio::sync::Mutex::new(()),
             last_snapshot: Mutex::new(None),
             secret_store: Mutex::new(None),
             // P3-X2: 默认无 secret 源（CLI / BrowserConfig-only / 测试）。bootstrap 经 `with_policy`
@@ -490,6 +536,13 @@ impl BrowserTool {
             // it via `.with_approval_gate(...)` to enable takeover + egress approval.
             approval_gate: None,
         }
+    }
+
+    /// This facade's dedicated Chromium `--user-data-dir` (`<data_dir>/profiles/<token>`),
+    /// unique per instance so concurrent engines never collide on Chromium's process
+    /// singleton. Stable for the facade's lifetime. See the `profile_dir` field doc.
+    pub fn profile_dir(&self) -> &std::path::Path {
+        &self.profile_dir
     }
 
     /// **P3-G2 builder**: set the per-session/per-pet workspace dir on a tool built
@@ -771,8 +824,23 @@ impl BrowserTool {
     /// cached too, so an unavailable backend is reported without retrying — the
     /// first action pays the launch cost, later actions reuse the same engine
     /// (or the same cached failure).
+    ///
+    /// **并发隔离**：construction is serialized by [`Self::engine_build_gate`] so that
+    /// concurrent first-calls on one facade (the MCP stdio bridge shares a single
+    /// `Arc<BrowserTool>` and runs actions with no upstream serialization) launch at most
+    /// ONE Chrome against this facade's single [`Self::profile_dir`] — two racing
+    /// launches on one user-data-dir would hit Chromium's process singleton and one would
+    /// fail. The gate is held across the async build; a waiter re-checks the cache and
+    /// reuses the engine the first caller built.
     async fn engine(&self) -> Result<Arc<dyn BrowserEngine>, String> {
         // Fast path: already constructed (success or cached failure).
+        if let Some(cached) = self.engine.lock().expect("engine poisoned").as_ref() {
+            return cached.clone();
+        }
+        // Serialize construction per facade (see method + `engine_build_gate` doc).
+        let _build = self.engine_build_gate.lock().await;
+        // Double-check: another task may have built (or cached a failure) while we waited
+        // on the gate — reuse it instead of launching a second Chrome on the same dir.
         if let Some(cached) = self.engine.lock().expect("engine poisoned").as_ref() {
             return cached.clone();
         }
@@ -785,19 +853,16 @@ impl BrowserTool {
             .expect("firewall_override poisoned")
             .clone()
             .unwrap_or_default();
-        // Slow path: build the engine WITHOUT holding the lock across the await
-        // (construction is async and may take seconds). A concurrent first call
-        // could also build one; that is fine — we keep whichever lands first.
+        // Slow path: build the engine while holding ONLY the async build gate (not the
+        // sync cache mutex) across the await — the gate guarantees single-flight, so no
+        // second launch races this facade's user-data-dir.
 
-        // 持久登录（seed 侧，激活原本 dead-wired 的 vault 恢复）：仅当开启持久登录 **且磁盘 profile
-        // 尚不存在**（全新安装 / profile 被清）时，从加密 vault 播种一次登录态。为什么只在 profile 全新时
-        // seed：所有会话共用同一磁盘 profile（`<data_dir>/profile`），Chrome 会从磁盘加载最新 cookie；
-        // 若每次启动都注入（可能过时的）vault，`Storage.setCookies` 是 upsert，会用旧值**覆盖磁盘上更
-        // 新的 cookie** → 掉登录。故 profile 已存在时磁盘即权威、不注入；仅全新 profile 用 vault 做
-        // 恢复/迁移种子。key 复用 secret vault 的机器绑定 key（同一把）。坏/缺 vault → None（优雅降级）。
-        let storage_state = if self.evaluate_persistent_login
-            && !self.data_dir.join("profile").exists()
-        {
+        // 持久登录（seed 侧）：仅当开启持久登录 **且本 facade 的 profile 目录尚不存在**（每实例唯一目录
+        // 首次启动即全新，故几乎总会 seed 一次；SessionLost 自愈重启时目录已在则不重复注入）时，从加密
+        // vault 播种登录态。**每实例隔离后，跨会话登录态的唯一权威来源就是共享加密 vault**（不再依赖共享
+        // 磁盘 profile）。首启空目录 → 注入 vault 恢复登录；已存在（同 facade 二次构造）→ 磁盘为准不覆盖。
+        // key 复用 secret vault 的机器绑定 key。坏/缺 vault → None（优雅降级）。
+        let storage_state = if self.evaluate_persistent_login && !self.profile_dir.exists() {
             self.persist_login_key().and_then(|key| {
                 load_storage_state(&shared_storage_state_path(&self.data_dir), &key)
                     .and_then(|s| serde_json::to_value(&s).ok())
@@ -808,6 +873,10 @@ impl BrowserTool {
 
         let result = create_engine(EngineConfig {
             data_dir: self.data_dir.clone(),
+            // 并发隔离基石：本 facade 专属唯一 user-data-dir（<data_dir>/profiles/<token>），使任意两个
+            // 并发存活引擎绝不共享 profile → 根治 Chromium 进程单例碰撞。ephemeral=true → 引擎 Drop 清理。
+            user_data_dir: Some(self.profile_dir.clone()),
+            ephemeral_profile: true,
             // PKG-1: inject the bundled Chrome resource dir (from Tauri resource dir)
             // so the engine resolve chain is: env > bundled > data_dir > download.
             bundled_dir: self.bundled_dir.clone(),
@@ -3255,6 +3324,34 @@ mod tests {
     fn new_defaults_to_non_bypassing_normal_session() {
         // `new`（只有 BrowserConfig 的调用方）默认普通会话——门不武装（不误拦）。
         assert!(!tool().session_bypasses_approval());
+    }
+
+    // ── 并发隔离：每个 facade 分配唯一 user-data-dir（根治 Chromium 进程单例碰撞）──
+    #[test]
+    fn allocates_unique_stable_profile_dir_under_data_dir() {
+        let data = std::env::temp_dir().join("bt-profile-iso");
+        let a = BrowserTool::with_data_dir(data.clone(), false);
+        let b = BrowserTool::with_data_dir(data.clone(), false);
+        // 同一 facade 生命周期内稳定（SessionLost 自愈重启复用同一目录）。
+        assert_eq!(a.profile_dir(), a.profile_dir());
+        // 跨实例唯一：两个会话 / 网关 key / stdio 桥绝不共享 user-data-dir。
+        assert_ne!(
+            a.profile_dir(),
+            b.profile_dir(),
+            "two BrowserTool instances must get distinct user-data-dirs (no singleton collision)"
+        );
+        // 落在 <data_dir>/profiles/ 下（GC 可扫的唯一根）。
+        assert!(
+            a.profile_dir().starts_with(data.join("profiles")),
+            "profile dir must live under <data_dir>/profiles/, got {:?}",
+            a.profile_dir()
+        );
+        // 绝非旧的共享 <data_dir>/profile。
+        assert_ne!(
+            a.profile_dir(),
+            data.join("profile"),
+            "must not reuse the legacy shared <data_dir>/profile"
+        );
     }
 
     // ── P3-G2: workspace_dir 传参链（构造带 workspace → 字段填对；默认 None；with_policy 透传）──

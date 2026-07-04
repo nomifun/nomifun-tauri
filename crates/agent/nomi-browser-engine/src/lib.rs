@@ -97,6 +97,19 @@ pub struct EngineConfig {
     /// 应用数据目录：下载兜底的 chrome 落点 + **专属** user-data-dir 的父目录。
     /// 默认 `std::env::temp_dir()/nomifun-browser-data`。
     pub data_dir: PathBuf,
+    /// **显式 user-data-dir（并发隔离基石）**：`Some` → 引擎用它作 Chromium `--user-data-dir`；
+    /// `None`（默认，向后兼容）→ 回退 `data_dir.join("profile")`（旧行为）。
+    ///
+    /// 红线不变（永不指向用户真实 profile）。**为什么需要它**：Chromium 进程单例禁止两个 Chrome
+    /// 同用一个 user-data-dir——第二个进程转发命令行后立即退出，我们 spawn 的 chrome 随之死亡，CDP
+    /// 连接失败。此前所有构造点（会话 / 网关每 key / stdio 桥 / 登录窗）都落到同一个 `data_dir/profile`，
+    /// 故任意两个并发存活的引擎相互踩踏。上层（facade / 网关 / 登录）据此为**每个存活实例**注入一个
+    /// 唯一目录（`data_dir/profiles/<token>`），使碰撞在结构上不可能。见 [`resolve_user_data_dir`]。
+    pub user_data_dir: Option<PathBuf>,
+    /// **临时 profile：Drop 时清理**。`true` → 引擎在关闭（`CdpBackend` Drop）时 best-effort 删除
+    /// [`Self::user_data_dir`] 指向的目录（per-instance 唯一目录用完即弃，避免磁盘无界增长）。
+    /// `false`（默认）→ 不删（共享 `data_dir/profile` 兜底、或登录窗的专用稳定目录需保留）。
+    pub ephemeral_profile: bool,
     /// 打包资源目录（Tauri resource dir，build 期固化的 chrome）。默认 None。
     pub bundled_dir: Option<PathBuf>,
     /// 是否希望带可见窗口。注意：无显示器时本标志被忽略，强制 headless。默认 false。
@@ -166,6 +179,8 @@ impl std::fmt::Debug for EngineConfig {
         let secret_count = self.known_secret_values.lock().map(|s| s.len()).unwrap_or(0);
         f.debug_struct("EngineConfig")
             .field("data_dir", &self.data_dir)
+            .field("user_data_dir", &self.user_data_dir)
+            .field("ephemeral_profile", &self.ephemeral_profile)
             .field("bundled_dir", &self.bundled_dir)
             .field("headful", &self.headful)
             .field("chrome_source", &self.chrome_source)
@@ -184,6 +199,10 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             data_dir: std::env::temp_dir().join("nomifun-browser-data"),
+            // 默认 None：回退 data_dir/profile（旧行为，零回归）。上层为并发隔离注入唯一目录。
+            user_data_dir: None,
+            // 默认 false：不删 profile（共享兜底目录 / 登录窗稳定目录需保留）。per-instance 注入 true。
+            ephemeral_profile: false,
             bundled_dir: None,
             headful: false,
             // 默认来源 = Managed（内置/下载 CfT 优先）= 现行为，零回归。
@@ -204,6 +223,45 @@ impl Default for EngineConfig {
     }
 }
 
+/// **[纯逻辑] 解析引擎的 `--user-data-dir`**（并发隔离基石）。
+///
+/// - `config.user_data_dir` 为 `Some` → 直接用它（上层为每个存活实例注入的唯一目录，使
+///   Chromium 进程单例碰撞在结构上不可能）。
+/// - `None`（默认/向后兼容）→ 回退 `config.data_dir.join("profile")`（旧行为）。
+///
+/// 红线不变：两条路径都在**我们自己的 data_dir 下**，绝不指向用户真实 profile。纯函数（不碰 FS），
+/// 故隔离解析可在不启动浏览器的前提下单测。
+pub fn resolve_user_data_dir(config: &EngineConfig) -> PathBuf {
+    config
+        .user_data_dir
+        .clone()
+        .unwrap_or_else(|| config.data_dir.join("profile"))
+}
+
+/// 默认并发冷启上限（同时**启动中**的 Chrome 进程数）。移除共享 profile 单例后，编排扇出可一次拉起
+/// 很多引擎；此闸把**同时冷启**的数量压住（防瞬时内存尖峰），排队而非失败。稳态存活数由网关 slot
+/// 空闲驱逐 + 会话生命周期约束。
+const DEFAULT_MAX_CONCURRENT_LAUNCHES: usize = 8;
+
+/// **[纯逻辑] 解析并发冷启上限**（env `NOMIFUN_BROWSER_MAX_CONCURRENT_LAUNCHES`）。
+/// 合法正整数 → 采用；缺省 / 非数字 / 0 → [`DEFAULT_MAX_CONCURRENT_LAUNCHES`]（0 会永久卡死，拒绝）。
+pub fn parse_max_concurrent_launches(env: Option<&str>) -> usize {
+    env.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_LAUNCHES)
+}
+
+/// 进程级冷启信号量（launch-scoped：仅在 `create_engine` 的 launch+connect+attach 期间持 permit，
+/// 建好即释放——限**同时冷启**数，不限存活总数）。
+fn launch_semaphore() -> &'static tokio::sync::Semaphore {
+    static SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| {
+        let permits =
+            parse_max_concurrent_launches(std::env::var("NOMIFUN_BROWSER_MAX_CONCURRENT_LAUNCHES").ok().as_deref());
+        tokio::sync::Semaphore::new(permits)
+    })
+}
+
 /// 端到端创建一个浏览器引擎：resolve → launch → connect → attach → page session。
 ///
 /// 失败语义（绝不 panic）：
@@ -222,7 +280,9 @@ pub async fn create_engine(config: EngineConfig) -> Result<Arc<dyn BrowserEngine
     .await?;
 
     // 2) 专属 user-data-dir（红线：非用户 profile；放在我们自己的 data_dir 下）。
-    let user_data_dir = config.data_dir.join("profile");
+    //    并发隔离基石：上层为每个存活实例注入唯一目录（`config.user_data_dir=Some(..)`），使
+    //    Chromium 进程单例碰撞在结构上不可能；`None` 回退旧行为 `<data_dir>/profile`。
+    let user_data_dir = resolve_user_data_dir(&config);
 
     let launch_config = LaunchConfig {
         chrome_path,
@@ -238,6 +298,13 @@ pub async fn create_engine(config: EngineConfig) -> Result<Arc<dyn BrowserEngine
         .unwrap_or_else(|| config.data_dir.clone());
     let download_dir = crate::download::ensure_download_dir(&workspace);
 
+    // 并发冷启限流：仅在 launch+connect+attach 期间持 permit（建好即释放），把**同时冷启**的 Chrome
+    // 数压在上限内——移除共享 profile 单例后编排扇出可能一次拉起很多引擎，此闸排队而非失败。
+    let _launch_permit = launch_semaphore()
+        .acquire()
+        .await
+        .expect("browser launch semaphore is never closed");
+
     // 3) launch（headless 由 display 决策）+ connect + attach + page session + setDownloadBehavior 沙箱。
     // P3-G1：把注入的 firewall 配置一路透传到 spawn_fetch_firewall_loop（不再硬编码 default）。
     // P3-D2：把注入的出口审批通道（egress_approver）透传到防火墙循环——被门控请求悬挂等其裁决
@@ -245,7 +312,7 @@ pub async fn create_engine(config: EngineConfig) -> Result<Arc<dyn BrowserEngine
     // W4d：把 storage_state 透传——Some（上层从 vault load_storage_state 解出的登录态）→
     //   from_launched 在 page 建好后 restore_cookies + restore_local_storage 灌登录态（持久登录）；
     //   None（默认）→ 不灌（现行为零回归）。
-    let backend = build_backend(
+    let mut backend = build_backend(
         &launch_config,
         Some(download_dir),
         config.workspace_dir.clone(),
@@ -257,12 +324,55 @@ pub async fn create_engine(config: EngineConfig) -> Result<Arc<dyn BrowserEngine
         config.known_secret_values,
     )
     .await?;
+    // 并发隔离：per-instance 唯一目录（`ephemeral_profile=true`）→ 标记引擎 Drop 时清理该目录
+    //（用完即弃，避免磁盘无界增长；孤儿由 profile::gc_stale_profiles 启动兜底）。共享兜底 / 登录窗
+    // 稳定目录（`ephemeral_profile=false`）→ 不清理，保留。
+    if config.ephemeral_profile {
+        backend.mark_ephemeral(launch_config.user_data_dir.clone());
+    }
     Ok(Arc::new(backend))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_max_concurrent_launches_defaults_and_overrides() {
+        // 缺省 → 默认上限。
+        assert_eq!(parse_max_concurrent_launches(None), DEFAULT_MAX_CONCURRENT_LAUNCHES);
+        // 合法正整数 → 采用。
+        assert_eq!(parse_max_concurrent_launches(Some("3")), 3);
+        assert_eq!(parse_max_concurrent_launches(Some("16")), 16);
+        // 非数字 / 0（会永久卡死）→ 回退默认（拒绝 0）。
+        assert_eq!(parse_max_concurrent_launches(Some("xyz")), DEFAULT_MAX_CONCURRENT_LAUNCHES);
+        assert_eq!(parse_max_concurrent_launches(Some("0")), DEFAULT_MAX_CONCURRENT_LAUNCHES);
+    }
+
+    #[test]
+    fn user_data_dir_prefers_explicit_over_data_dir_profile() {
+        // 显式注入的唯一目录（并发隔离）必须原样采用。
+        let explicit = EngineConfig {
+            user_data_dir: Some(PathBuf::from("/tmp/uniq-abc")),
+            data_dir: PathBuf::from("/tmp/data"),
+            ..Default::default()
+        };
+        assert_eq!(resolve_user_data_dir(&explicit), PathBuf::from("/tmp/uniq-abc"));
+
+        // None（向后兼容）→ 回退 <data_dir>/profile（旧行为）。
+        let fallback = EngineConfig {
+            data_dir: PathBuf::from("/tmp/data"),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_user_data_dir(&fallback),
+            PathBuf::from("/tmp/data").join("profile")
+        );
+
+        // Default 保持 None + 非临时（零回归）。
+        assert!(EngineConfig::default().user_data_dir.is_none());
+        assert!(!EngineConfig::default().ephemeral_profile);
+    }
 
     #[test]
     fn engine_config_default_is_headless_with_temp_data_dir() {

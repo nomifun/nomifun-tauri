@@ -395,6 +395,13 @@ impl AppServices {
         // `LiveKnowledgeCompleter` above).
         #[cfg(feature = "browser-use")]
         {
+            // 并发隔离：启动 GC 回收上次运行崩溃/硬杀遗留、未经引擎 Drop 清理的 per-instance profile
+            // 孤儿（`<data_dir>/browser-data/profiles/<token>`）。此刻本进程尚未启动任何引擎，故这些目录
+            // 都是旧运行的孤儿；保守 TTL（1h）以免误删并发 MCP stdio 桥进程刚建的活目录。best-effort。
+            nomi_browser_engine::profile::gc_stale_profiles(
+                &data_dir.join("browser-data").join("profiles"),
+                std::time::Duration::from_secs(3600),
+            );
             let browser_fetcher =
                 nomifun_ai_agent::BrowserFetcher::new(data_dir.join("knowledge-browser"));
             knowledge_service.set_render_fetcher(Arc::new(browser_fetcher));

@@ -72,6 +72,28 @@ fn isolated_data_dir(suffix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("nomifun-f3-e2e-{suffix}-data"))
 }
 
+/// **并发隔离：同一 facade 的两个并发首调用只启动一个引擎（构造锁 `engine_build_gate`）。**
+///
+/// 场景对应 MCP stdio 桥：它共享**一个** `Arc<BrowserTool>` 且对 `execute` **零上游串行**。两个并发
+/// 动作会各自触发 `engine()` 首建；若无构造锁，二者会各 `launch_chrome` 一个 Chrome，撞本 facade 的
+/// **单一** user-data-dir（`<data_dir>/profiles/<token>`）→ Chromium 进程单例 → 一个失败。构造锁使
+/// 只 launch 一个引擎、另一个复用 → 两个 navigate 都成功。这是 stdio 桥「并行查询一个节点失败」的修复证明。
+///
+///   set NOMIFUN_CHROME_BINARY=C:\Program Files\Google\Chrome\Application\chrome.exe
+///   cargo nextest run -p nomi-browser --run-ignored all -E 'test(concurrent_first_calls)'
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "需本机/打包 chrome：同 facade 并发构造锁证明（set NOMIFUN_CHROME_BINARY）"]
+async fn concurrent_first_calls_on_one_facade_launch_single_engine() {
+    let tool = BrowserTool::with_data_dir(isolated_data_dir("concurrent-gate"), false);
+    let page = "data:text/html,<title>gate</title><h1>ok</h1>";
+    let (a, b) = tokio::join!(
+        tool.execute(json!({"action": "navigate", "url": page})),
+        tool.execute(json!({"action": "navigate", "url": page})),
+    );
+    assert!(!a.is_error, "concurrent first-call A must succeed (single-flight engine build): {:?}", a.content);
+    assert!(!b.is_error, "concurrent first-call B must succeed (single-flight engine build): {:?}", b.content);
+}
+
 /// **多步 e2e（普通会话，经 facade）+ 安全门「普通会话 submit 不被门拦」证据。**
 ///
 /// navigate → observe → type username → type password → select_option Pro → click submit →

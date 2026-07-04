@@ -27,6 +27,7 @@
 //! 必须在 chrome **未运行**时改（launch 前，本引擎专属 dir 同一时刻只一个 chrome）。
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 /// 默认 profile 子目录。本引擎单 profile 启动（不传 `--profile-directory`），故恒 `Default`。
 pub const DEFAULT_PROFILE_SUBDIR: &str = "Default";
@@ -121,9 +122,90 @@ pub fn clear_stale_singleton(user_data_dir: &Path) {
     }
 }
 
+/// **[纯逻辑] 判定一个 per-instance profile 目录是否 stale（可被启动 GC 回收）**：其 `mtime` 早于
+/// `now - max_age`。用于清理上次运行崩溃/被硬杀、未走引擎 Drop 清理的孤儿 profile 目录。
+///
+/// - `mtime` 在未来（时钟回拨）→ 保守视为「新」（不删），避免误删。
+/// - `age >= max_age` → stale。纯函数（不碰 FS），故 GC 判定可脱离时钟/文件系统单测。
+pub fn is_stale_profile(dir_mtime: SystemTime, now: SystemTime, max_age: Duration) -> bool {
+    match now.duration_since(dir_mtime) {
+        Ok(age) => age >= max_age,
+        Err(_) => false, // mtime 在未来（时钟回拨）→ 保守视为新，不删
+    }
+}
+
+/// **启动时 GC per-instance profile 目录**：删除 `profiles_root` 下 `mtime` 早于 `now - max_age` 的
+/// **子目录**（上次运行崩溃/硬杀遗留、未经引擎 Drop 清理的孤儿）。
+///
+/// 语义：best-effort（读不到 root / 删失败 → 跳过，绝不 panic / 阻断启动）；**只删目录**，非目录项与
+/// `profiles_root` 本身原样保留。正常退出的 per-instance profile 已由 [`crate::backend::cdp::CdpBackend`]
+/// 的 ephemeral Drop 清理，本函数是孤儿兜底 + 磁盘增长上界。`max_age` 取保守值（如 1 小时）以免误删
+/// 另一进程（如 MCP stdio 桥）刚建的活目录。
+pub fn gc_stale_profiles(profiles_root: &Path, max_age: Duration) {
+    let now = SystemTime::now();
+    let Ok(entries) = std::fs::read_dir(profiles_root) else {
+        return; // root 不存在（首次运行）/ 不可读 → 无事可做
+    };
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_dir() {
+            continue; // 只回收目录（非目录项不碰）
+        }
+        let mtime = meta.modified().unwrap_or(now);
+        if is_stale_profile(mtime, now, max_age) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_stale_profile_flags_dirs_older_than_max_age() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000); // age 9000s
+        let recent = SystemTime::UNIX_EPOCH + Duration::from_secs(9_990); // age 10s
+        assert!(
+            is_stale_profile(old, now, Duration::from_secs(3600)),
+            "a dir older than max_age is stale"
+        );
+        assert!(
+            !is_stale_profile(recent, now, Duration::from_secs(3600)),
+            "a dir younger than max_age is not stale"
+        );
+        // 时钟回拨（mtime 在未来）→ 保守视为新，不删。
+        let future = now + Duration::from_secs(100);
+        assert!(
+            !is_stale_profile(future, now, Duration::from_secs(3600)),
+            "a future mtime (clock skew) is treated as fresh"
+        );
+    }
+
+    #[test]
+    fn gc_stale_profiles_removes_stale_dirs_only() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("profiles");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::write(root.join("keep.txt"), "x").unwrap();
+
+        // max_age = 0 → 一切皆 stale → 两个子目录都删；非目录项 + root 本身保留。
+        gc_stale_profiles(&root, Duration::from_secs(0));
+        assert!(!root.join("a").exists(), "stale dir a removed");
+        assert!(!root.join("b").exists(), "stale dir b removed");
+        assert!(root.join("keep.txt").exists(), "non-dir entries left untouched");
+        assert!(root.exists(), "profiles root itself is preserved");
+
+        // max_age 很大 → 刚建的目录不删（不误删活目录）。
+        std::fs::create_dir_all(root.join("c")).unwrap();
+        gc_stale_profiles(&root, Duration::from_secs(3600));
+        assert!(root.join("c").exists(), "a fresh dir survives a large max_age");
+
+        // root 不存在 → 静默无操作（首次运行）。
+        gc_stale_profiles(&tmp.path().join("nope"), Duration::from_secs(0));
+    }
 
     #[test]
     fn preferences_path_is_default_subdir() {

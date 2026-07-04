@@ -73,7 +73,12 @@ pub fn shared_storage_state_path(data_dir: &Path) -> PathBuf {
 /// **[W4d] 把 storage_state 加密持久化到磁盘 vault**（持久登录的「存」侧）。
 ///
 /// 序列化 [`StorageState`] → JSON → `nomifun_common::encrypt_string`（AES-256-GCM，机器绑定 `key`）→
-/// 写 `vault_path`（原子性 best-effort：直接 write，部分写入由 load 侧 GCM 认证失败兜底成 `None`）。
+/// **原子写** `vault_path`（同目录唯一临时文件 + rename 替换；同卷 rename 是原子替换）。
+///
+/// **为什么原子写**：per-instance profile 隔离后，多个 facade（会话/网关每 key/编排节点）会**并发**把
+/// 登录态存进同一个共享 vault。直接 `write` 可能被并发写者撕裂成半截密文；虽然 load 侧 GCM 认证失败会
+/// 兜底成 `None`（丢一轮登录、不崩），但原子 temp+rename 让读者**永远只看到完整文件**（末位写者胜），
+/// 消除撕裂。临时名带 pid+纳秒，故并发写者各用各的临时文件、互不覆盖。
 /// 父目录不存在则 best-effort 建（per-pet workspace 可能首次落 vault）。
 ///
 /// `key` 必须恰 32 字节（[`KEY_SIZE`]），否则 [`VaultError::Crypto`]。失败 → `Err`（**绝不 panic**）；
@@ -94,8 +99,19 @@ pub fn save_storage_state(
             parent.display()
         )));
     }
-    std::fs::write(vault_path, ciphertext.as_bytes())
-        .map_err(|e| VaultError::Io(format!("write vault {}: {e}", vault_path.display())))?;
+    // 原子写：同目录唯一临时文件（pid+纳秒 → 并发写者互不覆盖）→ rename 替换（同卷原子）。
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = vault_path.with_extension(format!("tmp-{}-{}", std::process::id(), nanos));
+    if let Err(e) = std::fs::write(&tmp, ciphertext.as_bytes()) {
+        return Err(VaultError::Io(format!("write vault tmp {}: {e}", tmp.display())));
+    }
+    if let Err(e) = std::fs::rename(&tmp, vault_path) {
+        let _ = std::fs::remove_file(&tmp); // 清理未落地的临时文件（best-effort）
+        return Err(VaultError::Io(format!("rename vault {}: {e}", vault_path.display())));
+    }
     Ok(())
 }
 
@@ -346,6 +362,29 @@ mod tests {
         assert_eq!(loaded, empty);
         assert!(loaded.cookies.is_empty());
         assert!(loaded.local_storage.is_empty());
+    }
+
+    #[test]
+    fn save_is_atomic_and_leaves_no_temp_file() {
+        // 原子写：save 后目录里只有 vault 本身，无残留临时文件（temp+rename 已完成替换）。
+        // 再存一次（覆盖）仍只剩 vault，且可正常读回（末位写者胜）。
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = storage_state_path(dir.path());
+        save_storage_state(&full_state(), &path, &test_key()).expect("save");
+        save_storage_state(&full_state(), &path, &test_key()).expect("overwrite save");
+
+        let entries: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        let vault_name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            entries,
+            vec![vault_name.clone()],
+            "after save the dir must hold only the vault (no leftover .tmp-* files): {entries:?}"
+        );
+        assert!(load_storage_state(&path, &test_key()).is_some(), "vault loads after atomic save");
     }
 
     #[test]

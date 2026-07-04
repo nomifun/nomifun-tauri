@@ -221,9 +221,48 @@ pub struct CdpBackend {
     /// read this set and `String::replace` each value with `[KNOWN_SECRET_REDACTED]` before
     /// heuristic redaction passes. See [`crate::KnownSecretValues`] doc for invariants.
     known_secret_values: crate::KnownSecretValues,
+    /// **并发隔离：本引擎实例专属临时 user-data-dir 的清理目标**（`Some` → ephemeral）。
+    /// `create_engine` 对每实例唯一目录（`<data_dir>/profiles/<token>`）经 [`Self::mark_ephemeral`]
+    /// 设成 `Some(dir)`；引擎关闭（[`Drop`]）时 best-effort 删除它（用完即弃，避免磁盘无界增长）。
+    /// `None`（默认）→ 不删（共享兜底 `<data_dir>/profile` / 登录窗稳定目录 / 测试固定目录需保留）。
+    /// 未删掉的孤儿（app 硬退出/崩溃）由 [`crate::profile::gc_stale_profiles`] 启动时兜底回收。
+    cleanup_user_data_dir: Option<PathBuf>,
+}
+
+impl Drop for CdpBackend {
+    /// **并发隔离：引擎关闭时 best-effort 清理本实例专属的临时 user-data-dir**（`ephemeral`=Some）。
+    ///
+    /// 时序：Drop::drop 体先跑、字段（含 `_child` 的 `kill_on_drop`）随后 drop——即此刻 chrome 尚在被杀、
+    /// Windows 上文件句柄释放有延迟。故派一个 **detached 线程**：先小睡让 chrome 退出/句柄释放，再重试
+    /// `remove_dir_all`（指数退避几次）。删不掉不致命（[`crate::profile::gc_stale_profiles`] 启动时兜底）。
+    fn drop(&mut self) {
+        let Some(dir) = self.cleanup_user_data_dir.take() else {
+            return; // 非 ephemeral（共享兜底 / 登录窗稳定目录 / 测试）→ 不清理
+        };
+        std::thread::spawn(move || {
+            for attempt in 0..10u32 {
+                std::thread::sleep(std::time::Duration::from_millis(200 * u64::from(attempt + 1)));
+                if !dir.exists() || std::fs::remove_dir_all(&dir).is_ok() {
+                    return;
+                }
+            }
+            tracing::debug!(
+                target: "nomi_browser_engine::profile",
+                dir = %dir.display(),
+                "ephemeral profile dir cleanup gave up after retries (startup GC will reclaim it)"
+            );
+        });
+    }
 }
 
 impl CdpBackend {
+    /// **并发隔离：把本引擎的 user-data-dir 标记为 ephemeral（Drop 时清理）**。`create_engine` 对每实例
+    /// 唯一目录（`<data_dir>/profiles/<token>`）调用它，使该目录随引擎关闭 best-effort 删除（用完即弃）。
+    /// 共享兜底目录 / 登录窗稳定目录 / 测试不调用它 → 保留（默认 `None`）。见 [`Self::cleanup_user_data_dir`]。
+    pub fn mark_ephemeral(&mut self, user_data_dir: PathBuf) {
+        self.cleanup_user_data_dir = Some(user_data_dir);
+    }
+
     /// 用一次成功的 [`launch_chrome`] 产物建后端：connect → 起 attach loop →
     /// enable_auto_attach → 取一个 page session。
     ///
@@ -393,6 +432,9 @@ impl CdpBackend {
             op_mutex: AsyncMutex::new(()),
             // Known-secret blackout: store the shared Arc for debug serializers to read.
             known_secret_values,
+            // 并发隔离：临时 user-data-dir 清理目标。默认 None（不清理——共享兜底 / 登录窗稳定目录 /
+            // 测试）；`create_engine` 对 per-instance 唯一目录调 `mark_ephemeral` 设成 Some → Drop 时清理。
+            cleanup_user_data_dir: None,
         };
 
         // ── W4d 持久登录：启动注入 storage_state（灌登录态）──────────────────────────

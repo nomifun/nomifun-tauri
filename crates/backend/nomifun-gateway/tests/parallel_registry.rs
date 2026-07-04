@@ -44,3 +44,31 @@ async fn execute_parallel_same_key_serializes_and_returns_all() {
     let results = reg.execute_parallel(batch).await;
     assert_eq!(results.len(), 2, "同 key 两调用都须返回(串行,无丢失)");
 }
+
+// ── real-chrome：并发隔离真机证明（#[ignore]，需本机/打包 chrome）───────────────────────
+// 上面两个测试是 hermetic 的（未知动作 → 不启动 Chrome），只证保序/串行/不死锁，**不**证明隔离。
+// 本测试用真动作让两个**不同 key** 并发各 navigate：每 key 的 BrowserTool 自分配进程内唯一
+// user-data-dir（`<data_dir>/profiles/<token>`），故两个 Chrome 真并发冷启都成功——旧的共享
+// `<data_dir>/profile` 下第二个会撞 Chromium 进程单例（转发命令行后退出）而失败。这正是修复的核心证明。
+//   set NOMIFUN_CHROME_BINARY=C:\Program Files\Google\Chrome\Application\chrome.exe 后：
+//   cargo nextest run -p nomifun-gateway --features browser-use --run-ignored all -E 'test(distinct_keys_both_launch)'
+#[tokio::test]
+#[ignore = "需本机/打包 chrome：并发隔离真机证明（set NOMIFUN_CHROME_BINARY）"]
+async fn execute_parallel_distinct_keys_both_launch_real_chrome() {
+    let reg = BrowserRegistry::default_for_browser_use();
+    let page = "data:text/html,<title>iso</title><h1>hello</h1>";
+    let batch = vec![
+        ("companion-iso-a".to_string(), json!({"action": "navigate", "url": page})),
+        ("companion-iso-b".to_string(), json!({"action": "navigate", "url": page})),
+    ];
+    let results = reg.execute_parallel(batch).await;
+    assert_eq!(results.len(), 2, "一输入一结果");
+    for (i, r) in results.into_iter().enumerate() {
+        let v = tool_result_to_value(r);
+        assert!(
+            v.get("error").is_none(),
+            "key {i} navigate must succeed — distinct per-instance user-data-dirs mean no Chromium \
+             singleton collision between the two concurrent launches: {v}"
+        );
+    }
+}

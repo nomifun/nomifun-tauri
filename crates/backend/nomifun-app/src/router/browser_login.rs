@@ -44,7 +44,9 @@ pub(crate) struct BrowserLoginState {
 struct BrowserLoginInner {
     /// 在活的登录引擎(`Some` = 窗口开着)。`close` 取走并 drop(=关窗)。
     session: Mutex<Option<Arc<dyn BrowserEngine>>>,
-    /// 共享浏览器数据目录(与 agent 工具同源 `<app_config>/browser-data`),其下 `profile` 是共享 profile。
+    /// 浏览器数据目录(与 agent 工具同源 `<app_config>/browser-data`)。登录窗用其下**专用稳定**子目录
+    /// `login-profile`（与 agent 的 per-instance 唯一目录 `profiles/<token>` 隔离，绝不共享）；vault 落在
+    /// `<data_dir>/browser-state/…`（`shared_storage_state_path`），登录态经它传播给 agent 会话。
     data_dir: PathBuf,
     /// 打包 Chrome 资源目录(与 agent 一致),`None` 走 env>下载兜底。
     bundled_dir: Option<PathBuf>,
@@ -100,6 +102,13 @@ pub(crate) async fn open_browser_login(
     }
     let config = EngineConfig {
         data_dir: inner.data_dir.clone(),
+        // 并发隔离：登录窗用**专用稳定** user-data-dir（`<data_dir>/login-profile`），与 agent 的
+        // per-instance 唯一目录（`<data_dir>/profiles/<token>`）+ 知识抓取（`knowledge-browser/profile`）
+        // 完全隔离——绝不再与 agent 会话共享一个 profile（此前共享 `<data_dir>/profile` 会与活着的 agent
+        // 会话撞 Chromium 单例，即注释里的 "launch_failed"）。稳定（非 ephemeral）→ 重开登录窗见上次登录态；
+        // 登录态传播给 agent 经 close 时写入的**共享加密 vault**（agent 首启从 vault 播种），不依赖共享磁盘 profile。
+        user_data_dir: Some(inner.data_dir.join("login-profile")),
+        ephemeral_profile: false,
         bundled_dir: inner.bundled_dir.clone(),
         // 可见窗口(有显示器时)让用户登录。无显示器的服务器会被迫 headless(窗口不可见)。
         headful: true,
@@ -117,7 +126,7 @@ pub(crate) async fn open_browser_login(
                 saved: false,
             }))
         }
-        // 多为同 profile 已被 agent 会话占用(Chrome Singleton),或本机无 Chrome。给可读信息。
+        // 现在登录窗用专用隔离 profile，不再与 agent 会话争用 → 主要失败源是本机无 Chrome。给可读信息。
         Err(e) => Json(ApiResponse::ok(LoginStatus {
             active: false,
             message: Some(format!("launch_failed:{e}")),
