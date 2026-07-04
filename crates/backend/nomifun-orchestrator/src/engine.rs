@@ -1559,7 +1559,13 @@ async fn run_loop(
                 let interval_due = last_batch_report
                     .map(|t| t.elapsed() >= BATCH_REPORT_INTERVAL)
                     .unwrap_or(true);
-                if done_since_report >= BATCH_REPORT_MIN_NODES && interval_due {
+                // Gate the batch report on `did_complete` too: a settle that is a
+                // permanent FAILURE fires `NodeFailed` inside `settle_task_outcome`
+                // above, so firing the batch report on the SAME settle would emit
+                // `node_failed` then `batch_progress` back-to-back. Only consider the
+                // batch report when THIS settle was a completion (the count floor + the
+                // interval gate still apply).
+                if did_complete && done_since_report >= BATCH_REPORT_MIN_NODES && interval_due {
                     let digest = match deps.run_repo.list_tasks(run_id).await {
                         Ok(tasks) if !tasks.is_empty() => build_summary_digest(&tasks),
                         _ => "（run 进行中，暂无可汇总的节点产出）".to_string(),

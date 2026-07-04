@@ -884,6 +884,10 @@ async fn spawn(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: SpawnPara
         });
     }
 
+    // 实际装配出的节点数（含可选的综合节点）——append 路径按此上报 task_count，避免
+    // synthesize 时少报一个节点（n 只数 agent 任务，不含综合节点）。
+    let appended_count = tasks.len();
+
     // ── 单 run 收敛：本会话若已绑定一个可追加的 run，直接把这批任务 append 上去，
     //    不新建 run、不重绑（extra.orchestrator_run_id 不变）——一个会话复用同一个持久
     //    run。取消的 run 不复活（run_is_appendable 排除 cancelled）。engine.add_tasks
@@ -902,11 +906,19 @@ async fn spawn(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: SpawnPara
                     {
                         deps.orchestrator_run_engine.start(existing_run_id.clone());
                     }
+                    // 只有 running 才是真正在跑；paused / awaiting_plan_approval / planning
+                    // 下 add_tasks 的重臂门并不会把 run 翻成 running，任务只是排队、不会执行——
+                    // 此时若仍宣称「已在后台并行执行」就是误导，必须提示用户先恢复该 run。
+                    let message = if run.status == "running" {
+                        "子任务已追加到本会话当前的编排 run 并在画布并行执行（复用同一个 run，未新建）。请告诉用户已在后台并行执行、进度见右侧画布，然后结束本轮——你无需轮询等待：全部完成或失败时系统会自动把结果回执给你再汇总。不要重复创建编排；用户若中途询问进度，可用 nomi_run_status 查一次。"
+                    } else {
+                        "子任务已追加到本会话当前的编排 run（复用同一个 run，未新建），但该 run 当前处于暂停中——任务只是排队、不会执行。请先在右侧编排面板继续/恢复该 run，任务才会开始跑；请把这一情况转达给用户。"
+                    };
                     ok(json!({
                         "run_id": existing_run_id,
                         "status": run.status,
-                        "task_count": n,
-                        "message": "子任务已追加到本会话当前的编排 run 并在画布并行执行（复用同一个 run，未新建）。请告诉用户已在后台并行执行、进度见右侧画布，然后结束本轮——你无需轮询等待：全部完成或失败时系统会自动把结果回执给你再汇总。不要重复创建编排；用户若中途询问进度，可用 nomi_run_status 查一次。",
+                        "task_count": appended_count,
+                        "message": message,
                     }))
                 }
                 Err(e) => json!({ "error": e.to_string() }),
@@ -1062,10 +1074,17 @@ async fn run_add_tasks(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: A
             if run.status == "running" && !deps.orchestrator_run_engine.is_running(&run_id) {
                 deps.orchestrator_run_engine.start(run_id.clone());
             }
+            // paused / awaiting_plan_approval / planning 下重臂门不会把 run 翻成 running，
+            // 追加的任务只是排队、不会执行——避免误导，明确提示用户先恢复该 run。
+            let message = if run.status == "running" {
+                "已把新任务追加到本会话当前的编排 run（未新建 run、无需审批），每个任务都是画布上可见的子 agent。继续执行、完成/失败自动回执——无需轮询。"
+            } else {
+                "已把新任务追加到本会话当前的编排 run（未新建 run），但该 run 当前处于暂停中——任务只是排队、不会执行。请先在右侧编排面板继续/恢复该 run，任务才会开始跑；请把这一情况转达给用户。"
+            };
             ok(json!({
                 "run_id": run_id,
                 "status": run.status,
-                "message": "已把新任务追加到本会话当前的编排 run（未新建 run、无需审批），每个任务都是画布上可见的子 agent。继续执行、完成/失败自动回执——无需轮询。",
+                "message": message,
             }))
         }
         Err(e) => json!({ "error": e.to_string() }),
