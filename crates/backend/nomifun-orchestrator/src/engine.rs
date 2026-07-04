@@ -129,6 +129,12 @@ pub enum RunOutcome {
     Stalled,
     /// An interactive run planned and parked awaiting the user's approval.
     AwaitingApproval,
+    /// A single node PERMANENTLY failed mid-run (retry budget exhausted / non-
+    /// retryable). Reported best-effort to the lead BEFORE the run's terminal state
+    /// so the master agent can repair (rerun w/ another model, adjust the graph,
+    /// adopt, or abandon) instead of waiting for the whole run to end. Distinct from
+    /// [`RunOutcome::Failed`], which is the run's terminal receipt.
+    NodeFailed,
 }
 
 impl RunOutcome {
@@ -139,6 +145,7 @@ impl RunOutcome {
             RunOutcome::Failed => "failed",
             RunOutcome::Stalled => "stalled",
             RunOutcome::AwaitingApproval => "awaiting_approval",
+            RunOutcome::NodeFailed => "node_failed",
         }
     }
 }
@@ -1750,6 +1757,31 @@ async fn settle_failed_or_retry(
             if t.on_fail.as_deref() == Some("skip_and_continue") {
                 if let Ok(edges) = deps.run_repo.list_deps(run_id).await {
                     skip_downstream(deps, run_id, task_id, &edges).await;
+                }
+            }
+        }
+
+        // 中途上报 lead:某节点永久失败时(必需节点将拖垮 run,软失败也值得知会),
+        // best-effort 唤起 master 会话让其决策(改图/换模型重跑/adopt/放弃),不等终态。
+        // 绝不在终态 `RunLocks` 锁内(本函数在 run_loop 分支(d),不持终态锁);失败仅
+        // warn。每永久失败节点触发一次(天然有界)。`last_error` 已由上面的
+        // `mark_task_failed` 落库,此处读到的是真实原因。
+        if let Ok(Some(run)) = deps.run_repo.get_run(run_id).await {
+            if let Some(lead_conv_id) = run.lead_conv_id {
+                let brief = match deps.run_repo.get_task(task_id).await {
+                    Ok(Some(t)) => format!(
+                        "节点「{}」永久失败：{}",
+                        t.title,
+                        t.last_error.as_deref().unwrap_or("未知原因")
+                    ),
+                    _ => format!("run {run_id} 的一个节点永久失败"),
+                };
+                if let Err(e) = deps
+                    .lead_reporter
+                    .report(lead_conv_id, run_id, RunOutcome::NodeFailed, &brief)
+                    .await
+                {
+                    warn!(run_id, task_id, error = %e, "mid-run node-failed lead report failed");
                 }
             }
         }
@@ -4100,7 +4132,9 @@ mod tests {
         assert_eq!(reports[0].2, "completed", "outcome is completed");
     }
 
-    /// A FAILED run reports exactly once, with `Failed`, to its lead conv.
+    /// A FAILED run reports its TERMINAL `Failed` receipt exactly once to its lead
+    /// conv. (Task 3 adds a mid-run `node_failed` receipt BEFORE the terminal one, so
+    /// this asserts on the count of `failed` receipts, not the total report count.)
     #[tokio::test]
     async fn failed_run_reports_once_to_lead() {
         let worker: Arc<dyn WorkerRunner> = Arc::new(AlwaysFailWorker);
@@ -4112,15 +4146,85 @@ mod tests {
             wait_run_status(&run_service, &run_id, "failed").await,
             "run must fail"
         );
-        await_first_report(&reporter).await;
+        // The terminal `failed` receipt fires AFTER the loop exits, so it can lag the
+        // persisted status the poll above observed (and the mid-run `node_failed`
+        // receipt) — wait for it specifically rather than for the first report.
+        let mut saw_failed = false;
+        for _ in 0..40 {
+            if reporter
+                .reports
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, _, o)| o == "failed")
+            {
+                saw_failed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         let reports = reporter.reports.lock().unwrap().clone();
+        assert!(saw_failed, "terminal failed receipt must fire, got {reports:?}");
+        // Exactly ONE terminal `failed` receipt (the mid-run `node_failed` is correct
+        // additional behaviour, not a duplicate terminal report).
+        let failed: Vec<_> = reports.iter().filter(|(_, _, o)| o == "failed").collect();
         assert_eq!(
-            reports.len(),
+            failed.len(),
             1,
-            "exactly one lead report on failure, got {reports:?}"
+            "exactly one terminal `failed` lead report, got {reports:?}"
         );
-        assert_eq!(reports[0].0, 42, "reported to the lead conversation");
-        assert_eq!(reports[0].2, "failed", "outcome is failed");
+        assert_eq!(failed[0].0, 42, "reported to the lead conversation");
+    }
+
+    /// A node that PERMANENTLY fails mid-run re-engages the lead conversation with a
+    /// best-effort `node_failed` receipt BEFORE the run reaches its terminal state,
+    /// so the master agent can repair (rerun w/ another model, adjust the graph,
+    /// adopt, or abandon) instead of waiting for the whole run to end. `AlwaysFail`
+    /// worker + `max_worker_retries = 0` → the first attempt is terminal for the
+    /// node; the mid-run report fires from `settle_failed_or_retry`'s permanent-fail
+    /// branch, after `mark_task_failed` persisted the reason.
+    #[tokio::test]
+    async fn permanent_node_failure_reports_to_lead_midrun() {
+        let worker: Arc<dyn WorkerRunner> = Arc::new(AlwaysFailWorker);
+        // max_retries = 0 → the first failure is terminal for the node (no retry wait).
+        let (run_service, engine, reporter) = reporter_stack(worker, 0).await;
+        let run_id = adhoc_lead_run(&run_service, 55).await;
+        engine.start(run_id.clone());
+        assert!(
+            wait_run_status(&run_service, &run_id, "failed").await,
+            "run must fail"
+        );
+        // The mid-run receipt is pushed during settle (before the terminal status
+        // write the poll above observed), so it is already present here — but poll a
+        // bounded moment to stay robust against scheduling.
+        let mut saw_node_failed = false;
+        for _ in 0..40 {
+            if reporter
+                .reports
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, _, o)| o == "node_failed")
+            {
+                saw_node_failed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let reports = reporter.reports.lock().unwrap().clone();
+        assert!(
+            saw_node_failed,
+            "a permanent node failure must produce a mid-run node_failed lead report, got {reports:?}"
+        );
+        // The mid-run receipt targets the lead conversation.
+        let node_failed = reports
+            .iter()
+            .find(|(_, _, o)| o == "node_failed")
+            .expect("node_failed report present");
+        assert_eq!(
+            node_failed.0, 55,
+            "mid-run node_failed reported to the lead conversation"
+        );
     }
 
     /// A permanently-failed task PERSISTS a `last_error` reason, surfaced on the DTO
