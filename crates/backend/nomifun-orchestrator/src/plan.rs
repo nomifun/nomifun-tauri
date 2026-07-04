@@ -578,6 +578,7 @@ Rules:\n\
 - COMPOSING PATTERNS: the kinds above are building blocks — COMBINE them when the goal calls for it. Each pattern is just a task plus its \"depends_on\" edges, so you compose by CHAINING one pattern's aggregator/result into the next pattern's inputs. Reach for a composition only when the goal genuinely needs it (do not nest patterns gratuitously). The most useful compositions:\n\
   - FAN-OUT → JUDGE → SYNTHESIS (explore alternatives, pick the best, then build on it): emit M candidate \"kind\":\"agent\" siblings sharing a \"{\\\"group\\\":\\\"candidates\\\"}\" tag; N judge \"kind\":\"agent\" tasks each \"depends_on\" ALL M candidates emitting a \"{\\\"scores\\\":[..]}\" ballot; ONE \"kind\":\"judge\" task \"depends_on\" ALL N judges (it REPORTS the winning candidate index); then a closing \"kind\":\"synthesis\" (or plain \"kind\":\"agent\") task \"depends_on\" the judge that takes the winner and produces the final deliverable.\n\
   - VERIFY-GATE → DOWNSTREAM (validate a result before anything builds on it): emit the task T to validate, then N skeptic \"kind\":\"agent\" tasks each \"depends_on\":[T] emitting a \"{\\\"pass\\\":bool}\" verdict, then ONE \"kind\":\"verify\" task \"depends_on\" ALL N skeptics with a \"{\\\"vote\\\":...}\" policy, then the downstream work (a \"kind\":\"synthesis\" merge or a plain \"kind\":\"agent\" build step) \"depends_on\" the VERIFY task — on a FAIL verdict the engine SKIPS that downstream automatically so unvalidated work never runs.\n\
+  - 收尾验收(acceptance)：当目标是多阶段/正确性关键(会有他人基于产物继续工作、或交付物必须达标)时，在最终汇聚处加一个收尾 verify 门——用 2-3 个独立 skeptic agent 对照原始目标校验「最终产物是否达标、是否遗漏关键交付」，再由一个 kind:\"verify\" 任务按 majority 汇总；只有验收 PASS 才算真正完工。简单/单步目标不必加，避免过度工程。\n\
   - LOOP WITH AN INTERNAL CHECK (iterate until the result is good enough): emit a BODY \"kind\":\"agent\" task that BOTH produces a round of work AND self-assesses it, ending its output with a strict-JSON verdict {\\\"pass\\\":true|false} (or a PASS/FAIL marker); then ONE \"kind\":\"loop\" task \"depends_on\":[BODY] with \"pattern_config\":\"{\\\"max_iter\\\":N,\\\"stop\\\":{\\\"kind\\\":\\\"approved\\\"}}\" — the loop re-runs the body until ITS OWN verdict PASSES, bounded by the max_iter hard cap (the body sees its prior round's output, so it refines until it approves itself or the cap stops it). Downstream \"depends_on\" the LOOP.\n\
 - \"pattern_config\" is a raw JSON STRING (or omit it). It carries the fan-out \"group\" tag, a verify task's \"vote\" policy, a judge task's \"aggregate\" policy, OR a loop task's \"max_iter\"+\"stop\" criterion (see above); leave it out for ordinary tasks.\n\
 - \"task_profile\", \"member_index\" and \"rationale\" are optional.\n\
@@ -1388,6 +1389,18 @@ mod tests {
         for kw in ["majority", "unanimous", "threshold"] {
             assert!(PLAN_SYSTEM.contains(kw), "rules must teach vote policy '{kw}': {PLAN_SYSTEM}");
         }
+    }
+
+    // Task 4: the system prompt must TEACH a CLOSING acceptance/verify gate for
+    // complex (multi-stage / correctness-critical) goals — reusing the existing
+    // verify+skeptics machinery — so the final deliverable is validated before the
+    // run is considered done. It must coexist with the general verify teaching.
+    #[test]
+    fn plan_system_teaches_closing_acceptance_gate() {
+        assert!(super::PLAN_SYSTEM.contains("验收") || super::PLAN_SYSTEM.contains("acceptance"),
+            "PLAN_SYSTEM must instruct a closing acceptance/verify gate for complex goals");
+        // 与既有 verify 教学并存
+        assert!(super::PLAN_SYSTEM.contains("verify"));
     }
 
     // UC-1c: the system prompt must TEACH the judge pattern — the `judge` kind,
