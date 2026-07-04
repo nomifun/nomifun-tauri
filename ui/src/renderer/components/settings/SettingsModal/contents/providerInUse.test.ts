@@ -9,7 +9,7 @@ import { featureRoute, groupUsagesByFeature, parseProviderInUseDetails, type Pro
 
 describe('providerInUse helpers', () => {
   test('featureRoute maps each feature', () => {
-    expect(featureRoute('desktopCompanion')).toBe('/companion');
+    expect(featureRoute('desktopCompanion')).toBe('/nomi');
     expect(featureRoute('publicCompanion', 'pa_1')).toBe('/public-companions/pa_1');
     expect(featureRoute('publicCompanion')).toBe('/public-companions');
     expect(featureRoute('smartDecision')).toBe('/models?section=global');
