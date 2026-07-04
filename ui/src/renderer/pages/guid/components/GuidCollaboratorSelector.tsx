@@ -6,6 +6,7 @@
 
 import React, { useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import classNames from 'classnames';
 import { Button, Dropdown } from '@arco-design/web-react';
 import { Branch, Down } from '@icon-park/react';
 import type { TModelRef } from '@/common/types/orchestrator/orchestratorTypes';
@@ -21,6 +22,9 @@ export interface GuidCollaboratorSelectorProps {
   /** The 主模型 — excluded from the collaborator list (it is always the lead and
    * already in the run's pool). */
   mainModel?: TModelRef | null;
+  /** Optional extra class merged onto the trigger button so callers (e.g. the
+   * conversation composer) can restyle the pill. */
+  className?: string;
 }
 
 /** Case-insensitive substring match against an option's text label — mirrors
@@ -44,7 +48,7 @@ const filterByLabel = (input: string, option: React.ReactNode): boolean => {
  * just the 主模型. Visuals reuse the OrchestratorComposer popover tokens so the
  * two model surfaces read as one family.
  */
-const GuidCollaboratorSelector: React.FC<GuidCollaboratorSelectorProps> = ({ value, onChange, mainModel }) => {
+const GuidCollaboratorSelector: React.FC<GuidCollaboratorSelectorProps> = ({ value, onChange, mainModel, className }) => {
   const { t } = useTranslation();
   const { providers, getAvailableModels, formatModelLabel, hasModels } = useModelRange();
   const [open, setOpen] = useState(false);
@@ -131,7 +135,7 @@ const GuidCollaboratorSelector: React.FC<GuidCollaboratorSelectorProps> = ({ val
   return (
     <Dropdown trigger='click' popupVisible={open} onVisibleChange={setOpen} droplist={panel} position='tr'>
       <Button
-        className='sendbox-model-btn guid-config-btn'
+        className={classNames('sendbox-model-btn guid-config-btn', className)}
         shape='round'
         size='small'
         data-testid='guid-collaborator-selector'
