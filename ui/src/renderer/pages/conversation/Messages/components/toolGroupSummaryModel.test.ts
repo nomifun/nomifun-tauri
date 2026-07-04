@@ -52,6 +52,17 @@ describe('buildToolReceiptSummaryParts', () => {
     ]);
   });
 
+  test('uses the concrete command from input when a shell tool has no description', () => {
+    const parts = buildToolReceiptSummaryParts(
+      [tool({ key: 'check', name: 'Bash', input: '{"command":"bun run check"}', status: 'running' })],
+      'running'
+    );
+
+    expect(parts).toEqual([
+      { action: 'run_commands', count: 1, state: 'running', target: 'bun run check' },
+    ]);
+  });
+
   test('recognizes code search and file listing as scan-friendly receipt titles', () => {
     const parts = buildToolReceiptSummaryParts(
       [
@@ -93,7 +104,7 @@ describe('buildToolSummaryDescriptor', () => {
       'running'
     );
 
-    expect(descriptor?.target).toBe('Bash bun test ...');
+    expect(descriptor?.target).toBe('bun test ...');
     expect(descriptor?.count).toBe(2);
   });
 
@@ -106,7 +117,7 @@ describe('buildToolSummaryDescriptor', () => {
       'failed'
     );
 
-    expect(descriptor?.target).toBe('Bash bun test ...');
+    expect(descriptor?.target).toBe('bun test ...');
   });
 
   test('uses the latest completed tool for completed groups', () => {

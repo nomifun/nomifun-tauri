@@ -32,9 +32,15 @@ describe('MessageList turn completion disclosure structure', () => {
     expect(source.includes('defaultExpanded={true}')).toBe(false);
   });
 
-  test('keeps internal thinking messages out of the visible execution stream', () => {
-    expect(source.includes("if (message.type === 'thinking') continue;")).toBe(true);
+  test('keeps running thinking visible while hiding completed thinking receipts', () => {
+    expect(source.includes("if (message.type === 'thinking' && message.content.status === 'done') continue;")).toBe(true);
+    expect(source.includes("if (message.type === 'thinking') continue;")).toBe(false);
     expect(source.includes('thinkingCompletedWithDuration')).toBe(false);
+  });
+
+  test('routes context compaction tips through process receipts instead of assistant text', () => {
+    expect(source.includes('isContextCompressionTip')).toBe(true);
+    expect(source.includes("if (isContextCompressionTip(item)) return 'process';")).toBe(true);
   });
 
   test('keeps the implementation scoped to the message content area', () => {

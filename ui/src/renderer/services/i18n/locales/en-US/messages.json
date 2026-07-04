@@ -30,6 +30,7 @@
     "fileChanged": "Edited {{target}} {{stats}}",
     "thinkingRunning": "Thinking",
     "thinkingCompleted": "Thought",
+    "contextCompressed": "Context compressed",
     "searchedTarget": "Searched {{target}}",
     "waitingPermission": "Waiting to confirm {{target}}",
     "agentConnecting": "Connecting {{target}}",

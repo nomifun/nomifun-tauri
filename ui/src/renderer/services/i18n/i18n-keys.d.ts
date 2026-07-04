@@ -1603,6 +1603,7 @@ export type I18nKey =
   | 'messages.planTodoList'
   | 'messages.processReceipt.agentConnecting'
   | 'messages.processReceipt.agentFailed'
+  | 'messages.processReceipt.contextCompressed'
   | 'messages.processReceipt.editingFiles'
   | 'messages.processReceipt.fileChanged'
   | 'messages.processReceipt.fileEdits'

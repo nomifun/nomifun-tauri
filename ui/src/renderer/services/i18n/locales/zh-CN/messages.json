@@ -30,6 +30,7 @@
     "fileChanged": "已编辑 {{target}} {{stats}}",
     "thinkingRunning": "正在思考",
     "thinkingCompleted": "已思考",
+    "contextCompressed": "上下文已自动压缩",
     "searchedTarget": "已搜索 {{target}}",
     "waitingPermission": "等待确认 {{target}}",
     "agentConnecting": "正在连接 {{target}}",

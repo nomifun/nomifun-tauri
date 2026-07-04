@@ -48,14 +48,61 @@ const stateMatchesTool = (state: TurnDisclosureProcessState, tool: NormalizedToo
   return tool.status === 'pending' || tool.status === 'running';
 };
 
+const compactToolText = (value?: string): string => value?.replace(/\s+/g, ' ').trim() ?? '';
+
 const formatToolTarget = (tool: NormalizedToolCall): string => {
+  if (classifyToolForReceipt(tool) === 'run_commands') return getCommandTarget(tool);
+
   const name = tool.name?.trim();
   const description = tool.description?.trim();
   if (name && description && description !== name) return `${name} ${description}`;
   return name || description || tool.key;
 };
 
-const compactToolText = (value?: string): string => value?.replace(/\s+/g, ' ').trim() ?? '';
+const commandFieldNames = ['command', 'cmd', 'script', 'shell', 'bash'];
+
+const pickCommandFromValue = (value: unknown): string | undefined => {
+  if (!value || typeof value !== 'object') return undefined;
+  const record = value as Record<string, unknown>;
+
+  for (const field of commandFieldNames) {
+    const fieldValue = record[field];
+    if (typeof fieldValue === 'string' && compactToolText(fieldValue)) return compactToolText(fieldValue);
+  }
+
+  for (const fieldValue of Object.values(record)) {
+    if (fieldValue && typeof fieldValue === 'object') {
+      const nested = pickCommandFromValue(fieldValue);
+      if (nested) return nested;
+    }
+  }
+
+  return undefined;
+};
+
+const extractCommandFromText = (value?: string): string | undefined => {
+  const compacted = compactToolText(value);
+  if (!compacted) return undefined;
+
+  try {
+    const parsed = JSON.parse(value ?? '');
+    const command = pickCommandFromValue(parsed);
+    if (command) return command;
+    if (typeof parsed === 'string') return compactToolText(parsed);
+    return undefined;
+  } catch {
+    // Plain shell strings are already the desired preview.
+  }
+
+  return compacted;
+};
+
+const getCommandTarget = (tool: NormalizedToolCall): string => {
+  const description = compactToolText(tool.description);
+  const name = compactToolText(tool.name);
+  if (description && description !== name) return description;
+  return extractCommandFromText(tool.input) || description || name || tool.key;
+};
 
 const getToolSearchText = (tool: NormalizedToolCall): string =>
   `${tool.name ?? ''} ${tool.description ?? ''} ${tool.key ?? ''}`.toLowerCase();
@@ -74,7 +121,7 @@ const classifyToolForReceipt = (tool: NormalizedToolCall): ToolReceiptAction => 
 
 const getToolReceiptTarget = (tool: NormalizedToolCall, action: ToolReceiptAction): string | undefined => {
   if (action === 'run_commands') {
-    return compactToolText(tool.description) || compactToolText(tool.name) || tool.key;
+    return getCommandTarget(tool);
   }
   if (action !== 'generic') return undefined;
   return formatToolTarget(tool);
@@ -86,7 +133,7 @@ const getToolReceiptDetailTarget = (tool: NormalizedToolCall, action: ToolReceip
 
   if (action === 'generic') return formatToolTarget(tool);
   if (description && description !== name) return description;
-  if (action === 'run_commands') return name || tool.key;
+  if (action === 'run_commands') return getCommandTarget(tool);
   return undefined;
 };
 

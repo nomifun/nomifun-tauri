@@ -43,6 +43,7 @@ import {
   type ToolReceiptSummaryPart,
 } from './components/toolGroupSummaryModel';
 import ProcessTraceItem from './components/ProcessTraceItem';
+import { isContextCompressionTip } from './processTipModel';
 import type { WriteFileResult } from './types';
 import { useAutoScroll } from './useAutoScroll';
 import { useAutoPreviewOfficeFiles } from '@/renderer/hooks/file/useAutoPreviewOfficeFiles';
@@ -170,6 +171,7 @@ const getProcessedItemRole = (item: IRenderableItem): TurnDisclosureInputItem['r
     case 'text':
       return item.position === 'right' ? 'user' : 'assistant';
     case 'tips':
+      if (isContextCompressionTip(item)) return 'process';
       return 'assistant';
     case 'thinking':
     case 'tool_call':
@@ -406,6 +408,13 @@ const buildProcessReceiptSummary = (
         defaultExpanded: state === 'failed',
       };
     case 'tips':
+      if (isContextCompressionTip(item)) {
+        return {
+          label: t('messages.processReceipt.contextCompressed', { defaultValue: 'Context compressed' }),
+          icon: 'status',
+          defaultExpanded: false,
+        };
+      }
       return {
         label: compactReceiptText(
           item.content.content,
@@ -597,7 +606,7 @@ const MessageList: React.FC<{
       // Skip hidden and available_commands messages
       if (message.hidden) continue;
       if (message.type === 'available_commands') continue;
-      if (message.type === 'thinking') continue;
+      if (message.type === 'thinking' && message.content.status === 'done') continue;
       // Plans are no longer rendered inline — they surface in the docked
       // PinnedPlan bar above the composer, which reads the raw list directly.
       if (message.type === 'plan') continue;

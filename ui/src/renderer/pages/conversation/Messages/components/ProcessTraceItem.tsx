@@ -16,6 +16,7 @@ import classNames from 'classnames';
 import React, { useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { FileChangeInfo } from '../MessageFileChanges';
+import { isContextCompressionTip } from '../processTipModel';
 import type { TurnDisclosureProcessState } from '../turnDisclosureModel';
 import { getProcessItemState } from '../turnProcessState';
 import MessagePermission from './MessagePermission';
@@ -351,6 +352,19 @@ const ProcessTraceItem: React.FC<{ item: ProcessTraceRenderableItem; variant?: P
         </div>
       );
     case 'tips':
+      if (isContextCompressionTip(item)) {
+        return (
+          <ProcessTraceRows
+            rows={[
+              {
+                key: item.id,
+                state,
+                label: t('messages.processReceipt.contextCompressed', { defaultValue: 'Context compressed' }),
+              },
+            ]}
+          />
+        );
+      }
       return (
         <ProcessTraceRows
           rows={[
@@ -434,7 +448,21 @@ const ProcessTraceItem: React.FC<{ item: ProcessTraceRenderableItem; variant?: P
         />
       );
     case 'thinking':
-      return null;
+      if (item.content.status === 'done') return null;
+      return (
+        <ProcessTraceRows
+          rows={[
+            {
+              key: item.id,
+              state,
+              label: compactReceiptText(
+                item.content.subject,
+                t('messages.processReceipt.thinkingRunning', { defaultValue: 'Thinking' })
+              ),
+            },
+          ]}
+        />
+      );
     case 'plan':
     case 'available_commands':
       return null;

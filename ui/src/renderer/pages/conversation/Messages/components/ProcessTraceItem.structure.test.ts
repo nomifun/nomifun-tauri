@@ -22,4 +22,10 @@ describe('ProcessTraceItem Codex-style execution rows', () => {
     expect(source.includes('thinkingCompletedWithDuration')).toBe(false);
     expect(source.includes('formatProcessDuration')).toBe(false);
   });
+
+  test('renders running thinking and context compression as lightweight process rows', () => {
+    expect(source.includes("item.content.status === 'done'")).toBe(true);
+    expect(source.includes('messages.processReceipt.thinkingRunning')).toBe(true);
+    expect(source.includes('messages.processReceipt.contextCompressed')).toBe(true);
+  });
 });
