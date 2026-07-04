@@ -475,16 +475,79 @@ async fn read_conversation_run_id(
         .map(str::to_owned)
 }
 
-/// Whether a run can be APPENDED to via `add_tasks`: it exists AND is not
-/// `cancelled`. Terminal `completed` / `failed` / `completed_with_failures` runs ARE
-/// appendable — `add_tasks` re-arms them back to `running`. A user-`cancelled` run
-/// stays dead (a follow-up spawn must never silently resurrect it — start fresh
-/// instead). A missing run or a read error ⇒ not appendable (the caller falls through
-/// to creating a fresh run).
-async fn run_is_appendable(deps: &Arc<GatewayDeps>, run_id: &str) -> bool {
+/// Why a conversation's linked run can / cannot be APPENDED to — the tri-state the
+/// two append seams (`nomi_spawn` convergence + `nomi_run_add_tasks`) branch on so
+/// each gives a PRECISE outcome instead of a bare bool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Appendability {
+    /// The run exists, is not `cancelled`, and (if `autonomous`) is within its hard
+    /// budget → append. Terminal `completed` / `failed` / `completed_with_failures`
+    /// runs land here too — `add_tasks` re-arms them back to `running`.
+    Yes,
+    /// No run to append to: the run is missing / a read error, or `cancelled` (a
+    /// user-`cancelled` run stays dead — a follow-up must never silently resurrect
+    /// it). The `nomi_spawn` path falls through to minting a FRESH run;
+    /// `nomi_run_add_tasks` returns the "no active run" error.
+    NoRun,
+    /// An AUTONOMOUS run blew its token/round hard budget (Phase 3b deterministic
+    /// runaway backstop). BOTH seams must REFUSE — return the budget error, do NOT
+    /// re-arm (no `engine.start`/`add_tasks`) and do NOT mint a fresh run — so the
+    /// autonomous run stays terminal and the emergent loop halts cleanly.
+    BudgetExhausted,
+}
+
+/// The tool error returned when an AUTONOMOUS run is refused for budget (distinct
+/// from the "no active run" error). Instructs the lead to WRAP UP rather than append
+/// more — the deterministic complement to the cooperative autonomous prompt (Task 2).
+const AUTONOMOUS_BUDGET_EXHAUSTED_ERROR: &str =
+    "autonomous budget exhausted (tokens/rounds); finalize and report to the user";
+
+/// Whether an AUTONOMOUS run has exhausted its hard budget — the deterministic
+/// runaway backstop the LLM cannot bypass. ONLY `autonomy == "autonomous"` runs are
+/// gated: a manual `nomi_spawn` / `nomi_run_add_tasks` on a supervised/interactive
+/// run is human-driven and unbounded here. Pure so the decision is unit-tested
+/// directly — seeding a real 2M-token / 60-task run in a unit test is impractical.
+fn autonomous_budget_exhausted(autonomy: &str, total_tokens: i64, task_count: usize) -> bool {
+    autonomy == "autonomous"
+        && (total_tokens >= nomifun_orchestrator::AUTONOMOUS_TOKEN_BUDGET
+            || task_count >= nomifun_orchestrator::AUTONOMOUS_MAX_TASKS)
+}
+
+/// Pure classification core: map a run's `(status, autonomy, total_tokens,
+/// task_count)` → [`Appendability`]. Split from the async fetch in
+/// [`run_appendability`] so the whole decision table is unit-tested without a DB.
+/// `cancelled` wins first (a cancelled run stays dead regardless of budget); then the
+/// autonomous budget gate; otherwise appendable.
+fn classify_appendability(
+    status: &str,
+    autonomy: &str,
+    total_tokens: i64,
+    task_count: usize,
+) -> Appendability {
+    if status == "cancelled" {
+        return Appendability::NoRun;
+    }
+    if autonomous_budget_exhausted(autonomy, total_tokens, task_count) {
+        return Appendability::BudgetExhausted;
+    }
+    Appendability::Yes
+}
+
+/// Read a run's detail and classify whether it can be APPENDED to (single-run
+/// convergence). Folds in the Phase 3b autonomous hard budget: an autonomous run
+/// at/over `AUTONOMOUS_TOKEN_BUDGET` (cumulative `Run.total_tokens`) OR
+/// `AUTONOMOUS_MAX_TASKS` (task count) → [`Appendability::BudgetExhausted`], so the
+/// emergent loop terminates deterministically. A missing run / read error ⇒
+/// [`Appendability::NoRun`] (the caller falls through to a fresh run).
+async fn run_appendability(deps: &Arc<GatewayDeps>, run_id: &str) -> Appendability {
     match deps.orchestrator_run_service.get_detail(run_id).await {
-        Ok(detail) => detail.run.status != "cancelled",
-        Err(_) => false,
+        Ok(detail) => classify_appendability(
+            &detail.run.status,
+            &detail.run.autonomy,
+            detail.run.total_tokens.unwrap_or(0),
+            detail.tasks.len(),
+        ),
+        Err(_) => Appendability::NoRun,
     }
 }
 
@@ -890,39 +953,49 @@ async fn spawn(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: SpawnPara
 
     // ── 单 run 收敛：本会话若已绑定一个可追加的 run，直接把这批任务 append 上去，
     //    不新建 run、不重绑（extra.orchestrator_run_id 不变）——一个会话复用同一个持久
-    //    run。取消的 run 不复活（run_is_appendable 排除 cancelled）。engine.add_tasks
-    //    会把终态 run 重臂为 running；随后在锁外(re)start 引擎循环（若 running 且无活体
-    //    loop）——与 run_adjust 的重臂门一致。
+    //    run。取消的 run 不复活（run_appendability → NoRun 时排除 cancelled，落到新建）；
+    //    自主 run 超硬预算不复活（BudgetExhausted → 返错、不重臂、不新建，emergent loop
+    //    干净停止）。engine.add_tasks 会把终态 run 重臂为 running；随后在锁外(re)start
+    //    引擎循环（若 running 且无活体 loop）——与 run_adjust 的重臂门一致。
     if let Some(existing_run_id) = read_conversation_run_id(&deps, &user, &ctx.conversation_id).await {
-        if run_is_appendable(&deps, &existing_run_id).await {
-            return match deps
-                .orchestrator_run_engine
-                .add_tasks(&deps.orchestrator_run_service, &existing_run_id, tasks)
-                .await
-            {
-                Ok(run) => {
-                    if run.status == "running"
-                        && !deps.orchestrator_run_engine.is_running(&existing_run_id)
-                    {
-                        deps.orchestrator_run_engine.start(existing_run_id.clone());
+        match run_appendability(&deps, &existing_run_id).await {
+            Appendability::Yes => {
+                return match deps
+                    .orchestrator_run_engine
+                    .add_tasks(&deps.orchestrator_run_service, &existing_run_id, tasks)
+                    .await
+                {
+                    Ok(run) => {
+                        if run.status == "running"
+                            && !deps.orchestrator_run_engine.is_running(&existing_run_id)
+                        {
+                            deps.orchestrator_run_engine.start(existing_run_id.clone());
+                        }
+                        // 只有 running 才是真正在跑；paused / awaiting_plan_approval / planning
+                        // 下 add_tasks 的重臂门并不会把 run 翻成 running，任务只是排队、不会执行——
+                        // 此时若仍宣称「已在后台并行执行」就是误导，必须提示用户先恢复该 run。
+                        let message = if run.status == "running" {
+                            "子任务已追加到本会话当前的编排 run 并在画布并行执行（复用同一个 run，未新建）。请告诉用户已在后台并行执行、进度见右侧画布，然后结束本轮——你无需轮询等待：全部完成或失败时系统会自动把结果回执给你再汇总。不要重复创建编排；用户若中途询问进度，可用 nomi_run_status 查一次。"
+                        } else {
+                            "子任务已追加到本会话当前的编排 run（复用同一个 run，未新建），但该 run 当前处于暂停中——任务只是排队、不会执行。请先在右侧编排面板继续/恢复该 run，任务才会开始跑；请把这一情况转达给用户。"
+                        };
+                        ok(json!({
+                            "run_id": existing_run_id,
+                            "status": run.status,
+                            "task_count": appended_count,
+                            "message": message,
+                        }))
                     }
-                    // 只有 running 才是真正在跑；paused / awaiting_plan_approval / planning
-                    // 下 add_tasks 的重臂门并不会把 run 翻成 running，任务只是排队、不会执行——
-                    // 此时若仍宣称「已在后台并行执行」就是误导，必须提示用户先恢复该 run。
-                    let message = if run.status == "running" {
-                        "子任务已追加到本会话当前的编排 run 并在画布并行执行（复用同一个 run，未新建）。请告诉用户已在后台并行执行、进度见右侧画布，然后结束本轮——你无需轮询等待：全部完成或失败时系统会自动把结果回执给你再汇总。不要重复创建编排；用户若中途询问进度，可用 nomi_run_status 查一次。"
-                    } else {
-                        "子任务已追加到本会话当前的编排 run（复用同一个 run，未新建），但该 run 当前处于暂停中——任务只是排队、不会执行。请先在右侧编排面板继续/恢复该 run，任务才会开始跑；请把这一情况转达给用户。"
-                    };
-                    ok(json!({
-                        "run_id": existing_run_id,
-                        "status": run.status,
-                        "task_count": appended_count,
-                        "message": message,
-                    }))
-                }
-                Err(e) => json!({ "error": e.to_string() }),
-            };
+                    Err(e) => json!({ "error": e.to_string() }),
+                };
+            }
+            // 自主 run 超硬预算：确定性终止。返回预算错误，绝不重臂、也绝不新建 run——
+            // 让该自主 run 保持终态，emergent 循环干净停止。
+            Appendability::BudgetExhausted => {
+                return json!({ "error": AUTONOMOUS_BUDGET_EXHAUSTED_ERROR });
+            }
+            // 无可追加的 run（缺失 / 取消）——落到下方新建 run 路径（行为不变）。
+            Appendability::NoRun => {}
         }
     }
 
@@ -1035,8 +1108,10 @@ async fn run_adjust(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: RunA
 /// Append new task(s) to this conversation's CURRENT run — the single-run
 /// convergence primitive (`nomi_run_add_tasks`). The `run_id` is NOT a param: it is
 /// resolved from the calling conversation's linked run (`extra.orchestrator_run_id`).
-/// No conversation run, or a `cancelled` one ⇒ a clear error (start work with
-/// nomi_spawn / nomi_run_create first). The spawn-shaped tasks map to `PlannedTask`
+/// No conversation run, or a `cancelled` one ⇒ a clear "no active run" error (start
+/// work with nomi_spawn / nomi_run_create first); an AUTONOMOUS run over its hard
+/// budget ⇒ the distinct budget error WITHOUT re-arming (Phase 3b runaway backstop —
+/// the run stays terminal). The spawn-shaped tasks map to `PlannedTask`
 /// via the SAME `spawn_tasks_to_planned` helper `nomi_spawn` uses, then append via
 /// `engine.add_tasks` (which re-arms a terminal run to `running`); we then (re)start
 /// the loop OUTSIDE any lock when the run is running with no live loop — mirroring
@@ -1053,11 +1128,24 @@ async fn run_add_tasks(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: A
         return json!({ "error": format!("too many tasks: {} (max {MAX_SPAWN_TASKS}); use nomi_run_create for larger goals", p.tasks.len()) });
     }
 
-    // Resolve the conversation's current run; no run / a cancelled run ⇒ nothing to
-    // append to (a clear error, not a silent new run).
+    // Resolve the conversation's current run and classify appendability. No run / a
+    // cancelled run ⇒ a clear "no active run" error (not a silent new run). An
+    // AUTONOMOUS run over its hard budget ⇒ the distinct budget error — and we do NOT
+    // re-arm it (no add_tasks / no engine.start), so the run stays terminal and the
+    // emergent autonomous loop stops cleanly (Phase 3b deterministic backstop).
     let run_id = match read_conversation_run_id(&deps, &user, &ctx.conversation_id).await {
-        Some(id) if run_is_appendable(&deps, &id).await => id,
-        _ => {
+        Some(id) => match run_appendability(&deps, &id).await {
+            Appendability::Yes => id,
+            Appendability::BudgetExhausted => {
+                return json!({ "error": AUTONOMOUS_BUDGET_EXHAUSTED_ERROR });
+            }
+            Appendability::NoRun => {
+                return json!({
+                    "error": "this conversation has no active run to append to; start work with nomi_spawn or nomi_run_create first"
+                });
+            }
+        },
+        None => {
             return json!({
                 "error": "this conversation has no active run to append to; start work with nomi_spawn or nomi_run_create first"
             });
@@ -1725,5 +1813,116 @@ mod tests {
         assert!(is_awaiting_approval("awaiting_plan_approval"));
         assert!(!is_awaiting_approval("running"));
         assert!(!is_awaiting_approval("planning"));
+    }
+
+    // ── Phase 3b Task 1: autonomous hard budget (deterministic runaway backstop) ──
+
+    // An AUTONOMOUS run at/over the cumulative token budget is EXHAUSTED — the append
+    // gate must refuse further work so the emergent loop terminates deterministically.
+    #[test]
+    fn autonomous_run_at_or_over_token_budget_is_exhausted() {
+        assert!(
+            autonomous_budget_exhausted(
+                "autonomous",
+                nomifun_orchestrator::AUTONOMOUS_TOKEN_BUDGET,
+                0
+            ),
+            "at the token cap → exhausted"
+        );
+        assert!(
+            autonomous_budget_exhausted(
+                "autonomous",
+                nomifun_orchestrator::AUTONOMOUS_TOKEN_BUDGET + 1,
+                0
+            ),
+            "over the token cap → exhausted"
+        );
+    }
+
+    // An AUTONOMOUS run at/over the task cap is EXHAUSTED even if cheap in tokens —
+    // bounds an append-only runaway of many tiny rounds.
+    #[test]
+    fn autonomous_run_at_or_over_task_budget_is_exhausted() {
+        assert!(
+            autonomous_budget_exhausted("autonomous", 0, nomifun_orchestrator::AUTONOMOUS_MAX_TASKS),
+            "at the task cap → exhausted"
+        );
+    }
+
+    // An AUTONOMOUS run under BOTH caps is NOT exhausted — the loop may keep going.
+    #[test]
+    fn autonomous_run_within_both_budgets_is_not_exhausted() {
+        assert!(
+            !autonomous_budget_exhausted(
+                "autonomous",
+                nomifun_orchestrator::AUTONOMOUS_TOKEN_BUDGET - 1,
+                nomifun_orchestrator::AUTONOMOUS_MAX_TASKS - 1
+            ),
+            "under both caps → not exhausted"
+        );
+    }
+
+    // A NON-autonomous run (supervised / interactive / manual / unknown) is NEVER
+    // budget-gated: manual spawn/add is human-driven and unbounded here. Even wildly
+    // over both caps it is NOT "exhausted".
+    #[test]
+    fn non_autonomous_run_is_never_budget_gated() {
+        for autonomy in ["supervised", "interactive", "manual", ""] {
+            assert!(
+                !autonomous_budget_exhausted(
+                    autonomy,
+                    nomifun_orchestrator::AUTONOMOUS_TOKEN_BUDGET * 10,
+                    nomifun_orchestrator::AUTONOMOUS_MAX_TASKS * 10
+                ),
+                "{autonomy} must NOT be budget-gated"
+            );
+        }
+    }
+
+    // The pure classification core the async `run_appendability` delegates to: maps
+    // (status, autonomy, total_tokens, task_count) → Appendability, covering all seams.
+    #[test]
+    fn classify_appendability_covers_all_cases() {
+        // Cancelled → NoRun regardless of budget (a user-cancelled run stays dead;
+        // spawn falls through to a fresh run, add_tasks says "no active run").
+        assert_eq!(
+            classify_appendability("cancelled", "autonomous", 0, 0),
+            Appendability::NoRun
+        );
+        // Autonomous at/over budget → BudgetExhausted (deterministic runaway backstop;
+        // both seams REFUSE without re-arming, so the run stays terminal).
+        assert_eq!(
+            classify_appendability(
+                "running",
+                "autonomous",
+                nomifun_orchestrator::AUTONOMOUS_TOKEN_BUDGET,
+                0
+            ),
+            Appendability::BudgetExhausted
+        );
+        assert_eq!(
+            classify_appendability(
+                "completed",
+                "autonomous",
+                0,
+                nomifun_orchestrator::AUTONOMOUS_MAX_TASKS
+            ),
+            Appendability::BudgetExhausted
+        );
+        // Non-autonomous over budget → still appendable (Yes): NOT budget-gated.
+        assert_eq!(
+            classify_appendability(
+                "running",
+                "supervised",
+                nomifun_orchestrator::AUTONOMOUS_TOKEN_BUDGET * 5,
+                999
+            ),
+            Appendability::Yes
+        );
+        // Healthy autonomous within budget → Yes.
+        assert_eq!(
+            classify_appendability("completed", "autonomous", 10, 3),
+            Appendability::Yes
+        );
     }
 }

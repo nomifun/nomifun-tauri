@@ -1826,7 +1826,8 @@ impl RunService {
         // (2a) Defense-in-depth: NEVER resurrect a user-cancelled run. The re-arm tail
         //     below flips any terminal status (incl. `cancelled`) back to `running`, so
         //     without this guard an append would silently revive a cancelled run. The
-        //     gateway's `run_is_appendable` already refuses cancelled runs, but this
+        //     gateway's appendability gate (`run_appendability`) already refuses
+        //     cancelled runs, but this
         //     primitive must be safe on its own (a cancelled run stays dead — start a
         //     fresh run instead).
         if run.status == "cancelled" {

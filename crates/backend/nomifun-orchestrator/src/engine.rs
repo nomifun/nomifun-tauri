@@ -285,6 +285,35 @@ pub const STRAND_GRACE_MS: i64 = 5 * 60 * 1000;
 /// left re-plannable and abandoned) → force-finalize as stalled.
 pub const PLANNING_MAX_MS: i64 = 10 * 60 * 1000;
 
+// ── Phase 3b: autonomous runaway backstop (deterministic hard budget) ──────
+//
+// An AUTONOMOUS run drives an EMERGENT loop: a terminal worker's report re-engages
+// the lead as a fresh turn, which may call `nomi_run_add_tasks` to append more work
+// → re-arms the run → loops. Phase 3b Task 2's autonomous prompt asks the lead to
+// stop once the goal is met, but a prompt is COOPERATIVE — the LLM can ignore it.
+// These caps are the DETERMINISTIC backstop it CANNOT bypass: the gateway's
+// appendability gate folds them in, so an autonomous run at/over EITHER cap becomes
+// NOT appendable — the next append is refused WITHOUT re-arming and the run stays
+// terminal, halting the loop cleanly. Only `autonomy == "autonomous"` runs are
+// bounded here; a manual `nomi_spawn` / `nomi_run_add_tasks` on a supervised run is
+// human-driven and unbounded.
+
+/// Cumulative token budget for an AUTONOMOUS run — the sum of its tasks' real usage
+/// (`Run.total_tokens`, written by `finish_run` via `sum_task_tokens`). At/over this
+/// the run is no longer appendable, so the emergent loop terminates deterministically.
+pub const AUTONOMOUS_TOKEN_BUDGET: i64 = 2_000_000;
+
+/// Hard cap on the number of tasks an AUTONOMOUS run may accumulate. At/over this the
+/// run is no longer appendable — bounds an append-only runaway even when each round
+/// is cheap in tokens (a token cap alone would not stop many tiny rounds).
+pub const AUTONOMOUS_MAX_TASKS: usize = 60;
+
+/// Max consecutive autonomous re-engagements that append work WITHOUT completing any
+/// new task (no forward progress) before the loop is judged stuck. Consumed by the
+/// autonomous re-engagement guard (Phase 3b Task 2); defined here now alongside the
+/// other autonomous caps so Task 1 lands the full tunable set.
+pub const NO_PROGRESS_LIMIT: u32 = 2;
+
 /// Per-run async lock registry serializing the run-loop's **terminal-check +
 /// finish** against the rerun path's **reset + re-activation** (UC-2a 评审
 /// Critical). Both critical sections take the SAME run's lock, so the race window
