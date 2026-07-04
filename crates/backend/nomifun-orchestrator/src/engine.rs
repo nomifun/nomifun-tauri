@@ -1762,6 +1762,16 @@ async fn dispatch_task(
     // 任务角色随 dispatch 下发：受限角色（searcher/reviewer/verifier）在 worker
     // 侧收缩为 per-node 工具白名单 + 网关收缩（run_restricted）。
     let task_role = task.role.clone();
+    // 受控嵌套深度（Phase 3b W7d）：从 task.pattern_config 读出 delegation_depth，随
+    // dispatch 烙进 worker 会话 extra（build_worker_extra）。pattern_config 里同时可能
+    // 存 fan-out 的 {"group":...} 等键——只读 delegation_depth，缺失/不可解析默认 0。
+    // root lead 的任务无此键 → 0；网关追加口给追加任务盖 caller_depth+1。
+    let delegation_depth = task
+        .pattern_config
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| v.get("delegation_depth").and_then(serde_json::Value::as_u64))
+        .unwrap_or(0) as u32;
     let timeout = deps.worker_timeout;
 
     let fut: WorkerFuture = Box::pin(async move {
@@ -1799,6 +1809,7 @@ async fn dispatch_task(
         let outcome = worker
             .run_restricted(
                 task_role.as_deref(),
+                delegation_depth,
                 &member,
                 workspace_dir.as_deref(),
                 &run_id_for_run,

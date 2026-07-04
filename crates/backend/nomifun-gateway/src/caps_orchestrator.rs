@@ -475,6 +475,69 @@ async fn read_conversation_run_id(
         .map(str::to_owned)
 }
 
+/// 受控嵌套深度上限（Phase 3b W7d）：委派链最多 root lead(0) → worker(1) →
+/// sub-delegate(2)。深度 2 的 worker 再想追加/spawn 会被两个追加口拒绝，防子 agent
+/// 无界自我繁殖。
+const DELEGATION_DEPTH_LIMIT: u32 = 2;
+
+/// Pure decision core shared by BOTH append seams (`nomi_spawn` convergence +
+/// `nomi_run_add_tasks`): would a caller at `caller_depth` exceed the limit by
+/// spawning one level deeper? `caller_depth + 1 > LIMIT`. Split out so the depth
+/// ladder is unit-tested without a live gateway: root lead(0)+1=1 ok →
+/// worker(1)+1=2 ok → sub-delegate(2)+1=3 > 2 refused. `saturating_add` guards the
+/// (unreachable) u32 overflow.
+fn delegation_would_exceed_limit(caller_depth: u32) -> bool {
+    caller_depth.saturating_add(1) > DELEGATION_DEPTH_LIMIT
+}
+
+/// Read the calling conversation's委派深度（`extra.orchestrator_delegation_depth`,
+/// written by the orchestrator's `build_worker_extra`）. A root lead / 普通会话 has
+/// no such key → `0`. Mirrors [`read_conversation_run_id`]'s soft-failure contract:
+/// every read/parse miss (no conversation id, unreadable conversation, absent /
+/// non-numeric key) collapses to `0` — the safest floor (treats an unknown caller as
+/// the root, so the first append is always allowed and stamps depth 1).
+async fn read_conversation_delegation_depth(
+    deps: &Arc<GatewayDeps>,
+    user_id: &str,
+    conversation_id: &str,
+) -> u32 {
+    if conversation_id.is_empty() {
+        return 0;
+    }
+    let Ok(conv) = deps.conversation_service.get(user_id, conversation_id).await else {
+        return 0;
+    };
+    conv.extra
+        .get("orchestrator_delegation_depth")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32
+}
+
+/// Stamp `delegation_depth` into each about-to-be-appended task's `pattern_config`,
+/// MERGING into the existing JSON object (a synthesis/group/vote config already
+/// there is preserved — only the `delegation_depth` key is set/overwritten). A task
+/// with no / unparseable `pattern_config` gets a fresh `{"delegation_depth":<d>}`.
+/// This is what makes the depth guard compose DOWN the chain: the engine's
+/// `dispatch_task` reads this key back off `orch_run_tasks.pattern_config` and烙进
+/// the worker会话 extra, so the worker's own append is measured one level deeper.
+fn stamp_tasks_delegation_depth(tasks: &mut [PlannedTask], depth: u32) {
+    for t in tasks.iter_mut() {
+        let mut obj = t
+            .pattern_config
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        obj.insert("delegation_depth".to_string(), json!(depth));
+        t.pattern_config = Some(Value::Object(obj).to_string());
+    }
+}
+
+/// The tool error returned when a sub-agent at the depth limit tries to spawn / append
+/// further sub-agents — the deterministic controlled-nesting backstop.
+const DELEGATION_DEPTH_LIMIT_ERROR: &str =
+    "delegation depth limit reached; this sub-agent may not spawn further sub-agents";
+
 /// Why a conversation's linked run can / cannot be APPENDED to — the tri-state the
 /// two append seams (`nomi_spawn` convergence + `nomi_run_add_tasks`) branch on so
 /// each gives a PRECISE outcome instead of a bare bool.
@@ -960,6 +1023,16 @@ async fn spawn(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: SpawnPara
     if let Some(existing_run_id) = read_conversation_run_id(&deps, &user, &ctx.conversation_id).await {
         match run_appendability(&deps, &existing_run_id).await {
             Appendability::Yes => {
+                // 受控嵌套守卫（Phase 3b W7d）：读调用会话的委派深度。若 caller_depth+1
+                // 超上限 → 拒绝追加（该子 agent 不得再繁殖子 agent），绝不 append。否则给
+                // 这批任务的 pattern_config 盖 depth=caller_depth+1，使守卫沿链向下复合：
+                // root lead(0)→worker(1)→sub-delegate(2)→深度 2 的 worker 再追加被拒。
+                let caller_depth =
+                    read_conversation_delegation_depth(&deps, &user, &ctx.conversation_id).await;
+                if delegation_would_exceed_limit(caller_depth) {
+                    return json!({ "error": DELEGATION_DEPTH_LIMIT_ERROR });
+                }
+                stamp_tasks_delegation_depth(&mut tasks, caller_depth + 1);
                 return match deps
                     .orchestrator_run_engine
                     .add_tasks(&deps.orchestrator_run_service, &existing_run_id, tasks)
@@ -1152,7 +1225,16 @@ async fn run_add_tasks(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: A
         }
     };
 
-    let tasks = spawn_tasks_to_planned(p.tasks);
+    // 受控嵌套守卫（Phase 3b W7d）：目标 run 已解析且确认可追加。读调用会话的委派
+    // 深度，caller_depth+1 超上限即拒绝（该子 agent 不得再繁殖子 agent），绝不 append；
+    // 否则给这批追加任务的 pattern_config 盖 depth=caller_depth+1，使守卫沿链复合
+    // （与 nomi_spawn 收敛口同源）。
+    let caller_depth = read_conversation_delegation_depth(&deps, &user, &ctx.conversation_id).await;
+    if delegation_would_exceed_limit(caller_depth) {
+        return json!({ "error": DELEGATION_DEPTH_LIMIT_ERROR });
+    }
+    let mut tasks = spawn_tasks_to_planned(p.tasks);
+    stamp_tasks_delegation_depth(&mut tasks, caller_depth + 1);
     match deps
         .orchestrator_run_engine
         .add_tasks(&deps.orchestrator_run_service, &run_id, tasks)
@@ -1924,5 +2006,59 @@ mod tests {
             classify_appendability("completed", "autonomous", 10, 3),
             Appendability::Yes
         );
+    }
+
+    // ── 受控嵌套 delegation_depth 守卫（Phase 3b W7d）────────────────────────
+
+    fn spawn_param(name: &str) -> SpawnTaskParam {
+        SpawnTaskParam { name: name.to_owned(), prompt: format!("do {name}"), role: None }
+    }
+
+    // 深度阶梯：root lead(0)→worker(1)→sub-delegate(2)→深度 2 拒绝。这是两个追加口
+    // (nomi_spawn 收敛 + nomi_run_add_tasks) 守卫的纯判定核。
+    #[test]
+    fn delegation_depth_ladder_refuses_beyond_limit() {
+        assert_eq!(DELEGATION_DEPTH_LIMIT, 2);
+        // root lead (caller_depth 0): 0+1=1 ≤ 2 → 允许，子任务盖深度 1。
+        assert!(!delegation_would_exceed_limit(0));
+        // worker (caller_depth 1): 1+1=2 ≤ 2 → 允许，子任务盖深度 2。
+        assert!(!delegation_would_exceed_limit(1));
+        // sub-delegate (caller_depth 2): 2+1=3 > 2 → 拒绝（深度 2 的 worker 不得再繁殖）。
+        assert!(delegation_would_exceed_limit(2));
+        assert!(delegation_would_exceed_limit(3));
+        // 溢出不会 panic（saturating_add）。
+        assert!(delegation_would_exceed_limit(u32::MAX));
+    }
+
+    // 未超限：追加任务的 pattern_config 被盖上 depth = caller_depth+1。
+    #[test]
+    fn stamp_tasks_delegation_depth_sets_depth_on_fresh_config() {
+        let caller_depth = 0; // root lead
+        let mut tasks = spawn_tasks_to_planned(vec![spawn_param("a"), spawn_param("b")]);
+        // spawn_tasks_to_planned 产出的 agent 任务初始无 pattern_config。
+        assert!(tasks.iter().all(|t| t.pattern_config.is_none()));
+        stamp_tasks_delegation_depth(&mut tasks, caller_depth + 1);
+        for t in &tasks {
+            let v: Value = serde_json::from_str(t.pattern_config.as_deref().unwrap()).unwrap();
+            assert_eq!(v["delegation_depth"], 1, "root 的子任务盖深度 1");
+        }
+        // worker (caller_depth 1) 追加 → 子任务盖深度 2。
+        let mut deeper = spawn_tasks_to_planned(vec![spawn_param("c")]);
+        stamp_tasks_delegation_depth(&mut deeper, 1 + 1);
+        let v: Value = serde_json::from_str(deeper[0].pattern_config.as_deref().unwrap()).unwrap();
+        assert_eq!(v["delegation_depth"], 2, "worker 的子任务盖深度 2");
+    }
+
+    // 合并语义：既有 pattern_config（如 fan-out group / 综合配置）里的其它键必须保留，
+    // 只设置/覆盖 delegation_depth——绝不 clobber。
+    #[test]
+    fn stamp_tasks_delegation_depth_merges_into_existing_config() {
+        let mut tasks = spawn_tasks_to_planned(vec![spawn_param("x")]);
+        tasks[0].pattern_config = Some(r#"{"group":"candidates","aggregate":"mean"}"#.to_owned());
+        stamp_tasks_delegation_depth(&mut tasks, 2);
+        let v: Value = serde_json::from_str(tasks[0].pattern_config.as_deref().unwrap()).unwrap();
+        assert_eq!(v["delegation_depth"], 2, "盖上深度");
+        assert_eq!(v["group"], "candidates", "既有 group 键保留");
+        assert_eq!(v["aggregate"], "mean", "既有 aggregate 键保留");
     }
 }
