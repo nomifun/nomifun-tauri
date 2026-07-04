@@ -1932,11 +1932,13 @@ fn resolve_member(members: &[FleetMember], member_index: Option<usize>) -> Optio
 /// real cost-vs-effect routing for range members (which otherwise carry no
 /// profile). DELIBERATELY conservative and **fail-soft**: only a clear "strong"
 /// or clear "light" signal sets tiers; anything unknown or ambiguous returns
-/// `None`, which the Router treats as its neutral baseline — i.e. exactly the
-/// pre-existing behavior (zero regression). Strengths/modalities/tools are left
-/// at the baseline (empty / false), so this only nudges the reasoning + cost-tier
-/// scoring arms, never the hard filters (a bare member stays tool-neutral exactly
-/// as before).
+/// `None` (→ the Router's neutral baseline, i.e. exactly the pre-existing
+/// behavior, zero regression) UNLESS the name implies a modality (Phase 2): a
+/// vision model name still yields a profile so the Router's `needs_vision` hard
+/// filter admits it. `strengths`/`tools` stay at the baseline (empty / false);
+/// only `modalities` (from [`infer_model_modalities`](nomifun_api_types::infer_model_modalities))
+/// and the reasoning/cost tiers are populated — the tool hard filter is unchanged
+/// (a bare member stays tool-neutral exactly as before).
 fn infer_model_capability(model: &str) -> Option<CapabilityProfile> {
     let m = model.to_lowercase();
     // Strong / premium signals (high reasoning, premium cost).
@@ -1947,18 +1949,27 @@ fn infer_model_capability(model: &str) -> Option<CapabilityProfile> {
     const LIGHT: &[&str] = &["haiku", "mini", "flash", "lite", "nano", "-small", "-8b", "phi-"];
     let strong = STRONG.iter().any(|k| m.contains(k));
     let light = LIGHT.iter().any(|k| m.contains(k));
-    // Only commit when the signal is unambiguous; a name hitting both (or neither)
-    // stays None → baseline.
+    // Per-model modalities inferred from the NAME (Phase 2: activates the Router's
+    // `needs_vision` hard filter). A vision model name carries "vision" even when
+    // the STRONG/LIGHT tier signal is ambiguous, so vision routing still works.
+    let modalities = nomifun_api_types::infer_model_modalities(model);
+    // Only commit tiers when the strong/light signal is unambiguous; a name hitting
+    // both (or neither) gets neutral tiers. When there is NEITHER a tier signal NOR
+    // a modality, stay None → baseline (zero regression).
     let (reasoning, cost_tier, speed_tier) = if strong && !light {
         ("high", "premium", "medium")
     } else if light && !strong {
         ("low", "economy", "fast")
-    } else {
+    } else if modalities.is_empty() {
         return None;
+    } else {
+        // Ambiguous / no tier signal but a real modality (e.g. a vision name):
+        // give the neutral baseline tiers + carry the modality.
+        ("medium", "standard", "standard")
     };
     Some(CapabilityProfile {
         strengths: Vec::new(),
-        modalities: Vec::new(),
+        modalities,
         tools: false,
         reasoning: reasoning.to_string(),
         cost_tier: cost_tier.to_string(),
@@ -3800,11 +3811,117 @@ mod tests {
         let flash = infer_model_capability("gemini-2.5-flash").expect("flash → light");
         assert_eq!(flash.cost_tier, "economy");
 
-        // Unknown → None (baseline). Ambiguous (matches BOTH strong+light) → None.
+        // Unknown non-vision name → None (baseline, zero regression).
         assert!(infer_model_capability("some-unknown-model").is_none());
+        // Ambiguous tiers (matches BOTH strong `gpt-4` and light `mini`) → neutral
+        // tiers, but a vision model name still carries the vision modality (Phase 2)
+        // so `needs_vision` routing works. Previously this returned None; the
+        // contract is intentionally extended to admit vision-capable models.
+        let mini = infer_model_capability("gpt-4o-mini").expect("vision name → profile");
+        assert_eq!(mini.reasoning, "medium", "ambiguous strong+light → neutral tier");
+        assert_eq!(mini.cost_tier, "standard");
         assert!(
-            infer_model_capability("gpt-4o-mini").is_none(),
-            "a name hitting both strong (gpt-4) and light (mini) stays neutral"
+            mini.modalities.iter().any(|m| m == "vision"),
+            "gpt-4o-mini is a vision model → carries the vision modality: {:?}",
+            mini.modalities
+        );
+    }
+
+    // Phase 2: `infer_model_capability` populates `modalities` from the model NAME
+    // (via `nomifun_api_types::infer_model_modalities`), so the Router's
+    // `needs_vision` hard filter has a real signal. A vision-capable name gets a
+    // profile carrying the "vision" modality; a plain light model gets a profile
+    // WITHOUT it.
+    #[test]
+    fn infer_model_capability_sets_vision_modality() {
+        let cap = infer_model_capability("gpt-4o").expect("gpt-4o has a profile");
+        assert!(
+            cap.modalities.iter().any(|m| m == "vision"),
+            "gpt-4o is a vision model → carries the vision modality: {:?}",
+            cap.modalities
+        );
+        // A pure-text cheap model: a LIGHT tier signal but no vision modality.
+        let mini = infer_model_capability("some-mini").expect("light tier → profile");
+        assert!(
+            !mini.modalities.iter().any(|m| m == "vision"),
+            "some-mini is text-only → no vision modality: {:?}",
+            mini.modalities
+        );
+    }
+
+    // Phase 2 end-to-end: a `needs_vision` task routes to the VISION model, never
+    // the text-only one. Mirrors `plan_vetoes_planner_pick_that_was_hard_filtered`
+    // but uses REAL model names through the ad-hoc range path so the vision signal
+    // comes from `infer_model_capability` (not a hand-injected profile): the range
+    // is [gpt-4o (vision), deepseek-chat (text-only)] and the planner pre-picks the
+    // TEXT member — which the Router hard-filters out (no vision), vetoing the pick
+    // back to the surviving vision member.
+    #[tokio::test]
+    async fn needs_vision_task_routes_to_vision_model_not_text_model() {
+        // Planner pre-assigns the text-only member (index 1) for a needs_vision task.
+        let vision = TaskProfile {
+            kind: "analysis".to_string(),
+            needs_vision: true,
+            needs_long_context: false,
+            needs_high_reasoning: false,
+            bulk: false,
+        };
+        let dag = single_task_dag(Some(1), Some(vision));
+
+        // Ad-hoc service wired with the fixed planner above (mirror of
+        // `adhoc_service`, but with a custom DAG so we control the pick + profile).
+        let db = init_database_memory().await.expect("db init");
+        let pool = db.pool().clone();
+        let run_repo = Arc::new(SqliteRunRepository::new(pool.clone()));
+        let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
+        let ws_repo = Arc::new(SqliteOrchWorkspaceRepository::new(pool.clone()));
+        let emitter = OrchestratorRunEventEmitter::new(Arc::new(NoopBroadcaster));
+        let planner: Arc<dyn PlanProducer> = Arc::new(FixedPlanProducer::new(dag));
+        let svc = RunService::new(run_repo.clone(), fleet_repo, ws_repo, planner, emitter);
+
+        // Range built from REAL names: index 0 = gpt-4o (vision), 1 = deepseek-chat.
+        let req = CreateAdhocRunRequest {
+            goal: "描述这张图里的内容".to_string(),
+            work_dir: None,
+            model_range: ModelRange::Range {
+                models: vec![
+                    model_ref("prov_openai", "gpt-4o"),
+                    model_ref("prov_ds", "deepseek-chat"),
+                ],
+            },
+            pinned_roles: vec![],
+            role_members: vec![],
+            autonomy: None,
+            max_parallel: None,
+            lead_conv_id: None,
+            lead_model: None,
+        };
+        let run = svc.create_adhoc("u1", req).await.expect("create_adhoc");
+        svc.plan(&run.id).await.expect("plan");
+
+        let detail = svc.get_detail(&run.id).await.expect("detail");
+        // Snapshot order is preserved: [gpt-4o (vision), deepseek-chat (text)].
+        let vision_member = &detail.fleet_members[0];
+        let text_member = &detail.fleet_members[1];
+        assert_eq!(vision_member.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(text_member.model.as_deref(), Some("deepseek-chat"));
+        // The vision signal must come from `infer_model_capability`, not injection.
+        assert!(
+            vision_member
+                .capability_profile
+                .as_ref()
+                .is_some_and(|c| c.modalities.iter().any(|m| m == "vision")),
+            "gpt-4o member must carry the vision modality from infer_model_capability"
+        );
+
+        assert_eq!(detail.assignments.len(), 1);
+        assert_eq!(
+            detail.assignments[0].member_id, vision_member.id,
+            "needs_vision routes to the vision model; the planner's text-model pick is vetoed"
+        );
+        assert_ne!(
+            detail.assignments[0].member_id, text_member.id,
+            "the text-only member must NOT be assigned to a vision task"
         );
     }
 

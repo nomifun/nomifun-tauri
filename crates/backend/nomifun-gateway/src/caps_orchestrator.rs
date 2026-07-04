@@ -47,7 +47,8 @@
 use std::sync::Arc;
 
 use nomifun_api_types::{
-    CreateAdhocRunRequest, FleetMember, ModelRange, ModelRef, PlannedTask, RunDetail, derive_capability,
+    CapabilityProfile, CreateAdhocRunRequest, FleetMember, ModelRange, ModelRef, PlannedTask,
+    RunDetail, derive_capability, infer_model_modalities,
 };
 use nomifun_common::generate_prefixed_id;
 use schemars::JsonSchema;
@@ -603,18 +604,28 @@ fn resolve_assistant_model(
 /// assistant-crate dependency.
 fn derive_role_member(a: &AssistantData, provider_id: String, model: String) -> FleetMember {
     let persona = a.persona.trim();
+    // Conservative tag/description-derived profile (no modalities — `derive_capability`
+    // has no model name). Phase 2: merge the model NAME's inferred modalities (e.g.
+    // "vision") in HERE, at the caller that DOES have the model, so the Router's
+    // `needs_vision` hard filter admits a vision-capable assistant member.
+    let mut profile = derive_capability(
+        &a.audience_tags,
+        &a.scenario_tags,
+        a.description.as_deref(),
+        !a.enabled_skills.is_empty(),
+    );
+    for md in infer_model_modalities(&model) {
+        if !profile.modalities.contains(&md) {
+            profile.modalities.push(md);
+        }
+    }
     FleetMember {
         id: generate_prefixed_id("rmbr"),
         agent_id: a.id.clone(),
         provider_id: Some(provider_id),
         model: Some(model),
         role_hint: Some(a.name.clone()),
-        capability_profile: Some(derive_capability(
-            &a.audience_tags,
-            &a.scenario_tags,
-            a.description.as_deref(),
-            !a.enabled_skills.is_empty(),
-        )),
+        capability_profile: Some(profile),
         constraints: None,
         // Re-densified by the merge in `create_adhoc`; a placeholder here.
         sort_order: 0,
@@ -680,7 +691,20 @@ async fn build_assistant_members(
                 provider_id: Some(pid.clone()),
                 model: Some(model.clone()),
                 role_hint: None,
-                capability_profile: None,
+                // Phase 2: these description-decorated bare members WIN the
+                // `merge_members` dedup over the plain range-built members, so they
+                // are the AUTHORITATIVE vision signal for the range's models. Carry
+                // the model NAME's inferred modalities on the orchestrator baseline
+                // (strengths empty, tools false, neutral tiers) so the Router's
+                // `needs_vision` hard filter has a real signal instead of `None`.
+                capability_profile: Some(CapabilityProfile {
+                    strengths: Vec::new(),
+                    modalities: infer_model_modalities(model),
+                    tools: false,
+                    reasoning: "medium".to_string(),
+                    cost_tier: "standard".to_string(),
+                    speed_tier: "standard".to_string(),
+                }),
                 constraints: None,
                 sort_order: 0,
                 description: Some(desc.to_string()),
