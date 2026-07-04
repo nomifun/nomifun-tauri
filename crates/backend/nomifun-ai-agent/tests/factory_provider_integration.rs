@@ -99,7 +99,10 @@ fn make_factory(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn nomi_factory_returns_error_for_missing_provider() {
+async fn nomi_factory_returns_unavailable_when_no_providers_configured() {
+    // With NO providers in the DB, a conversation bound to any provider id has
+    // nothing to fall back to → ProviderUnavailable (the friendly terminal error,
+    // surfaced to the user as "no usable model" rather than a raw provider id).
     let (provider_repo, remote_agent_repo, agent_registry, acp_agent_service) = setup().await;
     let factory = make_factory(provider_repo, remote_agent_repo, agent_registry, acp_agent_service);
 
@@ -118,15 +121,41 @@ async fn nomi_factory_returns_error_for_missing_provider() {
 
     let result = factory(options).await;
     match result {
-        Ok(_) => panic!("Expected error for missing provider, got Ok"),
+        Ok(_) => panic!("Expected ProviderUnavailable error when no providers configured, got Ok"),
         Err(e) => {
             let err_msg = e.to_string();
             assert!(
-                err_msg.contains("not found"),
-                "Expected 'not found' error, got: {err_msg}"
+                err_msg.contains("No usable model provider"),
+                "Expected ProviderUnavailable error, got: {err_msg}"
             );
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nomi_factory_falls_back_to_first_enabled_when_bound_provider_missing() {
+    // A conversation bound to a DELETED provider must NOT hard-fail while an
+    // enabled provider still exists — it falls back to the first enabled model
+    // instead of erroring with "Provider '<id>' not found".
+    let (provider_repo, remote_agent_repo, agent_registry, acp_agent_service) = setup().await;
+    insert_test_provider(&*provider_repo, "prov-001", "openai").await;
+    let factory = make_factory(provider_repo, remote_agent_repo, agent_registry, acp_agent_service);
+
+    let options = BuildTaskOptions {
+        agent_type: AgentType::Nomi,
+        workspace: "/tmp/test-workspace".into(),
+        model: ProviderWithModel {
+            provider_id: "deleted-provider".into(),
+            model: "gpt-4o".into(),
+            use_model: None,
+        },
+        conversation_id: "conv-test-fallback".into(),
+        conversation_created_at: None,
+        extra: serde_json::json!({}),
+    };
+
+    let result = factory(options).await;
+    assert!(result.is_ok(), "Expected fallback Ok, got: {:?}", result.err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

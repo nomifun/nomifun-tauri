@@ -8,11 +8,12 @@ name = "nomicore"
 path = "src/main.rs"
 
 [features]
-default = ["telegram", "lark", "dingtalk", "weixin", "discord", "matrix", "mattermost", "slack", "twitch", "nostr", "qqbot"]
+default = ["telegram", "lark", "dingtalk", "weixin", "wecom", "discord", "matrix", "mattermost", "slack", "twitch", "nostr", "qqbot"]
 telegram = ["nomifun-channel/telegram"]
 lark = ["nomifun-channel/lark"]
 dingtalk = ["nomifun-channel/dingtalk"]
 weixin = ["nomifun-channel/weixin"]
+wecom = ["nomifun-channel/wecom"]
 discord = ["nomifun-channel/discord"]
 matrix = ["nomifun-channel/matrix"]
 mattermost = ["nomifun-channel/mattermost"]

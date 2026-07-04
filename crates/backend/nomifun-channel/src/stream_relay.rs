@@ -372,7 +372,7 @@ fn formatted_parse_mode(platform: PluginType) -> Option<ParseMode> {
 fn is_send_once_platform(platform: PluginType) -> bool {
     matches!(
         platform,
-        PluginType::Weixin | PluginType::Twitch | PluginType::Nostr | PluginType::Qqbot
+        PluginType::Weixin | PluginType::Wecom | PluginType::Twitch | PluginType::Nostr | PluginType::Qqbot
     )
 }
 

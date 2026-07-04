@@ -87,6 +87,50 @@ pub(crate) async fn resolve_provider_fields(
     })
 }
 
+/// Resolve provider fields for a conversation send, never hard-failing on a
+/// deleted/empty provider: fall back to the first enabled provider/model.
+/// Only `AppError::ProviderUnavailable` when NOTHING is configured.
+///
+/// This is the send-time counterpart to [`resolve_provider_fields`]: a
+/// conversation may reference a provider that has since been deleted (or carry
+/// an empty provider id). Rather than surfacing a hard `BadRequest`/crash to the
+/// user mid-send, we fall back to the app default (first enabled provider +
+/// model, via [`crate::resolve_default_model`]). The returned
+/// [`ResolvedProviderFields`] carries the ACTUAL resolved provider/model, so
+/// callers must read the model from `fields.model` (not the requested id).
+pub(crate) async fn resolve_provider_fields_with_fallback(
+    provider_repo: &Arc<dyn IProviderRepository>,
+    encryption_key: &[u8; 32],
+    provider_id: &str,
+    model: &str,
+) -> Result<ResolvedProviderFields, AppError> {
+    let stored_ok = !provider_id.is_empty()
+        && provider_repo
+            .find_by_id(provider_id)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to load provider config: {e}")))?
+            .is_some();
+
+    if stored_ok {
+        return resolve_provider_fields(provider_repo, encryption_key, provider_id, model).await;
+    }
+
+    match crate::resolve_default_model(provider_repo).await {
+        Some((pid, m)) => {
+            tracing::warn!(
+                requested_provider = %provider_id,
+                fallback_provider = %pid,
+                fallback_model = %m,
+                "conversation provider unavailable; falling back to first enabled model"
+            );
+            resolve_provider_fields(provider_repo, encryption_key, &pid, &m).await
+        }
+        None => Err(AppError::ProviderUnavailable(
+            "no enabled model provider is configured".into(),
+        )),
+    }
+}
+
 fn resolve_model_context_limit(
     provider_context_limit: Option<i64>,
     model_context_limits: Option<&str>,
@@ -619,5 +663,104 @@ mod tests {
         .await;
         assert!(saw_reasoning, "reasoning still forwarded");
         assert!(result.is_err(), "no TextDelta → no answer → error on empty close");
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+    use nomifun_db::models::Provider;
+    use nomifun_db::{CreateProviderParams, DbError, UpdateProviderParams};
+
+    // Copied (and lightly adapted) from knowledge_completer.rs tests: the same
+    // `ListOnlyRepo` + `provider(...)` fixture. `api_key_encrypted` is a REAL
+    // AES-GCM ciphertext under the all-zero test key so `resolve_provider_fields`
+    // (which decrypts) succeeds — an empty string would fail decrypt. `models`
+    // takes a `&[&str]` and is serialized to the JSON the repo stores.
+    fn provider(id: &str, enabled: bool, models: &[&str], model_enabled: Option<&str>) -> Provider {
+        Provider {
+            id: id.into(),
+            platform: "openai".into(),
+            name: id.into(),
+            base_url: String::new(),
+            api_key_encrypted: nomifun_common::encrypt_string("sk-test", &[0u8; 32])
+                .expect("encrypt test api key"),
+            models: serde_json::to_string(models).expect("serialize models"),
+            enabled,
+            capabilities: "[]".into(),
+            context_limit: None,
+            model_context_limits: None,
+            model_protocols: None,
+            model_descriptions: None,
+            model_enabled: model_enabled.map(str::to_owned),
+            model_health: None,
+            bedrock_config: None,
+            is_full_url: false,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    struct ListOnlyRepo(Vec<Provider>);
+
+    #[async_trait::async_trait]
+    impl IProviderRepository for ListOnlyRepo {
+        async fn list(&self) -> Result<Vec<Provider>, DbError> {
+            Ok(self.0.clone())
+        }
+        async fn find_by_id(&self, id: &str) -> Result<Option<Provider>, DbError> {
+            Ok(self.0.iter().find(|p| p.id == id).cloned())
+        }
+        async fn create(&self, _params: CreateProviderParams<'_>) -> Result<Provider, DbError> {
+            unimplemented!("not used by these tests")
+        }
+        async fn update(&self, _id: &str, _params: UpdateProviderParams<'_>) -> Result<Provider, DbError> {
+            unimplemented!("not used by these tests")
+        }
+        async fn delete(&self, _id: &str) -> Result<(), DbError> {
+            unimplemented!("not used by these tests")
+        }
+    }
+
+    fn list_only(providers: Vec<Provider>) -> Arc<dyn IProviderRepository> {
+        Arc::new(ListOnlyRepo(providers))
+    }
+
+    #[tokio::test]
+    async fn fallback_uses_stored_provider_when_present() {
+        let repo = list_only(vec![provider("prov_a", true, &["m1"], None)]);
+        let f = resolve_provider_fields_with_fallback(&repo, &[0u8; 32], "prov_a", "m1")
+            .await
+            .unwrap();
+        assert_eq!(f.model, "m1");
+    }
+
+    #[tokio::test]
+    async fn fallback_to_first_enabled_when_provider_missing() {
+        let repo = list_only(vec![provider("prov_a", true, &["m1"], None)]);
+        // 会话里存的是已删除的 prov_dead
+        let f = resolve_provider_fields_with_fallback(&repo, &[0u8; 32], "prov_dead", "mX")
+            .await
+            .unwrap();
+        assert_eq!(f.model, "m1"); // 回退到首个可用
+    }
+
+    #[tokio::test]
+    async fn fallback_on_empty_provider_id() {
+        let repo = list_only(vec![provider("prov_a", true, &["m1"], None)]);
+        let f = resolve_provider_fields_with_fallback(&repo, &[0u8; 32], "", "")
+            .await
+            .unwrap();
+        assert_eq!(f.model, "m1");
+    }
+
+    #[tokio::test]
+    async fn fallback_errors_provider_unavailable_when_none() {
+        let repo = list_only(vec![provider("prov_a", false, &["m1"], None)]); // disabled
+        // NB: match on the `Result` directly rather than `.unwrap_err()` — the Ok
+        // variant (`ResolvedProviderFields`) intentionally does not derive `Debug`
+        // (it holds a decrypted api key we must not risk logging).
+        let result = resolve_provider_fields_with_fallback(&repo, &[0u8; 32], "prov_dead", "m").await;
+        assert!(matches!(result, Err(AppError::ProviderUnavailable(_))));
     }
 }

@@ -232,7 +232,7 @@ pub(super) async fn build(
         .unwrap_or(&options.model.model)
         .to_owned();
 
-    let fields = super::provider_config::resolve_provider_fields(
+    let fields = super::provider_config::resolve_provider_fields_with_fallback(
         &deps.provider_repo,
         &deps.encryption_key,
         provider_id,
@@ -413,7 +413,7 @@ pub(super) async fn build(
     let config = NomiResolvedConfig {
         provider: fields.provider,
         api_key: fields.api_key,
-        model: model_id,
+        model: fields.model.clone(),
         base_url: fields.base_url,
         system_prompt: overrides.system_prompt,
         max_tokens: overrides.max_tokens,

@@ -867,6 +867,15 @@
   "baiduManualDownload": "百度网盘手动下载",
   "includePrereleaseUpdates": "包含预发布/dev 版本",
   "saveModelConfigFailed": "保存模型配置失败",
+  "providerInUse": {
+    "title": "该模型供应商正在被使用",
+    "desc": "以下功能仍在使用该供应商，请先前往解绑或更换模型后再删除：",
+    "goto": "前往处理",
+    "desktopCompanion": "桌面伙伴",
+    "publicCompanion": "对外伙伴",
+    "smartDecision": "智能决策",
+    "orchestrator": "智能编排"
+  },
   "healthCheck": "健康检测",
   "clearStatus": "清除状态",
   "healthStatusCleared": "健康状态已清除",

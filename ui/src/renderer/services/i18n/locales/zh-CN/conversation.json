@@ -146,6 +146,10 @@
       "unknown_upstream": "上游"
     },
     "codes": {
+      "PROVIDER_UNAVAILABLE": {
+        "title": "当前没有可用的模型",
+        "body": "当前没有可用的模型供应商，请到「模型&Agent」添加并启用一个模型后重试。"
+      },
       "NOMIFUN_STREAM_BROKEN": {
         "title": "响应流异常中断",
         "body": "消息已发送，但响应流异常结束。请先重试；如果反复出现，可以提交反馈。"
@@ -392,6 +396,7 @@
   },
   "chat": {
     "noModelSelected": "当前会话未选择模型，无法发送消息",
+    "modelHealedToDefault": "已回退到默认模型 {{model}}",
     "sendMessageTo": "发送消息到 {{model}}",
     "processing": "正在处理中……",
     "quotaExceededTitle": "模型额度已用尽",

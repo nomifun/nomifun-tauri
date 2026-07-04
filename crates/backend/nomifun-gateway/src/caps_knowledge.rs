@@ -132,11 +132,14 @@ pub(crate) async fn ensure_known_kb_ids(deps: &GatewayDeps, ids: &[String]) -> R
     if ids.is_empty() {
         return Ok(());
     }
-    let bases = match deps.knowledge_service.list_bases().await {
-        Ok(bases) => bases,
+    // ID-existence check only — use the disk-free registry lookup, NOT
+    // `list_bases()`, which walks every base's directory tree and would hang
+    // binding operations whenever a base is rooted on a slow/offline NAS mount.
+    let known_ids = match deps.knowledge_service.list_base_ids().await {
+        Ok(ids) => ids,
         Err(e) => return Err(json!({ "error": e.to_string() })),
     };
-    let known: HashSet<&str> = bases.iter().map(|b| b.id.as_str()).collect();
+    let known: HashSet<&str> = known_ids.iter().map(String::as_str).collect();
     match first_unknown_id(ids, &known) {
         Some(bad) => Err(unknown_kb_error(bad)),
         None => Ok(()),

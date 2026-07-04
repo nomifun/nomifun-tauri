@@ -271,6 +271,12 @@ async fn test_plugin(deps: Arc<GatewayDeps>, p: TestPluginParams) -> Value {
                 credentials.account_id = e.app_id.clone();
             }
         }
+        "wecom" => {
+            credentials.bot_id = Some(p.token.clone());
+            if let Some(e) = extra {
+                credentials.secret = e.app_secret.clone();
+            }
+        }
         "slack" => {
             credentials.token = Some(p.token.clone());
             if let Some(e) = extra {

@@ -1156,6 +1156,7 @@ impl ChannelManager {
             PluginType::Lark => "Lark Bot".into(),
             PluginType::Dingtalk => "DingTalk Bot".into(),
             PluginType::Weixin => "WeChat Bot".into(),
+            PluginType::Wecom => "WeCom Bot".into(),
             PluginType::Slack => "Slack Bot".into(),
             PluginType::Discord => "Discord Bot".into(),
             PluginType::Matrix => "Matrix Bot".into(),

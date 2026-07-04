@@ -848,6 +848,13 @@ fn build_test_config(req: &TestPluginRequest) -> PluginConfig {
                 credentials.account_id = extra.app_id.clone();
             }
         }
+        "wecom" => {
+            // Long-connection creds: bot_id in `token`, secret in extra.app_secret.
+            credentials.bot_id = Some(req.token.clone());
+            if let Some(ref extra) = req.extra_config {
+                credentials.secret = extra.app_secret.clone();
+            }
+        }
         "slack" => {
             // Bot token (xoxb-) in `token`; app-level token (xapp-) in extra.
             credentials.token = Some(req.token.clone());

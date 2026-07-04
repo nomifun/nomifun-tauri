@@ -18,6 +18,10 @@ pub enum PluginType {
     Lark,
     Dingtalk,
     Weixin,
+    /// WeCom / 企业微信 intelligent bot, long-connection (WebSocket) mode
+    /// authenticated with `bot_id` + `secret`. Distinct from `Weixin`
+    /// (consumer WeChat iLink bot) — different endpoint, transport, and creds.
+    Wecom,
     /// Reserved variant for future Slack integration.
     Slack,
     /// Reserved variant for future Discord integration.
@@ -41,6 +45,7 @@ impl fmt::Display for PluginType {
             Self::Lark => write!(f, "lark"),
             Self::Dingtalk => write!(f, "dingtalk"),
             Self::Weixin => write!(f, "weixin"),
+            Self::Wecom => write!(f, "wecom"),
             Self::Slack => write!(f, "slack"),
             Self::Discord => write!(f, "discord"),
             Self::Matrix => write!(f, "matrix"),
@@ -60,6 +65,7 @@ impl PluginType {
             "lark" => Some(Self::Lark),
             "dingtalk" => Some(Self::Dingtalk),
             "weixin" => Some(Self::Weixin),
+            "wecom" => Some(Self::Wecom),
             "slack" => Some(Self::Slack),
             "discord" => Some(Self::Discord),
             "matrix" => Some(Self::Matrix),
@@ -209,6 +215,12 @@ pub struct PluginCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bot_token: Option<String>,
 
+    // WeCom (企业微信智能机器人 long-connection: bot_id + secret)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+
     // Slack (Socket Mode: bot token reuses `token` (xoxb-); app-level token below)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_token: Option<String>,
@@ -295,6 +307,8 @@ pub fn bot_key_for(plugin_type: PluginType, credentials: &PluginCredentials) -> 
         PluginType::Lark => credentials.app_id.clone(),
         PluginType::Dingtalk => credentials.client_id.clone(),
         PluginType::Weixin => credentials.account_id.clone().or_else(|| credentials.bot_token.clone()),
+        // WeCom: the non-secret bot identity is its bot_id.
+        PluginType::Wecom => credentials.bot_id.clone(),
         PluginType::Matrix => match (&credentials.homeserver_url, &credentials.user_id) {
             (Some(hs), Some(uid)) => Some(format!("{}|{}", hs.trim_end_matches('/'), uid)),
             _ => None,

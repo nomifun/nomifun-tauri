@@ -146,6 +146,10 @@
       "unknown_upstream": "Upstream"
     },
     "codes": {
+      "PROVIDER_UNAVAILABLE": {
+        "title": "No model available",
+        "body": "No usable model provider is configured. Add and enable one in Models & Agent, then retry."
+      },
       "NOMIFUN_STREAM_BROKEN": {
         "title": "Response stream was interrupted",
         "body": "The app accepted your message but the response stream ended unexpectedly. Please retry; if it happens again, send feedback."
@@ -392,6 +396,7 @@
   },
   "chat": {
     "noModelSelected": "No model selected for current session, cannot send message",
+    "modelHealedToDefault": "Switched to your default model {{model}}",
     "sendMessageTo": "Send message to {{model}}",
     "processing": "Processing...",
     "quotaExceededTitle": "Model quota reached",

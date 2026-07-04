@@ -236,6 +236,37 @@ export function isBackendHttpError(error: unknown): error is BackendHttpError {
   return false;
 }
 
+/**
+ * Error thrown by `httpRequest` when the request never produced an HTTP
+ * response — i.e. a transport-layer failure, not a non-2xx status
+ * ([`BackendHttpError`] covers that). Two shapes:
+ *
+ * - `kind: 'timeout'` — the optional per-request `timeoutMs` deadline elapsed
+ *   and we aborted the request (the backend was unreachable or too slow, e.g.
+ *   a knowledge-base root on an offline/slow network drive).
+ * - `kind: 'network'` — `fetch` itself rejected. In the desktop WKWebView this
+ *   surfaces as the opaque `TypeError: Load failed`; we wrap it with a
+ *   diagnosable message instead of letting that raw string escape to the UI.
+ */
+export class BackendRequestError extends Error {
+  readonly kind: 'timeout' | 'network';
+  constructor(kind: 'timeout' | 'network', message: string) {
+    super(message);
+    this.name = 'BackendRequestError';
+    this.kind = kind;
+  }
+}
+
+export function isBackendRequestError(error: unknown): error is BackendRequestError {
+  return (
+    error instanceof BackendRequestError ||
+    (!!error &&
+      typeof error === 'object' &&
+      'name' in error &&
+      (error as { name: unknown }).name === 'BackendRequestError')
+  );
+}
+
 // ---------------------------------------------------------------------------
 // HTTP request helper
 // ---------------------------------------------------------------------------
@@ -250,6 +281,16 @@ export function isBackendHttpError(error: unknown): error is BackendHttpError {
  */
 export type HttpRequestOptions = {
   silentStatuses?: number[];
+  /**
+   * Optional client-side deadline in milliseconds. When set, the request is
+   * aborted after this long and a legible [`BackendRequestError`] (`timeout`)
+   * is thrown instead of hanging until the platform's own network timeout.
+   *
+   * Apply ONLY to bounded read endpoints. Long-running mutations (knowledge
+   * autogen, URL snapshot fetch, imports) legitimately take minutes and MUST
+   * NOT set this, or they will be killed mid-flight.
+   */
+  timeoutMs?: number;
 };
 
 const SENSITIVE_LOG_KEY_PATTERN = /api[_-]?key|authorization|auth[_-]?token|access[_-]?token|refresh[_-]?token|secret/i;
@@ -294,11 +335,39 @@ export async function httpRequest<T>(
     );
   }
 
-  const response = await fetch(url, {
-    method,
-    headers,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
+  // Optional client-side deadline (opt-in via options.timeoutMs). Aborts a
+  // request that outlives it so a hung/unreachable backend surfaces a legible
+  // error instead of the opaque platform network timeout minutes later.
+  const controller = options?.timeoutMs != null ? new AbortController() : undefined;
+  const timeoutHandle =
+    controller && options?.timeoutMs != null
+      ? setTimeout(() => controller.abort(), options.timeoutMs)
+      : undefined;
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: controller?.signal,
+    });
+  } catch (e) {
+    // No HTTP response was produced: our own timeout abort, or a transport
+    // failure (backend unreachable / connection reset). WKWebView renders the
+    // latter as an opaque "TypeError: Load failed"; rethrow something the UI
+    // and logs can actually act on.
+    if (controller?.signal.aborted) {
+      throw new BackendRequestError(
+        'timeout',
+        `Backend ${method} ${path} timed out after ${options?.timeoutMs}ms — the backend may be busy or a knowledge-base root is on a slow/offline drive`
+      );
+    }
+    const detail = e instanceof Error ? e.message : String(e);
+    throw new BackendRequestError('network', `Backend ${method} ${path} failed: backend unreachable (${detail})`);
+  } finally {
+    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+  }
 
   if (!response.ok) {
     // Read the body exactly once. A `Response` body is a one-shot stream, so

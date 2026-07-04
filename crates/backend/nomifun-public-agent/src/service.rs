@@ -72,6 +72,28 @@ impl PublicAgentService {
         self.registry.remove(id).await.map(|_| ())
     }
 
+    // ---- provider usage ----
+
+    /// Report every public agent whose model is backed by `provider_id`
+    /// (feeds the provider-deletion guard). Each hit is labelled by the agent
+    /// name and deep-links via its id.
+    pub async fn providers_in_use(&self, provider_id: &str) -> Vec<nomifun_common::ProviderUsage> {
+        // An empty provider_id is the "unconfigured" sentinel; never match it.
+        if provider_id.is_empty() {
+            return Vec::new();
+        }
+        self.list()
+            .await
+            .into_iter()
+            .filter(|a| a.model.provider_id == provider_id)
+            .map(|a| nomifun_common::ProviderUsage {
+                feature: nomifun_common::ProviderUsageFeature::PublicCompanion,
+                label: a.name,
+                target_id: Some(a.id),
+            })
+            .collect()
+    }
+
     // ---- audit ----
 
     /// Record an inbound turn (best-effort; never fails the caller). Retention
@@ -142,5 +164,17 @@ mod tests {
 
         // Unknown agent → NotFound on search.
         assert!(svc.search_audit("pubagent_nope", AuditQuery::default()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn providers_in_use_detects_public_agent_model() {
+        let d = tempfile::tempdir().unwrap();
+        let svc = PublicAgentService::start(d.path());
+        let a = svc.create("客服").await.unwrap();
+        svc.patch(&a.id, serde_json::json!({"model":{"provider_id":"prov_x","model":"m"}})).await.unwrap();
+
+        let hits = svc.providers_in_use("prov_x").await;
+        assert!(hits.iter().any(|u| u.label == "客服" && u.target_id.as_deref() == Some(a.id.as_str())));
+        assert!(svc.providers_in_use("prov_none").await.is_empty());
     }
 }

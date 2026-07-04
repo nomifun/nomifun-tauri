@@ -7,11 +7,19 @@
 import { ipcBridge } from '@/common';
 import type { IProvider } from '@/common/config/storage';
 import { prefixedId } from '@/common/utils';
-import { Button, Divider, Message, Popconfirm, Popover, Input, Collapse, Tag, Switch, Tooltip } from '@arco-design/web-react';
+import { Button, Divider, Message, Modal, Popconfirm, Popover, Input, Collapse, Tag, Switch, Tooltip } from '@arco-design/web-react';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 import { Copy, DeleteFour, Info, Minus, Plus, Write, Heartbeat } from '@icon-park/react';
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useNavigate } from 'react-router-dom';
+import { isBackendHttpError } from '@/common/adapter/httpBridge';
+import {
+  featureRoute,
+  groupUsagesByFeature,
+  parseProviderInUseDetails,
+  type ProviderUsageFeature,
+} from './providerInUse';
 import AddModelModal from '@/renderer/pages/settings/components/AddModelModal';
 import AddPlatformModal from '@/renderer/pages/settings/components/AddPlatformModal';
 import { isNewApiPlatform, NEW_API_PROTOCOL_OPTIONS } from '@/renderer/utils/model/modelPlatforms';
@@ -244,6 +252,7 @@ const ModelContextLimitEditor: React.FC<{
 
 const ModelModalContent: React.FC = () => {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const viewMode = useSettingsViewMode();
   const isPageMode = viewMode === 'page';
   // 以「内容面板实际宽度」而非视口宽度做分档：模型管理面板被一次 rail + 二级
@@ -308,6 +317,35 @@ const ModelModalContent: React.FC = () => {
       .catch((error) => {
         void mutate();
         console.error('Failed to delete provider:', error);
+        if (isBackendHttpError(error) && error.code === 'PROVIDER_IN_USE') {
+          const groups = groupUsagesByFeature(parseProviderInUseDetails(error.details));
+          const featureName: Record<ProviderUsageFeature, string> = {
+            desktopCompanion: t('settings.providerInUse.desktopCompanion'),
+            publicCompanion: t('settings.providerInUse.publicCompanion'),
+            smartDecision: t('settings.providerInUse.smartDecision'),
+            orchestrator: t('settings.providerInUse.orchestrator'),
+          };
+          Modal.confirm({
+            title: t('settings.providerInUse.title'),
+            content: (
+              <div className='flex flex-col gap-8px'>
+                <div>{t('settings.providerInUse.desc')}</div>
+                {groups.map((g) => (
+                  <div key={g.feature}>
+                    <b>{featureName[g.feature]}</b>：{g.labels.join('、')}
+                  </div>
+                ))}
+              </div>
+            ),
+            okText: t('settings.providerInUse.goto'),
+            cancelText: t('common.cancel', { defaultValue: '取消' }),
+            onOk: () => {
+              const first = groups[0];
+              if (first) navigate(featureRoute(first.feature, first.targetId));
+            },
+          });
+          return;
+        }
         message.error(t('settings.saveModelConfigFailed'));
       });
   };

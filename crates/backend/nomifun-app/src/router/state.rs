@@ -293,10 +293,28 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
     let pool = services.database.pool().clone();
     let provider_repo = Arc::new(SqliteProviderRepository::new(pool.clone()));
 
+    // Cross-subsystem provider-deletion guard: aggregate every hard-binding
+    // in-use scan (companion / public-agent / idmm global backup / orchestrator
+    // fleet) so `ProviderService::delete` refuses an in-use provider (409), and
+    // strip the soft failover-queue reference after a successful delete. The
+    // companion + public-agent singletons are reused from `services`; the client-pref
+    // + fleet repos are freshly built from the pool (per-builder pattern).
+    let client_pref_repo: Arc<dyn nomifun_db::IClientPreferenceRepository> =
+        Arc::new(SqliteClientPreferenceRepository::new(pool.clone()));
+    let fleet_repo: Arc<dyn nomifun_db::IFleetRepository> =
+        Arc::new(nomifun_db::SqliteFleetRepository::new(pool.clone()));
+    let deletion_coordinator = Arc::new(crate::provider_deletion::AppProviderDeletionCoordinator {
+        companion: services.companion_service.clone(),
+        public_agent: services.public_agent_service.clone(),
+        client_prefs: client_pref_repo,
+        fleet_repo,
+    });
+
     SystemRouterState {
         settings_service: SettingsService::new(Arc::new(SqliteSettingsRepository::new(pool.clone()))),
         client_pref_service: ClientPrefService::new(Arc::new(SqliteClientPreferenceRepository::new(pool))),
-        provider_service: ProviderService::new(provider_repo.clone(), encryption_key),
+        provider_service: ProviderService::new(provider_repo.clone(), encryption_key)
+            .with_deletion_coordinator(deletion_coordinator),
         model_fetch_service: ModelFetchService::new_dynamic(provider_repo, encryption_key),
         protocol_detection_service: ProtocolDetectionService::new_dynamic(),
         version_check_service: VersionCheckService::new_dynamic(env!("CARGO_PKG_VERSION").to_owned()),

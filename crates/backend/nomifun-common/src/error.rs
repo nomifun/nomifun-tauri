@@ -23,6 +23,14 @@ pub enum AppError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    /// A provider cannot be deleted because features still reference it.
+    #[error("Provider is in use: {} reference(s)", .0.usages.len())]
+    ProviderInUse(crate::provider_usage::ProviderInUseDetails),
+
+    /// No usable (enabled) provider/model is configured to serve a request.
+    #[error("No usable model provider is configured: {0}")]
+    ProviderUnavailable(String),
+
     #[error("Rate limited")]
     RateLimited,
 
@@ -77,6 +85,8 @@ impl AppError {
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::Conflict(_) => StatusCode::CONFLICT,
+            Self::ProviderInUse(_) => StatusCode::CONFLICT,
+            Self::ProviderUnavailable(_) => StatusCode::BAD_REQUEST,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::BadGateway(_) => StatusCode::BAD_GATEWAY,
@@ -102,6 +112,8 @@ impl AppError {
                 }
             }
             Self::Conflict(_) => "CONFLICT",
+            Self::ProviderInUse(_) => "PROVIDER_IN_USE",
+            Self::ProviderUnavailable(_) => "PROVIDER_UNAVAILABLE",
             Self::RateLimited => "RATE_LIMITED",
             Self::Internal(_) => "INTERNAL_ERROR",
             Self::BadGateway(_) => "BAD_GATEWAY",
@@ -123,6 +135,7 @@ impl AppError {
             Self::WorkspacePathEdgeWhitespaceRuntimeUnsupported(path) => {
                 Some(workspace_path_whitespace_details(path, "runtime"))
             }
+            Self::ProviderInUse(details) => Some(json!({ "usages": details.usages })),
             _ => None,
         }
     }
@@ -384,5 +397,33 @@ mod tests {
             source: Inner,
         };
         assert_eq!(format!("{}", ErrorChain(&err)), "outer: boom: inner cause");
+    }
+
+    #[tokio::test]
+    async fn provider_in_use_response_shape() {
+        use crate::provider_usage::{ProviderInUseDetails, ProviderUsage, ProviderUsageFeature};
+        let err = AppError::ProviderInUse(ProviderInUseDetails {
+            usages: vec![ProviderUsage {
+                feature: ProviderUsageFeature::DesktopCompanion,
+                label: "大聪明".into(),
+                target_id: Some("cmp_1".into()),
+            }],
+        });
+        assert_eq!(err.status_code(), StatusCode::CONFLICT);
+        assert_eq!(err.error_code(), "PROVIDER_IN_USE");
+        let resp = err.into_response();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "PROVIDER_IN_USE");
+        assert_eq!(json["details"]["usages"][0]["feature"], "desktopCompanion");
+        assert_eq!(json["details"]["usages"][0]["label"], "大聪明");
+        assert_eq!(json["details"]["usages"][0]["targetId"], "cmp_1");
+    }
+
+    #[test]
+    fn provider_unavailable_code_and_status() {
+        let err = AppError::ProviderUnavailable("no enabled provider".into());
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(err.error_code(), "PROVIDER_UNAVAILABLE");
     }
 }

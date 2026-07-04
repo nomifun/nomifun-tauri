@@ -20,6 +20,13 @@ const BACKEND_ERROR_CODE_MAP: Record<string, WorkspacePathErrorCode> = {
   WORKSPACE_PATH_EDGE_WHITESPACE_RUNTIME_UNSUPPORTED: 'WORKSPACE_PATH_EDGE_WHITESPACE_RUNTIME_UNSUPPORTED',
 };
 
+const PROVIDER_ERROR_CODES = new Set(['PROVIDER_UNAVAILABLE']);
+
+/** i18n key for a provider-config error code, or undefined if not one. */
+export function providerErrorI18nKey(code: string): string | undefined {
+  return PROVIDER_ERROR_CODES.has(code) ? `conversation.agentError.codes.${code}.body` : undefined;
+}
+
 type EmbeddedBackendErrorPayload = {
   code?: string;
   error?: string;
@@ -129,8 +136,12 @@ export const getConversationCreateErrorMessage = (error: unknown, t: TFunction):
 };
 
 export const getConversationRuntimeWorkspaceErrorMessage = (error: unknown, t: TFunction): string => {
-  const normalizedCode = normalizeConversationRuntimeWorkspaceErrorCode(error);
   const payload = getWorkspacePathErrorPayload(error);
+  const providerKey = payload?.code ? providerErrorI18nKey(payload.code) : undefined;
+  if (providerKey) {
+    return t(providerKey);
+  }
+  const normalizedCode = normalizeConversationRuntimeWorkspaceErrorCode(error);
   const workspacePath = getWorkspacePathFromErrorDetails(error);
   const rawMessage = payload?.error || parseError(error) || t('common.unknownError');
 

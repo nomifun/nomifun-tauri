@@ -2,20 +2,35 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use nomifun_api_types::{CreateProviderRequest, ProviderResponse, UpdateProviderRequest};
-use nomifun_common::{AppError, decrypt_string, encrypt_string};
+use nomifun_common::{AppError, ProviderInUseDetails, decrypt_string, encrypt_string};
 use nomifun_db::{CreateProviderParams, IProviderRepository, UpdateProviderParams, models::Provider};
 use serde::de::DeserializeOwned;
+use tracing::warn;
+
+use crate::provider_deletion::SharedProviderDeletionCoordinator;
 
 /// Business logic for model provider CRUD with API key encryption/masking.
 #[derive(Clone)]
 pub struct ProviderService {
     repo: Arc<dyn IProviderRepository>,
     encryption_key: [u8; 32],
+    coordinator: Option<SharedProviderDeletionCoordinator>,
 }
 
 impl ProviderService {
     pub fn new(repo: Arc<dyn IProviderRepository>, encryption_key: [u8; 32]) -> Self {
-        Self { repo, encryption_key }
+        Self {
+            repo,
+            encryption_key,
+            coordinator: None,
+        }
+    }
+
+    /// Inject a deletion coordinator so `delete` refuses in-use providers and
+    /// cleans up soft references afterwards.
+    pub fn with_deletion_coordinator(mut self, coordinator: SharedProviderDeletionCoordinator) -> Self {
+        self.coordinator = Some(coordinator);
+        self
     }
 
     /// List all providers with masked API keys.
@@ -108,8 +123,24 @@ impl ProviderService {
     }
 
     /// Delete a provider by ID.
+    ///
+    /// When a deletion coordinator is configured, deletion is refused with
+    /// `AppError::ProviderInUse` if any feature still holds a hard binding to
+    /// the provider. After a successful delete, soft references are cleaned up
+    /// on a best-effort basis (failures are logged, not propagated).
     pub async fn delete(&self, id: &str) -> Result<(), AppError> {
+        if let Some(coord) = &self.coordinator {
+            let usages = coord.usages(id).await?;
+            if !usages.is_empty() {
+                return Err(AppError::ProviderInUse(ProviderInUseDetails { usages }));
+            }
+        }
         self.repo.delete(id).await?;
+        if let Some(coord) = &self.coordinator
+            && let Err(e) = coord.cleanup_soft_refs(id).await
+        {
+            warn!(provider_id = %id, error = %e, "provider soft-ref cleanup failed (delete already committed)");
+        }
         Ok(())
     }
 
@@ -774,5 +805,85 @@ mod tests {
         let svc = setup().await;
         let err = svc.delete("no_such_id").await.unwrap_err();
         assert_eq!(err.status_code(), axum::http::StatusCode::NOT_FOUND);
+    }
+}
+
+#[cfg(test)]
+mod delete_guard_tests {
+    use super::*;
+    use nomifun_common::{ProviderUsage, ProviderUsageFeature};
+    use nomifun_db::models::Provider;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct CountingRepo {
+        deleted: AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl IProviderRepository for CountingRepo {
+        async fn list(&self) -> Result<Vec<Provider>, nomifun_db::DbError> {
+            Ok(vec![])
+        }
+        async fn find_by_id(&self, _: &str) -> Result<Option<Provider>, nomifun_db::DbError> {
+            Ok(None)
+        }
+        async fn create(&self, _: nomifun_db::CreateProviderParams<'_>) -> Result<Provider, nomifun_db::DbError> {
+            unimplemented!()
+        }
+        async fn update(&self, _: &str, _: nomifun_db::UpdateProviderParams<'_>) -> Result<Provider, nomifun_db::DbError> {
+            unimplemented!()
+        }
+        async fn delete(&self, _: &str) -> Result<(), nomifun_db::DbError> {
+            self.deleted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct FakeCoord {
+        usages: Vec<ProviderUsage>,
+        cleaned: AtomicBool,
+    }
+    #[async_trait::async_trait]
+    impl crate::provider_deletion::ProviderDeletionCoordinator for FakeCoord {
+        async fn usages(&self, _: &str) -> Result<Vec<ProviderUsage>, AppError> {
+            Ok(self.usages.clone())
+        }
+        async fn cleanup_soft_refs(&self, _: &str) -> Result<(), AppError> {
+            self.cleaned.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_blocked_when_in_use() {
+        let repo = Arc::new(CountingRepo {
+            deleted: AtomicBool::new(false),
+        });
+        let coord = Arc::new(FakeCoord {
+            usages: vec![ProviderUsage {
+                feature: ProviderUsageFeature::DesktopCompanion,
+                label: "甲".into(),
+                target_id: None,
+            }],
+            cleaned: AtomicBool::new(false),
+        });
+        let svc = ProviderService::new(repo.clone(), [0u8; 32]).with_deletion_coordinator(coord);
+        let err = svc.delete("prov_x").await.unwrap_err();
+        assert!(matches!(err, AppError::ProviderInUse(_)));
+        assert!(!repo.deleted.load(Ordering::SeqCst), "must not delete when in use");
+    }
+
+    #[tokio::test]
+    async fn delete_proceeds_and_cleans_when_unused() {
+        let repo = Arc::new(CountingRepo {
+            deleted: AtomicBool::new(false),
+        });
+        let coord = Arc::new(FakeCoord {
+            usages: vec![],
+            cleaned: AtomicBool::new(false),
+        });
+        let svc = ProviderService::new(repo.clone(), [0u8; 32]).with_deletion_coordinator(coord.clone());
+        svc.delete("prov_x").await.unwrap();
+        assert!(repo.deleted.load(Ordering::SeqCst));
+        assert!(coord.cleaned.load(Ordering::SeqCst));
     }
 }

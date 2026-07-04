@@ -4,6 +4,7 @@
 //! submodules. All logic lives in the modules below.
 
 mod config;
+mod provider_deletion;
 mod router;
 mod services;
 

@@ -155,6 +155,22 @@ impl IFleetRepository for SqliteFleetRepository {
         tx.commit().await?;
         Ok(())
     }
+
+    async fn fleets_using_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT f.id, f.name \
+             FROM fleet_members m JOIN fleets f ON f.id = m.fleet_id \
+             WHERE m.provider_id = ? \
+             ORDER BY f.name ASC",
+        )
+        .bind(provider_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]
@@ -197,5 +213,39 @@ mod tests {
         repo.delete_fleet(&f.id).await.unwrap();
         assert!(repo.get_fleet(&f.id).await.unwrap().is_none());
         assert_eq!(repo.list_members(&f.id).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn fleets_using_provider_returns_matching_fleet() {
+        let db = init_database_memory().await.unwrap();
+        let repo = SqliteFleetRepository::new(db.pool().clone());
+        let fleet = repo
+            .create_fleet(CreateFleetParams {
+                user_id: "u1".into(),
+                name: "研究舰队".into(),
+                description: None,
+                max_parallel: Some(3),
+            })
+            .await
+            .unwrap();
+        repo.replace_members(
+            &fleet.id,
+            vec![NewFleetMember {
+                agent_id: "agent_builtin_claude".into(),
+                provider_id: Some("prov_x".into()),
+                model: Some("claude-opus-4-8".into()),
+                role_hint: Some("后端".into()),
+                capability_profile: Some("{\"strengths\":[\"coding\"]}".into()),
+                constraints: None,
+                sort_order: 0,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let hits = repo.fleets_using_provider("prov_x").await.unwrap();
+        assert_eq!(hits, vec![(fleet.id.clone(), "研究舰队".to_string())]);
+        let none = repo.fleets_using_provider("prov_other").await.unwrap();
+        assert!(none.is_empty());
     }
 }

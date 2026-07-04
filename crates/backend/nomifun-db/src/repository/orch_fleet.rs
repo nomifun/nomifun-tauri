@@ -64,4 +64,10 @@ pub trait IFleetRepository: Send + Sync {
         fleet_id: &str,
         members: Vec<NewFleetMember>,
     ) -> Result<(), sqlx::Error>;
+
+    /// Distinct (fleet_id, fleet_name) whose members reference `provider_id`.
+    async fn fleets_using_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<Vec<(String, String)>, sqlx::Error>;
 }

@@ -927,6 +927,7 @@ fn platform_to_source(platform: PluginType) -> ConversationSource {
         | PluginType::Mattermost
         | PluginType::Twitch
         | PluginType::Nostr
+        | PluginType::Wecom
         | PluginType::Qqbot => ConversationSource::Nomifun,
     }
 }
@@ -959,6 +960,7 @@ fn channel_conversation_name(
         PluginType::Lark => "lark",
         PluginType::Dingtalk => "ding",
         PluginType::Weixin => "wx",
+        PluginType::Wecom => "wecom",
         PluginType::Slack => "slack",
         PluginType::Discord => "discord",
         PluginType::Matrix => "matrix",

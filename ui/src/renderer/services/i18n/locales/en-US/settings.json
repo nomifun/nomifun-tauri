@@ -867,6 +867,15 @@
   "baiduManualDownload": "Baidu mirror",
   "includePrereleaseUpdates": "Include prerelease/dev builds",
   "saveModelConfigFailed": "Failed to save model configuration",
+  "providerInUse": {
+    "title": "This model provider is in use",
+    "desc": "The following features still use this provider. Unbind or switch models first, then delete:",
+    "goto": "Go fix it",
+    "desktopCompanion": "Desktop companion",
+    "publicCompanion": "Public companion",
+    "smartDecision": "Smart decision",
+    "orchestrator": "Orchestration"
+  },
   "healthCheck": "Health Check",
   "clearStatus": "Clear status",
   "healthStatusCleared": "Health status cleared",

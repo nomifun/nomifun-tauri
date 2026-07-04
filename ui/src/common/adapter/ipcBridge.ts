@@ -3762,8 +3762,18 @@ export const publicAgent = {
   ),
 };
 
+/**
+ * Client-side deadline for knowledge-base READ endpoints. The backend now
+ * bounds each base's directory walk (≈6s) and parallelizes the list, so these
+ * return quickly in normal operation; this is only a safety net so a wedged
+ * NAS/offline root surfaces a legible timeout error instead of hanging the UI.
+ * NOT applied to knowledge mutations (autogen / snapshot fetch / import) — those
+ * legitimately take minutes.
+ */
+const KB_READ_TIMEOUT_MS = 30_000;
+
 export const knowledge = {
-  listBases: httpGet<IKnowledgeBase[], void>('/api/knowledge/bases'),
+  listBases: httpGet<IKnowledgeBase[], void>('/api/knowledge/bases', { timeoutMs: KB_READ_TIMEOUT_MS }),
   createBase: httpPost<
     IKnowledgeBase,
     {
@@ -3776,7 +3786,7 @@ export const knowledge = {
       tags?: string[];
     }
   >('/api/knowledge/bases'),
-  getBase: httpGet<IKnowledgeBase, { id: string }>((p) => `/api/knowledge/bases/${p.id}`),
+  getBase: httpGet<IKnowledgeBase, { id: string }>((p) => `/api/knowledge/bases/${p.id}`, { timeoutMs: KB_READ_TIMEOUT_MS }),
   updateBase: httpPut<IKnowledgeBase, { id: string; name?: string; description?: string; tags?: string[] }>(
     (p) => `/api/knowledge/bases/${p.id}`,
     (p) => ({ name: p.name, description: p.description, tags: p.tags })
@@ -3812,9 +3822,10 @@ export const knowledge = {
   deleteBase: httpDelete<void, { id: string; purge?: boolean }>(
     (p) => `/api/knowledge/bases/${p.id}${p.purge ? '?purge=true' : ''}`
   ),
-  listFiles: httpGet<IKnowledgeFileEntry[], { id: string }>((p) => `/api/knowledge/bases/${p.id}/files`),
+  listFiles: httpGet<IKnowledgeFileEntry[], { id: string }>((p) => `/api/knowledge/bases/${p.id}/files`, { timeoutMs: KB_READ_TIMEOUT_MS }),
   readFile: httpGet<IKnowledgeFileContent, { id: string; path: string }>(
-    (p) => `/api/knowledge/bases/${p.id}/file?path=${encodeURIComponent(p.path)}`
+    (p) => `/api/knowledge/bases/${p.id}/file?path=${encodeURIComponent(p.path)}`,
+    { timeoutMs: KB_READ_TIMEOUT_MS }
   ),
   writeFile: httpPut<void, { id: string; path: string; content: string }>(
     (p) => `/api/knowledge/bases/${p.id}/file`,
@@ -3850,7 +3861,7 @@ export const knowledge = {
   importBase: httpPost<IKnowledgeBase, { src_path: string }>('/api/knowledge/bases/import'),
   // ── P4 inbox review (staged write-back proposals) ──
   /** List staged write-back proposals under `_inbox/` (group by `scope` client-side). */
-  listInbox: httpGet<IKnowledgeInboxEntry[], { id: string }>((p) => `/api/knowledge/bases/${p.id}/inbox`),
+  listInbox: httpGet<IKnowledgeInboxEntry[], { id: string }>((p) => `/api/knowledge/bases/${p.id}/inbox`, { timeoutMs: KB_READ_TIMEOUT_MS }),
   /** Server-computed unified diff of one proposal vs. the current base document. */
   getInboxDiff: httpGet<IKnowledgeInboxDiff, { id: string; scope: string; path: string }>(
     (p) =>
@@ -3867,9 +3878,9 @@ export const knowledge = {
     (p) => ({ scope: p.scope, path: p.path })
   ),
   /** Bindings currently mounting this base (enabled AND disabled). */
-  listConsumers: httpGet<IKnowledgeConsumer[], { id: string }>((p) => `/api/knowledge/bases/${p.id}/consumers`),
+  listConsumers: httpGet<IKnowledgeConsumer[], { id: string }>((p) => `/api/knowledge/bases/${p.id}/consumers`, { timeoutMs: KB_READ_TIMEOUT_MS }),
   /** Total unreviewed staged proposals across all bases (sidebar red-dot signal). */
-  pendingInboxCount: httpGet<number, void>('/api/knowledge/inbox/pending-count'),
+  pendingInboxCount: httpGet<number, void>('/api/knowledge/inbox/pending-count', { timeoutMs: KB_READ_TIMEOUT_MS }),
   // ── P3 source connectors (Feishu, …) ──
   /** Pull a connector-backed base's remote docs into snapshots/ (distinct from refresh-source). */
   syncSource: httpPost<IKnowledgeSourceFetchSummary, { id: string }>(

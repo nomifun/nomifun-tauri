@@ -14,7 +14,7 @@ pub fn format_text_for_platform(text: &str, platform: PluginType) -> String {
     match platform {
         PluginType::Telegram => markdown_to_telegram_html(text),
         PluginType::Lark | PluginType::Dingtalk => html_to_markdown(text),
-        PluginType::Weixin => strip_html(text),
+        PluginType::Weixin | PluginType::Wecom => strip_html(text),
         _ => escape_html(text),
     }
 }
