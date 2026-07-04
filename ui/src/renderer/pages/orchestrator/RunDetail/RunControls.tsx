@@ -85,7 +85,11 @@ export const RunControls: React.FC<{
   const [message, msgCtx] = useArcoMessage();
   const [busy, setBusy] = useState(false);
 
-  const isTerminal = status === 'completed' || status === 'failed' || status === 'cancelled';
+  const isTerminal =
+    status === 'completed' ||
+    status === 'failed' ||
+    status === 'cancelled' ||
+    status === 'completed_with_failures';
   // `planning` (fleet still building the graph) and `''` (detail not yet loaded) both
   // render a disabled busy placeholder so the header always shows a primary control.
   const isBusyPlaceholder = status === 'planning' || status === '';
