@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use nomifun_common::AppError;
+use nomifun_common::{AppError, ProviderUsage, ProviderUsageFeature};
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 
@@ -336,6 +336,37 @@ impl CompanionService {
     /// All companion profiles, oldest first.
     pub async fn list_companions(&self) -> Vec<CompanionProfileConfig> {
         self.registry.list().await
+    }
+
+    /// Every desktop-companion reference to `provider_id`: per-companion chat
+    /// model + the shared learn/evolve models. Empty ⇒ not used.
+    pub async fn providers_in_use(&self, provider_id: &str) -> Vec<ProviderUsage> {
+        let mut out = Vec::new();
+        for p in self.list_companions().await {
+            if p.model.provider_id == provider_id {
+                out.push(ProviderUsage {
+                    feature: ProviderUsageFeature::DesktopCompanion,
+                    label: p.name.clone(),
+                    target_id: Some(p.id.clone()),
+                });
+            }
+        }
+        let shared = self.get_config().await;
+        if shared.learn.model.provider_id == provider_id {
+            out.push(ProviderUsage {
+                feature: ProviderUsageFeature::DesktopCompanion,
+                label: "共享学习模型".into(),
+                target_id: None,
+            });
+        }
+        if shared.evolve.model.provider_id == provider_id {
+            out.push(ProviderUsage {
+                feature: ProviderUsageFeature::DesktopCompanion,
+                label: "共享进化模型".into(),
+                target_id: None,
+            });
+        }
+        out
     }
 
     /// Create a companion. The first companion ever created automatically becomes the
@@ -1295,6 +1326,27 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn providers_in_use_detects_companion_chat_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service(dir.path()).await;
+        let cid = svc.registry.create("大聪明", "ink").await.unwrap().id;
+        svc.patch_companion(&cid, serde_json::json!({"model":{"provider_id":"prov_x","model":"m"}})).await.unwrap();
+
+        let hits = svc.providers_in_use("prov_x").await;
+        assert!(hits.iter().any(|u| u.label == "大聪明" && u.target_id.as_deref() == Some(cid.as_str())));
+        assert!(svc.providers_in_use("prov_none").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn providers_in_use_detects_shared_learn_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = service(dir.path()).await;
+        svc.patch_config(serde_json::json!({"learn":{"model":{"provider_id":"prov_learn","model":"m"}}})).await.unwrap();
+        let hits = svc.providers_in_use("prov_learn").await;
+        assert!(hits.iter().any(|u| matches!(u.feature, nomifun_common::ProviderUsageFeature::DesktopCompanion)));
     }
 
     #[tokio::test]
