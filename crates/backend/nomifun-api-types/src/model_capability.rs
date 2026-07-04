@@ -35,10 +35,12 @@ pub fn base_model_name(model: &str) -> String {
 /// Model families that DISQUALIFY vision (checked first).
 const VISION_EXCLUDE: &[&str] =
     &["embed", "rerank", "dall-e", "flux", "stable-diffusion", "whisper", "tts"];
-/// Model families that IMPLY vision.
+/// Model families that IMPLY vision. Note `"-vl"` catches the current-gen
+/// vision-language IDs (`qwen2-vl`, `qwen2.5-vl`, future `qwenN-vl`, …) that the
+/// bare `"qwen-vl"` substring misses once a version digit is inserted.
 const VISION_INCLUDE: &[&str] = &[
-    "4o", "claude-3", "gpt-4", "gemini", "qwen-vl", "llava", "vision", "pixtral", "grok-vision",
-    "internvl", "minicpm-v",
+    "4o", "claude-3", "gpt-4", "gemini", "-vl", "qwen-vl", "llava", "vision", "pixtral",
+    "grok-vision", "internvl", "minicpm-v", "mimo-v2.5",
 ];
 
 /// Infer per-model modalities from the model name. Currently only `"vision"`.
@@ -62,6 +64,9 @@ mod tests {
             "claude-3-5-sonnet",
             "gemini-1.5-pro",
             "qwen-vl-max",
+            "qwen2-vl-7b-instruct",
+            "qwen2.5-vl-72b-instruct",
+            "mimo-v2.5",
             "llava-1.6",
             "pixtral-12b",
             "some-vision-model",
