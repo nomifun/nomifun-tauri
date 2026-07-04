@@ -246,7 +246,7 @@ export type IMessageAgentStatus = IMessage<
   'agent_status',
   {
     backend: string; // Agent identifier: 'claude', 'qwen', 'codex', 'remote', etc.
-    status: 'connecting' | 'connected' | 'authenticated' | 'session_active' | 'error';
+    status: 'connecting' | 'connected' | 'authenticated' | 'session_active' | 'preparing' | 'prepared' | 'error';
     /** Display name for the agent (e.g. extension-contributed adapter name) / Agent 显示名称 */
     agent_name?: string;
     // Optional legacy fields for backward compatibility

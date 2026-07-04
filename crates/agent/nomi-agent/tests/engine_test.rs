@@ -1,6 +1,7 @@
 mod common;
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use nomi_agent::engine::{AgentEngine, AgentError};
@@ -26,8 +27,10 @@ fn silent_output() -> Arc<dyn OutputSink> {
 
 #[derive(Default)]
 struct RecordingOutputSink {
+    tool_call_deltas: Mutex<Vec<(String, String, Option<String>)>>,
     tool_calls: Mutex<Vec<(String, String)>>,
     tool_results: Mutex<Vec<(String, String, bool)>>,
+    model_activity: Mutex<Vec<(String, String)>>,
 }
 
 impl OutputSink for RecordingOutputSink {
@@ -39,6 +42,21 @@ impl OutputSink for RecordingOutputSink {
             .lock()
             .unwrap()
             .push((tool_use_id.to_owned(), name.to_owned()));
+    }
+
+    fn emit_tool_call_delta(&self, tool_use_id: &str, name: &str, input: Option<&str>) {
+        self.tool_call_deltas.lock().unwrap().push((
+            tool_use_id.to_owned(),
+            name.to_owned(),
+            input.map(ToOwned::to_owned),
+        ));
+    }
+
+    fn emit_model_activity(&self, msg_id: &str, status: &str) {
+        self.model_activity
+            .lock()
+            .unwrap()
+            .push((msg_id.to_owned(), status.to_owned()));
     }
 
     fn emit_tool_result(&self, tool_use_id: &str, name: &str, is_error: bool, _content: &str) {
@@ -66,6 +84,38 @@ impl OutputSink for RecordingOutputSink {
 struct RecordingRequestProvider {
     requests: Arc<Mutex<Vec<Vec<Message>>>>,
     responses: Mutex<Vec<Vec<LlmEvent>>>,
+}
+
+struct DelayedEventsProvider {
+    responses: Mutex<Vec<Vec<(Duration, LlmEvent)>>>,
+}
+
+impl DelayedEventsProvider {
+    fn with_turns(turns: Vec<Vec<(Duration, LlmEvent)>>) -> Self {
+        Self {
+            responses: Mutex::new(turns),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for DelayedEventsProvider {
+    async fn stream(
+        &self,
+        _request: &LlmRequest,
+    ) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
+        let events = self.responses.lock().unwrap().remove(0);
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            for (delay, event) in events {
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
+                let _ = tx.send(event).await;
+            }
+        });
+        Ok(rx)
+    }
 }
 
 impl RecordingRequestProvider {
@@ -179,6 +229,132 @@ async fn test_engine_tool_use_executes_and_continues() {
 
     assert_eq!(result.turns, 2);
     assert_eq!(result.text, "Done");
+}
+
+#[tokio::test]
+async fn test_engine_forwards_tool_use_delta_before_final_tool_call() {
+    let turn1 = vec![
+        LlmEvent::ToolUseDelta {
+            id: "tool-1".to_string(),
+            name: "mock_tool".to_string(),
+            input: Some(json!({"file_path": "snake.html"})),
+        },
+        LlmEvent::ToolUse {
+            id: "tool-1".to_string(),
+            name: "mock_tool".to_string(),
+            input: json!({"file_path": "snake.html", "content": "long payload"}),
+            extra: None,
+        },
+        LlmEvent::Done {
+            stop_reason: StopReason::ToolUse,
+            usage: TokenUsage::default(),
+        },
+    ];
+    let turn2 = vec![
+        LlmEvent::TextDelta("Done".to_string()),
+        LlmEvent::Done {
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage::default(),
+        },
+    ];
+
+    let provider = Arc::new(MockLlmProvider::with_turns(vec![turn1, turn2]));
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(MockTool::new("mock_tool", "tool output", false)));
+    let output = Arc::new(RecordingOutputSink::default());
+
+    let mut engine = AgentEngine::new_with_provider(
+        provider,
+        test_config(),
+        registry,
+        output.clone(),
+        std::env::temp_dir(),
+    );
+    let result = engine
+        .run("Use the tool", "")
+        .await
+        .expect("engine should succeed");
+
+    assert_eq!(result.text, "Done");
+    assert_eq!(
+        *output.tool_call_deltas.lock().unwrap(),
+        vec![(
+            "tool-1".to_string(),
+            "mock_tool".to_string(),
+            Some(r#"{"file_path":"snake.html"}"#.to_string())
+        )]
+    );
+    assert_eq!(
+        *output.tool_calls.lock().unwrap(),
+        vec![("tool-1".to_string(), "mock_tool".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn test_engine_emits_model_activity_during_idle_stream_gap_before_tool_use() {
+    let turn1 = vec![
+        (
+            Duration::ZERO,
+            LlmEvent::ThinkingDelta("I will create a complete Snake game.".to_string()),
+        ),
+        (
+            Duration::from_millis(1_500),
+            LlmEvent::ToolUse {
+                id: "tool-1".to_string(),
+                name: "mock_tool".to_string(),
+                input: json!({"file_path": "snake.html", "content": "long payload"}),
+                extra: None,
+            },
+        ),
+        (
+            Duration::ZERO,
+            LlmEvent::Done {
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+            },
+        ),
+    ];
+    let turn2 = vec![
+        (
+            Duration::ZERO,
+            LlmEvent::TextDelta("Done".to_string()),
+        ),
+        (
+            Duration::ZERO,
+            LlmEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::default(),
+            },
+        ),
+    ];
+
+    let provider = Arc::new(DelayedEventsProvider::with_turns(vec![turn1, turn2]));
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(MockTool::new("mock_tool", "tool output", false)));
+    let output = Arc::new(RecordingOutputSink::default());
+
+    let mut engine = AgentEngine::new_with_provider(
+        provider,
+        test_config(),
+        registry,
+        output.clone(),
+        std::env::temp_dir(),
+    );
+    let result = engine
+        .run("Use the tool", "")
+        .await
+        .expect("engine should succeed");
+
+    assert_eq!(result.text, "Done");
+    let activity = output.model_activity.lock().unwrap().clone();
+    assert!(
+        activity.iter().any(|(_, status)| status == "preparing"),
+        "engine should emit a preparing activity event while the provider stream is idle"
+    );
+    assert!(
+        activity.iter().any(|(_, status)| status == "prepared"),
+        "engine should complete the preparing activity when the next provider event arrives"
+    );
 }
 
 #[tokio::test]

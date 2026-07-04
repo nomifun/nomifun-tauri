@@ -12,6 +12,8 @@ export interface TurnDisclosureInputItem {
   turnId?: string;
   role: TurnDisclosureRole;
   createdAt: number;
+  processStartedAt?: number;
+  processEndedAt?: number;
   processState?: TurnDisclosureProcessState;
   running?: boolean;
   sourceMessageIds?: string[];
@@ -68,6 +70,10 @@ const getProcessState = (entry: TurnDisclosureInputItem): TurnDisclosureProcessS
   return 'completed';
 };
 
+const getProcessStartAt = (entry: TurnDisclosureInputItem): number => entry.processStartedAt ?? entry.createdAt;
+
+const getProcessEndAt = (entry: TurnDisclosureInputItem): number => entry.processEndedAt ?? entry.createdAt;
+
 const resolveDisclosureState = (processItems: TurnDisclosureInputItem[]): TurnDisclosureProcessState => {
   const states = processItems.map(getProcessState);
   if (states.includes('waiting')) return 'waiting';
@@ -110,8 +116,8 @@ function buildSegmentOutput(segment: TurnDisclosureInputItem[], isClosed: boolea
     turnId,
     processItemIds: processItems.map((entry) => entry.id),
     sourceMessageIds: unique(processItems.flatMap((entry) => entry.sourceMessageIds ?? [entry.id])),
-    startAt: Math.min(...processItems.map((entry) => entry.createdAt)),
-    endAt: Math.max(...finalOrProcessItems.map((entry) => entry.createdAt)),
+    startAt: Math.min(...processItems.map(getProcessStartAt)),
+    endAt: Math.max(...finalOrProcessItems.map(getProcessEndAt)),
     state,
     running: false,
     defaultCollapsed: true,

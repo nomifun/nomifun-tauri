@@ -44,4 +44,9 @@ describe('turn process state', () => {
     expect(getProcessItemState({ type: 'tips', content: { type: 'error' } } as any)).toBe('failed');
     expect(getProcessItemState({ type: 'agent_status', content: { status: 'error' } } as any)).toBe('failed');
   });
+
+  test('keeps preparing agent status as a running process step', () => {
+    expect(getProcessItemState({ type: 'agent_status', content: { status: 'preparing' } } as any)).toBe('running');
+    expect(getProcessItemState({ type: 'agent_status', content: { status: 'prepared' } } as any)).toBe('completed');
+  });
 });

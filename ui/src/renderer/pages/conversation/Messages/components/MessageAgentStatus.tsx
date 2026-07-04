@@ -44,6 +44,20 @@ const MessageAgentStatus: React.FC<MessageAgentStatusProps> = ({ message }) => {
         return <Badge status='success' text={t('acp.status.authenticated', { agent: display_name })} />;
       case 'session_active':
         return <Badge status='success' text={t('acp.status.session_active', { agent: display_name })} />;
+      case 'preparing':
+        return (
+          <Badge
+            status='processing'
+            text={t('messages.processReceipt.preparingAction', { defaultValue: 'Preparing next action' })}
+          />
+        );
+      case 'prepared':
+        return (
+          <Badge
+            status='default'
+            text={t('messages.processReceipt.preparedAction', { defaultValue: 'Prepared next action' })}
+          />
+        );
       case 'error':
         return <Badge status='error' text={t('acp.status.error')} />;
       default:
@@ -53,6 +67,7 @@ const MessageAgentStatus: React.FC<MessageAgentStatusProps> = ({ message }) => {
 
   const isError = status === 'error';
   const isSuccess = status === 'connected' || status === 'authenticated' || status === 'session_active';
+  const isPreparing = status === 'preparing' || status === 'prepared';
 
   return (
     <div
@@ -62,9 +77,23 @@ const MessageAgentStatus: React.FC<MessageAgentStatusProps> = ({ message }) => {
           ? 'var(--color-danger-light-1)'
           : isSuccess
             ? 'var(--color-success-light-1)'
+            : isPreparing
+              ? 'transparent'
             : 'var(--color-primary-light-1)',
-        borderColor: isError ? 'rgb(var(--danger-3))' : isSuccess ? 'rgb(var(--success-3))' : 'rgb(var(--primary-3))',
-        color: isError ? 'rgb(var(--danger-6))' : isSuccess ? 'rgb(var(--success-6))' : 'rgb(var(--primary-6))',
+        borderColor: isError
+          ? 'rgb(var(--danger-3))'
+          : isSuccess
+            ? 'rgb(var(--success-3))'
+            : isPreparing
+              ? 'transparent'
+              : 'rgb(var(--primary-3))',
+        color: isError
+          ? 'rgb(var(--danger-6))'
+          : isSuccess
+            ? 'rgb(var(--success-6))'
+            : isPreparing
+              ? 'var(--color-text-3)'
+              : 'rgb(var(--primary-6))',
       }}
     >
       <div className='flex items-center gap-2'>

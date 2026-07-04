@@ -5,8 +5,9 @@ use nomi_agent::output::OutputSink;
 use tokio::sync::broadcast;
 
 use crate::protocol::events::{
-    AgentStreamEvent, ErrorEventData, FinishEventData, PlanEventData, StartEventData, TextEventData,
-    ThinkingEventData, TipType, TipsEventData, ToolCallEventData, ToolCallStatus,
+    AgentStatusEventData, AgentStreamEvent, ErrorEventData, FinishEventData, PlanEventData,
+    StartEventData, TextEventData, ThinkingEventData, TipType, TipsEventData, ToolCallEventData,
+    ToolCallStatus,
 };
 
 pub struct BackendOutputSink {
@@ -93,6 +94,46 @@ impl OutputSink for BackendOutputSink {
             duration: None,
             status: None,
         }));
+    }
+
+    fn emit_tool_call_delta(&self, tool_use_id: &str, name: &str, input: Option<&str>) {
+        let Some(call_id) = Self::internal_call_id(tool_use_id) else {
+            tracing::error!(tool = name, "Cannot emit tool_call progress with empty tool_use_id");
+            return;
+        };
+
+        let parsed_input: Option<serde_json::Value> =
+            input.and_then(|value| serde_json::from_str(value).ok());
+
+        tracing::info!(
+            tool_use_id = %tool_use_id,
+            call_id = %call_id,
+            tool = name,
+            has_input_preview = parsed_input.is_some(),
+            status = ?ToolCallStatus::Running,
+            "Emitting nomi tool_call progress event"
+        );
+
+        let _ = self.event_tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id,
+            name: name.to_owned(),
+            args: parsed_input.clone().unwrap_or(serde_json::Value::Null),
+            status: ToolCallStatus::Running,
+            input: parsed_input,
+            output: None,
+            description: None,
+        }));
+    }
+
+    fn emit_model_activity(&self, _msg_id: &str, status: &str) {
+        let _ = self
+            .event_tx
+            .send(AgentStreamEvent::AgentStatus(AgentStatusEventData {
+                backend: "nomi".to_owned(),
+                status: status.to_owned(),
+                agent_name: Some("Nomi".to_owned()),
+                session_id: None,
+            }));
     }
 
     fn emit_tool_call(&self, tool_use_id: &str, name: &str, input: &str) {
@@ -286,6 +327,42 @@ mod tests {
     }
 
     #[test]
+    fn emit_tool_call_delta_sends_running_tool_call_with_preview_input() {
+        let (sink, mut rx) = make_sink();
+        sink.emit_tool_call_delta(
+            "call_write_1",
+            "Write",
+            Some(r#"{"file_path":"/tmp/snake.html"}"#),
+        );
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentStreamEvent::ToolCall(data) => {
+                assert_eq!(data.call_id, "nomi-call_write_1");
+                assert_eq!(data.name, "Write");
+                assert_eq!(data.status, ToolCallStatus::Running);
+                assert_eq!(data.input.as_ref().unwrap()["file_path"], "/tmp/snake.html");
+                assert_eq!(data.args["file_path"], "/tmp/snake.html");
+            }
+            other => panic!("Expected ToolCall, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn emit_model_activity_sends_agent_status() {
+        let (sink, mut rx) = make_sink();
+        sink.emit_model_activity("msg-1", "preparing");
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentStreamEvent::AgentStatus(data) => {
+                assert_eq!(data.backend, "nomi");
+                assert_eq!(data.status, "preparing");
+                assert_eq!(data.agent_name.as_deref(), Some("Nomi"));
+            }
+            other => panic!("Expected AgentStatus, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn emit_tool_result_success_sends_completed() {
         let (sink, mut rx) = make_sink();
         sink.emit_tool_result("call_read_1", "Read", false, "file content here");
@@ -465,6 +542,7 @@ mod tests {
         let sink = BackendOutputSink::new(tx);
         sink.emit_text_delta("hello", "msg-1");
         sink.emit_thinking("thought", "msg-1");
+        sink.emit_tool_call_delta("call_read_1", "Read", Some(r#"{"path":"/tmp/a.txt"}"#));
         sink.emit_tool_call("call_read_1", "Read", "{}");
         sink.emit_tool_result("call_read_1", "Read", false, "ok");
         sink.emit_stream_start("msg-1");

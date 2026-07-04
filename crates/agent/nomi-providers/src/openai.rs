@@ -535,10 +535,19 @@ struct ToolCallAccumulator {
     name: String,
     arguments: String,
     extra: Option<Value>,
+    announced: bool,
+    last_progress_signature: String,
+}
+
+struct TextToolCallAccumulator {
+    id: String,
+    announced: bool,
+    last_progress_signature: String,
 }
 
 struct StreamState {
     tool_calls: Vec<ToolCallAccumulator>,
+    text_tool_calls: Vec<TextToolCallAccumulator>,
     input_tokens: u64,
     output_tokens: u64,
     /// Deferred Done event: populated when finish_reason arrives, emitted on
@@ -554,17 +563,22 @@ struct StreamState {
     /// tool_calls present) never touches this.
     content_buf: String,
     reasoning_buf: String,
+    visible_content_buf: String,
+    visible_reasoning_buf: String,
 }
 
 impl StreamState {
     fn new() -> Self {
         Self {
             tool_calls: Vec::new(),
+            text_tool_calls: Vec::new(),
             input_tokens: 0,
             output_tokens: 0,
             pending_done: None,
             content_buf: String::new(),
             reasoning_buf: String::new(),
+            visible_content_buf: String::new(),
+            visible_reasoning_buf: String::new(),
         }
     }
 
@@ -596,9 +610,22 @@ impl StreamState {
                 name: String::new(),
                 arguments: String::new(),
                 extra: None,
+                announced: false,
+                last_progress_signature: String::new(),
             });
         }
         &mut self.tool_calls[index]
+    }
+
+    fn get_or_create_text_tool(&mut self, index: usize) -> &mut TextToolCallAccumulator {
+        while self.text_tool_calls.len() <= index {
+            self.text_tool_calls.push(TextToolCallAccumulator {
+                id: String::new(),
+                announced: false,
+                last_progress_signature: String::new(),
+            });
+        }
+        &mut self.text_tool_calls[index]
     }
 }
 
@@ -751,6 +778,7 @@ async fn process_sse_stream(
                         event,
                         LlmEvent::TextDelta(_)
                             | LlmEvent::ThinkingDelta(_)
+                            | LlmEvent::ToolUseDelta { .. }
                             | LlmEvent::ToolUse { .. }
                     ) {
                         emitted_content = true;
@@ -780,7 +808,7 @@ async fn process_sse_stream(
 /// accumulator is empty at finish, so it never affects the normal path. Reasoning
 /// is scanned first (step puts the call there), then content. Returns `None` when
 /// no parseable call is found (turn dead-ends as before — no regression).
-fn recover_text_tool_calls(state: &StreamState) -> Option<Vec<LlmEvent>> {
+fn recover_text_tool_calls(state: &mut StreamState) -> Option<Vec<LlmEvent>> {
     let mut calls = parse_text_tool_calls(&state.reasoning_buf);
     if calls.is_empty() {
         calls = parse_text_tool_calls(&state.content_buf);
@@ -791,14 +819,61 @@ fn recover_text_tool_calls(state: &StreamState) -> Option<Vec<LlmEvent>> {
     Some(
         calls
             .into_iter()
-            .map(|(name, input)| LlmEvent::ToolUse {
-                id: generate_call_id(),
-                name,
-                input,
-                extra: None,
+            .enumerate()
+            .map(|(index, (name, input))| {
+                let progress = state.get_or_create_text_tool(index);
+                if progress.id.is_empty() {
+                    progress.id = generate_call_id();
+                }
+                LlmEvent::ToolUse {
+                    id: progress.id.clone(),
+                    name,
+                    input,
+                    extra: None,
+                }
             })
             .collect(),
     )
+}
+
+fn visible_text_without_tool_call_blocks(text: &str) -> String {
+    let mut visible = String::new();
+    let mut rest = text;
+
+    loop {
+        let Some(start) = rest.find("<tool_call>") else {
+            visible.push_str(rest);
+            break;
+        };
+        visible.push_str(&rest[..start]);
+        let after = &rest[start + "<tool_call>".len()..];
+        let Some(end) = after.find("</tool_call>") else {
+            break;
+        };
+        rest = &after[end + "</tool_call>".len()..];
+    }
+
+    visible
+}
+
+fn append_raw_text_and_visible_delta(
+    raw_buffer: &mut String,
+    visible_buffer: &mut String,
+    delta: &str,
+) -> String {
+    raw_buffer.push_str(delta);
+    let next_visible = visible_text_without_tool_call_blocks(raw_buffer);
+    let visible_delta = next_visible
+        .strip_prefix(visible_buffer.as_str())
+        .unwrap_or_default()
+        .to_string();
+    *visible_buffer = next_visible;
+    visible_delta
+}
+
+struct TextToolCallPreview {
+    name: String,
+    input: Option<Value>,
 }
 
 /// Extract every `<tool_call>…</tool_call>` block from `text` and parse each into
@@ -820,6 +895,62 @@ fn parse_text_tool_calls(text: &str) -> Vec<(String, Value)> {
         rest = next;
     }
     out
+}
+
+fn parse_text_tool_call_progress(text: &str) -> Vec<TextToolCallPreview> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<tool_call>") {
+        let after = &rest[start + "<tool_call>".len()..];
+        let (block, next) = match after.find("</tool_call>") {
+            Some(end) => (&after[..end], &after[end + "</tool_call>".len()..]),
+            None => (after, ""),
+        };
+        if let Some(call) = parse_one_tool_call_progress(block.trim()) {
+            out.push(call);
+        }
+        if next.is_empty() {
+            break;
+        }
+        rest = next;
+    }
+    out
+}
+
+fn parse_one_tool_call_progress(block: &str) -> Option<TextToolCallPreview> {
+    if block.starts_with('{') {
+        if let Some((name, input)) = parse_one_tool_call(block) {
+            return Some(TextToolCallPreview {
+                name,
+                input: tool_argument_value_progress_preview(&input),
+            });
+        }
+
+        let name = extract_json_string_field(block, "name")?.trim().to_string();
+        if name.is_empty() {
+            return None;
+        }
+
+        let input = tool_argument_progress_preview(block).or_else(|| {
+            let unescaped = block.replace("\\\"", "\"");
+            if unescaped == block {
+                None
+            } else {
+                tool_argument_progress_preview(&unescaped)
+            }
+        });
+        return Some(TextToolCallPreview { name, input });
+    }
+
+    let name = str_between(block, "<function=", ">")?.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+
+    Some(TextToolCallPreview {
+        name,
+        input: xml_parameter_progress_preview(block),
+    })
 }
 
 fn parse_one_tool_call(block: &str) -> Option<(String, Value)> {
@@ -876,6 +1007,232 @@ fn str_between<'a>(s: &'a str, start: &str, end: &str) -> Option<&'a str> {
     Some(&s[i..j])
 }
 
+const TOOL_PROGRESS_PREVIEW_FIELDS: &[&str] = &[
+    "file_path",
+    "filePath",
+    "path",
+    "file_name",
+    "fileName",
+    "relative_path",
+    "relativePath",
+    "dir",
+    "glob",
+    "command",
+    "cmd",
+    "script",
+    "pattern",
+    "query",
+    "url",
+    "skill",
+];
+
+fn tool_argument_value_progress_preview(input: &Value) -> Option<Value> {
+    let Value::Object(map) = input else {
+        return None;
+    };
+
+    let mut preview = serde_json::Map::new();
+    for key in TOOL_PROGRESS_PREVIEW_FIELDS {
+        if let Some(value) = map.get(*key)
+            && is_small_preview_value(value)
+        {
+            preview.insert((*key).to_string(), value.clone());
+        }
+    }
+
+    if preview.is_empty() {
+        None
+    } else {
+        Some(Value::Object(preview))
+    }
+}
+
+fn tool_argument_progress_preview(arguments: &str) -> Option<Value> {
+    let mut preview = serde_json::Map::new();
+
+    if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(arguments) {
+        return tool_argument_value_progress_preview(&Value::Object(map));
+    } else {
+        for key in TOOL_PROGRESS_PREVIEW_FIELDS {
+            if let Some(value) = extract_json_string_field(arguments, key) {
+                preview.insert((*key).to_string(), Value::String(value));
+            }
+        }
+    }
+
+    if preview.is_empty() {
+        None
+    } else {
+        Some(Value::Object(preview))
+    }
+}
+
+fn xml_parameter_progress_preview(block: &str) -> Option<Value> {
+    let mut preview = serde_json::Map::new();
+
+    for key in TOOL_PROGRESS_PREVIEW_FIELDS {
+        if let Some(value) = extract_xml_parameter_text(block, key)
+            && value.len() <= 2_000
+        {
+            preview.insert((*key).to_string(), Value::String(value));
+        }
+    }
+
+    if preview.is_empty() {
+        None
+    } else {
+        Some(Value::Object(preview))
+    }
+}
+
+fn extract_xml_parameter_text(block: &str, key: &str) -> Option<String> {
+    let start_tag = format!("<parameter={key}>");
+    let start = block.find(&start_tag)? + start_tag.len();
+    let raw = match block[start..].find("</parameter>") {
+        Some(end) => &block[start..start + end],
+        None => &block[start..],
+    };
+    let value = raw.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn is_small_preview_value(value: &Value) -> bool {
+    match value {
+        Value::String(s) => s.len() <= 2_000,
+        Value::Number(_) | Value::Bool(_) => true,
+        _ => false,
+    }
+}
+
+fn extract_json_string_field(arguments: &str, key: &str) -> Option<String> {
+    let quoted_key = format!("\"{key}\"");
+    let mut search_from = 0usize;
+
+    while let Some(relative_pos) = arguments[search_from..].find(&quoted_key) {
+        let mut cursor = search_from + relative_pos + quoted_key.len();
+        cursor = skip_json_whitespace(arguments, cursor);
+        if arguments[cursor..].chars().next()? != ':' {
+            search_from = cursor;
+            continue;
+        }
+        cursor += ':'.len_utf8();
+        cursor = skip_json_whitespace(arguments, cursor);
+        if arguments[cursor..].chars().next()? != '"' {
+            search_from = cursor;
+            continue;
+        }
+        cursor += '"'.len_utf8();
+
+        let mut escaped = false;
+        for (offset, ch) in arguments[cursor..].char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                let end = cursor + offset;
+                let raw = &arguments[cursor..end];
+                let quoted = format!("\"{raw}\"");
+                return serde_json::from_str::<String>(&quoted)
+                    .ok()
+                    .or_else(|| Some(raw.to_string()));
+            }
+        }
+
+        return None;
+    }
+
+    None
+}
+
+fn skip_json_whitespace(input: &str, mut index: usize) -> usize {
+    while let Some(ch) = input[index..].chars().next() {
+        if !ch.is_whitespace() {
+            break;
+        }
+        index += ch.len_utf8();
+    }
+    index
+}
+
+fn maybe_tool_progress_event(
+    acc: &mut ToolCallAccumulator,
+    auto_tool_id: bool,
+) -> Option<LlmEvent> {
+    if acc.name.trim().is_empty() {
+        return None;
+    }
+
+    if acc.id.trim().is_empty() {
+        if auto_tool_id {
+            acc.id = generate_call_id();
+        } else {
+            return None;
+        }
+    }
+
+    let input = tool_argument_progress_preview(&acc.arguments);
+    let signature = input
+        .as_ref()
+        .and_then(|value| serde_json::to_string(value).ok())
+        .unwrap_or_default();
+
+    if !acc.announced || (!signature.is_empty() && signature != acc.last_progress_signature) {
+        acc.announced = true;
+        acc.last_progress_signature = signature;
+        Some(LlmEvent::ToolUseDelta {
+            id: acc.id.clone(),
+            name: acc.name.clone(),
+            input,
+        })
+    } else {
+        None
+    }
+}
+
+fn text_tool_progress_events(state: &mut StreamState) -> Vec<LlmEvent> {
+    let mut previews = parse_text_tool_call_progress(&state.reasoning_buf);
+    if previews.is_empty() {
+        previews = parse_text_tool_call_progress(&state.content_buf);
+    }
+
+    let mut events = Vec::new();
+    for (index, preview) in previews.into_iter().enumerate() {
+        let progress = state.get_or_create_text_tool(index);
+        if progress.id.is_empty() {
+            progress.id = generate_call_id();
+        }
+
+        let signature = preview
+            .input
+            .as_ref()
+            .and_then(|value| serde_json::to_string(value).ok())
+            .unwrap_or_default();
+
+        if !progress.announced
+            || (!signature.is_empty() && signature != progress.last_progress_signature)
+        {
+            progress.announced = true;
+            progress.last_progress_signature = signature;
+            events.push(LlmEvent::ToolUseDelta {
+                id: progress.id.clone(),
+                name: preview.name,
+                input: preview.input,
+            });
+        }
+    }
+
+    events
+}
+
 fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id: bool) -> Vec<LlmEvent> {
     let mut events = Vec::new();
 
@@ -911,16 +1268,25 @@ fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id: bool) -> V
     if let Some(reasoning) = delta["reasoning_content"].as_str()
         && !reasoning.is_empty()
     {
-        state.reasoning_buf.push_str(reasoning);
-        events.push(LlmEvent::ThinkingDelta(reasoning.to_string()));
+        let visible_delta = append_raw_text_and_visible_delta(
+            &mut state.reasoning_buf,
+            &mut state.visible_reasoning_buf,
+            reasoning,
+        );
+        if !visible_delta.is_empty() {
+            events.push(LlmEvent::ThinkingDelta(visible_delta));
+        }
     }
 
     // Text content
     if let Some(content) = delta["content"].as_str()
         && !content.is_empty()
     {
-        state.content_buf.push_str(content);
-        events.push(LlmEvent::TextDelta(content.to_string()));
+        let visible_delta =
+            append_raw_text_and_visible_delta(&mut state.content_buf, &mut state.visible_content_buf, content);
+        if !visible_delta.is_empty() {
+            events.push(LlmEvent::TextDelta(visible_delta));
+        }
     }
 
     // Tool calls
@@ -943,7 +1309,14 @@ fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id: bool) -> V
             if let Some(extra) = tc.get("extra_content").filter(|v| !v.is_null()) {
                 acc.extra = Some(extra.clone());
             }
+            if let Some(event) = maybe_tool_progress_event(acc, auto_tool_id) {
+                events.push(event);
+            }
         }
+    }
+
+    if state.tool_calls.is_empty() {
+        events.extend(text_tool_progress_events(state));
     }
 
     // Check finish_reason — defer Done until [DONE] so the trailing usage
@@ -1017,7 +1390,8 @@ fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id: bool) -> V
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_text_tool_calls, StreamState};
+    use super::{parse_sse_chunk, parse_text_tool_calls, StreamState};
+    use nomi_types::llm::LlmEvent;
     use serde_json::json;
 
     /// Qwen XML form (the exact shape step-3.7-flash emitted in session 18 that
@@ -1059,14 +1433,95 @@ mod tests {
     /// nothing (guards against the fallback firing on an empty turn).
     #[test]
     fn empty_state_recovers_nothing() {
-        let state = StreamState::new();
-        assert!(super::recover_text_tool_calls(&state).is_none());
+        let mut state = StreamState::new();
+        assert!(super::recover_text_tool_calls(&mut state).is_none());
+    }
+
+    #[test]
+    fn text_tool_call_stream_emits_write_preview_before_finish() {
+        let mut state = StreamState::new();
+
+        let chunk = r#"{"choices":[{"delta":{"reasoning_content":"<tool_call>{\"name\":\"Write\",\"arguments\":{\"file_path\":\"/tmp/snake.html\",\"content\":\""},"finish_reason":null,"index":0}]}"#;
+        let events = parse_sse_chunk(chunk, &mut state, true);
+
+        let progress = events
+            .iter()
+            .find(|event| matches!(event, LlmEvent::ToolUseDelta { .. }))
+            .expect("text-form tool calls should announce running work before the tool block closes");
+
+        if let LlmEvent::ToolUseDelta { name, input, .. } = progress {
+            assert_eq!(name, "Write");
+            assert_eq!(input.as_ref().unwrap()["file_path"], "/tmp/snake.html");
+            assert!(
+                input.as_ref().unwrap().get("content").is_none(),
+                "large generated file content must not be surfaced as progress input"
+            );
+        }
+    }
+
+    #[test]
+    fn text_tool_call_stream_hides_tool_markup_from_visible_thinking() {
+        let mut state = StreamState::new();
+
+        let chunk = r#"{"choices":[{"delta":{"reasoning_content":"<tool_call>{\"name\":\"Write\",\"arguments\":{\"file_path\":\"/tmp/snake.html\",\"content\":\""},"finish_reason":null,"index":0}]}"#;
+        let events = parse_sse_chunk(chunk, &mut state, true);
+
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, LlmEvent::ThinkingDelta(_) | LlmEvent::TextDelta(_))),
+            "text-form tool call markup should not be streamed as visible assistant or thinking text"
+        );
+    }
+
+    #[test]
+    fn text_tool_call_progress_id_is_reused_by_recovered_tool_use() {
+        let mut state = StreamState::new();
+
+        let chunk1 = r#"{"choices":[{"delta":{"reasoning_content":"<tool_call>{\"name\":\"Write\",\"arguments\":{\"file_path\":\"/tmp/snake.html\",\"content\":\""},"finish_reason":null,"index":0}]}"#;
+        let events1 = parse_sse_chunk(chunk1, &mut state, true);
+        let progress_id = events1
+            .iter()
+            .find_map(|event| match event {
+                LlmEvent::ToolUseDelta { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("partial text tool call should announce a progress id");
+
+        let chunk2 = r#"{"choices":[{"delta":{"reasoning_content":"hello\"}}</tool_call>"},"finish_reason":"stop","index":0}]}"#;
+        let events2 = parse_sse_chunk(chunk2, &mut state, true);
+        let final_id = events2
+            .iter()
+            .find_map(|event| match event {
+                LlmEvent::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("closed text tool call should recover a final ToolUse");
+
+        assert_eq!(progress_id, final_id);
+    }
+
+    #[test]
+    fn qwen_xml_text_tool_call_stream_emits_file_preview_before_finish() {
+        let mut state = StreamState::new();
+
+        let chunk = r#"{"choices":[{"delta":{"reasoning_content":"<tool_call><function=Write><parameter=file_path>/tmp/snake.html</parameter><parameter=content>"},"finish_reason":null,"index":0}]}"#;
+        let events = parse_sse_chunk(chunk, &mut state, true);
+
+        let progress = events
+            .iter()
+            .find(|event| matches!(event, LlmEvent::ToolUseDelta { .. }))
+            .expect("Qwen XML text tool calls should announce running work before finish");
+
+        if let LlmEvent::ToolUseDelta { name, input, .. } = progress {
+            assert_eq!(name, "Write");
+            assert_eq!(input.as_ref().unwrap()["file_path"], "/tmp/snake.html");
+        }
     }
 
     #[tokio::test]
     async fn stream_without_done_sentinel_still_emits_done() {
         use super::{StreamOutcome, process_sse_stream};
-        use nomi_types::llm::LlmEvent;
         // Some OpenAI-compatible servers (vLLM, local deployments) close the
         // connection after the final chunk without sending the `[DONE]`
         // sentinel. The parser must still flush the deferred Done so the
@@ -1598,13 +2053,23 @@ mod tests {
     #[test]
     fn tool_calls_with_stop_finish_reason() {
         // Gemini uses finish_reason:"stop" even when tool_calls are present.
-        // The accumulated tool calls must still be emitted.
+        // The accumulated tool calls must still be emitted, and the first
+        // structured delta should be visible immediately so the UI is not blank
+        // while long arguments are still being generated.
         let mut state = StreamState::new();
 
         // chunk 1: tool call delta (name + partial args)
         let chunk1 = r#"{"choices":[{"delta":{"role":"assistant","tool_calls":[{"extra_content":{},"function":{"arguments":"{\"skill\":\"test\",\"args\":\"hello\"}","name":"Skill"},"id":"call_abc123","type":"function"}]},"index":0}]}"#;
         let events1 = parse_sse_chunk(chunk1, &mut state, false);
-        assert!(events1.is_empty(), "no events until finish_reason");
+        let progress = events1
+            .iter()
+            .find(|e| matches!(e, LlmEvent::ToolUseDelta { .. }))
+            .expect("tool call deltas should announce running work before finish_reason");
+        if let LlmEvent::ToolUseDelta { id, name, input } = progress {
+            assert_eq!(id, "call_abc123");
+            assert_eq!(name, "Skill");
+            assert_eq!(input.as_ref().unwrap()["skill"], "test");
+        }
         assert_eq!(state.tool_calls.len(), 1);
         assert_eq!(state.tool_calls[0].name, "Skill");
 
@@ -1637,6 +2102,55 @@ mod tests {
         }
 
         assert!(state.tool_calls.is_empty(), "tool calls should be drained");
+    }
+
+    #[test]
+    fn tool_call_argument_stream_emits_file_target_preview_before_finish() {
+        let mut state = StreamState::new();
+
+        let chunk = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_write_1","function":{"name":"Write","arguments":"{\"file_path\":\"/tmp/snake.html\",\"content\":\""}}]},"finish_reason":null,"index":0}]}"#;
+        let events = parse_sse_chunk(chunk, &mut state, false);
+
+        let progress = events
+            .iter()
+            .find(|e| matches!(e, LlmEvent::ToolUseDelta { .. }))
+            .expect("Write should be announced while arguments are still streaming");
+        if let LlmEvent::ToolUseDelta { id, name, input } = progress {
+            assert_eq!(id, "call_write_1");
+            assert_eq!(name, "Write");
+            assert_eq!(input.as_ref().unwrap()["file_path"], "/tmp/snake.html");
+            assert!(
+                input.as_ref().unwrap().get("content").is_none(),
+                "large write content must not be pushed as a progress preview"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_tool_id_is_stable_between_progress_and_final_tool_use() {
+        let mut state = StreamState::new();
+
+        let chunk1 = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"Bash","arguments":"{\"command\":\"bun test\""}}]},"finish_reason":null,"index":0}]}"#;
+        let events1 = parse_sse_chunk(chunk1, &mut state, true);
+        let progress_id = events1
+            .iter()
+            .find_map(|e| match e {
+                LlmEvent::ToolUseDelta { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("auto-id providers should still emit a stable progress event");
+
+        let chunk2 = r#"{"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}]}"#;
+        let events2 = parse_sse_chunk(chunk2, &mut state, true);
+        let final_id = events2
+            .iter()
+            .find_map(|e| match e {
+                LlmEvent::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("final tool use should be emitted");
+
+        assert_eq!(progress_id, final_id);
     }
 
     #[test]

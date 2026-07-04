@@ -43,12 +43,12 @@ import { iconColors } from '@/renderer/styles/colors';
 import { emitter, useAddEventListener } from '@/renderer/utils/emitter';
 import { mergeFileSelectionItems } from '@/renderer/utils/file/fileSelection';
 import { buildDisplayMessage, collectSelectedFiles } from '@/renderer/utils/file/messageFiles';
-import { mergeWithCapabilities, type AgentModeOption } from '@/renderer/utils/model/agentModes';
+import type { AgentModeOption } from '@/renderer/utils/model/agentModes';
 import { Message, Tag, Tooltip } from '@arco-design/web-react';
 import { Brain, ChartHistogram, MagicHat, Shield, Time } from '@icon-park/react';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useNomiMessage } from './useNomiMessage';
+import type { NomiMessageRuntime } from './useNomiMessage';
 import { formatTokenCount, formatTurnDuration } from './turnMetrics';
 import NomiModelSelector from './NomiModelSelector';
 import { ContextUsagePill } from './ContextUsagePill';
@@ -102,15 +102,24 @@ const NomiSendBox: React.FC<{
   modelSelection: NomiModelSelection;
   session_mode?: string;
   agent_name?: string;
+  dynamicModes: AgentModeOption[];
+  turnActivity: NomiMessageRuntime;
   /**
    * Hide the permission/agent-mode selector (and the mobile action-sheet
    * model + permission entries). Used by locked surfaces like the desktop
    * companion chat, which runs in a fixed yolo mode with a locked model.
    */
   hideModeSelector?: boolean;
-}> = ({ conversation_id, modelSelection, session_mode, agent_name, hideModeSelector }) => {
+}> = ({
+  conversation_id,
+  modelSelection,
+  session_mode,
+  agent_name,
+  dynamicModes,
+  turnActivity,
+  hideModeSelector,
+}) => {
   const [workspacePath, setWorkspacePath] = useState('');
-  const [dynamicModes, setDynamicModes] = useState<AgentModeOption[]>([]);
   const [currentMode, setCurrentMode] = useState<string | undefined>(session_mode);
   const [isMobileSheetOpen, setIsMobileSheetOpen] = useState(false);
   const layout = useLayoutContext();
@@ -129,14 +138,7 @@ const NomiSendBox: React.FC<{
   const { current_model } = modelSelection;
 
   const { thought, running, hasHydratedRunningState, tokenUsage, setActiveMsgId, setWaitingResponse, resetState } =
-    useNomiMessage(conversation_id, {
-      onConfigChanged: (capabilities) => {
-        const modes = (capabilities as { modes?: string[] })?.modes;
-        if (modes && modes.length > 0) {
-          setDynamicModes(mergeWithCapabilities('nomi', modes));
-        }
-      },
-    });
+    turnActivity;
 
   const { atPath, uploadFile, setAtPath, setUploadFile, content, setContent } = useSendBoxDraft(conversation_id);
 

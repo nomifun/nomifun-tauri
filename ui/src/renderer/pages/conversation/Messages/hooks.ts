@@ -5,7 +5,7 @@
  */
 
 import { ipcBridge } from '@/common';
-import type { AgentStreamErrorInfo, IMessageText, IMessageTips, TMessage } from '@/common/chat/chatLib';
+import type { AgentStreamErrorInfo, IMessageThinking, IMessageTips, TMessage } from '@/common/chat/chatLib';
 import {
   composeMessage,
   mergeAcpToolCallContent,
@@ -32,7 +32,27 @@ interface MessageIndex {
 
 function getMessageIndexKey(message: TMessage): string | undefined {
   if (!message.msg_id) return undefined;
-  return message.type === 'thinking' ? `thinking:${message.msg_id}` : message.msg_id;
+  if (message.type === 'thinking') return `thinking:${message.msg_id}`;
+  if (message.type === 'agent_status') {
+    const backend = typeof message.content?.backend === 'string' ? message.content.backend : 'agent';
+    return `agent_status:${message.msg_id}:${backend}`;
+  }
+  return message.msg_id;
+}
+
+const compactThinkingStreamText = (value: string): string => value.replace(/\s+/g, ' ').trim();
+
+export function mergeThinkingStreamContent(existing: string, incoming: string): string {
+  if (!incoming) return existing;
+  if (!existing) return incoming;
+  if (incoming === existing) return existing;
+  const existingCompact = compactThinkingStreamText(existing);
+  const incomingCompact = compactThinkingStreamText(incoming);
+  if (incomingCompact === existingCompact) return existing;
+  if (incomingCompact && existingCompact.startsWith(incomingCompact)) return existing;
+  if (existingCompact && incomingCompact.startsWith(existingCompact)) return incoming;
+  if (incoming.startsWith(existing)) return incoming;
+  return existing + incoming;
 }
 
 // 使用 WeakMap 缓存索引，当列表被 GC 时自动清理
@@ -244,12 +264,13 @@ function composeMessageWithIndex(message: TMessage | undefined, list: TMessage[]
     }
 
     if (last.type === 'thinking' && last.msg_id === message.msg_id) {
+      const nextContent = mergeThinkingStreamContent(last.content.content, message.content.content);
       const newList = list.slice();
       newList[newList.length - 1] = {
         ...last,
         content: {
           ...last.content,
-          content: last.content.content + message.content.content,
+          content: nextContent,
           subject: message.content.subject || last.content.subject,
         },
       };
@@ -283,10 +304,12 @@ function composeMessageWithIndex(message: TMessage | undefined, list: TMessage[]
     return list.concat(message);
   }
 
-  // agent_status / tips and other msg_id-based messages:
-  // replace the existing item in place instead of appending duplicates.
-  if (message.msg_id) {
-    const existingIdx = index.msgIdIndex.get(message.msg_id);
+  // agent_status / tips and other msg-id-keyed messages:
+  // replace only the same keyed process item, never a text/tool item that
+  // happens to belong to the same turn msg_id.
+  const msgIndexKey = getMessageIndexKey(message);
+  if (msgIndexKey) {
+    const existingIdx = index.msgIdIndex.get(msgIndexKey);
     if (existingIdx !== undefined && existingIdx < list.length) {
       const existingMsg = list[existingIdx];
       const newList = list.slice();
@@ -314,6 +337,10 @@ function composeMessageWithIndex(message: TMessage | undefined, list: TMessage[]
   const lastIdx = newList.length - 1;
   newList[lastIdx] = { ...last, ...message };
   return newList;
+}
+
+export function composeMessageForTest(message: TMessage | undefined, list: TMessage[]): TMessage[] {
+  return composeMessageWithIndex(message, list, buildMessageIndex(list));
 }
 
 export const useAddOrUpdateMessage = () => {
@@ -599,6 +626,72 @@ const HISTORY_WINDOW_SIZE = 60;
  *  `parse_message_cursor` / `get_messages_keyset`). */
 const messageCursorOf = (m: TMessage): string => `${m.created_at ?? 0}:${m.id}`;
 
+const getFetchedMergeKey = (message: TMessage): string | undefined => {
+  if (!message.msg_id) return undefined;
+  return `${message.type}:${message.msg_id}`;
+};
+
+const getThinkingTextLength = (message: IMessageThinking): number => {
+  const content = message.content?.content;
+  return typeof content === 'string' ? content.length : 0;
+};
+
+const preferThinkingMessageVersion = (
+  dbMessage: IMessageThinking,
+  streamMessage: IMessageThinking
+): IMessageThinking => {
+  const dbLength = getThinkingTextLength(dbMessage);
+  const streamLength = getThinkingTextLength(streamMessage);
+  if (streamLength > dbLength) return streamMessage;
+  if (dbLength > streamLength) return dbMessage;
+  if (dbMessage.content.status === 'done' && streamMessage.content.status !== 'done') return dbMessage;
+  return dbMessage;
+};
+
+export const mergeFetchedMessagesForConversation = (
+  currentList: TMessage[],
+  messages: TMessage[],
+  conversationId: number
+): TMessage[] => {
+  if (!currentList.length) return messages;
+  const sameConversation = currentList.filter((m) => m.conversation_id === conversationId);
+  if (!sameConversation.length) return messages;
+
+  const dbIds = new Set(messages.map((m) => m.id));
+  const dbKeys = new Set(messages.map(getFetchedMergeKey).filter((key): key is string => Boolean(key)));
+  const streamingByKey = new Map<string, TMessage>();
+
+  for (const message of sameConversation) {
+    const key = getFetchedMergeKey(message);
+    if (key && dbKeys.has(key)) {
+      streamingByKey.set(key, message);
+    }
+  }
+
+  const mergedMessages = messages.map((dbMessage) => {
+    const key = getFetchedMergeKey(dbMessage);
+    const streamMessage = key ? streamingByKey.get(key) : undefined;
+    if (!streamMessage) return dbMessage;
+
+    if (dbMessage.type === 'text' && streamMessage.type === 'text') {
+      return preferTextMessageVersion(dbMessage, streamMessage);
+    }
+    if (dbMessage.type === 'thinking' && streamMessage.type === 'thinking') {
+      return preferThinkingMessageVersion(dbMessage, streamMessage);
+    }
+    return dbMessage;
+  });
+
+  const streamingOnly = sameConversation.filter((message) => {
+    if (dbIds.has(message.id)) return false;
+    const key = getFetchedMergeKey(message);
+    return !key || !dbKeys.has(key);
+  });
+
+  if (!streamingOnly.length && !streamingByKey.size) return messages;
+  return [...mergedMessages, ...streamingOnly];
+};
+
 /**
  * Loads a conversation's message history into the shared message-list store.
  *
@@ -631,31 +724,7 @@ export const useMessageLstCache = (key: number, opts?: { windowed?: boolean }) =
   const mergeIntoList = useCallback(
     (messages: TMessage[]) => {
       update((currentList) => {
-        if (!currentList.length) return messages;
-        const sameConversation = currentList.filter((m) => m.conversation_id === key);
-        if (!sameConversation.length) return messages;
-        const dbIds = new Set(messages.map((m) => m.id));
-        const dbMsgIds = new Set(messages.map((m) => m.msg_id).filter(Boolean));
-
-        // Build a map of streaming messages by msg_id for content-length comparison.
-        const streamingByMsgId = new Map<string, IMessageText>();
-        for (const m of sameConversation) {
-          if (m.msg_id && m.type === 'text' && dbMsgIds.has(m.msg_id)) {
-            streamingByMsgId.set(m.msg_id, m);
-          }
-        }
-
-        // Replace DB messages with streaming versions when streaming has more content
-        const mergedMessages = messages.map((dbMsg) => {
-          if (!dbMsg.msg_id || dbMsg.type !== 'text') return dbMsg;
-          const streamMsg = streamingByMsgId.get(dbMsg.msg_id);
-          if (!streamMsg) return dbMsg;
-          return preferTextMessageVersion(dbMsg, streamMsg);
-        });
-
-        const streamingOnly = sameConversation.filter((m) => !dbIds.has(m.id) && !(m.msg_id && dbMsgIds.has(m.msg_id)));
-        if (!streamingOnly.length && !streamingByMsgId.size) return messages;
-        return [...mergedMessages, ...streamingOnly];
+        return mergeFetchedMessagesForConversation(currentList, messages, key);
       });
     },
     [key, update]

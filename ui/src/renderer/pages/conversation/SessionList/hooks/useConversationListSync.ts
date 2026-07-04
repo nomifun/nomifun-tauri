@@ -16,7 +16,20 @@ import { useCallback, useEffect, useSyncExternalStore } from 'react';
  * types (e.g. slash_commands_updated, acp_context_usage) from falsely
  * triggering the generating state.
  */
-const isGeneratingStreamMessage = (type: string): boolean => {
+const isPreparingAgentStatus = (data: unknown): boolean => {
+  if (!data || typeof data !== 'object') {
+    return false;
+  }
+
+  return (data as { status?: string }).status === 'preparing';
+};
+
+const isGeneratingStreamMessage = (message: { type: string; data: unknown }): boolean => {
+  if (message.type === 'agent_status') {
+    return isPreparingAgentStatus(message.data);
+  }
+
+  const { type } = message;
   return (
     type === 'content' ||
     type === 'start' ||
@@ -245,7 +258,7 @@ const initializeConversationListSyncStore = () => {
       return;
     }
 
-    if (isGeneratingStreamMessage(message.type)) {
+    if (isGeneratingStreamMessage(message)) {
       markGenerating(conversation_id);
     }
   });

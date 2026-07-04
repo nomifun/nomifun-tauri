@@ -72,7 +72,7 @@ export const getProcessItemState = (item: ProcessStateItem): TurnDisclosureProce
       return 'waiting';
     case 'agent_status':
       if (item.content.status === 'error') return 'failed';
-      if (item.content.status === 'connecting') return 'running';
+      if (item.content.status === 'connecting' || item.content.status === 'preparing') return 'running';
       return 'completed';
     case 'tips':
       return item.content.type === 'error' ? 'failed' : 'completed';

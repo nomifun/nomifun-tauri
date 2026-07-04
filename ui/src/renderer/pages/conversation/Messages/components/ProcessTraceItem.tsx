@@ -19,9 +19,15 @@ import { useTranslation } from 'react-i18next';
 import type { FileChangeInfo } from '../MessageFileChanges';
 import { isContextCompressionTip } from '../processTipModel';
 import { formatFileTargetPreview, formatWorkspaceFileTarget } from '../processFileTargetLabel';
-import { isFileReceiptRow, shouldShowFileListDetail, shouldShowToolRowDetail } from '../processTraceDisplayModel';
+import {
+  buildThinkingReceiptDisplay,
+  isFileReceiptRow,
+  shouldShowFileListDetail,
+  shouldShowThinkingReceiptDetail,
+  shouldShowToolRowDetail,
+} from '../processTraceDisplayModel';
 import type { TurnDisclosureProcessState } from '../turnDisclosureModel';
-import { getProcessItemState } from '../turnProcessState';
+import { getProcessItemState, mergeProcessStates } from '../turnProcessState';
 import MessagePermission from './MessagePermission';
 import { buildToolReceiptDetailRows, type ToolReceiptDetailRow } from './toolGroupSummaryModel';
 
@@ -72,6 +78,22 @@ const compactReceiptText = (value: unknown, fallback: string): string => {
 };
 
 const joinCompactText = (parts: Array<string | undefined>): string => parts.filter(Boolean).join(' ');
+
+const getThinkingDurationMs = (item: TMessage): number | undefined => {
+  if (item.type !== 'thinking') return undefined;
+  const duration = item.content.duration;
+  if (typeof duration !== 'number' || !Number.isFinite(duration) || duration <= 0) return undefined;
+  return duration;
+};
+
+const formatReceiptDuration = (ms: number | undefined, t: TranslationFn): string | undefined => {
+  if (ms === undefined) return undefined;
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const sUnit = t('common.unit.second_short', { defaultValue: 's' });
+  const mUnit = t('common.unit.minute_short', { defaultValue: 'm' });
+  if (totalSeconds < 60) return `${totalSeconds}${sUnit}`;
+  return `${Math.floor(totalSeconds / 60)}${mUnit} ${totalSeconds % 60}${sUnit}`;
+};
 
 const getToolReceiptDetailDisplayTarget = (row: ToolReceiptDetailRow, workspaceRoots: string[]): string | undefined => {
   if (!row.target) return undefined;
@@ -163,31 +185,60 @@ const formatFileChangeStats = (file: FileChangeInfo): string =>
 const formatTargetPreview = (targets: string[], workspaceRoots: string[]): string =>
   formatFileTargetPreview(targets, { workspaceRoots });
 
-const ToolFileListDetail: React.FC<{ rows: ToolReceiptDetailRow[]; workspaceRoots: string[] }> = ({
+const getToolFileListTargets = (rows: ToolReceiptDetailRow[]): string[] =>
+  Array.from(new Set(rows.map((row) => row.target).filter((target): target is string => Boolean(target))));
+
+const formatToolFileListLabel = (
+  rows: ToolReceiptDetailRow[],
+  t: TranslationFn,
+  workspaceRoots: string[]
+): string => {
+  const targets = getToolFileListTargets(rows);
+  const targetPreview = formatTargetPreview(targets, workspaceRoots);
+  const hasReadRows = rows.some((row) => row.action === 'read_files');
+  const hasEditRows = rows.some((row) => row.action === 'edit_files');
+
+  if (hasEditRows && !hasReadRows) {
+    return t('messages.processReceipt.fileEditTargets', {
+      count: targets.length,
+      target: targetPreview,
+      defaultValue: 'Edited {{count}} files: {{target}}',
+    });
+  }
+
+  if (hasReadRows && !hasEditRows) {
+    return t('messages.processReceipt.readTargets', {
+      count: targets.length,
+      target: targetPreview,
+      defaultValue: 'Read {{count}} files: {{target}}',
+    });
+  }
+
+  return t('messages.processReceipt.fileTargets', {
+    count: targets.length,
+    target: targetPreview,
+    defaultValue: 'Handled {{count}} files: {{target}}',
+  });
+};
+
+const ToolFileListDetail: React.FC<{
+  rows: ToolReceiptDetailRow[];
+  workspaceRoots: string[];
+  showLabel?: boolean;
+}> = ({
   rows,
   workspaceRoots,
+  showLabel = true,
 }) => {
   const { t } = useTranslation();
-  const targets = rows.map((row) => row.target).filter((target): target is string => Boolean(target));
+  const targets = getToolFileListTargets(rows);
   if (!targets.length) return null;
 
-  const firstAction = rows[0]?.action;
-  const label =
-    firstAction === 'edit_files'
-      ? t('messages.processReceipt.fileEditTargets', {
-          count: targets.length,
-          target: formatTargetPreview(targets, workspaceRoots),
-          defaultValue: 'Edited {{count}} files: {{target}}',
-        })
-      : t('messages.processReceipt.readTargets', {
-          count: targets.length,
-          target: formatTargetPreview(targets, workspaceRoots),
-          defaultValue: 'Read {{count}} files: {{target}}',
-        });
+  const label = formatToolFileListLabel(rows, t, workspaceRoots);
 
   return (
     <div className='turn-process-trace-detail'>
-      <div className='turn-process-trace-detail__label'>{label}</div>
+      {showLabel && <div className='turn-process-trace-detail__label'>{label}</div>}
       <ul className='turn-process-trace-file-list'>
         {targets.map((target) => {
           const display = formatWorkspaceFileTarget(target, { workspaceRoots });
@@ -198,6 +249,44 @@ const ToolFileListDetail: React.FC<{ rows: ToolReceiptDetailRow[]; workspaceRoot
           );
         })}
       </ul>
+    </div>
+  );
+};
+
+const ToolFileGroupTraceRow: React.FC<{ rows: ToolReceiptDetailRow[]; workspaceRoots: string[] }> = ({
+  rows,
+  workspaceRoots,
+}) => {
+  const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  const targets = getToolFileListTargets(rows);
+  if (!targets.length) return null;
+
+  const label = formatToolFileListLabel(rows, t, workspaceRoots);
+  const state = mergeProcessStates(rows.map((row) => row.state));
+
+  return (
+    <div className='turn-process-trace-tool'>
+      <button
+        type='button'
+        className={classNames(
+          'turn-process-trace__row',
+          'turn-process-trace-tool__toggle',
+          `turn-process-trace__row--${state}`
+        )}
+        onClick={() => setExpanded((value) => !value)}
+        aria-expanded={expanded}
+      >
+        <span className='turn-process-trace__text' title={targets.join('\n')}>
+          {label}
+        </span>
+        <Right
+          theme='outline'
+          size='12'
+          className={classNames('turn-process-trace-tool__arrow', expanded && 'turn-process-trace-tool__arrow--open')}
+        />
+      </button>
+      {expanded && <ToolFileListDetail rows={rows} workspaceRoots={workspaceRoots} showLabel={false} />}
     </div>
   );
 };
@@ -214,7 +303,9 @@ const ToolTraceDetailSection: React.FC<{ label: string; value?: string }> = ({ l
 
 const ToolTraceDetail: React.FC<{ row: ToolReceiptDetailRow; workspaceRoots: string[] }> = ({ row, workspaceRoots }) => {
   const { t } = useTranslation();
-  if (isFileReceiptRow(row)) return <ToolFileListDetail rows={[row]} workspaceRoots={workspaceRoots} />;
+  if (isFileReceiptRow(row) && row.state !== 'failed' && row.state !== 'canceled') {
+    return <ToolFileListDetail rows={[row]} workspaceRoots={workspaceRoots} />;
+  }
 
   const command = row.action === 'run_commands' ? row.target : undefined;
   const input = row.input && row.input !== command ? row.input : undefined;
@@ -242,13 +333,19 @@ const ToolTraceDetail: React.FC<{ row: ToolReceiptDetailRow; workspaceRoots: str
   );
 };
 
-const ToolTraceRow: React.FC<{ row: ToolReceiptDetailRow; label: string; workspaceRoots: string[] }> = ({
+const ToolTraceRow: React.FC<{
+  row: ToolReceiptDetailRow;
+  label: string;
+  workspaceRoots: string[];
+  fileRowCount?: number;
+}> = ({
   row,
   label,
   workspaceRoots,
+  fileRowCount,
 }) => {
   const [expanded, setExpanded] = useState(false);
-  const hasDetail = shouldShowToolRowDetail(row);
+  const hasDetail = shouldShowToolRowDetail(row, { fileRowCount });
   const rowClassName = classNames(
     'turn-process-trace__row',
     'turn-process-trace-tool__toggle',
@@ -320,6 +417,30 @@ const ProcessTraceRows: React.FC<{ rows: ProcessTraceRow[] }> = ({ rows }) => {
   );
 };
 
+const ThinkingTraceRow: React.FC<{
+  label: string;
+  detail: string;
+  state: TurnDisclosureProcessState;
+}> = ({ label, detail, state }) => {
+  const hasDetail = Boolean(detail);
+
+  if (!hasDetail) {
+    return (
+      <div className={classNames('turn-process-trace__row', `turn-process-trace__row--${state}`)}>
+        <span className='turn-process-trace__text' title={label}>
+          {label}
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div className='turn-process-trace-thinking-inline'>
+      <div className='turn-process-trace__paragraph'>{detail}</div>
+    </div>
+  );
+};
+
 const ToolProcessTraceRows: React.FC<{
   messages: ToolProcessMessage[];
   variant?: ProcessTraceVariant;
@@ -346,7 +467,7 @@ const ToolProcessTraceRows: React.FC<{
   if (shouldShowFileListDetail(fileRows)) {
     return (
       <div className='turn-process-trace'>
-        <ToolFileListDetail rows={fileRows} workspaceRoots={workspaceRoots} />
+        <ToolFileGroupTraceRow rows={fileRows} workspaceRoots={workspaceRoots} />
         {nonFileRows.map(({ row, label }) => (
           <ToolTraceRow key={row.key} row={row} label={label} workspaceRoots={workspaceRoots} />
         ))}
@@ -354,14 +475,20 @@ const ToolProcessTraceRows: React.FC<{
     );
   }
 
-  if (variant === 'receipt' && rows.length === 1 && shouldShowToolRowDetail(rows[0].row)) {
+  if (variant === 'receipt' && rows.length === 1 && shouldShowToolRowDetail(rows[0].row, { fileRowCount: fileRows.length })) {
     return <ToolTraceDetail row={rows[0].row} workspaceRoots={workspaceRoots} />;
   }
 
   return (
     <div className='turn-process-trace'>
       {rows.map(({ row, label }) => (
-        <ToolTraceRow key={row.key} row={row} label={label} workspaceRoots={workspaceRoots} />
+        <ToolTraceRow
+          key={row.key}
+          row={row}
+          label={label}
+          workspaceRoots={workspaceRoots}
+          fileRowCount={fileRows.length}
+        />
       ))}
     </div>
   );
@@ -515,7 +642,15 @@ const ProcessTraceItem: React.FC<{
               key: item.id,
               state,
               label:
-                state === 'failed'
+                item.content.status === 'preparing'
+                  ? t('messages.processReceipt.preparingAction', {
+                      defaultValue: 'Preparing next action',
+                    })
+                  : item.content.status === 'prepared'
+                    ? t('messages.processReceipt.preparedAction', {
+                        defaultValue: 'Prepared next action',
+                      })
+                  : state === 'failed'
                   ? t('messages.processReceipt.agentFailed', {
                       target: item.content.agent_name || item.content.backend,
                       defaultValue: '{{target}} failed',
@@ -568,22 +703,43 @@ const ProcessTraceItem: React.FC<{
           ]}
         />
       );
-    case 'thinking':
-      if (item.content.status === 'done') return null;
+    case 'thinking': {
+      const thinkingDuration = formatReceiptDuration(getThinkingDurationMs(item), t);
+      const thinkingDisplay = buildThinkingReceiptDisplay(item.content, {
+        completedFallback: thinkingDuration
+          ? t('messages.processReceipt.thinkingCompletedDuration', {
+              duration: thinkingDuration,
+              defaultValue: 'Thought {{duration}}',
+            })
+          : t('messages.processReceipt.thinkingCompleted', { defaultValue: 'Thought' }),
+        runningFallback: t('messages.processReceipt.thinkingRunning', { defaultValue: 'Thinking' }),
+        waitingFallback: t('messages.processReceipt.thinkingWaiting', {
+          defaultValue: 'Waiting for model output',
+        }),
+      });
+      const thinkingDetail = shouldShowThinkingReceiptDetail(item.content) ? thinkingDisplay.detail : '';
+      if (thinkingDetail) {
+        const thinkingClassName = classNames(
+          variant === 'receipt' && 'turn-process-trace-receipt-detail',
+          variant !== 'receipt' && 'turn-process-trace',
+          variant !== 'receipt' && 'turn-process-trace-thinking-inline'
+        );
+        return (
+          <div className={thinkingClassName}>
+            <div className='turn-process-trace__paragraph'>{thinkingDetail}</div>
+          </div>
+        );
+      }
       return (
-        <ProcessTraceRows
-          rows={[
-            {
-              key: item.id,
-              state,
-              label: compactReceiptText(
-                item.content.subject,
-                t('messages.processReceipt.thinkingRunning', { defaultValue: 'Thinking' })
-              ),
-            },
-          ]}
-        />
+        <div className='turn-process-trace'>
+          <ThinkingTraceRow
+            label={thinkingDisplay.label}
+            detail={thinkingDetail}
+            state={state}
+          />
+        </div>
       );
+    }
     case 'plan':
     case 'available_commands':
       return null;

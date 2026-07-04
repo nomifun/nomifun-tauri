@@ -53,6 +53,29 @@ describe('buildTurnDisclosureItems', () => {
     expect(disclosure.sourceMessageIds).toEqual(['thinking', 'tool']);
   });
 
+  test('uses completed thinking intervals when calculating disclosure duration', () => {
+    const result = buildTurnDisclosureItems(
+      [
+        item('user', 'user', { createdAt: 0 }),
+        item('thinking', 'process', {
+          createdAt: 35000,
+          processStartedAt: 1000,
+          processEndedAt: 35000,
+        }),
+        item('tool', 'process', { createdAt: 33000 }),
+        item('final', 'assistant', { createdAt: 35600 }),
+      ],
+      { tailClosed: true }
+    );
+
+    const disclosure = result[1];
+    expect(disclosure.type).toBe('turn_disclosure');
+    if (disclosure.type !== 'turn_disclosure') return;
+    expect(disclosure.processItemIds).toEqual(['thinking', 'tool']);
+    expect(disclosure.startAt).toBe(1000);
+    expect(disclosure.endAt).toBe(35600);
+  });
+
   test('keeps the final assistant answer outside the disclosure when earlier assistant text was intermediate', () => {
     const result = buildTurnDisclosureItems(
       [

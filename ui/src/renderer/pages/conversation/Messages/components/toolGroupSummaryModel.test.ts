@@ -68,6 +68,15 @@ describe('buildToolReceiptSummaryParts', () => {
     ]);
   });
 
+  test('uses the concrete file target from a running write input preview', () => {
+    const parts = buildToolReceiptSummaryParts(
+      [tool({ key: 'write', name: 'Write', input: '{"file_path":"/tmp/snake.html"}', status: 'running' })],
+      'running'
+    );
+
+    expect(parts).toEqual([{ action: 'edit_files', count: 1, state: 'running', target: '/tmp/snake.html' }]);
+  });
+
   test('recognizes code search and file listing as scan-friendly receipt titles', () => {
     const parts = buildToolReceiptSummaryParts(
       [
@@ -230,6 +239,28 @@ describe('buildToolReceiptDetailRows', () => {
         title: 'Read',
         target: 'ui/src/renderer/pages/conversation/Messages/MessageList.tsx',
         input: '{"file_path":"ui/src/renderer/pages/conversation/Messages/MessageList.tsx"}',
+      },
+    ]);
+  });
+
+  test('extracts running write targets from structured input previews', () => {
+    const rows = buildToolReceiptDetailRows([
+      tool({
+        key: 'write-input',
+        name: 'Write',
+        status: 'running',
+        input: '{"file_path":"/tmp/snake.html"}',
+      }),
+    ]);
+
+    expect(rows).toEqual([
+      {
+        key: 'write-input',
+        action: 'edit_files',
+        state: 'running',
+        title: 'Write',
+        target: '/tmp/snake.html',
+        input: '{"file_path":"/tmp/snake.html"}',
       },
     ]);
   });

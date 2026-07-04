@@ -300,10 +300,30 @@ async fn test_openai_stream_tool_call_aggregation() {
     let rx = provider.stream(&make_request()).await.unwrap();
     let events = collect_events(rx).await;
 
-    // Expect: ToolUse, Done{ToolUse}
-    assert_eq!(events.len(), 2, "expected 2 events, got: {:?}", events);
+    // Expect: early tool progress, target-bearing progress, final ToolUse,
+    // Done{ToolUse}. The progress events are what keep the UI responsive while
+    // long tool arguments are still streaming.
+    assert_eq!(events.len(), 4, "expected 4 events, got: {:?}", events);
 
     match &events[0] {
+        LlmEvent::ToolUseDelta { id, name, input } => {
+            assert_eq!(id, "call_abc123");
+            assert_eq!(name, "read_file");
+            assert!(input.is_none());
+        }
+        e => panic!("expected first ToolUseDelta, got: {:?}", e),
+    }
+
+    match &events[1] {
+        LlmEvent::ToolUseDelta { id, name, input } => {
+            assert_eq!(id, "call_abc123");
+            assert_eq!(name, "read_file");
+            assert_eq!(input.as_ref().unwrap()["path"], "/tmp/test.txt");
+        }
+        e => panic!("expected second ToolUseDelta, got: {:?}", e),
+    }
+
+    match &events[2] {
         LlmEvent::ToolUse {
             id, name, input, ..
         } => {
@@ -314,7 +334,7 @@ async fn test_openai_stream_tool_call_aggregation() {
         e => panic!("expected ToolUse, got: {:?}", e),
     }
 
-    match &events[1] {
+    match &events[3] {
         LlmEvent::Done { stop_reason, usage } => {
             assert_eq!(*stop_reason, StopReason::ToolUse);
             assert_eq!(usage.input_tokens, 40);
@@ -407,10 +427,28 @@ async fn test_openai_multiple_tool_calls() {
     let rx = provider.stream(&make_request()).await.unwrap();
     let events = collect_events(rx).await;
 
-    // Expect: ToolUse (index 0), ToolUse (index 1), Done{ToolUse}
-    assert_eq!(events.len(), 3, "expected 3 events, got: {:?}", events);
+    // Expect: progress for both tools, final ToolUse for both, Done{ToolUse}.
+    assert_eq!(events.len(), 5, "expected 5 events, got: {:?}", events);
 
     match &events[0] {
+        LlmEvent::ToolUseDelta { id, name, input } => {
+            assert_eq!(id, "call_tool0");
+            assert_eq!(name, "list_files");
+            assert_eq!(input.as_ref().unwrap()["dir"], "/tmp");
+        }
+        e => panic!("expected first ToolUseDelta, got: {:?}", e),
+    }
+
+    match &events[1] {
+        LlmEvent::ToolUseDelta { id, name, input } => {
+            assert_eq!(id, "call_tool1");
+            assert_eq!(name, "read_file");
+            assert_eq!(input.as_ref().unwrap()["path"], "/etc/hosts");
+        }
+        e => panic!("expected second ToolUseDelta, got: {:?}", e),
+    }
+
+    match &events[2] {
         LlmEvent::ToolUse {
             id, name, input, ..
         } => {
@@ -421,7 +459,7 @@ async fn test_openai_multiple_tool_calls() {
         e => panic!("expected first ToolUse, got: {:?}", e),
     }
 
-    match &events[1] {
+    match &events[3] {
         LlmEvent::ToolUse {
             id, name, input, ..
         } => {
@@ -432,7 +470,7 @@ async fn test_openai_multiple_tool_calls() {
         e => panic!("expected second ToolUse, got: {:?}", e),
     }
 
-    match &events[2] {
+    match &events[4] {
         LlmEvent::Done { stop_reason, .. } => {
             assert_eq!(*stop_reason, StopReason::ToolUse);
         }

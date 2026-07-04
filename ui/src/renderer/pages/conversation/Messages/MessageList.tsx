@@ -45,6 +45,10 @@ import {
 import ProcessTraceItem from './components/ProcessTraceItem';
 import { isContextCompressionTip } from './processTipModel';
 import { formatFileTargetPreview, splitToolReceiptTargets } from './processFileTargetLabel';
+import {
+  buildThinkingReceiptDisplay,
+  shouldShowThinkingReceiptDetail,
+} from './processTraceDisplayModel';
 import type { WriteFileResult } from './types';
 import { useAutoScroll } from './useAutoScroll';
 import { useAutoPreviewOfficeFiles } from '@/renderer/hooks/file/useAutoPreviewOfficeFiles';
@@ -101,6 +105,7 @@ type IProcessReceiptVO = {
   label: string;
   icon: TurnProcessReceiptIcon;
   defaultExpanded: boolean;
+  hasDetail?: boolean;
 };
 type IProcessedItem = IRenderableItem | ITurnProcessDisclosureVO | IProcessReceiptVO;
 
@@ -148,6 +153,22 @@ const getProcessedItemCreatedAt = (item: IProcessedItem): number => {
     return item.created_at ?? 0;
   }
   return item.created_at ?? 0;
+};
+
+const getThinkingDurationMs = (item: IRenderableItem): number | undefined => {
+  if (!('type' in item) || item.type !== 'thinking') return undefined;
+  const duration = item.content.duration;
+  if (typeof duration !== 'number' || !Number.isFinite(duration) || duration <= 0) return undefined;
+  return duration;
+};
+
+const getProcessedItemProcessStartedAt = (item: IRenderableItem): number => getProcessedItemCreatedAt(item);
+
+const getProcessedItemProcessEndedAt = (item: IRenderableItem): number => {
+  const createdAt = getProcessedItemCreatedAt(item);
+  const duration = getThinkingDurationMs(item);
+  if (duration === undefined) return createdAt;
+  return createdAt + duration;
 };
 
 const getProcessedItemMsgId = (item: IRenderableItem): string | undefined => {
@@ -201,6 +222,15 @@ const compactReceiptText = (value: unknown, fallback: string): string => {
   if (typeof value !== 'string') return fallback;
   const compacted = value.replace(/\s+/g, ' ').trim();
   return compacted || fallback;
+};
+
+const formatReceiptDuration = (ms: number | undefined, t: TranslationFn): string | undefined => {
+  if (ms === undefined) return undefined;
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const sUnit = t('common.unit.second_short', { defaultValue: 's' });
+  const mUnit = t('common.unit.minute_short', { defaultValue: 'm' });
+  if (totalSeconds < 60) return `${totalSeconds}${sUnit}`;
+  return `${Math.floor(totalSeconds / 60)}${mUnit} ${totalSeconds % 60}${sUnit}`;
 };
 
 const getToolReceiptDisplayTarget = (part: ToolReceiptSummaryPart, workspaceRoots: string[]): string | undefined => {
@@ -352,7 +382,7 @@ const buildProcessReceiptSummary = (
   state: TurnDisclosureProcessState,
   t: TranslationFn,
   workspaceRoots: string[] = []
-): { label: string; icon: TurnProcessReceiptIcon; defaultExpanded: boolean } => {
+): { label: string; icon: TurnProcessReceiptIcon; defaultExpanded: boolean; hasDetail?: boolean } => {
   if ('type' in item && item.type === 'tool_summary') {
     const tools = normalizeToolMessages(item.messages);
     const receiptParts = buildToolReceiptSummaryParts(tools, state);
@@ -372,17 +402,29 @@ const buildProcessReceiptSummary = (
       label,
       icon: getToolReceiptIcon(item.messages),
       defaultExpanded: state === 'waiting',
+      hasDetail: true,
     };
   }
 
   if ('type' in item && item.type === 'file_summary') {
+    const targets = item.diffs
+      .map((file) => file.fullPath || file.file_name)
+      .filter((target): target is string => Boolean(target));
+    const targetPreview = targets.length ? formatFileTargetPreview(targets, { workspaceRoots }) : '';
     return {
-      label: t('messages.processReceipt.fileEdits', {
-        count: item.diffs.length,
-        defaultValue: 'Edited {{count}} files',
-      }),
+      label: targetPreview
+        ? t('messages.processReceipt.fileEditTargets', {
+            count: item.diffs.length,
+            target: targetPreview,
+            defaultValue: 'Edited {{count}} files: {{target}}',
+          })
+        : t('messages.processReceipt.fileEdits', {
+            count: item.diffs.length,
+            defaultValue: 'Edited {{count}} files',
+          }),
       icon: 'edit',
       defaultExpanded: false,
+      hasDetail: item.diffs.length > 1,
     };
   }
 
@@ -393,21 +435,33 @@ const buildProcessReceiptSummary = (
       label: t('messages.processReceipt.status', { target, defaultValue: '{{target}}' }),
       icon: 'status',
       defaultExpanded: false,
+      hasDetail: false,
     };
   }
 
   switch (item.type) {
     case 'thinking': {
+      const thinkingDuration = formatReceiptDuration(getThinkingDurationMs(item), t);
+      const display = buildThinkingReceiptDisplay(item.content, {
+        completedFallback: thinkingDuration
+          ? t('messages.processReceipt.thinkingCompletedDuration', {
+              duration: thinkingDuration,
+              defaultValue: 'Thought {{duration}}',
+            })
+          : t('messages.processReceipt.thinkingCompleted', { defaultValue: 'Thought' }),
+        runningFallback: t('messages.processReceipt.thinkingRunning', { defaultValue: 'Thinking' }),
+        waitingFallback: t('messages.processReceipt.thinkingWaiting', {
+          defaultValue: 'Waiting for model output',
+        }),
+      });
       return {
         label:
           state === 'running'
-            ? compactReceiptText(
-                item.content.subject,
-                t('messages.processReceipt.thinkingRunning', { defaultValue: 'Thinking' })
-              )
+            ? display.label
             : t('messages.processReceipt.thinkingCompleted', { defaultValue: 'Thought' }),
         icon: 'thinking',
-        defaultExpanded: false,
+        defaultExpanded: shouldShowThinkingReceiptDetail(item.content),
+        hasDetail: shouldShowThinkingReceiptDetail(item.content),
       };
     }
     case 'permission':
@@ -418,6 +472,7 @@ const buildProcessReceiptSummary = (
         }),
         icon: 'permission',
         defaultExpanded: true,
+        hasDetail: true,
       };
     case 'acp_permission':
       return {
@@ -432,11 +487,16 @@ const buildProcessReceiptSummary = (
         }),
         icon: 'permission',
         defaultExpanded: true,
+        hasDetail: true,
       };
     case 'agent_status':
       return {
         label:
-          state === 'failed'
+          item.content.status === 'preparing'
+            ? t('messages.processReceipt.preparingAction', { defaultValue: 'Preparing next action' })
+            : item.content.status === 'prepared'
+              ? t('messages.processReceipt.preparedAction', { defaultValue: 'Prepared next action' })
+            : state === 'failed'
             ? t('messages.processReceipt.agentFailed', {
                 target: item.content.agent_name || item.content.backend,
                 defaultValue: '{{target}} failed',
@@ -446,7 +506,8 @@ const buildProcessReceiptSummary = (
                 defaultValue: 'Connecting {{target}}',
               }),
         icon: 'status',
-        defaultExpanded: state === 'failed',
+        defaultExpanded: false,
+        hasDetail: false,
       };
     case 'tips':
       if (isContextCompressionTip(item)) {
@@ -454,6 +515,7 @@ const buildProcessReceiptSummary = (
           label: t('messages.processReceipt.contextCompressed', { defaultValue: 'Context compressed' }),
           icon: 'status',
           defaultExpanded: false,
+          hasDetail: false,
         };
       }
       return {
@@ -463,6 +525,7 @@ const buildProcessReceiptSummary = (
         ),
         icon: state === 'failed' ? 'permission' : 'status',
         defaultExpanded: state === 'failed',
+        hasDetail: false,
       };
     case 'tool_call':
     case 'tool_group':
@@ -488,6 +551,7 @@ const buildProcessReceiptSummary = (
         }),
         icon: 'status',
         defaultExpanded: false,
+        hasDetail: false,
       };
   }
 };
@@ -513,6 +577,9 @@ const renderProcessTraceItem = (
 ) => (
   <ProcessTraceItem item={item} variant={variant} workspaceRoots={workspaceRoots} />
 );
+
+const isReadableThinkingReceipt = (item: IProcessReceiptVO): boolean =>
+  'type' in item.item && item.item.type === 'thinking' && shouldShowThinkingReceiptDetail(item.item.content);
 
 const MessageItem: React.FC<{ message: TMessage; highlighted?: boolean }> = React.memo(
   HOC((props) => {
@@ -656,7 +723,6 @@ const MessageList: React.FC<{
       // Skip hidden and available_commands messages
       if (message.hidden) continue;
       if (message.type === 'available_commands') continue;
-      if (message.type === 'thinking' && message.content.status === 'done') continue;
       // Plans are no longer rendered inline — they surface in the docked
       // PinnedPlan bar above the composer, which reads the raw list directly.
       if (message.type === 'plan') continue;
@@ -744,12 +810,14 @@ const MessageList: React.FC<{
         role,
         createdAt: getProcessedItemCreatedAt(item),
         processState: getProcessItemState(item),
+        processStartedAt: getProcessedItemProcessStartedAt(item),
+        processEndedAt: getProcessedItemProcessEndedAt(item),
         sourceMessageIds: getProcessedItemSourceMessageIds(item),
       };
     });
     const modelInput = assignTurnIdsFromUserRequests(rawModelInput);
 
-    return buildTurnDisclosureItems(modelInput, { tailClosed: conversationContext?.isProcessing !== true })
+    const disclosureItems = buildTurnDisclosureItems(modelInput, { tailClosed: conversationContext?.isProcessing !== true })
       .map<IProcessedItem | undefined>((entry: TurnDisclosureOutputItem) => {
         if (entry.type === 'item') {
           return itemById.get(entry.id);
@@ -771,6 +839,7 @@ const MessageList: React.FC<{
             label: summary.label,
             icon: summary.icon,
             defaultExpanded: summary.defaultExpanded,
+            hasDetail: summary.hasDetail,
           };
         }
 
@@ -792,6 +861,8 @@ const MessageList: React.FC<{
         };
       })
       .filter((item): item is IProcessedItem => Boolean(item));
+
+    return disclosureItems;
   }, [conversationContext?.isProcessing, processedList, t, workspaceRoots]);
 
   // Use auto-scroll hook
@@ -954,13 +1025,19 @@ const MessageList: React.FC<{
     />
   );
 
-  const renderProcessReceipt = (item: IProcessReceiptVO, highlighted: boolean) => (
-    <TurnProcessReceipt
-      receipt={item}
-      highlighted={highlighted}
-      renderProcessItem={(processItem) => renderProcessTraceItem(processItem, 'receipt', workspaceRoots)}
-    />
-  );
+  const renderProcessReceipt = (item: IProcessReceiptVO, highlighted: boolean) => {
+    if (isReadableThinkingReceipt(item)) {
+      return renderProcessTraceItem(item.item, 'receipt', workspaceRoots);
+    }
+
+    return (
+      <TurnProcessReceipt
+        receipt={item}
+        highlighted={highlighted}
+        renderProcessItem={(processItem) => renderProcessTraceItem(processItem, 'receipt', workspaceRoots)}
+      />
+    );
+  };
 
   const renderItem = (_index: number, item: (typeof displayList)[0]) => {
     const highlighted = matchesTargetMessage(item, highlightedMessageId);

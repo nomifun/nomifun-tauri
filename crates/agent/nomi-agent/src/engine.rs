@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use nomi_config::compact::CompactConfig;
 use nomi_config::config::Config;
@@ -53,6 +54,11 @@ fn cache_diagnostic_message(diag: &CacheDiagnostic, diagnostics_enabled: bool) -
 /// transcript. Tool outputs can be huge (file dumps, search results); the
 /// distiller only needs a hint of what happened, not the full payload.
 const TRANSCRIPT_TOOL_RESULT_MAX: usize = 600;
+
+/// If the provider stream stays alive but silent for this long, surface a
+/// lightweight progress event so the UI does not look frozen while the model is
+/// generating a large tool-call argument.
+const STREAM_IDLE_ACTIVITY_AFTER: Duration = Duration::from_millis(1_200);
 
 /// Render the conversation history as a role-tagged plain-text transcript for
 /// post-session memory distillation.
@@ -787,18 +793,37 @@ impl AgentEngine {
             let mut turn_usage = TokenUsage::default();
 
             let mut cancelled_midstream = false;
+            let mut idle_activity_active = false;
             loop {
                 let event = match &self.cancel_token {
-                    Some(token) => tokio::select! {
-                        biased;
-                        _ = token.cancelled() => {
-                            cancelled_midstream = true;
-                            break;
+                    Some(token) => {
+                        tokio::select! {
+                            biased;
+                            _ = token.cancelled() => {
+                                cancelled_midstream = true;
+                                break;
+                            }
+                            ev = tokio::time::timeout(STREAM_IDLE_ACTIVITY_AFTER, rx.recv()) => ev,
                         }
-                        ev = rx.recv() => ev,
-                    },
-                    None => rx.recv().await,
+                    }
+                    None => tokio::time::timeout(STREAM_IDLE_ACTIVITY_AFTER, rx.recv()).await,
                 };
+                let event = match event {
+                    Ok(event) => event,
+                    Err(_) => {
+                        if !idle_activity_active {
+                            self.output
+                                .emit_model_activity(&self.current_msg_id, "preparing");
+                            idle_activity_active = true;
+                        }
+                        continue;
+                    }
+                };
+                if idle_activity_active {
+                    self.output
+                        .emit_model_activity(&self.current_msg_id, "prepared");
+                    idle_activity_active = false;
+                }
                 let Some(event) = event else { break };
                 match event {
                     LlmEvent::TextDelta(text) => {
@@ -833,6 +858,14 @@ impl AgentEngine {
                             input,
                             extra,
                         });
+                    }
+                    LlmEvent::ToolUseDelta { id, name, input } => {
+                        let input_str = input
+                            .as_ref()
+                            .map(serde_json::to_string)
+                            .and_then(Result::ok);
+                        self.output
+                            .emit_tool_call_delta(&id, &name, input_str.as_deref());
                     }
                     LlmEvent::ThinkingDelta(text) => {
                         self.output.emit_thinking(&text, &self.current_msg_id);

@@ -397,3 +397,5 @@ export const useNomiMessage = (
     resetState,
   };
 };
+
+export type NomiMessageRuntime = ReturnType<typeof useNomiMessage>;

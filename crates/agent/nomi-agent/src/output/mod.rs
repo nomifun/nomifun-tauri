@@ -14,6 +14,11 @@ pub trait OutputSink: Send + Sync {
     fn emit_thinking(&self, text: &str, msg_id: &str);
     /// Announce a tool call.
     fn emit_tool_call(&self, tool_use_id: &str, name: &str, input: &str);
+    /// Announce that a tool call is being generated before full arguments are available.
+    fn emit_tool_call_delta(&self, _tool_use_id: &str, _name: &str, _input: Option<&str>) {}
+    /// Surface non-terminal model activity when the provider stream is still
+    /// alive but has not produced a new visible event for a short period.
+    fn emit_model_activity(&self, _msg_id: &str, _status: &str) {}
     /// Display tool result.
     fn emit_tool_result(&self, tool_use_id: &str, name: &str, is_error: bool, content: &str);
     /// Signal start of a new message stream

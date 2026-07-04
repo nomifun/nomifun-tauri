@@ -19,6 +19,7 @@ export interface TurnProcessReceiptView<T> {
   state: TurnDisclosureProcessState;
   icon: TurnProcessReceiptIcon;
   defaultExpanded: boolean;
+  hasDetail?: boolean;
 }
 
 interface TurnProcessReceiptProps<T> {
@@ -44,38 +45,50 @@ const ReceiptIcon: React.FC<{
 };
 
 function TurnProcessReceipt<T>({ receipt, highlighted = false, renderProcessItem }: TurnProcessReceiptProps<T>) {
-  const [expanded, setExpanded] = useState(receipt.defaultExpanded);
+  const canExpand = receipt.hasDetail === true;
+  const [expanded, setExpanded] = useState(receipt.defaultExpanded && canExpand);
 
   useEffect(() => {
-    setExpanded(receipt.defaultExpanded);
-  }, [receipt.defaultExpanded, receipt.id]);
+    setExpanded(receipt.defaultExpanded && canExpand);
+  }, [canExpand, receipt.defaultExpanded, receipt.id]);
 
   useEffect(() => {
-    if (highlighted) setExpanded(true);
-  }, [highlighted]);
+    if (highlighted && canExpand) setExpanded(true);
+  }, [canExpand, highlighted]);
 
   const bodyId = `turn-process-receipt-body-${sanitizeDomId(receipt.id)}`;
-
-  return (
-    <div className={classNames('turn-process-receipt', `turn-process-receipt--${receipt.state}`)}>
-      <button
-        type='button'
-        className='turn-process-receipt__header'
-        onClick={() => setExpanded((value) => !value)}
-        aria-expanded={expanded}
-        aria-controls={bodyId}
-      >
-        <span className='turn-process-receipt__icon'>
-          <ReceiptIcon icon={receipt.icon} state={receipt.state} />
-        </span>
-        <span className='turn-process-receipt__label'>{receipt.label}</span>
+  const headerContent = (
+    <>
+      <span className='turn-process-receipt__icon'>
+        <ReceiptIcon icon={receipt.icon} state={receipt.state} />
+      </span>
+      <span className='turn-process-receipt__label'>{receipt.label}</span>
+      {canExpand && (
         <Right
           theme='outline'
           size='13'
           className={classNames('turn-process-receipt__arrow', expanded && 'turn-process-receipt__arrow--open')}
         />
-      </button>
-      {expanded && (
+      )}
+    </>
+  );
+
+  return (
+    <div className={classNames('turn-process-receipt', `turn-process-receipt--${receipt.state}`)}>
+      {canExpand ? (
+        <button
+          type='button'
+          className='turn-process-receipt__header'
+          onClick={() => setExpanded((value) => !value)}
+          aria-expanded={expanded}
+          aria-controls={bodyId}
+        >
+          {headerContent}
+        </button>
+      ) : (
+        <div className='turn-process-receipt__header turn-process-receipt__header--static'>{headerContent}</div>
+      )}
+      {canExpand && expanded && (
         <div id={bodyId} className='turn-process-receipt__body'>
           {renderProcessItem(receipt.item)}
         </div>

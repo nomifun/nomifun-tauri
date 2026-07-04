@@ -467,6 +467,14 @@
   color: var(--color-text-2, #4e5969);
 }
 
+.turn-process-receipt__header--static {
+  cursor: default;
+}
+
+.turn-process-receipt__header--static:hover {
+  color: inherit;
+}
+
 .turn-process-receipt__header:focus-visible {
   border-radius: 6px;
   box-shadow: 0 0 0 2px var(--color-primary-light-3, #bedaff);
@@ -612,6 +620,17 @@ button.turn-process-trace__row:focus-visible {
   margin: 2px 0 6px 0;
   padding-left: 12px;
   border-left: 1px solid var(--color-border-2, #e5e6eb);
+}
+
+.turn-process-trace-receipt-detail {
+  min-width: 0;
+  padding-left: 12px;
+  border-left: 1px solid var(--color-border-2, #e5e6eb);
+}
+
+.turn-process-trace-thinking-inline > .turn-process-trace__paragraph,
+.turn-process-trace-receipt-detail > .turn-process-trace__paragraph {
+  color: var(--color-text-1, #1d2129);
 }
 
 .turn-process-trace-detail__section {

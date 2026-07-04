@@ -36,6 +36,13 @@ pub enum LlmEvent {
         /// Opaque provider metadata (e.g. Gemini thought_signature) to round-trip.
         extra: Option<Value>,
     },
+    /// Partial tool call progress while the provider is still streaming tool arguments.
+    ToolUseDelta {
+        id: ToolUseId,
+        name: String,
+        /// Small structured preview of arguments that are already known.
+        input: Option<Value>,
+    },
     /// Thinking content (Anthropic only)
     ThinkingDelta(String),
     /// Opaque provider signature for the current thinking block.
@@ -113,6 +120,24 @@ mod tests {
                 assert_eq!(input["cmd"], "ls");
             }
             _ => panic!("expected ToolUse"),
+        }
+    }
+
+    #[test]
+    fn test_llm_event_tool_use_delta_fields() {
+        let event = LlmEvent::ToolUseDelta {
+            id: "call_1".to_string(),
+            name: "Write".to_string(),
+            input: Some(json!({"file_path": "snake.html"})),
+        };
+
+        match &event {
+            LlmEvent::ToolUseDelta { id, name, input } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "Write");
+                assert_eq!(input.as_ref().unwrap()["file_path"], "snake.html");
+            }
+            _ => panic!("expected ToolUseDelta"),
         }
     }
 

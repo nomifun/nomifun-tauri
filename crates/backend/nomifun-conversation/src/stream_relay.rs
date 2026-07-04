@@ -508,6 +508,12 @@ impl StreamRelay {
                             self.forward_to_websocket(&event);
                             self.persist_tool_group(entries).await;
                         }
+                        AgentStreamEvent::AgentStatus(data) => {
+                            self.forward_to_websocket(&event);
+                            if data.backend == "nomi" && (data.status == "preparing" || data.status == "prepared") {
+                                self.persist_agent_status(data).await;
+                            }
+                        }
                         AgentStreamEvent::TurnCompleted(metrics) => {
                             // Accumulate this turn's token usage into the
                             // conversation's running total (only when this relay was
@@ -859,6 +865,53 @@ impl StreamRelay {
         };
         if let Err(e) = self.repo.insert_message(&row).await {
             error!(error = %ErrorChain(&e), "Failed to store error message");
+        }
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn persist_agent_status(&self, data: &nomifun_ai_agent::protocol::events::AgentStatusEventData) {
+        let id = format!("{}:agent_status:model_activity", self.msg_id);
+        let content = serde_json::to_string(data).unwrap_or_else(|_| "{}".to_owned());
+        let status = if data.status == "prepared" { "finish" } else { "work" };
+        let existing = self
+            .repo
+            .get_message_by_msg_id(self.conv_id(), &id, "agent_status")
+            .await
+            .unwrap_or(None);
+
+        if existing.is_some() {
+            let update = nomifun_db::MessageRowUpdate {
+                content: Some(content),
+                status: Some(Some(status.to_owned())),
+                hidden: Some(false),
+            };
+            if let Err(e) = self.repo.update_message(&id, &update).await {
+                error!(
+                    status = %data.status,
+                    error = %ErrorChain(&e),
+                    "Failed to update agent_status message"
+                );
+            }
+            return;
+        }
+
+        let row = MessageRow {
+            id: id.clone(),
+            conversation_id: self.conv_id(),
+            msg_id: Some(id),
+            r#type: "agent_status".into(),
+            content,
+            position: Some("left".into()),
+            status: Some(status.into()),
+            hidden: false,
+            created_at: now_ms(),
+        };
+        if let Err(e) = self.repo.insert_message(&row).await {
+            error!(
+                status = %data.status,
+                error = %ErrorChain(&e),
+                "Failed to persist agent_status message"
+            );
         }
     }
 
