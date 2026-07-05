@@ -556,6 +556,13 @@ impl RunEngine {
         );
     }
 
+    fn stop_registered_loop(&self, run_id: &str) {
+        if let Some((_, handle)) = self.handles.remove(run_id) {
+            handle.cancelled.store(true, Ordering::SeqCst);
+            handle.join.abort();
+        }
+    }
+
     /// Stop a run's loop: set the cooperative cancel flag, abort the task, and
     /// cancel any in-flight worker conversations so their turns end as
     /// `Finish(Cancelled)`.
@@ -574,10 +581,7 @@ impl RunEngine {
     /// this run's conversations are cancelled. Persisting `cancelled` is the
     /// service's job ([`RunService::cancel`](crate::run_service::RunService::cancel)).
     pub fn stop(&self, run_id: &str) {
-        if let Some((_, handle)) = self.handles.remove(run_id) {
-            handle.cancelled.store(true, Ordering::SeqCst);
-            handle.join.abort();
-        }
+        self.stop_registered_loop(run_id);
         // Cancel in-flight worker conversations for this run (detached + best
         // effort). Idempotent: if no task is running / no conversation is stamped
         // / no live agent exists, the canceller no-ops. Safe to run even when the
@@ -587,6 +591,15 @@ impl RunEngine {
         tokio::spawn(async move {
             cancel_in_flight_conversations(&deps, &run_id).await;
         });
+    }
+
+    /// Stop a run's loop and wait until in-flight worker cancellation has been
+    /// attempted. Use this before immediately rewriting `running` task rows (for
+    /// example, pause -> reset to `pending`); otherwise the detached `stop()` query
+    /// can race with the row rewrite and miss the worker conversation.
+    pub async fn stop_and_cancel_in_flight(&self, run_id: &str) {
+        self.stop_registered_loop(run_id);
+        cancel_in_flight_conversations(&self.deps, run_id).await;
     }
 
     /// Run-level stall watchdog (safety net): finalize runs stuck non-terminal with
@@ -1108,12 +1121,12 @@ async fn run_loop(
         }
 
         // (a') Paused gate (P3b): re-read the persisted run status each iteration.
-        // When `paused` the loop must NOT dispatch new workers — but it keeps
-        // processing any in-flight workers to completion (pause ≠ cancel). With
-        // no in-flight work it idle-waits (a short sleep, NOT a busy-spin) and
-        // re-checks, so a `resume` (status → `running`) is observed on the next
-        // iteration and filling resumes. A read error is treated as not-paused
-        // (fail-open: better to keep driving than to wedge on a transient error).
+        // The product pause route stops the loop and cancels live workers before
+        // resetting interrupted nodes. This gate remains defensive for a loop that
+        // observes `paused` through a direct state transition: it dispatches no new
+        // workers and idles when empty until `resume` flips the status to `running`.
+        // A read error is treated as not-paused (fail-open: better to keep driving
+        // than to wedge on a transient error).
         let status = match deps.run_repo.get_run(run_id).await {
             Ok(Some(r)) => Some(r.status),
             _ => None,

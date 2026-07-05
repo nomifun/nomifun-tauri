@@ -23,11 +23,11 @@ async fn stdio_npx_resolves_from_enhanced_process_path() {
         r#"#!/bin/sh
 while IFS= read -r line; do
   case "$line" in
-    *'"id":1'*)
-      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake-npx","version":"1.0.0"}}}'
+    *'"id":"1"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"1","result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake-npx","version":"1.0.0"}}}'
       ;;
-    *'"id":2'*)
-      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}'
+    *'"id":"2"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":"2","result":{"tools":[]}}'
       exit 0
       ;;
   esac

@@ -4,17 +4,19 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Dropdown, Menu, Spin } from '@arco-design/web-react';
-import { Brain, Comment, Down, Left, Redo, CheckOne, SettingOne } from '@icon-park/react';
+import { Brain, Comment, Down, Left, Redo, CheckOne } from '@icon-park/react';
 import { ipcBridge } from '@/common';
 import type { TChatConversation } from '@/common/config/storage';
+import type { TModelRef, TTaskConfigUpdate } from '@/common/types/orchestrator/orchestratorTypes';
 import type { OpenTaskPayload } from '@/renderer/pages/orchestrator/RunDetail/DagCanvas';
 import { memberShortLabel } from '@/renderer/pages/orchestrator/RunDetail/memberLabel';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 import { useOrchestration } from './OrchestrationContext';
-import NodePreconfigPanel from './NodePreconfigPanel';
+import NodeConfigBar from './NodeConfigBar';
+import NodePresetPill from './NodePresetPill';
 import RouteErrorBoundary from '@/renderer/components/layout/RouteErrorBoundary';
 import ReadOnlyConversationView from '@/renderer/pages/orchestrator/RunDetail/ReadOnlyConversationView';
 import styles from './projectedWorkerView.module.css';
@@ -59,7 +61,7 @@ const TOAST_ERR_MS = 2500;
  */
 const ProjectedWorkerView: React.FC<ProjectedWorkerViewProps> = ({ payload }) => {
   const { t } = useTranslation();
-  const { returnToMain, detail } = useOrchestration();
+  const { returnToMain, detail, refetch } = useOrchestration();
   const [message, msgCtx] = useArcoMessage();
 
   const { task: snapshotTask, runId } = payload;
@@ -103,12 +105,76 @@ const ProjectedWorkerView: React.FC<ProjectedWorkerViewProps> = ({ payload }) =>
   // model to take effect; a not-yet-started node simply picks it up at dispatch.
   const taskSettled = ['running', 'done', 'completed', 'failed', 'error'].includes(task.status);
 
-  // 启动前配置台 (迁移 026): a node that is NOT currently running can have its model
-  // + 预置要求 configured. A pending (no-conversation) node shows the panel as its
-  // body (applied at dispatch); a settled node shows it as a collapsible "重跑配置"
-  // above its transcript (applied on the next 重跑). A running node never shows it.
+  // 启动前配置 (迁移 026, 折叠进 composer): a node that is NOT currently running can
+  // have its model + 预置要求 configured. A settled node folds it INTO the reused
+  // worker composer (model write-through on the composer's own selector + a 预置要求
+  // pill in its toolbar); a pending node (no conversation) gets a NodeConfigBar with
+  // the same two pills. A running node never shows it.
   const canConfig = task.status !== 'running';
-  const [configOpen, setConfigOpen] = useState(false);
+
+  // ── 启动前配置 writes (迁移 026, 折叠进 composer) ─────────────────────────────
+  // `setTaskConfig` is a FULL replace, and the WS-driven `task` lags a just-committed
+  // write. Folding the config into a model write-through + a 预置要求 pill therefore
+  // risks a cross-field wipe: a second edit that merged the sibling field from the
+  // stale `task` would null the field the first edit just set. We close that window by
+  // merging EVERY write against this ref — updated SYNCHRONOUSLY before the awaited
+  // write — instead of the lagging `task`. Seeded from the node's current config;
+  // ProjectedWorkerView is remounted per node (key={task.id}) so this resets on switch.
+  const configRef = useRef<TTaskConfigUpdate>({
+    override_provider_id: task.override_provider_id,
+    override_model: task.override_model,
+    preset_prompt: task.preset_prompt,
+  });
+
+  // Persist a partial config patch, atomically merged with the node's other fields.
+  // Optimistically updates `configRef` first (so a rapid follow-up edit merges the
+  // just-set value), then writes the full triple and refetches the SAME useRunLive
+  // instance this view reads (context `refetch`) so `task` reflects the save. Rolls
+  // back the optimistic merge and rethrows on failure so callers can toast.
+  const applyNodeConfig = useCallback(
+    async (patch: Partial<TTaskConfigUpdate>) => {
+      const prev = configRef.current;
+      const next: TTaskConfigUpdate = { ...prev, ...patch };
+      configRef.current = next;
+      try {
+        await ipcBridge.orchestrator.runs.setTaskConfig.invoke({
+          run_id: runId,
+          task_id: task.id,
+          updates: {
+            override_provider_id: next.override_provider_id || undefined,
+            override_model: next.override_model || undefined,
+            preset_prompt: next.preset_prompt || undefined,
+          },
+        });
+        await refetch();
+      } catch (e) {
+        configRef.current = prev;
+        throw e;
+      }
+    },
+    [runId, task.id, refetch]
+  );
+
+  // The model write-through binding for the settled node's reused composer.
+  const nodeBinding = useMemo(
+    () => ({
+      applyModelOverride: (providerId: string, model: string) =>
+        applyNodeConfig({ override_provider_id: providerId, override_model: model }),
+    }),
+    [applyNodeConfig]
+  );
+
+  // Preset writer — shared by the settled composer pill and the pending config bar.
+  const applyPreset = useCallback(
+    (preset: string) => applyNodeConfig({ preset_prompt: preset || undefined }),
+    [applyNodeConfig]
+  );
+  // Model writer for the pending config bar (`null` = follow auto / clear override).
+  const applyModel = useCallback(
+    (ref: TModelRef | null) =>
+      applyNodeConfig({ override_provider_id: ref?.provider_id, override_model: ref?.model }),
+    [applyNodeConfig]
+  );
 
   // Reassign this node to a different fleet member (= a different model). The
   // backend only updates the assignment row — for a PENDING node the engine reads
@@ -342,76 +408,48 @@ const ProjectedWorkerView: React.FC<ProjectedWorkerViewProps> = ({ payload }) =>
         <RouteErrorBoundary>
           {conversationId === undefined ? (
             canConfig ? (
-            // Pending node — no worker conversation yet. The body IS the 启动前配置台
-            // (model override + 预置要求), applied automatically at dispatch. Own
-            // scroll container so it fills the pane and is fully reachable.
-            <div className='flex-1 min-h-0 overflow-y-auto'>
-              <NodePreconfigPanel runId={runId} task={task} settled={false} onSaved={payload.refetch} />
-            </div>
-          ) : (
-            <div className={styles.center}>
-              <span className={styles.emptyIcon}>
-                <Comment theme='outline' size='26' strokeWidth={3} />
-              </span>
-              <div className={styles.emptyTitle}>
-                {t('orchestrator.run.transcript.notStarted', { defaultValue: '该 agent 尚未开始' })}
-              </div>
-              <div className={styles.emptyHint}>
-                {t('orchestrator.run.transcript.noConversation', {
-                  defaultValue: '该节点还没有被 worker 接手,暂无可查看的会话记录。',
-                })}
-              </div>
-            </div>
-          )
-        ) : loading ? (
-          <Spin loading className='flex flex-1 items-center justify-center' />
-        ) : conversation ? (
-          // Settled node — an OPTIONAL collapsible 重跑配置 above the read-only
-          // transcript. Rendered as SIBLINGS of the flex-col `.body` (NO wrapper
-          // div) so ReadOnlyConversationView (NomiChat, `flex-1`) keeps filling the
-          // remaining height exactly as before — wrapping it in a plain block broke
-          // NomiChat's flex sizing (the composer floated to the top).
-          <>
-            {canConfig && (
-              <div className='shrink-0 border-b border-solid border-[var(--color-border-2)]'>
-                <div
-                  role='button'
-                  tabIndex={0}
-                  aria-expanded={configOpen}
-                  onClick={() => setConfigOpen((v) => !v)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      setConfigOpen((v) => !v);
-                    }
-                  }}
-                  className='flex cursor-pointer select-none items-center gap-6px px-16px py-9px text-12px font-600 text-[var(--color-text-2)] hover:text-[var(--color-text-1)]'
-                >
-                  <SettingOne theme='outline' size='13' strokeWidth={3} className='line-height-0 text-[rgb(var(--primary-6))]' />
-                  <span>{t('orchestrator.run.preconfig.rerunConfig', { defaultValue: '重跑配置（模型 / 预置要求）' })}</span>
-                  <Down
-                    theme='outline'
-                    size='12'
-                    strokeWidth={3}
-                    className={`line-height-0 transition-transform duration-150 ${configOpen ? 'rotate-180' : ''}`}
-                  />
+              // Pending node — no worker conversation yet. A composer-shaped config
+              // bar carries the same model + 预置要求 pills a settled node gets inside
+              // its real composer; applied automatically at dispatch.
+              <NodeConfigBar task={task} onApplyModel={applyModel} onApplyPreset={applyPreset} />
+            ) : (
+              <div className={styles.center}>
+                <span className={styles.emptyIcon}>
+                  <Comment theme='outline' size='26' strokeWidth={3} />
+                </span>
+                <div className={styles.emptyTitle}>
+                  {t('orchestrator.run.transcript.notStarted', { defaultValue: '该 agent 尚未开始' })}
                 </div>
-                {configOpen && (
-                  <div className='max-h-340px overflow-y-auto border-t border-solid border-[var(--color-border-2)]'>
-                    <NodePreconfigPanel runId={runId} task={task} settled onSaved={payload.refetch} />
-                  </div>
-                )}
+                <div className={styles.emptyHint}>
+                  {t('orchestrator.run.transcript.noConversation', {
+                    defaultValue: '该节点还没有被 worker 接手,暂无可查看的会话记录。',
+                  })}
+                </div>
               </div>
-            )}
-            <ReadOnlyConversationView conversation={conversation} agent_name={task.title} />
-          </>
-        ) : canConfig ? (
-          // A conversation id exists but the record couldn't load — still let the
-          // user configure this node instead of showing a blank body.
-          <div className='flex-1 min-h-0 overflow-y-auto'>
-            <NodePreconfigPanel runId={runId} task={task} settled onSaved={payload.refetch} />
-          </div>
-        ) : null}
+            )
+          ) : loading ? (
+            <Spin loading className='flex flex-1 items-center justify-center' />
+          ) : conversation ? (
+            // Settled node — the config folds INTO the worker's OWN composer: the
+            // model selector writes the per-node override through (nodeBinding), and
+            // the 预置要求 pill is injected into the composer toolbar (extraRightTools).
+            // No separate panel. ReadOnlyConversationView (NomiChat, flex-1) fills the
+            // pane exactly as before.
+            <ReadOnlyConversationView
+              conversation={conversation}
+              agent_name={task.title}
+              nodeBinding={canConfig ? nodeBinding : undefined}
+              extraRightTools={
+                canConfig ? (
+                  <NodePresetPill initialPreset={task.preset_prompt ?? ''} settled={taskSettled} onApply={applyPreset} />
+                ) : undefined
+              }
+            />
+          ) : canConfig ? (
+            // A conversation id exists but the record couldn't load — still let the
+            // user configure this node via the same bar instead of a blank body.
+            <NodeConfigBar task={task} onApplyModel={applyModel} onApplyPreset={applyPreset} />
+          ) : null}
         </RouteErrorBoundary>
       </div>
     </div>

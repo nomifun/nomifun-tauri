@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use nomifun_mcp::McpConnectionTestService;
 use nomifun_mcp::McpServerTransport;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 fn make_service() -> McpConnectionTestService {
     McpConnectionTestService::new(test_http_client())
@@ -167,6 +169,170 @@ async fn sse_401_returns_needs_auth() {
     assert!(result.www_authenticate.is_some());
 
     server_handle.abort();
+}
+
+#[tokio::test]
+async fn sse_connection_test_uses_string_jsonrpc_ids() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (event_tx, event_rx) = mpsc::unbounded_channel::<String>();
+
+    let server_handle = tokio::spawn(async move {
+        let mut event_rx = Some(event_rx);
+        while let Ok((stream, _)) = listener.accept().await {
+            let event_tx = event_tx.clone();
+            let rx = event_rx.take();
+            tokio::spawn(async move {
+                let _ = handle_string_id_sse_connection(stream, event_tx, rx).await;
+            });
+        }
+    });
+
+    let svc = make_service_with_timeout(Duration::from_secs(5));
+    let transport = McpServerTransport::Sse {
+        url: format!("http://{}/sse", addr),
+        headers: HashMap::new(),
+    };
+
+    let result = svc.test_connection("string-id-sse", &transport).await;
+
+    assert!(result.success, "expected string-id SSE server to connect: {result:?}");
+    let tools = result.tools.unwrap();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "strict_string_id_tool");
+
+    server_handle.abort();
+}
+
+async fn handle_string_id_sse_connection(
+    mut stream: tokio::net::TcpStream,
+    event_tx: mpsc::UnboundedSender<String>,
+    event_rx: Option<mpsc::UnboundedReceiver<String>>,
+) -> std::io::Result<()> {
+    let (request, body) = read_http_request(&mut stream).await?;
+    if request.starts_with("GET /sse ") {
+        let mut event_rx = event_rx.expect("SSE GET should be the first connection");
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\n\r\n",
+            )
+            .await?;
+        stream
+            .write_all(b"event: endpoint\ndata: /messages\n\n")
+            .await?;
+        stream.flush().await?;
+        while let Some(message) = event_rx.recv().await {
+            stream
+                .write_all(format!("event: message\ndata: {message}\n\n").as_bytes())
+                .await?;
+            stream.flush().await?;
+        }
+        return Ok(());
+    }
+
+    if request.starts_with("POST /messages ") {
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let method = body["method"].as_str().unwrap_or_default();
+        match method {
+            "initialize" | "tools/list" => {
+                let Some(id) = body["id"].as_str() else {
+                    write_http_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        "Bad request: id expected a string",
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                let response = match method {
+                    "initialize" => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {},
+                            "serverInfo": { "name": "strict-string-id", "version": "1.0.0" }
+                        }
+                    }),
+                    _ => serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "tools": [
+                                { "name": "strict_string_id_tool", "description": "Requires string JSON-RPC ids" }
+                            ]
+                        }
+                    }),
+                };
+                event_tx.send(response.to_string()).unwrap();
+                write_http_response(&mut stream, "202 Accepted", "").await?;
+            }
+            "notifications/initialized" => {
+                write_http_response(&mut stream, "202 Accepted", "").await?;
+            }
+            _ => {
+                write_http_response(&mut stream, "400 Bad Request", "unknown method").await?;
+            }
+        }
+        return Ok(());
+    }
+
+    write_http_response(&mut stream, "404 Not Found", "").await
+}
+
+async fn read_http_request(stream: &mut tokio::net::TcpStream) -> std::io::Result<(String, Vec<u8>)> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    let header_end = loop {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed before headers",
+            ));
+        }
+        buffer.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = find_header_end(&buffer) {
+            break pos;
+        }
+    };
+
+    let header = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+    let content_length = header
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:").or_else(|| line.strip_prefix("Content-Length:")))
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+
+    let body_start = header_end + 4;
+    let mut body = buffer[body_start..].to_vec();
+    while body.len() < content_length {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..n]);
+    }
+    body.truncate(content_length);
+
+    Ok((header, body))
+}
+
+fn find_header_end(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+async fn write_http_response(
+    stream: &mut tokio::net::TcpStream,
+    status: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    let response = format!(
+        "HTTP/1.1 {status}\r\ncontent-length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await
 }
 
 // ---------------------------------------------------------------------------

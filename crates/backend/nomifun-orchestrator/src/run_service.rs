@@ -565,18 +565,15 @@ impl RunService {
         self.transition(run_id, &["awaiting_plan_approval"], "running").await
     }
 
-    /// Pause a `running` run: `running` → `paused` + emit. The engine's persistent
-    /// loop keeps running but stops filling new workers (it re-reads the run status
-    /// each iteration); any in-flight workers run to completion. Pause does NOT
-    /// cancel in-flight work (that is `cancel`). A run not `running` is a 400.
+    /// Pause a `running` run: `running` -> `paused` + emit. This service only
+    /// mutates persisted run state; the route owns stopping the engine and
+    /// resetting interrupted nodes to `pending`. A run not `running` is a 400.
     pub async fn pause(&self, run_id: &str) -> Result<(), AppError> {
         self.transition(run_id, &["running"], "paused").await
     }
 
-    /// Resume a `paused` run: `paused` → `running` + emit. The caller (route) then
-    /// `engine.start`s the loop (idempotent stop-then-start): if the loop was still
-    /// alive idling on the paused gate it resumes filling on its next iteration; if
-    /// it had exited, `start` respawns it. A run not `paused` is a 400.
+    /// Resume a `paused` run: `paused` -> `running` + emit. The route owns the
+    /// engine lifecycle after this transition. A run not `paused` is a 400.
     pub async fn resume(&self, run_id: &str) -> Result<(), AppError> {
         self.transition(run_id, &["paused"], "running").await
     }
@@ -1176,11 +1173,25 @@ impl RunService {
     /// rerun proceed (the rerun guard rejects a `running` target). Kind-aware; no
     /// emit (the caller's rerun emits + the route's refetch reload all task states).
     pub async fn reset_orphaned_running(&self, run_id: &str) -> Result<u64, AppError> {
+        let running_task_ids: Vec<String> = self
+            .run_repo
+            .list_tasks(run_id)
+            .await
+            .map_err(OrchestratorError::from)?
+            .into_iter()
+            .filter(|t| t.status == "running")
+            .map(|t| t.id)
+            .collect();
         let n = self
             .run_repo
             .reset_orphaned_running_tasks(Some(run_id))
             .await
             .map_err(OrchestratorError::from)?;
+        if n > 0 {
+            for task_id in running_task_ids {
+                self.emitter.emit_task_status(run_id, &task_id, "pending");
+            }
+        }
         Ok(n)
     }
 
