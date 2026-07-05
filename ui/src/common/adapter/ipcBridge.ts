@@ -3569,6 +3569,16 @@ export interface IKnowledgeFileEntry {
   modified_at: number | null;
 }
 
+export interface IKnowledgeTreeEntry {
+  name: string;
+  rel_path: string;
+  is_dir: boolean;
+  is_file: boolean;
+  size?: number;
+  modified_at: number | null;
+  children?: IKnowledgeTreeEntry[];
+}
+
 export interface IKnowledgeFileContent {
   rel_path: string;
   content: string;
@@ -3824,6 +3834,10 @@ export const knowledge = {
     (p) => `/api/knowledge/bases/${p.id}${p.purge ? '?purge=true' : ''}`
   ),
   listFiles: httpGet<IKnowledgeFileEntry[], { id: string }>((p) => `/api/knowledge/bases/${p.id}/files`, { timeoutMs: KB_READ_TIMEOUT_MS }),
+  listTree: httpGet<IKnowledgeTreeEntry[], { id: string; path?: string }>(
+    (p) => `/api/knowledge/bases/${p.id}/tree${p.path ? `?path=${encodeURIComponent(p.path)}` : ''}`,
+    { timeoutMs: KB_READ_TIMEOUT_MS }
+  ),
   readFile: httpGet<IKnowledgeFileContent, { id: string; path: string }>(
     (p) => `/api/knowledge/bases/${p.id}/file?path=${encodeURIComponent(p.path)}`,
     { timeoutMs: KB_READ_TIMEOUT_MS }

@@ -148,6 +148,19 @@ pub struct KbFileEntry {
     pub modified_at: Option<TimestampMs>,
 }
 
+/// One immediate child in the knowledge-base document tree. Directories are
+/// browse-only; files are markdown documents that can be read/edited.
+#[derive(Debug, Clone, Serialize)]
+pub struct KbTreeEntry {
+    pub name: String,
+    pub rel_path: String,
+    pub is_dir: bool,
+    pub is_file: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    pub modified_at: Option<TimestampMs>,
+}
+
 /// Content payload for a single file read.
 #[derive(Debug, Clone, Serialize)]
 pub struct KbFileContent {
@@ -1162,6 +1175,16 @@ impl KnowledgeService {
         // Bounded so a slow/stale NAS root degrades to an empty listing instead
         // of hanging the detail view (and the agent write-path collision check).
         Ok(bounded_blocking(BASE_WALK_BUDGET, Vec::new(), move || list_md_files(&root)).await)
+    }
+
+    pub async fn list_tree(&self, id: &str, rel_path: &str) -> Result<Vec<KbTreeEntry>, AppError> {
+        let row = self.require_base(id).await?;
+        let root = PathBuf::from(&row.root_path);
+        let rel_path = normalize_tree_rel_path(rel_path)?;
+        Ok(bounded_blocking(BASE_WALK_BUDGET, Ok(Vec::new()), move || {
+            list_tree_level(&root, &rel_path)
+        })
+        .await?)
     }
 
     pub async fn read_file(&self, id: &str, rel_path: &str) -> Result<KbFileContent, AppError> {
@@ -2992,6 +3015,120 @@ fn safe_md_path(root: &Path, rel_path: &str) -> Result<PathBuf, AppError> {
     Ok(root.join(rel))
 }
 
+fn is_excluded_tree_dir_name(name: &str) -> bool {
+    name.starts_with('.') || name == "node_modules" || name == KB_INBOX_REL_DIR
+}
+
+fn looks_like_windows_drive_prefix(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.len() == 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
+}
+
+fn normalize_tree_rel_path(rel_path: &str) -> Result<String, AppError> {
+    let normalized = rel_path.trim().replace('\\', "/");
+    let trimmed = normalized.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut segments = Vec::new();
+    for segment in trimmed.split('/') {
+        if segment.is_empty()
+            || segment == "."
+            || segment == ".."
+            || looks_like_windows_drive_prefix(segment)
+        {
+            return Err(AppError::BadRequest(format!("invalid path: {rel_path}")));
+        }
+        if is_excluded_tree_dir_name(segment) {
+            return Err(AppError::BadRequest(format!(
+                "directory is excluded: {segment}"
+            )));
+        }
+        segments.push(segment);
+    }
+    Ok(segments.join("/"))
+}
+
+fn join_tree_rel_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+fn list_tree_level(root: &Path, rel_path: &str) -> Result<Vec<KbTreeEntry>, AppError> {
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let dir = if rel_path.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(rel_path)
+    };
+    let meta = match std::fs::symlink_metadata(&dir) {
+        Ok(meta) => meta,
+        Err(_) => return Ok(Vec::new()),
+    };
+    if !meta.file_type().is_dir() {
+        return Err(AppError::NotFound(format!(
+            "directory not found: {rel_path}"
+        )));
+    }
+
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) => return Err(AppError::Internal(format!("failed to read directory: {e}"))),
+    };
+
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let child_rel = join_tree_rel_path(rel_path, &name);
+        if file_type.is_dir() {
+            if is_excluded_tree_dir_name(&name) {
+                continue;
+            }
+            out.push(KbTreeEntry {
+                name,
+                rel_path: child_rel,
+                is_dir: true,
+                is_file: false,
+                size: None,
+                modified_at: None,
+            });
+            continue;
+        }
+        if file_type.is_file() && is_md(&entry.path()) {
+            let meta = entry.metadata().ok();
+            out.push(KbTreeEntry {
+                name,
+                rel_path: child_rel,
+                is_dir: false,
+                is_file: true,
+                size: meta.as_ref().map(|m| m.len()),
+                modified_at: meta.as_ref().and_then(modified_ms),
+            });
+        }
+    }
+
+    out.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(out)
+}
+
 /// Sanitize a base name into a directory-safe mount link name, deduplicating
 /// collisions (with other mounts AND with the platform-managed companion
 /// files inside the mount root, e.g. a base literally named `README.md`)
@@ -3812,6 +3949,58 @@ mod tests {
             vec!["note.md", "sub/real.md"],
             "dot-dir files must not appear in the document listing"
         );
+    }
+
+    #[tokio::test]
+    async fn tree_listing_shows_real_dirs_and_markdown_files_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join("raw")).unwrap();
+        std::fs::create_dir_all(vault.join("empty")).unwrap();
+        std::fs::create_dir_all(vault.join("assets")).unwrap();
+        std::fs::create_dir_all(vault.join("_inbox/conv_x")).unwrap();
+        std::fs::create_dir_all(vault.join(".obsidian")).unwrap();
+        std::fs::create_dir_all(vault.join("node_modules/pkg")).unwrap();
+        std::fs::write(vault.join("README.md"), "# Root").unwrap();
+        std::fs::write(vault.join("raw/python3-type-conversion.md"), "# Types").unwrap();
+        std::fs::write(vault.join("assets/logo.png"), "png").unwrap();
+        std::fs::write(vault.join("_inbox/conv_x/draft.md"), "# Draft").unwrap();
+        std::fs::write(vault.join(".obsidian/workspace.md"), "# Tooling").unwrap();
+        std::fs::write(vault.join("node_modules/pkg/readme.md"), "# Package").unwrap();
+
+        let info = service
+            .create_base("vault", "", Some(vault.to_str().unwrap()), None)
+            .await
+            .unwrap();
+
+        let root = service.list_tree(&info.id, "").await.unwrap();
+        let root_names: Vec<(&str, bool, bool)> = root
+            .iter()
+            .map(|entry| (entry.name.as_str(), entry.is_dir, entry.is_file))
+            .collect();
+        assert_eq!(
+            root_names,
+            vec![
+                ("assets", true, false),
+                ("empty", true, false),
+                ("raw", true, false),
+                ("README.md", false, true),
+            ]
+        );
+
+        let raw = service.list_tree(&info.id, "raw").await.unwrap();
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].rel_path, "raw/python3-type-conversion.md");
+        assert!(raw[0].is_file);
+
+        let empty = service.list_tree(&info.id, "empty").await.unwrap();
+        assert!(
+            empty.is_empty(),
+            "empty folders should be expandable but list no children"
+        );
+        assert!(service.list_tree(&info.id, "../escape").await.is_err());
     }
 
     /// The per-base walk must be bounded: a walk that finishes within budget

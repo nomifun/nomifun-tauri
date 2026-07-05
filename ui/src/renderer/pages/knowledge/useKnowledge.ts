@@ -15,6 +15,7 @@ import type {
   IKnowledgeInboxEntry,
   IKnowledgeSource,
   IKnowledgeSourceFetchSummary,
+  IKnowledgeTreeEntry,
 } from '@/common/adapter/ipcBridge';
 import type { I18nKey } from '@/renderer/services/i18n';
 
@@ -56,6 +57,7 @@ export function useKnowledgeBases() {
 export function useKnowledgeBase(id: string | undefined) {
   const [base, setBase] = useState<IKnowledgeBase | null>(null);
   const [files, setFiles] = useState<IKnowledgeFileEntry[]>([]);
+  const [tree, setTree] = useState<IKnowledgeTreeEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -63,12 +65,14 @@ export function useKnowledgeBase(id: string | undefined) {
     if (!id) return;
     setLoading(true);
     try {
-      const [info, list] = await Promise.all([
+      const [info, list, treeRoot] = await Promise.all([
         ipcBridge.knowledge.getBase.invoke({ id }),
         ipcBridge.knowledge.listFiles.invoke({ id }),
+        ipcBridge.knowledge.listTree.invoke({ id }),
       ]);
       setBase(info);
       setFiles(list);
+      setTree(treeRoot);
       setError(null);
     } catch (e) {
       console.error('Failed to load knowledge base', e);
@@ -92,7 +96,7 @@ export function useKnowledgeBase(id: string | undefined) {
     return () => unsub();
   }, [id, refresh]);
 
-  return { base, files, loading, error, refresh };
+  return { base, files, tree, loading, error, refresh };
 }
 
 /**

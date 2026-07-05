@@ -35,11 +35,13 @@ import {
   Spin,
   Tabs,
   Tag,
+  Tree,
 } from '@arco-design/web-react';
 import {
   ApiApp,
   Earth,
   EditTwo,
+  FileText,
   FolderOpen,
   Left,
   LinkCloud,
@@ -53,7 +55,7 @@ import {
   SettingTwo,
   Upload,
 } from '@icon-park/react';
-import type { IKnowledgeBase, IKnowledgeTag } from '@/common/adapter/ipcBridge';
+import type { IKnowledgeBase, IKnowledgeTag, IKnowledgeTreeEntry } from '@/common/adapter/ipcBridge';
 import Markdown from '@renderer/components/Markdown';
 import { useLayoutContext } from '@renderer/hooks/context/LayoutContext';
 import { ipcBridge } from '@/common';
@@ -73,6 +75,12 @@ import KnowledgeConnectorDrawer from '../KnowledgeConnectorDrawer';
 import KnowledgeConsumersSection from '../KnowledgeConsumersSection';
 import TagPicker from '../CreateStudio/TagPicker';
 import { FEISHU_KNOWLEDGE_CREATION_ENABLED } from '../CreateStudio/sourceTypes';
+import {
+  buildKnowledgeSearchTree,
+  mergeKnowledgeTreeChildren,
+  parentDirOfKnowledgePath,
+  preserveKnowledgeTreeChildren,
+} from './treeModel';
 
 // ─── Tab keys (maps to ?tab= query values) ─────────────────────────────────────
 
@@ -152,6 +160,19 @@ function DetailKindIcon({ kind, config }: { kind: IKnowledgeBase['kind']; config
       {kind === 'blank' && <EditTwo {...iconProps} />}
     </div>
   );
+}
+
+function collectKnowledgeDirKeys(nodes: IKnowledgeTreeEntry[]): string[] {
+  const keys: string[] = [];
+  const visit = (items: IKnowledgeTreeEntry[]) => {
+    for (const item of items) {
+      if (!item.is_dir) continue;
+      keys.push(item.rel_path);
+      if (item.children?.length) visit(item.children);
+    }
+  };
+  visit(nodes);
+  return keys;
 }
 
 // ─── Settings Tab (D5) ────────────────────────────────────────────────────────
@@ -460,7 +481,7 @@ const KnowledgeDetailPage: React.FC = () => {
   const isMobile = layout?.isMobile ?? false;
 
   // ─── Data hooks ─────────────────────────────────────────────────────────────
-  const { base, files, loading, error, refresh } = useKnowledgeBase(id);
+  const { base, files, tree, loading, error, refresh } = useKnowledgeBase(id);
   const { items: inboxItems, loading: inboxLoading, refresh: refreshInbox } = useKnowledgeInbox(id);
   const { choice: modelChoice, setChoice: setModelChoice } = useKnowledgeAutogenModel();
   const { tags: allTags, createTag } = useKnowledgeTags();
@@ -501,14 +522,23 @@ const KnowledgeDetailPage: React.FC = () => {
   const [autogenLoading, setAutogenLoading] = useState(false);
   const [refreshingSource, setRefreshingSource] = useState(false);
   const [connectorVisible, setConnectorVisible] = useState(false);
+  const [treeData, setTreeData] = useState<IKnowledgeTreeEntry[]>([]);
+  const [expandedTreeKeys, setExpandedTreeKeys] = useState<string[]>([]);
+  const [selectedFolderPath, setSelectedFolderPath] = useState('');
+  const [selectedTreeKey, setSelectedTreeKey] = useState<string | null>(null);
 
   const handleConnectorOpen = useCallback(() => {
     if (!FEISHU_KNOWLEDGE_CREATION_ENABLED) return;
     setConnectorVisible(true);
   }, []);
   const [fileSearch, setFileSearch] = useState('');
+  const isTreeSearch = fileSearch.trim().length > 0;
 
   const source = getBaseSource(base);
+
+  useEffect(() => {
+    setTreeData((prev) => preserveKnowledgeTreeChildren(tree, prev));
+  }, [tree]);
 
   const handleInboxChanged = () => {
     void refresh();
@@ -519,9 +549,12 @@ const KnowledgeDetailPage: React.FC = () => {
   useEffect(() => {
     if (!selectedPath && files.length > 0) {
       setSelectedPath(files[0].rel_path);
+      setSelectedTreeKey(files[0].rel_path);
     }
     if (selectedPath && !files.some((f) => f.rel_path === selectedPath)) {
-      setSelectedPath(files.length > 0 ? files[0].rel_path : null);
+      const nextPath = files.length > 0 ? files[0].rel_path : null;
+      setSelectedPath(nextPath);
+      setSelectedTreeKey(nextPath);
     }
   }, [files, selectedPath]);
 
@@ -532,6 +565,9 @@ const KnowledgeDetailPage: React.FC = () => {
   useEffect(() => {
     setFileSearch('');
     setEditMode(false);
+    setExpandedTreeKeys([]);
+    setSelectedFolderPath('');
+    setSelectedTreeKey(null);
   }, [id]);
 
   // Load file content
@@ -580,17 +616,52 @@ const KnowledgeDetailPage: React.FC = () => {
     }
   };
 
+  const refreshTreeBranch = useCallback(
+    async (folderPath: string) => {
+      if (!id || isTreeSearch) return;
+      const children = await ipcBridge.knowledge.listTree.invoke({ id, path: folderPath || undefined });
+      if (folderPath) {
+        setTreeData((prev) => mergeKnowledgeTreeChildren(prev, folderPath, children));
+      } else {
+        setTreeData(children);
+      }
+    },
+    [id, isTreeSearch]
+  );
+
+  const handleLoadTreeChildren = useCallback(
+    async (node: IKnowledgeTreeEntry) => {
+      if (!id || node.is_file || isTreeSearch) return;
+      const children = await ipcBridge.knowledge.listTree.invoke({ id, path: node.rel_path });
+      setTreeData((prev) => mergeKnowledgeTreeChildren(prev, node.rel_path, children));
+    },
+    [id, isTreeSearch]
+  );
+
+  const openNewFileModal = () => {
+    const folder = selectedFolderPath || parentDirOfKnowledgePath(selectedPath);
+    setNewFilePath(folder ? `${folder}/` : '');
+    setNewFileVisible(true);
+  };
+
   const handleCreateFile = async () => {
     if (!id) return;
     let path = newFilePath.trim();
     if (!path) return;
     if (!path.toLowerCase().endsWith('.md')) path = `${path}.md`;
+    const parent = parentDirOfKnowledgePath(path);
+    const fileTitle = path.split('/').filter(Boolean).at(-1)?.replace(/\.md$/i, '') || path.replace(/\.md$/i, '');
     try {
-      await ipcBridge.knowledge.writeFile.invoke({ id, path, content: `# ${path.replace(/\.md$/i, '')}\n` });
+      await ipcBridge.knowledge.writeFile.invoke({ id, path, content: `# ${fileTitle}\n` });
       setNewFileVisible(false);
       setNewFilePath('');
       await refresh();
+      await refreshTreeBranch(parent);
+      if (parent) {
+        setExpandedTreeKeys((prev) => [...new Set([...prev, parent])]);
+      }
       setSelectedPath(path);
+      setSelectedTreeKey(path);
       Message.success(t('knowledge.actions.createOk'));
     } catch (e) {
       Message.error(String(e));
@@ -599,11 +670,16 @@ const KnowledgeDetailPage: React.FC = () => {
 
   const handleDeleteFile = async (path: string) => {
     if (!id) return;
+    const parent = parentDirOfKnowledgePath(path);
     try {
       await ipcBridge.knowledge.deleteFile.invoke({ id, path });
       Message.success(t('knowledge.actions.deleteOk'));
-      if (selectedPath === path) setSelectedPath(null);
-      void refresh();
+      if (selectedPath === path) {
+        setSelectedPath(null);
+        setSelectedTreeKey(parent || null);
+      }
+      await refresh();
+      await refreshTreeBranch(parent);
     } catch (e) {
       Message.error(String(e));
     }
@@ -652,12 +728,14 @@ const KnowledgeDetailPage: React.FC = () => {
   const kindConfig = base ? getKindConfig(base.kind, t) : null;
   const pendingCount = base?.pending_inbox ?? inboxItems.length;
 
-  // Filtered file list for search
-  const filteredFiles = useMemo(() => {
-    if (!fileSearch.trim()) return files;
-    const q = fileSearch.toLowerCase().trim();
-    return files.filter((f) => f.rel_path.toLowerCase().includes(q));
-  }, [files, fileSearch]);
+  const displayedTreeData = useMemo(
+    () => (isTreeSearch ? buildKnowledgeSearchTree(files, fileSearch) : treeData),
+    [files, fileSearch, isTreeSearch, treeData]
+  );
+  const visibleTreeExpandedKeys = useMemo(
+    () => (isTreeSearch ? collectKnowledgeDirKeys(displayedTreeData) : expandedTreeKeys),
+    [displayedTreeData, expandedTreeKeys, isTreeSearch]
+  );
 
   // Build breadcrumb segments from selected path
   const breadcrumbSegments = useMemo(() => {
@@ -864,7 +942,7 @@ const KnowledgeDetailPage: React.FC = () => {
                 {/* File tree */}
                 <div className='flex-1 overflow-y-auto'>
                   <Spin loading={loading} className='w-full'>
-                    {filteredFiles.length === 0 ? (
+                    {displayedTreeData.length === 0 ? (
                       <Empty
                         description={
                           fileSearch.trim()
@@ -874,39 +952,75 @@ const KnowledgeDetailPage: React.FC = () => {
                         className='mt-32px'
                       />
                     ) : (
-                      <div className='flex flex-col gap-2px'>
-                        {filteredFiles.map((f) => (
-                          <div
-                            key={f.rel_path}
-                            className={classNames(
-                              'group flex items-center justify-between gap-6px px-8px py-6px rd-7px cursor-pointer text-13px',
-                              selectedPath === f.rel_path
-                                ? '!bg-primary-1 !text-primary-6 font-600'
-                                : 'hover:bg-fill-2 text-[var(--color-text-2)]'
-                            )}
-                            onClick={() => setSelectedPath(f.rel_path)}
-                          >
-                            <span className='truncate' title={f.rel_path}>
-                              {/* Show only filename for brevity; full path on hover via title */}
-                              {f.rel_path.split('/').pop()}
-                            </span>
-                            <Popconfirm
-                              title={t('knowledge.actions.deleteFileConfirm')}
-                              onOk={() => handleDeleteFile(f.rel_path)}
-                            >
-                              <Button
-                                size='mini'
-                                status='danger'
-                                type='text'
-                                className='!hidden group-hover:!inline-flex shrink-0'
-                                onClick={(e) => e.stopPropagation()}
-                              >
-                                {t('knowledge.actions.delete')}
-                              </Button>
-                            </Popconfirm>
-                          </div>
-                        ))}
-                      </div>
+                      <Tree
+                        className='knowledge-doc-tree text-13px'
+                        showLine
+                        actionOnClick={['select', 'expand']}
+                        selectedKeys={selectedTreeKey ? [selectedTreeKey] : []}
+                        expandedKeys={visibleTreeExpandedKeys}
+                        treeData={displayedTreeData}
+                        fieldNames={{
+                          children: 'children',
+                          title: 'name',
+                          key: 'rel_path',
+                          isLeaf: 'is_file',
+                        }}
+                        onSelect={(_keys, extra) => {
+                          const dataRef = (extra?.node as { props?: { dataRef?: IKnowledgeTreeEntry } } | undefined)
+                            ?.props?.dataRef;
+                          if (!dataRef) return;
+                          setSelectedTreeKey(dataRef.rel_path);
+                          if (dataRef.is_file) {
+                            setSelectedPath(dataRef.rel_path);
+                            setSelectedFolderPath(parentDirOfKnowledgePath(dataRef.rel_path));
+                          } else {
+                            setSelectedFolderPath(dataRef.rel_path);
+                          }
+                        }}
+                        onExpand={(keys) => {
+                          if (!isTreeSearch) setExpandedTreeKeys(keys.map(String));
+                        }}
+                        loadMore={(treeNode) => {
+                          const dataRef = (treeNode.props as { dataRef?: IKnowledgeTreeEntry }).dataRef;
+                          if (!dataRef || dataRef.is_file || isTreeSearch) return Promise.resolve();
+                          return handleLoadTreeChildren(dataRef).catch((e: unknown) => {
+                            Message.error(String(e));
+                          });
+                        }}
+                        renderTitle={(node) => {
+                          const item = node.dataRef as IKnowledgeTreeEntry;
+                          return (
+                            <div className='group flex min-w-0 items-center justify-between gap-6px pr-4px'>
+                              <span className='flex min-w-0 items-center gap-5px'>
+                                {item.is_dir ? (
+                                  <FolderOpen theme='outline' size='13' className='shrink-0 text-[var(--color-text-3)]' />
+                                ) : (
+                                  <FileText theme='outline' size='13' className='shrink-0 text-[var(--color-text-3)]' />
+                                )}
+                                <span className='truncate' title={item.rel_path}>
+                                  {node.title}
+                                </span>
+                              </span>
+                              {item.is_file && (
+                                <Popconfirm
+                                  title={t('knowledge.actions.deleteFileConfirm')}
+                                  onOk={() => handleDeleteFile(item.rel_path)}
+                                >
+                                  <Button
+                                    size='mini'
+                                    status='danger'
+                                    type='text'
+                                    className='!hidden group-hover:!inline-flex shrink-0'
+                                    onClick={(e) => e.stopPropagation()}
+                                  >
+                                    {t('knowledge.actions.delete')}
+                                  </Button>
+                                </Popconfirm>
+                              )}
+                            </div>
+                          );
+                        }}
+                      />
                     )}
                   </Spin>
                 </div>
@@ -916,7 +1030,7 @@ const KnowledgeDetailPage: React.FC = () => {
                   <button
                     type='button'
                     className='knowledge-doc-action inline-flex min-w-0 appearance-none items-center justify-center gap-5px rounded-8px border-none bg-transparent px-10px py-7px font-[inherit] text-12px font-500 text-[var(--color-text-2)] cursor-pointer transition-colors hover:bg-[var(--color-fill-3)] hover:text-[var(--color-text-1)] focus-visible:outline-none focus-visible:bg-[var(--color-fill-3)] focus-visible:text-[var(--color-text-1)]'
-                    onClick={() => setNewFileVisible(true)}
+                    onClick={openNewFileModal}
                   >
                     <Plus theme='outline' size='12' />
                     <span className='truncate'>{t('knowledge.detail.docs.newFile', { defaultValue: '新建文档' })}</span>
