@@ -65,14 +65,14 @@ const HeaderControl: React.FC<{
  * and 编排画布 views (and rendered exactly once). There is ALWAYS a meaningful
  * primary control visible — the header never collapses to "no buttons":
  *  - `awaiting_plan_approval` → approve (primary);
- *  - `running` → pause (+ a read-only 「进行中 N · 排空中」draining badge);
- *  - `paused` → resume (+ the same draining badge while in-flight workers drain);
+ *  - `running` → pause (+ a read-only 「进行中 N」live-worker badge);
+ *  - `paused` → resume;
  *  - `planning` / `''` (detail not yet loaded) → a disabled busy「规划中…」placeholder;
  *  - terminal (`completed`/`failed`/`cancelled`) → replan is the primary「再来一次」;
  *  - any non-terminal run → confirm-guarded cancel.
  * `replan` is rendered in every state. Each action calls its REST endpoint,
  * toasts via {@link useArcoMessage}, then refetches. `inFlightCount` is the number
- * of `running` worker tasks (from `detail.tasks`), used for the draining badge.
+ * of `running` worker tasks (from `detail.tasks`), used for the active-run badge.
  */
 export const RunControls: React.FC<{
   runId: string;
@@ -93,9 +93,8 @@ export const RunControls: React.FC<{
   // `planning` (fleet still building the graph) and `''` (detail not yet loaded) both
   // render a disabled busy placeholder so the header always shows a primary control.
   const isBusyPlaceholder = status === 'planning' || status === '';
-  // Draining badge: workers still in flight in a run that is running or (still) paused.
-  const showDraining =
-    (status === 'running' || status === 'paused') && typeof inFlightCount === 'number' && inFlightCount > 0;
+  // Active-run badge: pause now cancels in-flight workers instead of draining them.
+  const showDraining = status === 'running' && typeof inFlightCount === 'number' && inFlightCount > 0;
 
   const run = useCallback(
     async (
@@ -172,7 +171,7 @@ export const RunControls: React.FC<{
       )}
       {showDraining && (
         // Read-only status badge (NOT a HeaderControl) — mirrors the status pill so it
-        // can't be mis-clicked. Signals in-flight workers still draining after pause.
+        // can't be mis-clicked. Signals the run currently has live workers.
         <span className='inline-flex items-center gap-4px rd-8px px-8px h-30px text-11px font-500 text-t-secondary border border-b-base'>
           <Loading theme='outline' size='12' strokeWidth={3} className='animate-spin line-height-0' />
           {t('orchestrator.run.detail.draining', { count: inFlightCount })}

@@ -454,28 +454,24 @@ async fn approve_run(
     Ok(Json(ApiResponse::success()))
 }
 
-/// Pause a `running` run: `running` → `paused`. The engine's persistent loop
-/// observes the paused status and stops dispatching new workers (in-flight
-/// workers run to completion). No engine call needed — the loop self-gates.
+/// Pause a `running` run: `running` -> `paused`, stop any live loop, cancel its
+/// in-flight worker conversations, then reset interrupted nodes to `pending` so
+/// resume re-dispatches them instead of letting background work keep running.
 async fn pause_run(
     State(state): State<OrchestratorRouterState>,
     Extension(_user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     state.run_service.pause(&id).await?;
+    state.engine.stop_and_cancel_in_flight(&id).await;
+    state.run_service.reset_orphaned_running(&id).await?;
     Ok(Json(ApiResponse::success()))
 }
 
-/// Resume a `paused` run: `paused` → `running`. A paused run loop stays ALIVE
-/// (it idles on the paused gate, re-reading the run status each tick), so once
-/// the service flips the status back to `running` the loop self-resumes filling
-/// on its next iteration — no engine restart is needed. We therefore only
-/// `engine.start` when the loop is NOT already running (i.e. it actually exited,
-/// e.g. after a process restart / boot before `resume_persisted_runs` re-armed
-/// it). **Critically, an unconditional `engine.start` would `stop()` first,
-/// cancelling every in-flight worker conversation — destroying the live work
-/// that pause was meant to let finish (at cap=1 that is the standard pause
-/// state). The `!is_running` gate avoids that destructive restart.**
+/// Resume a `paused` run: `paused` -> `running`. The normal pause route stops the
+/// loop, so resume starts a fresh driver. The `!is_running` guard also preserves
+/// defensive compatibility with any older/directly-paused loop that is still
+/// alive and can self-resume after the status flip.
 async fn resume_run(
     State(state): State<OrchestratorRouterState>,
     Extension(_user): Extension<CurrentUser>,
@@ -1633,11 +1629,9 @@ mod tests {
             .expect("request");
         assert_ne!(resp.status(), StatusCode::OK);
     }
-    // worker. At cap=1, pausing a run with one live worker is the standard pause
-    // state; the buggy resume_run called `engine.start` UNCONDITIONALLY, whose
-    // `stop()` cancels every in-flight worker conversation — destroying the live
-    // work that pause was meant to let finish. This test hits the REAL resume
-    // route handler, so it is RED before the `!is_running` gate and GREEN after.
+    // worker. At cap=1, pausing a run with one live worker must stop that worker,
+    // reset the node to pending, and leave the run paused. Resume then starts a
+    // fresh worker for the same node.
     // -------------------------------------------------------------------------
 
     /// Single independent task DAG (one task, no deps), pre-assigned to member 0 —
@@ -1667,8 +1661,7 @@ mod tests {
         }
     }
 
-    /// Records every conversation id it was asked to cancel — the test asserts the
-    /// in-flight conv was NEVER passed here across pause→resume.
+    /// Records every conversation id it was asked to cancel.
     struct RecordingCanceller {
         cancelled: Arc<Mutex<Vec<i64>>>,
     }
@@ -1691,7 +1684,7 @@ mod tests {
 
     /// A worker that stamps a distinct conv id via `on_started`, then blocks on a
     /// shared gate until the test releases it — keeping the worker provably
-    /// in-flight across the pause→resume window.
+    /// in-flight when pause is clicked.
     struct GatedWorkerRunner {
         gate: Arc<tokio::sync::Notify>,
         next_conv_id: AtomicUsize,
@@ -1730,7 +1723,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_route_does_not_cancel_in_flight_worker() {
+    async fn pause_route_cancels_in_flight_worker_and_resets_task_pending() {
         let db = init_database_memory().await.expect("db init");
         let pool = db.pool().clone();
         let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
@@ -1748,8 +1741,8 @@ mod tests {
             emitter.clone(),
         ));
 
-        // cap=1, gated worker → the single task is in-flight (blocked on the gate)
-        // when we pause. A RecordingCanceller proves resume does not tear it down.
+        // cap=1, gated worker -> the single task is in-flight (blocked on the gate)
+        // when we pause. A RecordingCanceller proves pause reaches the real worker.
         let gate = Arc::new(tokio::sync::Notify::new());
         let worker: Arc<dyn WorkerRunner> = Arc::new(GatedWorkerRunner::new(gate.clone()));
         let canceller = Arc::new(RecordingCanceller::new());
@@ -1798,7 +1791,7 @@ mod tests {
                 "u1",
                 CreateRunRequest {
                     workspace_id: seeded_ws.id,
-                    goal: "resume must preserve in-flight".to_string(),
+                    goal: "pause must stop in-flight".to_string(),
                     fleet_id: seeded_fleet.id,
                     autonomy: None,
                     max_parallel: Some(1),
@@ -1845,9 +1838,8 @@ mod tests {
         }
         let in_flight_conv = in_flight_conv.expect("task running with stamped conv id");
 
-        // Pause via the real route, then resume via the real route — the path the
-        // bug lives in. The pre-fix resume_run calls engine.start unconditionally,
-        // cancelling the in-flight worker.
+        // Pause via the real route. It must stop the live loop, cancel the stamped
+        // worker conversation, and normalize the interrupted node back to pending.
         let resp = app
             .clone()
             .oneshot(
@@ -1860,6 +1852,41 @@ mod tests {
             .await
             .expect("pause request");
         assert_eq!(resp.status(), StatusCode::OK, "pause must 200");
+
+        let mut cancels = Vec::new();
+        for _ in 0..200 {
+            cancels = recorded_cancels.lock().unwrap().clone();
+            if cancels.contains(&in_flight_conv) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            cancels.contains(&in_flight_conv),
+            "pause must cancel the in-flight worker conversation {in_flight_conv}; cancelled={cancels:?}"
+        );
+        assert!(
+            !engine_for_test.is_running(&run_id),
+            "pause must stop the run loop so no worker continues in the background"
+        );
+
+        let paused = run_service
+            .get_detail(&run_id)
+            .await
+            .expect("detail after pause");
+        assert_eq!(paused.run.status, "paused", "run remains paused");
+        assert_eq!(
+            paused.tasks[0].status, "pending",
+            "interrupted node must be reset to pending for resume"
+        );
+        assert_eq!(
+            paused.tasks[0].conversation_id, None,
+            "reset pending node must not keep the cancelled worker conversation"
+        );
+        assert_eq!(
+            paused.tasks[0].attempt, 1,
+            "resetting an interrupted node bumps attempt so the resume execution is distinguishable"
+        );
 
         let resp = app
             .clone()
@@ -1898,13 +1925,12 @@ mod tests {
         let detail = run_service.get_detail(&run_id).await.expect("detail");
         assert_eq!(
             detail.tasks[0].status, "done",
-            "the in-flight worker preserved across pause→resume must settle `done`, got {}",
+            "the re-dispatched worker after pause->resume must settle `done`, got {}",
             detail.tasks[0].status
         );
-        let cancels = recorded_cancels.lock().unwrap().clone();
         assert!(
-            !cancels.contains(&in_flight_conv),
-            "resume must NOT cancel the in-flight worker conversation {in_flight_conv}; cancelled={cancels:?}"
+            detail.tasks[0].conversation_id != Some(in_flight_conv),
+            "resume must create a fresh worker conversation after the paused one is cancelled"
         );
     }
 
