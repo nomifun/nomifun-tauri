@@ -43,6 +43,7 @@ import {
   EditTwo,
   FileText,
   FolderOpen,
+  FolderPlus,
   Left,
   LinkCloud,
   LinkOne,
@@ -77,6 +78,7 @@ import TagPicker from '../CreateStudio/TagPicker';
 import { FEISHU_KNOWLEDGE_CREATION_ENABLED } from '../CreateStudio/sourceTypes';
 import {
   buildKnowledgeSearchTree,
+  knowledgeFolderPathChain,
   mergeKnowledgeTreeChildren,
   parentDirOfKnowledgePath,
   preserveKnowledgeTreeChildren,
@@ -519,6 +521,8 @@ const KnowledgeDetailPage: React.FC = () => {
   const [saving, setSaving] = useState(false);
   const [newFileVisible, setNewFileVisible] = useState(false);
   const [newFilePath, setNewFilePath] = useState('');
+  const [newFolderVisible, setNewFolderVisible] = useState(false);
+  const [newFolderPath, setNewFolderPath] = useState('');
   const [autogenLoading, setAutogenLoading] = useState(false);
   const [refreshingSource, setRefreshingSource] = useState(false);
   const [connectorVisible, setConnectorVisible] = useState(false);
@@ -616,19 +620,6 @@ const KnowledgeDetailPage: React.FC = () => {
     }
   };
 
-  const refreshTreeBranch = useCallback(
-    async (folderPath: string) => {
-      if (!id || isTreeSearch) return;
-      const children = await ipcBridge.knowledge.listTree.invoke({ id, path: folderPath || undefined });
-      if (folderPath) {
-        setTreeData((prev) => mergeKnowledgeTreeChildren(prev, folderPath, children));
-      } else {
-        setTreeData(children);
-      }
-    },
-    [id, isTreeSearch]
-  );
-
   const handleLoadTreeChildren = useCallback(
     async (node: IKnowledgeTreeEntry) => {
       if (!id || node.is_file || isTreeSearch) return;
@@ -638,10 +629,34 @@ const KnowledgeDetailPage: React.FC = () => {
     [id, isTreeSearch]
   );
 
+  const reloadTreePath = useCallback(
+    async (folderPath: string) => {
+      if (!id) return;
+      const rootChildren = await ipcBridge.knowledge.listTree.invoke({ id });
+      setTreeData(rootChildren);
+
+      const branchesToReload = knowledgeFolderPathChain(folderPath);
+      for (const branchPath of branchesToReload) {
+        const children = await ipcBridge.knowledge.listTree.invoke({ id, path: branchPath });
+        setTreeData((prev) => mergeKnowledgeTreeChildren(prev, branchPath, children));
+      }
+      if (branchesToReload.length > 0) {
+        setExpandedTreeKeys((prev) => [...new Set([...prev, ...branchesToReload])]);
+      }
+    },
+    [id]
+  );
+
   const openNewFileModal = () => {
     const folder = selectedFolderPath || parentDirOfKnowledgePath(selectedPath);
     setNewFilePath(folder ? `${folder}/` : '');
     setNewFileVisible(true);
+  };
+
+  const openNewFolderModal = () => {
+    const folder = selectedFolderPath || parentDirOfKnowledgePath(selectedPath);
+    setNewFolderPath(folder ? `${folder}/` : '');
+    setNewFolderVisible(true);
   };
 
   const handleCreateFile = async () => {
@@ -656,13 +671,30 @@ const KnowledgeDetailPage: React.FC = () => {
       setNewFileVisible(false);
       setNewFilePath('');
       await refresh();
-      await refreshTreeBranch(parent);
-      if (parent) {
-        setExpandedTreeKeys((prev) => [...new Set([...prev, parent])]);
-      }
+      setFileSearch('');
+      await reloadTreePath(parent);
       setSelectedPath(path);
       setSelectedTreeKey(path);
       Message.success(t('knowledge.actions.createOk'));
+    } catch (e) {
+      Message.error(String(e));
+    }
+  };
+
+  const handleCreateFolder = async () => {
+    if (!id) return;
+    const path = newFolderPath.trim().replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+    if (!path) return;
+    const parent = parentDirOfKnowledgePath(path);
+    try {
+      await ipcBridge.knowledge.createFolder.invoke({ id, path });
+      setNewFolderVisible(false);
+      setNewFolderPath('');
+      setFileSearch('');
+      await reloadTreePath(parent);
+      setSelectedFolderPath(path);
+      setSelectedTreeKey(path);
+      Message.success(t('knowledge.actions.createFolderOk', { defaultValue: '文件夹已创建' }));
     } catch (e) {
       Message.error(String(e));
     }
@@ -679,7 +711,7 @@ const KnowledgeDetailPage: React.FC = () => {
         setSelectedTreeKey(parent || null);
       }
       await refresh();
-      await refreshTreeBranch(parent);
+      await reloadTreePath(parent);
     } catch (e) {
       Message.error(String(e));
     }
@@ -928,8 +960,39 @@ const KnowledgeDetailPage: React.FC = () => {
                   isMobile ? 'w-full' : 'w-264px'
                 )}
               >
+                {/* Document actions */}
+                <div className='knowledge-doc-actions mb-8px grid grid-cols-3 gap-4px rounded-10px bg-[var(--color-fill-2)] p-3px'>
+                  <button
+                    type='button'
+                    className='knowledge-doc-action inline-flex min-w-0 appearance-none items-center justify-center gap-4px rounded-8px border-none bg-transparent px-6px py-7px font-[inherit] text-11px font-500 text-[var(--color-text-2)] cursor-pointer transition-colors hover:bg-[var(--color-fill-3)] hover:text-[var(--color-text-1)] focus-visible:outline-none focus-visible:bg-[var(--color-fill-3)] focus-visible:text-[var(--color-text-1)]'
+                    onClick={openNewFileModal}
+                    title={t('knowledge.detail.docs.newFile', { defaultValue: '新建文档' })}
+                  >
+                    <Plus theme='outline' size='12' className='shrink-0' />
+                    <span className='truncate'>{t('knowledge.detail.docs.newFile', { defaultValue: '新建文档' })}</span>
+                  </button>
+                  <button
+                    type='button'
+                    className='knowledge-doc-action inline-flex min-w-0 appearance-none items-center justify-center gap-4px rounded-8px border-none bg-transparent px-6px py-7px font-[inherit] text-11px font-500 text-[var(--color-text-2)] cursor-pointer transition-colors hover:bg-[var(--color-fill-3)] hover:text-[var(--color-text-1)] focus-visible:outline-none focus-visible:bg-[var(--color-fill-3)] focus-visible:text-[var(--color-text-1)]'
+                    onClick={openNewFolderModal}
+                    title={t('knowledge.detail.docs.newFolder', { defaultValue: '新建文件夹' })}
+                  >
+                    <FolderPlus theme='outline' size='12' className='shrink-0' />
+                    <span className='truncate'>{t('knowledge.detail.docs.newFolder', { defaultValue: '文件夹' })}</span>
+                  </button>
+                  <button
+                    type='button'
+                    className='knowledge-doc-action inline-flex min-w-0 appearance-none items-center justify-center gap-4px rounded-8px border-none bg-transparent px-6px py-7px font-[inherit] text-11px font-500 text-[var(--color-text-2)] cursor-pointer transition-colors hover:bg-[var(--color-fill-3)] hover:text-[var(--color-text-1)] focus-visible:outline-none focus-visible:bg-[var(--color-fill-3)] focus-visible:text-[var(--color-text-1)]'
+                    onClick={() => Message.info(t('knowledge.detail.docs.uploadTodo', { defaultValue: '上传功能开发中' }))}
+                    title={t('knowledge.detail.docs.upload', { defaultValue: '上传' })}
+                  >
+                    <Upload theme='outline' size='12' className='shrink-0' />
+                    <span className='truncate'>{t('knowledge.detail.docs.upload', { defaultValue: '上传' })}</span>
+                  </button>
+                </div>
+
                 {/* Search box */}
-                <div className='flex items-center gap-7px rounded-8px bg-[var(--color-fill-2)] border border-solid border-[var(--color-border-3)] px-10px py-7px mb-8px'>
+                <div className='knowledge-doc-search flex items-center gap-7px rounded-8px bg-[var(--color-fill-2)] border border-solid border-[var(--color-border-3)] px-10px py-7px mb-8px'>
                   <Search theme='outline' size='13' className='text-[var(--color-text-3)] shrink-0' />
                   <input
                     className='border-none bg-transparent outline-none text-[var(--color-text-1)] text-12px w-full placeholder:text-[var(--color-text-3)]'
@@ -1023,26 +1086,6 @@ const KnowledgeDetailPage: React.FC = () => {
                       />
                     )}
                   </Spin>
-                </div>
-
-                {/* Bottom actions: new + upload */}
-                <div className='knowledge-doc-actions mt-10px grid grid-cols-2 gap-4px rounded-10px bg-[var(--color-fill-2)] p-3px'>
-                  <button
-                    type='button'
-                    className='knowledge-doc-action inline-flex min-w-0 appearance-none items-center justify-center gap-5px rounded-8px border-none bg-transparent px-10px py-7px font-[inherit] text-12px font-500 text-[var(--color-text-2)] cursor-pointer transition-colors hover:bg-[var(--color-fill-3)] hover:text-[var(--color-text-1)] focus-visible:outline-none focus-visible:bg-[var(--color-fill-3)] focus-visible:text-[var(--color-text-1)]'
-                    onClick={openNewFileModal}
-                  >
-                    <Plus theme='outline' size='12' />
-                    <span className='truncate'>{t('knowledge.detail.docs.newFile', { defaultValue: '新建文档' })}</span>
-                  </button>
-                  <button
-                    type='button'
-                    className='knowledge-doc-action inline-flex min-w-0 appearance-none items-center justify-center gap-5px rounded-8px border-none bg-transparent px-10px py-7px font-[inherit] text-12px font-500 text-[var(--color-text-2)] cursor-pointer transition-colors hover:bg-[var(--color-fill-3)] hover:text-[var(--color-text-1)] focus-visible:outline-none focus-visible:bg-[var(--color-fill-3)] focus-visible:text-[var(--color-text-1)]'
-                    onClick={() => Message.info(t('knowledge.detail.docs.uploadTodo', { defaultValue: '上传功能开发中' }))}
-                  >
-                    <Upload theme='outline' size='12' />
-                    <span className='truncate'>{t('knowledge.detail.docs.upload', { defaultValue: '上传' })}</span>
-                  </button>
                 </div>
               </div>
 
@@ -1341,6 +1384,21 @@ const KnowledgeDetailPage: React.FC = () => {
           value={newFilePath}
           onChange={setNewFilePath}
           onPressEnter={() => void handleCreateFile()}
+        />
+      </Modal>
+
+      <Modal
+        title={t('knowledge.newFolder', { defaultValue: '新建文件夹' })}
+        visible={newFolderVisible}
+        onOk={() => void handleCreateFolder()}
+        onCancel={() => setNewFolderVisible(false)}
+        autoFocus={false}
+      >
+        <Input
+          placeholder={t('knowledge.newFolderPlaceholder', { defaultValue: '输入文件夹名或相对路径，例如 raw 或 raw/tutorials' })}
+          value={newFolderPath}
+          onChange={setNewFolderPath}
+          onPressEnter={() => void handleCreateFolder()}
         />
       </Modal>
     </div>

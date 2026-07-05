@@ -3838,6 +3838,10 @@ export const knowledge = {
     (p) => `/api/knowledge/bases/${p.id}/tree${p.path ? `?path=${encodeURIComponent(p.path)}` : ''}`,
     { timeoutMs: KB_READ_TIMEOUT_MS }
   ),
+  createFolder: httpPost<IKnowledgeTreeEntry, { id: string; path: string }>(
+    (p) => `/api/knowledge/bases/${p.id}/folder`,
+    (p) => ({ path: p.path })
+  ),
   readFile: httpGet<IKnowledgeFileContent, { id: string; path: string }>(
     (p) => `/api/knowledge/bases/${p.id}/file?path=${encodeURIComponent(p.path)}`,
     { timeoutMs: KB_READ_TIMEOUT_MS }

@@ -1187,6 +1187,18 @@ impl KnowledgeService {
         .await?)
     }
 
+    pub async fn create_folder(&self, id: &str, rel_path: &str) -> Result<KbTreeEntry, AppError> {
+        let row = self.require_base(id).await?;
+        let root = PathBuf::from(&row.root_path);
+        let rel_path = normalize_tree_rel_path(rel_path)?;
+        if rel_path.is_empty() {
+            return Err(AppError::BadRequest("folder path must not be empty".into()));
+        }
+        tokio::task::spawn_blocking(move || create_tree_folder(&root, &rel_path))
+            .await
+            .map_err(|e| AppError::Internal(format!("folder create task join error: {e}")))?
+    }
+
     pub async fn read_file(&self, id: &str, rel_path: &str) -> Result<KbFileContent, AppError> {
         let row = self.require_base(id).await?;
         let path = safe_md_path(Path::new(&row.root_path), rel_path)?;
@@ -3129,6 +3141,57 @@ fn list_tree_level(root: &Path, rel_path: &str) -> Result<Vec<KbTreeEntry>, AppE
     Ok(out)
 }
 
+fn create_tree_folder(root: &Path, rel_path: &str) -> Result<KbTreeEntry, AppError> {
+    if !root.is_dir() {
+        return Err(AppError::NotFound("knowledge base directory not found".into()));
+    }
+
+    let segments: Vec<&str> = rel_path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.is_empty() {
+        return Err(AppError::BadRequest("folder path must not be empty".into()));
+    }
+
+    let mut cursor = root.to_path_buf();
+    for (idx, segment) in segments.iter().enumerate() {
+        cursor.push(segment);
+        let is_final = idx + 1 == segments.len();
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(AppError::BadRequest(format!("path crosses a symlink: {rel_path}")));
+                }
+                if !meta.file_type().is_dir() {
+                    return Err(AppError::BadRequest(format!(
+                        "path is not a directory: {}",
+                        segments[..=idx].join("/")
+                    )));
+                }
+                if is_final {
+                    return Err(AppError::Conflict(format!("folder already exists: {rel_path}")));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&cursor)
+                    .map_err(|e| AppError::Internal(format!("failed to create folder: {e}")))?;
+            }
+            Err(e) => return Err(AppError::Internal(format!("failed to inspect folder path: {e}"))),
+        }
+    }
+
+    let meta = std::fs::metadata(&cursor).ok();
+    Ok(KbTreeEntry {
+        name: segments.last().unwrap_or(&rel_path).to_string(),
+        rel_path: rel_path.to_owned(),
+        is_dir: true,
+        is_file: false,
+        size: None,
+        modified_at: meta.as_ref().and_then(modified_ms),
+    })
+}
+
 /// Sanitize a base name into a directory-safe mount link name, deduplicating
 /// collisions (with other mounts AND with the platform-managed companion
 /// files inside the mount root, e.g. a base literally named `README.md`)
@@ -4001,6 +4064,35 @@ mod tests {
             "empty folders should be expandable but list no children"
         );
         assert!(service.list_tree(&info.id, "../escape").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn create_folder_creates_real_empty_folder_visible_in_tree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(vault.join("README.md"), "# Root").unwrap();
+
+        let info = service
+            .create_base("vault", "", Some(vault.to_str().unwrap()), None)
+            .await
+            .unwrap();
+
+        service.create_folder(&info.id, "raw/tutorials").await.unwrap();
+        assert!(vault.join("raw/tutorials").is_dir());
+
+        let raw = service.list_tree(&info.id, "raw").await.unwrap();
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].rel_path, "raw/tutorials");
+        assert!(raw[0].is_dir);
+
+        assert!(service.create_folder(&info.id, "").await.is_err());
+        assert!(service.create_folder(&info.id, "../escape").await.is_err());
+        assert!(service.create_folder(&info.id, "_inbox/draft").await.is_err());
+        assert!(service.create_folder(&info.id, "node_modules/pkg").await.is_err());
+        assert!(service.create_folder(&info.id, "README.md/child").await.is_err());
     }
 
     /// The per-base walk must be bounded: a walk that finishes within budget

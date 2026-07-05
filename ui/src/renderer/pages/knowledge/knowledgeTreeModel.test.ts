@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import type { IKnowledgeFileEntry, IKnowledgeTreeEntry } from '@/common/adapter/ipcBridge';
 import {
   buildKnowledgeSearchTree,
+  knowledgeFolderPathChain,
   mergeKnowledgeTreeChildren,
   preserveKnowledgeTreeChildren,
 } from './KnowledgeDetailPage/treeModel';
@@ -77,5 +78,11 @@ describe('knowledge detail tree model', () => {
 
     expect(preserved[0].children?.map((child) => child.rel_path)).toEqual(['raw/python3-type-conversion.md']);
     expect(preserved[1].children).toBeUndefined();
+  });
+
+  test('builds a folder path chain for branch refresh and expansion', () => {
+    expect(knowledgeFolderPathChain('raw/tutorials/deep')).toEqual(['raw', 'raw/tutorials', 'raw/tutorials/deep']);
+    expect(knowledgeFolderPathChain('/raw//tutorials/')).toEqual(['raw', 'raw/tutorials']);
+    expect(knowledgeFolderPathChain('')).toEqual([]);
   });
 });

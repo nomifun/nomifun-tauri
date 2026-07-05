@@ -130,3 +130,8 @@ export function parentDirOfKnowledgePath(relPath: string | null): string {
   if (parts.length <= 1) return '';
   return parts.slice(0, -1).join('/');
 }
+
+export function knowledgeFolderPathChain(relPath: string): string[] {
+  const parts = relPath.split('/').filter(Boolean);
+  return parts.map((_, index) => parts.slice(0, index + 1).join('/'));
+}

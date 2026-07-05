@@ -6,6 +6,7 @@
     "autogenOkNoReadme": "AI 描述已生成（保留了现有 README.md）",
     "autogenOkReadme": "AI 描述已生成，README.md 已写入",
     "cancel": "取消",
+    "createFolderOk": "文件夹已创建",
     "createOk": "已创建",
     "delete": "删除",
     "deleteConfirm": "确认删除该知识库？",
@@ -122,6 +123,7 @@
     "docs": {
       "edit": "编辑",
       "newFile": "新建文档",
+      "newFolder": "新建文件夹",
       "noSearchResults": "无匹配文件",
       "preview": "预览",
       "searchPlaceholder": "搜索文档…",
@@ -300,6 +302,8 @@
   "newBase": "新建知识库",
   "newFile": "新建文档",
   "newFilePlaceholder": "输入文件名或相对路径，例如 领域概念.md 或 api/约定.md",
+  "newFolder": "新建文件夹",
+  "newFolderPlaceholder": "输入文件夹名或相对路径，例如 raw 或 raw/tutorials",
   "noFiles": "目录里还没有 .md 文档，向目录放入文件或点击右上角新建",
   "onboarding": {
     "import": "导入",

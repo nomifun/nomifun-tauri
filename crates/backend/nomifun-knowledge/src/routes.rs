@@ -55,6 +55,7 @@ pub fn knowledge_routes(state: KnowledgeRouterState) -> Router {
         )
         .route("/api/knowledge/bases/{id}/files", get(list_files))
         .route("/api/knowledge/bases/{id}/tree", get(list_tree))
+        .route("/api/knowledge/bases/{id}/folder", post(create_folder))
         .route("/api/knowledge/bases/{id}/inbox", get(list_inbox))
         .route("/api/knowledge/inbox/pending-count", get(pending_inbox_count))
         .route("/api/knowledge/bases/{id}/inbox/diff", get(inbox_diff))
@@ -217,6 +218,21 @@ async fn list_tree(
     Ok(Json(ApiResponse::ok(
         state.service.list_tree(&id, &query.path).await?,
     )))
+}
+
+#[derive(Deserialize)]
+struct CreateFolderRequest {
+    path: String,
+}
+
+async fn create_folder(
+    State(state): State<KnowledgeRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<CreateFolderRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<KbTreeEntry>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    Ok(Json(ApiResponse::ok(state.service.create_folder(&id, &req.path).await?)))
 }
 
 #[derive(Deserialize)]

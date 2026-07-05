@@ -18,6 +18,16 @@ describe('Knowledge detail document action bar', () => {
     expect(detailSource.includes('border-none bg-transparent')).toBe(true);
   });
 
+  test('places document actions above document search and includes folder creation', () => {
+    const actionsIndex = detailSource.indexOf('knowledge-doc-actions');
+    const searchIndex = detailSource.indexOf('knowledge-doc-search');
+    expect(actionsIndex).toBeGreaterThan(-1);
+    expect(searchIndex).toBeGreaterThan(-1);
+    expect(actionsIndex).toBeLessThan(searchIndex);
+    expect(detailSource.includes('openNewFolderModal')).toBe(true);
+    expect(detailSource.includes('FolderPlus')).toBe(true);
+  });
+
   test('disables connector entries while Feishu knowledge creation is disabled', () => {
     expect(detailSource.includes('FEISHU_KNOWLEDGE_CREATION_ENABLED')).toBe(true);
     expect(detailSource.includes("disabled={!FEISHU_KNOWLEDGE_CREATION_ENABLED}")).toBe(true);
