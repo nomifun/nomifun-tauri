@@ -50,7 +50,7 @@ use nomifun_api_types::{
     CapabilityProfile, CreateAdhocRunRequest, FleetMember, ModelRange, ModelRef, PlannedTask,
     RunDetail, derive_capability, infer_model_modalities,
 };
-use nomifun_common::generate_prefixed_id;
+use nomifun_common::{ProviderWithModel, generate_prefixed_id};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -215,11 +215,14 @@ async fn create(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: RunCreat
         Err(e) => return e,
     };
 
-    // 1b. When the lead OMITS model_range (⇒ Auto), prefer the curated「主模型 +
-    //     协作模型」range the homepage stashed on the calling conversation's
-    //     `extra.orchestrator_model_range` (deterministic — never relayed through
-    //     the LLM). An explicit tool arg (MCP caller) still wins; a missing /
-    //     malformed extra value falls through to Auto.
+    // 1b. When the lead OMITS model_range (⇒ Auto), prefer the conversation-native
+    //     range the composer stashed on `extra.orchestrator_model_range`
+    //     (deterministic — never relayed through the LLM), and when that is absent
+    //     fall back to the conversation's CURRENT 主模型 as a single-model range. An
+    //     explicit tool arg (MCP caller) still wins; only a caller with NO
+    //     conversation / no usable model falls through to Auto (every enabled model).
+    //     This is what stops a conversation-native run from spreading nodes across
+    //     models the user never selected.
     let model_range = if matches!(model_range, ModelRange::Auto) {
         read_conversation_model_range(&deps, &user, &ctx.conversation_id)
             .await
@@ -415,12 +418,25 @@ fn resolve_model_range(model_range: Option<Value>) -> Result<ModelRange, Value> 
     }
 }
 
-/// Read the curated「主模型 + 协作模型」range the homepage stashed on the lead
-/// conversation's `extra.orchestrator_model_range`. This is the deterministic
-/// channel from the FE picker into the run (the lead agent never has to pass a
-/// `model_range`). Returns `None` — falling back to `Auto` — for every soft
-/// failure: no calling conversation, an unreadable conversation, an absent key,
-/// or a value that does not parse as a [`ModelRange`].
+/// Resolve the model range for a CONVERSATION-native run from the calling
+/// conversation, deterministically (never relayed through the LLM), in priority
+/// order:
+///
+/// 1. The curated「主模型 + 协作模型」range the composer's selector stashed on
+///    `extra.orchestrator_model_range` (`models[0]` = 主模型 = lead/planner). This is
+///    written ONLY when the user TOUCHES the main-model / collaborator pickers.
+/// 2. **Fallback — the conversation's CURRENT 主模型 (`conversation.model`) as a
+///    single-model range.** A fresh conversation whose pickers were never touched
+///    carries NO `orchestrator_model_range` extra; such a run must still execute on
+///    the model the user is chatting with — it must NOT silently fan out across
+///    EVERY enabled model (models the user never selected). This is the fix for the
+///    「节点用了我没选中的模型」bug: the old code returned `None` here, so the caller
+///    fell back to `Auto` = all enabled models.
+///
+/// Returns `None` ONLY when there is no usable signal at all — no calling
+/// conversation (MCP / no-session caller), an unreadable conversation, or a
+/// conversation with no valid main model — in which case the caller's `Auto`
+/// ("every enabled model") default is the only sensible option.
 async fn read_conversation_model_range(
     deps: &Arc<GatewayDeps>,
     user_id: &str,
@@ -434,18 +450,53 @@ async fn read_conversation_model_range(
         .get(user_id, conversation_id)
         .await
         .ok()?;
-    let raw = conv.extra.get("orchestrator_model_range")?;
-    match serde_json::from_value::<ModelRange>(raw.clone()) {
-        Ok(range) => Some(range),
-        Err(e) => {
-            tracing::warn!(
-                conversation_id,
-                error = %e,
-                "orchestrator_model_range on conversation extra is malformed; falling back to Auto"
-            );
-            None
+    // 1. The curated range from the composer's 主模型/协作模型 selector, when present.
+    if let Some(raw) = conv.extra.get("orchestrator_model_range") {
+        match serde_json::from_value::<ModelRange>(raw.clone()) {
+            Ok(range) => return Some(range),
+            Err(e) => {
+                tracing::warn!(
+                    conversation_id,
+                    error = %e,
+                    "orchestrator_model_range on conversation extra is malformed; falling back to the conversation's main model"
+                );
+                // fall through to the main-model fallback below
+            }
         }
     }
+    // 2. No curated range → the conversation's current 主模型 as a single-model range
+    //    (NOT Auto). `None` only when the conversation has no usable model, so the
+    //    caller's Auto default applies just for a genuinely-unknown run.
+    main_model_range(conv.model.as_ref())
+}
+
+/// Build a single-model [`ModelRange`] from a conversation's 主模型
+/// (`conversation.model`) — the model the user is chatting with. The effective
+/// model name is `use_model` when set (the specific model chosen WITHIN the
+/// provider, matching what the FE persists as `models[0]`), else the provider's
+/// `model`. Returns `None` when the provider id or resolved model name is blank so
+/// a conversation with no real model still falls through to the caller's `Auto`
+/// default rather than synthesizing an empty/degenerate member.
+fn main_model_range(model: Option<&ProviderWithModel>) -> Option<ModelRange> {
+    let m = model?;
+    // `use_model` is the specific model chosen within the provider; a blank/absent
+    // one falls back to the provider's `model`.
+    let name = m
+        .use_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| m.model.trim());
+    let provider_id = m.provider_id.trim();
+    if provider_id.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(ModelRange::Single {
+        model: ModelRef {
+            provider_id: provider_id.to_string(),
+            model: name.to_string(),
+        },
+    })
 }
 
 /// Read the run this conversation is CURRENTLY bound to
@@ -1073,7 +1124,8 @@ async fn spawn(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: SpawnPara
     }
 
     // ── 否则新建 run（原 create+link 路径，行为不变）──
-    // 模型解析：会话策展的「主模型+协作模型」优先，缺省 Auto 全量展开（与 create 一致）。
+    // 模型解析：会话策展的「主模型+协作模型」优先，其次回退到会话当前主模型(单模型)；
+    // 仅无会话/无可用模型时才 Auto 全量展开（与 create 一致，避免节点用到用户没选的模型）。
     let model_range = read_conversation_model_range(&deps, &user, &ctx.conversation_id)
         .await
         .unwrap_or(ModelRange::Auto);
@@ -1567,6 +1619,87 @@ mod tests {
         let err = resolve_model_range(Some(v)).expect_err("must error on malformed range");
         let msg = err["error"].as_str().unwrap_or("");
         assert!(msg.contains("malformed"), "got: {msg}");
+    }
+
+    // ── main_model_range: conversation 主模型 → single-model fallback ──────────
+    //
+    // This is the fix for「节点用了我没选中的模型」: a conversation-native run whose
+    // `extra.orchestrator_model_range` was never persisted (the user never touched
+    // the composer's model / collaborator pickers) must fall back to the
+    // conversation's CURRENT 主模型 as a single-model range — NOT `Auto` (every
+    // enabled model). These cover the pure fallback core `read_conversation_model_range`
+    // delegates to when the curated extra is absent/malformed.
+
+    fn provider_with_model(
+        provider_id: &str,
+        model: &str,
+        use_model: Option<&str>,
+    ) -> ProviderWithModel {
+        ProviderWithModel {
+            provider_id: provider_id.to_string(),
+            model: model.to_string(),
+            use_model: use_model.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn main_model_range_prefers_use_model() {
+        // `use_model` (the specific model chosen within the provider — what the FE
+        // persists as models[0]) wins over the provider's bare `model`.
+        let range = main_model_range(Some(&provider_with_model("p1", "default-m", Some("opus"))))
+            .expect("a conversation with a main model yields a single range");
+        match range {
+            ModelRange::Single { model } => {
+                assert_eq!(model.provider_id, "p1");
+                assert_eq!(model.model, "opus", "use_model is the effective model name");
+            }
+            other => panic!("expected single, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn main_model_range_uses_model_when_no_use_model() {
+        // No `use_model` → the provider's `model` is the effective name.
+        let range = main_model_range(Some(&provider_with_model("p2", "sonnet", None)))
+            .expect("single range from bare model");
+        match range {
+            ModelRange::Single { model } => {
+                assert_eq!(model.provider_id, "p2");
+                assert_eq!(model.model, "sonnet");
+            }
+            other => panic!("expected single, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn main_model_range_blank_use_model_falls_back_to_model() {
+        // A blank `use_model` (e.g. Some("")) must NOT shadow a valid `model` — it is
+        // treated as absent so the effective name is the provider's `model`.
+        let range = main_model_range(Some(&provider_with_model("p3", "haiku", Some("   "))))
+            .expect("blank use_model falls back to model");
+        match range {
+            ModelRange::Single { model } => {
+                assert_eq!(model.provider_id, "p3");
+                assert_eq!(model.model, "haiku");
+            }
+            other => panic!("expected single, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn main_model_range_none_when_no_model_or_blank() {
+        // No conversation model at all → None (caller falls through to Auto).
+        assert!(main_model_range(None).is_none(), "no model → None");
+        // Blank provider id → None (cannot synthesize a usable member).
+        assert!(
+            main_model_range(Some(&provider_with_model("  ", "opus", None))).is_none(),
+            "blank provider id → None"
+        );
+        // Blank resolved model name (empty model + empty use_model) → None.
+        assert!(
+            main_model_range(Some(&provider_with_model("p1", "", Some("   ")))).is_none(),
+            "blank model name → None"
+        );
     }
 
     // ── build_adhoc_request: EXPLICIT params → CreateAdhocRunRequest ──────────
