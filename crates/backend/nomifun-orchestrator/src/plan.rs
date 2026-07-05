@@ -1956,6 +1956,7 @@ mod tests {
     /// Build a minimal `RunTask` for the adjust-prompt tests.
     fn run_task(id: &str, title: &str, status: &str, output: Option<&str>) -> RunTask {
         RunTask {
+            pending_question: None,
             id: id.to_string(),
             run_id: "run_x".to_string(),
             last_error: None,

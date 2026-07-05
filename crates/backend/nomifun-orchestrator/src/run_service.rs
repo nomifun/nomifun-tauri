@@ -196,6 +196,23 @@ impl RunService {
             .await
             .map_err(OrchestratorError::from)?;
 
+        // 节点级审批模式（迁移 030）：仅显式 "manual" 落列；其余（None/"auto"/未知值）
+        // 保持 NULL = 全授权，读回视作 "auto"（零回归）。best-effort 之外——这是创建
+        // 语义的一部分，写失败即创建失败。
+        let approval_mode = req
+            .approval_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| *m == "manual");
+        if let Some(mode) = approval_mode {
+            self.run_repo
+                .set_run_approval_mode(&row.id, Some(mode))
+                .await
+                .map_err(OrchestratorError::from)?;
+        }
+        let mut row = row;
+        row.approval_mode = approval_mode.map(str::to_string);
+
         let run = run_row_to_dto(row);
         self.emitter.emit_run_status(&run.id, &run.status);
         Ok(run)
@@ -2596,6 +2613,11 @@ fn run_row_to_dto(row: OrchRunRow) -> Run {
         workspace_id: row.workspace_id,
         goal: row.goal,
         autonomy: row.autonomy,
+        // 迁移 030：NULL/未知值一律读作 "auto"（全授权），只认显式 "manual"。
+        approval_mode: match row.approval_mode.as_deref() {
+            Some("manual") => "manual".to_string(),
+            _ => "auto".to_string(),
+        },
         max_parallel: row.max_parallel,
         status: row.status,
         summary: row.summary,
@@ -2644,6 +2666,8 @@ fn task_row_to_dto(row: OrchRunTaskRow) -> RunTask {
         override_model: row.override_model,
         preset_prompt: row.preset_prompt,
         last_error: row.last_error,
+        // 迁移 030：节点挂起的决策问题（needs_review 态时在场）。旧行读回 None。
+        pending_question: row.pending_question,
         created_at: row.created_at,
         updated_at: row.updated_at,
     }
@@ -3673,6 +3697,7 @@ mod tests {
     /// supervised 的 adhoc run（nomi_spawn 前门的形状：单模型、无审批门）。
     async fn flat_run(svc: &RunService) -> String {
         let req = CreateAdhocRunRequest {
+            approval_mode: None,
             goal: "并行执行子任务".to_string(),
             work_dir: None,
             model_range: ModelRange::Single {
@@ -3706,6 +3731,37 @@ mod tests {
         }
         // 每个任务必须有 assignment（引擎 dispatch 需要）。
         assert_eq!(detail.assignments.len(), 2);
+    }
+
+    // 迁移 030: create_adhoc 透传 approval_mode——显式 "manual" 落到 run 行并从
+    // DTO 读回 "manual"；省略/其他值一律读回 "auto"（全授权，零回归）。
+    #[tokio::test]
+    async fn create_adhoc_threads_approval_mode_manual() {
+        let (svc, _repo) = adhoc_service().await;
+        let mk_req = |approval: Option<&str>| CreateAdhocRunRequest {
+            approval_mode: approval.map(str::to_string),
+            goal: "审批模式透传".to_string(),
+            work_dir: None,
+            model_range: ModelRange::Single {
+                model: model_ref("prov_a", "model-a"),
+            },
+            pinned_roles: vec![],
+            role_members: vec![],
+            autonomy: Some("supervised".to_string()),
+            max_parallel: None,
+            lead_conv_id: None,
+            lead_model: None,
+        };
+
+        let manual = svc.create_adhoc("u1", mk_req(Some("manual"))).await.expect("create manual");
+        assert_eq!(manual.approval_mode, "manual", "显式 manual 落库");
+        let detail = svc.get_detail(&manual.id).await.expect("detail");
+        assert_eq!(detail.run.approval_mode, "manual", "读回 manual");
+
+        let auto = svc.create_adhoc("u1", mk_req(None)).await.expect("create default");
+        assert_eq!(auto.approval_mode, "auto", "省略 → auto（全授权）");
+        let bogus = svc.create_adhoc("u1", mk_req(Some("yolo!"))).await.expect("create bogus");
+        assert_eq!(bogus.approval_mode, "auto", "未知值 → auto（fail-soft）");
     }
 
     #[tokio::test]
@@ -3746,6 +3802,7 @@ mod tests {
     async fn create_adhoc_range_snapshots_two_members() {
         let (svc, _repo) = adhoc_service().await;
         let req = CreateAdhocRunRequest {
+            approval_mode: None,
             goal: "ship the feature".to_string(),
             work_dir: Some("/tmp/proj".to_string()),
             model_range: ModelRange::Range {
@@ -3793,6 +3850,7 @@ mod tests {
     async fn create_adhoc_single_snapshots_one_member() {
         let (svc, _repo) = adhoc_service().await;
         let req = CreateAdhocRunRequest {
+            approval_mode: None,
             goal: "single-model run".to_string(),
             work_dir: None,
             model_range: ModelRange::Single { model: model_ref("prov_solo", "model-solo") },
@@ -3819,6 +3877,7 @@ mod tests {
     async fn create_adhoc_empty_goal_is_bad_request() {
         let (svc, _repo) = adhoc_service().await;
         let req = CreateAdhocRunRequest {
+            approval_mode: None,
             goal: "   ".to_string(),
             work_dir: None,
             model_range: ModelRange::Single { model: model_ref("p", "m") },
@@ -3838,6 +3897,7 @@ mod tests {
     async fn create_adhoc_empty_range_is_bad_request() {
         let (svc, _repo) = adhoc_service().await;
         let req = CreateAdhocRunRequest {
+            approval_mode: None,
             goal: "needs a model".to_string(),
             work_dir: None,
             model_range: ModelRange::Range { models: vec![] },
@@ -3859,6 +3919,7 @@ mod tests {
     async fn create_adhoc_auto_range_is_bad_request() {
         let (svc, _repo) = adhoc_service().await;
         let req = CreateAdhocRunRequest {
+            approval_mode: None,
             goal: "auto picks".to_string(),
             work_dir: None,
             model_range: ModelRange::Auto,
@@ -4120,6 +4181,7 @@ mod tests {
 
         // Range built from REAL names: index 0 = gpt-4o (vision), 1 = deepseek-chat.
         let req = CreateAdhocRunRequest {
+            approval_mode: None,
             goal: "描述这张图里的内容".to_string(),
             work_dir: None,
             model_range: ModelRange::Range {
@@ -4173,6 +4235,7 @@ mod tests {
     async fn create_adhoc_merges_role_members_into_snapshot() {
         let (svc, _repo) = adhoc_service().await;
         let req = CreateAdhocRunRequest {
+            approval_mode: None,
             goal: "build it".to_string(),
             work_dir: None,
             model_range: ModelRange::Range { models: vec![model_ref("p1", "m1")] },
@@ -4714,6 +4777,7 @@ mod tests {
     async fn adhoc_run_with_dir(work_dir: Option<String>) -> (RunService, Run) {
         let (svc, _repo) = adhoc_service().await;
         let req = CreateAdhocRunRequest {
+            approval_mode: None,
             goal: "browse run".to_string(),
             work_dir,
             model_range: ModelRange::Single { model: model_ref("p", "m") },

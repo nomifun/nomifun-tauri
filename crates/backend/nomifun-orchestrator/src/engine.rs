@@ -4511,6 +4511,7 @@ mod tests {
             .create_adhoc(
                 "u1",
                 CreateAdhocRunRequest {
+                    approval_mode: None,
                     goal: "chain".to_string(),
                     work_dir: Some("/tmp/lead-report".to_string()),
                     model_range: ModelRange::Single {
@@ -4977,6 +4978,7 @@ mod tests {
             .create_adhoc(
                 "u1",
                 CreateAdhocRunRequest {
+                    approval_mode: None,
                     goal: "build the chain".to_string(),
                     work_dir: Some("/tmp/adhoc-proj".to_string()),
                     model_range: ModelRange::Single {
@@ -5083,6 +5085,7 @@ mod tests {
     #[test]
     fn compose_brief_includes_role_task_and_upstream() {
         let task = OrchRunTaskRow {
+            pending_question: None,
             last_error: None,
             id: "rtask_1".to_string(),
             run_id: "run_1".to_string(),
@@ -5185,6 +5188,7 @@ mod tests {
     /// by the kind-aware compose_brief tests.
     fn task_row_with_kind(kind: &str, title: &str, spec: &str) -> OrchRunTaskRow {
         OrchRunTaskRow {
+            pending_question: None,
             last_error: None,
             id: "rtask_k".to_string(),
             run_id: "run_1".to_string(),
@@ -5333,6 +5337,7 @@ mod tests {
     #[test]
     fn aggregate_summary_is_non_empty_and_counts_done() {
         let mk = |title: &str, status: &str, summary: Option<&str>| OrchRunTaskRow {
+            pending_question: None,
             last_error: None,
             id: format!("rtask_{title}"),
             run_id: "run_1".to_string(),
@@ -6175,6 +6180,7 @@ mod tests {
             .create_adhoc(
                 "u1",
                 CreateAdhocRunRequest {
+                    approval_mode: None,
                     goal: "share one dir".to_string(),
                     work_dir: None,
                     model_range: ModelRange::Single {
@@ -11961,6 +11967,7 @@ mod tests {
     /// Build a minimal completed-run task row for the digest test.
     fn summary_task(title: &str, status: &str, output: Option<&str>) -> OrchRunTaskRow {
         OrchRunTaskRow {
+            pending_question: None,
             last_error: None,
             id: format!("rtask_{title}"),
             run_id: "run_x".to_string(),

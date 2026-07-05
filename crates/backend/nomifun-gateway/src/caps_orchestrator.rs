@@ -291,10 +291,22 @@ async fn create(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: RunCreat
     // engine-start gate in `spawn_plan_and_start`.
     let autonomy = p.autonomy;
 
+    // 节点级审批模式：会话 extra 的用户设置（会话页集群 pill 写入）。soft-failure
+    // 一律 None = 全授权。
+    let approval_mode = read_conversation_approval_mode(&deps, &user, &ctx.conversation_id).await;
+
     // Build the ad-hoc request from the EXPLICIT params: work_dir straight from the
     // arg, resolved autonomy, lead_conv_id = the parsed calling-conversation id.
-    let req =
-        build_adhoc_request(p.goal, p.work_dir, model_range, autonomy, role_members, lead_conv_id, lead_model);
+    let req = build_adhoc_request(
+        p.goal,
+        p.work_dir,
+        model_range,
+        autonomy,
+        role_members,
+        lead_conv_id,
+        lead_model,
+        approval_mode,
+    );
 
     // 4. Create: synthesize the fleet from the model range + park in `planning`.
     let run = match deps.orchestrator_run_service.create_adhoc(&user, req).await {
@@ -526,6 +538,31 @@ async fn read_conversation_run_id(
         .map(str::to_owned)
 }
 
+/// 读会话的节点级审批模式设置（`extra.orchestrator_approval_mode`，会话页集群 pill
+/// 写入）。只认显式 `"manual"`（审批模式）；其余（缺失/`"auto"`/未知值/任何软失败——
+/// 无会话、读错）一律 `None` = 全授权，与 [`read_conversation_run_id`] 同一 soft-failure
+/// 契约。`create` / `spawn` 建 run 时读出并经 `CreateAdhocRunRequest.approval_mode`
+/// 落到 run 行。
+async fn read_conversation_approval_mode(
+    deps: &Arc<GatewayDeps>,
+    user_id: &str,
+    conversation_id: &str,
+) -> Option<String> {
+    if conversation_id.is_empty() {
+        return None;
+    }
+    let conv = deps
+        .conversation_service
+        .get(user_id, conversation_id)
+        .await
+        .ok()?;
+    conv.extra
+        .get("orchestrator_approval_mode")
+        .and_then(|v| v.as_str())
+        .filter(|m| *m == "manual")
+        .map(str::to_owned)
+}
+
 /// 受控嵌套深度上限（Phase 3b W7d）：委派链最多 root lead(0) → worker(1) →
 /// sub-delegate(2)。深度 2 的 worker 再想追加/spawn 会被两个追加口拒绝，防子 agent
 /// 无界自我繁殖。
@@ -679,6 +716,7 @@ fn build_adhoc_request(
     role_members: Vec<FleetMember>,
     lead_conv_id: Option<i64>,
     lead_model: Option<ModelRef>,
+    approval_mode: Option<String>,
 ) -> CreateAdhocRunRequest {
     CreateAdhocRunRequest {
         goal,
@@ -699,6 +737,8 @@ fn build_adhoc_request(
         // The 主模型 (planner/lead) when the range is curated/explicit; `None` for
         // an uncurated Auto run (engine keeps its positional default).
         lead_model,
+        // 节点级审批模式（迁移 030）：会话 extra 的用户设置；`None` = 全授权。
+        approval_mode,
     }
 }
 
@@ -1148,6 +1188,8 @@ async fn spawn(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: SpawnPara
     };
 
     let lead_conv_id = parse_lead_conv_id(&ctx.conversation_id);
+    // 节点级审批模式：与 create 同源（会话 extra 用户设置），soft-failure = 全授权。
+    let approval_mode = read_conversation_approval_mode(&deps, &user, &ctx.conversation_id).await;
     // 扁平扇出恒 supervised：即时并行、无审批门。绝不显式传 interactive——
     // nomi_spawn 的任务是调用方显式给出的，park 在批准门会回归进程内 Spawn 的
     // 静默卡死体验（人工审批门只在编排 Tab 前门保留）。
@@ -1159,6 +1201,7 @@ async fn spawn(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: SpawnPara
         Vec::new(),
         lead_conv_id,
         lead_model,
+        approval_mode,
     );
 
     let run = match deps.orchestrator_run_service.create_adhoc(&user, req).await {
@@ -1720,6 +1763,7 @@ mod tests {
             vec![],
             Some(909),
             Some(ModelRef { provider_id: "p1".into(), model: "m1".into() }),
+            Some("manual".into()),
         );
         assert_eq!(req.goal, "ship it");
         assert_eq!(req.work_dir.as_deref(), Some("/tmp/proj"));
@@ -1730,6 +1774,11 @@ mod tests {
             req.lead_model.as_ref().map(|m| m.model.as_str()),
             Some("m1"),
             "lead_model (主模型) threaded through"
+        );
+        assert_eq!(
+            req.approval_mode.as_deref(),
+            Some("manual"),
+            "approval_mode (审批模式) threaded through"
         );
         assert!(req.pinned_roles.is_empty());
         assert!(req.max_parallel.is_none());
@@ -1747,8 +1796,10 @@ mod tests {
             vec![],
             None,
             None,
+            None,
         );
         assert!(req.lead_conv_id.is_none(), "lead_conv_id must be None (no lead conversation)");
+        assert!(req.approval_mode.is_none(), "omitted approval_mode → None (auto 全授权)");
     }
 
     #[test]
@@ -1761,6 +1812,7 @@ mod tests {
             ModelRange::Range { models: vec![] },
             None,
             vec![],
+            None,
             None,
             None,
         );
