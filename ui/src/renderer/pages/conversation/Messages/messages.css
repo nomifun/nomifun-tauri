@@ -211,17 +211,33 @@
 }
 
 .message-error-note__details .arco-collapse-item-header {
+  display: flex;
+  gap: 4px;
   min-height: 22px;
+  align-items: center;
+  justify-content: flex-start;
   padding: 0;
   line-height: 22px;
 }
 
 .message-error-note__details .arco-collapse-item-icon-hover {
+  position: static;
+  top: auto;
+  left: auto;
+  width: 16px;
+  height: 16px;
+  flex: none;
   color: var(--color-text-3);
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  margin-right: 4px;
+  margin: 0;
+  transform: none;
+}
+
+.message-error-note__details .arco-collapse-item-header-title {
+  min-width: 0;
+  line-height: 18px;
 }
 
 .message-error-note__details .arco-collapse-item-content-box {
