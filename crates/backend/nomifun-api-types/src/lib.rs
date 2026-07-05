@@ -137,7 +137,7 @@ pub use mcp::{
     OAuthCheckStatusRequest, OAuthLoginRequest, OAuthLoginResponse, OAuthLogoutRequest,
     OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
 };
-pub use model_capability::infer_model_modalities;
+pub use model_capability::{infer_generation_capabilities, infer_model_modalities};
 pub use office::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DetectStarOfficeRequest,
     DocumentConversionRequest, DocumentConversionResponse, ExcelSheetData, ExcelSheetImage,

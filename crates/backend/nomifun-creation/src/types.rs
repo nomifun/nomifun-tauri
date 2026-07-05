@@ -108,11 +108,32 @@ impl CreationError {
         Self { kind: kind.into(), message: message.into(), http_status: None }
     }
 
-    /// The M0 placeholder: no adapter is wired yet.
+    /// Attach an HTTP status (for `provider_error`s carrying a remote status).
+    pub fn with_http_status(mut self, status: u16) -> Self {
+        self.http_status = Some(status);
+        self
+    }
+
+    /// No adapter is registered / routed for the requested capability.
     pub fn adapter_unavailable() -> Self {
         Self::new(
             "adapter_unavailable",
-            "no media provider adapter is available yet (M0 skeleton); generation lands in M2",
+            "no media provider adapter is available for this provider/capability",
         )
+    }
+
+    /// A remote provider call failed (network / non-2xx / parse).
+    pub fn provider_error(message: impl Into<String>) -> Self {
+        Self::new("provider_error", message)
+    }
+
+    /// The engine's own wiring is incomplete (no resolver / sink / source).
+    pub fn config(message: impl Into<String>) -> Self {
+        Self::new("config", message)
+    }
+
+    /// The task exceeded the poll deadline.
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self::new("timeout", message)
     }
 }

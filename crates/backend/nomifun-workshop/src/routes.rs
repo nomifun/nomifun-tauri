@@ -24,10 +24,12 @@ use crate::service::{AssetPatch, AssetQuery, NewAssetUpload, NewTextAsset};
 use crate::state::WorkshopRouterState;
 
 pub fn workshop_routes(state: WorkshopRouterState) -> Router {
-    // The asset upload route carries its own (larger) body limit. Disable the
-    // app's global `DefaultBodyLimit` on it first, then cap at MAX_ASSET_BYTES.
+    // The asset upload + canvas import routes carry their own (larger) body
+    // limit. Disable the app's global `DefaultBodyLimit` on them, then cap at
+    // MAX_ASSET_BYTES.
     let upload_router = Router::new()
         .route("/api/workshop/assets/upload", post(upload_asset))
+        .route("/api/workshop/canvases/import", post(import_canvas))
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(MAX_ASSET_BYTES))
         .with_state(state.clone());
@@ -36,9 +38,12 @@ pub fn workshop_routes(state: WorkshopRouterState) -> Router {
         .route("/api/workshop/canvases", get(list_canvases).post(create_canvas))
         .route(
             "/api/workshop/canvases/{id}",
-            get(get_canvas).patch(rename_canvas).delete(delete_canvas),
+            get(get_canvas).patch(patch_canvas).delete(delete_canvas),
         )
         .route("/api/workshop/canvases/{id}/doc", axum::routing::put(put_doc))
+        .route("/api/workshop/canvases/{id}/export", get(export_canvas))
+        .route("/api/workshop/canvas-thumbs/{id}", get(serve_canvas_thumb))
+        .route("/api/workshop/gc", post(run_gc))
         .route("/api/workshop/assets", get(list_assets).post(create_text_asset))
         .route("/api/workshop/assets/{id}", axum::routing::patch(patch_asset).delete(delete_asset))
         .route("/api/workshop/files/{asset_id}", get(serve_file))
@@ -115,18 +120,24 @@ async fn put_doc(
 }
 
 #[derive(Deserialize)]
-struct RenameCanvasRequest {
-    title: String,
+struct PatchCanvasRequest {
+    #[serde(default)]
+    title: Option<String>,
+    /// Set the canvas gallery thumbnail from this asset (append-only over the
+    /// original `{ title }` contract).
+    #[serde(default)]
+    thumbnail_asset_id: Option<String>,
 }
 
-async fn rename_canvas(
+async fn patch_canvas(
     State(state): State<WorkshopRouterState>,
     Extension(_user): Extension<CurrentUser>,
     Path(id): Path<String>,
-    body: Result<Json<RenameCanvasRequest>, JsonRejection>,
+    body: Result<Json<PatchCanvasRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<WorkshopCanvasMeta>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    Ok(Json(ApiResponse::ok(state.service.rename_canvas(&id, &req.title).await?)))
+    let meta = state.service.patch_canvas(&id, req.title, req.thumbnail_asset_id).await?;
+    Ok(Json(ApiResponse::ok(meta)))
 }
 
 async fn delete_canvas(
@@ -136,6 +147,79 @@ async fn delete_canvas(
 ) -> Result<StatusCode, AppError> {
     state.service.delete_canvas(&id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ── export / import / gc ─────────────────────────────────────────────────────
+
+async fn export_canvas(
+    State(state): State<WorkshopRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    let zip = state.service.export_canvas(&id).await?;
+    let filename = format!("workshop-canvas-{id}.zip");
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/zip".to_string()),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{filename}\"")),
+        ],
+        Body::from(zip),
+    )
+        .into_response())
+}
+
+async fn import_canvas(
+    State(state): State<WorkshopRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    multipart: Multipart,
+) -> Result<impl IntoResponse, AppError> {
+    let bytes = extract_single_file(multipart).await?;
+    let meta = state.service.import_canvas(bytes).await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(meta))))
+}
+
+/// Pull the `file` field bytes out of a multipart body (the import zip).
+async fn extract_single_file(mut multipart: Multipart) -> Result<Vec<u8>, AppError> {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("multipart error: {e}")))?
+    {
+        if field.name() == Some("file") {
+            return Ok(field
+                .bytes()
+                .await
+                .map_err(|e| AppError::BadRequest(format!("failed to read file: {e}")))?
+                .to_vec());
+        }
+    }
+    Err(AppError::BadRequest("missing 'file' field".into()))
+}
+
+#[derive(serde::Serialize)]
+struct GcResponse {
+    orphan_rows_deleted: usize,
+    orphan_files_deleted: usize,
+}
+
+async fn run_gc(
+    State(state): State<WorkshopRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<GcResponse>>, AppError> {
+    let stats = state.service.gc().await?;
+    Ok(Json(ApiResponse::ok(GcResponse {
+        orphan_rows_deleted: stats.orphan_rows_deleted,
+        orphan_files_deleted: stats.orphan_files_deleted,
+    })))
+}
+
+async fn serve_canvas_thumb(
+    State(state): State<WorkshopRouterState>,
+    Extension(_user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Response, AppError> {
+    let served = state.service.serve_canvas_thumbnail(&id).await?;
+    Ok(([(header::CONTENT_TYPE, served.mime)], Body::from(served.bytes)).into_response())
 }
 
 // ── assets ────────────────────────────────────────────────────────────────

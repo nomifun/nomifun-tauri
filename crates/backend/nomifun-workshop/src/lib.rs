@@ -12,9 +12,12 @@
 //! service only stores it, caps its size, and derives `node_count` from it; the
 //! doc's internal shape is a frontend contract.
 
+mod archive;
+mod docscan;
 mod dto;
 mod fsio;
 mod imagemeta;
+mod thumbnail;
 
 pub mod routes;
 pub mod service;
@@ -27,8 +30,9 @@ pub use state::WorkshopRouterState;
 
 /// Domain root under the backend data dir. Layout:
 /// - `{data_dir}/workshop/canvases/{id}/canvas.json` — canvas body (opaque).
+/// - `{data_dir}/workshop/canvases/{id}/thumb.jpg` — canvas gallery thumbnail.
 /// - `{data_dir}/workshop/assets/{id}.{ext}` — asset originals.
-/// - `{data_dir}/workshop/assets/thumbs/{id}.webp` — asset thumbnails (M3).
+/// - `{data_dir}/workshop/assets/thumbs/{id}.jpg` — asset thumbnails (JPEG).
 pub const WORKSHOP_REL_DIR: &str = "workshop";
 
 /// Max serialized canvas doc size (contract §1: ≤ 8 MB).

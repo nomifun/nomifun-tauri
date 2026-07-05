@@ -8,9 +8,9 @@ use nomifun_db::{WorkshopAssetRow, WorkshopCanvasRow};
 use serde::Serialize;
 use serde_json::Value;
 
-/// A canvas index entry. `thumbnail_url` is `None` until thumbnail generation
-/// lands (M3); the `workshop_canvases.thumbnail_rel_path` column is populated
-/// then and a serve route wired.
+/// A canvas index entry. `thumbnail_url` is populated once a canvas thumbnail
+/// has been set (via `PATCH …/{id}` with `thumbnail_asset_id`); it points at the
+/// dedicated `GET /api/workshop/canvas-thumbs/{id}` serve route.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkshopCanvasMeta {
     pub id: String,
@@ -23,12 +23,16 @@ pub struct WorkshopCanvasMeta {
 
 impl From<WorkshopCanvasRow> for WorkshopCanvasMeta {
     fn from(row: WorkshopCanvasRow) -> Self {
-        // M0 has no thumbnail generation; keep None even if a rel_path exists so
-        // we never advertise a URL with no serve route behind it.
+        // Advertise a thumbnail URL only when a thumbnail file was actually
+        // written (rel_path present) — never a URL with no bytes behind it.
+        let thumbnail_url = row
+            .thumbnail_rel_path
+            .as_ref()
+            .map(|_| format!("/api/workshop/canvas-thumbs/{}", row.id));
         Self {
             id: row.id,
             title: row.title,
-            thumbnail_url: None,
+            thumbnail_url,
             node_count: row.node_count,
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -135,17 +139,30 @@ mod tests {
     }
 
     #[test]
-    fn canvas_meta_never_advertises_thumbnail_in_m0() {
+    fn canvas_meta_advertises_thumbnail_when_rel_path_present() {
         let row = WorkshopCanvasRow {
             id: "wsc_1".into(),
             title: "c".into(),
-            thumbnail_rel_path: Some("workshop/canvases/wsc_1/thumb.webp".into()),
+            thumbnail_rel_path: Some("workshop/canvases/wsc_1/thumb.jpg".into()),
             node_count: 3,
             created_at: 1,
             updated_at: 2,
         };
         let meta = WorkshopCanvasMeta::from(row);
-        assert!(meta.thumbnail_url.is_none());
+        assert_eq!(meta.thumbnail_url.as_deref(), Some("/api/workshop/canvas-thumbs/wsc_1"));
         assert_eq!(meta.node_count, 3);
+    }
+
+    #[test]
+    fn canvas_meta_no_thumbnail_url_when_absent() {
+        let row = WorkshopCanvasRow {
+            id: "wsc_2".into(),
+            title: "c".into(),
+            thumbnail_rel_path: None,
+            node_count: 0,
+            created_at: 1,
+            updated_at: 2,
+        };
+        assert!(WorkshopCanvasMeta::from(row).thumbnail_url.is_none());
     }
 }

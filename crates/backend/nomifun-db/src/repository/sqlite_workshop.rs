@@ -100,6 +100,26 @@ impl IWorkshopRepository for SqliteWorkshopRepository {
         Ok(())
     }
 
+    async fn set_canvas_thumbnail(
+        &self,
+        id: &str,
+        thumbnail_rel_path: &str,
+        now: i64,
+    ) -> Result<WorkshopCanvasRow, DbError> {
+        let result = sqlx::query("UPDATE workshop_canvases SET thumbnail_rel_path = ?, updated_at = ? WHERE id = ?")
+            .bind(thumbnail_rel_path)
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("workshop canvas '{id}' not found")));
+        }
+        self.get_canvas(id)
+            .await?
+            .ok_or_else(|| DbError::NotFound(format!("workshop canvas '{id}' not found")))
+    }
+
     // ---- assets ----
 
     async fn create_asset(&self, row: &WorkshopAssetRow) -> Result<WorkshopAssetRow, DbError> {
@@ -136,6 +156,13 @@ impl IWorkshopRepository for SqliteWorkshopRepository {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row)
+    }
+
+    async fn list_all_assets(&self) -> Result<Vec<WorkshopAssetRow>, DbError> {
+        let rows = sqlx::query_as::<_, WorkshopAssetRow>("SELECT * FROM workshop_assets")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows)
     }
 
     async fn list_assets(&self, params: ListAssetsParams<'_>) -> Result<(Vec<WorkshopAssetRow>, i64), DbError> {
@@ -222,6 +249,19 @@ impl IWorkshopRepository for SqliteWorkshopRepository {
             updated_at: now,
             ..existing
         })
+    }
+
+    async fn set_asset_thumb(&self, id: &str, thumb_rel_path: &str, now: i64) -> Result<(), DbError> {
+        let result = sqlx::query("UPDATE workshop_assets SET thumb_rel_path = ?, updated_at = ? WHERE id = ?")
+            .bind(thumb_rel_path)
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("workshop asset '{id}' not found")));
+        }
+        Ok(())
     }
 
     async fn delete_asset(&self, id: &str) -> Result<(), DbError> {
@@ -380,5 +420,35 @@ mod tests {
             repo.update_asset("nope", UpdateAssetParams::default(), 1).await.unwrap_err(),
             DbError::NotFound(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn set_canvas_thumbnail_and_asset_thumb() {
+        let (repo, _db) = repo().await;
+        repo.create_canvas("wsc_a", "画布", 1).await.unwrap();
+        let c = repo.set_canvas_thumbnail("wsc_a", "workshop/canvases/wsc_a/thumb.jpg", 5).await.unwrap();
+        assert_eq!(c.thumbnail_rel_path.as_deref(), Some("workshop/canvases/wsc_a/thumb.jpg"));
+        assert_eq!(c.updated_at, 5);
+        assert!(matches!(
+            repo.set_canvas_thumbnail("nope", "x", 1).await.unwrap_err(),
+            DbError::NotFound(_)
+        ));
+
+        repo.create_asset(&sample_asset("wsa_t", "image", "img")).await.unwrap();
+        repo.set_asset_thumb("wsa_t", "workshop/assets/thumbs/wsa_t.jpg", 6).await.unwrap();
+        let a = repo.get_asset("wsa_t").await.unwrap().unwrap();
+        assert_eq!(a.thumb_rel_path.as_deref(), Some("workshop/assets/thumbs/wsa_t.jpg"));
+        assert!(matches!(repo.set_asset_thumb("nope", "x", 1).await.unwrap_err(), DbError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn list_all_assets_returns_every_row() {
+        let (repo, _db) = repo().await;
+        repo.create_asset(&sample_asset("wsa_1", "image", "a")).await.unwrap();
+        let mut internal = sample_asset("wsa_2", "image", "b");
+        internal.in_library = false;
+        repo.create_asset(&internal).await.unwrap();
+        let all = repo.list_all_assets().await.unwrap();
+        assert_eq!(all.len(), 2);
     }
 }

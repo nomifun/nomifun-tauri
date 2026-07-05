@@ -12,6 +12,7 @@ pub enum ModelType {
     Vision,
     FunctionCalling,
     ImageGeneration,
+    VideoGeneration,
     WebSearch,
     Reasoning,
     Embedding,
@@ -363,6 +364,7 @@ mod tests {
             ModelType::Vision,
             ModelType::FunctionCalling,
             ModelType::ImageGeneration,
+            ModelType::VideoGeneration,
             ModelType::WebSearch,
             ModelType::Reasoning,
             ModelType::Embedding,
@@ -373,6 +375,19 @@ mod tests {
             let parsed: ModelType = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, mt);
         }
+    }
+
+    #[test]
+    fn test_model_type_generation_variants_serialize_snake_case() {
+        // The workshop/creation surfaces rely on these exact wire strings.
+        assert_eq!(
+            serde_json::to_string(&ModelType::ImageGeneration).unwrap(),
+            r#""image_generation""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ModelType::VideoGeneration).unwrap(),
+            r#""video_generation""#
+        );
     }
 
     // -- ModelCapability --

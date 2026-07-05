@@ -509,6 +509,7 @@ export type ModelType =
   | 'vision' // 视觉理解
   | 'function_calling' // 工具调用
   | 'image_generation' // 图像生成
+  | 'video_generation' // 视频生成
   | 'web_search' // 网络搜索
   | 'reasoning' // 推理模型
   | 'embedding' // 嵌入模型

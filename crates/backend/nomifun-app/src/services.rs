@@ -598,9 +598,29 @@ impl AppServices {
             &data_dir,
             Arc::new(nomifun_db::SqliteWorkshopRepository::new(database.pool().clone())),
         );
-        let creation_service = nomifun_creation::CreationService::new(Arc::new(
-            nomifun_db::SqliteCreationTaskRepository::new(database.pool().clone()),
+        // The generation engine resolves provider rows (endpoint + decrypted key,
+        // same machine-bound AES key the provider column uses), runs the media
+        // adapters over a proxy-aware HTTP client, and reads/writes canvas assets
+        // through the workshop bridge (AssetSource/AssetSink — no crate cycle).
+        // `reconcile_on_boot` (running-with-remote resume / else fail-interrupted)
+        // is driven from `build_creation_state` at router assembly.
+        let creation_http = nomifun_net::http_client();
+        let creation_asset_bridge = Arc::new(crate::workshop_bridge::WorkshopAssetBridge::new(
+            data_dir.clone(),
+            Arc::new(nomifun_db::SqliteWorkshopRepository::new(database.pool().clone())),
         ));
+        let creation_service = nomifun_creation::CreationService::builder(Arc::new(
+            nomifun_db::SqliteCreationTaskRepository::new(database.pool().clone()),
+        ))
+        .with_http(creation_http.clone())
+        .with_provider_repo(
+            Arc::new(nomifun_db::SqliteProviderRepository::new(database.pool().clone())),
+            encryption_key,
+        )
+        .with_asset_source(creation_asset_bridge.clone())
+        .with_asset_sink(creation_asset_bridge)
+        .with_providers(nomifun_creation::default_adapters(creation_http))
+        .build();
 
         // Headless seed: bind a Remote access token to the default companion so an
         // operator can configure the front door via env on a headless server.

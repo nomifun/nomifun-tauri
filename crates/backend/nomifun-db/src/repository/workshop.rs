@@ -30,6 +30,10 @@ pub trait IWorkshopRepository: Send + Sync {
     /// Delete a canvas index row. `DbError::NotFound` when the id is unknown.
     async fn delete_canvas(&self, id: &str) -> Result<(), DbError>;
 
+    /// Set (or replace) a canvas's gallery-thumbnail `rel_path`. The service
+    /// writes the thumbnail file first. `DbError::NotFound` when unknown.
+    async fn set_canvas_thumbnail(&self, id: &str, thumbnail_rel_path: &str, now: i64) -> Result<WorkshopCanvasRow, DbError>;
+
     // ---- assets ----
 
     /// Insert a fully-formed asset row.
@@ -38,12 +42,20 @@ pub trait IWorkshopRepository: Send + Sync {
     /// One asset by id, or `None`.
     async fn get_asset(&self, id: &str) -> Result<Option<WorkshopAssetRow>, DbError>;
 
+    /// Every asset row (no pagination) — for GC (orphan detection + on-disk
+    /// file reconciliation). The asset table is small enough to scan whole.
+    async fn list_all_assets(&self) -> Result<Vec<WorkshopAssetRow>, DbError>;
+
     /// Filtered + paginated listing. Returns `(page_items, total_matching)`.
     async fn list_assets(&self, params: ListAssetsParams<'_>) -> Result<(Vec<WorkshopAssetRow>, i64), DbError>;
 
     /// Partial update (title/collection/tags/in_library). `DbError::NotFound`
     /// when the id is unknown.
     async fn update_asset(&self, id: &str, params: UpdateAssetParams<'_>, now: i64) -> Result<WorkshopAssetRow, DbError>;
+
+    /// Set (or replace) an asset's thumbnail `rel_path` — used by lazy thumbnail
+    /// generation on the serve path. `DbError::NotFound` when the id is unknown.
+    async fn set_asset_thumb(&self, id: &str, thumb_rel_path: &str, now: i64) -> Result<(), DbError>;
 
     /// Delete an asset row (the service removes the file). `DbError::NotFound`
     /// when the id is unknown.

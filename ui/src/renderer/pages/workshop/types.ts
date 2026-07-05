@@ -222,6 +222,12 @@ export interface WorkshopImageNodeData {
   naturalWidth?: number;
   naturalHeight?: number;
   caption?: string;
+  /**
+   * Append-only (M1): whether the resize handle keeps the image's aspect ratio.
+   * Absent/undefined is treated as locked (default) by the canvas. Adding this
+   * optional field does not change any existing semantics.
+   */
+  lockAspect?: boolean;
 }
 
 /** Text node payload. */

@@ -1,25 +1,57 @@
 //! The [`MediaProvider`] adapter trait + its submit/poll value types (contract
-//! §6 `provider.rs`). Adapters live under `adapters/` (empty in M0).
+//! §6 `provider.rs`). Adapters live under `adapters/`.
 
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::types::{CreationError, CreationInput, MediaCapability};
+use crate::types::{CreationError, MediaCapability};
+
+/// A provider row resolved for one task: the decrypted primary API key + the
+/// endpoint shape the adapter needs. Built by the [`crate::CreationService`]
+/// from the `providers` row (never by the adapter) so the crypto/DB surface
+/// stays in one place.
+///
+/// Deliberately does **not** derive `Debug` — it holds a decrypted API key that
+/// must never land in a log line (mirrors `nomifun-ai-agent`'s
+/// `ResolvedProviderFields`).
+#[derive(Clone)]
+pub struct ResolvedProvider {
+    pub provider_id: String,
+    /// Provider platform tag (`openai` / `gemini` / `ark` / …) — drives routing.
+    pub platform: String,
+    /// Raw base URL from the provider row (trailing slash tolerated).
+    pub base_url: String,
+    /// Decrypted primary API key (first of comma/newline-separated keys).
+    pub api_key: String,
+    /// When true, `base_url` already carries the version path — adapters append
+    /// their operation path without inserting an extra `/v1`.
+    pub is_full_url: bool,
+}
+
+/// One input asset already loaded to bytes for an adapter (the service resolves
+/// `inputs[{asset_id,role}]` → bytes via its [`crate::AssetSource`] before
+/// calling `submit`). `role` is a free string
+/// (`reference|mask|first_frame|last_frame|video|audio`).
+#[derive(Clone)]
+pub struct InputAsset {
+    pub asset_id: String,
+    pub role: String,
+    pub bytes: Vec<u8>,
+    pub mime: String,
+}
 
 /// Everything an adapter needs to run one task: the resolved provider/model,
-/// the capability, the opaque parameter map, and the input asset references.
+/// the capability, the opaque parameter map, and the (byte-loaded) inputs.
 ///
-/// M2 will extend this with the decrypted endpoint/key (resolved by the service
-/// from the provider row) — kept out of M0 so the skeleton has no crypto/HTTP
-/// surface yet.
-#[derive(Debug, Clone)]
+/// No `Debug` — it carries the resolved provider (with its API key) and large
+/// input byte buffers.
 pub struct SubmitRequest {
-    pub provider_id: String,
+    pub provider: ResolvedProvider,
     pub model: String,
     pub capability: MediaCapability,
-    /// Opaque parameter snapshot (prompt/size/quality/count/…).
+    /// Opaque parameter snapshot (prompt/size/quality/count/seconds/…).
     pub params: Value,
-    pub inputs: Vec<CreationInput>,
+    pub inputs: Vec<InputAsset>,
 }
 
 /// A generated artifact handed back by an adapter: either inline bytes or a
@@ -54,11 +86,11 @@ pub enum PollResult {
     Failed(CreationError),
 }
 
-/// A media generation backend. Adapter ids: `openai_images | media_async |
-/// gemini_image | ark | modelscope | comfyui`.
+/// A media generation backend. Adapter ids: `openai_images | gemini_image |
+/// openai_video | ark | modelscope | comfyui`.
 #[async_trait]
 pub trait MediaProvider: Send + Sync {
-    /// Stable adapter id (matches the media-protocol tag on the provider).
+    /// Stable adapter id (matches the routing tag chosen by the engine).
     fn id(&self) -> &'static str;
 
     /// Whether this adapter can serve `cap`.
@@ -69,6 +101,6 @@ pub trait MediaProvider: Send + Sync {
     async fn submit(&self, req: &SubmitRequest) -> Result<SubmitAck, CreationError>;
 
     /// Poll an async job by its remote id. `req` is the original request (for
-    /// re-auth / endpoint reconstruction).
+    /// re-auth / endpoint reconstruction — inputs may be empty on a boot resume).
     async fn poll(&self, remote_task_id: &str, req: &SubmitRequest) -> Result<PollResult, CreationError>;
 }
