@@ -1141,6 +1141,7 @@
     "marketContributionAction": "前往 NomiHub 提交 PR",
     "marketComingSoon": "NomiHub 市场即将上线。",
     "detectCustomAgent": "识别自定义 Agent",
+    "refreshDetection": "刷新检测",
     "editCustomAgent": "编辑自定义 Agent",
     "localAgentsEmpty": "未检测到本地 Agent",
     "detected": "已检测",

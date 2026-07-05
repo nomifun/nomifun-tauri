@@ -7,7 +7,38 @@
 import { ipcBridge } from '@/common';
 import type { AgentMetadata } from '@/renderer/utils/model/agentTypes';
 import { DETECTED_AGENTS_SWR_KEY, fetchDetectedAgents } from '@/renderer/utils/model/agentTypes';
+import { useCallback, useEffect } from 'react';
 import useSWR, { mutate } from 'swr';
+
+const AGENT_AUTO_REFRESH_MIN_INTERVAL_MS = 30_000;
+
+let lastAgentAutoRefreshAt = 0;
+let agentAutoRefreshPromise: Promise<void> | null = null;
+
+async function refreshDetectedAgentsCache(): Promise<void> {
+  await ipcBridge.acpConversation.refreshCustomAgents.invoke();
+  await mutate(DETECTED_AGENTS_SWR_KEY);
+}
+
+export async function refreshDetectedAgentsIfStale(): Promise<void> {
+  const now = Date.now();
+  if (agentAutoRefreshPromise) {
+    return agentAutoRefreshPromise;
+  }
+  if (lastAgentAutoRefreshAt > 0 && now - lastAgentAutoRefreshAt < AGENT_AUTO_REFRESH_MIN_INTERVAL_MS) {
+    return;
+  }
+
+  lastAgentAutoRefreshAt = now;
+  agentAutoRefreshPromise = refreshDetectedAgentsCache()
+    .catch((error) => {
+      console.error('Failed to refresh detected agents:', error);
+    })
+    .finally(() => {
+      agentAutoRefreshPromise = null;
+    });
+  return agentAutoRefreshPromise;
+}
 
 export type UseAgentsResult = {
   agents: AgentMetadata[];
@@ -28,16 +59,19 @@ export type UseAgentsResult = {
  */
 export const useAgents = (): UseAgentsResult => {
   const { data, isLoading, error } = useSWR<AgentMetadata[]>(DETECTED_AGENTS_SWR_KEY, fetchDetectedAgents);
+  const revalidate = useCallback(() => mutate<AgentMetadata[]>(DETECTED_AGENTS_SWR_KEY), []);
+  const refreshCustomAgents = useCallback(refreshDetectedAgentsCache, []);
+
+  useEffect(() => {
+    void refreshDetectedAgentsIfStale();
+  }, []);
 
   return {
     agents: data ?? [],
     isLoading,
     error,
-    revalidate: () => mutate<AgentMetadata[]>(DETECTED_AGENTS_SWR_KEY),
-    refreshCustomAgents: async () => {
-      await ipcBridge.acpConversation.refreshCustomAgents.invoke();
-      await mutate(DETECTED_AGENTS_SWR_KEY);
-    },
+    revalidate,
+    refreshCustomAgents,
   };
 };
 

@@ -1140,6 +1140,7 @@
     "marketContributionAction": "Open a PR on NomiHub",
     "marketComingSoon": "NomiHub market is coming soon.",
     "detectCustomAgent": "Detect Custom Agent",
+    "refreshDetection": "Refresh detection",
     "editCustomAgent": "Edit Custom Agent",
     "localAgentsEmpty": "No local agents detected",
     "detected": "Detected",

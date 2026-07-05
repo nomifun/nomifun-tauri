@@ -2805,6 +2805,7 @@ export type I18nKey =
   | 'settings.agentManagement.notInstalled'
   | 'settings.agentManagement.notInstalledDesc'
   | 'settings.agentManagement.oneClickInstall'
+  | 'settings.agentManagement.refreshDetection'
   | 'settings.agentManagement.remoteAgents'
   | 'settings.agentManagement.remoteAgentsDescription'
   | 'settings.agentManagement.remoteManualGuide'
