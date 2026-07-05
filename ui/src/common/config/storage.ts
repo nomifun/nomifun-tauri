@@ -580,6 +580,11 @@ export interface IProvider {
    */
   enabled?: boolean;
   /**
+   * 供应商排序优先级，数值越小优先级越高。
+   * Provider priority order; lower values are used first.
+   */
+  sort_order?: number;
+  /**
    * 各个模型的启用状态，默认全部为 true
    * Individual model enabled states, defaults to all true
    */

@@ -9,8 +9,24 @@ import type { IProvider } from '@/common/config/storage';
 import { prefixedId } from '@/common/utils';
 import { Button, Divider, Message, Modal, Popconfirm, Popover, Input, Collapse, Tag, Switch, Tooltip } from '@arco-design/web-react';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
-import { Copy, DeleteFour, Info, Minus, Plus, Write, Heartbeat } from '@icon-park/react';
-import React, { useEffect, useState } from 'react';
+import { Copy, DeleteFour, Info, Minus, Plus, Write, Heartbeat, Drag } from '@icon-park/react';
+import {
+  closestCenter,
+  DndContext,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from '@dnd-kit/core';
+import {
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { isBackendHttpError } from '@/common/adapter/httpBridge';
@@ -31,6 +47,7 @@ import { useSettingsViewMode } from '../settingsViewContext';
 import { consumePendingDeepLink } from '@/renderer/hooks/system/useDeepLink';
 import { ContextLimitSelect, formatContextLimit } from '@/renderer/pages/settings/components/ContextLimitSelect';
 import { cloneProviderConfig } from '@/renderer/utils/model/providerClone';
+import { reorderById, reorderStrings, withDenseSortOrder } from './modelProviderOrdering';
 import '../model-provider.css';
 
 /**
@@ -250,6 +267,95 @@ const ModelContextLimitEditor: React.FC<{
   );
 };
 
+const providerSortableId = (providerId: string) => `provider:${providerId}`;
+const modelSortableId = (providerId: string, model: string) => `model:${providerId}:${model}`;
+
+type SortableDragData =
+  | { type: 'provider'; providerId: string }
+  | { type: 'model'; providerId: string; model: string };
+
+type SortableRenderProps = {
+  attributes: ReturnType<typeof useSortable>['attributes'];
+  listeners: ReturnType<typeof useSortable>['listeners'];
+  setActivatorNodeRef: ReturnType<typeof useSortable>['setActivatorNodeRef'];
+  isDragging: boolean;
+};
+
+const SortableProviderCard: React.FC<{
+  provider: IProvider;
+  children: (props: SortableRenderProps) => React.ReactNode;
+}> = ({ provider, children }) => {
+  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } = useSortable({
+    id: providerSortableId(provider.id),
+    data: { type: 'provider', providerId: provider.id } satisfies SortableDragData,
+  });
+
+  return (
+    <div
+      ref={setNodeRef}
+      className={isDragging ? 'model-provider-sortable-card is-dragging' : 'model-provider-sortable-card'}
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+      }}
+    >
+      {children({ attributes, listeners, setActivatorNodeRef, isDragging })}
+    </div>
+  );
+};
+
+const SortableModelRow: React.FC<{
+  providerId: string;
+  model: string;
+  children: (props: SortableRenderProps) => React.ReactNode;
+}> = ({ providerId, model, children }) => {
+  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } = useSortable({
+    id: modelSortableId(providerId, model),
+    data: { type: 'model', providerId, model } satisfies SortableDragData,
+  });
+
+  return (
+    <div
+      ref={setNodeRef}
+      className={isDragging ? 'model-provider-sortable-row is-dragging' : 'model-provider-sortable-row'}
+      style={{
+        transform: CSS.Transform.toString(transform),
+        transition,
+      }}
+    >
+      {children({ attributes, listeners, setActivatorNodeRef, isDragging })}
+    </div>
+  );
+};
+
+const PriorityDragHandle: React.FC<SortableRenderProps & { label: string }> = ({
+  attributes,
+  listeners,
+  setActivatorNodeRef,
+  isDragging,
+  label,
+}) => (
+  <Tooltip content={label}>
+    <span
+      ref={setActivatorNodeRef}
+      {...attributes}
+      {...listeners}
+      aria-label={label}
+      className={`model-provider-drag-handle inline-flex shrink-0 ${isDragging ? 'is-dragging' : ''}`}
+      style={{ touchAction: 'none' }}
+      onClick={(e) => e.stopPropagation()}
+      onMouseDown={(e) => e.stopPropagation()}
+    >
+      <Button
+        tabIndex={-1}
+        size='mini'
+        className='model-provider-action-btn !w-24px !h-24px !min-w-24px text-t-secondary hover:text-t-primary cursor-grab'
+        icon={<Drag theme='outline' size='14' />}
+      />
+    </span>
+  </Tooltip>
+);
+
 const ModelModalContent: React.FC = () => {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -264,6 +370,11 @@ const ModelModalContent: React.FC = () => {
   const [healthCheckLoading, setHealthCheckLoading] = useState<Record<string, boolean>>({});
   const { data, mutate } = useProvidersQuery();
   const [message, messageContext] = useArcoMessage();
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
+  );
+  const providerSortableItems = useMemo(() => (data || []).map((platform) => providerSortableId(platform.id)), [data]);
 
   /**
    * Create when the provider id is new, update otherwise.
@@ -348,6 +459,76 @@ const ModelModalContent: React.FC = () => {
         }
         message.error(t('settings.saveModelConfigFailed'));
       });
+  };
+
+  const persistProviderOrder = async (nextArray: IProvider[], previousArray: IProvider[]) => {
+    const previousById = new Map(previousArray.map((item) => [item.id, item.sort_order]));
+    const changed = nextArray.filter((item) => previousById.get(item.id) !== item.sort_order);
+
+    if (changed.length === 0) return;
+
+    await Promise.all(
+      changed.map((platform) =>
+        ipcBridge.mode.updateProvider.invoke({
+          id: platform.id,
+          sort_order: platform.sort_order,
+        })
+      )
+    );
+  };
+
+  const handleProviderDragEnd = (activeData: SortableDragData, overData: SortableDragData) => {
+    if (!data || activeData.type !== 'provider' || overData.type !== 'provider') return;
+
+    const reordered = reorderById(data, activeData.providerId, overData.providerId);
+    if (reordered === data) return;
+
+    const nextArray = withDenseSortOrder(reordered);
+    void mutate(nextArray, false);
+
+    persistProviderOrder(nextArray, data)
+      .then(() => {
+        void mutate();
+      })
+      .catch((error) => {
+        void mutate();
+        console.error('Failed to save provider order:', error);
+        message.error(t('settings.saveModelConfigFailed'));
+      });
+  };
+
+  const handleModelDragEnd = (activeData: SortableDragData, overData: SortableDragData) => {
+    if (activeData.type !== 'model' || overData.type !== 'model' || activeData.providerId !== overData.providerId) {
+      return;
+    }
+
+    const platform = (data || []).find((item) => item.id === activeData.providerId);
+    if (!platform) return;
+
+    const nextModels = reorderStrings(platform.models ?? [], activeData.model, overData.model);
+    if (nextModels === platform.models) return;
+
+    updatePlatform(
+      {
+        ...platform,
+        models: nextModels,
+      },
+      () => {}
+    );
+  };
+
+  const handleDragEnd = ({ active, over }: DragEndEvent) => {
+    if (!over || active.id === over.id) return;
+
+    const activeData = active.data.current as SortableDragData | undefined;
+    const overData = over.data.current as SortableDragData | undefined;
+    if (!activeData || !overData || activeData.type !== overData.type) return;
+
+    if (activeData.type === 'provider') {
+      handleProviderDragEnd(activeData, overData);
+    } else {
+      handleModelDragEnd(activeData, overData);
+    }
   };
 
   const duplicatePlatform = (platform: IProvider) => {
@@ -595,18 +776,21 @@ const ModelModalContent: React.FC = () => {
             </p>
           </div>
         ) : (
-          <div className='space-y-16px'>
+          <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+            <SortableContext items={providerSortableItems} strategy={verticalListSortingStrategy}>
+              <div className='space-y-16px'>
             {(data || []).map((platform: IProvider) => {
               const key = platform.id;
               const isExpanded = collapseKey[platform.id] ?? false;
               return (
+                <SortableProviderCard key={key} provider={platform}>
+                  {({ attributes, listeners, setActivatorNodeRef, isDragging }) => (
                 <Collapse
                   activeKey={isExpanded ? ['image-generation'] : []}
                   onChange={(_, activeKeys) => {
                     const expanded = activeKeys.includes('image-generation');
                     setCollapseKey((prev) => ({ ...prev, [platform.id]: expanded }));
                   }}
-                  key={key}
                   bordered
                   expandIconPosition='left'
                   className={`[&_.arco-collapse-item]:!border-0 [&_.arco-collapse-item]:!rounded-12px [&_.arco-collapse-item]:!overflow-hidden [&_.arco-collapse-item]:!bg-[var(--color-bg-2)] [&_.arco-collapse-item-header]:!bg-[var(--fill-0)] [&_.arco-collapse-item-header]:!pl-36px [&_.arco-collapse-item-header]:!pr-12px [&_.arco-collapse-item-header]:!py-8px [&_.arco-collapse-item-header]:transition-colors [&_.arco-collapse-item-header]:hover:!bg-[var(--color-bg-2)] [&_.arco-collapse-item-header]:!gap-8px [&_.arco-collapse-item-header-title]:!min-w-0 [&_.arco-collapse-item-header-icon]:!text-2 [&_.arco-collapse-item-header:hover_.arco-collapse-item-header-icon]:!text-1 [&_.arco-collapse-item-content]:!bg-fill-1 [&_.arco-collapse-item-content-box]:!px-10px [&_.arco-collapse-item-content-box]:!py-8px [&_.arco-collapse-item-content]:!border-t [&_.arco-collapse-item-content]:!border-[var(--color-border-2)] ${
@@ -620,11 +804,20 @@ const ModelModalContent: React.FC = () => {
                     className='[&_.arco-collapse-item-header-title]:flex-1 group'
                     header={
                       <div className='group flex items-center justify-between w-full min-h-32px gap-8px min-w-0'>
-                        <span
-                          className={`text-14px font-500 truncate min-w-0 transition-colors ${isExpanded ? 'text-t-primary' : 'text-2 group-hover:text-1'}`}
-                        >
-                          {platform.name}
-                        </span>
+                        <div className='flex items-center gap-8px min-w-0 flex-1'>
+                          <PriorityDragHandle
+                            attributes={attributes}
+                            listeners={listeners}
+                            setActivatorNodeRef={setActivatorNodeRef}
+                            isDragging={isDragging}
+                            label={t('settings.dragProviderPriority', { defaultValue: '拖拽调整供应商优先级' })}
+                          />
+                          <span
+                            className={`text-14px font-500 truncate min-w-0 transition-colors ${isExpanded ? 'text-t-primary' : 'text-2 group-hover:text-1'}`}
+                          >
+                            {platform.name}
+                          </span>
+                        </div>
                         <div
                           className='flex items-center gap-8px shrink-0'
                           onClick={(e) => {
@@ -634,7 +827,7 @@ const ModelModalContent: React.FC = () => {
                             e.stopPropagation();
                           }}
                         >
-                          <span className={`text-12px text-t-secondary whitespace-nowrap items-center overflow-hidden max-w-0 opacity-0 group-hover:max-w-200px group-hover:opacity-100 transition-all duration-180 ${isWide ? 'inline-flex' : 'hidden'}`}>
+                          <span className={`text-12px text-t-secondary whitespace-nowrap items-center ${isWide ? 'inline-flex' : 'hidden'}`}>
                             <span
                               className='cursor-pointer hover:text-t-primary transition-colors'
                               onClick={() => setCollapseKey((prev) => ({ ...prev, [platform.id]: !isExpanded }))}
@@ -694,6 +887,10 @@ const ModelModalContent: React.FC = () => {
                       </div>
                     }
                   >
+                    <SortableContext
+                      items={(platform.models ?? []).map((model) => modelSortableId(platform.id, model))}
+                      strategy={verticalListSortingStrategy}
+                    >
                     {(platform.models ?? []).map((model: string, index: number, arr: string[]) => {
                       const isNewApiProvider = isNewApiPlatform(platform.platform);
                       const modelProtocol = platform.model_protocols?.[model] || 'openai';
@@ -704,10 +901,25 @@ const ModelModalContent: React.FC = () => {
                       const inheritedContextLimit = modelContextLimit == null ? platform.context_limit : undefined;
 
                       return (
-                        <div key={model}>
+                        <SortableModelRow key={model} providerId={platform.id} model={model}>
+                          {({
+                            attributes: modelAttributes,
+                            listeners: modelListeners,
+                            setActivatorNodeRef: setModelActivatorNodeRef,
+                            isDragging: modelIsDragging,
+                          }) => (
+                        <div>
                           <div className='flex items-center justify-between px-8px py-12px transition-colors hover:bg-[var(--fill-0)]'>
                             <div className='flex flex-col min-w-0 flex-1 gap-2px'>
                               <div className='flex items-center gap-8px min-w-0'>
+                                <PriorityDragHandle
+                                  attributes={modelAttributes}
+                                  listeners={modelListeners}
+                                  setActivatorNodeRef={setModelActivatorNodeRef}
+                                  isDragging={modelIsDragging}
+                                  label={t('settings.dragModelPriority', { defaultValue: '拖拽调整模型优先级' })}
+                                />
+
                                 {/* 健康状态指示器 / Health status indicator */}
                                 {healthStatus !== 'unknown' && (
                                   <Tooltip
@@ -878,13 +1090,20 @@ const ModelModalContent: React.FC = () => {
                           </div>
                           {index < arr.length - 1 && <Divider className='!my-0 !border-[var(--color-border-2)]/70' />}
                         </div>
+                          )}
+                        </SortableModelRow>
                       );
                     })}
+                    </SortableContext>
                   </Collapse.Item>
                 </Collapse>
+                  )}
+                </SortableProviderCard>
               );
             })}
-          </div>
+              </div>
+            </SortableContext>
+          </DndContext>
         )}
       </NomiScrollArea>
     </div>

@@ -314,6 +314,8 @@
   "modelCount": "Model",
   "apiKeyCount": "API Key",
   "copyProviderConfig": "Duplicate provider config",
+  "dragProviderPriority": "Drag to reorder provider priority",
+  "dragModelPriority": "Drag to reorder model priority",
   "providerCopySuffix": "Copy",
   "providerConfigCopied": "Copied provider config: {{name}}",
   "pleaseEnterBaseUrlAndApiKey": "Please enter base url and api key",

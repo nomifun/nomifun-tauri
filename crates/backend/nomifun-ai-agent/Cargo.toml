@@ -32,6 +32,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+toml.workspace = true
 nomi-agent.workspace = true
 nomi-types.workspace = true
 nomi-protocol.workspace = true

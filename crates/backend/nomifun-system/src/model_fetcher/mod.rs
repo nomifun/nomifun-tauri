@@ -236,6 +236,7 @@ mod tests {
                 model_health: None,
                 bedrock_config: None,
                 is_full_url: false,
+                sort_order: None,
             })
             .await
             .unwrap();

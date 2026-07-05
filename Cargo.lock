@@ -5302,6 +5302,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tokio-util",
+ "toml 0.8.2",
  "tracing",
  "tracing-subscriber",
  "ts-rs",

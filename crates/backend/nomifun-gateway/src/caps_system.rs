@@ -229,6 +229,7 @@ async fn create_provider(deps: Arc<GatewayDeps>, p: CreateProviderParams) -> Val
         model_health: None,
         bedrock_config,
         is_full_url: false,
+        sort_order: None,
     };
     match deps.provider_service.create(req).await {
         Ok(resp) => ok(json!({
@@ -268,6 +269,7 @@ async fn update_provider(deps: Arc<GatewayDeps>, p: UpdateProviderParams) -> Val
         model_health: None,
         bedrock_config,
         is_full_url: None,
+        sort_order: None,
     };
     match deps.provider_service.update(&p.id, req).await {
         Ok(resp) => ok(json!({

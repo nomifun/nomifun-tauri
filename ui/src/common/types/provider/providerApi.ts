@@ -28,6 +28,7 @@ export interface CreateProviderRequest {
   api_key: string;
   models?: string[];
   enabled?: boolean;
+  sort_order?: number;
   capabilities?: ModelCapability[];
   context_limit?: number;
   model_context_limits?: Record<string, number>;
@@ -50,6 +51,7 @@ export interface UpdateProviderRequest {
   api_key?: string;
   models?: string[];
   enabled?: boolean;
+  sort_order?: number;
   capabilities?: ModelCapability[];
   context_limit?: number;
   model_context_limits?: Record<string, number>;

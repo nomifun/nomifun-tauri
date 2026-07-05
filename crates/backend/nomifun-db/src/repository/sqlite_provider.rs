@@ -20,9 +20,11 @@ impl SqliteProviderRepository {
 #[async_trait::async_trait]
 impl IProviderRepository for SqliteProviderRepository {
     async fn list(&self) -> Result<Vec<Provider>, DbError> {
-        let rows = sqlx::query_as::<_, Provider>("SELECT * FROM providers ORDER BY created_at ASC")
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query_as::<_, Provider>(
+            "SELECT * FROM providers ORDER BY sort_order ASC, created_at ASC, id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
 
         Ok(rows)
     }
@@ -42,13 +44,23 @@ impl IProviderRepository for SqliteProviderRepository {
             .map(String::from)
             .unwrap_or_else(|| nomifun_common::generate_prefixed_id("prov"));
         let now = nomifun_common::now_ms();
+        let sort_order = match params.sort_order {
+            Some(value) => value,
+            None => {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM providers",
+                )
+                .fetch_one(&self.pool)
+                .await?
+            }
+        };
 
         sqlx::query(
             "INSERT INTO providers \
                 (id, platform, name, base_url, api_key_encrypted, models, enabled, \
                  capabilities, context_limit, model_context_limits, model_protocols, model_descriptions, \
-                 model_enabled, model_health, bedrock_config, is_full_url, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 model_enabled, model_health, bedrock_config, is_full_url, sort_order, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(params.platform)
@@ -67,6 +79,7 @@ impl IProviderRepository for SqliteProviderRepository {
         .bind(params.model_health)
         .bind(params.bedrock_config)
         .bind(params.is_full_url)
+        .bind(sort_order)
         .bind(now)
         .bind(now)
         .execute(&self.pool)
@@ -95,6 +108,7 @@ impl IProviderRepository for SqliteProviderRepository {
             model_health: params.model_health.map(String::from),
             bedrock_config: params.bedrock_config.map(String::from),
             is_full_url: params.is_full_url,
+            sort_order,
             created_at: now,
             updated_at: now,
         })
@@ -113,7 +127,7 @@ impl IProviderRepository for SqliteProviderRepository {
                 platform = ?, name = ?, base_url = ?, api_key_encrypted = ?, \
                 models = ?, enabled = ?, capabilities = ?, context_limit = ?, \
                 model_context_limits = ?, model_protocols = ?, model_descriptions = ?, model_enabled = ?, \
-                model_health = ?, bedrock_config = ?, is_full_url = ?, updated_at = ? \
+                model_health = ?, bedrock_config = ?, is_full_url = ?, sort_order = ?, updated_at = ? \
              WHERE id = ?",
         )
         .bind(&merged.platform)
@@ -132,6 +146,7 @@ impl IProviderRepository for SqliteProviderRepository {
         .bind(&merged.model_health)
         .bind(&merged.bedrock_config)
         .bind(merged.is_full_url)
+        .bind(merged.sort_order)
         .bind(merged.updated_at)
         .bind(id)
         .execute(&self.pool)
@@ -194,6 +209,7 @@ fn merge_update(existing: Provider, params: UpdateProviderParams<'_>) -> Provide
             .bedrock_config
             .map_or(existing.bedrock_config, |v| v.map(String::from)),
         is_full_url: params.is_full_url.unwrap_or(existing.is_full_url),
+        sort_order: params.sort_order.unwrap_or(existing.sort_order),
         created_at: existing.created_at,
         updated_at: now,
     }
@@ -228,6 +244,7 @@ mod tests {
             model_health: None,
             bedrock_config: None,
             is_full_url: false,
+            sort_order: None,
         }
     }
 

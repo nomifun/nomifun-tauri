@@ -696,6 +696,7 @@ mod fallback_tests {
             model_health: None,
             bedrock_config: None,
             is_full_url: false,
+            sort_order: 0,
             created_at: 0,
             updated_at: 0,
         }

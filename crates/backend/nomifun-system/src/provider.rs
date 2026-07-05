@@ -76,6 +76,7 @@ impl ProviderService {
             model_health: model_health_json.as_deref(),
             bedrock_config: bedrock_json.as_deref(),
             is_full_url: req.is_full_url,
+            sort_order: req.sort_order,
         };
 
         let row = self.repo.create(params).await?;
@@ -116,6 +117,7 @@ impl ProviderService {
             model_health: model_health_json.as_ref().map(|s| Some(s.as_str())),
             bedrock_config: bedrock_json.as_ref().map(|s| Some(s.as_str())),
             is_full_url: req.is_full_url,
+            sort_order: req.sort_order,
         };
 
         let row = self.repo.update(id, params).await?;
@@ -190,6 +192,7 @@ impl ProviderService {
             model_health,
             bedrock_config,
             is_full_url: row.is_full_url,
+            sort_order: row.sort_order,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
@@ -251,6 +254,7 @@ fn validate_create_request(req: &CreateProviderRequest) -> Result<(), AppError> 
     if req.name.trim().is_empty() {
         return Err(AppError::BadRequest("name is required".into()));
     }
+    validate_sort_order(req.sort_order)?;
     // Bedrock auths via bedrock_config (IAM profile / static keys) rather than
     // an HTTP endpoint + bearer key, so baseUrl and apiKey may be empty.
     if req.platform == "bedrock" {
@@ -296,6 +300,7 @@ fn validate_id(id: &str) -> Result<(), AppError> {
 }
 
 fn validate_update_request(req: &UpdateProviderRequest) -> Result<(), AppError> {
+    validate_sort_order(req.sort_order)?;
     if let Some(ref platform) = req.platform
         && platform.trim().is_empty()
     {
@@ -310,6 +315,13 @@ fn validate_update_request(req: &UpdateProviderRequest) -> Result<(), AppError> 
         && !url.trim().is_empty()
     {
         validate_base_url(url)?;
+    }
+    Ok(())
+}
+
+fn validate_sort_order(sort_order: Option<i64>) -> Result<(), AppError> {
+    if sort_order.is_some_and(|value| value < 0) {
+        return Err(AppError::BadRequest("sort_order must be non-negative".into()));
     }
     Ok(())
 }
@@ -359,6 +371,7 @@ mod tests {
             model_health: None,
             bedrock_config: None,
             is_full_url: false,
+            sort_order: None,
         }
     }
 

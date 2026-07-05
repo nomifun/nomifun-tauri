@@ -43,6 +43,8 @@ pub struct CreateProviderParams<'a> {
     pub model_health: Option<&'a str>,
     pub bedrock_config: Option<&'a str>,
     pub is_full_url: bool,
+    /// Optional explicit provider priority. Omitted means append after current max.
+    pub sort_order: Option<i64>,
 }
 
 /// Parameters for updating an existing provider.
@@ -65,4 +67,5 @@ pub struct UpdateProviderParams<'a> {
     pub model_health: Option<Option<&'a str>>,
     pub bedrock_config: Option<Option<&'a str>>,
     pub is_full_url: Option<bool>,
+    pub sort_order: Option<i64>,
 }

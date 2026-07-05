@@ -24,3 +24,28 @@
 [data-theme='dark'] .model-provider-action-btn.arco-btn:active {
   background-color: var(--color-bg-1) !important;
 }
+
+.model-provider-sortable-card,
+.model-provider-sortable-row {
+  position: relative;
+}
+
+.model-provider-sortable-card.is-dragging,
+.model-provider-sortable-row.is-dragging {
+  z-index: 5;
+  opacity: 0.86;
+}
+
+.model-provider-drag-handle {
+  cursor: grab;
+}
+
+.model-provider-drag-handle.is-dragging {
+  cursor: grabbing;
+}
+
+.model-provider-drag-handle:focus-visible {
+  outline: 2px solid rgba(var(--primary-6), 0.45);
+  outline-offset: 2px;
+  border-radius: 6px;
+}

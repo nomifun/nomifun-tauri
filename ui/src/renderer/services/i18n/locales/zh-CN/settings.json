@@ -314,6 +314,8 @@
   "modelCount": "模型",
   "apiKeyCount": "API Key",
   "copyProviderConfig": "复制整组配置",
+  "dragProviderPriority": "拖拽调整供应商优先级",
+  "dragModelPriority": "拖拽调整模型优先级",
   "providerCopySuffix": "副本",
   "providerConfigCopied": "已复制配置：{{name}}",
   "pleaseEnterBaseUrlAndApiKey": "请输入base url和api key",

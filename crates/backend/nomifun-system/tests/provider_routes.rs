@@ -128,6 +128,119 @@ async fn list_providers_returns_plaintext_api_key() {
     assert!(!api_key.contains("***"));
 }
 
+#[tokio::test]
+async fn provider_sort_order_round_trips_create_update_and_list() {
+    let (_app, db) = setup().await;
+
+    let first_body = json!({
+        "platform": "openai",
+        "name": "Low Priority",
+        "base_url": "https://api.openai.com",
+        "api_key": "sk-low",
+        "sort_order": 10
+    });
+    let second_body = json!({
+        "platform": "anthropic",
+        "name": "High Priority",
+        "base_url": "https://api.anthropic.com",
+        "api_key": "sk-high",
+        "sort_order": 0
+    });
+
+    let app1 = system_routes(build_state(&db));
+    let first_resp = app1
+        .oneshot(json_request("POST", "/api/providers", first_body))
+        .await
+        .unwrap();
+    assert_eq!(first_resp.status(), StatusCode::CREATED);
+    let first_json = body_json(first_resp).await;
+    let first_id = first_json["data"]["id"].as_str().unwrap().to_string();
+    assert_eq!(first_json["data"]["sort_order"], 10);
+
+    let app2 = system_routes(build_state(&db));
+    let second_resp = app2
+        .oneshot(json_request("POST", "/api/providers", second_body))
+        .await
+        .unwrap();
+    assert_eq!(second_resp.status(), StatusCode::CREATED);
+    let second_json = body_json(second_resp).await;
+    let second_id = second_json["data"]["id"].as_str().unwrap().to_string();
+    assert_eq!(second_json["data"]["sort_order"], 0);
+
+    let app3 = system_routes(build_state(&db));
+    let list_resp = app3.oneshot(get_request("/api/providers")).await.unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let list_json = body_json(list_resp).await;
+    let providers = list_json["data"].as_array().unwrap();
+    assert_eq!(providers[0]["id"], second_id);
+    assert_eq!(providers[0]["sort_order"], 0);
+    assert_eq!(providers[1]["id"], first_id);
+    assert_eq!(providers[1]["sort_order"], 10);
+
+    let app4 = system_routes(build_state(&db));
+    let update_resp = app4
+        .oneshot(json_request("PUT", &format!("/api/providers/{second_id}"), json!({"sort_order": 20})))
+        .await
+        .unwrap();
+    assert_eq!(update_resp.status(), StatusCode::OK);
+    let update_json = body_json(update_resp).await;
+    assert_eq!(update_json["data"]["sort_order"], 20);
+
+    let app5 = system_routes(build_state(&db));
+    let relist_resp = app5.oneshot(get_request("/api/providers")).await.unwrap();
+    let relist_json = body_json(relist_resp).await;
+    let providers = relist_json["data"].as_array().unwrap();
+    assert_eq!(providers[0]["id"], first_id);
+    assert_eq!(providers[0]["sort_order"], 10);
+    assert_eq!(providers[1]["id"], second_id);
+    assert_eq!(providers[1]["sort_order"], 20);
+}
+
+#[tokio::test]
+async fn provider_sort_order_rejects_negative_values() {
+    let (_app, db) = setup().await;
+
+    let create_resp = system_routes(build_state(&db))
+        .oneshot(json_request(
+            "POST",
+            "/api/providers",
+            json!({
+                "platform": "openai",
+                "name": "Invalid Priority",
+                "base_url": "https://api.openai.com",
+                "api_key": "sk-test",
+                "sort_order": -1
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_resp.status(), StatusCode::BAD_REQUEST);
+
+    let create_valid = system_routes(build_state(&db))
+        .oneshot(json_request(
+            "POST",
+            "/api/providers",
+            json!({
+                "platform": "openai",
+                "name": "Valid Priority",
+                "base_url": "https://api.openai.com",
+                "api_key": "sk-test",
+                "sort_order": 0
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(create_valid.status(), StatusCode::CREATED);
+    let created_json = body_json(create_valid).await;
+    let id = created_json["data"]["id"].as_str().unwrap();
+
+    let update_resp = system_routes(build_state(&db))
+        .oneshot(json_request("PUT", &format!("/api/providers/{id}"), json!({"sort_order": -1})))
+        .await
+        .unwrap();
+    assert_eq!(update_resp.status(), StatusCode::BAD_REQUEST);
+}
+
 // ===========================================================================
 // POST /api/providers — create
 // ===========================================================================

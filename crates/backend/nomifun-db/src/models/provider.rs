@@ -34,6 +34,8 @@ pub struct Provider {
     /// When true, base_url is treated as a complete endpoint URL.
     /// The system will NOT append paths like /v1/chat/completions.
     pub is_full_url: bool,
+    /// Lower values have higher priority in provider selection.
+    pub sort_order: i64,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }

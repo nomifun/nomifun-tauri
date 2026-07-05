@@ -147,6 +147,7 @@ pub struct ProviderResponse {
     pub bedrock_config: Option<BedrockConfig>,
     #[serde(default)]
     pub is_full_url: bool,
+    pub sort_order: i64,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -186,6 +187,8 @@ pub struct CreateProviderRequest {
     pub bedrock_config: Option<BedrockConfig>,
     #[serde(default)]
     pub is_full_url: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_order: Option<i64>,
 }
 
 fn default_true() -> bool {
@@ -212,6 +215,7 @@ pub struct UpdateProviderRequest {
     pub model_health: Option<HashMap<String, ModelHealthStatus>>,
     pub bedrock_config: Option<BedrockConfig>,
     pub is_full_url: Option<bool>,
+    pub sort_order: Option<i64>,
 }
 
 /// Request body for `POST /api/providers/:id/models`.
@@ -496,6 +500,7 @@ mod tests {
             model_health: None,
             bedrock_config: None,
             is_full_url: false,
+            sort_order: 0,
             created_at: 1712345678000,
             updated_at: 1712345678000,
         };
@@ -531,6 +536,7 @@ mod tests {
             model_health: None,
             bedrock_config: None,
             is_full_url: false,
+            sort_order: 0,
             created_at: 0,
             updated_at: 0,
         };
@@ -659,6 +665,7 @@ mod tests {
             model_health: None,
             bedrock_config: None,
             is_full_url: false,
+            sort_order: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("id").is_none());

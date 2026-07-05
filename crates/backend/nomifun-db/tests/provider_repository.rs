@@ -32,6 +32,7 @@ fn sample_params() -> CreateProviderParams<'static> {
         model_health: None,
         bedrock_config: None,
         is_full_url: false,
+        sort_order: None,
     }
 }
 
@@ -128,6 +129,68 @@ async fn list_returns_all_providers_in_creation_order() {
     assert_eq!(all.len(), 2);
     assert_eq!(all[0].id, first.id);
     assert_eq!(all[1].id, second.id);
+}
+
+#[tokio::test]
+async fn provider_sort_order_defaults_to_append_order() {
+    let r = repo().await;
+    let first = r.create(sample_params()).await.unwrap();
+    let second = r
+        .create(CreateProviderParams {
+            platform: "openai",
+            name: "OpenAI",
+            ..sample_params()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(first.sort_order, 0);
+    assert_eq!(second.sort_order, 1);
+
+    let all = r.list().await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].id, first.id);
+    assert_eq!(all[1].id, second.id);
+}
+
+#[tokio::test]
+async fn provider_sort_order_controls_list_priority() {
+    let r = repo().await;
+    let first = r.create(sample_params()).await.unwrap();
+    let second = r
+        .create(CreateProviderParams {
+            platform: "openai",
+            name: "OpenAI",
+            ..sample_params()
+        })
+        .await
+        .unwrap();
+
+    r.update(
+        &first.id,
+        UpdateProviderParams {
+            sort_order: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    r.update(
+        &second.id,
+        UpdateProviderParams {
+            sort_order: Some(0),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let all = r.list().await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].id, second.id);
+    assert_eq!(all[0].sort_order, 0);
+    assert_eq!(all[1].id, first.id);
+    assert_eq!(all[1].sort_order, 1);
 }
 
 // -- Update --
