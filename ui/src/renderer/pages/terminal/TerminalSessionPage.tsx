@@ -55,9 +55,10 @@ const TERMINAL_PREVIEW_MIN_PX = 260;
  *    to non-mac/Windows desktop (identical to ChatLayout).
  *  - The rail collapses to width 0; {@link DesktopWorkspaceToggle} is the
  *    floating expand affordance when collapsed (Linux/web only).
- *  - It auto-expands on `WORKSPACE_HAS_FILES_EVENT` once the cwd's files load
- *    (not a temp workspace), so a terminal opened on a populated dir shows the
- *    rail without a manual toggle.
+ *  - It explicitly auto-expands on the current terminal's
+ *    `WORKSPACE_HAS_FILES_EVENT` once the cwd's files load (not a temp
+ *    workspace), so a terminal opened on a populated dir shows the rail without
+ *    a manual toggle.
  */
 const TerminalRightRegion: React.FC<{ session: ITerminalSession }> = ({ session }) => {
   const { t } = useTranslation();
@@ -84,6 +85,8 @@ const TerminalRightRegion: React.FC<{ session: ITerminalSession }> = ({ session 
     isMobile,
     preferenceKey: `terminal-${session.id}`,
     isTemporaryWorkspace: false,
+    autoExpandOnFiles: true,
+    workspaceEventKey: String(session.id),
   });
 
   // Rail width (px), persisted. Drag handle on the rail's LEFT edge → reverse:true.

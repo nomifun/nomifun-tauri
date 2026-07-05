@@ -8,7 +8,7 @@ import React, { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import classNames from 'classnames';
 import { Popconfirm } from '@arco-design/web-react';
-import { CheckOne, Pause, PauseOne, PlayOne, Refresh } from '@icon-park/react';
+import { CheckOne, Loading, Pause, PauseOne, PlayOne, Refresh } from '@icon-park/react';
 import { ipcBridge } from '@/common';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 
@@ -62,22 +62,39 @@ const HeaderControl: React.FC<{
 /**
  * RunControls — the status-aware run-control button group, lifted UP from the
  * DAG canvas into the shared glass header so it is reachable from BOTH the 对话
- * and 编排画布 views (and rendered exactly once). Status gating mirrors the old
- * run-detail header: awaiting → approve (primary); running → pause; paused → resume;
- * any non-terminal run → confirm-guarded cancel. Each action calls its REST
- * endpoint, toasts via {@link useArcoMessage}, then refetches.
+ * and 编排画布 views (and rendered exactly once). There is ALWAYS a meaningful
+ * primary control visible — the header never collapses to "no buttons":
+ *  - `awaiting_plan_approval` → approve (primary);
+ *  - `running` → pause (+ a read-only 「进行中 N」live-worker badge);
+ *  - `paused` → resume;
+ *  - `planning` / `''` (detail not yet loaded) → a disabled busy「规划中…」placeholder;
+ *  - terminal (`completed`/`failed`/`cancelled`) → replan is the primary「再来一次」;
+ *  - any non-terminal run → confirm-guarded cancel.
+ * `replan` is rendered in every state. Each action calls its REST endpoint,
+ * toasts via {@link useArcoMessage}, then refetches. `inFlightCount` is the number
+ * of `running` worker tasks (from `detail.tasks`), used for the active-run badge.
  */
 export const RunControls: React.FC<{
   runId: string;
   status: string;
+  inFlightCount?: number;
   refetch: () => Promise<void>;
   onReplan: () => void;
-}> = ({ runId, status, refetch, onReplan }) => {
+}> = ({ runId, status, inFlightCount, refetch, onReplan }) => {
   const { t } = useTranslation();
   const [message, msgCtx] = useArcoMessage();
   const [busy, setBusy] = useState(false);
 
-  const isTerminal = status === 'completed' || status === 'failed' || status === 'cancelled';
+  const isTerminal =
+    status === 'completed' ||
+    status === 'failed' ||
+    status === 'cancelled' ||
+    status === 'completed_with_failures';
+  // `planning` (fleet still building the graph) and `''` (detail not yet loaded) both
+  // render a disabled busy placeholder so the header always shows a primary control.
+  const isBusyPlaceholder = status === 'planning' || status === '';
+  // Active-run badge: pause now cancels in-flight workers instead of draining them.
+  const showDraining = status === 'running' && typeof inFlightCount === 'number' && inFlightCount > 0;
 
   const run = useCallback(
     async (
@@ -135,6 +152,13 @@ export const RunControls: React.FC<{
           <CheckOne theme='outline' size='14' strokeWidth={3} />
         </HeaderControl>
       )}
+      {isBusyPlaceholder && (
+        // Disabled busy primary — clicks suppressed (busy). Guarantees the header
+        // always presents a meaningful primary control, even before detail loads.
+        <HeaderControl label={t('orchestrator.run.detail.planningHint')} onClick={() => {}} busy tone='primary'>
+          <Loading theme='outline' size='14' strokeWidth={3} className='animate-spin line-height-0' />
+        </HeaderControl>
+      )}
       {status === 'running' && (
         <HeaderControl label={t('orchestrator.run.detail.pause')} onClick={onPause} busy={busy}>
           <PauseOne theme='outline' size='14' strokeWidth={3} />
@@ -144,6 +168,14 @@ export const RunControls: React.FC<{
         <HeaderControl label={t('orchestrator.run.detail.resume')} onClick={onResume} busy={busy}>
           <PlayOne theme='outline' size='14' strokeWidth={3} />
         </HeaderControl>
+      )}
+      {showDraining && (
+        // Read-only status badge (NOT a HeaderControl) — mirrors the status pill so it
+        // can't be mis-clicked. Signals the run currently has live workers.
+        <span className='inline-flex items-center gap-4px rd-8px px-8px h-30px text-11px font-500 text-t-secondary border border-b-base'>
+          <Loading theme='outline' size='12' strokeWidth={3} className='animate-spin line-height-0' />
+          {t('orchestrator.run.detail.draining', { count: inFlightCount })}
+        </span>
       )}
       {!isTerminal && (
         <Popconfirm

@@ -46,9 +46,10 @@ const repo = flag('repo', DEFAULT_REPO);
 const out = flag('out', DEFAULT_OUT);
 const collect = flag('collect', false) === true;
 const version = flag('version') || readWorkspaceVersion();
+const notesArg = flag('notes');
 const notesFile = flag('notes-file');
 const notesFromFile = typeof notesFile === 'string' && existsSync(notesFile) ? readFileSync(notesFile, 'utf8').trim() : null;
-const notes = flag('notes') || notesFromFile || readChangelogNotes(version) || `NomiFun v${version}`;
+let notes = typeof notesArg === 'string' ? notesArg : notesFromFile;
 const distDir = join(ROOT, 'dist/desktop');
 
 // 单一真源版本号：根 Cargo.toml 的 [workspace.package].version。
@@ -187,7 +188,7 @@ if (foundKeys.length === 0) {
 }
 
 // ── 合并进既有 latest.json（同版本时保留其它平台的真实条目，丢弃占位模板条目）。 ──
-const manifest = { version, notes, pub_date: new Date().toISOString(), platforms: {} };
+const manifest = { version, notes: '', pub_date: new Date().toISOString(), platforms: {} };
 if (existsSync(out)) {
   try {
     const prev = JSON.parse(readFileSync(out, 'utf8'));
@@ -195,6 +196,7 @@ if (existsSync(out)) {
     // 指向上一版的下载链（首发某个新版本时尤其危险——如 0.1.14 里残留 0.1.13 的 darwin
     // 条目）。版本不同则视为新版本，从空清单开始，只写本机本次构建出的平台。
     if (prev.version === version) {
+      if (!notes && typeof prev.notes === 'string' && prev.notes.trim()) notes = prev.notes.trim();
       for (const [k, v] of Object.entries(prev.platforms || {})) {
         const placeholder = !v?.signature || v.signature.includes('<<') || String(v.url).includes('REPLACE-WITH');
         if (!placeholder) manifest.platforms[k] = v;
@@ -206,6 +208,7 @@ if (existsSync(out)) {
     console.warn(`  ! 既有 ${rel(out)} 解析失败，将重新生成。`);
   }
 }
+manifest.notes = notes || readChangelogNotes(version) || `NomiFun v${version}`;
 for (const key of foundKeys) {
   manifest.platforms[key] = { signature: collected[key].signature, url: collected[key].url };
 }

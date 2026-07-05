@@ -10,6 +10,12 @@ import { describe, expect, test } from 'bun:test';
 const source = readFileSync(new URL('./MessageTips.tsx', import.meta.url), 'utf8');
 const cssSource = readFileSync(new URL('../messages.css', import.meta.url), 'utf8');
 
+const cssRuleFor = (selector: string) => {
+  const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = cssSource.match(new RegExp(`${escapedSelector}\\s*\\{([^}]*)\\}`));
+  return match?.[1] ?? '';
+};
+
 describe('MessageTips structured error presentation', () => {
   test('uses a NomiFun-native diagnostic note instead of the legacy open-source alert block', () => {
     expect(source.includes('message-error-note')).toBe(true);
@@ -34,6 +40,18 @@ describe('MessageTips structured error presentation', () => {
     expect(source.includes('message-error-note__footer-main')).toBe(true);
     expect(cssSource.includes('align-items: center')).toBe(true);
     expect(cssSource.includes('min-height: 32px')).toBe(true);
+  });
+
+  test('keeps the technical-details icon inline before the label instead of overlaying it', () => {
+    const headerRule = cssRuleFor('.message-error-note__details .arco-collapse-item-header');
+    const iconRule = cssRuleFor('.message-error-note__details .arco-collapse-item-icon-hover');
+
+    expect(headerRule.includes('display: flex')).toBe(true);
+    expect(headerRule.includes('align-items: center')).toBe(true);
+    expect(headerRule.includes('justify-content: flex-start')).toBe(true);
+    expect(iconRule.includes('position: static')).toBe(true);
+    expect(iconRule.includes('width: 16px')).toBe(true);
+    expect(iconRule.includes('transform: none')).toBe(true);
   });
 
   test('pins the feedback action to a centered footer slot without inherited icon offset', () => {

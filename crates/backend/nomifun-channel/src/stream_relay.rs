@@ -10,6 +10,7 @@ use crate::error::ChannelError;
 use crate::formatter::format_text_for_platform;
 use crate::message_service::{ChannelMessageService, StreamAction};
 use crate::pending_decision::{PendingDecision, PendingDecisionStore};
+use crate::think_filter::{Stage, strip_reasoning};
 use crate::types::{OutgoingMessageType, ParseMode, PluginType, UnifiedOutgoingMessage};
 
 /// Configuration for a stream relay session.
@@ -93,14 +94,22 @@ impl ChannelStreamRelay {
                     }
                     Some(StreamAction::Thinking(_)) => {}
                     Some(StreamAction::ToolCall { .. }) if has_content && !text_buffer.trim().is_empty() => {
-                        let formatted = format_text_for_platform(&text_buffer, self.config.platform);
-                        let flush_msg = ChannelMessageService::build_streaming_message(&formatted);
-                        let _ = self
-                            .sender
-                            .send_message(&self.config.plugin_id, &self.config.chat_id, flush_msg)
-                            .await;
-                        text_buffer.clear();
-                        has_content = false;
+                        // Strip inline reasoning before flushing buffered text.
+                        // If only <think> content has arrived so far, skip the
+                        // flush AND keep the buffer — the closing tag may still be
+                        // streaming (any orphan </think> that surfaces after a
+                        // later flush is absorbed by the strip's orphan-close rule).
+                        let visible = strip_reasoning(&text_buffer, Stage::Streaming);
+                        if !visible.trim().is_empty() {
+                            let formatted = format_text_for_platform(&visible, self.config.platform);
+                            let flush_msg = ChannelMessageService::build_streaming_message(&formatted);
+                            let _ = self
+                                .sender
+                                .send_message(&self.config.plugin_id, &self.config.chat_id, flush_msg)
+                                .await;
+                            text_buffer.clear();
+                            has_content = false;
+                        }
                     }
                     Some(StreamAction::ToolCall { .. }) => {}
                     // A blocking decision: record it and forward a numbered
@@ -110,8 +119,9 @@ impl ChannelStreamRelay {
                         self.record_and_send_decision(call_id, prompt, options).await;
                     }
                     Some(StreamAction::Finish) => {
-                        if has_content && !text_buffer.trim().is_empty() {
-                            let formatted = format_text_for_platform(&text_buffer, self.config.platform);
+                        let visible = strip_reasoning(&text_buffer, Stage::Final);
+                        if has_content && !visible.trim().is_empty() {
+                            let formatted = format_text_for_platform(&visible, self.config.platform);
                             let final_msg = ChannelMessageService::build_final_message(&formatted);
                             let _ = self
                                 .sender
@@ -149,8 +159,9 @@ impl ChannelStreamRelay {
                     None => {}
                 },
                 Err(broadcast::error::RecvError::Closed) => {
-                    if has_content && !text_buffer.trim().is_empty() {
-                        let formatted = format_text_for_platform(&text_buffer, self.config.platform);
+                    let visible = strip_reasoning(&text_buffer, Stage::Final);
+                    if has_content && !visible.trim().is_empty() {
+                        let formatted = format_text_for_platform(&visible, self.config.platform);
                         let final_msg = ChannelMessageService::build_final_message(&formatted);
                         let _ = self
                             .sender
@@ -191,7 +202,6 @@ impl ChannelStreamRelay {
 
         let mut text_buffer = String::new();
         let mut last_edit = Instant::now() - throttle;
-        let mut has_content = false;
         // Whether a blocking decision was forwarded during this turn. When a
         // decision is pending, the thinking/streaming card is deliberately left
         // intact so the turn stays live (see `record_and_send_decision`); we
@@ -203,15 +213,23 @@ impl ChannelStreamRelay {
                 Ok(event) => match ChannelMessageService::process_stream_event(&event) {
                     Some(StreamAction::AppendText(chunk)) => {
                         text_buffer.push_str(&chunk);
-                        has_content = true;
                         if last_edit.elapsed() >= throttle {
-                            let formatted = format_text_for_platform(&text_buffer, self.config.platform);
-                            let mut msg = ChannelMessageService::build_streaming_message(&formatted);
-                            msg.parse_mode = formatted_parse_mode(self.config.platform);
-                            let _ = self
-                                .sender
-                                .edit_message(&self.config.plugin_id, &self.config.chat_id, &thinking_msg_id, msg)
-                                .await;
+                            let visible = strip_reasoning(&text_buffer, Stage::Streaming);
+                            if !visible.trim().is_empty() {
+                                let formatted = format_text_for_platform(&visible, self.config.platform);
+                                let mut msg = ChannelMessageService::build_streaming_message(&formatted);
+                                msg.parse_mode = formatted_parse_mode(self.config.platform);
+                                let _ = self
+                                    .sender
+                                    .edit_message(&self.config.plugin_id, &self.config.chat_id, &thinking_msg_id, msg)
+                                    .await;
+                            }
+                            // Advance the throttle clock whether or not we edited:
+                            // while only reasoning has streamed in, the "⏳
+                            // Thinking..." placeholder stays put, and re-scanning a
+                            // long buffer on every delta would waste CPU. The first
+                            // visible text appears within one throttle window, same
+                            // as ordinary streaming.
                             last_edit = Instant::now();
                         }
                     }
@@ -233,7 +251,7 @@ impl ChannelStreamRelay {
                         self.record_and_send_decision(call_id, prompt, options).await;
                     }
                     Some(StreamAction::Finish) => {
-                        self.send_final_edit(&text_buffer, has_content, decision_forwarded, &thinking_msg_id)
+                        self.send_final_edit(&text_buffer, decision_forwarded, &thinking_msg_id)
                             .await;
                         info!(
                             plugin_id = %self.config.plugin_id,
@@ -274,7 +292,7 @@ impl ChannelStreamRelay {
                 },
                 Err(broadcast::error::RecvError::Closed) => {
                     warn!("channel stream relay: broadcast closed without terminal event");
-                    self.send_final_edit(&text_buffer, has_content, decision_forwarded, &thinking_msg_id)
+                    self.send_final_edit(&text_buffer, decision_forwarded, &thinking_msg_id)
                         .await;
                     break;
                 }
@@ -293,18 +311,23 @@ impl ChannelStreamRelay {
 
     /// Finalize the turn by replacing the "Thinking..." placeholder.
     ///
-    /// - With assistant text: render the formatted final card.
-    /// - Without text but a decision was forwarded: leave the card intact — the
-    ///   decision flow owns the live UX and the turn stays interactive.
-    /// - Without text and no decision (tool-only / empty completion): the agent
-    ///   reported a finished turn that produced no `Text` event. The placeholder
-    ///   must still be replaced with a terminal card, otherwise the user is left
-    ///   staring at "Thinking..." forever on an already-completed turn (the
-    ///   silent-empty-reply failure class). Emit a neutral "(no text output)"
-    ///   final card so the action buttons are delivered and the card is终态.
-    async fn send_final_edit(&self, text_buffer: &str, has_content: bool, decision_forwarded: bool, msg_id: &str) {
-        if has_content {
-            let formatted = format_text_for_platform(text_buffer, self.config.platform);
+    /// "Has assistant text" is decided on the reasoning-stripped buffer, so a
+    /// turn that produced only inline `<think>` reasoning counts as no-text.
+    ///
+    /// - With visible text: render the formatted final card.
+    /// - Without visible text but a decision was forwarded: leave the card intact
+    ///   — the decision flow owns the live UX and the turn stays interactive.
+    /// - Without visible text and no decision (tool-only / pure-thinking / empty
+    ///   completion): the agent reported a finished turn that produced no visible
+    ///   `Text`. The placeholder must still be replaced with a terminal card,
+    ///   otherwise the user is left staring at "Thinking..." forever on an
+    ///   already-completed turn (the silent-empty-reply failure class). Emit a
+    ///   neutral "(no text output)" final card so the action buttons are
+    ///   delivered and the card is终态.
+    async fn send_final_edit(&self, text_buffer: &str, decision_forwarded: bool, msg_id: &str) {
+        let visible = strip_reasoning(text_buffer, Stage::Final);
+        if !visible.trim().is_empty() {
+            let formatted = format_text_for_platform(&visible, self.config.platform);
             let mut final_msg = ChannelMessageService::build_final_message(&formatted);
             final_msg.parse_mode = formatted_parse_mode(self.config.platform);
             let _ = self

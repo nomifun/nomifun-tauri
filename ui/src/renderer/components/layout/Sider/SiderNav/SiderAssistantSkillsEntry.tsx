@@ -28,7 +28,7 @@ const SiderAssistantSkillsEntry: React.FC<SiderAssistantSkillsEntryProps> = ({
   onClick,
 }) => {
   const { t } = useTranslation();
-  const label = t('settings.assistantSkills.railTitle', { defaultValue: 'Assistant & Skill' });
+  const label = t('settings.assistantSkillsHub.railTitle', { defaultValue: 'Assistant & Skill' });
 
   if (collapsed) {
     return (

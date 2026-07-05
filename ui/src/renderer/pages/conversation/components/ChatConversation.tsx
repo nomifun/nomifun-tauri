@@ -12,7 +12,7 @@ import { usePresetAssistantInfo, resolveAssistantConfigId } from '@/renderer/hoo
 import { iconColors } from '@/renderer/styles/colors';
 import { Button, Dropdown, Menu, Message, Tooltip, Typography } from '@arco-design/web-react';
 import { History } from '@icon-park/react';
-import React, { useCallback, useEffect, useMemo, useRef } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import useSWR from 'swr';
@@ -33,6 +33,8 @@ import { isConversationProcessing } from '@/renderer/pages/conversation/utils/co
 import NomiChat from '../platforms/nomi/NomiChat';
 import { useNomiModelSelection } from '../platforms/nomi/useNomiModelSelection';
 import CompanionChatPanel from '@/renderer/pages/nomi/companion/CompanionChatPanel';
+import GuidCollaboratorSelector from '@/renderer/pages/guid/components/GuidCollaboratorSelector';
+import type { TModelRange, TModelRef } from '@/common/types/orchestrator/orchestratorTypes';
 import { OrchestrationProvider } from '../orchestration/OrchestrationContext';
 import OrchestrationTopPanel from '../orchestration/OrchestrationTopPanel';
 import ConversationContentSwitcher from '../orchestration/ConversationContentSwitcher';
@@ -150,6 +152,45 @@ const NomiConversationPanel: React.FC<{ conversation: NomiConversation; sliderTi
   conversation,
   sliderTitle,
 }) => {
+  // 协作模型池:每会话的真源是 `extra.orchestrator_model_range`。水合时 models[0] 是
+  // 主模型(lead/planner),其余为协作池。面板以 `key={conversation.id}` 挂载,切换会话
+  // 会重挂并按新会话 extra 重新水合。
+  const [collaborators, setCollaboratorsState] = useState<TModelRef[]>(() => {
+    const range = conversation.extra?.orchestrator_model_range;
+    return range?.mode === 'range' ? range.models.slice(1) : [];
+  });
+
+  // 写回:主模型 FIRST(models[0]=lead/planner)+ 协作池,按 `${provider_id} ${model}`
+  // 去重(与旧 useGuidSend 一致),整体作为 range 落到会话 extra;后端 caps_orchestrator
+  // 的 read_conversation_model_range 只读回来构建 run 的 fleet(确定性,不经 LLM)。
+  const persistModelRange = useCallback(
+    async (mainRef: TModelRef | null, collabs: TModelRef[]) => {
+      if (!mainRef) return;
+      const seen = new Set<string>();
+      const models = [mainRef, ...collabs].filter((r) => {
+        if (!r?.provider_id || !r.model) return false;
+        const key = `${r.provider_id} ${r.model}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      const orchestrator_model_range: TModelRange = { mode: 'range', models };
+      // extra 顶层浅合并(后端保留同级 extra 键),只覆盖 orchestrator_model_range。
+      // 内部吞掉失败并 console.error:未持久化的模型范围是低危状态(下次选择即重试),
+      // 不值得打断用户;此处兜底也让两处 `void persistModelRange(...)` 调用点不会产生
+      // 未处理的 promise rejection。
+      try {
+        await ipcBridge.conversation.update.invoke({
+          id: conversation.id,
+          updates: { extra: { orchestrator_model_range } as TChatConversation['extra'] },
+        });
+      } catch (err) {
+        console.error('[ChatConversation] persist orchestrator_model_range failed', err);
+      }
+    },
+    [conversation.id]
+  );
+
   const { t } = useTranslation();
   const onSelectModel = useCallback(
     async (_provider: IProvider, modelName: string) => {
@@ -157,16 +198,49 @@ const NomiConversationPanel: React.FC<{ conversation: NomiConversation; sliderTi
       // Kill running agent on model switch — will be rebuilt with new model on next message
       await ipcBridge.conversation.stop.invoke({ conversation_id: conversation.id });
       const ok = await ipcBridge.conversation.update.invoke({ id: conversation.id, updates: { model: selected } });
-      if (ok) void saveNomiDefaultModel(_provider.id, modelName);
+      if (ok) {
+        void saveNomiDefaultModel(_provider.id, modelName);
+        // 主模型即 range 的 models[0](lead/planner):切换主模型后同步重写 range,
+        // 让协作池仍钉在新主模型之后。
+        void persistModelRange({ provider_id: _provider.id, model: modelName }, collaborators);
+      }
       return Boolean(ok);
     },
-    [conversation.id]
+    [conversation.id, persistModelRange, collaborators]
   );
 
   const modelSelection = useNomiModelSelection({
     initialModel: conversation.model,
     onSelectModel,
   });
+
+  // 主模型引用(range 的 models[0]),供协作选择器钉选与写回。
+  const mainModelRef = useMemo<TModelRef | null>(
+    () =>
+      modelSelection.current_model
+        ? { provider_id: modelSelection.current_model.id, model: modelSelection.current_model.use_model }
+        : null,
+    [modelSelection.current_model?.id, modelSelection.current_model?.use_model]
+  );
+
+  const onCollaboratorsChange = useCallback(
+    (next: TModelRef[]) => {
+      setCollaboratorsState(next);
+      void persistModelRange(mainModelRef, next);
+    },
+    [mainModelRef, persistModelRange]
+  );
+
+  // 会话内「协作模型」选择器:主模型选择器旁的 pill。锁定伙伴表面走
+  // CompanionChatPanel(不经此面板),故此处天然只在普通会话构造。
+  const collaboratorSelectorNode = (
+    <GuidCollaboratorSelector
+      value={collaborators}
+      onChange={onCollaboratorsChange}
+      mainModel={mainModelRef}
+      className='nomi-sendbox-model-btn'
+    />
+  );
 
   const { providers: healProviders, getAvailableModels: healGetAvailable } = useModelProviderList();
   useEffect(() => {
@@ -249,6 +323,7 @@ const NomiConversationPanel: React.FC<{ conversation: NomiConversation; sliderTi
                   (conversation.extra as { mcp_statuses?: IConversationMcpStatus[] } | undefined)?.mcp_statuses
                 }
                 agent_name={presetAssistantInfo?.name}
+                collaboratorSelectorNode={collaboratorSelectorNode}
                 isProcessing={isConversationProcessing(conversation)}
               />
             </ConversationContentSwitcher>

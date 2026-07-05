@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 use crate::channel_settings::{ChannelSettingsService, resolved_model_to_provider};
 use crate::constants::{STREAM_THROTTLE_INTERVAL, TOOL_CONFIRM_TIMEOUT};
 use crate::error::ChannelError;
-use crate::types::{ActionButton, OutgoingMessageType, PluginType, UnifiedOutgoingMessage};
+use crate::types::{OutgoingMessageType, PluginType, UnifiedOutgoingMessage};
 
 /// Profile of the desktop's master agent (the companion). The channel layer
 /// resolves which companion greets a session via the channel row's own `companion_id`
@@ -683,30 +683,19 @@ impl ChannelMessageService {
         }
     }
 
-    /// Builds the final message after streaming completes, including
-    /// action buttons for the user.
+    /// Builds the final message after streaming completes.
+    ///
+    /// The `Buttons` message type is retained purely as the "final turn" marker
+    /// that channels key off to finalize a streaming card (e.g. DingTalk flips
+    /// its AI Card to FINISHED on this type). No action buttons are attached:
+    /// the Regenerate / Continue / New Session affordances were removed because
+    /// they cluttered the reply and hurt readability across IM channels.
     pub fn build_final_message(text: &str) -> UnifiedOutgoingMessage {
         UnifiedOutgoingMessage {
             message_type: OutgoingMessageType::Buttons,
             text: Some(text.to_owned()),
             parse_mode: None,
-            buttons: Some(vec![vec![
-                ActionButton {
-                    label: "\u{1f504} Regenerate".into(),
-                    action: "chat.regenerate".into(),
-                    params: None,
-                },
-                ActionButton {
-                    label: "\u{25b6}\u{fe0f} Continue".into(),
-                    action: "chat.continue".into(),
-                    params: None,
-                },
-                ActionButton {
-                    label: "\u{2795} New Session".into(),
-                    action: "session.new".into(),
-                    params: None,
-                },
-            ]]),
+            buttons: None,
             keyboard: None,
             image_url: None,
             file_url: None,
@@ -1411,13 +1400,13 @@ mod tests {
     // ── build_final_message ────────────────────────────────────────────
 
     #[test]
-    fn final_message_has_buttons() {
+    fn final_message_is_marked_final_without_buttons() {
         let msg = ChannelMessageService::build_final_message("Response text");
+        // `Buttons` type is kept as the "final turn" marker (channels key off it
+        // to finalize a streaming card), but no action buttons are attached.
         assert_eq!(msg.message_type, OutgoingMessageType::Buttons);
         assert_eq!(msg.text.as_deref(), Some("Response text"));
-        let buttons = msg.buttons.unwrap();
-        assert!(!buttons.is_empty());
-        assert!(buttons[0].len() >= 2);
+        assert!(msg.buttons.is_none(), "final reply must carry no action buttons");
     }
 
     // ── build_streaming_message ────────────────────────────────────────

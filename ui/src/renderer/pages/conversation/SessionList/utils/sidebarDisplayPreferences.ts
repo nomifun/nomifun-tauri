@@ -53,7 +53,7 @@ const PRESET_PREFERENCES: Record<Exclude<SidebarDisplayPreset, 'custom'>, Sideba
   },
 };
 
-export const DEFAULT_SIDEBAR_DISPLAY_PREFERENCES: SidebarDisplayPreferences = PRESET_PREFERENCES.balanced;
+export const DEFAULT_SIDEBAR_DISPLAY_PREFERENCES: SidebarDisplayPreferences = PRESET_PREFERENCES.detailed;
 
 const PRESET_VALUES = new Set<SidebarDisplayPreset>(['compact', 'balanced', 'detailed', 'custom']);
 const WORKPATH_NAME_VALUES = new Set<WorkpathNameMode>(['compressed', 'folder', 'full', 'folderWithPath']);

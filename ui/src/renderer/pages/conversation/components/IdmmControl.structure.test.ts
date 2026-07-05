@@ -17,4 +17,12 @@ describe('IdmmControl structure', () => {
     expect(source.includes("aria-label={t(open ? 'idmm.collapseConfig' : 'idmm.expandConfig')}")).toBe(true);
     expect(source.includes("aria-label={t(strategyOpen ? 'idmm.collapseConfig' : 'idmm.expandConfig')}")).toBe(true);
   });
+
+  test('locks watch configuration whenever the watch is enabled, including draft mode', () => {
+    const source = readSource(new URL('./IdmmControl.tsx', import.meta.url));
+
+    expect(source.includes('const faultLocked = cfg.fault_watch.enabled;')).toBe(true);
+    expect(source.includes('const decisionLocked = cfg.decision_watch.enabled;')).toBe(true);
+    expect(source.includes('watchEnabled && !isDraft')).toBe(false);
+  });
 });

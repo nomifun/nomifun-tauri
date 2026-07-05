@@ -1008,13 +1008,74 @@ impl ConversationSteerer for OrchestratorConversationSteerer {
 struct OrchestratorLeadReporter {
     conv: ConversationService,
     task_manager: Arc<dyn IWorkerTaskManager>,
+    /// Read the run row (autonomy/goal/total_tokens) + its task list so an
+    /// AUTONOMOUS run's receipt can be goal/budget-aware (Phase 3b Task 2) — the
+    /// master self-assesses instead of the autonomy-blind "仅汇总" text. Best-effort:
+    /// any read error falls back to the autonomy-blind receipt.
+    run_repo: Arc<dyn nomifun_db::IRunRepository>,
+    /// In-memory no-progress streak, `run_id → (last_done_count, streak)`. For an
+    /// autonomous run, each report compares the current done-node count against the
+    /// last one; a non-increase bumps the streak (else resets to 0). At
+    /// [`nomifun_orchestrator::NO_PROGRESS_LIMIT`] the loop is judged stuck and the
+    /// receipt tells the master to wrap up. Best-effort: a poisoned lock → no_progress=false.
+    no_progress: Arc<std::sync::Mutex<std::collections::HashMap<String, (usize, u32)>>>,
 }
 
 /// Build the hidden receipt prompt injected into the lead conversation for a run's
-/// outcome. It hands the master agent the per-node digest and tells it to
-/// summarize / re-strategize / relay — never to spawn a fresh orchestration (the
-/// 会话9 loop guard).
-fn compose_lead_receipt(run_id: &str, outcome: RunOutcome, brief: &str) -> String {
+/// outcome. It hands the master agent the per-node digest and tells it how to react.
+///
+/// For a NON-autonomous run (`autonomy != "autonomous"`) the behavior is unchanged:
+/// summarize / re-strategize / relay — never spawn a fresh orchestration (the 会话9
+/// loop guard). For an AUTONOMOUS run reaching a terminal outcome
+/// (`Completed`/`Failed`) the receipt is instead a SELF-ASSESS prompt (Phase 3b Task
+/// 2): it hands the master the goal + per-node brief + budget headroom
+/// (`rounds_left`/`tokens_left`) and drives the emergent loop — 已达成→收尾不追加；
+/// 未达成且有预算→用 `nomi_run_add_tasks` 往同一个 run 追加继续；预算耗尽/连续无进展→
+/// 汇总进展交给用户。All other autonomous outcomes fall through to the shared arms.
+fn compose_lead_receipt(
+    run_id: &str,
+    outcome: RunOutcome,
+    brief: &str,
+    autonomy: &str,
+    goal: &str,
+    task_count: usize,
+    total_tokens: i64,
+    no_progress: bool,
+) -> String {
+    // Autonomous terminal outcome → goal/budget-aware self-assess prompt.
+    if autonomy == "autonomous" && matches!(outcome, RunOutcome::Completed | RunOutcome::Failed) {
+        let rounds_left = nomifun_orchestrator::AUTONOMOUS_MAX_TASKS.saturating_sub(task_count);
+        let tokens_left = nomifun_orchestrator::AUTONOMOUS_TOKEN_BUDGET - total_tokens;
+        // Budget exhausted (no round OR no token headroom) or the loop stopped making
+        // progress → the master must NOT append; a further append would be refused by
+        // the gateway budget backstop anyway.
+        let exhausted = no_progress || rounds_left == 0 || tokens_left <= 0;
+        let phase = match outcome {
+            RunOutcome::Failed => "本轮部分或全部子任务执行失败",
+            _ => "本轮子任务已全部完成",
+        };
+        let head = format!(
+            "[自主编排回执] 你正在自主推进这个 run（run {run_id}）。{phase}。\n\
+             【目标】{goal}\n【本轮各节点产出】\n{brief}\n\
+             【预算余量】剩余可追加任务数 {rounds_left}，剩余 token 约 {tokens_left}。\n"
+        );
+        if exhausted {
+            return format!(
+                "{head}\
+                 预算已达上限或已连续多轮无实质进展：请**不要再用 nomi_run_add_tasks / \
+                 nomi_run_adjust / nomi_task_rerun 继续推进本 run，也不要 nomi_run_create 新建 run**。\
+                 用一段自然的话向用户汇总目前已完成的部分、说明尚未达成的目标，并把后续决定交给用户。"
+            );
+        }
+        return format!(
+            "{head}\
+             请先自评是否已达成上述【目标】，再据下列规则行动：\n\
+             - 已达成 → 用一段自然的话向用户汇总最终结论，本轮结束，**不要再追加**。\n\
+             - 未达成且仍有预算（剩余可追加任务数 {rounds_left}）→ 用 `nomi_run_add_tasks` 向\
+             **同一个 run（run {run_id}）** 追加下一批任务继续推进，然后结束本轮（勿轮询、勿新建 run）。\n\
+             - 预算即将耗尽或已连续多轮无进展 → 汇总当前进展、说明未竟部分并交给用户，**不要再追加**。"
+        );
+    }
     match outcome {
         RunOutcome::Completed => format!(
             "[编排回执] 你之前派发的子任务（run {run_id}）已全部完成。各节点产出：\n{brief}\n\
@@ -1033,6 +1094,17 @@ fn compose_lead_receipt(run_id: &str, outcome: RunOutcome, brief: &str) -> Strin
         RunOutcome::AwaitingApproval => format!(
             "[编排回执] 编排（run {run_id}）计划已拟好，正等待用户批准后执行。\
              请转达用户在编排面板点「批准执行」或直接回复批准。"
+        ),
+        RunOutcome::NodeFailed => format!(
+            "[编排回执·中途] 你派发的编排（run {run_id}）中有一个节点永久失败，run 仍在进行：\n{brief}\n\
+             你可以现在就介入：给该节点换更合适的模型后重跑、调整编排（保留已完成部分）、\
+             采纳该节点当前产出，或放弃。若暂不处理，run 会按其它独立分支继续，终态时再给你完整回执。\
+             不要重复创建相同编排。"
+        ),
+        RunOutcome::BatchProgress => format!(
+            "[编排回执·进展] 你派发的编排（run {run_id}）刚完成了一批节点，run 仍在进行：\n{brief}\n\
+             可据此判断是否需要追加工作：如有必要用 nomi_run_add_tasks 往同一个 run 追加任务；\
+             否则继续等待，终态时会给你完整回执。不要新建编排。"
         ),
     }
 }
@@ -1061,12 +1133,74 @@ impl LeadReporter for OrchestratorLeadReporter {
         } else {
             row.user_id
         };
+        // Autonomy/goal/budget context (Phase 3b Task 2): best-effort read the run
+        // row (autonomy/goal/total_tokens) + its task list so an autonomous run's
+        // receipt can be self-assess-driven. Any read error → autonomy-blind fallback
+        // (empty `autonomy` selects the unchanged non-autonomous arms).
+        let (autonomy, goal, total_tokens) = match self.run_repo.get_run(run_id).await {
+            Ok(Some(run)) => (run.autonomy, run.goal, run.total_tokens.unwrap_or(0)),
+            Ok(None) => (String::new(), String::new(), 0),
+            Err(e) => {
+                tracing::warn!(run_id, error = %e, "lead report: read run failed — autonomy-blind receipt");
+                (String::new(), String::new(), 0)
+            }
+        };
+        let tasks = match self.run_repo.list_tasks(run_id).await {
+            Ok(tasks) => tasks,
+            Err(e) => {
+                tracing::warn!(run_id, error = %e, "lead report: list tasks failed — budget headroom blind");
+                Vec::new()
+            }
+        };
+        let task_count = tasks.len();
+        // No-progress streak (autonomous only): if the count of `done` nodes did NOT
+        // increase since the last report, bump the streak, else reset to 0. At
+        // NO_PROGRESS_LIMIT the receipt treats the loop as stuck. Best-effort — a
+        // poisoned lock just treats no_progress=false.
+        let no_progress = if autonomy == "autonomous" {
+            let done = tasks.iter().filter(|t| t.status == "done").count();
+            match self.no_progress.lock() {
+                Ok(mut map) => {
+                    let entry = map.entry(run_id.to_owned()).or_insert((0, 0));
+                    if done > entry.0 {
+                        entry.0 = done;
+                        entry.1 = 0;
+                    } else {
+                        entry.1 = entry.1.saturating_add(1);
+                    }
+                    let np = entry.1 >= nomifun_orchestrator::NO_PROGRESS_LIMIT;
+                    // Evict when the autonomous loop is ENDING — a terminal outcome that is
+                    // budget/round/progress-exhausted (the gateway backstop will refuse any
+                    // further re-arm) — so the map does not grow one entry per run forever.
+                    let ending = matches!(outcome, RunOutcome::Completed | RunOutcome::Failed)
+                        && (np
+                            || task_count >= nomifun_orchestrator::AUTONOMOUS_MAX_TASKS
+                            || total_tokens >= nomifun_orchestrator::AUTONOMOUS_TOKEN_BUDGET);
+                    if ending {
+                        map.remove(run_id);
+                    }
+                    np
+                }
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
         self.conv
             .steer_message(
                 &owner,
                 &lead_conv_id.to_string(),
                 nomifun_api_types::SendMessageRequest {
-                    content: compose_lead_receipt(run_id, outcome, brief),
+                    content: compose_lead_receipt(
+                        run_id,
+                        outcome,
+                        brief,
+                        &autonomy,
+                        &goal,
+                        task_count,
+                        total_tokens,
+                        no_progress,
+                    ),
                     files: vec![],
                     inject_skills: vec![],
                     hidden: true,
@@ -1166,6 +1300,11 @@ pub fn build_orchestrator_state(
     let lead_reporter: Arc<dyn LeadReporter> = Arc::new(OrchestratorLeadReporter {
         conv: conv_service.clone(),
         task_manager: services.worker_task_manager.clone(),
+        // Same run repo the RunService/engine use (Arc-internal clone, same DB) — the
+        // reporter reads the live run row + tasks to make the receipt autonomy/goal/
+        // budget-aware.
+        run_repo: run_repo.clone(),
+        no_progress: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     });
     // Path B (B3): the `create_adhoc_run` route associates the originating
     // conversation as the run's lead (`link_orchestrator_run`) when the request
@@ -1223,6 +1362,11 @@ pub fn build_orchestrator_state(
     engine_deps.cancel_conversation = cancel_conversation;
     engine_deps.steer_conversation = steer_conversation;
     engine_deps.lead_reporter = lead_reporter;
+    // Phase 1b: an ad-hoc/conversation-native run (no workspace, no work_dir) gets a
+    // per-run SHARED working directory auto-allocated under
+    // `{work_dir}/orchestrator/runs/{run_id}`, so all its nodes share one cwd (files
+    // + a shared workpath KB binding). `services.work_dir` is the app data root.
+    engine_deps.data_dir = services.work_dir.clone();
     // B2: the engine summarizes a COMPLETED run with the SAME LlmPlanProducer the
     // RunService plans with — a one-shot lead summary. Shared `Arc`, so the lead is
     // resolved the same way (off the run's fleet snapshot). Fail-soft in the engine:

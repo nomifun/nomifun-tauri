@@ -195,15 +195,21 @@ const OrchestrationTopPanel: React.FC = () => {
     ? t(`orchestrator.run.status.${statusMeta.key}`, { defaultValue: status })
     : t('orchestrator.run.status.unknown', { defaultValue: status });
   const panelTitle = t('conversation.orchestration.panelTitle', { defaultValue: '编排画布' });
+  // In-flight worker count (from the polled `runs.get` task list) — feeds the
+  // RunControls「进行中 N · 排空中」draining badge.
+  const inFlightCount = detail?.tasks.filter((tk) => tk.status === 'running').length ?? 0;
 
   // ── Collapsed: thin vertical strip on the right edge ──────────────────────────
   if (collapsed) {
+    // Self-describing so the collapsed strip never reads as "the controls vanished":
+    // the vertical label carries both the pane title AND the live run status.
+    const collapsedLabel = `${panelTitle} · ${statusLabel}`;
     return (
       <div
         role='button'
         tabIndex={0}
         aria-label={t('conversation.orchestration.expandCanvas', { defaultValue: '展开编排画布' })}
-        title={panelTitle}
+        title={collapsedLabel}
         onClick={() => setCollapsed(false)}
         onKeyDown={(e) => {
           if (e.key === 'Enter' || e.key === ' ') {
@@ -216,7 +222,7 @@ const OrchestrationTopPanel: React.FC = () => {
         {msgCtx}
         <Left theme='outline' size='14' strokeWidth={3} />
         <span className={styles.collapsedDot} style={{ background: statusColor }} />
-        <span className={styles.collapsedLabel}>{panelTitle}</span>
+        <span className={styles.collapsedLabel}>{collapsedLabel}</span>
       </div>
     );
   }
@@ -277,7 +283,7 @@ const OrchestrationTopPanel: React.FC = () => {
         )}
 
         <div className='ml-auto'>
-          <RunControls runId={runId} status={status} refetch={refetch} onReplan={openReplan} />
+          <RunControls runId={runId} status={status} inFlightCount={inFlightCount} refetch={refetch} onReplan={openReplan} />
         </div>
       </div>
 

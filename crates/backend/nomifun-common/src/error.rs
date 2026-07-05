@@ -189,6 +189,21 @@ fn workspace_path_edge_whitespace_segments(path: &Path) -> Vec<String> {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
+        // Observability: the HTTP access log (router trace layer) records only
+        // status + latency, so a storm of `Internal` errors on one endpoint is
+        // indistinguishable from any other 500. Emit the machine code + message
+        // for 5xx here — this is the one place that still holds the typed error
+        // before it collapses into an opaque HTTP body — so incidents are
+        // diagnosable (e.g. a workspace 500 vs a DB 500). 4xx are left to the
+        // access log to avoid doubling routine client-error noise.
+        if status.is_server_error() {
+            tracing::error!(
+                code = self.error_code(),
+                status = status.as_u16(),
+                error = %self,
+                "request failed with server error"
+            );
+        }
         let body = ErrorBody {
             success: false,
             error: self.to_string(),

@@ -27,7 +27,7 @@ const CLIENT_VERSION: &str = "1.0.0";
 #[derive(Debug, Serialize)]
 pub(super) struct JsonRpcRequest {
     pub jsonrpc: &'static str,
-    pub id: u64,
+    pub id: String,
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
@@ -43,9 +43,17 @@ pub(super) struct JsonRpcNotification {
 pub(super) struct JsonRpcResponse {
     #[allow(dead_code)]
     pub jsonrpc: String,
-    pub id: Option<u64>,
+    pub id: Option<JsonRpcId>,
     pub result: Option<serde_json::Value>,
     pub error: Option<JsonRpcError>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub(super) enum JsonRpcId {
+    String(String),
+    Number(i64),
 }
 
 #[derive(Debug, Deserialize)]
@@ -328,7 +336,7 @@ fn extract_jsonrpc_from_sse(body: &str) -> Result<JsonRpcResponse, String> {
 pub(super) fn build_initialize_request(id: u64) -> JsonRpcRequest {
     JsonRpcRequest {
         jsonrpc: "2.0",
-        id,
+        id: id.to_string(),
         method: "initialize".into(),
         params: Some(serde_json::json!({
             "protocolVersion": PROTOCOL_VERSION,
@@ -351,7 +359,7 @@ pub(super) fn build_initialized_notification() -> JsonRpcNotification {
 pub(super) fn build_tools_list_request(id: u64) -> JsonRpcRequest {
     JsonRpcRequest {
         jsonrpc: "2.0",
-        id,
+        id: id.to_string(),
         method: "tools/list".into(),
         params: None,
     }
@@ -819,7 +827,7 @@ mod tests {
     fn initialize_request_structure() {
         let req = build_initialize_request(1);
         assert_eq!(req.jsonrpc, "2.0");
-        assert_eq!(req.id, 1);
+        assert_eq!(req.id, "1");
         assert_eq!(req.method, "initialize");
         let params = req.params.unwrap();
         assert_eq!(params["protocolVersion"], PROTOCOL_VERSION);
@@ -836,9 +844,25 @@ mod tests {
     #[test]
     fn tools_list_request_structure() {
         let req = build_tools_list_request(2);
-        assert_eq!(req.id, 2);
+        assert_eq!(req.id, "2");
         assert_eq!(req.method, "tools/list");
         assert!(req.params.is_none());
+    }
+
+    #[test]
+    fn jsonrpc_requests_serialize_ids_as_strings() {
+        let init = serde_json::to_value(build_initialize_request(1)).unwrap();
+        assert_eq!(init["id"], serde_json::json!("1"));
+
+        let tools = serde_json::to_value(build_tools_list_request(2)).unwrap();
+        assert_eq!(tools["id"], serde_json::json!("2"));
+    }
+
+    #[test]
+    fn jsonrpc_response_accepts_string_id() {
+        let resp: JsonRpcResponse =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":"1","result":{}}"#).unwrap();
+        assert!(matches!(resp.id, Some(JsonRpcId::String(ref id)) if id == "1"));
     }
 
     // -- HTTP header builder ----------------------------------------------
@@ -865,7 +889,7 @@ mod tests {
     fn extract_jsonrpc_from_sse_basic() {
         let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n";
         let resp = extract_jsonrpc_from_sse(body).unwrap();
-        assert_eq!(resp.id, Some(1));
+        assert!(matches!(resp.id, Some(JsonRpcId::Number(1))));
     }
 
     #[test]
@@ -873,7 +897,7 @@ mod tests {
         let body =
             "data: {\"jsonrpc\":\"2.0\",\"method\":\"log\"}\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n";
         let resp = extract_jsonrpc_from_sse(body).unwrap();
-        assert_eq!(resp.id, Some(1));
+        assert!(matches!(resp.id, Some(JsonRpcId::Number(1))));
     }
 
     #[test]

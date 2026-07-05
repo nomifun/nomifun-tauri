@@ -7,7 +7,7 @@ use nomifun_ai_agent::protocol::events::{
 };
 use nomifun_channel::pending_decision::PendingDecisionStore;
 use nomifun_channel::stream_relay::{ChannelSender, ChannelStreamRelay, MessageRecorder, RelayConfig};
-use nomifun_channel::types::{ParseMode, PluginType};
+use nomifun_channel::types::{OutgoingMessageType, ParseMode, PluginType};
 use tokio::sync::broadcast;
 
 /// Builds a relay with a fresh (unshared) pending-decision store. Tests that
@@ -82,7 +82,10 @@ async fn relay_sends_thinking_then_final_message() {
     let edits = recorder.take_edits();
     let last = edits.last().unwrap();
     assert!(last.text.as_deref().unwrap().contains("Hello World"));
-    assert!(last.buttons.is_some());
+    // The final message keeps the `Buttons` type as its "final turn" marker but
+    // no longer carries action buttons (Regenerate/Continue/New Session removed).
+    assert_eq!(last.message_type, OutgoingMessageType::Buttons);
+    assert!(last.buttons.is_none());
 }
 
 #[tokio::test]
@@ -535,4 +538,349 @@ async fn weixin_relay_forwards_decision() {
         "weixin relay must forward the decision: {sends:?}"
     );
     assert!(store.peek("conv-wx").is_some(), "decision recorded for weixin");
+}
+
+// ── Inline reasoning stripping (<think>…</think> in the Text stream) ─────
+//
+// Reasoning models often emit chain-of-thought inline in assistant content
+// wrapped in <think>…</think>, which arrives as ordinary Text events. The relay
+// must strip it so IM chats only ever see the final answer. (Structured Thinking
+// events are dropped elsewhere; this covers the inline form.)
+
+/// A <think> block split across several Text deltas must never leak into any
+/// edit, and the final card must carry only the answer + action buttons.
+#[tokio::test]
+async fn telegram_inline_think_across_deltas_never_leaks() {
+    let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
+    let recorder = Arc::new(MessageRecorder::new());
+
+    let config = RelayConfig {
+        platform: PluginType::Telegram,
+        plugin_id: "telegram".into(),
+        chat_id: "chat_1".into(),
+        throttle_ms: 0, // edit on every chunk so mid-stream leaks would surface
+        conversation_id: "conv-test".into(),
+    };
+    let relay = relay(config, recorder.clone());
+    let rx = event_tx.subscribe();
+
+    for chunk in ["<think>secret ", "reasoning</think>", "The answer."] {
+        event_tx
+            .send(AgentStreamEvent::Text(TextEventData { content: chunk.into() }))
+            .unwrap();
+    }
+    event_tx
+        .send(AgentStreamEvent::Finish(FinishEventData { session_id: None, stop_reason: None }))
+        .unwrap();
+
+    relay.run(rx).await;
+
+    let edits = recorder.take_edits();
+    for edit in &edits {
+        let text = edit.text.as_deref().unwrap_or("");
+        assert!(!text.contains("secret"), "reasoning leaked into an edit: {text}");
+        assert!(!text.contains("reasoning"), "reasoning leaked into an edit: {text}");
+        assert!(!text.contains("<think"), "raw think tag leaked into an edit: {text}");
+    }
+    let last = edits.last().expect("a final edit must be sent");
+    assert!(last.text.as_deref().unwrap().contains("The answer."), "final card: {last:?}");
+    assert_eq!(last.message_type, OutgoingMessageType::Buttons, "final card keeps the Buttons marker");
+    assert!(last.buttons.is_none(), "final card no longer carries action buttons");
+}
+
+/// A turn that produces ONLY inline reasoning (no visible answer) must land on
+/// the neutral "(no text output)" terminal card, never a blank / reasoning card.
+#[tokio::test]
+async fn telegram_pure_thinking_turn_gets_no_text_output_card() {
+    let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
+    let recorder = Arc::new(MessageRecorder::new());
+
+    let config = RelayConfig {
+        platform: PluginType::Telegram,
+        plugin_id: "telegram".into(),
+        chat_id: "chat_1".into(),
+        throttle_ms: 0,
+        conversation_id: "conv-test".into(),
+    };
+    let relay = relay(config, recorder.clone());
+    let rx = event_tx.subscribe();
+
+    for chunk in ["<think>plan a", " plan b</think>"] {
+        event_tx
+            .send(AgentStreamEvent::Text(TextEventData { content: chunk.into() }))
+            .unwrap();
+    }
+    event_tx
+        .send(AgentStreamEvent::Finish(FinishEventData { session_id: None, stop_reason: None }))
+        .unwrap();
+
+    relay.run(rx).await;
+
+    let edits = recorder.take_edits();
+    for edit in &edits {
+        assert!(
+            !edit.text.as_deref().unwrap_or("").contains("plan"),
+            "reasoning leaked into an edit: {edit:?}"
+        );
+    }
+    let last = edits.last().expect("a terminal card must be sent");
+    assert!(
+        last.text.as_deref().unwrap().contains("（无文本输出）"),
+        "pure-thinking turn must show the no-text-output card: {last:?}"
+    );
+    assert_eq!(last.message_type, OutgoingMessageType::Buttons, "terminal card keeps the Buttons marker");
+    assert!(last.buttons.is_none(), "terminal card no longer carries action buttons");
+}
+
+/// MiniMax-style output omits the opening tag ("reasoning…</think>answer"); the
+/// final card must drop everything up to the orphan close.
+#[tokio::test]
+async fn telegram_minimax_orphan_close_final_is_clean() {
+    let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
+    let recorder = Arc::new(MessageRecorder::new());
+
+    let config = RelayConfig {
+        platform: PluginType::Telegram,
+        plugin_id: "telegram".into(),
+        chat_id: "chat_1".into(),
+        throttle_ms: 0,
+        conversation_id: "conv-test".into(),
+    };
+    let relay = relay(config, recorder.clone());
+    let rx = event_tx.subscribe();
+
+    for chunk in ["raw reasoning\n", "</think>\n", "Answer only."] {
+        event_tx
+            .send(AgentStreamEvent::Text(TextEventData { content: chunk.into() }))
+            .unwrap();
+    }
+    event_tx
+        .send(AgentStreamEvent::Finish(FinishEventData { session_id: None, stop_reason: None }))
+        .unwrap();
+
+    relay.run(rx).await;
+
+    let edits = recorder.take_edits();
+    let last = edits.last().expect("a final edit must be sent");
+    let text = last.text.as_deref().unwrap();
+    assert!(text.contains("Answer only."), "final card must keep the answer: {text}");
+    assert!(!text.contains("raw reasoning"), "final card must drop the reasoning head: {text}");
+}
+
+/// Regression guard: a decision arriving on a thinking-only turn must leave the
+/// live card intact — the reasoning must NOT be rendered as a terminal card and
+/// must NOT overwrite the decision's live UX.
+#[tokio::test]
+async fn telegram_decision_with_thinking_only_leaves_card_intact() {
+    let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
+    let recorder = Arc::new(MessageRecorder::new());
+    let store = PendingDecisionStore::new();
+
+    let config = RelayConfig {
+        platform: PluginType::Telegram,
+        plugin_id: "telegram".into(),
+        chat_id: "chat_1".into(),
+        throttle_ms: 10_000,
+        conversation_id: "conv-dec".into(),
+    };
+    let relay = relay_with_store(config, recorder.clone(), Arc::clone(&store));
+    let rx = event_tx.subscribe();
+
+    event_tx
+        .send(AgentStreamEvent::Text(TextEventData { content: "<think>hmm</think>".into() }))
+        .unwrap();
+    event_tx.send(acp_decision_event("call-1", "Proceed?")).unwrap();
+    event_tx
+        .send(AgentStreamEvent::Finish(FinishEventData { session_id: None, stop_reason: None }))
+        .unwrap();
+
+    relay.run(rx).await;
+
+    // The decision is forwarded as a fresh send.
+    let sends = recorder.take_sends();
+    assert!(
+        sends
+            .iter()
+            .any(|m| m.text.as_deref().is_some_and(|t| t.contains("需要你的决策"))),
+        "decision must be forwarded: {sends:?}"
+    );
+    // No terminal card overwrites the live decision, and reasoning never shows.
+    let edits = recorder.take_edits();
+    for edit in &edits {
+        let text = edit.text.as_deref().unwrap_or("");
+        assert!(!text.contains("（无文本输出）"), "must not overwrite decision with a terminal card: {text}");
+        assert!(!text.contains("hmm"), "reasoning leaked: {text}");
+    }
+}
+
+/// Send-once platforms (WeChat): the tool-call flush must be reasoning-stripped
+/// too, and both the flush and the final send must carry only visible text.
+#[tokio::test]
+async fn weixin_inline_think_flush_and_final_are_stripped() {
+    let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
+    let recorder = Arc::new(MessageRecorder::new());
+
+    let config = RelayConfig {
+        platform: PluginType::Weixin,
+        plugin_id: "weixin".into(),
+        chat_id: "chat_1".into(),
+        throttle_ms: 10_000,
+        conversation_id: "conv-test".into(),
+    };
+    let relay = relay(config, recorder.clone());
+    let rx = event_tx.subscribe();
+
+    event_tx
+        .send(AgentStreamEvent::Text(TextEventData {
+            content: "<think>t1</think>Visible before tool.".into(),
+        }))
+        .unwrap();
+    event_tx
+        .send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "call-1".into(),
+            name: "read_file".into(),
+            args: serde_json::Value::Null,
+            status: ToolCallStatus::Running,
+            description: None,
+            input: None,
+            output: None,
+        }))
+        .unwrap();
+    event_tx
+        .send(AgentStreamEvent::Text(TextEventData {
+            content: "<think>t2</think>After tool.".into(),
+        }))
+        .unwrap();
+    event_tx
+        .send(AgentStreamEvent::Finish(FinishEventData { session_id: None, stop_reason: None }))
+        .unwrap();
+
+    relay.run(rx).await;
+
+    let sends = recorder.take_sends();
+    assert_eq!(sends.len(), 2, "expected a flush send + a final send: {sends:?}");
+    for m in &sends {
+        let text = m.text.as_deref().unwrap_or("");
+        assert!(!text.contains("<think"), "raw think tag leaked: {text}");
+        assert!(!text.contains("t1") && !text.contains("t2"), "reasoning leaked: {text}");
+    }
+    assert!(sends[0].text.as_deref().unwrap().contains("Visible before tool."));
+    assert!(sends[1].text.as_deref().unwrap().contains("After tool."));
+}
+
+/// Send-once: an all-reasoning buffer at a tool call skips the flush and keeps
+/// the buffer, so the answer that follows the close tag is still delivered.
+#[tokio::test]
+async fn weixin_all_think_buffer_skips_flush_then_recovers() {
+    let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
+    let recorder = Arc::new(MessageRecorder::new());
+
+    let config = RelayConfig {
+        platform: PluginType::Weixin,
+        plugin_id: "weixin".into(),
+        chat_id: "chat_1".into(),
+        throttle_ms: 10_000,
+        conversation_id: "conv-test".into(),
+    };
+    let relay = relay(config, recorder.clone());
+    let rx = event_tx.subscribe();
+
+    event_tx
+        .send(AgentStreamEvent::Text(TextEventData { content: "<think>only reasoning".into() }))
+        .unwrap();
+    event_tx
+        .send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "call-1".into(),
+            name: "read_file".into(),
+            args: serde_json::Value::Null,
+            status: ToolCallStatus::Running,
+            description: None,
+            input: None,
+            output: None,
+        }))
+        .unwrap();
+    event_tx
+        .send(AgentStreamEvent::Text(TextEventData { content: " more</think>Done.".into() }))
+        .unwrap();
+    event_tx
+        .send(AgentStreamEvent::Finish(FinishEventData { session_id: None, stop_reason: None }))
+        .unwrap();
+
+    relay.run(rx).await;
+
+    let sends = recorder.take_sends();
+    assert_eq!(sends.len(), 1, "only the final answer should be sent: {sends:?}");
+    let text = sends[0].text.as_deref().unwrap();
+    assert!(text.contains("Done."), "final answer must be delivered: {text}");
+    assert!(!text.contains("only reasoning"), "reasoning leaked: {text}");
+}
+
+/// Send-once: a turn that produces only reasoning sends nothing at all.
+#[tokio::test]
+async fn weixin_pure_thinking_turn_sends_nothing() {
+    let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
+    let recorder = Arc::new(MessageRecorder::new());
+
+    let config = RelayConfig {
+        platform: PluginType::Weixin,
+        plugin_id: "weixin".into(),
+        chat_id: "chat_1".into(),
+        throttle_ms: 10_000,
+        conversation_id: "conv-test".into(),
+    };
+    let relay = relay(config, recorder.clone());
+    let rx = event_tx.subscribe();
+
+    event_tx
+        .send(AgentStreamEvent::Text(TextEventData { content: "<think>x</think>".into() }))
+        .unwrap();
+    event_tx
+        .send(AgentStreamEvent::Finish(FinishEventData { session_id: None, stop_reason: None }))
+        .unwrap();
+
+    relay.run(rx).await;
+
+    assert_eq!(recorder.take_sends().len(), 0, "pure-thinking send-once turn must be silent");
+}
+
+/// Regression guard (adversarial review): a final answer ending on a bare `<`
+/// (a tag-prefix char) must NOT lose its trailing character in the terminal
+/// card — the trailing-partial-tag hiding is mid-stream only. Telegram escapes
+/// `<` to `&lt;`, so the char surviving into the formatter proves the strip kept
+/// it (had it been dropped, there would be no `&lt;`).
+#[tokio::test]
+async fn telegram_final_answer_ending_on_lt_is_preserved() {
+    let (event_tx, _) = broadcast::channel::<AgentStreamEvent>(64);
+    let recorder = Arc::new(MessageRecorder::new());
+
+    let config = RelayConfig {
+        platform: PluginType::Telegram,
+        plugin_id: "telegram".into(),
+        chat_id: "chat_1".into(),
+        throttle_ms: 10_000,
+        conversation_id: "conv-test".into(),
+    };
+    let relay = relay(config, recorder.clone());
+    let rx = event_tx.subscribe();
+
+    event_tx
+        .send(AgentStreamEvent::Text(TextEventData {
+            content: "the less-than symbol is <".into(),
+        }))
+        .unwrap();
+    event_tx
+        .send(AgentStreamEvent::Finish(FinishEventData { session_id: None, stop_reason: None }))
+        .unwrap();
+
+    relay.run(rx).await;
+
+    let edits = recorder.take_edits();
+    let last = edits.last().expect("a terminal edit must be sent");
+    assert_eq!(
+        last.text.as_deref().unwrap(),
+        "the less-than symbol is &lt;",
+        "terminal render must preserve a trailing tag-prefix char"
+    );
+    assert_eq!(last.message_type, OutgoingMessageType::Buttons, "terminal card keeps the Buttons marker");
+    assert!(last.buttons.is_none(), "terminal card no longer carries action buttons");
 }

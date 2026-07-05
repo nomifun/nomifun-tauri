@@ -19,6 +19,7 @@ mod idmm;
 mod knowledge;
 mod lifecycle;
 mod mcp;
+pub mod model_capability;
 mod office;
 mod orchestrator;
 mod provider;
@@ -136,6 +137,7 @@ pub use mcp::{
     OAuthCheckStatusRequest, OAuthLoginRequest, OAuthLoginResponse, OAuthLogoutRequest,
     OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
 };
+pub use model_capability::infer_model_modalities;
 pub use office::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DetectStarOfficeRequest,
     DocumentConversionRequest, DocumentConversionResponse, ExcelSheetData, ExcelSheetImage,

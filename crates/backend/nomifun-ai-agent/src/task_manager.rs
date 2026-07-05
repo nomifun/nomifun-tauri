@@ -75,10 +75,109 @@ pub trait IWorkerTaskManager: Send + Sync {
 /// may retry; the slot itself is only removed on `kill` / `clear`.
 type TaskSlot = Arc<OnceCell<AgentInstance>>;
 
+/// Max crash-evictions within [`RESTART_WINDOW_MS`] before a conversation's
+/// respawn is refused. Beyond this the agent is deterministically crash-looping
+/// and respawning again just burns a fresh CLI process + ACP handshake to die
+/// the same way.
+const RESTART_MAX_PER_WINDOW: u32 = 3;
+/// Sliding window (ms) over which crash-evictions are counted. A conversation
+/// that survives this long without a crash resets its budget, so a single crash
+/// deep into a long session never trips the breaker.
+const RESTART_WINDOW_MS: i64 = 60_000;
+/// Base respawn backoff (ms); doubled per crash within the window (1s, 2s, …)
+/// and capped at [`RESTART_MAX_BACKOFF_MS`]. Paces a flapping agent so a
+/// zero-delay respawn cannot re-enter the same crashing operation instantly.
+const RESTART_BASE_BACKOFF_MS: u64 = 500;
+const RESTART_MAX_BACKOFF_MS: u64 = 8_000;
+
+#[derive(Clone, Copy)]
+struct RestartRecord {
+    /// Crash-evictions inside the current window.
+    count: u32,
+    /// When the current window began (`now_ms`).
+    window_start_ms: i64,
+}
+
+/// Crash-loop governor for agent (re)builds.
+///
+/// A companion ACP agent that repeatedly crashes mid-turn (e.g. a native fault
+/// in the Computer/a11y C-FFI, which no Rust error boundary can catch) is
+/// evicted with [`AgentKillReason::AgentErrorRecovery`] and lazily respawned on
+/// the next drive. With no throttle that respawn is instant, so a deterministic
+/// crash re-faults within seconds — the "6-second restart loop" users observe.
+///
+/// This governor bounds that loop per conversation: it counts crash-evictions
+/// within a sliding window, applies exponential backoff before each respawn,
+/// and once [`RESTART_MAX_PER_WINDOW`] crashes occur inside [`RESTART_WINDOW_MS`]
+/// it refuses to respawn (the caller surfaces a terminal error the UI renders as
+/// "paused — crash looping") until the window elapses. Only genuine crashes are
+/// counted; deliberate recycles (idle timeout, knowledge-binding rebuild, team
+/// rebuild, conversation delete) never consume the budget, so a healthy reopen
+/// is never throttled. Modelled on the MCP stdio transport's respawn breaker.
+#[derive(Default)]
+struct RestartGovernor {
+    records: DashMap<String, RestartRecord>,
+}
+
+impl RestartGovernor {
+    /// Record a crash-eviction for `conversation_id` at `now_ms`; returns the
+    /// crash count within the (possibly just-reset) window.
+    fn record_crash(&self, conversation_id: &str, now_ms: i64) -> u32 {
+        let mut rec = self
+            .records
+            .entry(conversation_id.to_owned())
+            .or_insert(RestartRecord {
+                count: 0,
+                window_start_ms: now_ms,
+            });
+        if now_ms - rec.window_start_ms > RESTART_WINDOW_MS {
+            rec.count = 1;
+            rec.window_start_ms = now_ms;
+        } else {
+            rec.count += 1;
+        }
+        rec.count
+    }
+
+    /// Decide whether a (re)build for `conversation_id` may proceed at `now_ms`.
+    ///
+    /// - `Ok(backoff_ms)` — proceed after sleeping `backoff_ms` (0 when there is
+    ///   no recent crash history or the window has elapsed).
+    /// - `Err(count)` — refuse: the conversation crashed `count` times within
+    ///   the window and is crash-looping.
+    fn gate(&self, conversation_id: &str, now_ms: i64) -> Result<u64, u32> {
+        match self.records.get(conversation_id) {
+            Some(rec) if now_ms - rec.window_start_ms <= RESTART_WINDOW_MS => {
+                if rec.count >= RESTART_MAX_PER_WINDOW {
+                    Err(rec.count)
+                } else {
+                    let backoff = RESTART_BASE_BACKOFF_MS
+                        .saturating_mul(1u64 << rec.count.min(5))
+                        .min(RESTART_MAX_BACKOFF_MS);
+                    Ok(backoff)
+                }
+            }
+            // No record, or the window has elapsed → unthrottled build.
+            _ => Ok(0),
+        }
+    }
+
+    /// Drop all crash bookkeeping for a conversation (definitive teardown).
+    fn forget(&self, conversation_id: &str) {
+        self.records.remove(conversation_id);
+    }
+
+    fn clear(&self) {
+        self.records.clear();
+    }
+}
+
 /// Default implementation of [`IWorkerTaskManager`] using a concurrent hash map.
 pub struct WorkerTaskManagerImpl {
     tasks: DashMap<String, TaskSlot>,
     factory: AgentFactory,
+    /// Bounds rapid crash-respawn loops per conversation (see [`RestartGovernor`]).
+    governor: RestartGovernor,
 }
 
 impl WorkerTaskManagerImpl {
@@ -86,12 +185,33 @@ impl WorkerTaskManagerImpl {
         Self {
             tasks: DashMap::new(),
             factory,
+            governor: RestartGovernor::default(),
         }
     }
 
     /// Look up a fully-initialised instance by conversation id.
     fn initialised_instance(&self, conversation_id: &str) -> Option<AgentInstance> {
         self.tasks.get(conversation_id).and_then(|slot| slot.get().cloned())
+    }
+
+    /// Feed a kill into the restart governor. Only a crash-recovery eviction
+    /// ([`AgentKillReason::AgentErrorRecovery`]) counts against the respawn
+    /// budget; every other kill is a deliberate recycle and must not. A
+    /// definitive teardown ([`AgentKillReason::ConversationDeleted`]) drops the
+    /// bookkeeping so a reused conversation id starts fresh.
+    fn note_kill_for_governor(&self, conversation_id: &str, reason: Option<AgentKillReason>) {
+        match reason {
+            Some(AgentKillReason::AgentErrorRecovery) => {
+                let count = self.governor.record_crash(conversation_id, now_ms());
+                warn!(
+                    conversation_id,
+                    crash_count = count,
+                    "Recorded agent crash-eviction for the restart governor"
+                );
+            }
+            Some(AgentKillReason::ConversationDeleted) => self.governor.forget(conversation_id),
+            _ => {}
+        }
     }
 }
 
@@ -116,6 +236,40 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
             .or_insert_with(|| Arc::new(OnceCell::new()))
             .clone();
 
+        // Fast path: a live instance already exists — hand it back without
+        // touching the restart governor (a healthy warm task is never
+        // throttled).
+        if let Some(instance) = slot.get() {
+            return Ok(instance.clone());
+        }
+
+        // About to (re)build. Enforce the crash-loop governor so a
+        // deterministically-crashing conversation cannot hot-loop respawns.
+        match self.governor.gate(conversation_id, now_ms()) {
+            Ok(0) => {}
+            Ok(backoff_ms) => {
+                warn!(
+                    conversation_id,
+                    backoff_ms, "Backing off before respawning a recently-crashed agent"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+            Err(count) => {
+                warn!(
+                    conversation_id,
+                    crash_count = count,
+                    window_ms = RESTART_WINDOW_MS,
+                    "Agent is crash-looping; refusing to respawn until the window elapses"
+                );
+                return Err(AppError::Conflict(format!(
+                    "Agent for conversation {conversation_id} crashed {count} times within {}s and \
+                     is paused to break a crash loop. Resolve the underlying failure (see the \
+                     agent's exit code/signal in the logs), then try again shortly.",
+                    RESTART_WINDOW_MS / 1000
+                )));
+            }
+        }
+
         // `OnceCell::get_or_try_init` serialises concurrent initialisers:
         // the first caller to reach it runs the factory, every other caller
         // awaits the same future and ends up with the same instance. On
@@ -126,6 +280,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
     }
 
     fn kill(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AppError> {
+        self.note_kill_for_governor(conversation_id, reason);
         if let Some((id, slot)) = self.tasks.remove(conversation_id) {
             info!(conversation_id = %id, ?reason, "Killing agent task");
             if let Some(agent) = slot.get() {
@@ -140,6 +295,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         conversation_id: &str,
         reason: Option<AgentKillReason>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        self.note_kill_for_governor(conversation_id, reason);
         if let Some((id, slot)) = self.tasks.remove(conversation_id) {
             info!(conversation_id = %id, ?reason, "Killing agent task (awaitable)");
             if let Some(agent) = slot.get() {
@@ -150,6 +306,7 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
     }
 
     fn clear(&self) {
+        self.governor.clear();
         let keys: Vec<String> = self.tasks.iter().map(|r| r.key().clone()).collect();
         for key in keys {
             if let Some((id, slot)) = self.tasks.remove(&key) {
@@ -547,5 +704,100 @@ mod tests {
         let mgr = make_manager();
         let idle = mgr.collect_idle(300_000);
         assert!(idle.is_empty());
+    }
+
+    // ── Restart governor (crash-loop breaker) ───────────────────────
+
+    #[test]
+    fn restart_governor_trips_after_max_crashes_in_window() {
+        let g = RestartGovernor::default();
+        let t0 = 1_000_000;
+        // No history → unthrottled.
+        assert_eq!(g.gate("c", t0), Ok(0));
+        // Crashes within the window accumulate.
+        assert_eq!(g.record_crash("c", t0), 1);
+        assert_eq!(g.record_crash("c", t0 + 6_000), 2);
+        assert_eq!(g.record_crash("c", t0 + 12_000), 3);
+        // At the cap the breaker trips.
+        assert_eq!(g.gate("c", t0 + 12_000), Err(RESTART_MAX_PER_WINDOW));
+    }
+
+    #[test]
+    fn restart_governor_backoff_grows_per_crash() {
+        let g = RestartGovernor::default();
+        let t0 = 5_000;
+        g.record_crash("c", t0); // count 1
+        assert_eq!(g.gate("c", t0), Ok(1_000));
+        g.record_crash("c", t0); // count 2
+        assert_eq!(g.gate("c", t0), Ok(2_000));
+    }
+
+    #[test]
+    fn restart_governor_resets_after_window() {
+        let g = RestartGovernor::default();
+        let t0 = 0;
+        g.record_crash("c", t0);
+        g.record_crash("c", t0 + 1_000);
+        g.record_crash("c", t0 + 2_000); // count 3 → tripped
+        assert!(g.gate("c", t0 + 2_000).is_err());
+        // A crash after the window has elapsed starts a fresh budget.
+        let after = t0 + RESTART_WINDOW_MS + 3_000;
+        assert_eq!(g.record_crash("c", after), 1);
+        assert_eq!(g.gate("c", after), Ok(1_000));
+    }
+
+    #[test]
+    fn restart_governor_forget_clears_history() {
+        let g = RestartGovernor::default();
+        let t0 = 100;
+        g.record_crash("c", t0);
+        g.record_crash("c", t0);
+        g.record_crash("c", t0); // tripped
+        assert!(g.gate("c", t0).is_err());
+        g.forget("c");
+        assert_eq!(g.gate("c", t0), Ok(0)); // fresh
+    }
+
+    #[tokio::test]
+    async fn agent_error_recovery_crashes_trip_the_restart_breaker() {
+        let mgr = make_manager();
+        // Initial build succeeds.
+        mgr.get_or_build_task("c", make_options("c")).await.unwrap();
+        // Crash-evictions accumulate (recorded whether or not a rebuild
+        // intervenes). At the cap, gate() returns Err *before* any backoff
+        // sleep, so the test needs no clock control.
+        for _ in 0..RESTART_MAX_PER_WINDOW {
+            mgr.kill("c", Some(AgentKillReason::AgentErrorRecovery)).unwrap();
+        }
+        // The next respawn is refused — the loop is broken.
+        match mgr.get_or_build_task("c", make_options("c")).await {
+            Err(AppError::Conflict(_)) => {}
+            Err(other) => panic!("expected Conflict, got {other:?}"),
+            Ok(_) => panic!("crash loop must trip the breaker, but the build succeeded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn benign_recycles_never_trip_the_breaker() {
+        let mgr = make_manager();
+        for _ in 0..6 {
+            mgr.get_or_build_task("c", make_options("c")).await.unwrap();
+            // Knowledge-binding rebuild is a deliberate recycle, not a crash.
+            mgr.kill("c", Some(AgentKillReason::KnowledgeBindingChanged)).unwrap();
+        }
+        // Never counted as a crash → still builds.
+        assert!(mgr.get_or_build_task("c", make_options("c")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn conversation_delete_resets_the_restart_governor() {
+        let mgr = make_manager();
+        mgr.get_or_build_task("c", make_options("c")).await.unwrap();
+        for _ in 0..RESTART_MAX_PER_WINDOW {
+            mgr.kill("c", Some(AgentKillReason::AgentErrorRecovery)).unwrap();
+        }
+        // Deleting the conversation clears the crash history so a reused id starts fresh.
+        mgr.kill("c", Some(AgentKillReason::ConversationDeleted)).unwrap();
+        assert!(mgr.get_or_build_task("c", make_options("c")).await.is_ok());
     }
 }

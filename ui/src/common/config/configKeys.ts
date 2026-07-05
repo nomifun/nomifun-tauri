@@ -43,10 +43,6 @@ export type ConfigKeyMap = {
   // 智能编排「协作模型」默认偏好：主模型(=nomi.defaultModel)之外、供主模型按任务难度
   // 为各节点挑选的额外 worker 模型池。仅编排发起时使用；空 = 全程用主模型。
   'nomi.orchestrationCollaborators': { provider_id: string; model: string }[] | undefined;
-  // 全局「智能编排」开关：为真时，普通桌面会话默认成为编排 lead——遇到复杂多步需求会自动
-  // 用 nomi_run_create 把活拆给子 agent 并行处理（后端工厂读此偏好注入主管 prompt）。
-  // 默认 undefined/false = 仅在用户显式发起时编排。伙伴有各自的智能编排开关。
-  'nomi.autoOrchestration': boolean | undefined;
   // Default provider+model for the knowledge-base AI description/overview
   // generators (autogen / description.generate / description.polish). Empty
   // value = let the backend fall back to its own default completer model.

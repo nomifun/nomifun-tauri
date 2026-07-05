@@ -16,7 +16,7 @@ import type { AvailableAgent } from '../types';
 import type { Assistant } from '@/common/types/agent/assistantTypes';
 import PresetAgentTag, { type AgentSwitcherItem } from './PresetAgentTag';
 import { Button, Checkbox, Dropdown, Menu, Message, Tooltip } from '@arco-design/web-react';
-import { ArrowUp, Plus, Robot, Shield, UploadOne, Workbench } from '@icon-park/react';
+import { ArrowUp, Plus, Robot, Shield, UploadOne } from '@icon-park/react';
 import React, { useCallback, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import styles from '../index.module.css';
@@ -28,9 +28,6 @@ type GuidActionRowProps = {
 
   // Model selector node (rendered by parent)
   modelSelectorNode: React.ReactNode;
-  /** 智能编排「协作模型」selector — rendered next to the model selector, only in
-   * orchestration mode (the parent passes null otherwise). */
-  collaboratorSelectorNode?: React.ReactNode;
 
   // Agent mode
   selectedAgent: string | 'custom';
@@ -67,17 +64,12 @@ type GuidActionRowProps = {
    * it shows a robot icon + "Start AutoWork" tooltip. Disabled/onClick are
    * still driven by the parent. */
   autoWorkMode?: boolean;
-  /** When true the primary button starts a conversation-hosted orchestration
-   * run (no chat send): it shows a workbench icon + "Start orchestration"
-   * tooltip. Disabled/onClick are still driven by the parent. */
-  orchestrationMode?: boolean;
 };
 
 const GuidActionRow: React.FC<GuidActionRowProps> = ({
   files,
   onFilesUploaded,
   modelSelectorNode,
-  collaboratorSelectorNode,
   selectedAgent,
   effectiveModeAgent,
   selectedMode,
@@ -99,7 +91,6 @@ const GuidActionRow: React.FC<GuidActionRowProps> = ({
   speechInputNode,
   onSend,
   autoWorkMode = false,
-  orchestrationMode = false,
 }) => {
   const { t } = useTranslation();
   const layout = useLayoutContext();
@@ -107,7 +98,7 @@ const GuidActionRow: React.FC<GuidActionRowProps> = ({
   const [isPlusDropdownOpen, setIsPlusDropdownOpen] = useState(false);
   const modeBackend = effectiveModeAgent || selectedAgent;
   const showModeSwitch = supportsModeSwitch(modeBackend);
-  const configOptionCount = (modelSelectorNode ? 1 : 0) + (collaboratorSelectorNode ? 1 : 0) + (showModeSwitch ? 1 : 0);
+  const configOptionCount = (modelSelectorNode ? 1 : 0) + (showModeSwitch ? 1 : 0);
 
   // Browser file picker ref (WebUI only)
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -268,7 +259,6 @@ const GuidActionRow: React.FC<GuidActionRowProps> = ({
         {configOptionCount > 0 && (
           <div className={styles.actionConfigGroup} data-mobile={isMobile ? 'true' : undefined}>
             {modelSelectorNode}
-            {collaboratorSelectorNode}
 
             {showModeSwitch && (
               <AgentModeSelector
@@ -299,12 +289,8 @@ const GuidActionRow: React.FC<GuidActionRowProps> = ({
 
         {speechInputNode}
         <Tooltip
-          content={
-            orchestrationMode
-              ? t('conversation.orchestration.startTitle', { defaultValue: '发起智能编排' })
-              : t('requirements.autowork.startSession')
-          }
-          disabled={!autoWorkMode && !orchestrationMode}
+          content={t('requirements.autowork.startSession')}
+          disabled={!autoWorkMode}
         >
           <Button
             shape='circle'
@@ -317,9 +303,7 @@ const GuidActionRow: React.FC<GuidActionRowProps> = ({
               borderColor: isButtonDisabled ? undefined : '#000000',
             }}
             icon={
-              orchestrationMode ? (
-                <Workbench theme='filled' size='14' fill='white' strokeWidth={5} />
-              ) : autoWorkMode ? (
+              autoWorkMode ? (
                 <Robot theme='filled' size='14' fill='white' strokeWidth={5} />
               ) : (
                 <ArrowUp theme='filled' size='14' fill='white' strokeWidth={5} />

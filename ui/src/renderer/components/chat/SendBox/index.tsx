@@ -27,6 +27,7 @@ import { Button, Input, Message, Tag } from '@arco-design/web-react';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 import { ArrowUp, CloseSmall, Lightning, Plus, Quote } from '@icon-park/react';
 import type { SlashCommandItem } from '@/common/chat/slash/types';
+import type { TFunction } from 'i18next';
 import { theme } from '@/platform';
 import React, { useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -151,6 +152,13 @@ const buildOwnedSelectionItems = (
 function extractBtwQuestion(value: string): string | null {
   const match = value.trim().match(BTW_COMMAND_RE);
   return match ? match[1] || '' : null;
+}
+
+function getSlashCommandDescription(command: SlashCommandItem, t: TFunction): string {
+  if (command.source !== 'builtin' && command.name === 'compact') {
+    return t('conversation.slashCommands.compact.description', { defaultValue: command.description });
+  }
+  return command.description;
 }
 
 const SendBox: React.FC<{
@@ -563,10 +571,10 @@ const SendBox: React.FC<{
       slashController.filteredCommands.map((command) => ({
         key: command.name,
         label: `/${command.name}`,
-        description: command.description,
+        description: getSlashCommandDescription(command, t),
         badge: command.hint,
       })),
-    [slashController.filteredCommands]
+    [slashController.filteredCommands, t]
   );
 
   const isCommandMenuOpen = conversationExport.isOpen || slashController.isOpen;

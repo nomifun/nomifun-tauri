@@ -121,6 +121,17 @@ pub struct OrchRunTaskRow {
     /// re-reading the worker conversation.
     #[serde(default)]
     pub last_error: Option<String>,
+    /// Per-node failure policy (迁移 029, nullable): how the engine settles the RUN
+    /// when THIS task permanently fails.
+    ///   `None` / `"fail_run"`   = default — a hard failure fails the whole run
+    ///                             (current behaviour, zero regression).
+    ///   `"skip_and_continue"`   = a soft failure — the engine skips this node's
+    ///                             transitive downstream, lets independent branches
+    ///                             finish, and settles the run
+    ///                             `completed_with_failures` (not `failed`).
+    /// Set by the planner in a later phase; today all planned nodes persist `None`.
+    #[serde(default)]
+    pub on_fail: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }

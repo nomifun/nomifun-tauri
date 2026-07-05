@@ -174,27 +174,21 @@ pub(super) async fn build(
         knowledge_write_enabled,
     );
 
-    // Orchestration lead (会话 entry "auto/range" models → extra.orchestrator_role
-    // == "lead", OR the global 智能编排 preference for a plain desktop session):
-    // prepend the server-authored 编排主管 system prompt so the conversation
-    // decomposes complex requirements via `nomi_run_create`. Composed LAST so the
-    // 主管 prompt leads, with the full preset/persona/knowledge prompt preserved
-    // after the separator. Tool availability is NOT granted here — the
-    // orchestration tools ride the desktop gateway that every locally-trusted
-    // desktop session is already granted server-side; this only shapes the prompt
-    // (no capability or approval-mode change). Companions use their own in-persona
-    // nudge; remote/IM never auto-fan-out.
-    let auto_orchestration = read_bool_pref(&deps, PREF_AUTO_ORCHESTRATION, false).await;
-    let lead = is_orchestration_lead(
-        overrides.orchestrator_role.as_deref(),
-        auto_orchestration,
+    // 常驻 subagent 提示：让普通桌面会话默认懂得在合适场景用 nomi_spawn / nomi_run_create
+    // 把活拆给子 agent 并在画布可视化。工具本就随桌面网关标配，这里只塑形提示（不授予能力、
+    // 不改审批模式）。伙伴走各自 smart_orchestration；渠道/远程会话不注入（网关拒 Remote）；
+    // 对外服务（PublicService）不注入（网关被钳制关闭，spawn 工具不可达，且不得让陌生人扇出）。
+    let inject_subagent_hint = should_inject_subagent_hint(
+        overrides.desktop_gateway,
         overrides.companion,
         overrides.channel_platform.is_some(),
+        matches!(
+            overrides.exposure,
+            nomifun_api_types::ExposureMode::PublicService
+        ),
     );
-    overrides.system_prompt = compose_lead_prompt(
-        overrides.system_prompt.take(),
-        if lead { Some("lead") } else { None },
-    );
+    overrides.system_prompt =
+        compose_subagent_hint(overrides.system_prompt.take(), inject_subagent_hint);
 
     // Companion-owned sessions (local 桌面伙伴 chat + IM channel master) — AND
     // 对外伙伴 (public agent) sessions — must reply in the app's UI language, not a
@@ -602,10 +596,6 @@ const PREF_BROWSER_SILENT: &str = "agent.browserUse.silent";
 const PREF_BROWSER_SOURCE: &str = "agent.browserUse.source";
 /// 浏览器来源 host default（无设置行/无 client_prefs 时）：内置/下载的 Chrome for Testing。
 const BROWSER_SOURCE_DEFAULT: &str = "managed";
-/// 全局「智能编排」开关（client preference）。为真时，普通桌面会话默认成为编排 lead（注入
-/// 主管 prompt，鼓励对复杂需求 `nomi_run_create` 扇出）。伙伴走各自的 smart_orchestration
-/// 人格提示、远程会话不参与，故此处仅对「非伙伴、非远程」的桌面会话生效。默认 OFF（opt-in）。
-const PREF_AUTO_ORCHESTRATION: &str = "nomi.autoOrchestration";
 
 /// Read a boolean `client_preferences` toggle live, falling back to
 /// `host_default` when there is no setting row (fresh install) or no
@@ -754,13 +744,37 @@ fn append_knowledge_context(
     }
 }
 
-/// Server-authored 编排主管 (orchestration lead) system prompt. Injected when a
-/// conversation carries `extra.orchestrator_role == "lead"` (会话 entry with
-/// "auto/range" models selected). The available-model range and working
-/// directory are supplied to the orchestration tools at runtime, so the prompt
-/// instructs the lead not to ask for them. Kept as a `const` so the composition
-/// is unit-testable without standing up the async factory.
-pub(crate) const LEAD_ORCHESTRATOR_PROMPT: &str = "你是 NomiFun 的编排主管。用户已在本会话限定可用模型范围（见运行上下文）。对简单或单步需求：直接作答。需要并行开几个子 agent 干活（研究、分析、各自独立产出等）时——默认用 `nomi_spawn(tasks)`：无需规划、立即并行执行，每个子任务在画布上实时可见状态与转录。只有当任务真正复杂、需要先由 planner 拆成有依赖关系的任务 DAG 时，才用 `nomi_run_create(goal)`（模型范围与工作目录会自动取用、随即自动开跑）。派发拿到 run_id 后，直接告诉用户已在后台并行执行、进度可在右侧编排画布实时查看，然后结束本轮——不要自己轮询等待，也不要重复创建：子任务全部完成或失败时，系统会自动把结果回执给你，届时你再向用户汇总产出。若回执是失败：先用 `nomi_run_status` 查清是哪个节点失败、试了几次(attempt)、原因(last_error)，再据此重新调整策略——用 `nomi_run_adjust(intent)` 增量改编排（保留已完成部分、只重做失败处），或用 `nomi_task_config` 给失败节点换更合适的模型后 `nomi_task_rerun` 重跑，必要时 `nomi_run_cancel` 放弃；自己试过 2-3 种策略仍不成，就如实向用户说明并请其决定，不要无限重试。用户若中途询问进度，才用 `nomi_run_status` 查一次。不要询问 workspace 或 fleet——它们已不存在。";
+/// 常驻轻量 subagent 使用提示。追加到每个普通桌面 nomi 会话的附加系统提示末尾，
+/// 让模型在合适场景自发用编排工具把活拆给子 agent 并在画布可视化。伙伴走各自的
+/// smart_orchestration 人格提示、渠道/远程会话网关拒 Remote，故不注入。取代原
+/// 「智能编排」lead 提示（不再需要 autoOrchestration 开关或 orchestrator_role 角色）。
+pub(crate) const SUBAGENT_STANDARD_HINT: &str = "遇到可并行的独立子任务，或需要成体系拆解的复杂多步任务时，可用 `nomi_spawn(tasks)` 立即并行派发子 agent（每个子任务在右侧编排画布实时可见状态与转录），或用 `nomi_run_create(goal)` 让规划器把目标拆成有依赖关系的任务 DAG（可用模型范围与工作目录自动取用、随即开跑）。派发后拿到 run_id，直接告诉用户已在后台执行、进度可在右侧编排画布查看，然后结束本轮——不要自己轮询等待，也不要重复创建：子任务全部完成或失败时系统会自动把结果回执给你，届时再向用户汇总。简单或单步问题直接作答，无需派发。";
+
+/// 是否给本会话追加常驻 subagent 提示（纯策略，可单测）。提示点名的 `nomi_spawn` /
+/// `nomi_run_create` 工具只随桌面网关标配（`desktop_gateway`=true 的本地可信会话），
+/// 故必须 `has_gateway` 才注入——否则会话拿不到这些工具，提示就成了空头支票（远程
+/// WebUI 未授信、对外服务被钳制关网关等）。伙伴走各自 smart_orchestration、渠道/远程
+/// 网关拒 Remote、对外服务恒不注入，故一并排除。
+pub(crate) fn should_inject_subagent_hint(
+    has_gateway: bool,
+    is_companion: bool,
+    is_channel: bool,
+    is_public: bool,
+) -> bool {
+    has_gateway && !is_companion && !is_channel && !is_public
+}
+
+/// 把 subagent 提示组合到已有的附加系统提示之后（组合而非替换，保留 preset/人格/知识
+/// 内容）。`inject` 为假时原样返回 `base`。纯函数，便于隔离测试。
+pub(crate) fn compose_subagent_hint(base: Option<String>, inject: bool) -> Option<String> {
+    if !inject {
+        return base;
+    }
+    Some(match base {
+        Some(existing) if !existing.is_empty() => format!("{existing}\n\n{SUBAGENT_STANDARD_HINT}"),
+        _ => SUBAGENT_STANDARD_HINT.to_owned(),
+    })
+}
 
 /// 进程内 Spawn 门控（纯函数，可单测）：本地桌面网关会话（desktop_gateway 且非
 /// IM 渠道）禁用进程内 Spawn —— 子 agent 改走 nomi_spawn 编排扇出（每个子任务
@@ -847,40 +861,6 @@ pub(crate) fn build_public_agent_prompt(runtime: &crate::factory::PublicAgentRun
         );
     }
     out
-}
-
-/// Decide whether a session should act as an orchestration lead (and thus get
-/// the 主管 prompt). Pure so the policy is unit-testable.
-///
-/// - An explicit `extra.orchestrator_role == "lead"` always wins (WebUI-set / per-session).
-/// - Otherwise the global 智能编排 preference (`nomi.autoOrchestration`) turns
-///   plain desktop sessions into leads by default — but NOT companions (they use
-///   their own in-persona `smart_orchestration` nudge) and NOT remote/IM sessions
-///   (`caps_orchestrator` denies Remote, so a lead prompt there would be a dead end).
-pub(crate) fn is_orchestration_lead(role: Option<&str>, auto_pref: bool, is_companion: bool, is_remote: bool) -> bool {
-    role == Some("lead") || (auto_pref && !is_companion && !is_remote)
-}
-
-/// Compose the 主管 system prompt onto whatever base prompt the assembly has
-/// produced (preset rules + companion persona + knowledge context), when the
-/// conversation is the orchestration lead.
-///
-/// - `role == Some("lead")`: prepend [`LEAD_ORCHESTRATOR_PROMPT`], then the base
-///   (if any) after a blank-line separator. Composition, NOT replacement — no
-///   preset/persona/knowledge content is discarded.
-/// - any other role (or `None`): return `base` unchanged (no 主管 injection).
-///
-/// Pure and side-effect-free so the lead path is testable in isolation.
-pub(crate) fn compose_lead_prompt(base: Option<String>, role: Option<&str>) -> Option<String> {
-    if role != Some("lead") {
-        return base;
-    }
-    Some(match base {
-        Some(existing) if !existing.is_empty() => {
-            format!("{LEAD_ORCHESTRATOR_PROMPT}\n\n{existing}")
-        }
-        _ => LEAD_ORCHESTRATOR_PROMPT.to_owned(),
-    })
 }
 
 /// Map Nomi DB platform name to the nomi provider identifier.
@@ -1982,60 +1962,6 @@ mod tests {
     }
 
     #[test]
-    fn compose_lead_prompt_prepends_supervisor_prompt_for_lead() {
-        // lead role → 主管 prompt is prepended and composed with the existing
-        // base (preset/persona/knowledge), not discarded.
-        let composed =
-            compose_lead_prompt(Some("Be concise.".to_owned()), Some("lead")).expect("some prompt");
-        assert!(
-            composed.contains("编排主管"),
-            "lead prompt must carry the distinctive 主管 marker: {composed}"
-        );
-        assert!(
-            composed.contains("nomi_run_create"),
-            "lead prompt must name the orchestration tool: {composed}"
-        );
-        assert!(
-            composed.contains("nomi_spawn"),
-            "lead prompt must teach the flat fan-out verb for independent small tasks: {composed}"
-        );
-        // Composition, not replacement: the provided base survives.
-        assert!(
-            composed.contains("Be concise."),
-            "existing base prompt must be preserved: {composed}"
-        );
-        // The 主管 prompt comes first, then the base after a separator.
-        let idx_lead = composed.find("编排主管").unwrap();
-        let idx_base = composed.find("Be concise.").unwrap();
-        assert!(idx_lead < idx_base, "主管 prompt must precede the base");
-    }
-
-    #[test]
-    fn compose_lead_prompt_with_no_base_is_just_supervisor_prompt() {
-        let composed = compose_lead_prompt(None, Some("lead")).expect("some prompt");
-        assert!(composed.contains("编排主管"));
-        assert_eq!(composed, LEAD_ORCHESTRATOR_PROMPT);
-    }
-
-    #[test]
-    fn compose_lead_prompt_non_lead_is_passthrough() {
-        // Non-lead role (None / other) returns the base verbatim — no 主管 prompt.
-        assert_eq!(
-            compose_lead_prompt(Some("Be concise.".to_owned()), None),
-            Some("Be concise.".to_owned())
-        );
-        let other = compose_lead_prompt(Some("Be concise.".to_owned()), Some("member"));
-        assert_eq!(other.as_deref(), Some("Be concise."));
-        assert!(
-            !other.unwrap().contains("编排主管"),
-            "non-lead must NOT carry the 主管 prompt"
-        );
-        // Non-lead with no base stays None (no injection).
-        assert_eq!(compose_lead_prompt(None, None), None);
-        assert_eq!(compose_lead_prompt(None, Some("member")), None);
-    }
-
-    #[test]
     fn engine_spawn_enabled_policy() {
         // 本地桌面网关会话（普通/伙伴）→ 禁进程内 Spawn（改走 nomi_spawn 可视化扇出）。
         assert!(!engine_spawn_enabled(true, None));
@@ -2043,6 +1969,42 @@ mod tests {
         assert!(engine_spawn_enabled(true, Some("telegram")));
         // 无网关会话 → 保留。
         assert!(engine_spawn_enabled(false, None));
+    }
+
+    #[test]
+    fn subagent_hint_injects_for_plain_desktop_session() {
+        // 普通桌面会话（有网关、非伙伴、非渠道、非对外）→ 追加 subagent 提示
+        assert!(super::should_inject_subagent_hint(true, false, false, false));
+        let out = super::compose_subagent_hint(Some("基础提示".to_string()), true);
+        let s = out.unwrap();
+        assert!(s.starts_with("基础提示"));
+        assert!(s.contains("nomi_spawn"));
+        assert!(s.contains("nomi_run_create"));
+    }
+
+    #[test]
+    fn subagent_hint_skips_when_gateway_absent() {
+        // 无桌面网关（如远程 WebUI 未授信）→ 不注入：提示点名的 nomi_spawn /
+        // nomi_run_create 工具此时不可达，注入只会成为空头支票。
+        assert!(!super::should_inject_subagent_hint(false, false, false, false));
+    }
+
+    #[test]
+    fn subagent_hint_skips_companion_and_channel() {
+        // 伙伴有自己的 smart_orchestration；渠道/远程网关拒 Remote，注入是死路；对外服务恒不注入
+        // （下述三例均带网关 true，隔离出各排除维度）
+        assert!(!super::should_inject_subagent_hint(true, true, false, false)); // companion
+        assert!(!super::should_inject_subagent_hint(true, false, true, false)); // channel/remote
+        assert!(!super::should_inject_subagent_hint(true, false, false, true)); // public service
+        // inject=false 时原样返回，不追加
+        let base = Some("仅基础".to_string());
+        assert_eq!(super::compose_subagent_hint(base.clone(), false), base);
+    }
+
+    #[test]
+    fn subagent_hint_handles_empty_base() {
+        let out = super::compose_subagent_hint(None, true);
+        assert_eq!(out, Some(super::SUBAGENT_STANDARD_HINT.to_string()));
     }
 
     #[test]
@@ -2115,22 +2077,6 @@ mod tests {
         // 缺省不回归
         let d: NomiBuildExtra = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(d.exposure, nomifun_api_types::ExposureMode::Private);
-    }
-
-    #[test]
-    fn is_orchestration_lead_policy() {
-        // Explicit role wins regardless of preference/companion/remote.
-        assert!(is_orchestration_lead(Some("lead"), false, false, false));
-        assert!(is_orchestration_lead(Some("lead"), false, true, false));
-        // Global 智能编排 preference makes a plain desktop session a lead.
-        assert!(is_orchestration_lead(None, true, false, false));
-        // …but never a companion (它有自己的 smart_orchestration 人设提示)…
-        assert!(!is_orchestration_lead(None, true, true, false));
-        // …nor a remote/IM session (caps_orchestrator denies Remote).
-        assert!(!is_orchestration_lead(None, true, false, true));
-        // Preference off + no explicit role → not a lead.
-        assert!(!is_orchestration_lead(None, false, false, false));
-        assert!(!is_orchestration_lead(Some("member"), false, false, false));
     }
 
     #[test]

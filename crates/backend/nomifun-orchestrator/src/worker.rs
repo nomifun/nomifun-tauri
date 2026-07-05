@@ -114,6 +114,19 @@ pub trait WorkerRunner: Send + Sync {
         false
     }
 
+    /// Whether the worker conversation carries ANY `content.type == "error"` marker.
+    /// Distinguishes a NonRetryable provider error (marker present, `retryable=false`)
+    /// from a NoMarker timeout / empty reply (no marker at all — a turn that returned
+    /// `ok:false` without ever persisting a provider-error message). The engine's
+    /// three-way classification retries a NoMarker failure under the SEPARATE
+    /// `max_timeout_retries` budget, while a marked non-retryable error still fails
+    /// fast. Default `false` (no marker) so test/mock runners with no live
+    /// conversation store report NoMarker unless they explicitly override; the
+    /// production [`ConversationWorkerRunner`] overrides it to read the marker.
+    async fn last_error_present(&self, _conversation_id: &str) -> bool {
+        false
+    }
+
     /// A short human-readable failure reason (`<code>: <message>`) from the
     /// conversation's latest error marker, PERSISTED onto a permanently-failed task
     /// so the lead-report / escalation / diagnostic tools can show WHY it failed
@@ -126,11 +139,13 @@ pub trait WorkerRunner: Send + Sync {
     /// 带角色的执行入口：默认忽略 `role` 委托给 [`Self::run`]（既有 mock/测试
     /// runner 零改动）。生产 [`ConversationWorkerRunner`] 覆写本方法，把受限
     /// 角色（searcher/reviewer/verifier）映射为 per-node 工具白名单 + 网关收缩。
-    /// 引擎 dispatch 统一走本方法并传 `task.role`。
+    /// 引擎 dispatch 统一走本方法并传 `task.role` 与 `delegation_depth`（受控嵌套：
+    /// 从 task.pattern_config 读出、烙进 worker 会话 extra）。
     #[allow(clippy::too_many_arguments)]
     async fn run_restricted(
         &self,
         role: Option<&str>,
+        delegation_depth: u32,
         member: &FleetMember,
         workspace_dir: Option<&str>,
         run_id: &str,
@@ -140,7 +155,7 @@ pub trait WorkerRunner: Send + Sync {
         timeout: Duration,
         on_started: Box<dyn FnOnce(i64) + Send>,
     ) -> Result<WorkerOutcome, AppError> {
-        let _ = role;
+        let _ = (role, delegation_depth);
         self.run(member, workspace_dir, run_id, task_id, brief, task_spec, timeout, on_started)
             .await
     }
@@ -181,6 +196,15 @@ impl WorkerRunner for ConversationWorkerRunner {
         self.read_latest_error_retryable(conversation_id).await
     }
 
+    /// Production override of [`WorkerRunner::last_error_present`]: scan the worker
+    /// conversation's most recent messages for ANY provider-error marker
+    /// (`content.type == "error"`) and report whether one exists (regardless of its
+    /// `retryable` flag). Lets the engine tell a marked failure (present) apart from
+    /// a plain timeout / empty reply (absent).
+    async fn last_error_present(&self, conversation_id: &str) -> bool {
+        self.read_latest_error_present(conversation_id).await
+    }
+
     async fn last_error_summary(&self, conversation_id: &str) -> Option<String> {
         self.read_latest_error_summary(conversation_id).await
     }
@@ -196,14 +220,17 @@ impl WorkerRunner for ConversationWorkerRunner {
         timeout: Duration,
         on_started: Box<dyn FnOnce(i64) + Send>,
     ) -> Result<WorkerOutcome, AppError> {
-        // 无角色入口：委托给带角色版本（生产逻辑在 run_restricted 里）。
-        self.run_restricted(None, member, workspace_dir, run_id, task_id, brief, task_spec, timeout, on_started)
+        // 无角色入口：委托给带角色版本（生产逻辑在 run_restricted 里）。root 深度 0：
+        // 无角色直入的 worker 视作委派链起点，其派生子任务将得深度 1。
+        self.run_restricted(None, 0, member, workspace_dir, run_id, task_id, brief, task_spec, timeout, on_started)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_restricted(
         &self,
         role: Option<&str>,
+        delegation_depth: u32,
         member: &FleetMember,
         workspace_dir: Option<&str>,
         run_id: &str,
@@ -236,6 +263,7 @@ impl WorkerRunner for ConversationWorkerRunner {
             &member.enabled_skills,
             &member.disabled_builtin_skills,
             role,
+            delegation_depth,
         );
 
         // Create the worker conversation. yolo: unattended orchestrator runs have
@@ -388,6 +416,35 @@ impl ConversationWorkerRunner {
         }
     }
 
+    /// Read whether the worker conversation's recent window carries ANY provider-
+    /// error marker (`content.type == "error"`). Lists the same recent (desc) window
+    /// as [`read_latest_error_retryable`](Self::read_latest_error_retryable) and
+    /// mirrors its fetch path, but only tests for the marker's PRESENCE (not its
+    /// `retryable` flag); `false` on any list error / no error marker.
+    async fn read_latest_error_present(&self, conv_id: &str) -> bool {
+        let Ok(messages) = self
+            .conv
+            .list_messages(
+                &self.user_id,
+                conv_id,
+                ListMessagesQuery {
+                    page: Some(1),
+                    page_size: Some(10),
+                    order: Some("desc".to_owned()),
+                    content_mode: None,
+                    cursor: None,
+                },
+            )
+            .await
+        else {
+            return false;
+        };
+        match serde_json::to_value(&messages) {
+            Ok(v) => latest_error_present(&v),
+            Err(_) => false,
+        }
+    }
+
     /// Read the conversation's latest error marker as a `<code>: <message>` string
     /// (best-effort → `None` on any read/parse failure or when no error marker
     /// exists). Mirrors [`Self::read_latest_error_retryable`]'s message-fetch path.
@@ -434,6 +491,7 @@ impl ConversationWorkerRunner {
 /// the canonical request-only keys; the existing handler does the rest (no
 /// handler/factory changes). Empty lists are emitted as empty arrays — harmless
 /// (the create handler treats them as "no preset / no exclusion").
+#[allow(clippy::too_many_arguments)]
 fn build_worker_extra(
     run_id: &str,
     task_id: &str,
@@ -443,6 +501,11 @@ fn build_worker_extra(
     enabled_skills: &[String],
     disabled_builtin_skills: &[String],
     role: Option<&str>,
+    // 受控嵌套深度（Phase 3b W7d）：本 worker 会话在委派链上的层级。root lead=0（其
+    // 会话 extra 由别处构造、不含本键 → 读回 0）；lead 的直属 worker=1；被 worker 再
+    // 委派出的子任务=2。网关两个追加口（nomi_run_add_tasks / nomi_spawn 收敛）据此
+    // 钳制深度（DELEGATION_DEPTH_LIMIT），防无界自我繁殖。
+    delegation_depth: u32,
 ) -> Value {
     // 受限角色（searcher/reviewer 只读、verifier 只读+Bash）：收缩引擎工具白名单，
     // 且不授桌面网关 —— 只读 worker 拿全量 nomi_* 桌面控制等于静默升权。
@@ -453,6 +516,8 @@ fn build_worker_extra(
         "desktopGateway": restricted.is_none(),
         "orchestrator_run_id": run_id,
         "orchestrator_task_id": task_id,
+        // 受控嵌套：本 worker 的委派深度。网关追加口读取此键 +1 与 LIMIT 比较后钳制。
+        "orchestrator_delegation_depth": delegation_depth,
         "system_prompt": brief,
         // Request-only skill-shaping inputs consumed by ConversationService::create:
         // preset_enabled_skills ∪ (auto_inject − exclude_auto_inject_skills) → extra.skills.
@@ -537,6 +602,27 @@ fn error_retryable_flag(v: &Value) -> Option<bool> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
     )
+}
+
+/// Whether a serialized message list (array or single) carries ANY provider-error
+/// marker (`content.type == "error"`). Mirrors [`latest_error_retryable`]'s
+/// array/single walk but tests only for PRESENCE — used to tell a marked failure
+/// (present) apart from a plain timeout / empty reply (absent).
+fn latest_error_present(v: &Value) -> bool {
+    match v {
+        Value::Array(arr) => arr.iter().any(error_marker_present),
+        _ => error_marker_present(v),
+    }
+}
+
+/// True iff this single serialized message is a provider-error marker
+/// (`content.type == "error"`).
+fn error_marker_present(v: &Value) -> bool {
+    v.as_object()
+        .and_then(|o| o.get("content"))
+        .and_then(|c| c.get("type"))
+        .and_then(Value::as_str)
+        == Some("error")
 }
 
 /// The latest error marker rendered as a short `<code>: <message>` reason (or one
@@ -754,7 +840,7 @@ mod tests {
 
     #[test]
     fn build_worker_extra_carries_correlation_keys_and_brief() {
-        let extra = build_worker_extra("run_abc", "task_xyz", "you are a worker", None, None, &[], &[], None);
+        let extra = build_worker_extra("run_abc", "task_xyz", "you are a worker", None, None, &[], &[], None, 0);
         assert_eq!(extra["session_mode"], "yolo");
         assert_eq!(extra["desktopGateway"], true);
         assert_eq!(extra["orchestrator_run_id"], "run_abc");
@@ -782,27 +868,27 @@ mod tests {
     // nomi_* 桌面控制 = 静默升权）。无角色/implementer：现状完全不变。
     #[test]
     fn build_worker_extra_restricted_role_shrinks_tools_and_gateway() {
-        let extra = build_worker_extra("run_abc", "task_xyz", "brief", None, None, &[], &[], Some("searcher"));
+        let extra = build_worker_extra("run_abc", "task_xyz", "brief", None, None, &[], &[], Some("searcher"), 0);
         assert_eq!(extra["desktopGateway"], false, "受限角色不得静默升权到全量网关");
         assert_eq!(extra["allowed_tools"], json!(["Read", "Grep", "Glob"]));
 
-        let verify = build_worker_extra("run_abc", "task_xyz", "brief", None, None, &[], &[], Some("verifier"));
+        let verify = build_worker_extra("run_abc", "task_xyz", "brief", None, None, &[], &[], Some("verifier"), 0);
         assert_eq!(verify["allowed_tools"], json!(["Read", "Grep", "Glob", "Bash"]));
 
-        let full = build_worker_extra("run_abc", "task_xyz", "brief", None, None, &[], &[], Some("implementer"));
+        let full = build_worker_extra("run_abc", "task_xyz", "brief", None, None, &[], &[], Some("implementer"), 0);
         assert_eq!(full["desktopGateway"], true);
         assert!(full.get("allowed_tools").is_none());
     }
 
     #[test]
     fn build_worker_extra_includes_trimmed_workspace() {
-        let extra = build_worker_extra("r", "t", "b", Some("  /tmp/ws  "), None, &[], &[], None);
+        let extra = build_worker_extra("r", "t", "b", Some("  /tmp/ws  "), None, &[], &[], None, 0);
         assert_eq!(extra["workspace"], "/tmp/ws");
     }
 
     #[test]
     fn build_worker_extra_ignores_blank_workspace() {
-        let extra = build_worker_extra("r", "t", "b", Some("   "), None, &[], &[], None);
+        let extra = build_worker_extra("r", "t", "b", Some("   "), None, &[], &[], None, 0);
         assert!(extra.get("workspace").is_none());
     }
 
@@ -820,6 +906,7 @@ mod tests {
             &[],
             &[],
             None,
+            0,
         );
         // Brief stays as the system_prompt; persona rides as preset_rules.
         assert_eq!(extra["system_prompt"], "supervisor brief");
@@ -829,12 +916,12 @@ mod tests {
     // A blank/whitespace-only persona is dropped — no preset_rules key.
     #[test]
     fn build_worker_extra_drops_blank_persona() {
-        let empty = build_worker_extra("r", "t", "b", None, Some(""), &[], &[], None);
+        let empty = build_worker_extra("r", "t", "b", None, Some(""), &[], &[], None, 0);
         assert!(empty.get("preset_rules").is_none());
-        let blank = build_worker_extra("r", "t", "b", None, Some("   \n  "), &[], &[], None);
+        let blank = build_worker_extra("r", "t", "b", None, Some("   \n  "), &[], &[], None, 0);
         assert!(blank.get("preset_rules").is_none());
         // Persona is trimmed before being stored.
-        let padded = build_worker_extra("r", "t", "b", None, Some("  persona  "), &[], &[], None);
+        let padded = build_worker_extra("r", "t", "b", None, Some("  persona  "), &[], &[], None, 0);
         assert_eq!(padded["preset_rules"], "persona");
     }
 
@@ -845,7 +932,7 @@ mod tests {
     fn build_worker_extra_forwards_skill_lists_as_request_only_keys() {
         let enabled = vec!["web_search".to_string(), "code_run".to_string()];
         let disabled = vec!["browser".to_string()];
-        let extra = build_worker_extra("r", "t", "b", None, None, &enabled, &disabled, None);
+        let extra = build_worker_extra("r", "t", "b", None, None, &enabled, &disabled, None, 0);
         assert_eq!(
             extra["preset_enabled_skills"],
             json!(["web_search", "code_run"]),
@@ -862,9 +949,23 @@ mod tests {
     // as "no preset / no exclusion" (no behavior change for bare members).
     #[test]
     fn build_worker_extra_emits_empty_skill_arrays_when_member_has_none() {
-        let extra = build_worker_extra("r", "t", "b", None, None, &[], &[], None);
+        let extra = build_worker_extra("r", "t", "b", None, None, &[], &[], None, 0);
         assert_eq!(extra["preset_enabled_skills"], json!([]));
         assert_eq!(extra["exclude_auto_inject_skills"], json!([]));
+    }
+
+    // 受控嵌套（Phase 3b W7d）：build_worker_extra 把委派深度烙进 worker 会话 extra
+    // 的 orchestrator_delegation_depth 键（网关追加口据此 +1 与 LIMIT 比较后钳制）。
+    #[test]
+    fn build_worker_extra_stamps_delegation_depth() {
+        let root = build_worker_extra("r", "t", "b", None, None, &[], &[], None, 0);
+        assert_eq!(root["orchestrator_delegation_depth"], 0);
+        let deep = build_worker_extra("r", "t", "b", None, None, &[], &[], Some("implementer"), 2);
+        assert_eq!(deep["orchestrator_delegation_depth"], 2);
+        // 受限角色也照常烙深度（键与角色收缩正交）。
+        let restricted = build_worker_extra("r", "t", "b", None, None, &[], &[], Some("searcher"), 1);
+        assert_eq!(restricted["orchestrator_delegation_depth"], 1);
+        assert_eq!(restricted["desktopGateway"], false);
     }
 
     #[test]

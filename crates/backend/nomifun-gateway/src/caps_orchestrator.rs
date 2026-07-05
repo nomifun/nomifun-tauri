@@ -47,9 +47,10 @@
 use std::sync::Arc;
 
 use nomifun_api_types::{
-    CreateAdhocRunRequest, FleetMember, ModelRange, ModelRef, PlannedTask, RunDetail, derive_capability,
+    CapabilityProfile, CreateAdhocRunRequest, FleetMember, ModelRange, ModelRef, PlannedTask,
+    RunDetail, derive_capability, infer_model_modalities,
 };
-use nomifun_common::generate_prefixed_id;
+use nomifun_common::{ProviderWithModel, generate_prefixed_id};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -141,6 +142,16 @@ struct SpawnParams {
     synthesize: Option<bool>,
 }
 
+/// Append new task(s) to the CURRENT run of the calling conversation (single-run
+/// convergence). Reuses `nomi_spawn`'s task shape — the `run_id` is NOT a param; it
+/// is resolved from the conversation's linked run (`extra.orchestrator_run_id`).
+#[derive(Deserialize, JsonSchema)]
+struct AddTasksParams {
+    /// 1-8 new tasks to append to this conversation's current run. Same shape as
+    /// nomi_spawn's tasks: each becomes a visible worker on the orchestration canvas.
+    tasks: Vec<SpawnTaskParam>,
+}
+
 // ── re-adjust (supervision) param structs ─────────────────────────────────
 
 /// Incrementally re-strategize a run: a natural-language `intent` the lead LLM
@@ -204,11 +215,14 @@ async fn create(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: RunCreat
         Err(e) => return e,
     };
 
-    // 1b. When the lead OMITS model_range (⇒ Auto), prefer the curated「主模型 +
-    //     协作模型」range the homepage stashed on the calling conversation's
-    //     `extra.orchestrator_model_range` (deterministic — never relayed through
-    //     the LLM). An explicit tool arg (MCP caller) still wins; a missing /
-    //     malformed extra value falls through to Auto.
+    // 1b. When the lead OMITS model_range (⇒ Auto), prefer the conversation-native
+    //     range the composer stashed on `extra.orchestrator_model_range`
+    //     (deterministic — never relayed through the LLM), and when that is absent
+    //     fall back to the conversation's CURRENT 主模型 as a single-model range. An
+    //     explicit tool arg (MCP caller) still wins; only a caller with NO
+    //     conversation / no usable model falls through to Auto (every enabled model).
+    //     This is what stops a conversation-native run from spreading nodes across
+    //     models the user never selected.
     let model_range = if matches!(model_range, ModelRange::Auto) {
         read_conversation_model_range(&deps, &user, &ctx.conversation_id)
             .await
@@ -404,12 +418,25 @@ fn resolve_model_range(model_range: Option<Value>) -> Result<ModelRange, Value> 
     }
 }
 
-/// Read the curated「主模型 + 协作模型」range the homepage stashed on the lead
-/// conversation's `extra.orchestrator_model_range`. This is the deterministic
-/// channel from the FE picker into the run (the lead agent never has to pass a
-/// `model_range`). Returns `None` — falling back to `Auto` — for every soft
-/// failure: no calling conversation, an unreadable conversation, an absent key,
-/// or a value that does not parse as a [`ModelRange`].
+/// Resolve the model range for a CONVERSATION-native run from the calling
+/// conversation, deterministically (never relayed through the LLM), in priority
+/// order:
+///
+/// 1. The curated「主模型 + 协作模型」range the composer's selector stashed on
+///    `extra.orchestrator_model_range` (`models[0]` = 主模型 = lead/planner). This is
+///    written ONLY when the user TOUCHES the main-model / collaborator pickers.
+/// 2. **Fallback — the conversation's CURRENT 主模型 (`conversation.model`) as a
+///    single-model range.** A fresh conversation whose pickers were never touched
+///    carries NO `orchestrator_model_range` extra; such a run must still execute on
+///    the model the user is chatting with — it must NOT silently fan out across
+///    EVERY enabled model (models the user never selected). This is the fix for the
+///    「节点用了我没选中的模型」bug: the old code returned `None` here, so the caller
+///    fell back to `Auto` = all enabled models.
+///
+/// Returns `None` ONLY when there is no usable signal at all — no calling
+/// conversation (MCP / no-session caller), an unreadable conversation, or a
+/// conversation with no valid main model — in which case the caller's `Auto`
+/// ("every enabled model") default is the only sensible option.
 async fn read_conversation_model_range(
     deps: &Arc<GatewayDeps>,
     user_id: &str,
@@ -423,17 +450,218 @@ async fn read_conversation_model_range(
         .get(user_id, conversation_id)
         .await
         .ok()?;
-    let raw = conv.extra.get("orchestrator_model_range")?;
-    match serde_json::from_value::<ModelRange>(raw.clone()) {
-        Ok(range) => Some(range),
-        Err(e) => {
-            tracing::warn!(
-                conversation_id,
-                error = %e,
-                "orchestrator_model_range on conversation extra is malformed; falling back to Auto"
-            );
-            None
+    // 1. The curated range from the composer's 主模型/协作模型 selector, when present.
+    if let Some(raw) = conv.extra.get("orchestrator_model_range") {
+        match serde_json::from_value::<ModelRange>(raw.clone()) {
+            Ok(range) => return Some(range),
+            Err(e) => {
+                tracing::warn!(
+                    conversation_id,
+                    error = %e,
+                    "orchestrator_model_range on conversation extra is malformed; falling back to the conversation's main model"
+                );
+                // fall through to the main-model fallback below
+            }
         }
+    }
+    // 2. No curated range → the conversation's current 主模型 as a single-model range
+    //    (NOT Auto). `None` only when the conversation has no usable model, so the
+    //    caller's Auto default applies just for a genuinely-unknown run.
+    main_model_range(conv.model.as_ref())
+}
+
+/// Build a single-model [`ModelRange`] from a conversation's 主模型
+/// (`conversation.model`) — the model the user is chatting with. The effective
+/// model name is `use_model` when set (the specific model chosen WITHIN the
+/// provider, matching what the FE persists as `models[0]`), else the provider's
+/// `model`. Returns `None` when the provider id or resolved model name is blank so
+/// a conversation with no real model still falls through to the caller's `Auto`
+/// default rather than synthesizing an empty/degenerate member.
+fn main_model_range(model: Option<&ProviderWithModel>) -> Option<ModelRange> {
+    let m = model?;
+    // `use_model` is the specific model chosen within the provider; a blank/absent
+    // one falls back to the provider's `model`.
+    let name = m
+        .use_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| m.model.trim());
+    let provider_id = m.provider_id.trim();
+    if provider_id.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(ModelRange::Single {
+        model: ModelRef {
+            provider_id: provider_id.to_string(),
+            model: name.to_string(),
+        },
+    })
+}
+
+/// Read the run this conversation is CURRENTLY bound to
+/// (`extra.orchestrator_run_id`, written by
+/// [`ConversationService::link_orchestrator_run`]). This is the deterministic pointer
+/// from a conversation to its ONE persistent run — the single-run convergence lever
+/// (`nomi_spawn` / `nomi_run_add_tasks` append here instead of minting a new run per
+/// call). Mirrors [`read_conversation_model_range`]: returns `None` for every soft
+/// failure — no calling conversation, an unreadable conversation, or an absent /
+/// non-string key.
+async fn read_conversation_run_id(
+    deps: &Arc<GatewayDeps>,
+    user_id: &str,
+    conversation_id: &str,
+) -> Option<String> {
+    if conversation_id.is_empty() {
+        return None;
+    }
+    let conv = deps
+        .conversation_service
+        .get(user_id, conversation_id)
+        .await
+        .ok()?;
+    conv.extra
+        .get("orchestrator_run_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+}
+
+/// 受控嵌套深度上限（Phase 3b W7d）：委派链最多 root lead(0) → worker(1) →
+/// sub-delegate(2)。深度 2 的 worker 再想追加/spawn 会被两个追加口拒绝，防子 agent
+/// 无界自我繁殖。
+const DELEGATION_DEPTH_LIMIT: u32 = 2;
+
+/// Pure decision core shared by BOTH append seams (`nomi_spawn` convergence +
+/// `nomi_run_add_tasks`): would a caller at `caller_depth` exceed the limit by
+/// spawning one level deeper? `caller_depth + 1 > LIMIT`. Split out so the depth
+/// ladder is unit-tested without a live gateway: root lead(0)+1=1 ok →
+/// worker(1)+1=2 ok → sub-delegate(2)+1=3 > 2 refused. `saturating_add` guards the
+/// (unreachable) u32 overflow.
+fn delegation_would_exceed_limit(caller_depth: u32) -> bool {
+    caller_depth.saturating_add(1) > DELEGATION_DEPTH_LIMIT
+}
+
+/// Read the calling conversation's委派深度（`extra.orchestrator_delegation_depth`,
+/// written by the orchestrator's `build_worker_extra`）. A root lead / 普通会话 has
+/// no such key → `0`. Mirrors [`read_conversation_run_id`]'s soft-failure contract:
+/// every read/parse miss (no conversation id, unreadable conversation, absent /
+/// non-numeric key) collapses to `0` — the safest floor (treats an unknown caller as
+/// the root, so the first append is always allowed and stamps depth 1).
+async fn read_conversation_delegation_depth(
+    deps: &Arc<GatewayDeps>,
+    user_id: &str,
+    conversation_id: &str,
+) -> u32 {
+    if conversation_id.is_empty() {
+        return 0;
+    }
+    let Ok(conv) = deps.conversation_service.get(user_id, conversation_id).await else {
+        return 0;
+    };
+    conv.extra
+        .get("orchestrator_delegation_depth")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32
+}
+
+/// Stamp `delegation_depth` into each about-to-be-appended task's `pattern_config`,
+/// MERGING into the existing JSON object (a synthesis/group/vote config already
+/// there is preserved — only the `delegation_depth` key is set/overwritten). A task
+/// with no / unparseable `pattern_config` gets a fresh `{"delegation_depth":<d>}`.
+/// This is what makes the depth guard compose DOWN the chain: the engine's
+/// `dispatch_task` reads this key back off `orch_run_tasks.pattern_config` and烙进
+/// the worker会话 extra, so the worker's own append is measured one level deeper.
+fn stamp_tasks_delegation_depth(tasks: &mut [PlannedTask], depth: u32) {
+    for t in tasks.iter_mut() {
+        let mut obj = t
+            .pattern_config
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        obj.insert("delegation_depth".to_string(), json!(depth));
+        t.pattern_config = Some(Value::Object(obj).to_string());
+    }
+}
+
+/// The tool error returned when a sub-agent at the depth limit tries to spawn / append
+/// further sub-agents — the deterministic controlled-nesting backstop.
+const DELEGATION_DEPTH_LIMIT_ERROR: &str =
+    "delegation depth limit reached; this sub-agent may not spawn further sub-agents";
+
+/// Why a conversation's linked run can / cannot be APPENDED to — the tri-state the
+/// two append seams (`nomi_spawn` convergence + `nomi_run_add_tasks`) branch on so
+/// each gives a PRECISE outcome instead of a bare bool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Appendability {
+    /// The run exists, is not `cancelled`, and (if `autonomous`) is within its hard
+    /// budget → append. Terminal `completed` / `failed` / `completed_with_failures`
+    /// runs land here too — `add_tasks` re-arms them back to `running`.
+    Yes,
+    /// No run to append to: the run is missing / a read error, or `cancelled` (a
+    /// user-`cancelled` run stays dead — a follow-up must never silently resurrect
+    /// it). The `nomi_spawn` path falls through to minting a FRESH run;
+    /// `nomi_run_add_tasks` returns the "no active run" error.
+    NoRun,
+    /// An AUTONOMOUS run blew its token/round hard budget (Phase 3b deterministic
+    /// runaway backstop). BOTH seams must REFUSE — return the budget error, do NOT
+    /// re-arm (no `engine.start`/`add_tasks`) and do NOT mint a fresh run — so the
+    /// autonomous run stays terminal and the emergent loop halts cleanly.
+    BudgetExhausted,
+}
+
+/// The tool error returned when an AUTONOMOUS run is refused for budget (distinct
+/// from the "no active run" error). Instructs the lead to WRAP UP rather than append
+/// more — the deterministic complement to the cooperative autonomous prompt (Task 2).
+const AUTONOMOUS_BUDGET_EXHAUSTED_ERROR: &str =
+    "autonomous budget exhausted (tokens/rounds); finalize and report to the user";
+
+/// Whether an AUTONOMOUS run has exhausted its hard budget — the deterministic
+/// runaway backstop the LLM cannot bypass. ONLY `autonomy == "autonomous"` runs are
+/// gated: a manual `nomi_spawn` / `nomi_run_add_tasks` on a supervised/interactive
+/// run is human-driven and unbounded here. Pure so the decision is unit-tested
+/// directly — seeding a real 2M-token / 60-task run in a unit test is impractical.
+fn autonomous_budget_exhausted(autonomy: &str, total_tokens: i64, task_count: usize) -> bool {
+    autonomy == "autonomous"
+        && (total_tokens >= nomifun_orchestrator::AUTONOMOUS_TOKEN_BUDGET
+            || task_count >= nomifun_orchestrator::AUTONOMOUS_MAX_TASKS)
+}
+
+/// Pure classification core: map a run's `(status, autonomy, total_tokens,
+/// task_count)` → [`Appendability`]. Split from the async fetch in
+/// [`run_appendability`] so the whole decision table is unit-tested without a DB.
+/// `cancelled` wins first (a cancelled run stays dead regardless of budget); then the
+/// autonomous budget gate; otherwise appendable.
+fn classify_appendability(
+    status: &str,
+    autonomy: &str,
+    total_tokens: i64,
+    task_count: usize,
+) -> Appendability {
+    if status == "cancelled" {
+        return Appendability::NoRun;
+    }
+    if autonomous_budget_exhausted(autonomy, total_tokens, task_count) {
+        return Appendability::BudgetExhausted;
+    }
+    Appendability::Yes
+}
+
+/// Read a run's detail and classify whether it can be APPENDED to (single-run
+/// convergence). Folds in the Phase 3b autonomous hard budget: an autonomous run
+/// at/over `AUTONOMOUS_TOKEN_BUDGET` (cumulative `Run.total_tokens`) OR
+/// `AUTONOMOUS_MAX_TASKS` (task count) → [`Appendability::BudgetExhausted`], so the
+/// emergent loop terminates deterministically. A missing run / read error ⇒
+/// [`Appendability::NoRun`] (the caller falls through to a fresh run).
+async fn run_appendability(deps: &Arc<GatewayDeps>, run_id: &str) -> Appendability {
+    match deps.orchestrator_run_service.get_detail(run_id).await {
+        Ok(detail) => classify_appendability(
+            &detail.run.status,
+            &detail.run.autonomy,
+            detail.run.total_tokens.unwrap_or(0),
+            detail.tasks.len(),
+        ),
+        Err(_) => Appendability::NoRun,
     }
 }
 
@@ -603,18 +831,28 @@ fn resolve_assistant_model(
 /// assistant-crate dependency.
 fn derive_role_member(a: &AssistantData, provider_id: String, model: String) -> FleetMember {
     let persona = a.persona.trim();
+    // Conservative tag/description-derived profile (no modalities — `derive_capability`
+    // has no model name). Phase 2: merge the model NAME's inferred modalities (e.g.
+    // "vision") in HERE, at the caller that DOES have the model, so the Router's
+    // `needs_vision` hard filter admits a vision-capable assistant member.
+    let mut profile = derive_capability(
+        &a.audience_tags,
+        &a.scenario_tags,
+        a.description.as_deref(),
+        !a.enabled_skills.is_empty(),
+    );
+    for md in infer_model_modalities(&model) {
+        if !profile.modalities.contains(&md) {
+            profile.modalities.push(md);
+        }
+    }
     FleetMember {
         id: generate_prefixed_id("rmbr"),
         agent_id: a.id.clone(),
         provider_id: Some(provider_id),
         model: Some(model),
         role_hint: Some(a.name.clone()),
-        capability_profile: Some(derive_capability(
-            &a.audience_tags,
-            &a.scenario_tags,
-            a.description.as_deref(),
-            !a.enabled_skills.is_empty(),
-        )),
+        capability_profile: Some(profile),
         constraints: None,
         // Re-densified by the merge in `create_adhoc`; a placeholder here.
         sort_order: 0,
@@ -680,7 +918,20 @@ async fn build_assistant_members(
                 provider_id: Some(pid.clone()),
                 model: Some(model.clone()),
                 role_hint: None,
-                capability_profile: None,
+                // Phase 2: these description-decorated bare members WIN the
+                // `merge_members` dedup over the plain range-built members, so they
+                // are the AUTHORITATIVE vision signal for the range's models. Carry
+                // the model NAME's inferred modalities on the orchestrator baseline
+                // (strengths empty, tools false, neutral tiers) so the Router's
+                // `needs_vision` hard filter has a real signal instead of `None`.
+                capability_profile: Some(CapabilityProfile {
+                    strengths: Vec::new(),
+                    modalities: infer_model_modalities(model),
+                    tools: false,
+                    reasoning: "medium".to_string(),
+                    cost_tier: "standard".to_string(),
+                    speed_tier: "standard".to_string(),
+                }),
                 constraints: None,
                 sort_order: 0,
                 description: Some(desc.to_string()),
@@ -742,6 +993,28 @@ async fn result(deps: Arc<GatewayDeps>, p: RunResultParams) -> Value {
 /// 超过应改用 nomi_run_create 让 planner 规划分批。
 const MAX_SPAWN_TASKS: usize = 8;
 
+/// Map the flat spawn-shaped tasks (`{name, prompt, role?}`) → `PlannedTask` nodes
+/// (kind `agent`, no deps). The SHARED mapping used by `nomi_spawn`, the single-run
+/// convergence append, and `nomi_run_add_tasks`, so a spawned node and an appended
+/// node are built identically. (`nomi_spawn`'s optional read-only synthesis node is
+/// layered on by `spawn` itself, since only it takes a `synthesize` flag.)
+fn spawn_tasks_to_planned(tasks: Vec<SpawnTaskParam>) -> Vec<PlannedTask> {
+    tasks
+        .into_iter()
+        .map(|t| PlannedTask {
+            title: t.name,
+            spec: t.prompt,
+            task_profile: None,
+            depends_on: vec![],
+            member_index: None,
+            rationale: None,
+            role: t.role,
+            kind: "agent".to_string(),
+            pattern_config: None,
+        })
+        .collect()
+}
+
 /// Flat fan-out (`nomi_spawn`): create a run, link it to the calling
 /// conversation, persist the caller's EXPLICIT task list via `plan_flat` (no
 /// planner LLM), and start the engine — all with `supervised` autonomy so it
@@ -760,7 +1033,99 @@ async fn spawn(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: SpawnPara
         return json!({ "error": format!("too many tasks: {} (max {MAX_SPAWN_TASKS}); use nomi_run_create for larger goals", p.tasks.len()) });
     }
 
-    // 模型解析：会话策展的「主模型+协作模型」优先，缺省 Auto 全量展开（与 create 一致）。
+    // 先装配这批任务（+ 可选只读综合节点），好在「已有 run 追加」与「新建 run」两条
+    // 路径复用同一份 Vec<PlannedTask>——保证 spawn 出来的节点与 append 上去的节点构造
+    // 完全一致。goal 借用 p.tasks（在 into_iter 消费前算好）。
+    let n = p.tasks.len();
+    let goal = format!(
+        "并行执行 {n} 个子任务：{}",
+        p.tasks.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join("、")
+    );
+    let synthesize = p.synthesize.unwrap_or(false);
+    let mut tasks: Vec<PlannedTask> = spawn_tasks_to_planned(p.tasks);
+    if synthesize && n >= 2 {
+        tasks.push(PlannedTask {
+            title: "综合汇总".to_string(),
+            spec: "综合上游各子任务的产出为一份结论，显式标注子任务之间的冲突或分歧（无则写「无」）。"
+                .to_string(),
+            task_profile: None,
+            // 依赖新批次内的 n 个 agent 节点（intra-batch 索引 0..n）——append 路径同样
+            // 只连 new→new 边，语义一致。
+            depends_on: (0..n).collect(),
+            member_index: None,
+            rationale: None,
+            // 只读综合（对齐进程内 Spawn 的 reviewer 语义；worker 端收缩工具）。
+            role: Some("reviewer".to_string()),
+            kind: "synthesis".to_string(),
+            pattern_config: None,
+        });
+    }
+
+    // 实际装配出的节点数（含可选的综合节点）——append 路径按此上报 task_count，避免
+    // synthesize 时少报一个节点（n 只数 agent 任务，不含综合节点）。
+    let appended_count = tasks.len();
+
+    // ── 单 run 收敛：本会话若已绑定一个可追加的 run，直接把这批任务 append 上去，
+    //    不新建 run、不重绑（extra.orchestrator_run_id 不变）——一个会话复用同一个持久
+    //    run。取消的 run 不复活（run_appendability → NoRun 时排除 cancelled，落到新建）；
+    //    自主 run 超硬预算不复活（BudgetExhausted → 返错、不重臂、不新建，emergent loop
+    //    干净停止）。engine.add_tasks 会把终态 run 重臂为 running；随后在锁外(re)start
+    //    引擎循环（若 running 且无活体 loop）——与 run_adjust 的重臂门一致。
+    if let Some(existing_run_id) = read_conversation_run_id(&deps, &user, &ctx.conversation_id).await {
+        match run_appendability(&deps, &existing_run_id).await {
+            Appendability::Yes => {
+                // 受控嵌套守卫（Phase 3b W7d）：读调用会话的委派深度。若 caller_depth+1
+                // 超上限 → 拒绝追加（该子 agent 不得再繁殖子 agent），绝不 append。否则给
+                // 这批任务的 pattern_config 盖 depth=caller_depth+1，使守卫沿链向下复合：
+                // root lead(0)→worker(1)→sub-delegate(2)→深度 2 的 worker 再追加被拒。
+                let caller_depth =
+                    read_conversation_delegation_depth(&deps, &user, &ctx.conversation_id).await;
+                if delegation_would_exceed_limit(caller_depth) {
+                    return json!({ "error": DELEGATION_DEPTH_LIMIT_ERROR });
+                }
+                stamp_tasks_delegation_depth(&mut tasks, caller_depth + 1);
+                return match deps
+                    .orchestrator_run_engine
+                    .add_tasks(&deps.orchestrator_run_service, &existing_run_id, tasks)
+                    .await
+                {
+                    Ok(run) => {
+                        if run.status == "running"
+                            && !deps.orchestrator_run_engine.is_running(&existing_run_id)
+                        {
+                            deps.orchestrator_run_engine.start(existing_run_id.clone());
+                        }
+                        // 只有 running 才是真正在跑；paused / awaiting_plan_approval / planning
+                        // 下 add_tasks 的重臂门并不会把 run 翻成 running，任务只是排队、不会执行——
+                        // 此时若仍宣称「已在后台并行执行」就是误导，必须提示用户先恢复该 run。
+                        let message = if run.status == "running" {
+                            "子任务已追加到本会话当前的编排 run 并在画布并行执行（复用同一个 run，未新建）。请告诉用户已在后台并行执行、进度见右侧画布，然后结束本轮——你无需轮询等待：全部完成或失败时系统会自动把结果回执给你再汇总。不要重复创建编排；用户若中途询问进度，可用 nomi_run_status 查一次。"
+                        } else {
+                            "子任务已追加到本会话当前的编排 run（复用同一个 run，未新建），但该 run 当前处于暂停中——任务只是排队、不会执行。请先在右侧编排面板继续/恢复该 run，任务才会开始跑；请把这一情况转达给用户。"
+                        };
+                        ok(json!({
+                            "run_id": existing_run_id,
+                            "status": run.status,
+                            "task_count": appended_count,
+                            "message": message,
+                        }))
+                    }
+                    Err(e) => json!({ "error": e.to_string() }),
+                };
+            }
+            // 自主 run 超硬预算：确定性终止。返回预算错误，绝不重臂、也绝不新建 run——
+            // 让该自主 run 保持终态，emergent 循环干净停止。
+            Appendability::BudgetExhausted => {
+                return json!({ "error": AUTONOMOUS_BUDGET_EXHAUSTED_ERROR });
+            }
+            // 无可追加的 run（缺失 / 取消）——落到下方新建 run 路径（行为不变）。
+            Appendability::NoRun => {}
+        }
+    }
+
+    // ── 否则新建 run（原 create+link 路径，行为不变）──
+    // 模型解析：会话策展的「主模型+协作模型」优先，其次回退到会话当前主模型(单模型)；
+    // 仅无会话/无可用模型时才 Auto 全量展开（与 create 一致，避免节点用到用户没选的模型）。
     let model_range = read_conversation_model_range(&deps, &user, &ctx.conversation_id)
         .await
         .unwrap_or(ModelRange::Auto);
@@ -783,11 +1148,6 @@ async fn spawn(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: SpawnPara
     };
 
     let lead_conv_id = parse_lead_conv_id(&ctx.conversation_id);
-    let n = p.tasks.len();
-    let goal = format!(
-        "并行执行 {n} 个子任务：{}",
-        p.tasks.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join("、")
-    );
     // 扁平扇出恒 supervised：即时并行、无审批门。绝不显式传 interactive——
     // nomi_spawn 的任务是调用方显式给出的，park 在批准门会回归进程内 Spawn 的
     // 静默卡死体验（人工审批门只在编排 Tab 前门保留）。
@@ -822,39 +1182,6 @@ async fn spawn(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: SpawnPara
         }
     }
 
-    // 组装扁平任务（+ 可选只读综合节点，语义对齐进程内 Spawn 的 synthesize）。
-    let synthesize = p.synthesize.unwrap_or(false);
-    let mut tasks: Vec<PlannedTask> = p
-        .tasks
-        .into_iter()
-        .map(|t| PlannedTask {
-            title: t.name,
-            spec: t.prompt,
-            task_profile: None,
-            depends_on: vec![],
-            member_index: None,
-            rationale: None,
-            role: t.role,
-            kind: "agent".to_string(),
-            pattern_config: None,
-        })
-        .collect();
-    if synthesize && n >= 2 {
-        tasks.push(PlannedTask {
-            title: "综合汇总".to_string(),
-            spec: "综合上游各子任务的产出为一份结论，显式标注子任务之间的冲突或分歧（无则写「无」）。"
-                .to_string(),
-            task_profile: None,
-            depends_on: (0..n).collect(),
-            member_index: None,
-            rationale: None,
-            // 只读综合（对齐进程内 Spawn 的 reviewer 语义；worker 端收缩工具）。
-            role: Some("reviewer".to_string()),
-            kind: "synthesis".to_string(),
-            pattern_config: None,
-        });
-    }
-
     // 后台 plan_flat → engine.start（fail-soft），工具立即返回 —— 画布经 WS 实时
     // 点亮（与 create 的 Path A spawn_plan_and_start 同样的不阻塞 lead turn 设计）。
     nomifun_orchestrator::spawn_plan_flat_and_start(
@@ -884,6 +1211,14 @@ async fn run_adjust(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: RunA
     if p.intent.trim().is_empty() {
         return json!({ "error": "intent must not be empty" });
     }
+    // Phase 3b runaway backstop (deterministic, not cooperative): `nomi_run_adjust`
+    // re-activates a terminal run + adds tasks, so an autonomous master refused by the
+    // append seams could otherwise re-arm the exhausted run here. Refuse an AUTONOMOUS
+    // run over its hard budget — no adjust, no re-arm — so the emergent loop halts.
+    // Non-autonomous runs are never BudgetExhausted, so manual adjust is unaffected.
+    if let Appendability::BudgetExhausted = run_appendability(&deps, &p.run_id).await {
+        return json!({ "error": AUTONOMOUS_BUDGET_EXHAUSTED_ERROR });
+    }
     match deps
         .orchestrator_run_engine
         .adjust(&deps.orchestrator_run_service, &user, &p.run_id, &p.intent)
@@ -903,6 +1238,89 @@ async fn run_adjust(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: RunA
     }
 }
 
+/// Append new task(s) to this conversation's CURRENT run — the single-run
+/// convergence primitive (`nomi_run_add_tasks`). The `run_id` is NOT a param: it is
+/// resolved from the calling conversation's linked run (`extra.orchestrator_run_id`).
+/// No conversation run, or a `cancelled` one ⇒ a clear "no active run" error (start
+/// work with nomi_spawn / nomi_run_create first); an AUTONOMOUS run over its hard
+/// budget ⇒ the distinct budget error WITHOUT re-arming (Phase 3b runaway backstop —
+/// the run stays terminal). The spawn-shaped tasks map to `PlannedTask`
+/// via the SAME `spawn_tasks_to_planned` helper `nomi_spawn` uses, then append via
+/// `engine.add_tasks` (which re-arms a terminal run to `running`); we then (re)start
+/// the loop OUTSIDE any lock when the run is running with no live loop — mirroring
+/// `run_adjust`.
+async fn run_add_tasks(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: AddTasksParams) -> Value {
+    let user = match require_user(&ctx) {
+        Ok(u) => u.to_owned(),
+        Err(e) => return e,
+    };
+    if p.tasks.is_empty() {
+        return json!({ "error": "nomi_run_add_tasks requires at least one task" });
+    }
+    if p.tasks.len() > MAX_SPAWN_TASKS {
+        return json!({ "error": format!("too many tasks: {} (max {MAX_SPAWN_TASKS}); use nomi_run_create for larger goals", p.tasks.len()) });
+    }
+
+    // Resolve the conversation's current run and classify appendability. No run / a
+    // cancelled run ⇒ a clear "no active run" error (not a silent new run). An
+    // AUTONOMOUS run over its hard budget ⇒ the distinct budget error — and we do NOT
+    // re-arm it (no add_tasks / no engine.start), so the run stays terminal and the
+    // emergent autonomous loop stops cleanly (Phase 3b deterministic backstop).
+    let run_id = match read_conversation_run_id(&deps, &user, &ctx.conversation_id).await {
+        Some(id) => match run_appendability(&deps, &id).await {
+            Appendability::Yes => id,
+            Appendability::BudgetExhausted => {
+                return json!({ "error": AUTONOMOUS_BUDGET_EXHAUSTED_ERROR });
+            }
+            Appendability::NoRun => {
+                return json!({
+                    "error": "this conversation has no active run to append to; start work with nomi_spawn or nomi_run_create first"
+                });
+            }
+        },
+        None => {
+            return json!({
+                "error": "this conversation has no active run to append to; start work with nomi_spawn or nomi_run_create first"
+            });
+        }
+    };
+
+    // 受控嵌套守卫（Phase 3b W7d）：目标 run 已解析且确认可追加。读调用会话的委派
+    // 深度，caller_depth+1 超上限即拒绝（该子 agent 不得再繁殖子 agent），绝不 append；
+    // 否则给这批追加任务的 pattern_config 盖 depth=caller_depth+1，使守卫沿链复合
+    // （与 nomi_spawn 收敛口同源）。
+    let caller_depth = read_conversation_delegation_depth(&deps, &user, &ctx.conversation_id).await;
+    if delegation_would_exceed_limit(caller_depth) {
+        return json!({ "error": DELEGATION_DEPTH_LIMIT_ERROR });
+    }
+    let mut tasks = spawn_tasks_to_planned(p.tasks);
+    stamp_tasks_delegation_depth(&mut tasks, caller_depth + 1);
+    match deps
+        .orchestrator_run_engine
+        .add_tasks(&deps.orchestrator_run_service, &run_id, tasks)
+        .await
+    {
+        Ok(run) => {
+            if run.status == "running" && !deps.orchestrator_run_engine.is_running(&run_id) {
+                deps.orchestrator_run_engine.start(run_id.clone());
+            }
+            // paused / awaiting_plan_approval / planning 下重臂门不会把 run 翻成 running，
+            // 追加的任务只是排队、不会执行——避免误导，明确提示用户先恢复该 run。
+            let message = if run.status == "running" {
+                "已把新任务追加到本会话当前的编排 run（未新建 run、无需审批），每个任务都是画布上可见的子 agent。继续执行、完成/失败自动回执——无需轮询。"
+            } else {
+                "已把新任务追加到本会话当前的编排 run（未新建 run），但该 run 当前处于暂停中——任务只是排队、不会执行。请先在右侧编排面板继续/恢复该 run，任务才会开始跑；请把这一情况转达给用户。"
+            };
+            ok(json!({
+                "run_id": run_id,
+                "status": run.status,
+                "message": message,
+            }))
+        }
+        Err(e) => json!({ "error": e.to_string() }),
+    }
+}
+
 /// Re-run one node (+ cascade-reset its downstream). Mirrors the Tab `rerun_task`
 /// route. Retry a failed node — optionally after `nomi_task_config` changes it.
 async fn task_rerun(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: TaskRerunParams) -> Value {
@@ -910,6 +1328,12 @@ async fn task_rerun(deps: Arc<GatewayDeps>, ctx: crate::deps::CallerCtx, p: Task
         Ok(u) => u.to_owned(),
         Err(e) => return e,
     };
+    // Phase 3b runaway backstop: `nomi_task_rerun` re-arms a terminal run (re-running
+    // nodes burns tokens). Refuse an AUTONOMOUS run over its hard budget so it can't be
+    // used to bypass the append-seam guard. Non-autonomous runs are never gated.
+    if let Appendability::BudgetExhausted = run_appendability(&deps, &p.run_id).await {
+        return json!({ "error": AUTONOMOUS_BUDGET_EXHAUSTED_ERROR });
+    }
     match deps
         .orchestrator_run_engine
         .rerun_task(&deps.orchestrator_run_service, &user, &p.run_id, &p.task_id)
@@ -1084,6 +1508,20 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
         .deny_on(ORCHESTRATOR_DENY_SURFACES),
         |deps, ctx, p| run_adjust(deps, ctx, p),
     ));
+    // 4b. Single-run convergence (write, Desktop-only): APPEND task(s) to this
+    //     conversation's CURRENT run instead of minting a new run per call — the run
+    //     is resolved from `extra.orchestrator_run_id`, no planner, no approval, no
+    //     rebind. Same domain deny (Remote) as the rest.
+    out.push(Capability::new::<AddTasksParams, _, _>(
+        CapabilityMeta::new(
+            "nomi_run_add_tasks",
+            "orchestrator",
+            "Append new task(s) to the CURRENT run of this conversation — no new run, no approval, no planner; each task is a visible canvas worker. Use to extend work already in flight. Params: tasks (1-8 of {name, prompt, role?}; role searcher/reviewer = read-only tools, verifier = read-only+Bash, omit = full tools). Errors if this conversation has no active run — start one with nomi_spawn / nomi_run_create first. Returns run_id and status.",
+            DangerTier::Write,
+        )
+        .deny_on(ORCHESTRATOR_DENY_SURFACES),
+        |deps, ctx, p| run_add_tasks(deps, ctx, p),
+    ));
     out.push(Capability::new::<TaskRerunParams, _, _>(
         CapabilityMeta::new(
             "nomi_task_rerun",
@@ -1181,6 +1619,87 @@ mod tests {
         let err = resolve_model_range(Some(v)).expect_err("must error on malformed range");
         let msg = err["error"].as_str().unwrap_or("");
         assert!(msg.contains("malformed"), "got: {msg}");
+    }
+
+    // ── main_model_range: conversation 主模型 → single-model fallback ──────────
+    //
+    // This is the fix for「节点用了我没选中的模型」: a conversation-native run whose
+    // `extra.orchestrator_model_range` was never persisted (the user never touched
+    // the composer's model / collaborator pickers) must fall back to the
+    // conversation's CURRENT 主模型 as a single-model range — NOT `Auto` (every
+    // enabled model). These cover the pure fallback core `read_conversation_model_range`
+    // delegates to when the curated extra is absent/malformed.
+
+    fn provider_with_model(
+        provider_id: &str,
+        model: &str,
+        use_model: Option<&str>,
+    ) -> ProviderWithModel {
+        ProviderWithModel {
+            provider_id: provider_id.to_string(),
+            model: model.to_string(),
+            use_model: use_model.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn main_model_range_prefers_use_model() {
+        // `use_model` (the specific model chosen within the provider — what the FE
+        // persists as models[0]) wins over the provider's bare `model`.
+        let range = main_model_range(Some(&provider_with_model("p1", "default-m", Some("opus"))))
+            .expect("a conversation with a main model yields a single range");
+        match range {
+            ModelRange::Single { model } => {
+                assert_eq!(model.provider_id, "p1");
+                assert_eq!(model.model, "opus", "use_model is the effective model name");
+            }
+            other => panic!("expected single, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn main_model_range_uses_model_when_no_use_model() {
+        // No `use_model` → the provider's `model` is the effective name.
+        let range = main_model_range(Some(&provider_with_model("p2", "sonnet", None)))
+            .expect("single range from bare model");
+        match range {
+            ModelRange::Single { model } => {
+                assert_eq!(model.provider_id, "p2");
+                assert_eq!(model.model, "sonnet");
+            }
+            other => panic!("expected single, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn main_model_range_blank_use_model_falls_back_to_model() {
+        // A blank `use_model` (e.g. Some("")) must NOT shadow a valid `model` — it is
+        // treated as absent so the effective name is the provider's `model`.
+        let range = main_model_range(Some(&provider_with_model("p3", "haiku", Some("   "))))
+            .expect("blank use_model falls back to model");
+        match range {
+            ModelRange::Single { model } => {
+                assert_eq!(model.provider_id, "p3");
+                assert_eq!(model.model, "haiku");
+            }
+            other => panic!("expected single, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn main_model_range_none_when_no_model_or_blank() {
+        // No conversation model at all → None (caller falls through to Auto).
+        assert!(main_model_range(None).is_none(), "no model → None");
+        // Blank provider id → None (cannot synthesize a usable member).
+        assert!(
+            main_model_range(Some(&provider_with_model("  ", "opus", None))).is_none(),
+            "blank provider id → None"
+        );
+        // Blank resolved model name (empty model + empty use_model) → None.
+        assert!(
+            main_model_range(Some(&provider_with_model("p1", "", Some("   ")))).is_none(),
+            "blank model name → None"
+        );
     }
 
     // ── build_adhoc_request: EXPLICIT params → CreateAdhocRunRequest ──────────
@@ -1372,7 +1891,7 @@ mod tests {
     #[test]
     fn orchestrator_tools_registered_and_visible_on_desktop() {
         let reg = Registry::global();
-        for name in ["nomi_run_create", "nomi_spawn", "nomi_run_status", "nomi_run_result", "nomi_run_adjust", "nomi_task_rerun", "nomi_task_config", "nomi_run_cancel"] {
+        for name in ["nomi_run_create", "nomi_spawn", "nomi_run_status", "nomi_run_result", "nomi_run_adjust", "nomi_run_add_tasks", "nomi_task_rerun", "nomi_task_config", "nomi_run_cancel"] {
             assert!(
                 reg.contains(name),
                 "orchestrator tool {name} is not registered"
@@ -1403,7 +1922,7 @@ mod tests {
             .iter()
             .map(|s| s.name)
             .collect();
-        for name in ["nomi_run_create", "nomi_spawn", "nomi_run_status", "nomi_run_result", "nomi_run_adjust", "nomi_task_rerun", "nomi_task_config", "nomi_run_cancel"] {
+        for name in ["nomi_run_create", "nomi_spawn", "nomi_run_status", "nomi_run_result", "nomi_run_adjust", "nomi_run_add_tasks", "nomi_task_rerun", "nomi_task_config", "nomi_run_cancel"] {
             // Not advertised on the Remote surface.
             assert!(
                 !remote.contains(&name),
@@ -1523,5 +2042,170 @@ mod tests {
         assert!(is_awaiting_approval("awaiting_plan_approval"));
         assert!(!is_awaiting_approval("running"));
         assert!(!is_awaiting_approval("planning"));
+    }
+
+    // ── Phase 3b Task 1: autonomous hard budget (deterministic runaway backstop) ──
+
+    // An AUTONOMOUS run at/over the cumulative token budget is EXHAUSTED — the append
+    // gate must refuse further work so the emergent loop terminates deterministically.
+    #[test]
+    fn autonomous_run_at_or_over_token_budget_is_exhausted() {
+        assert!(
+            autonomous_budget_exhausted(
+                "autonomous",
+                nomifun_orchestrator::AUTONOMOUS_TOKEN_BUDGET,
+                0
+            ),
+            "at the token cap → exhausted"
+        );
+        assert!(
+            autonomous_budget_exhausted(
+                "autonomous",
+                nomifun_orchestrator::AUTONOMOUS_TOKEN_BUDGET + 1,
+                0
+            ),
+            "over the token cap → exhausted"
+        );
+    }
+
+    // An AUTONOMOUS run at/over the task cap is EXHAUSTED even if cheap in tokens —
+    // bounds an append-only runaway of many tiny rounds.
+    #[test]
+    fn autonomous_run_at_or_over_task_budget_is_exhausted() {
+        assert!(
+            autonomous_budget_exhausted("autonomous", 0, nomifun_orchestrator::AUTONOMOUS_MAX_TASKS),
+            "at the task cap → exhausted"
+        );
+    }
+
+    // An AUTONOMOUS run under BOTH caps is NOT exhausted — the loop may keep going.
+    #[test]
+    fn autonomous_run_within_both_budgets_is_not_exhausted() {
+        assert!(
+            !autonomous_budget_exhausted(
+                "autonomous",
+                nomifun_orchestrator::AUTONOMOUS_TOKEN_BUDGET - 1,
+                nomifun_orchestrator::AUTONOMOUS_MAX_TASKS - 1
+            ),
+            "under both caps → not exhausted"
+        );
+    }
+
+    // A NON-autonomous run (supervised / interactive / manual / unknown) is NEVER
+    // budget-gated: manual spawn/add is human-driven and unbounded here. Even wildly
+    // over both caps it is NOT "exhausted".
+    #[test]
+    fn non_autonomous_run_is_never_budget_gated() {
+        for autonomy in ["supervised", "interactive", "manual", ""] {
+            assert!(
+                !autonomous_budget_exhausted(
+                    autonomy,
+                    nomifun_orchestrator::AUTONOMOUS_TOKEN_BUDGET * 10,
+                    nomifun_orchestrator::AUTONOMOUS_MAX_TASKS * 10
+                ),
+                "{autonomy} must NOT be budget-gated"
+            );
+        }
+    }
+
+    // The pure classification core the async `run_appendability` delegates to: maps
+    // (status, autonomy, total_tokens, task_count) → Appendability, covering all seams.
+    #[test]
+    fn classify_appendability_covers_all_cases() {
+        // Cancelled → NoRun regardless of budget (a user-cancelled run stays dead;
+        // spawn falls through to a fresh run, add_tasks says "no active run").
+        assert_eq!(
+            classify_appendability("cancelled", "autonomous", 0, 0),
+            Appendability::NoRun
+        );
+        // Autonomous at/over budget → BudgetExhausted (deterministic runaway backstop;
+        // both seams REFUSE without re-arming, so the run stays terminal).
+        assert_eq!(
+            classify_appendability(
+                "running",
+                "autonomous",
+                nomifun_orchestrator::AUTONOMOUS_TOKEN_BUDGET,
+                0
+            ),
+            Appendability::BudgetExhausted
+        );
+        assert_eq!(
+            classify_appendability(
+                "completed",
+                "autonomous",
+                0,
+                nomifun_orchestrator::AUTONOMOUS_MAX_TASKS
+            ),
+            Appendability::BudgetExhausted
+        );
+        // Non-autonomous over budget → still appendable (Yes): NOT budget-gated.
+        assert_eq!(
+            classify_appendability(
+                "running",
+                "supervised",
+                nomifun_orchestrator::AUTONOMOUS_TOKEN_BUDGET * 5,
+                999
+            ),
+            Appendability::Yes
+        );
+        // Healthy autonomous within budget → Yes.
+        assert_eq!(
+            classify_appendability("completed", "autonomous", 10, 3),
+            Appendability::Yes
+        );
+    }
+
+    // ── 受控嵌套 delegation_depth 守卫（Phase 3b W7d）────────────────────────
+
+    fn spawn_param(name: &str) -> SpawnTaskParam {
+        SpawnTaskParam { name: name.to_owned(), prompt: format!("do {name}"), role: None }
+    }
+
+    // 深度阶梯：root lead(0)→worker(1)→sub-delegate(2)→深度 2 拒绝。这是两个追加口
+    // (nomi_spawn 收敛 + nomi_run_add_tasks) 守卫的纯判定核。
+    #[test]
+    fn delegation_depth_ladder_refuses_beyond_limit() {
+        assert_eq!(DELEGATION_DEPTH_LIMIT, 2);
+        // root lead (caller_depth 0): 0+1=1 ≤ 2 → 允许，子任务盖深度 1。
+        assert!(!delegation_would_exceed_limit(0));
+        // worker (caller_depth 1): 1+1=2 ≤ 2 → 允许，子任务盖深度 2。
+        assert!(!delegation_would_exceed_limit(1));
+        // sub-delegate (caller_depth 2): 2+1=3 > 2 → 拒绝（深度 2 的 worker 不得再繁殖）。
+        assert!(delegation_would_exceed_limit(2));
+        assert!(delegation_would_exceed_limit(3));
+        // 溢出不会 panic（saturating_add）。
+        assert!(delegation_would_exceed_limit(u32::MAX));
+    }
+
+    // 未超限：追加任务的 pattern_config 被盖上 depth = caller_depth+1。
+    #[test]
+    fn stamp_tasks_delegation_depth_sets_depth_on_fresh_config() {
+        let caller_depth = 0; // root lead
+        let mut tasks = spawn_tasks_to_planned(vec![spawn_param("a"), spawn_param("b")]);
+        // spawn_tasks_to_planned 产出的 agent 任务初始无 pattern_config。
+        assert!(tasks.iter().all(|t| t.pattern_config.is_none()));
+        stamp_tasks_delegation_depth(&mut tasks, caller_depth + 1);
+        for t in &tasks {
+            let v: Value = serde_json::from_str(t.pattern_config.as_deref().unwrap()).unwrap();
+            assert_eq!(v["delegation_depth"], 1, "root 的子任务盖深度 1");
+        }
+        // worker (caller_depth 1) 追加 → 子任务盖深度 2。
+        let mut deeper = spawn_tasks_to_planned(vec![spawn_param("c")]);
+        stamp_tasks_delegation_depth(&mut deeper, 1 + 1);
+        let v: Value = serde_json::from_str(deeper[0].pattern_config.as_deref().unwrap()).unwrap();
+        assert_eq!(v["delegation_depth"], 2, "worker 的子任务盖深度 2");
+    }
+
+    // 合并语义：既有 pattern_config（如 fan-out group / 综合配置）里的其它键必须保留，
+    // 只设置/覆盖 delegation_depth——绝不 clobber。
+    #[test]
+    fn stamp_tasks_delegation_depth_merges_into_existing_config() {
+        let mut tasks = spawn_tasks_to_planned(vec![spawn_param("x")]);
+        tasks[0].pattern_config = Some(r#"{"group":"candidates","aggregate":"mean"}"#.to_owned());
+        stamp_tasks_delegation_depth(&mut tasks, 2);
+        let v: Value = serde_json::from_str(tasks[0].pattern_config.as_deref().unwrap()).unwrap();
+        assert_eq!(v["delegation_depth"], 2, "盖上深度");
+        assert_eq!(v["group"], "candidates", "既有 group 键保留");
+        assert_eq!(v["aggregate"], "mean", "既有 aggregate 键保留");
     }
 }

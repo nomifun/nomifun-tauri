@@ -22,7 +22,6 @@
   },
   "orchestration": {
     "panelTitle": "Orchestration",
-    "startTitle": "Start orchestration",
     "planning": "Planning…",
     "collapseCanvas": "Collapse orchestration canvas",
     "expandCanvas": "Expand orchestration canvas",
@@ -571,6 +570,11 @@
   "editMessage": {
     "action": "Edit",
     "banner": "Editing message — sending will re-run from here"
+  },
+  "slashCommands": {
+    "compact": {
+      "description": "Compress conversation context"
+    }
   },
   "clearContext": {
     "description": "Clear conversation context",

@@ -5,7 +5,7 @@
   "collapseConfig": "Collapse config",
   "locked": {
     "badge": "Locked",
-    "notice": "This watch is running, so its config is locked. To change the tier (rule / backup model) or strategy, turn the watch off first."
+    "notice": "Once this watch is on, its config is locked to avoid mid-run mode changes leaving required fields missing. Turn the watch off, edit, then turn it on again."
   },
   "tierLabel": "Mode",
   "tier": {
@@ -65,7 +65,7 @@
     "onlySafeValue": "Only confirm read-only",
     "escalateRisky": "Escalate risky to model"
   },
-  "sessionBackupHint": "Leave empty to prefer the global default backup provider (Settings → Intelligent Decision-Making), then fall back to this session's own model; set one here to apply it to this watch only.",
+  "sessionBackupHint": "Leave empty to prefer the global default backup provider (Settings → Intelligent Decision-Making), then fall back to this session's own model. Pick a complete provider and model here before turning the watch on; after it is on, turn it off before editing.",
   "backupRequired": "Backup-model mode needs a usable model: pick one here, set a global default in Settings → Intelligent Decision-Making, or enable it on a session that already has a model (its model is reused automatically).",
   "backupModelIncomplete": "Select a complete backup model (provider and model) before enabling the watch.",
   "state": {
@@ -76,6 +76,7 @@
   "interventions": "{{count}} interventions",
   "enabledOk": "IDMM updated",
   "disabledOk": "IDMM disabled",
+  "draftIncomplete": "IDMM configuration is incomplete. Turn the watch off, complete the required fields, then turn it on again.",
   "settings": {
     "title": "Intelligent Decision-Making (IDMM)",
     "desc": "Defaults for the backup-model mode, used when a watch does not set its own.",

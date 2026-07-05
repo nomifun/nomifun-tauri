@@ -129,6 +129,19 @@ pub enum RunOutcome {
     Stalled,
     /// An interactive run planned and parked awaiting the user's approval.
     AwaitingApproval,
+    /// A single node PERMANENTLY failed mid-run (retry budget exhausted / non-
+    /// retryable). Reported best-effort to the lead BEFORE the run's terminal state
+    /// so the master agent can repair (rerun w/ another model, adjust the graph,
+    /// adopt, or abandon) instead of waiting for the whole run to end. Distinct from
+    /// [`RunOutcome::Failed`], which is the run's terminal receipt.
+    NodeFailed,
+    /// A THROTTLED mid-run heartbeat: after a batch of nodes finished `done` the
+    /// engine re-engages the lead so the master agent can OBSERVE progress and, if
+    /// warranted, append more work (`nomi_run_add_tasks`) to the SAME run — without
+    /// waiting for the terminal receipt. Rate-limited by node-count + time (see
+    /// [`BATCH_REPORT_MIN_NODES`] / [`BATCH_REPORT_INTERVAL`]) so a fast fan-out
+    /// cannot spam the lead. Non-terminal; the run keeps running.
+    BatchProgress,
 }
 
 impl RunOutcome {
@@ -139,6 +152,8 @@ impl RunOutcome {
             RunOutcome::Failed => "failed",
             RunOutcome::Stalled => "stalled",
             RunOutcome::AwaitingApproval => "awaiting_approval",
+            RunOutcome::NodeFailed => "node_failed",
+            RunOutcome::BatchProgress => "batch_progress",
         }
     }
 }
@@ -229,6 +244,23 @@ pub const DEFAULT_MAX_PARALLEL: usize = 4;
 /// per [`RunEngineDeps`] (tests set it small).
 pub const DEFAULT_MAX_WORKER_RETRIES: usize = 3;
 
+/// Mid-run batch-progress throttle (Phase 3a Task 3): the settle branch fires a
+/// best-effort [`RunOutcome::BatchProgress`] lead report only after AT LEAST this
+/// many nodes have completed `done` since the last report. Coupled with
+/// [`BATCH_REPORT_INTERVAL`] (BOTH must clear) so a fast fan-out cannot spam the
+/// lead conversation. Non-terminal — the run keeps driving.
+const BATCH_REPORT_MIN_NODES: usize = 3;
+
+/// Minimum wall-clock between two consecutive mid-run batch-progress lead reports
+/// (see [`BATCH_REPORT_MIN_NODES`]). The FIRST eligible batch fires immediately
+/// (no prior report); subsequent ones wait out this interval.
+const BATCH_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Independent, smaller budget for NO-MARKER failures (timeout / empty reply):
+/// a worker that returns `ok:false` with no persisted error marker. Bounded
+/// separately from provider-marker retries so a genuinely stuck node cannot loop.
+pub const DEFAULT_MAX_TIMEOUT_RETRIES: usize = 2;
+
 /// Base backoff before the FIRST auto-retry; doubles each subsequent retry
 /// (`base · 2^attempt`). 5s comfortably clears a per-minute RPM cap within the
 /// retry budget while staying snappy for a one-off blip. Overridable per
@@ -252,6 +284,35 @@ pub const STRAND_GRACE_MS: i64 = 5 * 60 * 1000;
 /// itself bounded by `PLAN_TIMEOUT_SECS`, so anything past that + margin is stuck /
 /// left re-plannable and abandoned) → force-finalize as stalled.
 pub const PLANNING_MAX_MS: i64 = 10 * 60 * 1000;
+
+// ── Phase 3b: autonomous runaway backstop (deterministic hard budget) ──────
+//
+// An AUTONOMOUS run drives an EMERGENT loop: a terminal worker's report re-engages
+// the lead as a fresh turn, which may call `nomi_run_add_tasks` to append more work
+// → re-arms the run → loops. Phase 3b Task 2's autonomous prompt asks the lead to
+// stop once the goal is met, but a prompt is COOPERATIVE — the LLM can ignore it.
+// These caps are the DETERMINISTIC backstop it CANNOT bypass: the gateway's
+// appendability gate folds them in, so an autonomous run at/over EITHER cap becomes
+// NOT appendable — the next append is refused WITHOUT re-arming and the run stays
+// terminal, halting the loop cleanly. Only `autonomy == "autonomous"` runs are
+// bounded here; a manual `nomi_spawn` / `nomi_run_add_tasks` on a supervised run is
+// human-driven and unbounded.
+
+/// Cumulative token budget for an AUTONOMOUS run — the sum of its tasks' real usage
+/// (`Run.total_tokens`, written by `finish_run` via `sum_task_tokens`). At/over this
+/// the run is no longer appendable, so the emergent loop terminates deterministically.
+pub const AUTONOMOUS_TOKEN_BUDGET: i64 = 2_000_000;
+
+/// Hard cap on the number of tasks an AUTONOMOUS run may accumulate. At/over this the
+/// run is no longer appendable — bounds an append-only runaway even when each round
+/// is cheap in tokens (a token cap alone would not stop many tiny rounds).
+pub const AUTONOMOUS_MAX_TASKS: usize = 60;
+
+/// Max consecutive autonomous re-engagements that append work WITHOUT completing any
+/// new task (no forward progress) before the loop is judged stuck. Consumed by the
+/// autonomous re-engagement guard (Phase 3b Task 2); defined here now alongside the
+/// other autonomous caps so Task 1 lands the full tunable set.
+pub const NO_PROGRESS_LIMIT: u32 = 2;
 
 /// Per-run async lock registry serializing the run-loop's **terminal-check +
 /// finish** against the rerun path's **reset + re-activation** (UC-2a 评审
@@ -364,9 +425,19 @@ pub struct RunEngineDeps {
     /// (see [`DEFAULT_MAX_WORKER_RETRIES`]). 0 disables auto-retry (every failure is
     /// terminal — the pre-retry behaviour).
     pub max_worker_retries: usize,
+    /// Max auto-retries for a NO-MARKER failure (timeout / empty reply). See
+    /// [`DEFAULT_MAX_TIMEOUT_RETRIES`]. 0 disables timeout auto-retry.
+    pub max_timeout_retries: usize,
     /// Base backoff before the first auto-retry, doubled per retry
     /// (see [`DEFAULT_RETRY_BACKOFF_BASE`]). [`Duration::ZERO`] retries instantly.
     pub retry_backoff_base: Duration,
+    /// Base data dir under which a workspace-less (ad-hoc / conversation-native)
+    /// run gets an auto-allocated SHARED working directory
+    /// (`<data_dir>/orchestrator/runs/{run_id}`), so all its nodes share one cwd
+    /// (files + a shared workpath KB binding). See `run_loop`'s workspace_dir
+    /// resolution. Defaults to `.` (tests override; the app injects the real
+    /// data dir via `services.work_dir`).
+    pub data_dir: std::path::PathBuf,
 }
 
 impl RunEngineDeps {
@@ -394,7 +465,9 @@ impl RunEngineDeps {
             run_locks: Arc::new(RunLocks::new()),
             summarizer: Arc::new(NoopSummaryProducer),
             max_worker_retries: DEFAULT_MAX_WORKER_RETRIES,
+            max_timeout_retries: DEFAULT_MAX_TIMEOUT_RETRIES,
             retry_backoff_base: DEFAULT_RETRY_BACKOFF_BASE,
+            data_dir: std::path::PathBuf::from("."),
         }
     }
 }
@@ -483,6 +556,13 @@ impl RunEngine {
         );
     }
 
+    fn stop_registered_loop(&self, run_id: &str) {
+        if let Some((_, handle)) = self.handles.remove(run_id) {
+            handle.cancelled.store(true, Ordering::SeqCst);
+            handle.join.abort();
+        }
+    }
+
     /// Stop a run's loop: set the cooperative cancel flag, abort the task, and
     /// cancel any in-flight worker conversations so their turns end as
     /// `Finish(Cancelled)`.
@@ -501,10 +581,7 @@ impl RunEngine {
     /// this run's conversations are cancelled. Persisting `cancelled` is the
     /// service's job ([`RunService::cancel`](crate::run_service::RunService::cancel)).
     pub fn stop(&self, run_id: &str) {
-        if let Some((_, handle)) = self.handles.remove(run_id) {
-            handle.cancelled.store(true, Ordering::SeqCst);
-            handle.join.abort();
-        }
+        self.stop_registered_loop(run_id);
         // Cancel in-flight worker conversations for this run (detached + best
         // effort). Idempotent: if no task is running / no conversation is stamped
         // / no live agent exists, the canceller no-ops. Safe to run even when the
@@ -514,6 +591,15 @@ impl RunEngine {
         tokio::spawn(async move {
             cancel_in_flight_conversations(&deps, &run_id).await;
         });
+    }
+
+    /// Stop a run's loop and wait until in-flight worker cancellation has been
+    /// attempted. Use this before immediately rewriting `running` task rows (for
+    /// example, pause -> reset to `pending`); otherwise the detached `stop()` query
+    /// can race with the row rewrite and miss the worker conversation.
+    pub async fn stop_and_cancel_in_flight(&self, run_id: &str) {
+        self.stop_registered_loop(run_id);
+        cancel_in_flight_conversations(&self.deps, run_id).await;
     }
 
     /// Run-level stall watchdog (safety net): finalize runs stuck non-terminal with
@@ -847,6 +933,38 @@ impl RunEngine {
         drop(guard);
         run
     }
+
+    /// **Phase 3a — runtime task APPEND under the per-run lock.** The engine-side
+    /// entry the master agent (route/gateway) calls instead of
+    /// [`RunService::add_tasks`](crate::run_service::RunService::add_tasks)
+    /// directly, so the service's insert + terminal-run re-arm run UNDER the per-run
+    /// lock — the SAME [`RunLocks`] registry the [`run_loop`]'s terminal-check-and-
+    /// finish holds. This closes the append-vs-finish race: without the lock the loop
+    /// could read `all_settled == true`, this append could insert a `pending` task in
+    /// the gap, then the loop `finish_run`s `completed` AND deregisters its handle →
+    /// a terminal run with an un-run pending task and no live driver (boot-resume only
+    /// re-lists `running`, so it would never recover). Holding the lock makes the
+    /// insert + re-arm atomic w.r.t. the loop's terminal decision.
+    ///
+    /// Unlike [`adjust`](Self::adjust) there is NO LLM await here — the whole call is
+    /// pure DB — so the entire method runs under the lock (mirrors
+    /// [`rerun_task`](Self::rerun_task) / [`adopt_task_result`](Self::adopt_task_result)).
+    /// Returns the (possibly re-armed) run DTO; the CALLER (route) makes the
+    /// engine-lifecycle decision (`run.status == "running" && !is_running →
+    /// engine.start`) OUTSIDE this lock, keeping `start` (which `stop`s first) off the
+    /// locked path so the no-deadlock invariant stays trivially obvious.
+    pub async fn add_tasks(
+        &self,
+        run_service: &crate::run_service::RunService,
+        run_id: &str,
+        tasks: Vec<nomifun_api_types::PlannedTask>,
+    ) -> Result<nomifun_api_types::Run, AppError> {
+        let lock = self.deps.run_locks.for_run(run_id);
+        let _guard = lock.lock().await;
+        run_service.add_tasks(run_id, tasks).await
+        // Lock drops here — the insert + re-arm were atomic w.r.t. the run_loop's
+        // terminal-check-and-finish (no strand, no orphaned terminal run).
+    }
 }
 
 /// The bounded-parallel run loop: dispatch up to `cap` ready tasks concurrently,
@@ -917,6 +1035,61 @@ async fn run_loop(
         None
     };
 
+    // Ad-hoc/conversation-native run with no dir: auto-allocate a per-run SHARED
+    // directory so all nodes share one cwd (files + a shared workpath KB binding).
+    // Deterministic path (`<data_dir>/orchestrator/runs/{run_id}`, stable across
+    // restarts); persisted to `run.work_dir` so browse + boot-resume resolve it
+    // (and the resolution above reads it back on a later loop). Best-effort — a
+    // create/persist failure logs and falls back to per-node temp dirs (never
+    // fails the run). Runs once per loop, before the fill loop.
+    let workspace_dir: Option<String> = match workspace_dir {
+        Some(d) => Some(d),
+        // Only a TRULY ad-hoc run (no workspace binding) gets an auto-allocated
+        // shared dir. A workspace-bound run whose workspace dir couldn't be
+        // resolved (e.g. a transient ws read error) is left as-is — never rebind
+        // it to an ad-hoc dir (the persist would stick and permanently rebind it).
+        None if run.workspace_id.is_none() => {
+            let dir = deps
+                .data_dir
+                .join("orchestrator")
+                .join("runs")
+                .join(run_id);
+            match std::fs::create_dir_all(&dir) {
+                Ok(()) => {
+                    let dir_str = dir.to_string_lossy().to_string();
+                    if let Err(e) = deps
+                        .run_repo
+                        .update_run(
+                            run_id,
+                            UpdateRunParams {
+                                work_dir: Some(Some(dir_str.clone())),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                    {
+                        warn!(run_id, error = %e, "failed to persist auto shared work_dir (continuing)");
+                    }
+                    Some(dir_str)
+                }
+                Err(e) => {
+                    warn!(run_id, error = %e, "failed to create shared run dir (nodes use temp dirs)");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    // Seed a human-readable RUN_NOTES.md in the shared dir (best-effort, idempotent
+    // — only if absent, to preserve node-appended content across restart/rerun). The
+    // plan is already persisted at this point (the choreography plans BEFORE
+    // `engine.start`), so `list_tasks` here returns the planned nodes' titles. A
+    // workspace-bound run also benefits (its shared dir gets the notes seed).
+    if let Some(ref dir) = workspace_dir {
+        seed_run_notes(&deps, run_id, dir).await;
+    }
+
     // In-flight worker futures, each resolving to (task_id, outcome). The set's
     // length is the live concurrency; we never exceed `cap`.
     let mut inflight: FuturesUnordered<WorkerFuture> = FuturesUnordered::new();
@@ -931,6 +1104,13 @@ async fn run_loop(
     // error) leaves it None → the run-level watchdog reports those.
     let mut terminal_report: Option<(RunOutcome, String)> = None;
 
+    // Mid-run batch-progress throttle state (Phase 3a Task 3). `done_since_report`
+    // counts nodes that finished `done` since the last batch report; `last_batch_report`
+    // gates the wall-clock interval (None = never reported → first eligible batch
+    // fires immediately). See BATCH_REPORT_MIN_NODES / BATCH_REPORT_INTERVAL.
+    let mut last_batch_report: Option<std::time::Instant> = None;
+    let mut done_since_report: usize = 0;
+
     loop {
         // (a) Cancelled → stop scheduling. Task 3 adds in-flight cancel
         // propagation; here we simply stop dispatching and let the loop unwind
@@ -941,12 +1121,12 @@ async fn run_loop(
         }
 
         // (a') Paused gate (P3b): re-read the persisted run status each iteration.
-        // When `paused` the loop must NOT dispatch new workers — but it keeps
-        // processing any in-flight workers to completion (pause ≠ cancel). With
-        // no in-flight work it idle-waits (a short sleep, NOT a busy-spin) and
-        // re-checks, so a `resume` (status → `running`) is observed on the next
-        // iteration and filling resumes. A read error is treated as not-paused
-        // (fail-open: better to keep driving than to wedge on a transient error).
+        // The product pause route stops the loop and cancels live workers before
+        // resetting interrupted nodes. This gate remains defensive for a loop that
+        // observes `paused` through a direct state transition: it dispatches no new
+        // workers and idles when empty until `resume` flips the status to `running`.
+        // A read error is treated as not-paused (fail-open: better to keep driving
+        // than to wedge on a transient error).
         let status = match deps.run_repo.get_run(run_id).await {
             Ok(Some(r)) => Some(r.status),
             _ => None,
@@ -1181,10 +1361,13 @@ async fn run_loop(
                 /// failed conclusively in a way that warrants re-driving → re-loop.
                 ReLoop,
                 /// All terminal, completable → summarize (no lock) then re-verify.
-                /// Carries the tasks (for the digest) + token total.
+                /// Carries the tasks (for the digest) + token total. `with_failures`
+                /// = any node soft-failed (`on_fail=skip_and_continue`), so the run
+                /// settles `completed_with_failures` instead of `completed`.
                 Completed {
                     tasks: Vec<OrchRunTaskRow>,
                     total_tokens: Option<i64>,
+                    with_failures: bool,
                 },
                 /// A task failed → finished `failed` under this guard already;
                 /// carries the tasks so the after-loop lead report can build a
@@ -1218,27 +1401,38 @@ async fn run_loop(
                 } else {
                     match deps.run_repo.list_tasks(run_id).await {
                         Ok(tasks) => {
-                            let all_terminal = tasks
+                            // 迁移 029 终态分流。软失败 = 失败但策略 skip_and_continue
+                            // (其传递性下游已在 settle 时 skip);硬失败 = 失败且策略
+                            // fail_run(默认)。已 settled = 每个任务处于终态
+                            // (done/skipped)或软失败。硬失败优先并支配任何 done/软失败
+                            // 兄弟节点 → 整 run failed(现状,零回归)。
+                            let hard_failed = tasks
                                 .iter()
-                                .all(|t| t.status == "done" || t.status == "skipped");
-                            let any_failed = tasks.iter().any(|t| t.status == "failed");
-                            if !tasks.is_empty() && all_terminal {
-                                // Completable: capture inputs and DROP the guard at
-                                // the end of this scope — the LLM summarize runs
-                                // OUTSIDE the lock, then we re-acquire + re-verify.
-                                let total_tokens = sum_task_tokens(&tasks);
-                                TerminalDecision::Completed {
-                                    tasks,
-                                    total_tokens,
-                                }
-                            } else if any_failed {
-                                // No LLM on the failed path → finish + deregister
+                                .any(|t| t.status == "failed" && !is_soft_fail(t));
+                            let all_settled = tasks.iter().all(|t| {
+                                t.status == "done" || t.status == "skipped" || is_soft_fail(t)
+                            });
+                            let any_soft_fail = tasks.iter().any(is_soft_fail);
+                            if hard_failed {
+                                // No LLM on the hard-failed path → finish + deregister
                                 // under THIS held guard (atomic terminal-write +
                                 // deregister, as before).
                                 let total_tokens = sum_task_tokens(&tasks);
                                 finish_run(&deps, run_id, "failed", None, total_tokens).await;
                                 handles.remove_if(run_id, |_, h| h.generation == generation);
                                 TerminalDecision::FinishedFailed { tasks }
+                            } else if !tasks.is_empty() && all_settled {
+                                // Completable: capture inputs and DROP the guard at
+                                // the end of this scope — the LLM summarize runs
+                                // OUTSIDE the lock, then we re-acquire + re-verify.
+                                // `any_soft_fail` selects completed vs
+                                // completed_with_failures at the finish site (③).
+                                let total_tokens = sum_task_tokens(&tasks);
+                                TerminalDecision::Completed {
+                                    tasks,
+                                    total_tokens,
+                                    with_failures: any_soft_fail,
+                                }
                             } else {
                                 // Not terminal and nothing ready. Distinguish a
                                 // transient-error retry-in-backoff (a `pending` task
@@ -1298,6 +1492,7 @@ async fn run_loop(
                 TerminalDecision::Completed {
                     tasks,
                     total_tokens,
+                    with_failures,
                 } => {
                     // B2: synthesize a coherent run summary with a one-shot lead
                     // call — WITH NO LOCK HELD (the guard above was dropped). This is
@@ -1334,9 +1529,11 @@ async fn run_loop(
                     let still_terminal = match deps.run_repo.list_tasks(run_id).await {
                         Ok(now) => {
                             !now.is_empty()
-                                && now
-                                    .iter()
-                                    .all(|t| t.status == "done" || t.status == "skipped")
+                                && now.iter().all(|t| {
+                                    t.status == "done"
+                                        || t.status == "skipped"
+                                        || is_soft_fail(t)
+                                })
                         }
                         // A re-read error → do NOT finish on stale data; re-loop and
                         // re-decide on the next pass (fail toward not-committing).
@@ -1352,10 +1549,17 @@ async fn run_loop(
                         continue;
                     }
                     // Still terminal, no ready work → commit the completion.
+                    // 迁移 029:有软失败节点(skip_and_continue)时写
+                    // completed_with_failures,否则 completed。
+                    let terminal_status = if with_failures {
+                        "completed_with_failures"
+                    } else {
+                        "completed"
+                    };
                     finish_run(
                         &deps,
                         run_id,
-                        "completed",
+                        terminal_status,
                         Some(summary.clone()),
                         total_tokens,
                     )
@@ -1377,7 +1581,48 @@ async fn run_loop(
         // completion may unblock downstream tasks, so the loop re-fills.
         if let Some((task_id, outcome)) = inflight.next().await {
             in_progress.remove(&task_id);
+            // Capture whether this settle is a node COMPLETION before `outcome` is
+            // moved into `settle_task_outcome` (it takes the value): `Ok(o) if o.ok`
+            // mirrors settle's own `done` arm. Retries / failures do not count.
+            let did_complete = matches!(&outcome, Ok(o) if o.ok);
             settle_task_outcome(&deps, run_id, &task_id, outcome).await;
+
+            // Mid-run batch-progress heartbeat (Phase 3a Task 3). This branch is
+            // reached ONLY while `inflight` is non-empty, so it is structurally
+            // DISJOINT from the `inflight.is_empty()` terminal decision above — we
+            // never hold a RunLocks terminal guard here. Best-effort: a report
+            // failure only warns and never affects the run. Throttled by BOTH a
+            // node-count floor and a wall-clock interval so a fast fan-out cannot
+            // spam the lead. A run with no lead conversation short-circuits (None).
+            if did_complete {
+                done_since_report += 1;
+            }
+            if let Some(lead_conv_id) = run.lead_conv_id {
+                let interval_due = last_batch_report
+                    .map(|t| t.elapsed() >= BATCH_REPORT_INTERVAL)
+                    .unwrap_or(true);
+                // Gate the batch report on `did_complete` too: a settle that is a
+                // permanent FAILURE fires `NodeFailed` inside `settle_task_outcome`
+                // above, so firing the batch report on the SAME settle would emit
+                // `node_failed` then `batch_progress` back-to-back. Only consider the
+                // batch report when THIS settle was a completion (the count floor + the
+                // interval gate still apply).
+                if did_complete && done_since_report >= BATCH_REPORT_MIN_NODES && interval_due {
+                    let digest = match deps.run_repo.list_tasks(run_id).await {
+                        Ok(tasks) if !tasks.is_empty() => build_summary_digest(&tasks),
+                        _ => "（run 进行中，暂无可汇总的节点产出）".to_string(),
+                    };
+                    if let Err(e) = deps
+                        .lead_reporter
+                        .report(lead_conv_id, run_id, RunOutcome::BatchProgress, &digest)
+                        .await
+                    {
+                        warn!(run_id, error = %e, "batch-progress lead report failed");
+                    }
+                    last_batch_report = Some(std::time::Instant::now());
+                    done_since_report = 0;
+                }
+            }
         }
         // Loop again — re-evaluate the ready set (newly unblocked) and the
         // terminal condition.
@@ -1446,6 +1691,39 @@ type WorkerFuture = std::pin::Pin<
     Box<dyn std::future::Future<Output = (String, Result<WorkerOutcome, AppError>)> + Send>,
 >;
 
+/// Seed a human-readable shared notes file (`RUN_NOTES.md`) in the run's shared
+/// dir. Best-effort and idempotent — writes ONLY if the file is absent, so a
+/// restart/rerun never clobbers content nodes appended (their appends survive).
+/// Carries the run goal + plan (task titles) + a「共享笔记」append region nodes
+/// add findings to via built-in file tools (their cwd is this shared dir). A
+/// read/write failure only `warn!`s and NEVER fails the run.
+async fn seed_run_notes(deps: &Arc<RunEngineDeps>, run_id: &str, dir: &str) {
+    let path = std::path::Path::new(dir).join("RUN_NOTES.md");
+    // Idempotent: preserve any node-appended content across restart/rerun.
+    if path.exists() {
+        return;
+    }
+    let goal = deps
+        .run_repo
+        .get_run(run_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|r| r.goal)
+        .unwrap_or_default();
+    let tasks = deps.run_repo.list_tasks(run_id).await.unwrap_or_default();
+    let mut body = String::from("# RUN_NOTES\n\n## 目标 (GOAL)\n");
+    body.push_str(&goal);
+    body.push_str("\n\n## 计划 (PLAN)\n");
+    for t in &tasks {
+        body.push_str(&format!("- {}\n", t.title));
+    }
+    body.push_str("\n## 共享笔记（各节点可追加发现/结论，供其它节点参考）\n");
+    if let Err(e) = std::fs::write(&path, body) {
+        warn!(run_id, error = %e, "failed to seed RUN_NOTES.md (continuing)");
+    }
+}
+
 /// Prepare a task for dispatch: resolve its member from the run's fleet snapshot,
 /// mark it `running` + emit, compose the brief, and build the worker future
 /// (which fires `on_started` to stamp `task.conversation_id` live). Returns
@@ -1474,9 +1752,12 @@ async fn dispatch_task(
     update_task_status(deps, &task.id, "running").await;
     deps.emitter.emit_task_status(run_id, &task.id, "running");
 
-    // Compose the brief: role hint + the task + completed upstream outputs.
+    // Compose the brief: role hint + the task + completed upstream outputs, plus
+    // cross-node context (run goal + plan shape + transitive-ancestor digest +
+    // shared-notes pointer) so a node deep in a chain retains earlier context.
     let upstream = collect_upstream_outputs(deps, run_id, &task.id).await;
-    let brief = compose_brief(member.role_hint.as_deref(), &task, &upstream);
+    let ctx = build_brief_context(deps, run_id, &task.id, workspace_dir.as_deref()).await;
+    let brief = compose_brief(member.role_hint.as_deref(), &task, &upstream, &ctx);
 
     // Clones captured by the worker future + the on_started closure. on_started is
     // a sync FnOnce(i64); the async task.conversation_id stamp is done in a
@@ -1494,6 +1775,16 @@ async fn dispatch_task(
     // 任务角色随 dispatch 下发：受限角色（searcher/reviewer/verifier）在 worker
     // 侧收缩为 per-node 工具白名单 + 网关收缩（run_restricted）。
     let task_role = task.role.clone();
+    // 受控嵌套深度（Phase 3b W7d）：从 task.pattern_config 读出 delegation_depth，随
+    // dispatch 烙进 worker 会话 extra（build_worker_extra）。pattern_config 里同时可能
+    // 存 fan-out 的 {"group":...} 等键——只读 delegation_depth，缺失/不可解析默认 0。
+    // root lead 的任务无此键 → 0；网关追加口给追加任务盖 caller_depth+1。
+    let delegation_depth = task
+        .pattern_config
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| v.get("delegation_depth").and_then(serde_json::Value::as_u64))
+        .unwrap_or(0) as u32;
     let timeout = deps.worker_timeout;
 
     let fut: WorkerFuture = Box::pin(async move {
@@ -1531,6 +1822,7 @@ async fn dispatch_task(
         let outcome = worker
             .run_restricted(
                 task_role.as_deref(),
+                delegation_depth,
                 &member,
                 workspace_dir.as_deref(),
                 &run_id_for_run,
@@ -1618,17 +1910,28 @@ fn retry_backoff_ms(base: Duration, attempt: i64) -> i64 {
     base_ms.saturating_mul(factor).min(MAX_RETRY_BACKOFF_MS)
 }
 
-/// Decide a failed worker turn's fate: AUTO-RETRY a transient/retryable provider
-/// error while the retry budget remains, else mark the task permanently `failed`.
+/// Decide a failed worker turn's fate via a THREE-WAY classification against the
+/// worker conversation, honouring TWO independent per-node budgets plus a run-level
+/// total-retry budget:
 ///
-/// Retryable is classified by [`WorkerRunner::last_error_retryable`] reading the
-/// worker conversation's latest error marker (`error.retryable` — the same flag the
-/// UI shows as 「可重试」). On a retry we keep the run `running` and put the node back
-/// to `pending` with `attempt+1` and a `next_retry_at = now + backoff` gate;
-/// `list_ready_tasks` holds the node out until the backoff elapses, then the loop
-/// re-dispatches it (a fresh worker turn). After `max_worker_retries` retries — or
-/// for a non-retryable error (auth / billing / bad request → `retryable:false`) — we
-/// fall back to [`mark_task_failed`] exactly as before.
+///   - **Retryable**  — a provider marker with `retryable=true` (e.g. a rate limit):
+///     retried under [`RunEngineDeps::max_worker_retries`], the same as before.
+///   - **NoMarker**   — `ok:false` with NO error marker (a timeout / empty reply):
+///     retried under the SEPARATE, smaller [`RunEngineDeps::max_timeout_retries`]
+///     budget so a genuinely stuck node self-heals on a transient blip yet cannot
+///     loop forever. This is the Task 1 addition (previously NoMarker → fail fast).
+///   - **NonRetryable** — a provider marker with `retryable=false` (auth / billing /
+///     bad request), or an `Err` outcome with no conversation to classify: fail
+///     immediately, exactly as before.
+///
+/// On a retry we keep the run `running` and put the node back to `pending` with
+/// `attempt+1` and a `next_retry_at = now + backoff` gate; `list_ready_tasks` holds
+/// it out until the backoff elapses, then the loop re-dispatches it (a fresh worker
+/// turn). The **run-level total-retry budget** additionally bounds a wide fan-out:
+/// stateless — the sum of persisted `attempt`s across the run vs
+/// `tasks.len() * max_worker_retries` — so many independently backing-off nodes
+/// cannot storm the provider. When neither budget permits a retry we fall back to
+/// [`mark_task_failed`] exactly as before.
 async fn settle_failed_or_retry(
     deps: &Arc<RunEngineDeps>,
     run_id: &str,
@@ -1636,26 +1939,52 @@ async fn settle_failed_or_retry(
     conv_from_outcome: Option<i64>,
     tokens: Option<i64>,
 ) {
-    // Read the task once for its current attempt count + its conversation id (the
-    // worker conv to classify the error against — prefer the outcome's, else the
-    // stamped one, since an `Err` outcome carries none).
     let task = deps.run_repo.get_task(task_id).await.ok().flatten();
     let attempt = task.as_ref().map(|t| t.attempt).unwrap_or(0);
     let conv = conv_from_outcome.or_else(|| task.as_ref().and_then(|t| t.conversation_id));
 
-    let retryable = match conv {
-        Some(c) => deps.worker.last_error_retryable(&c.to_string()).await,
-        None => false,
+    // Three-way classification against the worker conversation:
+    //   Retryable  = provider marker with retryable=true (e.g. rate limit)
+    //   NoMarker   = ok:false with no error marker (timeout / empty reply)
+    //   Otherwise  = NonRetryable (auth/billing/bad-request marker, or Err w/ no conv)
+    let (retryable_marker, has_marker) = match conv {
+        Some(c) => {
+            let s = c.to_string();
+            (deps.worker.last_error_retryable(&s).await, deps.worker.last_error_present(&s).await)
+        }
+        None => (false, true), // Err outcome (no conversation) → treat as NonRetryable
+    };
+    let (should_retry, budget) = if retryable_marker {
+        (true, deps.max_worker_retries)
+    } else if !has_marker && conv.is_some() {
+        (true, deps.max_timeout_retries) // NoMarker: timeout / empty reply
+    } else {
+        (false, 0) // NonRetryable marker
     };
 
-    if retryable && (attempt as usize) < deps.max_worker_retries {
+    // Run-level total-retry budget: bound wide fan-outs so many independently
+    // backing-off nodes cannot storm the provider. Stateless: sum of persisted
+    // attempts across the run vs tasks.len() * max_worker_retries.
+    //
+    // NOTE on coupling: the cap is expressed in `max_worker_retries`, and each
+    // node's own budget already caps its attempts, so this run gate only binds
+    // AFTER nodes have exhausted their per-node budgets (inert under defaults
+    // 3/2). Two consequences to keep in mind: (a) `max_worker_retries == 0`
+    // makes `cap == 0` → this gate blocks ALL retries incl. NoMarker timeouts,
+    // regardless of `max_timeout_retries`; (b) a caller setting
+    // `max_timeout_retries > max_worker_retries` would have timeout retries
+    // throttled by this run cap. Both are as-designed (per spec) but non-obvious.
+    let within_run_budget = match deps.run_repo.list_tasks(run_id).await {
+        Ok(tasks) => {
+            let used: i64 = tasks.iter().map(|t| t.attempt).sum();
+            let cap = (tasks.len().max(1) as i64) * (deps.max_worker_retries as i64);
+            used < cap
+        }
+        Err(_) => true, // fail-open on a transient read error; per-node budget still bounds it
+    };
+
+    if should_retry && (attempt as usize) < budget && within_run_budget {
         let next = now_ms() + retry_backoff_ms(deps.retry_backoff_base, attempt);
-        // Back to `pending`, attempt+1, gated by `next_retry_at`. The run stays
-        // `running` (we never write a terminal status here), so it self-heals — and
-        // survives a restart (boot-resume re-arms the still-`running` run, the loop
-        // respects the persisted gate). Keep the conversation_id (the failed turn
-        // stays inspectable); a re-dispatch creates a fresh worker conversation and
-        // re-stamps it. Record any tokens accrued by the failed attempt.
         let _ = deps
             .run_repo
             .update_task(
@@ -1669,20 +1998,54 @@ async fn settle_failed_or_retry(
                 },
             )
             .await;
-        // Emit `pending` so the canvas reflects the node leaving its failed/running
-        // state back to a queued-retry state (the ×N attempt badge shows the count).
         deps.emitter.emit_task_status(run_id, task_id, "pending");
         info!(
             run_id,
             task_id,
             attempt = attempt + 1,
-            backoff_ms = retry_backoff_ms(deps.retry_backoff_base, attempt),
-            "Run loop: worker hit a retryable error — scheduling bounded auto-retry"
+            no_marker = !has_marker,
+            "Run loop: scheduling bounded auto-retry"
         );
     } else {
-        // Non-retryable, or retry budget exhausted → permanent failure (the run
-        // loop's terminal check then fails the run, exactly as before).
+        // Non-retryable, retry budget exhausted, or run-level budget hit → permanent
+        // failure (the run loop's terminal check then fails the run, as before).
         mark_task_failed(deps, run_id, task_id, conv_from_outcome, tokens).await;
+        // 迁移 029 部分交付:若该节点策略是 skip_and_continue,跳过它的传递性下游
+        // (标 skipped),让独立分支跑完、run 终态走 completed_with_failures。默认
+        // (None/fail_run) 不进这里 → 整 run 仍判 failed(零回归)。mark_task_failed
+        // 保持单一职责,策略分流只在此处。
+        if let Ok(Some(t)) = deps.run_repo.get_task(task_id).await {
+            if t.on_fail.as_deref() == Some("skip_and_continue") {
+                if let Ok(edges) = deps.run_repo.list_deps(run_id).await {
+                    skip_downstream(deps, run_id, task_id, &edges).await;
+                }
+            }
+        }
+
+        // 中途上报 lead:某节点永久失败时(必需节点将拖垮 run,软失败也值得知会),
+        // best-effort 唤起 master 会话让其决策(改图/换模型重跑/adopt/放弃),不等终态。
+        // 绝不在终态 `RunLocks` 锁内(本函数在 run_loop 分支(d),不持终态锁);失败仅
+        // warn。每永久失败节点触发一次(天然有界)。`last_error` 已由上面的
+        // `mark_task_failed` 落库,此处读到的是真实原因。
+        if let Ok(Some(run)) = deps.run_repo.get_run(run_id).await {
+            if let Some(lead_conv_id) = run.lead_conv_id {
+                let brief = match deps.run_repo.get_task(task_id).await {
+                    Ok(Some(t)) => format!(
+                        "节点「{}」永久失败：{}",
+                        t.title,
+                        t.last_error.as_deref().unwrap_or("未知原因")
+                    ),
+                    _ => format!("run {run_id} 的一个节点永久失败"),
+                };
+                if let Err(e) = deps
+                    .lead_reporter
+                    .report(lead_conv_id, run_id, RunOutcome::NodeFailed, &brief)
+                    .await
+                {
+                    warn!(run_id, task_id, error = %e, "mid-run node-failed lead report failed");
+                }
+            }
+        }
     }
 }
 
@@ -1763,6 +2126,103 @@ async fn collect_upstream_outputs(
         .collect()
 }
 
+/// Build the cross-node [`BriefContext`] for a task at dispatch time (Phase 1b
+/// Task 3): the run goal, a short plan summary (task titles in plan order), a
+/// transitive-ancestor digest, and a pointer to the shared `RUN_NOTES.md`.
+///
+/// **Transitive-ancestor digest.** A node's DIRECT upstream is injected separately
+/// (as UPSTREAM RESULTS via [`collect_upstream_outputs`]); this walks the dep graph
+/// UP FROM those direct blockers to gather the blockers-of-blockers (and beyond) —
+/// the earlier context a long chain would otherwise lose. It mirrors
+/// [`skip_downstream`]'s bounded, `seen`-guarded BFS but in the REVERSE direction
+/// (following `blocked → blocker` edges upward). Direct upstream and the task
+/// itself are pre-seeded into `seen` so they are EXCLUDED (never re-injected). Only
+/// ancestors that have produced an `output_summary` land in the digest, each passed
+/// through [`truncate_summary_output`] so a verbose upstream cannot blow the budget.
+async fn build_brief_context(
+    deps: &Arc<RunEngineDeps>,
+    run_id: &str,
+    task_id: &str,
+    workspace_dir: Option<&str>,
+) -> BriefContext {
+    let goal = deps
+        .run_repo
+        .get_run(run_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|r| r.goal)
+        .unwrap_or_default();
+
+    let tasks = deps.run_repo.list_tasks(run_id).await.unwrap_or_default();
+    // Short plan summary: the task titles in plan order, so a node sees the overall
+    // shape and its own position. Kept compact (titles only) to bound the prompt.
+    let plan_summary = tasks
+        .iter()
+        .map(|t| t.title.as_str())
+        .collect::<Vec<_>>()
+        .join(" → ");
+
+    let dep_edges = deps.run_repo.list_deps(run_id).await.unwrap_or_default();
+    // DIRECT upstream (blockers of this task): injected separately as UPSTREAM
+    // RESULTS, so it is the SEED of the upward walk but is EXCLUDED from the digest.
+    let direct: Vec<String> = dep_edges
+        .iter()
+        .filter(|d| d.blocked_task_id == task_id)
+        .map(|d| d.blocker_task_id.clone())
+        .collect();
+
+    // Index tasks by id for O(1) title/output lookups during the walk.
+    let by_id: std::collections::HashMap<&str, &OrchRunTaskRow> =
+        tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+
+    // Reverse BFS (blocked → blocker) from the direct upstream. `seen` is pre-seeded
+    // with the task itself + its direct upstream so neither is ever added to the
+    // digest; bounded because each id is visited once.
+    let mut seen: HashSet<String> = HashSet::new();
+    seen.insert(task_id.to_string());
+    let mut frontier: Vec<String> = Vec::new();
+    for d in &direct {
+        // Direct upstream: excluded from the digest but the roots of the walk.
+        seen.insert(d.clone());
+        frontier.push(d.clone());
+    }
+    let mut ancestor_digest: Vec<(String, String)> = Vec::new();
+    while let Some(current) = frontier.pop() {
+        // Enqueue `current`'s own blockers (one level further up the chain).
+        for d in dep_edges.iter().filter(|d| d.blocked_task_id == current) {
+            let ancestor = d.blocker_task_id.clone();
+            if !seen.insert(ancestor.clone()) {
+                continue;
+            }
+            // A transitive ancestor beyond the direct upstream: include only when it
+            // has an output_summary, truncated to bound the prompt.
+            if let Some(t) = by_id.get(ancestor.as_str())
+                && let Some(summary) = t.output_summary.as_deref()
+            {
+                ancestor_digest.push((t.title.clone(), truncate_summary_output(summary)));
+            }
+            frontier.push(ancestor);
+        }
+    }
+
+    // Shared-notes pointer: the run's RUN_NOTES.md (None for a dir-less run). Built
+    // with Path::join so the separator is platform-correct.
+    let notes_hint = workspace_dir.map(|d| {
+        std::path::Path::new(d)
+            .join("RUN_NOTES.md")
+            .to_string_lossy()
+            .into_owned()
+    });
+
+    BriefContext {
+        goal,
+        plan_summary,
+        ancestor_digest,
+        notes_hint,
+    }
+}
+
 /// The `pattern_config` JSON field a `loop` body carries to its NEXT re-run with
 /// the PRIOR round's output text (written by [`settle_loop_task`] on CONTINUE).
 /// Its presence is what gates the "上一轮产出" brief section — a task without it
@@ -1792,6 +2252,29 @@ fn loop_prior_output(pattern_config: Option<&str>) -> Option<String> {
     Some(prior.to_string())
 }
 
+/// Cross-node context injected into every worker brief (Phase 1b Task 3) so a
+/// node deep in a chain sees the whole run's goal, the plan shape, relevant
+/// transitive-ancestor outputs (not just its DIRECT deps, which long chains would
+/// otherwise lose), and where the shared notes live. Built by
+/// [`build_brief_context`] at dispatch time. Every field is optional-by-emptiness:
+/// each brief section renders ONLY when its input is non-empty, so a default/empty
+/// `BriefContext` produces the exact legacy brief (zero regression).
+pub(crate) struct BriefContext {
+    /// The run goal (`orch_runs.goal`); empty when unavailable.
+    pub goal: String,
+    /// A short plan summary — the task titles in plan order — so a node knows its
+    /// position in the overall shape. Empty when there are no tasks.
+    pub plan_summary: String,
+    /// `(title, truncated output_summary)` for transitive ancestors BEYOND the
+    /// direct upstream (which is injected separately as UPSTREAM RESULTS). Only
+    /// ancestors that have produced an `output_summary` are included; each is
+    /// passed through [`truncate_summary_output`].
+    pub ancestor_digest: Vec<(String, String)>,
+    /// Absolute path to the run's shared `RUN_NOTES.md` (None when the run has no
+    /// shared dir). A node can read it and append its findings for other nodes.
+    pub notes_hint: Option<String>,
+}
+
 /// Compose the worker's brief: role hint + task title/spec + completed upstream
 /// outputs (injected as context). Sent as the conversation `system_prompt`.
 ///
@@ -1801,15 +2284,22 @@ fn loop_prior_output(pattern_config: Option<&str>) -> Option<String> {
 /// kind (the default, and anything unknown) keeps the exact previous framing
 /// (zero regression). The upstream gathering is identical for both kinds; only
 /// the framing differs.
+///
+/// **Cross-node context (Phase 1b Task 3).** Every brief also carries a
+/// [`BriefContext`] — the run goal, the plan shape, a transitive-ancestor digest
+/// (blockers-of-blockers beyond the DIRECT upstream), and a pointer to the shared
+/// notes file. Each new section renders ONLY when its input is non-empty, so an
+/// EMPTY `BriefContext` yields the exact legacy brief (zero regression).
 fn compose_brief(
     role_hint: Option<&str>,
     task: &OrchRunTaskRow,
     upstream: &[(String, String)],
+    ctx: &BriefContext,
 ) -> String {
     let mut out = if task.kind == "synthesis" {
-        compose_synthesis_brief(role_hint, task, upstream)
+        compose_synthesis_brief(role_hint, task, upstream, ctx)
     } else {
-        compose_agent_brief(role_hint, task, upstream)
+        compose_agent_brief(role_hint, task, upstream, ctx)
     };
     // 迁移 026 — 用户预置要求(启动前配置台):作为独立一段追加到 worker brief,与
     // 规划器写的 spec 分离(不覆盖它),读作明确的用户要求。门控于字段非空 —— 没有
@@ -1844,6 +2334,7 @@ fn compose_agent_brief(
     role_hint: Option<&str>,
     task: &OrchRunTaskRow,
     upstream: &[(String, String)],
+    ctx: &BriefContext,
 ) -> String {
     let mut out = String::new();
     if let Some(role) = role_hint.map(str::trim).filter(|s| !s.is_empty()) {
@@ -1859,15 +2350,46 @@ fn compose_agent_brief(
         out.push_str(&task.spec);
         out.push('\n');
     }
+    // Phase 1b Task 3: the run goal + plan shape, so a node deep in a chain knows
+    // WHAT the whole orchestration is for and where it sits. Each gated on non-empty
+    // so an empty BriefContext yields the exact legacy brief (byte-for-byte).
+    if !ctx.goal.trim().is_empty() {
+        out.push_str("\nRUN GOAL (整个编排的目标，你的产出要服务于它):\n");
+        out.push_str(ctx.goal.trim());
+        out.push('\n');
+    }
+    if !ctx.plan_summary.trim().is_empty() {
+        out.push_str("\nPLAN (全局计划概要):\n");
+        out.push_str(ctx.plan_summary.trim());
+        out.push('\n');
+    }
     if !upstream.is_empty() {
         out.push_str("\nUPSTREAM RESULTS (completed dependencies you can build on):\n");
         for (title, summary) in upstream {
             out.push_str("- ");
             out.push_str(title);
             out.push_str(": ");
+            out.push_str(&truncate_summary_output(summary));
+            out.push('\n');
+        }
+    }
+    // Phase 1b Task 3: transitive-ancestor digest (blockers-of-blockers beyond the
+    // DIRECT upstream) + a pointer to the shared notes file. Both gated on presence
+    // (already truncated in build_brief_context). Empty ctx → neither renders.
+    if !ctx.ancestor_digest.is_empty() {
+        out.push_str("\nEARLIER CONTEXT (更早的相关产出摘要):\n");
+        for (title, summary) in &ctx.ancestor_digest {
+            out.push_str("- ");
+            out.push_str(title);
+            out.push_str(": ");
             out.push_str(summary);
             out.push('\n');
         }
+    }
+    if let Some(notes) = &ctx.notes_hint {
+        out.push_str(&format!(
+            "\nSHARED NOTES: 你可读取并追加 {notes}（记录发现/结论供其它节点参考）。\n"
+        ));
     }
     // loop 迭代回看: APPEND the prior round's output when this body re-run carries
     // it (gated on the field — zero effect on any task without it).
@@ -1888,6 +2410,7 @@ fn compose_synthesis_brief(
     role_hint: Option<&str>,
     task: &OrchRunTaskRow,
     upstream: &[(String, String)],
+    ctx: &BriefContext,
 ) -> String {
     let mut out = String::new();
     if let Some(role) = role_hint.map(str::trim).filter(|s| !s.is_empty()) {
@@ -1906,6 +2429,19 @@ fn compose_synthesis_brief(
         out.push_str(&task.spec);
         out.push('\n');
     }
+    // Phase 1b Task 3: the run goal + plan shape (transitive ancestors carry less
+    // signal for a synthesis node — its material IS the upstream — so they are
+    // omitted here). Gated on non-empty → empty ctx = legacy synthesis brief.
+    if !ctx.goal.trim().is_empty() {
+        out.push_str("\nRUN GOAL (整个编排的目标，你的产出要服务于它):\n");
+        out.push_str(ctx.goal.trim());
+        out.push('\n');
+    }
+    if !ctx.plan_summary.trim().is_empty() {
+        out.push_str("\nPLAN (全局计划概要):\n");
+        out.push_str(ctx.plan_summary.trim());
+        out.push('\n');
+    }
     if upstream.is_empty() {
         // Defensive: a synthesis task with no resolved upstream still runs (it just
         // has nothing to merge) — note it so the worker does not hallucinate inputs.
@@ -1916,9 +2452,19 @@ fn compose_synthesis_brief(
             out.push_str("- ");
             out.push_str(title);
             out.push_str(": ");
+            // A synthesis node's PURPOSE is merging these upstream outputs — they
+            // are its source material, not mere context — so inject them VERBATIM
+            // (do NOT truncate to SUMMARY_TASK_OUTPUT_LEN as agent-node context is).
+            // Truncating/flattening here would silently degrade the merge.
             out.push_str(summary);
             out.push('\n');
         }
+    }
+    // Phase 1b Task 3: pointer to the shared notes file (gated on presence).
+    if let Some(notes) = &ctx.notes_hint {
+        out.push_str(&format!(
+            "\nSHARED NOTES: 你可读取并追加 {notes}（记录发现/结论供其它节点参考）。\n"
+        ));
     }
     out
 }
@@ -3480,6 +4026,15 @@ async fn mark_task_failed(
     deps.emitter.emit_task_status(run_id, task_id, "failed");
 }
 
+/// A *soft* failure: the task permanently `failed` but its per-node `on_fail`
+/// policy is `skip_and_continue` (迁移 029), so its transitive downstream was
+/// `skipped` and the RUN still settles — its terminal status becomes
+/// `completed_with_failures` rather than `failed`. `None`/`"fail_run"` is a HARD
+/// failure (default, current behaviour) → the whole run fails.
+fn is_soft_fail(t: &OrchRunTaskRow) -> bool {
+    t.status == "failed" && t.on_fail.as_deref() == Some("skip_and_continue")
+}
+
 /// Settle the run row to a terminal status (with an optional summary) and emit
 /// `run.completed`. Best-effort: a persistence error is logged, not propagated
 /// (the loop is exiting regardless).
@@ -3507,6 +4062,7 @@ async fn finish_run(
                 goal: None,
                 autonomy: None,
                 fleet_snapshot: None,
+                work_dir: None,
             },
         )
         .await
@@ -3908,6 +4464,14 @@ mod tests {
                 tokens: None,
             })
         }
+        // Represents a DEFINITE failure (a marked provider error): a marker IS
+        // present but `last_error_retryable` defaults false → NonRetryable, so the
+        // node fails immediately (attempt stays 0) — NOT retried under the NoMarker
+        // timeout budget. Preserves the pre-Task-1 dispatch counts / assertions for
+        // `failed_run_reports_once_to_lead` and `failed_task_persists_last_error`.
+        async fn last_error_present(&self, _conversation_id: &str) -> bool {
+            true
+        }
     }
 
     /// Build an engine over a shared in-memory DB wired with a RecordingLeadReporter
@@ -3990,7 +4554,10 @@ mod tests {
         }
     }
 
-    /// A COMPLETED run reports exactly once, with `Completed`, to its lead conv.
+    /// A COMPLETED run reports its TERMINAL `Completed` receipt exactly once to its
+    /// lead conv. (Task 3 adds a mid-run `batch_progress` receipt BEFORE the terminal
+    /// one when ≥3 nodes complete — the 3-node chain does — so this asserts on the
+    /// count of `completed` receipts, not the total report count.)
     #[tokio::test]
     async fn completed_run_reports_once_to_lead() {
         let worker: Arc<dyn WorkerRunner> =
@@ -4002,18 +4569,43 @@ mod tests {
             wait_run_status(&run_service, &run_id, "completed").await,
             "run must complete"
         );
-        await_first_report(&reporter).await;
+        // The terminal `completed` receipt fires AFTER the loop exits, so it can lag
+        // the persisted status the poll above observed (and any mid-run
+        // `batch_progress` receipt) — wait for it specifically rather than for the
+        // first report.
+        let mut saw_completed = false;
+        for _ in 0..40 {
+            if reporter
+                .reports
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, _, o)| o == "completed")
+            {
+                saw_completed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         let reports = reporter.reports.lock().unwrap().clone();
-        assert_eq!(
-            reports.len(),
-            1,
-            "exactly one lead report on completion, got {reports:?}"
+        assert!(
+            saw_completed,
+            "terminal completed receipt must fire, got {reports:?}"
         );
-        assert_eq!(reports[0].0, 909, "reported to the lead conversation");
-        assert_eq!(reports[0].2, "completed", "outcome is completed");
+        // Exactly ONE terminal `completed` receipt (a mid-run `batch_progress` is
+        // correct additional behaviour, not a duplicate terminal report).
+        let completed: Vec<_> = reports.iter().filter(|(_, _, o)| o == "completed").collect();
+        assert_eq!(
+            completed.len(),
+            1,
+            "exactly one terminal `completed` lead report, got {reports:?}"
+        );
+        assert_eq!(completed[0].0, 909, "reported to the lead conversation");
     }
 
-    /// A FAILED run reports exactly once, with `Failed`, to its lead conv.
+    /// A FAILED run reports its TERMINAL `Failed` receipt exactly once to its lead
+    /// conv. (Task 3 adds a mid-run `node_failed` receipt BEFORE the terminal one, so
+    /// this asserts on the count of `failed` receipts, not the total report count.)
     #[tokio::test]
     async fn failed_run_reports_once_to_lead() {
         let worker: Arc<dyn WorkerRunner> = Arc::new(AlwaysFailWorker);
@@ -4025,15 +4617,143 @@ mod tests {
             wait_run_status(&run_service, &run_id, "failed").await,
             "run must fail"
         );
-        await_first_report(&reporter).await;
+        // The terminal `failed` receipt fires AFTER the loop exits, so it can lag the
+        // persisted status the poll above observed (and the mid-run `node_failed`
+        // receipt) — wait for it specifically rather than for the first report.
+        let mut saw_failed = false;
+        for _ in 0..40 {
+            if reporter
+                .reports
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, _, o)| o == "failed")
+            {
+                saw_failed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         let reports = reporter.reports.lock().unwrap().clone();
+        assert!(saw_failed, "terminal failed receipt must fire, got {reports:?}");
+        // Exactly ONE terminal `failed` receipt (the mid-run `node_failed` is correct
+        // additional behaviour, not a duplicate terminal report).
+        let failed: Vec<_> = reports.iter().filter(|(_, _, o)| o == "failed").collect();
         assert_eq!(
-            reports.len(),
+            failed.len(),
             1,
-            "exactly one lead report on failure, got {reports:?}"
+            "exactly one terminal `failed` lead report, got {reports:?}"
         );
-        assert_eq!(reports[0].0, 42, "reported to the lead conversation");
-        assert_eq!(reports[0].2, "failed", "outcome is failed");
+        assert_eq!(failed[0].0, 42, "reported to the lead conversation");
+    }
+
+    /// A node that PERMANENTLY fails mid-run re-engages the lead conversation with a
+    /// best-effort `node_failed` receipt BEFORE the run reaches its terminal state,
+    /// so the master agent can repair (rerun w/ another model, adjust the graph,
+    /// adopt, or abandon) instead of waiting for the whole run to end. `AlwaysFail`
+    /// worker + `max_worker_retries = 0` → the first attempt is terminal for the
+    /// node; the mid-run report fires from `settle_failed_or_retry`'s permanent-fail
+    /// branch, after `mark_task_failed` persisted the reason.
+    #[tokio::test]
+    async fn permanent_node_failure_reports_to_lead_midrun() {
+        let worker: Arc<dyn WorkerRunner> = Arc::new(AlwaysFailWorker);
+        // max_retries = 0 → the first failure is terminal for the node (no retry wait).
+        let (run_service, engine, reporter) = reporter_stack(worker, 0).await;
+        let run_id = adhoc_lead_run(&run_service, 55).await;
+        engine.start(run_id.clone());
+        assert!(
+            wait_run_status(&run_service, &run_id, "failed").await,
+            "run must fail"
+        );
+        // The mid-run receipt is pushed during settle (before the terminal status
+        // write the poll above observed), so it is already present here — but poll a
+        // bounded moment to stay robust against scheduling.
+        let mut saw_node_failed = false;
+        for _ in 0..40 {
+            if reporter
+                .reports
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, _, o)| o == "node_failed")
+            {
+                saw_node_failed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let reports = reporter.reports.lock().unwrap().clone();
+        assert!(
+            saw_node_failed,
+            "a permanent node failure must produce a mid-run node_failed lead report, got {reports:?}"
+        );
+        // The mid-run receipt targets the lead conversation.
+        let node_failed = reports
+            .iter()
+            .find(|(_, _, o)| o == "node_failed")
+            .expect("node_failed report present");
+        assert_eq!(
+            node_failed.0, 55,
+            "mid-run node_failed reported to the lead conversation"
+        );
+    }
+
+    /// A run that completes ≥3 nodes re-engages the lead with a THROTTLED, best-effort
+    /// `batch_progress` receipt BEFORE the terminal receipt, so the master agent can
+    /// OBSERVE progress and append more work (`nomi_run_add_tasks`) to the SAME run.
+    /// The 3-node chain (A→B→C) all completes `done`; on the 3rd completion the
+    /// node-count floor (BATCH_REPORT_MIN_NODES = 3) is met and the FIRST interval
+    /// gate is open (no prior report) → exactly one `batch_progress` fires mid-run,
+    /// ordered before the terminal `completed` receipt.
+    #[tokio::test]
+    async fn batch_progress_reports_to_lead_midrun() {
+        let worker: Arc<dyn WorkerRunner> =
+            Arc::new(MockWorkerRunner::with_text(777, "task output"));
+        let (run_service, engine, reporter) = reporter_stack(worker, 3).await;
+        let run_id = adhoc_lead_run(&run_service, 321).await;
+        engine.start(run_id.clone());
+        assert!(
+            wait_run_status(&run_service, &run_id, "completed").await,
+            "run must complete"
+        );
+        // The mid-run batch_progress receipt is pushed during settle (before the
+        // terminal completed report), but poll a bounded moment to stay robust.
+        await_first_report(&reporter).await;
+        let mut saw_batch = false;
+        for _ in 0..40 {
+            if reporter
+                .reports
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, _, o)| o == "batch_progress")
+            {
+                saw_batch = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let reports = reporter.reports.lock().unwrap().clone();
+        assert!(
+            saw_batch,
+            "≥3 node completions must produce a mid-run batch_progress lead report, got {reports:?}"
+        );
+        // The mid-run batch_progress targets the lead conversation and PRECEDES the
+        // terminal `completed` receipt.
+        let batch_pos = reports
+            .iter()
+            .position(|(_, _, o)| o == "batch_progress")
+            .expect("batch_progress report present");
+        assert_eq!(
+            reports[batch_pos].0, 321,
+            "mid-run batch_progress reported to the lead conversation"
+        );
+        if let Some(done_pos) = reports.iter().position(|(_, _, o)| o == "completed") {
+            assert!(
+                batch_pos < done_pos,
+                "batch_progress must precede the terminal completed receipt, got {reports:?}"
+            );
+        }
     }
 
     /// A permanently-failed task PERSISTS a `last_error` reason, surfaced on the DTO
@@ -4384,15 +5104,81 @@ mod tests {
             override_provider_id: None,
             override_model: None,
             preset_prompt: None,
+            on_fail: None,
             created_at: 0,
             updated_at: 0,
         };
         let upstream = vec![("Gather".to_string(), "found 12 sources".to_string())];
-        let brief = compose_brief(Some("writer"), &task, &upstream);
+        let brief = compose_brief(Some("writer"), &task, &upstream, &empty_brief_ctx());
         assert!(brief.contains("ROLE: writer"));
         assert!(brief.contains("TASK: Synthesize"));
         assert!(brief.contains("write the report"));
         assert!(brief.contains("Gather: found 12 sources"));
+    }
+
+    /// An empty [`BriefContext`] — no goal, no plan, no ancestors, no notes. With
+    /// it, every Phase 1b Task 3 section is gated off, so a brief is byte-for-byte
+    /// the legacy brief. Every pre-existing compose_brief test passes this.
+    fn empty_brief_ctx() -> BriefContext {
+        BriefContext {
+            goal: String::new(),
+            plan_summary: String::new(),
+            ancestor_digest: vec![],
+            notes_hint: None,
+        }
+    }
+
+    // Phase 1b Task 3: a NON-empty BriefContext injects the run goal, the plan
+    // summary, a transitive-ancestor digest, and a shared-notes pointer — all
+    // ALONGSIDE the (still present) direct upstream.
+    #[test]
+    fn compose_brief_includes_goal_plan_ancestors_and_notes_pointer() {
+        let task = task_row_with_kind("agent", "Write", "写最终报告");
+        let upstream = vec![("B".to_string(), "b out".to_string())];
+        let ctx = BriefContext {
+            goal: "构建报告".into(),
+            plan_summary: "A → B → Write".into(),
+            ancestor_digest: vec![("A".to_string(), "a findings".to_string())],
+            notes_hint: Some("/ws/run1/RUN_NOTES.md".into()),
+        };
+        let brief = compose_brief(Some("writer"), &task, &upstream, &ctx);
+        assert!(brief.contains("构建报告"), "run goal injected: {brief}");
+        assert!(
+            brief.contains("A → B → Write"),
+            "plan summary injected: {brief}"
+        );
+        assert!(
+            brief.contains("a findings"),
+            "transitive ancestor digest injected: {brief}"
+        );
+        assert!(brief.contains("b out"), "direct upstream still present: {brief}");
+        assert!(
+            brief.contains("RUN_NOTES.md"),
+            "shared-notes pointer injected: {brief}"
+        );
+    }
+
+    // Phase 1b Task 3: a long direct-upstream output is truncated (CJK-safe) so a
+    // verbose upstream cannot blow the worker's prompt budget — the full text is
+    // NOT carried, and the truncation ellipsis marks where it was cut.
+    #[test]
+    fn compose_brief_truncates_long_upstream() {
+        let long = "x".repeat(SUMMARY_TASK_OUTPUT_LEN + 500);
+        let upstream = vec![("B".to_string(), long.clone())];
+        let ctx = BriefContext {
+            goal: "g".into(),
+            plan_summary: "p".into(),
+            ancestor_digest: vec![],
+            notes_hint: None,
+        };
+        let brief = compose_brief(
+            Some("w"),
+            &task_row_with_kind("agent", "T", "s"),
+            &upstream,
+            &ctx,
+        );
+        assert!(!brief.contains(&long), "long upstream truncated: {brief}");
+        assert!(brief.contains('…'), "truncation marker present: {brief}");
     }
 
     /// Build an `OrchRunTaskRow` with the given `kind` (other fields fixed) — used
@@ -4420,6 +5206,7 @@ mod tests {
             override_provider_id: None,
             override_model: None,
             preset_prompt: None,
+            on_fail: None,
             created_at: 0,
             updated_at: 0,
         }
@@ -4437,7 +5224,7 @@ mod tests {
         ];
 
         let synth_task = task_row_with_kind("synthesis", "合并草稿", "写出最终稿");
-        let synth_brief = compose_brief(Some("写手"), &synth_task, &upstream);
+        let synth_brief = compose_brief(Some("写手"), &synth_task, &upstream, &empty_brief_ctx());
 
         // Synthesis-specific framing present.
         assert!(
@@ -4465,7 +5252,7 @@ mod tests {
         // instruction, the plain TASK/UPSTREAM RESULTS labels) — proving the
         // branches diverge and agent is unchanged.
         let agent_task = task_row_with_kind("agent", "合并草稿", "写出最终稿");
-        let agent_brief = compose_brief(Some("写手"), &agent_task, &upstream);
+        let agent_brief = compose_brief(Some("写手"), &agent_task, &upstream, &empty_brief_ctx());
         assert_ne!(
             synth_brief, agent_brief,
             "synthesis framing must differ from agent"
@@ -4491,7 +5278,7 @@ mod tests {
     fn compose_brief_agent_kind_is_unchanged_legacy_framing() {
         let task = task_row_with_kind("agent", "Synthesize", "write the report");
         let upstream = vec![("Gather".to_string(), "found 12 sources".to_string())];
-        let brief = compose_brief(Some("writer"), &task, &upstream);
+        let brief = compose_brief(Some("writer"), &task, &upstream, &empty_brief_ctx());
         let expected = "ROLE: writer\n\nTASK: Synthesize\nSPEC:\nwrite the report\n\nUPSTREAM RESULTS (completed dependencies you can build on):\n- Gather: found 12 sources\n";
         assert_eq!(
             brief, expected,
@@ -4506,10 +5293,10 @@ mod tests {
     fn compose_brief_appends_preset_requirement_gated_on_presence() {
         // agent: preset appended AFTER the unchanged base brief.
         let mut a = task_row_with_kind("agent", "Do X", "the spec");
-        let a_base = compose_brief(Some("writer"), &a, &[]);
+        let a_base = compose_brief(Some("writer"), &a, &[], &empty_brief_ctx());
         assert!(!a_base.contains("用户预置要求"), "no preset → no section");
         a.preset_prompt = Some("务必用中文，并附引用".to_string());
-        let a_with = compose_brief(Some("writer"), &a, &[]);
+        let a_with = compose_brief(Some("writer"), &a, &[], &empty_brief_ctx());
         assert!(
             a_with.starts_with(&a_base),
             "preset is appended, base brief unchanged"
@@ -4523,9 +5310,9 @@ mod tests {
         // synthesis: preset also appended (uniform in compose_brief).
         let mut s = task_row_with_kind("synthesis", "Merge", "synthesize");
         let up = vec![("A".to_string(), "a".to_string())];
-        let s_base = compose_brief(None, &s, &up);
+        let s_base = compose_brief(None, &s, &up, &empty_brief_ctx());
         s.preset_prompt = Some("只输出要点".to_string());
-        let s_with = compose_brief(None, &s, &up);
+        let s_with = compose_brief(None, &s, &up, &empty_brief_ctx());
         assert!(
             s_with.starts_with(&s_base),
             "synthesis preset appended after base"
@@ -4534,10 +5321,10 @@ mod tests {
 
         // blank preset (whitespace only) → byte-for-byte unchanged.
         let mut b = task_row_with_kind("agent", "Y", "s");
-        let b_base = compose_brief(None, &b, &[]);
+        let b_base = compose_brief(None, &b, &[], &empty_brief_ctx());
         b.preset_prompt = Some("   \n  ".to_string());
         assert_eq!(
-            compose_brief(None, &b, &[]),
+            compose_brief(None, &b, &[], &empty_brief_ctx()),
             b_base,
             "blank preset appends nothing"
         );
@@ -4567,6 +5354,7 @@ mod tests {
             override_provider_id: None,
             override_model: None,
             preset_prompt: None,
+            on_fail: None,
             created_at: 0,
             updated_at: 0,
         };
@@ -5330,6 +6118,143 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // Phase 1b Task 1: an ad-hoc/conversation-native run with NO work_dir and NO
+    // workspace gets a per-run SHARED working directory auto-allocated under
+    // `<data_dir>/orchestrator/runs/{run_id}`, persisted to `run.work_dir`, and
+    // handed to EVERY node (so files + a shared workpath KB are shared). All-mock:
+    // the diamond planner + a temp `data_dir` on `RunEngineDeps`.
+    // -------------------------------------------------------------------------
+
+    /// Process-unique suffix so parallel/repeat runs never collide on the temp
+    /// `data_dir` base (the run subdir is already run-id-unique, this belts it).
+    static ADHOC_TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// Build an ad-hoc (workspace-less) run with NO work_dir + the diamond planner,
+    /// wired to a fresh temp `data_dir` on `RunEngineDeps` so the engine can
+    /// auto-allocate a per-run shared workspace directory. Autonomous (no approval
+    /// gate) so `engine.start` drives it straight to completion. Returns
+    /// `(svc, engine, run_id, data_dir)`.
+    async fn adhoc_no_dir_harness(
+        worker: Arc<ConcurrencyMockWorkerRunner>,
+    ) -> (RunService, RunEngine, String, std::path::PathBuf) {
+        let db = init_database_memory().await.expect("db init");
+        let pool = db.pool().clone();
+        let run_repo = Arc::new(SqliteRunRepository::new(pool.clone()));
+        let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
+        let ws_repo = Arc::new(SqliteOrchWorkspaceRepository::new(pool.clone()));
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let emitter = OrchestratorRunEventEmitter::new(broadcaster);
+        let planner: Arc<dyn PlanProducer> = Arc::new(DiamondPlanProducer);
+
+        let run_service = RunService::new(
+            run_repo.clone(),
+            fleet_repo,
+            ws_repo.clone(),
+            planner,
+            emitter.clone(),
+        );
+
+        // Unique temp data_dir so the auto-allocated run dir is real + isolated.
+        let data_dir = std::env::temp_dir().join(format!(
+            "nomifun-test-adhoc-{}-{}",
+            now_ms(),
+            ADHOC_TEST_DIR_SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+
+        let worker_dyn: Arc<dyn WorkerRunner> = worker;
+        let mut engine_deps =
+            RunEngineDeps::new(run_repo.clone(), worker_dyn, emitter, ws_repo);
+        engine_deps.worker_timeout = Duration::from_secs(10);
+        engine_deps.data_dir = data_dir.clone();
+        let engine = RunEngine::new(Arc::new(engine_deps));
+
+        // Ad-hoc run: workspace-less, NO work_dir, autonomous (no approval gate).
+        // `create_adhoc` synthesizes the fleet from the model range → member 0
+        // exists for the diamond's `member_index: Some(0)` tasks.
+        let run = run_service
+            .create_adhoc(
+                "u1",
+                CreateAdhocRunRequest {
+                    goal: "share one dir".to_string(),
+                    work_dir: None,
+                    model_range: ModelRange::Single {
+                        model: ModelRef {
+                            provider_id: "prov_x".to_string(),
+                            model: "claude-opus-4-8".to_string(),
+                        },
+                    },
+                    pinned_roles: vec![],
+                    role_members: vec![],
+                    autonomy: Some("autonomous".to_string()),
+                    max_parallel: Some(2),
+                    lead_conv_id: None,
+                    lead_model: None,
+                },
+            )
+            .await
+            .expect("create_adhoc");
+        assert!(run.workspace_id.is_none(), "ad-hoc run has no workspace");
+        assert!(run.work_dir.is_none(), "ad-hoc run starts with no work_dir");
+        run_service.plan(&run.id).await.expect("plan");
+        (run_service, engine, run.id, data_dir)
+    }
+
+    #[tokio::test]
+    async fn adhoc_run_auto_allocates_shared_workspace_dir() {
+        // 一个无 work_dir / 无 workspace 的 ad-hoc run:引擎应自动分配一个
+        // <data_dir>/orchestrator/runs/{run_id} 共享目录,持久化到 run.work_dir,
+        // 并把它作为 workspace_dir 传给每个节点(此前每节点各自临时目录、无法共享)。
+        let worker = Arc::new(ConcurrencyMockWorkerRunner::new(Duration::from_millis(10)));
+        let (svc, engine, run_id, data_dir) = adhoc_no_dir_harness(worker.clone()).await;
+        engine.start(run_id.clone());
+        let detail = drive_to_completion(&svc, &run_id).await;
+        // 持久化了 work_dir
+        let expected = data_dir.join("orchestrator").join("runs").join(&run_id);
+        assert_eq!(
+            detail.run.work_dir.as_deref(),
+            Some(expected.to_str().unwrap()),
+            "auto-allocated shared dir must be persisted to run.work_dir"
+        );
+        assert!(expected.is_dir(), "shared dir must be created on disk");
+        // 每个节点都拿到同一个共享目录
+        let dirs = worker.seen_workspace_dir.lock().unwrap().clone();
+        assert!(!dirs.is_empty());
+        for d in &dirs {
+            assert_eq!(
+                d.as_deref(),
+                expected.to_str(),
+                "every node shares the one run dir"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_start_seeds_run_notes_md() {
+        // run 启动时在共享目录 seed 一个人类可读的 RUN_NOTES.md:含 run 目标 +
+        // 计划(各节点 title)+ 「共享笔记」追加区,供节点经 cwd 内置文件工具读/追加。
+        let worker = Arc::new(ConcurrencyMockWorkerRunner::new(Duration::from_millis(10)));
+        let (svc, engine, run_id, data_dir) = adhoc_no_dir_harness(worker.clone()).await;
+        engine.start(run_id.clone());
+        let _ = drive_to_completion(&svc, &run_id).await;
+        let notes = data_dir
+            .join("orchestrator")
+            .join("runs")
+            .join(&run_id)
+            .join("RUN_NOTES.md");
+        assert!(notes.is_file(), "RUN_NOTES.md seeded in the shared dir");
+        let body = std::fs::read_to_string(&notes).unwrap();
+        assert!(
+            body.contains("目标") || body.contains("GOAL"),
+            "notes carry the run goal"
+        );
+        // 计划摘要含节点标题(harness 的 plan 至少含一个已知 title)
+        assert!(
+            body.contains("共享笔记"),
+            "has an append region for node findings"
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // 迁移 024: transient-error AUTO-RETRY. A single-task plan + a worker mock
     // that fails a configurable number of dispatches (classified retryable or
     // not) before succeeding. Proves a retryable failure (rate limit / timeout)
@@ -5409,6 +6334,14 @@ mod tests {
         }
         async fn last_error_retryable(&self, _conversation_id: &str) -> bool {
             self.retryable
+        }
+        // Simulates a MARKED provider error (rate-limit / auth / etc.): a marker IS
+        // present, so the three-way classification uses `retryable` above —
+        // `retryable=true` → Retryable path, `retryable=false` → NonRetryable
+        // (immediate fail). This keeps the marker-retry semantics distinct from the
+        // NoMarker timeout budget (which `TimeoutMockWorkerRunner` covers).
+        async fn last_error_present(&self, _conversation_id: &str) -> bool {
+            true
         }
     }
 
@@ -5550,6 +6483,354 @@ mod tests {
             worker.dispatches.load(Ordering::SeqCst),
             1,
             "dispatched exactly once"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // 迁移 029 (P1a Task 2): per-node `on_fail` policy + `completed_with_failures`
+    // terminal status. A two-INDEPENDENT-node DAG (A + B, no edge) seeded DIRECTLY
+    // via the `CreateTaskParams.on_fail` create path (the planner does not emit
+    // `on_fail` yet) proves: A's `skip_and_continue` soft-failure lets independent
+    // node B deliver and settles the run `completed_with_failures`; A's default
+    // `fail_run` policy fails the whole run (zero regression).
+    // -------------------------------------------------------------------------
+
+    /// A worker that FAILS any task whose spec contains `"FAIL"` (a MARKED,
+    /// non-retryable provider error → immediate permanent failure, attempt stays 0)
+    /// and SUCCEEDS every other task. A single instance drives a two-node DAG where
+    /// node A fails and independent node B still delivers.
+    struct SelectiveFailWorker;
+    #[async_trait]
+    impl WorkerRunner for SelectiveFailWorker {
+        async fn run(
+            &self,
+            _member: &FleetMember,
+            _workspace_dir: Option<&str>,
+            _run_id: &str,
+            task_id: &str,
+            _brief: &str,
+            task_spec: &str,
+            _timeout: Duration,
+            on_started: Box<dyn FnOnce(i64) + Send>,
+        ) -> Result<WorkerOutcome, AppError> {
+            on_started(778);
+            if task_spec.contains("FAIL") {
+                Ok(WorkerOutcome { conversation_id: 778, text: None, ok: false, tokens: None })
+            } else {
+                Ok(WorkerOutcome {
+                    conversation_id: 778,
+                    text: Some(format!("output of {task_id}")),
+                    ok: true,
+                    tokens: None,
+                })
+            }
+        }
+        // A MARKED provider error → the three-way classifier reads
+        // `last_error_retryable` (default false) → NonRetryable → the failing node
+        // fails immediately with no retry (attempt stays 0).
+        async fn last_error_present(&self, _conversation_id: &str) -> bool {
+            true
+        }
+    }
+
+    /// Two INDEPENDENT nodes A + B (no dep edge). Seeded DIRECTLY through the
+    /// `CreateTaskParams.on_fail` create path so node A carries an arbitrary
+    /// `on_fail` policy (the planner does not emit `on_fail` — 迁移 029). A's spec
+    /// contains `"FAIL"` so [`SelectiveFailWorker`] fails it permanently; B
+    /// succeeds. No assignments are created — `resolve_task_member` falls back to
+    /// member[0]. The run is flipped straight to `running` (the manual seed skips
+    /// `persist_dag_and_activate`). Returns (svc, engine, run id).
+    async fn two_independent_nodes_harness(a_on_fail: &str) -> (RunService, RunEngine, String) {
+        use nomifun_db::CreateTaskParams;
+        let db = init_database_memory().await.expect("db init");
+        let pool = db.pool().clone();
+        let run_repo = Arc::new(SqliteRunRepository::new(pool.clone()));
+        let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
+        let ws_repo = Arc::new(SqliteOrchWorkspaceRepository::new(pool.clone()));
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let emitter = OrchestratorRunEventEmitter::new(broadcaster);
+        // Planner is required by RunService::new but never invoked (tasks are seeded
+        // manually, `plan()` is not called).
+        let planner: Arc<dyn PlanProducer> = Arc::new(SingleTaskPlanProducer);
+        let run_service = RunService::new(
+            run_repo.clone(),
+            fleet_repo.clone(),
+            ws_repo.clone(),
+            planner,
+            emitter.clone(),
+        );
+
+        let worker: Arc<dyn WorkerRunner> = Arc::new(SelectiveFailWorker);
+        let mut engine_deps = RunEngineDeps::new(run_repo.clone(), worker, emitter, ws_repo.clone());
+        engine_deps.worker_timeout = Duration::from_secs(10);
+        engine_deps.retry_backoff_base = Duration::ZERO; // instant — no wall-clock wait
+        let engine = RunEngine::new(Arc::new(engine_deps));
+
+        let fleet = crate::service::FleetService::new(fleet_repo)
+            .create(
+                "u1",
+                CreateFleetRequest {
+                    name: "on_fail fleet".to_string(),
+                    description: None,
+                    max_parallel: None,
+                    members: vec![sample_member("agent_a")],
+                },
+            )
+            .await
+            .expect("fleet create");
+        let ws = crate::service::WorkspaceService::new(ws_repo)
+            .create(
+                "u1",
+                CreateWorkspaceRequest {
+                    name: "on_fail ws".to_string(),
+                    default_fleet_id: Some(fleet.id.clone()),
+                    workspace_dir: None,
+                },
+            )
+            .await
+            .expect("ws create");
+        let run = run_service
+            .create(
+                "u1",
+                CreateRunRequest {
+                    workspace_id: ws.id,
+                    goal: "on_fail policy test".to_string(),
+                    fleet_id: fleet.id,
+                    autonomy: None,
+                    max_parallel: Some(2),
+                },
+            )
+            .await
+            .expect("run create");
+
+        // Seed the two independent nodes DIRECTLY (bypassing the planner) so A
+        // carries the `on_fail` policy under test; B is a plain default node.
+        run_repo
+            .create_task(CreateTaskParams {
+                run_id: run.id.clone(),
+                title: "A".to_string(),
+                spec: "FAIL A".to_string(),
+                task_profile: None,
+                status: "pending".to_string(),
+                graph_x: None,
+                graph_y: None,
+                role: None,
+                kind: "agent".to_string(),
+                pattern_config: None,
+                on_fail: Some(a_on_fail.to_string()),
+            })
+            .await
+            .expect("create task A");
+        run_repo
+            .create_task(CreateTaskParams {
+                run_id: run.id.clone(),
+                title: "B".to_string(),
+                spec: "do B".to_string(),
+                task_profile: None,
+                status: "pending".to_string(),
+                graph_x: None,
+                graph_y: None,
+                role: None,
+                kind: "agent".to_string(),
+                pattern_config: None,
+                on_fail: None,
+            })
+            .await
+            .expect("create task B");
+
+        // Activate: flip the run to `running` so the engine picks it up.
+        run_repo
+            .update_run(
+                &run.id,
+                UpdateRunParams {
+                    status: Some("running".to_string()),
+                    summary: None,
+                    lead_conv_id: None,
+                    total_tokens: None,
+                    goal: None,
+                    autonomy: None,
+                    fleet_snapshot: None,
+                    work_dir: None,
+                },
+            )
+            .await
+            .expect("activate run");
+
+        (run_service, engine, run.id)
+    }
+
+    /// Poll until the run reaches ANY terminal status (completed /
+    /// completed_with_failures / failed / cancelled).
+    async fn drive_to_terminal(
+        run_service: &RunService,
+        run_id: &str,
+    ) -> nomifun_api_types::RunDetail {
+        for _ in 0..100 {
+            let d = run_service.get_detail(run_id).await.expect("detail");
+            if matches!(
+                d.run.status.as_str(),
+                "completed" | "completed_with_failures" | "failed" | "cancelled"
+            ) {
+                return d;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("run did not reach a terminal status within the bounded poll");
+    }
+
+    #[tokio::test]
+    async fn skip_and_continue_failed_node_completes_with_failures() {
+        // Two independent nodes: A permanently fails (on_fail=skip_and_continue),
+        // B succeeds. A has no downstream to skip → the run is all-settled with a
+        // soft failure → completed_with_failures, and B's product still delivers.
+        let (svc, engine, run_id) = two_independent_nodes_harness("skip_and_continue").await;
+        engine.start(run_id.clone());
+        let detail = drive_to_terminal(&svc, &run_id).await;
+        assert_eq!(detail.run.status, "completed_with_failures");
+        let a = detail.tasks.iter().find(|t| t.title == "A").expect("task A");
+        let b = detail.tasks.iter().find(|t| t.title == "B").expect("task B");
+        assert_eq!(a.status, "failed");
+        assert_eq!(b.status, "done", "independent branch still delivers");
+    }
+
+    #[tokio::test]
+    async fn fail_run_policy_fails_whole_run() {
+        // Default policy: A fails (on_fail="fail_run") → the whole run fails (the
+        // current hard-fail behaviour is preserved — zero regression).
+        let (svc, engine, run_id) = two_independent_nodes_harness("fail_run").await;
+        engine.start(run_id.clone());
+        let detail = drive_to_terminal(&svc, &run_id).await;
+        assert_eq!(detail.run.status, "failed");
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 1 (P1a): NO-MARKER (timeout / empty reply) BOUNDED auto-retry. A worker
+    // that returns `ok:false, text:None` with NO error marker is now retried under
+    // the SEPARATE `max_timeout_retries` budget (distinct from the provider-marker
+    // `max_worker_retries` path), so a transient timeout self-heals but a genuinely
+    // stuck node still fails after a bounded number of retries.
+    // -------------------------------------------------------------------------
+
+    /// Single-task harness parameterized by an arbitrary worker + ZERO backoff
+    /// (instant retries in tests). Mirrors [`retry_harness`]'s construction
+    /// (`SingleTaskPlanProducer`, one-member fleet) but leaves the retry/timeout
+    /// budgets at their [`RunEngineDeps::new`] defaults. Returns (svc, engine, run id).
+    async fn single_task_harness(worker: Arc<dyn WorkerRunner>) -> (RunService, RunEngine, String) {
+        let db = init_database_memory().await.expect("db init");
+        let pool = db.pool().clone();
+        let run_repo = Arc::new(SqliteRunRepository::new(pool.clone()));
+        let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
+        let ws_repo = Arc::new(SqliteOrchWorkspaceRepository::new(pool.clone()));
+        let broadcaster = Arc::new(RecordingBroadcaster::new());
+        let emitter = OrchestratorRunEventEmitter::new(broadcaster);
+        let planner: Arc<dyn PlanProducer> = Arc::new(SingleTaskPlanProducer);
+        let run_service =
+            RunService::new(run_repo.clone(), fleet_repo.clone(), ws_repo.clone(), planner, emitter.clone());
+
+        let mut engine_deps = RunEngineDeps::new(run_repo.clone(), worker, emitter, ws_repo.clone());
+        engine_deps.worker_timeout = Duration::from_secs(10);
+        engine_deps.retry_backoff_base = Duration::ZERO; // instant retries — no wall-clock wait in tests
+        let engine = RunEngine::new(Arc::new(engine_deps));
+
+        let fleet = crate::service::FleetService::new(fleet_repo)
+            .create(
+                "u1",
+                CreateFleetRequest {
+                    name: "timeout fleet".to_string(),
+                    description: None,
+                    max_parallel: None,
+                    members: vec![sample_member("agent_a")],
+                },
+            )
+            .await
+            .expect("fleet create");
+        let ws = crate::service::WorkspaceService::new(ws_repo)
+            .create(
+                "u1",
+                CreateWorkspaceRequest {
+                    name: "timeout ws".to_string(),
+                    default_fleet_id: Some(fleet.id.clone()),
+                    workspace_dir: None,
+                },
+            )
+            .await
+            .expect("ws create");
+        let run = run_service
+            .create(
+                "u1",
+                CreateRunRequest {
+                    workspace_id: ws.id,
+                    goal: "timeout test".to_string(),
+                    fleet_id: fleet.id,
+                    autonomy: None,
+                    max_parallel: Some(1),
+                },
+            )
+            .await
+            .expect("run create");
+        run_service.plan(&run.id).await.expect("plan");
+        (run_service, engine, run.id)
+    }
+
+    /// Simulates a worker that TIMES OUT / returns no final text with NO error
+    /// marker for the first `fail_times` dispatches, then succeeds. Mirrors the
+    /// production timeout/empty shape: `ok:false, text:None`, and (by NOT
+    /// overriding `last_error_present`) reports no error marker → NoMarker class.
+    struct TimeoutMockWorkerRunner {
+        fail_times: usize,
+        dispatches: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl WorkerRunner for TimeoutMockWorkerRunner {
+        async fn run(
+            &self,
+            _member: &FleetMember,
+            _workspace_dir: Option<&str>,
+            _run_id: &str,
+            _task_id: &str,
+            _brief: &str,
+            _task_spec: &str,
+            _timeout: Duration,
+            on_started: Box<dyn FnOnce(i64) + Send>,
+        ) -> Result<WorkerOutcome, AppError> {
+            on_started(900);
+            let n = self.dispatches.fetch_add(1, Ordering::SeqCst);
+            if n < self.fail_times {
+                Ok(WorkerOutcome { conversation_id: 900, text: None, ok: false, tokens: None })
+            } else {
+                Ok(WorkerOutcome { conversation_id: 900, text: Some("ok".into()), ok: true, tokens: None })
+            }
+        }
+        // last_error_present defaults false, last_error_retryable defaults false → NoMarker.
+    }
+
+    #[tokio::test]
+    async fn timeout_without_marker_retries_bounded_then_succeeds() {
+        // Times out once (no error marker) then succeeds → self-heals via the
+        // NoMarker timeout budget (NOT the marker-retryable path).
+        let worker: Arc<dyn WorkerRunner> =
+            Arc::new(TimeoutMockWorkerRunner { fail_times: 1, dispatches: Default::default() });
+        let (svc, engine, run_id) = single_task_harness(worker.clone()).await;
+        engine.start(run_id.clone());
+        let detail = drive_to_completion(&svc, &run_id).await;
+        assert_eq!(detail.run.status, "completed", "a no-marker timeout must retry to completion");
+        assert_eq!(detail.tasks[0].status, "done");
+        assert_eq!(detail.tasks[0].attempt, 1, "one timeout retry bumps attempt 0 → 1");
+    }
+
+    #[tokio::test]
+    async fn timeout_without_marker_exhausts_timeout_budget_then_fails() {
+        // Times out more than DEFAULT_MAX_TIMEOUT_RETRIES → permanent failure.
+        let worker: Arc<dyn WorkerRunner> =
+            Arc::new(TimeoutMockWorkerRunner { fail_times: 99, dispatches: Default::default() });
+        let (svc, engine, run_id) = single_task_harness(worker.clone()).await;
+        engine.start(run_id.clone());
+        let detail = drive_to_completion(&svc, &run_id).await;
+        assert_eq!(detail.run.status, "failed", "timeout budget exhausted → run fails");
+        assert_eq!(detail.tasks[0].status, "failed");
+        assert!(
+            detail.tasks[0].attempt as usize >= super::DEFAULT_MAX_TIMEOUT_RETRIES,
+            "attempt should reach the timeout budget"
         );
     }
 
@@ -7723,7 +9004,7 @@ mod tests {
         // appended so it refines the prior round.
         let mut body = task_row_with_kind("agent", "Refine draft", "polish it");
         body.pattern_config = build_body_loop_carry(None, Some("草稿第一版"), 2);
-        let brief = compose_brief(Some("写手"), &body, &[]);
+        let brief = compose_brief(Some("写手"), &body, &[], &empty_brief_ctx());
         assert!(
             brief.contains("上一轮产出(请在此基础上改进/迭代):"),
             "iter>=1 body brief carries the prior-output section: {brief}"
@@ -7748,7 +9029,7 @@ mod tests {
             body.pattern_config, None,
             "first iteration body has no carry"
         );
-        let brief = compose_brief(Some("写手"), &body, &[]);
+        let brief = compose_brief(Some("写手"), &body, &[], &empty_brief_ctx());
         assert!(
             !brief.contains("上一轮产出"),
             "first iteration brief must NOT carry a prior-output section: {brief}"
@@ -7765,13 +9046,13 @@ mod tests {
         let upstream = vec![("Gather".to_string(), "found 12 sources".to_string())];
         let expected = "ROLE: writer\n\nTASK: Synthesize\nSPEC:\nwrite the report\n\nUPSTREAM RESULTS (completed dependencies you can build on):\n- Gather: found 12 sources\n";
         // No pattern_config at all.
-        assert_eq!(compose_brief(Some("writer"), &task, &upstream), expected);
+        assert_eq!(compose_brief(Some("writer"), &task, &upstream, &empty_brief_ctx()), expected);
         // A pattern_config that does NOT carry the loop key (e.g. a fan-out group)
         // is also a no-op for the brief — same bytes.
         let mut tagged = task.clone();
         tagged.pattern_config = Some(r#"{"group":"g"}"#.to_string());
         assert_eq!(
-            compose_brief(Some("writer"), &tagged, &upstream),
+            compose_brief(Some("writer"), &tagged, &upstream, &empty_brief_ctx()),
             expected,
             "a non-carry pattern_config must not perturb the brief"
         );
@@ -7878,6 +9159,15 @@ mod tests {
                     tokens: None,
                 })
             }
+        }
+        // A failing loop body is a DEFINITE failure (a marked error), NOT a transient
+        // timeout: report a marker present so `settle_failed_or_retry` classifies it
+        // NonRetryable → fail immediately. This keeps
+        // `loop_failing_body_stops_loop_and_gates_downstream_no_infinite_iterate`'s
+        // "body ran exactly twice / loop stops failed" semantics under the new
+        // NoMarker timeout budget.
+        async fn last_error_present(&self, _conversation_id: &str) -> bool {
+            true
         }
     }
 
@@ -8817,6 +10107,82 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------------
+    // Phase 3a Task 1 — `add_tasks` runtime APPEND primitive (RunService +
+    // RunEngine lock wrapper). A conversation's ONE persistent run can have NEW
+    // nodes APPENDED at runtime (Claude-Code-style dispatch-while-running); the
+    // append inserts pending tasks + deps in one transaction (empty delete list)
+    // and re-arms a terminal run so the loop drives the new work — no strand.
+    // -------------------------------------------------------------------------
+
+    /// Minimal `PlannedTask` for the append tests — `agent` kind, no deps, no
+    /// pre-assignment (the harness's single-member fleet routes it via the pure
+    /// `resolve_assignment_pick` fallback).
+    fn planned_task(title: &str, spec: &str) -> PlannedTask {
+        PlannedTask {
+            title: title.to_string(),
+            spec: spec.to_string(),
+            task_profile: None,
+            depends_on: vec![],
+            member_index: None,
+            rationale: None,
+            role: None,
+            kind: "agent".to_string(),
+            pattern_config: None,
+        }
+    }
+
+    /// A run driven to a TERMINAL state gets a NEW node APPENDED via
+    /// `engine.add_tasks`; the append re-arms the terminal run to `running`, and
+    /// the re-started loop drives the appended node to `done` (the run settles
+    /// `completed` again) — the appended pending task is never stranded.
+    #[tokio::test]
+    async fn add_tasks_appends_to_running_run_and_new_node_runs() {
+        let worker: Arc<dyn WorkerRunner> = Arc::new(MockWorkerRunner::with_text(1, "x"));
+        let (svc, engine, run_id) = single_task_harness(worker).await;
+        engine.start(run_id.clone());
+        let first = drive_to_completion(&svc, &run_id).await;
+        assert_eq!(first.run.status, "completed", "initial run completes");
+
+        // Append one new node (no deps) onto the now-terminal run.
+        let new = vec![planned_task("追加节点", "do the extra work")];
+        let rearmed = engine
+            .add_tasks(&svc, &run_id, new)
+            .await
+            .expect("add_tasks");
+        assert_eq!(
+            rearmed.status, "running",
+            "terminal run re-armed to running by the append"
+        );
+
+        // The route (re)starts the loop for the re-armed run if it isn't live.
+        if !engine.is_running(&run_id) {
+            engine.start(run_id.clone());
+        }
+        let detail = drive_to_completion(&svc, &run_id).await;
+        assert_eq!(detail.run.status, "completed");
+        assert!(
+            detail
+                .tasks
+                .iter()
+                .any(|t| t.title.contains("追加节点") && t.status == "done"),
+            "appended node must run to done: {:?}",
+            detail.tasks
+        );
+    }
+
+    /// An empty append batch is a clean `BadRequest` — a no-op append would only
+    /// churn the re-arm, so a caller bug surfaces loudly (mirrors `plan_flat`).
+    #[tokio::test]
+    async fn add_tasks_empty_is_rejected() {
+        let worker: Arc<dyn WorkerRunner> = Arc::new(MockWorkerRunner::with_text(1, "x"));
+        let (svc, engine, run_id) = single_task_harness(worker).await;
+        assert!(
+            engine.add_tasks(&svc, &run_id, vec![]).await.is_err(),
+            "an empty add_tasks batch must be rejected"
+        );
+    }
+
     // B4 CONCURRENCY-REGRESSION GUARD: the lead LLM call in `engine.adjust` is awaited
     // with the per-run lock NOT held — `compute_adjusted_plan` (the LLM await) runs
     // lock-free; only `apply_adjusted_plan` (pure DB) runs under the lock. This pins
@@ -9305,6 +10671,14 @@ mod tests {
                         tokens: None,
                     })
                 }
+            }
+            // The first-call failure is a DEFINITE failure (marked error), NOT a
+            // transient timeout: report a marker present so it fails immediately
+            // (NonRetryable) rather than self-healing under the NoMarker timeout
+            // budget — the test relies on the FIRST run landing `failed` before the
+            // rerun re-executes it.
+            async fn last_error_present(&self, _conversation_id: &str) -> bool {
+                true
             }
         }
         let worker: Arc<dyn WorkerRunner> = Arc::new(FlakyWorker {
@@ -10608,6 +11982,7 @@ mod tests {
             override_provider_id: None,
             override_model: None,
             preset_prompt: None,
+            on_fail: None,
             created_at: 0,
             updated_at: 0,
         }

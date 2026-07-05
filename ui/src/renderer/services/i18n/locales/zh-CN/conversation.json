@@ -22,7 +22,6 @@
   },
   "orchestration": {
     "panelTitle": "编排画布",
-    "startTitle": "发起智能编排",
     "planning": "规划中…",
     "collapseCanvas": "收起编排画布",
     "expandCanvas": "展开编排画布",
@@ -571,6 +570,11 @@
   "editMessage": {
     "action": "编辑",
     "banner": "正在编辑消息——发送后将从这里重新生成"
+  },
+  "slashCommands": {
+    "compact": {
+      "description": "压缩会话上下文"
+    }
   },
   "clearContext": {
     "description": "清空会话上下文",

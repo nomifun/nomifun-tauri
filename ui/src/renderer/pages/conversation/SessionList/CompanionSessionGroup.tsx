@@ -12,6 +12,7 @@ import { customFigureMetaOf } from '@renderer/pages/companion/characters/customM
 import { useCompanions } from '@renderer/pages/nomi/useNomi';
 import { cleanupSiderTooltips } from '@renderer/utils/ui/siderTooltip';
 import { Message, Tooltip } from '@arco-design/web-react';
+import { Info } from '@icon-park/react';
 import classNames from 'classnames';
 import React, { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -181,6 +182,12 @@ const CompanionSessionGroup: React.FC<Props> = ({
 
       {expanded && (
         <div className='flex flex-col gap-2px mt-2px'>
+          <div className='mx-6px mb-2px flex min-h-28px items-center gap-6px rounded-8px bg-[rgba(var(--primary-6),0.06)] px-8px py-5px text-11px text-t-tertiary'>
+            <span className='inline-flex h-16px w-16px shrink-0 items-center justify-center text-primary opacity-70'>
+              <Info theme='outline' size='13' fill='currentColor' className='block leading-none' />
+            </span>
+            <span className='min-w-0 flex-1 truncate leading-16px'>{t('sessionList.companionTip')}</span>
+          </div>
           {visibleCompanions.entries.map((c) => {
             const active = activeConversationId != null && sessionMap.get(c.id) === activeConversationId;
             const modelReady = modelReadyOf(c);

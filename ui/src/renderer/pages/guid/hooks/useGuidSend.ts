@@ -21,7 +21,6 @@ import type { PendingConversation } from '@/renderer/pages/conversation/componen
 import { planGuidEntry, isAutoWorkEntry } from './autoWorkEntry';
 import type { AutoWorkDraftValue } from '@/renderer/pages/conversation/components/AutoWorkControl';
 import type { AcpModelInfo, AvailableAgent, EffectiveAgentInfo } from '../types';
-import type { TModelRange, TModelRef } from '@/common/types/orchestrator/orchestratorTypes';
 
 export type GuidSendDeps = {
   // Input state
@@ -74,24 +73,6 @@ export type GuidSendDeps = {
    * sending a first message would race the AutoWork turn and surface
    * "conversation N is already running". */
   autoWork: AutoWorkDraftValue;
-
-  /** When true the homepage 智能编排 strip creates an orchestration LEAD nomi
-   * conversation (`extra.orchestrator_role: 'lead'` → backend
-   * LEAD_ORCHESTRATOR_PROMPT), stashes the goal as the first message, and
-   * navigates immediately. On landing the lead agent natively thinks and calls
-   * `nomi_run_create`, which links a multi-agent run back to this conversation
-   * (writing `extra.orchestrator_run_id` + broadcasting) so `useConversationRun`
-   * lights up the top-panel DAG. No FE adhoc-run creation, no blank wait.
-   * Mutually exclusive with AutoWork / preset-agent flows (the homepage strip
-   * enforces this). */
-  orchestrationMode: boolean;
-
-  /** 智能编排「协作模型」(homepage picker). The ADDITIONAL worker pool the
-   * lead/planner may assign per node by difficulty (the 主模型 = `current_model`
-   * is always the lead and in the pool). Combined with the 主模型 into the run's
-   * `model_range`, stashed on the lead conversation's `extra.orchestrator_model_range`.
-   * Empty ⇒ the run uses just the 主模型. Ignored outside orchestration mode. */
-  collaborators: TModelRef[];
 
   // Mention state reset
   setMentionOpen: React.Dispatch<React.SetStateAction<boolean>>;
@@ -151,8 +132,6 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
     isGoogleAuth,
     applyAdvancedConfig,
     autoWork,
-    orchestrationMode,
-    collaborators,
     setMentionOpen,
     setMentionQuery,
     setMentionSelectorOpen,
@@ -167,70 +146,6 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
   const handleSend = useCallback(async () => {
     const isCustomWorkspace = !!dir;
     const finalWorkspace = dir || '';
-
-    // 智能编排(首页模式条)Direction B — create a nomi conversation set up as an
-    // ORCHESTRATION LEAD (`extra.orchestrator_role: 'lead'` → server-authored
-    // LEAD_ORCHESTRATOR_PROMPT), stash the user's goal as the first message, and
-    // navigate IMMEDIATELY. On landing the lead agent thinks natively (thinking
-    // bubbles), calls `nomi_run_create` (visible「查看步骤」tool card) to decompose
-    // the goal into a multi-agent run, and narrates — the whole startup/
-    // orchestration process is live in the native chat (no silent await, no blank
-    // wait). That tool call links the run to THIS conversation (lead_conv_id +
-    // extra.orchestrator_run_id + broadcast), so `useConversationRun` lights up the
-    // top-panel DAG on its own. No FE adhoc-run creation here.
-    if (orchestrationMode) {
-      const goal = input.trim();
-      if (!goal) return;
-      if (!current_model) {
-        Message.error(t('guid.modelRequired', { defaultValue: '请先选择模型' }));
-        return;
-      }
-      // Build the curated model range: 主模型 (current_model) FIRST — it is the
-      // lead/planner and `nomi_run_create`'s `lead_model` — then the 协作模型 pool,
-      // deduped. Stashed on the lead conversation's `extra.orchestrator_model_range`
-      // so the gateway `nomi_run_create` handler reads it back deterministically
-      // (no reliance on the LLM passing a model_range). Empty collaborators ⇒ a
-      // single-model range (= just the 主模型).
-      const mainRef: TModelRef = { provider_id: current_model.id, model: current_model.use_model };
-      const seen = new Set<string>();
-      const models: TModelRef[] = [mainRef, ...collaborators].filter((r) => {
-        if (!r || !r.provider_id || !r.model) return false;
-        const key = `${r.provider_id} ${r.model}`;
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
-      const orchestrator_model_range: TModelRange | undefined =
-        models.length > 0 ? { mode: 'range', models } : undefined;
-      const conversation = await ipcBridge.conversation.create.invoke({
-        type: 'nomi',
-        name: goal.slice(0, 60),
-        model: current_model,
-        extra: {
-          workspace: finalWorkspace,
-          custom_workspace: isCustomWorkspace,
-          orchestrator_role: 'lead',
-          orchestrator_model_range,
-          session_mode: selectedMode,
-        },
-      });
-      if (!conversation?.id) {
-        Message.error(t('conversation.createFailed', { defaultValue: '创建会话失败' }));
-        return;
-      }
-      await applyAdvancedConfig?.(conversation.id);
-      // Send the goal as the first turn — NomiSendBox consumes this on mount and
-      // starts a native turn. The lead agent then thinks + orchestrates natively;
-      // the live turn IS the visible startup process.
-      sessionStorage.setItem(
-        `nomi_initial_message_${conversation.id}`,
-        JSON.stringify({ input: goal, files: files.length > 0 ? files : undefined }),
-      );
-      emitter.emit('chat.history.refresh');
-      seedConversationCache(conversation);
-      await navigate(`/conversation/${conversation.id}`);
-      return;
-    }
 
     // AutoWork entry (switch on + tag) creates the session and lets the backend
     // requirement loop drive it — it must NOT also send a first message, which
@@ -547,7 +462,6 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
     selectedMcpServerIds,
     applyAdvancedConfig,
     autoWork,
-    orchestrationMode,
     navigate,
     t,
   ]);

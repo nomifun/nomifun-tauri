@@ -21,7 +21,7 @@ import type { ConversationRowProps } from './types';
 import { getBackendKeyFromConversation } from './utils/exportHelpers';
 import { isConversationPinned } from './utils/conversationPinned';
 import { buildSessionCapabilityItems, CAPABILITY_ICON_SIZE } from './utils/sessionCapabilityItems';
-import { getSessionAgeDays } from './utils/sessionAge';
+import { formatSessionAgeLabel } from './utils/sessionAge';
 
 const ConversationRow: React.FC<ConversationRowProps> = (props) => {
   const {
@@ -57,13 +57,7 @@ const ConversationRow: React.FC<ConversationRowProps> = (props) => {
   const isPinned = isConversationPinned(conversation);
   const cronStatus = getJobStatus(conversation.id);
   const siderTooltipProps = getSiderTooltipProps(tooltipEnabled);
-  const ageDays = getSessionAgeDays(conversation.created_at);
-  const ageLabel =
-    ageDays === null
-      ? null
-      : ageDays === 0
-        ? t('sessionList.createdToday')
-        : t('sessionList.createdDays', { count: ageDays });
+  const ageLabel = formatSessionAgeLabel(t, conversation.created_at);
 
   // Session-level capability markers (trailing cluster): 定时任务 → 自动工作 →
   // 智能决策, shared builder with TerminalRow.

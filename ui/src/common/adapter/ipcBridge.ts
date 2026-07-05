@@ -1764,9 +1764,10 @@ export interface ICreateConversationParams {
     context?: string;
     context_file_name?: string;
     preset_rules?: string;
-    /** Orchestration lead role. When `'lead'`, the backend composes the
-     *  LEAD_ORCHESTRATOR_PROMPT so the agent decomposes complex goals via
-     *  `nomi_run_create` (homepage 智能编排 entry). Prompt-only; never grants tools. */
+    /** Legacy field kept for backward-compat only (`#[serde(default)]`); no longer
+     *  drives any lead prompt (the homepage 智能编排 entry was removed). The model
+     *  range (主/协作) is now set per-conversation via the composer's collaborator
+     *  selector into `extra.orchestrator_model_range`. */
     orchestrator_role?: string;
     /** Curated model range for the orchestration run this lead conversation
      *  spawns (homepage「主模型 + 协作模型」picker). `models[0]` = 主模型 (also the

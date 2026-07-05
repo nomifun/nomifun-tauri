@@ -17,7 +17,7 @@ import FlexFullContainer from '@/renderer/components/layout/FlexFullContainer';
 import TerminalHoverCard from '@/renderer/pages/conversation/components/TerminalHoverCard';
 
 import { buildSessionCapabilityItems, CAPABILITY_ICON_SIZE } from './utils/sessionCapabilityItems';
-import { getSessionAgeDays } from './utils/sessionAge';
+import { formatSessionAgeLabel } from './utils/sessionAge';
 
 interface TerminalRowProps {
   session: ITerminalSession;
@@ -71,13 +71,7 @@ const TerminalRow: React.FC<TerminalRowProps> = ({
   // Session-level capability markers (trailing cluster), shared builder with
   // ConversationRow: 定时任务 → 自动工作 → 智能决策.
   const capabilityItems = buildSessionCapabilityItems(t, { cronStatus, autoworkState, idmmState });
-  const ageDays = getSessionAgeDays(session.created_at);
-  const ageLabel =
-    ageDays === null
-      ? null
-      : ageDays === 0
-        ? t('sessionList.createdToday')
-        : t('sessionList.createdDays', { count: ageDays });
+  const ageLabel = formatSessionAgeLabel(t, session.created_at);
 
   // 进入批量选择模式时菜单容器被卸载，但 menuVisible 残留会在退出选择模式时把菜单弹回来
   useEffect(() => {

@@ -264,8 +264,8 @@ const AssistantSettings: React.FC = () => {
 
   return (
     <HubPageShell
-      title={t('settings.assistantSkills.title', { defaultValue: 'Assistant & Skill' })}
-      subtitle={t('settings.assistantSkills.subtitle', {
+      title={t('settings.assistantSkillsHub.title', { defaultValue: 'Assistant & Skill' })}
+      subtitle={t('settings.assistantSkillsHub.subtitle', {
         defaultValue: 'Manage assistants and reusable skill packages in one place.',
       })}
       maxWidthClass='md:max-w-1200px'
@@ -279,11 +279,11 @@ const AssistantSettings: React.FC = () => {
       >
         <Tabs.TabPane
           key='assistants'
-          title={t('settings.assistantSkills.assistantsTab', { defaultValue: 'Assistants' })}
+          title={t('settings.assistantSkillsHub.assistantsTab', { defaultValue: 'Assistants' })}
         >
           {assistantManagementContent}
         </Tabs.TabPane>
-        <Tabs.TabPane key='skills' title={t('settings.assistantSkills.skillsTab', { defaultValue: 'Skills' })}>
+        <Tabs.TabPane key='skills' title={t('settings.assistantSkillsHub.skillsTab', { defaultValue: 'Skills' })}>
           <SkillsHubSettings withWrapper={false} />
         </Tabs.TabPane>
       </Tabs>

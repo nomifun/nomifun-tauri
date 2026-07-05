@@ -469,11 +469,11 @@ export type TChatConversation =
          * created as a worker for an orchestration run task (vs. the run's lead
          * conversation). Absent for the lead conversation and non-orchestration ones. */
         orchestrator_task_id?: string;
-        /** Marks this nomi conversation as an orchestration LEAD (homepage 智能编排
-         * on-ramp). When set to 'lead' the backend injects the LEAD_ORCHESTRATOR_PROMPT
-         * so the agent natively thinks → calls `nomi_run_create(goal)` to fan out a
-         * multi-agent run (which then writes `orchestrator_run_id` back here). Absent
-         * for normal nomi conversations. */
+        /** Legacy field kept for backward-compat only (`#[serde(default)]`). Once
+         * marked the homepage 智能编排 LEAD on-ramp, but that entry was removed: it
+         * no longer drives any lead prompt. The model range (主/协作) is now chosen
+         * per-conversation via the composer's collaborator selector, persisted into
+         * `extra.orchestrator_model_range`. Retained so old rows keep deserializing. */
         orchestrator_role?: string;
         /** Curated model range for the orchestration run this lead conversation
          * spawns (homepage「主模型 + 协作模型」picker). `models[0]` is the 主模型

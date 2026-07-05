@@ -11,6 +11,7 @@ import NomiModal from '@/renderer/components/base/NomiModal';
 import { useAgents } from '@/renderer/hooks/agent/useAgents';
 import { useContainerWidth } from '@/renderer/hooks/ui/useContainerWidth';
 import { Button, Typography } from '@arco-design/web-react';
+import { IconRefresh } from '@arco-design/web-react/icon';
 import { Home, Plus } from '@icon-park/react';
 import React, { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -43,7 +44,23 @@ const LocalAgents: React.FC = () => {
   const [hubModalVisible, setHubModalVisible] = useState(false);
 
   // Single fetch for all agents; both detected and custom lists are derived from it.
-  const { agents: allAgents, revalidate: mutateAgents } = useAgents();
+  const {
+    agents: allAgents,
+    revalidate: mutateAgents,
+    refreshCustomAgents,
+  } = useAgents();
+  const [refreshingDetection, setRefreshingDetection] = useState(false);
+
+  const handleRefreshDetection = useCallback(async () => {
+    setRefreshingDetection(true);
+    try {
+      await refreshCustomAgents();
+    } catch (err) {
+      console.error('refresh local agent detection failed:', err);
+    } finally {
+      setRefreshingDetection(false);
+    }
+  }, [refreshCustomAgents]);
 
   const detectedAgents = allAgents.filter((a) => a.agent_type !== 'remote' && a.agent_source !== 'custom');
 
@@ -149,7 +166,7 @@ const LocalAgents: React.FC = () => {
 
   return (
     <div ref={ref} className='flex flex-col gap-8px py-16px'>
-      <div className='px-16px text-12px text-t-secondary'>
+      <div className='flex flex-wrap items-center gap-x-6px gap-y-2px px-16px text-12px text-t-secondary'>
         <span>{t('settings.agentManagement.localAgentsDescription')} </span>
         <Button
           type='text'
@@ -158,6 +175,17 @@ const LocalAgents: React.FC = () => {
           onClick={openCustomAgentEditor}
         >
           {t('settings.agentManagement.detectCustomAgent')}
+        </Button>
+        <Button
+          type='text'
+          size='mini'
+          icon={<IconRefresh />}
+          loading={refreshingDetection}
+          data-testid='btn-refresh-local-agents'
+          className='!h-auto !p-0 !align-baseline !text-12px !font-normal !text-primary-6 hover:!text-primary-7 hover:!underline underline-offset-2'
+          onClick={() => void handleRefreshDetection()}
+        >
+          {t('settings.agentManagement.refreshDetection')}
         </Button>
       </div>
 

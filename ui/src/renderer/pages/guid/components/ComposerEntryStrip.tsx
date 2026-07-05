@@ -5,7 +5,7 @@
  */
 
 import { Trigger } from '@arco-design/web-react';
-import { Lightning, Robot, Workbench } from '@icon-park/react';
+import { Lightning, Robot } from '@icon-park/react';
 import React, { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import styles from '../index.module.css';
@@ -23,8 +23,6 @@ export interface ComposerEntryStripProps {
   onSummon: () => void;
   onAdjustSkills: () => void;
   onFree: () => void;
-  onOrchestrate: () => void;
-  isOrchestrationMode?: boolean;
   activeSkillCount?: number;
   activeSkills?: GuidActiveSkill[];
 }
@@ -33,7 +31,7 @@ export interface ComposerEntryStripProps {
  * ComposerEntryStrip — top-edge entry bar inside the chat composer.
  *
  * Two states:
- * - Default (isPresetAgent=false): [智能编排] [召唤助手] [使用 Skills + inline count]
+ * - Default (isPresetAgent=false): [召唤助手] [使用 Skills + inline count]
  *   (free play is the implicit default — no dedicated pill needed)
  * - Summoned (isPresetAgent=true): [persona token: avatar + label + close] [使用 Skills + inline count] ... [自由发挥]
  */
@@ -44,8 +42,6 @@ const ComposerEntryStrip: React.FC<ComposerEntryStripProps> = ({
   onSummon,
   onAdjustSkills,
   onFree,
-  onOrchestrate,
-  isOrchestrationMode = false,
   activeSkillCount,
   activeSkills = [],
 }) => {
@@ -233,16 +229,6 @@ const ComposerEntryStrip: React.FC<ComposerEntryStripProps> = ({
   // --- Default state ---
   return (
     <div className={styles.entryStrip}>
-      {/* Orchestration mode (first — primary on-ramp; free play is the implicit default) */}
-      <button
-        type='button'
-        className={`${styles.entryButton} ${styles.entryButtonInteractive} ${isOrchestrationMode ? styles.entryButtonActive : ''}`}
-        onClick={onOrchestrate}
-      >
-        <Workbench theme='outline' size={15} fill='currentColor' />
-        <span className={styles.entryButtonText}>{t('guid.entry.orchestrate', { defaultValue: '智能编排' })}</span>
-      </button>
-
       {/* Summon assistant */}
       <button
         type='button'

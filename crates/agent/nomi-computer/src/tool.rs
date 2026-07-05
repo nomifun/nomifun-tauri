@@ -139,7 +139,7 @@ impl ComputerTool {
     /// Lazily construct (and cache) the accessibility engine. The error string
     /// is cached too, so an unavailable backend is reported without retrying.
     fn engine(&self) -> Result<Arc<dyn A11yEngine>, String> {
-        let mut guard = self.a11y.lock().expect("a11y poisoned");
+        let mut guard = self.a11y.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if guard.is_none() {
             *guard = Some(nomi_a11y::create_engine().map_err(|e| e.to_string()));
         }
@@ -192,7 +192,7 @@ impl ComputerTool {
 
         let mut shot = match captured {
             Ok(shot) => {
-                *self.last_capture.lock().expect("last_capture poisoned") = Some(shot.geometry);
+                *self.last_capture.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(shot.geometry);
                 shot
             }
             Err(_) => {
@@ -210,7 +210,7 @@ impl ComputerTool {
                     });
                 }
                 let count = cached.len();
-                *self.last_snapshot.lock().expect("last_snapshot poisoned") = Some(SnapshotCache {
+                *self.last_snapshot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(SnapshotCache {
                     generation: snap.generation,
                     entries: cached,
                 });
@@ -310,7 +310,7 @@ impl ComputerTool {
             display.len()
         );
 
-        *self.last_snapshot.lock().expect("last_snapshot poisoned") = Some(SnapshotCache {
+        *self.last_snapshot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(SnapshotCache {
             generation: snap.generation,
             entries: cached,
         });
@@ -325,7 +325,7 @@ impl ComputerTool {
     /// Look up a `[ref]` in the latest snapshot, returning its generation and a
     /// clone of the cached entry (with its action target).
     fn resolve_ref(&self, r: u32) -> Result<(SnapshotGen, CachedEntry), String> {
-        let guard = self.last_snapshot.lock().expect("last_snapshot poisoned");
+        let guard = self.last_snapshot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match guard.as_ref() {
             Some(cache) => match cache.entries.iter().find(|c| c.display.r#ref == r) {
                 Some(c) => Ok((cache.generation, c.clone())),
@@ -527,7 +527,7 @@ impl ComputerTool {
     /// Map model-provided screenshot coordinates to absolute screen
     /// coordinates. Identity when no screenshot has been taken yet.
     fn to_screen(&self, x: i32, y: i32) -> (i32, i32) {
-        match *self.last_capture.lock().expect("last_capture poisoned") {
+        match *self.last_capture.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
             Some(g) => {
                 let (lx, ly) = map_llm_coord(x, y, g.img_w, g.img_h, g.logical_w, g.logical_h);
                 (g.origin_x + lx, g.origin_y + ly)
@@ -539,7 +539,7 @@ impl ComputerTool {
     /// Map an absolute screen coordinate into the most recent screenshot's
     /// pixel space (for reporting the cursor to the model).
     fn to_image(&self, x: i32, y: i32) -> (i32, i32) {
-        match *self.last_capture.lock().expect("last_capture poisoned") {
+        match *self.last_capture.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) {
             Some(g) => map_screen_coord(
                 x - g.origin_x,
                 y - g.origin_y,
@@ -572,7 +572,7 @@ impl ComputerTool {
 
         match captured {
             Ok(shot) => {
-                *self.last_capture.lock().expect("last_capture poisoned") =
+                *self.last_capture.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
                     Some(shot.geometry);
                 let text = format!(
                     "Screenshot captured: {}x{} (display {}, scaled from {}x{} physical). \

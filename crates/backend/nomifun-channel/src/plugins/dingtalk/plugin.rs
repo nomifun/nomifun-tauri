@@ -10,8 +10,8 @@ use crate::constants::DINGTALK_MESSAGE_LIMIT;
 use crate::error::ChannelError;
 use crate::plugin::{ChannelPlugin, PluginCallbacks, SharedPluginStatus, mark_error_on_unexpected_exit};
 use crate::types::{
-    ActionCategory, ActionContext, BotInfo, MessageContentType, PluginConfig, PluginStatus, PluginType, UnifiedAction,
-    UnifiedIncomingMessage, UnifiedMessageContent, UnifiedOutgoingMessage, UnifiedUser,
+    ActionCategory, ActionContext, BotInfo, MessageContentType, OutgoingMessageType, PluginConfig, PluginStatus,
+    PluginType, UnifiedAction, UnifiedIncomingMessage, UnifiedMessageContent, UnifiedOutgoingMessage, UnifiedUser,
 };
 
 use super::api::DingtalkApi;
@@ -162,9 +162,9 @@ impl ChannelPlugin for DingtalkPlugin {
 
         let text = truncate_message(message.text.as_deref().unwrap_or(""), DINGTALK_MESSAGE_LIMIT);
 
-        // Only use AI Card for streaming (messages without buttons).
-        // Messages with buttons are one-shot and should go via Open API.
-        if message.buttons.is_none() {
+        // Only use AI Card for streaming (non-final messages). The final turn
+        // is marked by the `Buttons` message type and goes one-shot via Open API.
+        if message.message_type != OutgoingMessageType::Buttons {
             match send_via_ai_card(api, chat_id).await {
                 Ok(card_id) => return Ok(card_id),
                 Err(e) => {
@@ -190,8 +190,9 @@ impl ChannelPlugin for DingtalkPlugin {
 
         let text = truncate_message(message.text.as_deref().unwrap_or(""), DINGTALK_MESSAGE_LIMIT);
 
-        // Presence of buttons signals the final message in a streaming sequence.
-        let is_final = message.buttons.is_some();
+        // The `Buttons` message type marks the final message in a streaming
+        // sequence (it carries no action buttons anymore — see build_final_message).
+        let is_final = message.message_type == OutgoingMessageType::Buttons;
 
         // AI Card streaming write (always send full content, not deltas)
         let req = StreamingWriteRequest {

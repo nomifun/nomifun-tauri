@@ -1,4 +1,7 @@
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
+
+use futures::FutureExt;
 
 use crate::confirm::{ConfirmResult, ToolConfirmer};
 use nomi_config::hooks::HookEngine;
@@ -144,6 +147,17 @@ fn confirm_call(
     }
 }
 
+/// Extract a human-readable message from a caught panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
 async fn execute_single(
     registry: &ToolRegistry,
     call: &ContentBlock,
@@ -187,7 +201,30 @@ async fn execute_single(
             // the single execution choke point — makes EVERY tool robust to it, on
             // every path (approval / non-approval / concurrent) and for sub-agents.
             let input = &nomi_tools::coerce_input_to_schema(&tool.input_schema(), input.clone());
-            let r = tool.execute(input.clone()).await;
+            // Catch a panic inside the tool so it becomes an error ToolResult
+            // fed back to the model, instead of unwinding out of the agent loop
+            // and terminating the subprocess — nomi-cli awaits `engine.run()`
+            // directly on the `#[tokio::main]` task with no catch_unwind above
+            // it. This catches Rust *unwinding* panics only; a native fault
+            // (SIGSEGV/SIGABRT inside FFI) is process-wide and cannot be caught
+            // here — those must be prevented at the FFI boundary or isolated in
+            // a separate process.
+            let r = match AssertUnwindSafe(tool.execute(input.clone())).catch_unwind().await {
+                Ok(r) => r,
+                Err(payload) => {
+                    let msg = panic_message(payload.as_ref());
+                    tracing::error!(
+                        target: "nomi_agent",
+                        tool = %name,
+                        call_id = %id,
+                        panic = %msg,
+                        "tool panicked; recovered as an error result"
+                    );
+                    ToolResult::error(format!(
+                        "Tool '{name}' panicked and was recovered (the agent stays alive): {msg}"
+                    ))
+                }
+            };
             let modifier = if r.is_error {
                 None
             } else {
@@ -880,6 +917,29 @@ mod tests {
         }
     }
 
+    struct MockPanickingTool;
+    #[async_trait::async_trait]
+    impl Tool for MockPanickingTool {
+        fn name(&self) -> &str {
+            "MockPanic"
+        }
+        fn description(&self) -> &str {
+            "panics during execution (simulates a tool bug / caught FFI unwind)"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            json!({ "type": "object" })
+        }
+        fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
+            false
+        }
+        async fn execute(&self, _input: serde_json::Value) -> nomi_types::tool::ToolResult {
+            panic!("boom: simulated tool panic");
+        }
+        fn category(&self) -> nomi_protocol::events::ToolCategory {
+            nomi_protocol::events::ToolCategory::Info
+        }
+    }
+
     #[tokio::test]
     async fn execute_single_redacts_secrets_in_output() {
         // Secrets in tool output must never reach the model/provider verbatim.
@@ -905,6 +965,41 @@ mod tests {
                 "secret must be redacted, got: {content}"
             );
             assert!(content.contains("REDACTED"), "should show a redaction placeholder: {content}");
+        } else {
+            panic!("expected ToolResult");
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_single_recovers_from_a_panicking_tool() {
+        // A panic inside a tool's execute() must be caught and surfaced as an
+        // error ToolResult fed back to the model — NOT unwind out of the agent
+        // loop. nomi-cli awaits engine.run() directly on the #[tokio::main]
+        // task with no catch_unwind above it, so an unguarded tool panic would
+        // terminate the whole agent subprocess.
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockPanickingTool));
+        let call = ContentBlock::ToolUse {
+            id: "cp".into(),
+            name: "MockPanic".into(),
+            input: json!({}),
+            extra: None,
+        };
+        let (result, modifier) = execute_single(
+            &registry,
+            &call,
+            None,
+            nomi_compact::CompactionLevel::Off,
+            false,
+        )
+        .await;
+        assert!(modifier.is_none());
+        if let ContentBlock::ToolResult { content, is_error, .. } = &result {
+            assert!(is_error, "a panicking tool must yield an error result");
+            assert!(
+                content.to_lowercase().contains("panic"),
+                "recovered result should mention the panic, got: {content}"
+            );
         } else {
             panic!("expected ToolResult");
         }

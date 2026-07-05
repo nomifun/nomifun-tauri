@@ -131,6 +131,9 @@ impl IRunRepository for SqliteRunRepository {
         if p.fleet_snapshot.is_some() {
             sets.push("fleet_snapshot = ?");
         }
+        if p.work_dir.is_some() {
+            sets.push("work_dir = ?");
+        }
         if sets.is_empty() {
             return Ok(());
         }
@@ -159,6 +162,11 @@ impl IRunRepository for SqliteRunRepository {
         if let Some(fleet_snapshot) = &p.fleet_snapshot {
             q = q.bind(fleet_snapshot);
         }
+        if let Some(work_dir) = &p.work_dir {
+            // `work_dir: &Option<String>` — sqlx binds `None` as NULL, `Some(v)` as v
+            // (skip/NULL/set, matching the `summary` column above).
+            q = q.bind(work_dir);
+        }
         q = q.bind(now_ms());
         q = q.bind(id);
         q.execute(&self.pool).await?;
@@ -185,8 +193,8 @@ impl IRunRepository for SqliteRunRepository {
             "INSERT INTO orch_run_tasks (\
                 id, run_id, title, spec, task_profile, status, conversation_id, \
                 output_summary, output_files, attempt, tokens, graph_x, graph_y, role, \
-                kind, pattern_config, created_at, updated_at\
-            ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, NULL, ?, ?, ?, ?, ?, ?, ?)",
+                kind, pattern_config, on_fail, created_at, updated_at\
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&p.run_id)
@@ -199,6 +207,7 @@ impl IRunRepository for SqliteRunRepository {
         .bind(&p.role)
         .bind(&p.kind)
         .bind(&p.pattern_config)
+        .bind(&p.on_fail)
         .bind(now)
         .bind(now)
         .execute(&self.pool)
@@ -225,6 +234,7 @@ impl IRunRepository for SqliteRunRepository {
             override_model: None,
             preset_prompt: None,
             last_error: None,
+            on_fail: p.on_fail,
             created_at: now,
             updated_at: now,
         })
@@ -516,8 +526,8 @@ impl IRunRepository for SqliteRunRepository {
                 "INSERT INTO orch_run_tasks (\
                     id, run_id, title, spec, task_profile, status, conversation_id, \
                     output_summary, output_files, attempt, tokens, graph_x, graph_y, role, \
-                    kind, pattern_config, created_at, updated_at\
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, NULL, ?, ?, ?, ?, ?, ?, ?)",
+                    kind, pattern_config, on_fail, created_at, updated_at\
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&task_id)
             .bind(run_id)
@@ -530,6 +540,7 @@ impl IRunRepository for SqliteRunRepository {
             .bind(&t.role)
             .bind(&t.kind)
             .bind(&t.pattern_config)
+            .bind(&t.on_fail)
             .bind(now)
             .bind(now)
             .execute(&mut *tx)
@@ -804,6 +815,7 @@ mod tests {
                 role: None,
                 kind: "agent".into(),
                 pattern_config: None,
+                on_fail: None,
             })
             .await
             .unwrap();
@@ -879,6 +891,7 @@ mod tests {
             role: None,
             kind: "agent".into(),
             pattern_config: None,
+            on_fail: None,
         };
         let a = repo.create_task(mk("A")).await.unwrap();
         let b = repo.create_task(mk("B")).await.unwrap();
@@ -960,6 +973,7 @@ mod tests {
                 goal: None,
                 autonomy: None,
                 fleet_snapshot: None,
+                work_dir: None,
             },
         )
         .await
@@ -1004,6 +1018,7 @@ mod tests {
             role: None,
             kind: "agent".into(),
             pattern_config: None,
+            on_fail: None,
         };
         // p1, p2 are independent blockers of c; standalone has no deps.
         let p1 = repo.create_task(mk("p1")).await.unwrap();
@@ -1180,6 +1195,7 @@ mod tests {
             role: None,
             kind: "agent".into(),
             pattern_config: None,
+            on_fail: None,
         };
         let a = repo.create_task(mk("A")).await.unwrap();
         let b = repo.create_task(mk("B")).await.unwrap();
@@ -1223,6 +1239,7 @@ mod tests {
                 role: None,
             kind: "agent".into(),
             pattern_config: None,
+            on_fail: None,
             })
             .await
             .unwrap();
@@ -1286,6 +1303,7 @@ mod tests {
                 goal: Some("new goal".into()),
                 autonomy: None,
                 fleet_snapshot: None,
+                work_dir: None,
             },
         )
         .await
@@ -1334,6 +1352,7 @@ mod tests {
             role: None,
             kind: "agent".into(),
             pattern_config: None,
+            on_fail: None,
         };
         let a = repo.create_task(mk(run.id.clone(), "A")).await.unwrap();
         let b = repo.create_task(mk(run.id.clone(), "B")).await.unwrap();
@@ -1427,6 +1446,7 @@ mod tests {
             role: None,
             kind: "agent".into(),
             pattern_config: None,
+            on_fail: None,
         };
         // A→B→C chain; delete B (the middle task) — both its edges (A→B, B→C) and
         // its assignment must cascade; A and C (and their kept edges/assignments)
@@ -1501,6 +1521,7 @@ mod tests {
             role: None,
             kind: "agent".into(),
             pattern_config: None,
+            on_fail: None,
         };
         let a = repo.create_task(mk(run.id.clone(), "A")).await.unwrap();
         let b = repo.create_task(mk(run.id.clone(), "B")).await.unwrap();
@@ -1570,6 +1591,7 @@ mod tests {
             role: None,
             kind: "agent".into(),
             pattern_config: None,
+            on_fail: None,
         };
         // Seed: keep + drop tasks, an edge keep→drop, and an assignment on each.
         let keep = repo.create_task(mk("keep")).await.unwrap();
@@ -1602,6 +1624,7 @@ mod tests {
                 role: None,
                 kind: "agent".into(),
                 pattern_config: None,
+                on_fail: None,
             },
             assignment: Some(CreateAssignmentParams {
                 task_id: String::new(), // overwritten with the minted id
@@ -1689,6 +1712,7 @@ mod tests {
             role: None,
             kind: "agent".into(),
             pattern_config: None,
+            on_fail: None,
         };
         let keep = repo.create_task(mk("keep")).await.unwrap();
         let drop = repo.create_task(mk("drop")).await.unwrap();
@@ -1708,6 +1732,7 @@ mod tests {
                 role: None,
                 kind: "agent".into(),
                 pattern_config: None,
+                on_fail: None,
             },
             assignment: None,
             depends_on: vec![ReconcileDepRef::Kept("rtask_does_not_exist".into())],
@@ -1761,6 +1786,7 @@ mod tests {
             role: None,
             kind: kind.into(),
             pattern_config: pattern_config.map(str::to_string),
+            on_fail: None,
         })
         .await
         .unwrap()

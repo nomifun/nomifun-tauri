@@ -124,6 +124,7 @@ where
         ("VOLTA_HOME", "bin"),        // volta
         ("DENO_INSTALL", "bin"),      // deno
         ("N_PREFIX", "bin"),          // `n` node version manager
+        ("CODEX_INSTALL_DIR", ""),    // OpenAI Codex standalone visible command dir
     ];
 
     let mut out: Vec<PathBuf> = Vec::new();
@@ -160,6 +161,9 @@ fn platform_extra_bins_at(home: Option<&Path>) -> Vec<PathBuf> {
         push_if_dir(h.join(".deno").join("bin"));
         push_if_dir(h.join(".local").join("bin"));
         push_if_dir(h.join(".volta").join("bin"));
+        // Legacy Claude Code local installs used ~/.claude/local instead of
+        // the newer native ~/.local/bin command location.
+        push_if_dir(h.join(".claude").join("local"));
         // Custom npm global prefixes (`npm config set prefix …`) and other
         // common per-user node install roots.
         push_if_dir(h.join(".npm-global").join("bin"));
@@ -199,6 +203,13 @@ fn platform_extra_bins_at(home: Option<&Path>) -> Vec<PathBuf> {
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
             push_if_dir(PathBuf::from(&local).join("pnpm"));
             push_if_dir(PathBuf::from(&local).join("fnm_multishells"));
+            push_if_dir(
+                PathBuf::from(&local)
+                    .join("Programs")
+                    .join("OpenAI")
+                    .join("Codex")
+                    .join("bin"),
+            );
             // winget package shims (stable since App Installer 1.4).
             push_if_dir(PathBuf::from(&local).join("Microsoft").join("WinGet").join("Links"));
             // Yarn classic global bin.
@@ -604,6 +615,39 @@ mod tests {
         assert!(
             !bins.iter().any(|p| p.ends_with("nope/bin")),
             "non-existent VOLTA_HOME/bin must be filtered: {bins:?}"
+        );
+    }
+
+    #[test]
+    fn env_driven_bins_resolves_codex_install_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let codex_bin = tmp.path().join("codex-bin");
+        std::fs::create_dir_all(&codex_bin).unwrap();
+
+        let codex_s = codex_bin.to_string_lossy().into_owned();
+        let bins = env_driven_bins(|k| match k {
+            "CODEX_INSTALL_DIR" => Some(codex_s.clone()),
+            _ => None,
+        });
+
+        assert!(
+            bins.contains(&codex_bin),
+            "CODEX_INSTALL_DIR should be treated as the visible codex command directory: {bins:?}"
+        );
+    }
+
+    #[test]
+    fn platform_extra_bins_at_includes_legacy_claude_local_dir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path();
+        let legacy_claude = home.join(".claude").join("local");
+        std::fs::create_dir_all(&legacy_claude).unwrap();
+
+        let bins = platform_extra_bins_at(Some(home));
+
+        assert!(
+            bins.contains(&legacy_claude),
+            "legacy Claude local installer directory should be included: {bins:?}"
         );
     }
 

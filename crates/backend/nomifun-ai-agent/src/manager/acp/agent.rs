@@ -669,8 +669,28 @@ impl crate::agent_task::IAgentTask for AcpAgentManager {
                 // Operator log: full error chain + the (raw, pre-redaction)
                 // stderr peek so on-call can correlate. The redacted summary
                 // is what reaches the UI.
+                //
+                // When the CLI process actually exited, surface the exit code
+                // and signal as STRUCTURED fields (not just buried inside the
+                // summary string) so a native fault — SIGSEGV/SIGABRT/SIGBUS,
+                // e.g. a crash inside the Computer/a11y C-FFI that no Rust
+                // error boundary can catch — is greppable in the operator log
+                // and unambiguously distinguishable from a clean non-zero exit
+                // or a Rust panic (exit code 101). This is the signal needed to
+                // tell a native crash apart from a recoverable error when
+                // triaging a restart loop.
                 let summary = close_reason.user_facing_message();
-                error!(error = %ErrorChain(&err), close_reason_summary = %summary, "ACP send_message failed");
+                if let CloseReason::ProcessExited { exit_code, signal, .. } = &close_reason {
+                    error!(
+                        error = %ErrorChain(&err),
+                        exit_code = ?exit_code,
+                        signal = ?signal,
+                        close_reason_summary = %summary,
+                        "ACP send_message failed: CLI process exited"
+                    );
+                } else {
+                    error!(error = %ErrorChain(&err), close_reason_summary = %summary, "ACP send_message failed");
+                }
 
                 {
                     let mut session = self.session.write().await;

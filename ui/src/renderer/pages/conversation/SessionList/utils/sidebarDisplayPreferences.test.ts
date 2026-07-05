@@ -14,10 +14,10 @@ import {
 } from './sidebarDisplayPreferences';
 
 describe('sidebarDisplayPreferences', () => {
-  test('defaults to the balanced preset with compressed paths, branch badges, and age metadata', () => {
+  test('defaults to the detailed preset with parent path, branch badges, and age metadata', () => {
     expect(DEFAULT_SIDEBAR_DISPLAY_PREFERENCES).toEqual({
-      preset: 'balanced',
-      workpathNameMode: 'compressed',
+      preset: 'detailed',
+      workpathNameMode: 'folderWithPath',
       showGitBranch: true,
       sessionMetaMode: 'age',
     });
@@ -41,7 +41,7 @@ describe('sidebarDisplayPreferences', () => {
     });
   });
 
-  test('normalizes invalid persisted data back to the balanced defaults', () => {
+  test('normalizes invalid persisted data back to the detailed defaults', () => {
     expect(normalizeSidebarDisplayPreferences(null)).toEqual(DEFAULT_SIDEBAR_DISPLAY_PREFERENCES);
     expect(normalizeSidebarDisplayPreferences({ preset: 'nope', workpathNameMode: 123 })).toEqual(
       DEFAULT_SIDEBAR_DISPLAY_PREFERENCES

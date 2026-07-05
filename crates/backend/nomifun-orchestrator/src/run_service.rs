@@ -374,6 +374,11 @@ impl RunService {
                     // so a normal single-agent task is unchanged (zero regression).
                     kind: planned.kind.clone(),
                     pattern_config: planned.pattern_config.clone(),
+                    // 迁移 029: the planner does not yet emit per-node failure
+                    // policy, so every persisted node is `None` = fail_run
+                    // (current hard-fail semantics, zero regression). A later
+                    // phase will let the planner set `skip_and_continue`.
+                    on_fail: None,
                 })
                 .await
                 .map_err(OrchestratorError::from)?;
@@ -477,6 +482,7 @@ impl RunService {
                     goal: None,
                     autonomy: None,
                     fleet_snapshot: None,
+                    work_dir: None,
                 },
             )
             .await
@@ -559,18 +565,15 @@ impl RunService {
         self.transition(run_id, &["awaiting_plan_approval"], "running").await
     }
 
-    /// Pause a `running` run: `running` → `paused` + emit. The engine's persistent
-    /// loop keeps running but stops filling new workers (it re-reads the run status
-    /// each iteration); any in-flight workers run to completion. Pause does NOT
-    /// cancel in-flight work (that is `cancel`). A run not `running` is a 400.
+    /// Pause a `running` run: `running` -> `paused` + emit. This service only
+    /// mutates persisted run state; the route owns stopping the engine and
+    /// resetting interrupted nodes to `pending`. A run not `running` is a 400.
     pub async fn pause(&self, run_id: &str) -> Result<(), AppError> {
         self.transition(run_id, &["running"], "paused").await
     }
 
-    /// Resume a `paused` run: `paused` → `running` + emit. The caller (route) then
-    /// `engine.start`s the loop (idempotent stop-then-start): if the loop was still
-    /// alive idling on the paused gate it resumes filling on its next iteration; if
-    /// it had exited, `start` respawns it. A run not `paused` is a 400.
+    /// Resume a `paused` run: `paused` -> `running` + emit. The route owns the
+    /// engine lifecycle after this transition. A run not `paused` is a 400.
     pub async fn resume(&self, run_id: &str) -> Result<(), AppError> {
         self.transition(run_id, &["paused"], "running").await
     }
@@ -609,6 +612,7 @@ impl RunService {
                     goal: None,
                     autonomy: None,
                     fleet_snapshot: None,
+                    work_dir: None,
                 },
             )
             .await
@@ -831,7 +835,10 @@ impl RunService {
             .map_err(OrchestratorError::from)?
             .map(|r| r.status)
             .unwrap_or_else(|| run.status.clone());
-        if matches!(current_status.as_str(), "completed" | "failed" | "cancelled") {
+        if matches!(
+            current_status.as_str(),
+            "completed" | "failed" | "cancelled" | "completed_with_failures"
+        ) {
             self.run_repo
                 .update_run(
                     run_id,
@@ -843,6 +850,7 @@ impl RunService {
                         goal: None,
                         autonomy: None,
                         fleet_snapshot: None,
+                        work_dir: None,
                     },
                 )
                 .await
@@ -962,7 +970,10 @@ impl RunService {
             .map_err(OrchestratorError::from)?
             .map(|r| r.status)
             .unwrap_or_else(|| run.status.clone());
-        if matches!(current_status.as_str(), "completed" | "failed" | "cancelled") {
+        if matches!(
+            current_status.as_str(),
+            "completed" | "failed" | "cancelled" | "completed_with_failures"
+        ) {
             self.run_repo
                 .update_run(
                     run_id,
@@ -974,6 +985,7 @@ impl RunService {
                         goal: None,
                         autonomy: None,
                         fleet_snapshot: None,
+                        work_dir: None,
                     },
                 )
                 .await
@@ -1161,11 +1173,25 @@ impl RunService {
     /// rerun proceed (the rerun guard rejects a `running` target). Kind-aware; no
     /// emit (the caller's rerun emits + the route's refetch reload all task states).
     pub async fn reset_orphaned_running(&self, run_id: &str) -> Result<u64, AppError> {
+        let running_task_ids: Vec<String> = self
+            .run_repo
+            .list_tasks(run_id)
+            .await
+            .map_err(OrchestratorError::from)?
+            .into_iter()
+            .filter(|t| t.status == "running")
+            .map(|t| t.id)
+            .collect();
         let n = self
             .run_repo
             .reset_orphaned_running_tasks(Some(run_id))
             .await
             .map_err(OrchestratorError::from)?;
+        if n > 0 {
+            for task_id in running_task_ids {
+                self.emitter.emit_task_status(run_id, &task_id, "pending");
+            }
+        }
         Ok(n)
     }
 
@@ -1205,6 +1231,7 @@ impl RunService {
                     goal: None,
                     autonomy: None,
                     fleet_snapshot: None,
+                    work_dir: None,
                 },
             )
             .await
@@ -1255,6 +1282,7 @@ impl RunService {
                     goal: Some(goal.to_string()),
                     autonomy: None,
                     fleet_snapshot: None,
+                    work_dir: None,
                 },
             )
             .await
@@ -1326,6 +1354,7 @@ impl RunService {
                         goal,
                         autonomy,
                         fleet_snapshot,
+                        work_dir: None,
                     },
                 )
                 .await
@@ -1652,6 +1681,8 @@ impl RunService {
                     role: new_task.role.clone(),
                     kind: new_task.kind.clone(),
                     pattern_config: new_task.pattern_config.clone(),
+                    // 迁移 029: reconcile-added nodes default to fail_run.
+                    on_fail: None,
                 },
                 assignment,
                 depends_on,
@@ -1713,7 +1744,10 @@ impl RunService {
             .map_err(OrchestratorError::from)?
             .map(|r| r.status)
             .unwrap_or_else(|| run.status.clone());
-        if matches!(current_status.as_str(), "completed" | "failed" | "cancelled") {
+        if matches!(
+            current_status.as_str(),
+            "completed" | "failed" | "cancelled" | "completed_with_failures"
+        ) {
             self.run_repo
                 .update_run(
                     run_id,
@@ -1725,6 +1759,235 @@ impl RunService {
                         goal: None,
                         autonomy: None,
                         fleet_snapshot: None,
+                        work_dir: None,
+                    },
+                )
+                .await
+                .map_err(OrchestratorError::from)?;
+            self.emitter.emit_run_status(run_id, "running");
+        }
+
+        let row = self
+            .run_repo
+            .get_run(run_id)
+            .await
+            .map_err(OrchestratorError::from)?
+            .ok_or_else(|| OrchestratorError::NotFound(format!("run {run_id}")))?;
+        Ok(run_row_to_dto(row))
+    }
+
+    /// **Phase 3a — runtime task APPEND primitive.** Insert one or more NEW
+    /// `pending` tasks (+ their intra-batch deps + auto-assignments) into an
+    /// EXISTING run WITHOUT deleting or rewiring any current node, then re-arm a
+    /// terminal run so the engine loop drives the appended work. This is the
+    /// Claude-Code-style "dispatch while running" append: the master agent grows
+    /// the DAG at runtime and [`run_loop`](crate::engine) picks the new pending
+    /// tasks up on its next fill pass (a `list_ready_tasks` re-query).
+    ///
+    /// **This is NOT `adjust`.** [`adjust`](Self::adjust) /
+    /// [`apply_adjusted_plan`](Self::apply_adjusted_plan) is the DESTRUCTIVE
+    /// reconcile (keep-vs-redo: it deletes/rewires non-kept nodes and REJECTS while
+    /// a task is `running`). A pure append never touches a running node — it only
+    /// ADDS pending tasks — so it reuses the SAME transactional
+    /// [`reconcile_run_plan`](nomifun_db::IRunRepository::reconcile_run_plan) with
+    /// an EMPTY `delete_task_ids` (nothing deleted, EVERY current task kept) and
+    /// deliberately does NOT go through the adjust path's running-guard. Those two
+    /// `status == "running"` rejects belong to destructive adjust and are left
+    /// UNCHANGED.
+    ///
+    /// **Atomicity / no-strand (the load-bearing invariant).** The engine caller
+    /// [`RunEngine::add_tasks`](crate::engine::RunEngine::add_tasks) holds the
+    /// per-run lock around this WHOLE method, so the insert + re-arm serialize with
+    /// the run loop's terminal-check-and-finish. Without the lock, the loop could
+    /// read `all_settled == true`, this append could insert a `pending` task in the
+    /// gap, then the loop writes `completed` AND deregisters its handle → a terminal
+    /// run with an un-run pending task and NO live driver (boot-resume only re-lists
+    /// `running`, so it would never recover). The lock closes that window; the
+    /// re-arm tail below is copied verbatim from `apply_adjusted_plan` so the
+    /// fresh-read TOCTOU handling is identical.
+    ///
+    /// **Dep mapping.** `PlannedTask::depends_on` are 0-based intra-batch indices →
+    /// [`ReconcileDepRef::NewIndex`] (range-checked against the batch; an
+    /// out-of-range index is logged + skipped, fail-soft like the initial-plan
+    /// path). `PlannedTask` carries no field for a dep onto an EXISTING run task, so
+    /// `Kept` refs cannot arise from this input type — the append only ever wires
+    /// new→new edges.
+    pub async fn add_tasks(
+        &self,
+        run_id: &str,
+        tasks: Vec<PlannedTask>,
+    ) -> Result<Run, AppError> {
+        // (1) An empty batch is a no-op that would only churn the re-arm — reject it
+        //     (mirrors `plan_flat`'s empty guard) so a caller bug surfaces loudly.
+        if tasks.is_empty() {
+            return Err(OrchestratorError::BadRequest(
+                "add_tasks requires at least one task".into(),
+            )
+            .into());
+        }
+
+        // (2) Load the run (clean 404). Its status seeds the re-arm tail's fallback.
+        let run = self
+            .run_repo
+            .get_run(run_id)
+            .await
+            .map_err(OrchestratorError::from)?
+            .ok_or_else(|| OrchestratorError::NotFound(format!("run {run_id}")))?;
+
+        // (2a) Defense-in-depth: NEVER resurrect a user-cancelled run. The re-arm tail
+        //     below flips any terminal status (incl. `cancelled`) back to `running`, so
+        //     without this guard an append would silently revive a cancelled run. The
+        //     gateway's appendability gate (`run_appendability`) already refuses
+        //     cancelled runs, but this
+        //     primitive must be safe on its own (a cancelled run stays dead — start a
+        //     fresh run instead).
+        if run.status == "cancelled" {
+            return Err(
+                OrchestratorError::BadRequest("cannot append to a cancelled run".into()).into(),
+            );
+        }
+
+        // (3) Route the NEW tasks off the run's FROZEN fleet snapshot (same source
+        //     `apply_adjusted_plan` / `plan` use — we never re-read the live fleet).
+        let members: Vec<FleetMember> = decode_fleet_snapshot(run_id, &run.fleet_snapshot);
+
+        // (4) Build the NEW tasks for the transactional reconcile — EVERY incoming
+        //     PlannedTask becomes a NEW `pending` node. The routing DECISION is the
+        //     SAME pure `resolve_assignment_pick` `plan()` uses (via `assign_task`);
+        //     unlike `apply_adjusted_plan` (whose `AdjustedNewTask` carries NO hints,
+        //     so it passes `None, None, None`) a `PlannedTask` DOES carry
+        //     task_profile/member_index/rationale, so we pass them THROUGH — a master
+        //     agent's routing intent is honored, faithful to how
+        //     `persist_dag_and_activate` treats a PlannedTask. `source = "auto"`; the
+        //     repo overwrites the placeholder `task_id` with the freshly minted id.
+        //     A dep index resolves to a `NewIndex` ref among the batch (range-checked
+        //     against `batch_len`); an out-of-range index is logged + skipped.
+        let batch_len = tasks.len();
+        let mut new_tasks: Vec<ReconcileNewTask> = Vec::with_capacity(batch_len);
+        for (idx, planned) in tasks.iter().enumerate() {
+            let mut depends_on: Vec<ReconcileDepRef> = Vec::new();
+            for &dep_idx in &planned.depends_on {
+                if dep_idx < batch_len {
+                    depends_on.push(ReconcileDepRef::NewIndex(dep_idx));
+                } else {
+                    tracing::warn!(
+                        run_id,
+                        node_idx = idx,
+                        dep_idx,
+                        "add_tasks depends_on index out of range for the batch; skipping edge"
+                    );
+                }
+            }
+
+            let task_profile = planned
+                .task_profile
+                .as_ref()
+                .and_then(|p| serde_json::to_string(p).ok());
+
+            let assignment = resolve_assignment_pick(
+                &members,
+                planned.task_profile.as_ref(),
+                planned.member_index,
+                planned.rationale.as_deref(),
+            )
+            .map(|pick| CreateAssignmentParams {
+                // Placeholder; the repo overwrites task_id with the minted id.
+                task_id: String::new(),
+                member_id: pick.member_id,
+                score: pick.score,
+                rationale: pick.rationale,
+                source: "auto".to_string(),
+                locked: false,
+            });
+
+            new_tasks.push(ReconcileNewTask {
+                task: CreateTaskParams {
+                    run_id: run_id.to_string(),
+                    title: planned.title.clone(),
+                    spec: planned.spec.clone(),
+                    task_profile,
+                    status: "pending".to_string(),
+                    graph_x: None,
+                    graph_y: None,
+                    role: planned.role.clone(),
+                    kind: planned.kind.clone(),
+                    pattern_config: planned.pattern_config.clone(),
+                    // 迁移 029: appended nodes default to fail_run (like plan/adjust).
+                    on_fail: None,
+                },
+                assignment,
+                depends_on,
+            });
+        }
+
+        // (5) ACYCLICITY PRE-CHECK over the appended batch (symmetric with
+        //     `apply_adjusted_plan`'s Important-B, reusing the SAME pure
+        //     `reconcile_plan_has_cycle`). Every current task is KEPT (delete list
+        //     empty) and gains NO new outgoing edge, so the only edges this append
+        //     adds are new→new (`NewIndex` refs) — a cycle can therefore ONLY run
+        //     through the batch. A malformed self/mutually-referential batch would
+        //     persist a DAG the engine can never make ready (a soft-strand); reject
+        //     it here so the run stays UNCHANGED. `kept_ids` is empty because no
+        //     `Kept` refs exist to resolve (PlannedTask can't express one).
+        if reconcile_plan_has_cycle(&std::collections::HashSet::new(), &new_tasks) {
+            return Err(OrchestratorError::BadRequest(
+                "追加任务存在循环依赖，已拒绝(run 未改动)".into(),
+            )
+            .into());
+        }
+
+        // (6) APPLY the append ATOMICALLY — ONE transaction with an EMPTY delete
+        //     list (nothing removed, every current task + its output/deps/assignment
+        //     kept). Same all-or-nothing `reconcile_run_plan` `apply_adjusted_plan`
+        //     uses; a mid-way DB error rolls the whole insert back → run unchanged.
+        self.run_repo
+            .reconcile_run_plan(
+                run_id,
+                ReconcilePlan {
+                    delete_task_ids: vec![],
+                    new_tasks,
+                },
+            )
+            .await
+            .map_err(OrchestratorError::from)?;
+
+        // The FE's `useRunLive` refetches the whole RunDetail on `planUpdated`, so
+        // the appended nodes appear with no fake per-task status. Emitted AFTER the
+        // successful commit so a rolled-back reconcile never signals a phantom plan.
+        self.emitter.emit_run_plan_updated(run_id);
+
+        // (7) RE-ARM a terminal run so the engine loop has a live run to drive the
+        //     appended pending tasks. Re-read the status FRESH (NOT the top-of-method
+        //     `run` snapshot): under the per-run lock the loop's terminal-check-and-
+        //     finish is mutually exclusive with this append, but the loop may have
+        //     written a terminal status AFTER our `get_run` and BEFORE the lock was
+        //     acquired (mirrors `apply_adjusted_plan` / `rerun_task`'s fresh re-read).
+        //     This flips a now-terminal run back to `running`; a still-`running` (or
+        //     `paused` / `awaiting_plan_approval`) run is left as-is — NO autonomy
+        //     gate. [re-arm tail copied VERBATIM from apply_adjusted_plan.]
+        let current_status = self
+            .run_repo
+            .get_run(run_id)
+            .await
+            .map_err(OrchestratorError::from)?
+            .map(|r| r.status)
+            .unwrap_or_else(|| run.status.clone());
+        if matches!(
+            current_status.as_str(),
+            "completed" | "failed" | "cancelled" | "completed_with_failures"
+        ) {
+            self.run_repo
+                .update_run(
+                    run_id,
+                    UpdateRunParams {
+                        status: Some("running".to_string()),
+                        summary: None,
+                        lead_conv_id: None,
+                        total_tokens: None,
+                        goal: None,
+                        autonomy: None,
+                        fleet_snapshot: None,
+                        work_dir: None,
                     },
                 )
                 .await
@@ -1908,11 +2171,13 @@ fn resolve_member(members: &[FleetMember], member_index: Option<usize>) -> Optio
 /// real cost-vs-effect routing for range members (which otherwise carry no
 /// profile). DELIBERATELY conservative and **fail-soft**: only a clear "strong"
 /// or clear "light" signal sets tiers; anything unknown or ambiguous returns
-/// `None`, which the Router treats as its neutral baseline — i.e. exactly the
-/// pre-existing behavior (zero regression). Strengths/modalities/tools are left
-/// at the baseline (empty / false), so this only nudges the reasoning + cost-tier
-/// scoring arms, never the hard filters (a bare member stays tool-neutral exactly
-/// as before).
+/// `None` (→ the Router's neutral baseline, i.e. exactly the pre-existing
+/// behavior, zero regression) UNLESS the name implies a modality (Phase 2): a
+/// vision model name still yields a profile so the Router's `needs_vision` hard
+/// filter admits it. `strengths`/`tools` stay at the baseline (empty / false);
+/// only `modalities` (from [`infer_model_modalities`](nomifun_api_types::infer_model_modalities))
+/// and the reasoning/cost tiers are populated — the tool hard filter is unchanged
+/// (a bare member stays tool-neutral exactly as before).
 fn infer_model_capability(model: &str) -> Option<CapabilityProfile> {
     let m = model.to_lowercase();
     // Strong / premium signals (high reasoning, premium cost).
@@ -1923,18 +2188,27 @@ fn infer_model_capability(model: &str) -> Option<CapabilityProfile> {
     const LIGHT: &[&str] = &["haiku", "mini", "flash", "lite", "nano", "-small", "-8b", "phi-"];
     let strong = STRONG.iter().any(|k| m.contains(k));
     let light = LIGHT.iter().any(|k| m.contains(k));
-    // Only commit when the signal is unambiguous; a name hitting both (or neither)
-    // stays None → baseline.
+    // Per-model modalities inferred from the NAME (Phase 2: activates the Router's
+    // `needs_vision` hard filter). A vision model name carries "vision" even when
+    // the STRONG/LIGHT tier signal is ambiguous, so vision routing still works.
+    let modalities = nomifun_api_types::infer_model_modalities(model);
+    // Only commit tiers when the strong/light signal is unambiguous; a name hitting
+    // both (or neither) gets neutral tiers. When there is NEITHER a tier signal NOR
+    // a modality, stay None → baseline (zero regression).
     let (reasoning, cost_tier, speed_tier) = if strong && !light {
         ("high", "premium", "medium")
     } else if light && !strong {
         ("low", "economy", "fast")
-    } else {
+    } else if modalities.is_empty() {
         return None;
+    } else {
+        // Ambiguous / no tier signal but a real modality (e.g. a vision name):
+        // give the neutral baseline tiers + carry the modality.
+        ("medium", "standard", "standard")
     };
     Some(CapabilityProfile {
         strengths: Vec::new(),
-        modalities: Vec::new(),
+        modalities,
         tools: false,
         reasoning: reasoning.to_string(),
         cost_tier: cost_tier.to_string(),
@@ -3776,11 +4050,117 @@ mod tests {
         let flash = infer_model_capability("gemini-2.5-flash").expect("flash → light");
         assert_eq!(flash.cost_tier, "economy");
 
-        // Unknown → None (baseline). Ambiguous (matches BOTH strong+light) → None.
+        // Unknown non-vision name → None (baseline, zero regression).
         assert!(infer_model_capability("some-unknown-model").is_none());
+        // Ambiguous tiers (matches BOTH strong `gpt-4` and light `mini`) → neutral
+        // tiers, but a vision model name still carries the vision modality (Phase 2)
+        // so `needs_vision` routing works. Previously this returned None; the
+        // contract is intentionally extended to admit vision-capable models.
+        let mini = infer_model_capability("gpt-4o-mini").expect("vision name → profile");
+        assert_eq!(mini.reasoning, "medium", "ambiguous strong+light → neutral tier");
+        assert_eq!(mini.cost_tier, "standard");
         assert!(
-            infer_model_capability("gpt-4o-mini").is_none(),
-            "a name hitting both strong (gpt-4) and light (mini) stays neutral"
+            mini.modalities.iter().any(|m| m == "vision"),
+            "gpt-4o-mini is a vision model → carries the vision modality: {:?}",
+            mini.modalities
+        );
+    }
+
+    // Phase 2: `infer_model_capability` populates `modalities` from the model NAME
+    // (via `nomifun_api_types::infer_model_modalities`), so the Router's
+    // `needs_vision` hard filter has a real signal. A vision-capable name gets a
+    // profile carrying the "vision" modality; a plain light model gets a profile
+    // WITHOUT it.
+    #[test]
+    fn infer_model_capability_sets_vision_modality() {
+        let cap = infer_model_capability("gpt-4o").expect("gpt-4o has a profile");
+        assert!(
+            cap.modalities.iter().any(|m| m == "vision"),
+            "gpt-4o is a vision model → carries the vision modality: {:?}",
+            cap.modalities
+        );
+        // A pure-text cheap model: a LIGHT tier signal but no vision modality.
+        let mini = infer_model_capability("some-mini").expect("light tier → profile");
+        assert!(
+            !mini.modalities.iter().any(|m| m == "vision"),
+            "some-mini is text-only → no vision modality: {:?}",
+            mini.modalities
+        );
+    }
+
+    // Phase 2 end-to-end: a `needs_vision` task routes to the VISION model, never
+    // the text-only one. Mirrors `plan_vetoes_planner_pick_that_was_hard_filtered`
+    // but uses REAL model names through the ad-hoc range path so the vision signal
+    // comes from `infer_model_capability` (not a hand-injected profile): the range
+    // is [gpt-4o (vision), deepseek-chat (text-only)] and the planner pre-picks the
+    // TEXT member — which the Router hard-filters out (no vision), vetoing the pick
+    // back to the surviving vision member.
+    #[tokio::test]
+    async fn needs_vision_task_routes_to_vision_model_not_text_model() {
+        // Planner pre-assigns the text-only member (index 1) for a needs_vision task.
+        let vision = TaskProfile {
+            kind: "analysis".to_string(),
+            needs_vision: true,
+            needs_long_context: false,
+            needs_high_reasoning: false,
+            bulk: false,
+        };
+        let dag = single_task_dag(Some(1), Some(vision));
+
+        // Ad-hoc service wired with the fixed planner above (mirror of
+        // `adhoc_service`, but with a custom DAG so we control the pick + profile).
+        let db = init_database_memory().await.expect("db init");
+        let pool = db.pool().clone();
+        let run_repo = Arc::new(SqliteRunRepository::new(pool.clone()));
+        let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
+        let ws_repo = Arc::new(SqliteOrchWorkspaceRepository::new(pool.clone()));
+        let emitter = OrchestratorRunEventEmitter::new(Arc::new(NoopBroadcaster));
+        let planner: Arc<dyn PlanProducer> = Arc::new(FixedPlanProducer::new(dag));
+        let svc = RunService::new(run_repo.clone(), fleet_repo, ws_repo, planner, emitter);
+
+        // Range built from REAL names: index 0 = gpt-4o (vision), 1 = deepseek-chat.
+        let req = CreateAdhocRunRequest {
+            goal: "描述这张图里的内容".to_string(),
+            work_dir: None,
+            model_range: ModelRange::Range {
+                models: vec![
+                    model_ref("prov_openai", "gpt-4o"),
+                    model_ref("prov_ds", "deepseek-chat"),
+                ],
+            },
+            pinned_roles: vec![],
+            role_members: vec![],
+            autonomy: None,
+            max_parallel: None,
+            lead_conv_id: None,
+            lead_model: None,
+        };
+        let run = svc.create_adhoc("u1", req).await.expect("create_adhoc");
+        svc.plan(&run.id).await.expect("plan");
+
+        let detail = svc.get_detail(&run.id).await.expect("detail");
+        // Snapshot order is preserved: [gpt-4o (vision), deepseek-chat (text)].
+        let vision_member = &detail.fleet_members[0];
+        let text_member = &detail.fleet_members[1];
+        assert_eq!(vision_member.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(text_member.model.as_deref(), Some("deepseek-chat"));
+        // The vision signal must come from `infer_model_capability`, not injection.
+        assert!(
+            vision_member
+                .capability_profile
+                .as_ref()
+                .is_some_and(|c| c.modalities.iter().any(|m| m == "vision")),
+            "gpt-4o member must carry the vision modality from infer_model_capability"
+        );
+
+        assert_eq!(detail.assignments.len(), 1);
+        assert_eq!(
+            detail.assignments[0].member_id, vision_member.id,
+            "needs_vision routes to the vision model; the planner's text-model pick is vetoed"
+        );
+        assert_ne!(
+            detail.assignments[0].member_id, text_member.id,
+            "the text-only member must NOT be assigned to a vision task"
         );
     }
 
@@ -5075,6 +5455,7 @@ mod tests {
                 role: None,
                 kind: "agent".into(),
                 pattern_config: None,
+                on_fail: None,
             },
             assignment: None,
             depends_on: deps,

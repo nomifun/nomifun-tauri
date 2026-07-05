@@ -18,4 +18,13 @@ describe('CompanionSessionGroup structure', () => {
     expect(source.includes("t('sessionList.expandDisplay'")).toBe(true);
     expect(source.includes("t('sessionList.collapseDisplay')")).toBe(true);
   });
+
+  test('shows a purpose tip above companion session rows', () => {
+    const source = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'CompanionSessionGroup.tsx'), 'utf8');
+
+    expect(source.includes("import { Info } from '@icon-park/react';")).toBe(true);
+    expect(source.includes("t('sessionList.companionTip')")).toBe(true);
+    expect(source.includes('bg-[rgba(var(--primary-6),0.06)]')).toBe(true);
+    expect(source.includes('inline-flex h-16px w-16px shrink-0 items-center justify-center')).toBe(true);
+  });
 });

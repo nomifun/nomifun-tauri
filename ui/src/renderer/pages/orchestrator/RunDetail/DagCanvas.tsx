@@ -684,7 +684,9 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onOpenTask, onOpenMain, ma
           roles as assistants. Lives as a `shrink-0` sibling above the canvas so
           the react-flow region keeps its `flex-1 min-h-0` sizing intact. The
           panel renders nothing when there are no roles / all already exist. */}
-      {detail.run.status === 'completed' && <RolePrecipitationPanel detail={detail} />}
+      {(detail.run.status === 'completed' || detail.run.status === 'completed_with_failures') && (
+        <RolePrecipitationPanel detail={detail} />
+      )}
 
       <div ref={flowWrapRef} className='flex-1 min-h-0'>
         {noTasks ? (

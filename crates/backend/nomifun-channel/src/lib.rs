@@ -14,6 +14,7 @@ pub mod plugins;
 pub mod routes;
 pub mod session;
 pub mod stream_relay;
+pub mod think_filter;
 pub mod types;
 
 pub use routes::{ChannelRouterState, channel_routes};

@@ -382,9 +382,8 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
     overflow: 'hidden',
   };
 
-  // Shared knob rows for a watch base. `locked` mirrors Phase-1: a running watch
-  // is read-only until disabled. Draft mode never locks (the config is applied
-  // on conversation creation, re-validated at apply time).
+  // Shared knob rows for a watch base. Once a watch is enabled, its config is
+  // read-only until disabled, including pre-creation draft mode.
   const renderBase = (
     base: IIdmmWatchBase,
     update: (updater: (w: IIdmmWatchBase) => IIdmmWatchBase) => void,
@@ -534,8 +533,8 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
     </div>
   );
 
-  const faultLocked = !isDraft && cfg.fault_watch.enabled;
-  const decisionLocked = !isDraft && cfg.decision_watch.enabled;
+  const faultLocked = cfg.fault_watch.enabled;
+  const decisionLocked = cfg.decision_watch.enabled;
   const dw = cfg.decision_watch;
   const strat = dw.strategy;
   const cats = strat.categories;
@@ -548,11 +547,10 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
   const optionModeKey = cats.option_decision.mode === 'ask_first' ? 'askFirst' : cats.option_decision.mode;
   const strategySummary = `${t(`idmm.tendency.${strat.tendency}`)} · ${t(`idmm.onBlocked.${blockedKey}`)} · ${t(`idmm.categoryMode.${optionModeKey}`)}`;
 
-  // When a watch is running its config is read-only — changing the tier
-  // (规则 / 旁路模型) or strategy mid-run could mis-steer the live supervisor.
-  // The controls are already `disabled`; this banner surfaces WHY and how to
-  // edit (turn the watch off first), so users don't think it's broken
-  // (防止用户改错乱). Draft mode never locks (still pre-creation configuration).
+  // When a watch is enabled its config is read-only — changing the tier
+  // (规则 / 旁路模型) or strategy after enabling can leave required fields
+  // incomplete. The controls are already `disabled`; this banner surfaces WHY
+  // and how to edit (turn the watch off first), so users don't think it's broken.
   const lockedNotice = (
     <div className='flex items-start gap-6px rounded-8px bg-fill-1 px-9px py-7px text-t-tertiary text-11px leading-15px'>
       <span aria-hidden className='shrink-0 leading-15px'>🔒</span>
@@ -602,7 +600,7 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
         <span className='min-w-0 flex flex-col gap-2px'>
           <span className='min-w-0 flex items-center gap-6px'>
             <span className='truncate text-t-primary text-13px font-600'>{t(titleKey)}</span>
-            {watchEnabled && !isDraft ? (
+            {watchEnabled ? (
               <span className='inline-flex shrink-0 items-center gap-3px rounded-full bg-fill-2 px-6px py-1px text-10px leading-none text-t-tertiary'>
                 <span aria-hidden>🔒</span>
                 {t('idmm.locked.badge')}

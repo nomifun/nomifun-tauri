@@ -40,6 +40,10 @@ const NomiChat: React.FC<{
   isProcessing?: boolean;
   /** Hide the permission/agent-mode selector in the send box (locked surfaces). */
   hideModeSelector?: boolean;
+  /** 会话内「协作模型」选择器节点，透传给 send box 紧跟主模型选择器渲染（锁定表面不传）。 */
+  collaboratorSelectorNode?: React.ReactNode;
+  /** 额外的右侧工具节点，透传给 send box 的 rightTools（编排节点投影把「预置要求」pill 折进 composer）。 */
+  extraRightTools?: React.ReactNode;
 }> = ({
   conversation_id,
   workspace,
@@ -54,6 +58,8 @@ const NomiChat: React.FC<{
   agent_name,
   isProcessing,
   hideModeSelector,
+  collaboratorSelectorNode,
+  extraRightTools,
 }) => {
   // Windowed history: load only the newest page on mount + lazily prepend older
   // pages on scroll-up. The nomi surface backs both work conversations and the
@@ -119,6 +125,8 @@ const NomiChat: React.FC<{
               session_mode={session_mode}
               agent_name={agent_name}
               hideModeSelector={hideModeSelector}
+              collaboratorSelectorNode={collaboratorSelectorNode}
+              extraRightTools={extraRightTools}
               dynamicModes={dynamicModes}
               turnActivity={turnActivity}
             />
