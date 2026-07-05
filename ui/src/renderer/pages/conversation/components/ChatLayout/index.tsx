@@ -114,6 +114,7 @@ const ChatLayoutInner: React.FC<ChatLayoutProps> = (props) => {
     conversation_id,
     preferenceKey: workspacePreferenceKey ?? (conversation_id != null ? String(conversation_id) : undefined),
     isTemporaryWorkspace,
+    autoExpandOnFiles: false,
   });
 
   // --- Hook B: container width ---

@@ -18,4 +18,10 @@ describe('ChatLayout advanced controls', () => {
     expect(source.includes("<KnowledgeControl target={{ kind: 'conversation', id: conversation_id }} />")).toBe(true);
     expect(source.includes('MultiAgentControl')).toBe(false);
   });
+
+  test('does not let workspace file-tree events auto-expand the conversation right rail', () => {
+    const source = readSource(new URL('./index.tsx', import.meta.url));
+
+    expect(source.includes('autoExpandOnFiles: false')).toBe(true);
+  });
 });
