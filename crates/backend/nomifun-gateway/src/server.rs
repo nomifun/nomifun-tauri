@@ -172,6 +172,12 @@ async fn handle_tool_request(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_owned),
+        session_mode: body
+            .get("session_mode")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
         // This in-process server is the INWARD path (bundled agents on loopback);
         // never the external Remote surface.
         ..Default::default()

@@ -236,6 +236,13 @@ pub trait Tool: Send + Sync {
         self.category()
     }
 
+    /// Whether this specific invocation can skip interactive approval even when
+    /// the session is not globally auto-approved. Defaults to false so existing
+    /// tools keep their current approval behavior.
+    fn auto_approve_invocation(&self, _input: &Value, _category: ToolCategory) -> bool {
+        false
+    }
+
     /// Whether this tool's schema should be deferred (sent as name-only stub).
     /// Override to `true` for tools with large schemas or infrequent use.
     fn is_deferred(&self) -> bool {

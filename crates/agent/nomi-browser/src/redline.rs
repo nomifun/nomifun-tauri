@@ -39,7 +39,7 @@ use nomi_protocol::events::ToolCategory;
 /// 是否在审批旁路会话里 hard-deny。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApprovalTier {
-    /// 只读（observe / screenshot / get_page_text / search_page / …）：无副作用。
+    /// 只读（navigate / observe / screenshot / get_page_text / search_page / …）：无副作用。
     Info,
     /// 轻写（导航类的良性 settle 等，本 facade 暂未细分到 Edit；保留对齐 ToolCategory）。
     Edit,
@@ -180,9 +180,9 @@ pub fn accname_is_irreversible(accname: &str) -> bool {
 /// - **reload**：reload 一个 POST 提交来的页（[`ActionContext::reload_resubmits_post`]，复用 D4 判定）。
 /// - **任何动作触发跨域 POST**（[`ActionContext::is_cross_origin_post`]，接 E5）→ Irreversible。
 ///
-/// 只读类（observe/screenshot/get_page_text/search_page/find_elements/get_dropdown_options/cursor/
-/// wait/wait_for/capabilities/tabs/**extract**）→ [`ApprovalTier::Info`]。
-/// 普通 type/set_value/hover/select_option/scroll/click（非危险）/ 导航类 / upload_file / download /
+/// 只读类（navigate/observe/screenshot/get_page_text/search_page/find_elements/get_dropdown_options/
+/// cursor/wait/wait_for/capabilities/tabs/**extract**）→ [`ApprovalTier::Info`]。
+/// 普通 type/set_value/hover/select_option/scroll/click（非危险）/ upload_file / download /
 /// save_as_pdf → [`ApprovalTier::Exec`]。
 ///
 /// **纯函数**：元素 accname/role/origin 全由 `ctx` 携带，无副作用，充分单测。
@@ -195,7 +195,7 @@ pub fn classify_action(action: &str, ctx: &ActionContext) -> ApprovalTier {
     match action {
         // ── 只读类（Info，零副作用）──────────────────────────────────────────
         // extract = deterministic 页面表示捕获（aria snapshot + 可见文本，redact+wrap），只读零写。
-        "observe" | "screenshot" | "capabilities" | "get_page_text" | "search_page"
+        "navigate" | "observe" | "screenshot" | "capabilities" | "get_page_text" | "search_page"
         | "find_elements" | "get_dropdown_options" | "cursor" | "wait" | "wait_for" | "tabs"
         | "extract" | "get_console_logs" | "get_page_errors" | "get_network_log" => {
             ApprovalTier::Info
@@ -232,9 +232,9 @@ pub fn classify_action(action: &str, ctx: &ActionContext) -> ApprovalTier {
             }
         }
 
-        // ── 一般写交互 / 导航（可逆）→ Exec ──────────────────────────────────────
+        // ── 一般写交互（可逆）→ Exec ───────────────────────────────────────────
         // type/set_value/hover/select_option/scroll/scroll_to_text/upload_file/download/save_as_pdf/
-        // navigate/back/forward/switch_tab/close_tab/open_link_new_tab/switch_frame/
+        // back/forward/switch_tab/close_tab/open_link_new_tab/switch_frame/
         // evaluate（evaluate 另有 E3 门控，这里仅给类别）。extract 是 Info（见上，只读零写）。
         _ => ApprovalTier::Exec,
     }
@@ -464,6 +464,7 @@ mod tests {
     fn classify_readonly_actions_are_info() {
         let ctx = ActionContext::default();
         for action in [
+            "navigate",
             "observe",
             "screenshot",
             "capabilities",
@@ -498,7 +499,6 @@ mod tests {
             "select_option",
             "scroll",
             "scroll_to_text",
-            "navigate",
             "back",
             "forward",
             "switch_tab",

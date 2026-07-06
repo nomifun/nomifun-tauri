@@ -120,6 +120,8 @@ impl GatewayMcpConfig {
     /// companion/desktop sessions. The gateway uses it to resolve the write
     /// surface (channel → write-disabled in P1).
     pub const ENV_CHANNEL_PLATFORM: &'static str = "NOMI_GW_MCP_CHANNEL_PLATFORM";
+    /// env key carrying the caller's resolved session approval mode.
+    pub const ENV_SESSION_MODE: &'static str = "NOMI_GW_MCP_SESSION_MODE";
     /// Optional gateway tool profile. The stdio bridge maps this to a curated
     /// capability-domain list before answering `tools/list`.
     pub const ENV_PROFILE: &'static str = "NOMI_GW_MCP_PROFILE";

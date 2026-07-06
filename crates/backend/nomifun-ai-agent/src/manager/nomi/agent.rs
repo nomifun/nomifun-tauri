@@ -15,6 +15,8 @@ use nomi_agent::session::Session;
 use nomi_config::config::{CliArgs, Config};
 use nomi_mcp::manager::McpManager;
 use nomi_protocol::commands::SessionMode;
+#[cfg(feature = "browser-use")]
+use nomi_protocol::events::ToolCategory;
 use nomi_protocol::{ToolApprovalManager, ToolApprovalResult};
 use nomifun_api_types::{AgentModeResponse, SlashCommandItem};
 use nomifun_common::{
@@ -295,6 +297,7 @@ impl NomiAgentManager {
         // P7B: 把会话的 visual-fallback LIVE 值灌进 BrowserConfig.visual_fallback（默认 OFF，opt-in）。
         // bootstrap 据它给 BrowserTool 注入会话模型的 VisualLocator（锚定失败时截图交视觉模型定位再点）。
         config.tools.browser.visual_fallback = config_extra.browser_visual_fallback;
+        config.tools.browser.unrestricted_approval = config_extra.browser_unrestricted_approval;
         // 「浏览器模式」两开关（与上面的 opt-in 开关正交，每会话 LIVE）：
         // - 静默：silent(默认 true) → headless。facade 由 !headless 得 headful；无显示器时引擎本就强制 headless。
         // - 来源：source("managed"/"system") → facade 解析为 ChromeSource（system=系统 Chrome/Edge 优先，
@@ -382,11 +385,16 @@ impl NomiAgentManager {
         // fail-closed (irreversible stays Blocked, gated egress fails). Threaded into the
         // native BrowserTool inside bootstrap (no-op if browser-use is off).
         #[cfg(feature = "browser-use")]
-        if config_extra.browser_takeover {
+        if should_install_browser_approval_gate(
+            config_extra.browser_takeover,
+            config_extra.browser_unrestricted_approval,
+            approval_manager.as_ref(),
+        ) {
             let gate = crate::manager::nomi::browser_approval::DesktopApprovalGate::new(
                 runtime.event_sender(),
                 confirmations.clone(),
                 approval_manager.clone(),
+                config_extra.browser_unrestricted_approval,
             );
             bootstrap = bootstrap.approval_gate(Arc::new(gate));
         }
@@ -1057,6 +1065,17 @@ fn parse_session_mode(s: &str) -> SessionMode {
     }
 }
 
+#[cfg(feature = "browser-use")]
+fn should_install_browser_approval_gate(
+    browser_takeover: bool,
+    browser_unrestricted_approval: bool,
+    approval_manager: &ToolApprovalManager,
+) -> bool {
+    browser_takeover
+        || browser_unrestricted_approval
+        || approval_manager.is_auto_approved(&ToolCategory::Irreversible.to_string())
+}
+
 fn nomi_engine_error_to_send_error(error_msg: String) -> AgentSendError {
     let lower = error_msg.to_ascii_lowercase();
     if lower.contains("provider error") || lower.contains("provider:") || lower.contains("api error:") {
@@ -1110,6 +1129,7 @@ mod tests {
             browser_persistent_login: false,
             browser_site_memory: false,
             browser_takeover: false,
+            browser_unrestricted_approval: false,
             browser_visual_fallback: false,
             goal: None,
             browser_secret_vault: None,
@@ -1339,6 +1359,29 @@ mod tests {
                 .as_deref()
                 .is_some_and(|output| output.contains("Automatic continuation recovered from the output token limit")),
             "automatic continuation should resolve the truncated tool card without marking it failed"
+        );
+    }
+
+    #[cfg(feature = "browser-use")]
+    #[test]
+    fn yolo_session_installs_browser_approval_gate_without_takeover_pref() {
+        let mgr = ToolApprovalManager::new();
+        mgr.set_mode(SessionMode::Yolo);
+
+        assert!(
+            should_install_browser_approval_gate(false, false, &mgr),
+            "full-auto/yolo sessions need the Browser gate so gated egress can approve without UI"
+        );
+    }
+
+    #[cfg(feature = "browser-use")]
+    #[test]
+    fn default_session_without_browser_approval_pref_does_not_install_browser_gate() {
+        let mgr = ToolApprovalManager::new();
+
+        assert!(
+            !should_install_browser_approval_gate(false, false, &mgr),
+            "default sessions without Browser approval prefs should keep the old fail-closed path"
         );
     }
 

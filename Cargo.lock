@@ -5680,6 +5680,7 @@ dependencies = [
 name = "nomifun-gateway"
 version = "0.2.6"
 dependencies = [
+ "async-trait",
  "axum",
  "dirs 6.0.0",
  "futures",

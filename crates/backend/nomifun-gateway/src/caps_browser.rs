@@ -2,12 +2,10 @@
 //! remote/master agent drive the desktop's in-process CDP browser, scoped +
 //! serialized per companion via [`crate::browser_registry::BrowserRegistry`].
 //!
-//! The GW2 out-of-band approval state machine (irreversible actions are held
-//! for explicit user approval via `nomi_browser_confirm`, never auto-run even
-//! under a yolo session) is preserved verbatim from the legacy tool — it is
-//! more specific than the registry's generic confirm-gate, so these tools are
-//! plain `Write`/`Read` and let GW2 do the gating. Browser tools are NOT denied
-//! on the Channel surface: remote browser driving is the entire point.
+//! The GW2 out-of-band approval state machine still gates irreversible browser
+//! actions for default callers, while full-auto/yolo callers bypass that hold to
+//! keep browser use low-friction. Browser tools are NOT denied on the Channel
+//! surface: remote browser driving is the entire point.
 //!
 //! Only compiled when the `browser-use` feature is on.
 
@@ -86,10 +84,10 @@ fn approval_required_value(call_id: &str, action: &str, args: &Value) -> Value {
             "call_id": call_id,
             "title": format!("Approve irreversible browser action: {action}"),
             "description": describe_pending(action, args),
-            "how_to": "This action is irreversible (submit / payment / delete / send) and your \
-                       session auto-approves, so it is held for out-of-band approval. Relay this \
-                       to the user; once they approve, call nomi_browser_confirm with this call_id \
-                       and option \"proceed_once\" (or \"cancel\" to deny).",
+            "how_to": "This action is irreversible (submit / payment / delete / send) and the \
+                       caller does not auto-approve Browser approval. Relay this to the user; \
+                       once they approve, call nomi_browser_confirm with this call_id and option \
+                       \"proceed_once\" (or \"cancel\" to deny).",
             "options": [
                 {"label": "Approve once", "value": "proceed_once"},
                 {"label": "Deny", "value": "cancel"},
@@ -114,7 +112,17 @@ fn describe_pending(action: &str, args: &Value) -> String {
 
 /// Gate an outbound action through out-of-band approval. `input` MUST already be
 /// sanitized. Returns `Some(json)` to short-circuit, `None` to proceed.
-fn gw2_gate(registry: &BrowserRegistry, key: &str, action: &str, input: &Value) -> Option<Value> {
+fn caller_bypasses_browser_approval(ctx: &CallerCtx) -> bool {
+    matches!(
+        ctx.session_mode.as_deref().map(str::trim),
+        Some("yolo" | "yoloNoSandbox" | "full-access" | "bypassPermissions")
+    )
+}
+
+fn gw2_gate(ctx: &CallerCtx, registry: &BrowserRegistry, key: &str, action: &str, input: &Value) -> Option<Value> {
+    if caller_bypasses_browser_approval(ctx) {
+        return None;
+    }
     if registry.classify(key, action, input) != ApprovalTier::Irreversible {
         return None;
     }
@@ -135,7 +143,7 @@ async fn navigate(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: NavigateParams) -> 
         Err(e) => return e,
     };
     let input = json!({"action": "navigate", "url": p.url, "new_tab": p.new_tab.unwrap_or(false)});
-    if let Some(short_circuit) = gw2_gate(registry, &key, "navigate", &input) {
+    if let Some(short_circuit) = gw2_gate(&ctx, registry, &key, "navigate", &input) {
         return short_circuit;
     }
     tool_result_to_value(registry.execute(&key, input).await)
@@ -150,7 +158,7 @@ async fn observe(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: ObserveParams) -> Va
     if let Some(d) = p.max_depth {
         input["max_depth"] = json!(d);
     }
-    if let Some(short_circuit) = gw2_gate(registry, &key, "observe", &input) {
+    if let Some(short_circuit) = gw2_gate(&ctx, registry, &key, "observe", &input) {
         return short_circuit;
     }
     tool_result_to_value(registry.execute(&key, input).await)
@@ -165,7 +173,7 @@ async fn act(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: ActParams) -> Value {
     // caller-supplied sentinel (trust boundary), then set the validated action.
     let mut input = sanitize_out_of_band(Value::Object(p.rest));
     input["action"] = json!(p.action);
-    if let Some(short_circuit) = gw2_gate(registry, &key, &p.action, &input) {
+    if let Some(short_circuit) = gw2_gate(&ctx, registry, &key, &p.action, &input) {
         return short_circuit;
     }
     tool_result_to_value(registry.execute(&key, input).await)
@@ -243,6 +251,39 @@ mod tests {
         let opts = ar.get("options").and_then(Value::as_array).expect("options");
         let values: Vec<&str> = opts.iter().filter_map(|o| o.get("value").and_then(Value::as_str)).collect();
         assert!(values.contains(&"proceed_once") && values.contains(&"cancel"));
+    }
+
+    #[test]
+    fn gw2_gate_keeps_irreversible_prompt_for_default_context() {
+        let registry = BrowserRegistry::default_for_browser_use();
+        let key = "conversation:default";
+        let input = json!({"action": "press_key", "keys": "Enter"});
+
+        let ctx = CallerCtx::default();
+        let result = gw2_gate(&ctx, &registry, key, "press_key", &input);
+
+        assert!(
+            result.and_then(|v| v.get("approval_required").cloned()).is_some(),
+            "default gateway browser context should keep the explicit irreversible-action approval"
+        );
+    }
+
+    #[test]
+    fn gw2_gate_skips_irreversible_prompt_for_yolo_context() {
+        let ctx = CallerCtx {
+            session_mode: Some("yolo".to_owned()),
+            ..Default::default()
+        };
+        let registry = BrowserRegistry::default_for_browser_use();
+        let key = "conversation:yolo";
+        let input = json!({"action": "press_key", "keys": "Enter"});
+
+        let result = gw2_gate(&ctx, &registry, key, "press_key", &input);
+
+        assert!(
+            result.is_none(),
+            "yolo gateway browser context should not return approval_required"
+        );
     }
 
     #[test]

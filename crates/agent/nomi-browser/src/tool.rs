@@ -289,6 +289,9 @@ pub struct BrowserTool {
     /// [`ToolApprovalManager::session_bypasses_approval`]，facade 不复制它。`nomi-browser` 本就依赖
     /// `nomi-protocol`，故此句柄零新增跨 crate 依赖。
     runtime_mode: Option<Arc<ToolApprovalManager>>,
+    /// Explicit Browser Use approval bypass. When true, Browser-specific approval
+    /// prompts approve immediately. This does not affect shell/file/native tools.
+    unrestricted_approval: bool,
     /// **F1-sec: evaluate「全权模式」LIVE 值**（裁决⑨，E3 门控的 opt-in 开关）。`true` 当且仅当用户在
     /// System Settings 显式 opt-in 了 browser-use 全权模式（`client_preferences` 形如
     /// `agent.browserUse.fullPower`，由 bootstrap 经 `read_bool_pref` 范式读后经 [`Self::with_policy`]
@@ -413,6 +416,7 @@ impl BrowserTool {
         // 浏览器来源（「我的浏览器」）：从 BrowserConfig.source 解析（坏值静默退回 Managed）。
         // 与 headful 正交；`with_policy` 无需带参——两开关都经 config.tools.browser.* 流入。
         t.chrome_source = ChromeSource::from_source_str(&config.source);
+        t.unrestricted_approval = config.unrestricted_approval;
         t
     }
 
@@ -502,6 +506,7 @@ impl BrowserTool {
             // （现行 fail-closed 行为不变）。bootstrap 经 `with_policy` 的 runtime_mode 参注入会话的
             // Arc<ToolApprovalManager>，届时门 LIVE 读运行时模式（set_mode 翻转即时生效）。
             runtime_mode: None,
+            unrestricted_approval: false,
             // Default: evaluate full-power OFF (E3 default-deny). Bootstrap overrides via
             // `with_policy` with the LIVE `agent.browserUse.fullPower` pref.
             evaluate_full_power: false,
@@ -1682,6 +1687,12 @@ impl BrowserTool {
     /// eTLD+1 判定）。保守：缺当前 origin / 缺目的 URL / 同域 → `false`（见 [`Self::build_action_context`]
     /// 对兜底契约的说明：真拦截在 E5/D2 网络层）。
     fn cross_origin_post_signal(&self, input: &Value) -> bool {
+        if matches!(
+            input.get("action").and_then(Value::as_str),
+            Some("navigate" | "open_link_new_tab" | "back" | "forward" | "reload")
+        ) {
+            return false;
+        }
         // 目的 URL：本动作携带的 `url`（navigate 带；click/type 等交互动作不带 → 无从判 → false）。
         let Some(target_url) = input.get("url").and_then(Value::as_str) else {
             return false;
@@ -1768,7 +1779,7 @@ impl BrowserTool {
         let ctx = self.build_action_context(input);
         let tier = redline::classify_action(action, &ctx);
         let bypass = self.session_bypasses_approval();
-        let confirmed = self.out_of_band_confirmed(input);
+        let confirmed = self.out_of_band_confirmed(input) || self.unrestricted_approval;
         match redline::enforce_redline(tier, bypass, confirmed) {
             Ok(()) => None,
             Err(e) => {
@@ -1798,7 +1809,7 @@ impl BrowserTool {
         let ctx = self.build_action_context(input);
         let tier = redline::classify_action(action, &ctx);
         let bypass = self.session_bypasses_approval();
-        let sentinel_confirmed = self.out_of_band_confirmed(input);
+        let sentinel_confirmed = self.out_of_band_confirmed(input) || self.unrestricted_approval;
 
         // Fast path: not irreversible, not bypass, or already sentinel-confirmed → use sync gate.
         if tier != redline::ApprovalTier::Irreversible || !bypass || sentinel_confirmed {
@@ -2526,6 +2537,10 @@ impl Tool for BrowserTool {
         }
     }
 
+    fn auto_approve_invocation(&self, _input: &Value, category: ToolCategory) -> bool {
+        self.unrestricted_approval || category != ToolCategory::Irreversible
+    }
+
     fn describe(&self, input: &Value) -> String {
         let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("?");
         let r#ref = input.get("ref").and_then(|v| v.as_str()).unwrap_or("");
@@ -2704,6 +2719,25 @@ mod tests {
         BrowserTool::with_policy(&BrowserConfig::default(), true, false, false, None, None, None)
     }
 
+    fn unrestricted_bypassing_tool() -> BrowserTool {
+        let config = BrowserConfig {
+            unrestricted_approval: true,
+            ..BrowserConfig::default()
+        };
+        BrowserTool::with_policy(&config, true, false, false, None, None, None)
+    }
+
+    #[test]
+    fn unrestricted_approval_releases_irreversible_in_bypassing_session() {
+        let t = unrestricted_bypassing_tool();
+        seed_snapshot(&t, "f0e3", "button", "Pay now");
+
+        assert!(
+            t.redline_gate("click", &json!({"action": "click", "ref": "f0e3"})).is_none(),
+            "unrestricted browser approval should release irreversible browser actions"
+        );
+    }
+
     #[test]
     fn fatal_session_lost_evicts_cached_engine_and_tells_model_to_retry() {
         let t = tool();
@@ -2810,16 +2844,24 @@ mod tests {
     #[test]
     fn category_for_info_and_exec_actions() {
         let t = tool();
-        for action in ["screenshot", "capabilities", "observe"] {
+        for action in ["navigate", "screenshot", "capabilities", "observe"] {
             assert_eq!(
-                t.category_for(&json!({"action": action})),
+                t.category_for(&json!({"action": action, "url": "https://example.com"})),
                 ToolCategory::Info,
                 "{action} should be Info"
             );
         }
+    }
+
+    #[test]
+    fn category_for_cross_origin_navigate_is_info() {
+        let t = tool();
+        seed_snapshot(&t, "f0e1", "link", "");
+
         assert_eq!(
-            t.category_for(&json!({"action": "navigate", "url": "https://example.com"})),
-            ToolCategory::Exec
+            t.category_for(&json!({"action": "navigate", "url": "https://evil.test/collect"})),
+            ToolCategory::Info,
+            "ordinary cross-origin navigation should not be treated as irreversible"
         );
     }
 
@@ -2994,13 +3036,16 @@ mod tests {
     // ── P3-D2：is_cross_origin_post 信号填实（best-effort 纯读，保守 + E5/D2 网络层兜底）────────
 
     #[test]
-    fn cross_origin_post_signal_true_when_navigate_target_is_cross_etld1() {
-        // 缓存的当前页 origin = shop.example.com（seed_snapshot 默认 url）；navigate 到跨 eTLD+1 的
-        // 目标 → is_cross_origin_post=true（让 classifier 据此分类）。复用引擎 PSL eTLD+1 判定。
+    fn cross_origin_post_signal_false_when_navigate_target_is_cross_etld1() {
+        // Ordinary navigation is a browser-read action for approval purposes. Do
+        // not pre-classify a cross-site GET navigation as a cross-origin POST.
         let t = tool();
         seed_snapshot(&t, "f0e1", "link", ""); // 仅为设当前 origin（shop.example.com）
         let ctx = t.build_action_context(&json!({"action": "navigate", "url": "https://evil.test/collect"}));
-        assert!(ctx.is_cross_origin_post, "cross-eTLD+1 navigate target → signal true");
+        assert!(
+            !ctx.is_cross_origin_post,
+            "cross-eTLD+1 navigate target must not look like a POST"
+        );
     }
 
     #[test]
@@ -4059,7 +4104,7 @@ mod tests {
     fn category_for_full_action_space() {
         let t = tool();
         // read-only → Info
-        for a in ["get_page_text", "search_page", "find_elements", "get_dropdown_options", "cursor", "tabs", "wait", "wait_for", "extract"] {
+        for a in ["navigate", "get_page_text", "search_page", "find_elements", "get_dropdown_options", "cursor", "tabs", "wait", "wait_for", "extract"] {
             assert_eq!(
                 t.category_for(&json!({"action": a})),
                 ToolCategory::Info,

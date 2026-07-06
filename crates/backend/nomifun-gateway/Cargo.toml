@@ -61,6 +61,7 @@ nomi-tools = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 axum.workspace = true
 tokio.workspace = true
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # Capability registry: single-source JSON Schema generation from each capability's

@@ -134,6 +134,8 @@ pub struct CallerCtx {
     /// `None` for plain companion/desktop sessions. Used to resolve the write
     /// surface (channel → write-disabled in P1).
     pub channel_platform: Option<String>,
+    /// Resolved approval mode for the calling agent session.
+    pub session_mode: Option<String>,
     /// `true` when the caller is an external network consumer reaching the
     /// platform through the Remote front door (the "外部伙伴" surface). Takes
     /// precedence over `channel_platform` in [`CallerCtx::surface`]. Defaults

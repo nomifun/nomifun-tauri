@@ -119,6 +119,9 @@ pub struct NomiResolvedConfig {
     /// 才放行（否则 fail-closed 硬挡）。工厂经 `read_bool_pref` LIVE 读 `agent.browserUse.takeover`
     /// （host_default=**false**=OFF）。`false`（默认）→ 不注入 gate，维持 fail-closed 零回归。
     pub browser_takeover: bool,
+    /// Explicit Browser Use approval bypass. Default false. When true, Browser-specific
+    /// irreversible and egress approval prompts approve immediately.
+    pub browser_unrestricted_approval: bool,
     /// **P7B visual-fallback LIVE 值**（opt-in，有 token 成本）。`true` → bootstrap 给 `BrowserTool`
     /// 注入会话模型的 `VisualLocator`：DOM/aria 锚定失败（ref stale/detached）时截图交视觉模型按描述
     /// 定位再点。工厂经 `read_bool_pref` 范式 LIVE 读 `agent.browserUse.visualFallback`

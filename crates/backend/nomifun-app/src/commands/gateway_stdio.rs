@@ -60,6 +60,10 @@ pub async fn run_gateway_stdio() -> ExitCode {
         .ok()
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty());
+    let session_mode = std::env::var(GatewayMcpConfig::ENV_SESSION_MODE)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
     let tool_filter = GatewayToolFilter::from_env();
 
     eprintln!("[mcp-gateway-stdio] Started OK. PORT={port}, CONV_ID={conversation_id}");
@@ -73,6 +77,7 @@ pub async fn run_gateway_stdio() -> ExitCode {
         user_id,
         companion_id,
         channel_platform,
+        session_mode,
         tool_filter,
         http_client,
     };
@@ -107,6 +112,8 @@ struct GatewayStdioServer {
     /// IM platform when this is a channel master-agent session (from
     /// `NOMI_GW_MCP_CHANNEL_PLATFORM`); `None` for plain companion/desktop.
     channel_platform: Option<String>,
+    /// Resolved approval mode for the calling session.
+    session_mode: Option<String>,
     tool_filter: GatewayToolFilter,
     http_client: reqwest::Client,
 }
@@ -233,6 +240,7 @@ impl GatewayStdioServer {
             "user_id": self.user_id,
             "companion_id": self.companion_id,
             "channel_platform": self.channel_platform,
+            "session_mode": self.session_mode,
         });
         super::stdio_common::forward_tool_http(
             &self.http_client,
@@ -337,6 +345,7 @@ mod tests {
             user_id: "u1".into(),
             companion_id: None,
             channel_platform: None,
+            session_mode: None,
             tool_filter: GatewayToolFilter::default(),
             http_client: reqwest::Client::new(),
         }
