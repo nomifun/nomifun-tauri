@@ -1,11 +1,19 @@
 {
   "version": "0.2.4",
   "notes": "Agent 集群体验升级：新增实时进度层、节点提问与节点级审批；优化集群画布状态反馈、知识库目录树、模型/Provider 排序、Codex ACP 配置保留和侧栏体验。",
-  "pub_date": "2026-07-06T01:29:46.243Z",
+  "pub_date": "2026-07-06T02:00:59.812Z",
   "platforms": {
     "windows-x86_64": {
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxOCtCQVd5WU1VbGdER2orc3poTStJdDBsdEpUS2oyMjQra0tZaEVlUXJPNXJwSFlNZHNVdnIwNUtONTYweUF0YlZ4TlpLdnZUUU9qL1J3ZE1Ic1k4QVFvPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzMzAxMzg0CWZpbGU6Tm9taUZ1bl8wLjIuNF94NjQtc2V0dXAuZXhlCmZKQ1ZZVjNuWk5KMFp6ejRkNVo1Z0s1N1d0dFd6TmdKYTNPR1ZBV0lpVDNVWFArTDZ2czk2MFJHb1VteGRvQ1BsZHkvR2pUY2lyU2xQdVJwcHVXUEJnPT0K",
       "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.4/NomiFun_0.2.4_x64-setup.exe"
+    },
+    "darwin-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODdwMStXNTM5RDNiUDVzS3BwTFRudjNlZWtTd081emFCb1BQc3pqQk9Kemx2Q0EwUGdNVWd2eVZuVGI1V0RvSHFTU29mU1ZpSnFERklyTVNsd3M4ZlFjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzMzAzMDc4CWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6CndNRmZTY3A0UUxjOTVvTUxVWXBnWU10ekJmYnNQZm16eW1pWHhpSGVCa1B1cytnVDJncyt4UW9Nd0ltSUpaRXljUmJIcnZkSU9yVWlldllyVjljV0FBPT0K",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.4/NomiFun.app.tar.gz"
+    },
+    "darwin-aarch64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODdwMStXNTM5RDNiUDVzS3BwTFRudjNlZWtTd081emFCb1BQc3pqQk9Kemx2Q0EwUGdNVWd2eVZuVGI1V0RvSHFTU29mU1ZpSnFERklyTVNsd3M4ZlFjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzMzAzMDc4CWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6CndNRmZTY3A0UUxjOTVvTUxVWXBnWU10ekJmYnNQZm16eW1pWHhpSGVCa1B1cytnVDJncyt4UW9Nd0ltSUpaRXljUmJIcnZkSU9yVWlldllyVjljV0FBPT0K",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.4/NomiFun.app.tar.gz"
     }
   }
 }
