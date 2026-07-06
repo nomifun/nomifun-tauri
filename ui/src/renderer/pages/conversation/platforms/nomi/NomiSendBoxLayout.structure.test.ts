@@ -10,16 +10,19 @@ import { describe, expect, test } from 'bun:test';
 const readSource = (url: URL) => readFileSync(url, 'utf8');
 
 describe('Nomi sendbox control layout', () => {
-  test('moves context usage to the top-right metrics slot and removes turn metrics copy', () => {
+  test('moves context usage into the sendbox top row and removes turn metrics copy', () => {
     const source = readSource(new URL('./NomiSendBox.tsx', import.meta.url));
-    const contextPillIndex = source.indexOf('<ContextUsagePill');
     const sendBoxIndex = source.indexOf('<SendBox');
+    const topRightToolsIndex = source.indexOf('topRightTools={', sendBoxIndex);
+    const contextPillIndex = source.indexOf('<ContextUsagePill', topRightToolsIndex);
     const rightToolsIndex = source.indexOf('rightTools={');
 
-    expect(contextPillIndex).toBeGreaterThan(-1);
-    expect(sendBoxIndex).toBeGreaterThan(contextPillIndex);
+    expect(sendBoxIndex).toBeGreaterThan(-1);
+    expect(topRightToolsIndex).toBeGreaterThan(sendBoxIndex);
+    expect(contextPillIndex).toBeGreaterThan(topRightToolsIndex);
     expect(rightToolsIndex).toBeGreaterThan(sendBoxIndex);
     expect(source.indexOf('<ContextUsagePill', rightToolsIndex)).toBe(-1);
+    expect(source.includes("data-testid='nomi-context-usage-slot'")).toBe(false);
     expect(source.includes("data-testid='nomi-turn-metrics'")).toBe(false);
     expect(source.includes('formatTurnDuration')).toBe(false);
     expect(source.includes('formatTokenCount(tokenUsage.total_tokens)')).toBe(false);

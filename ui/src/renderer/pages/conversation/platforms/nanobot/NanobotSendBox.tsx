@@ -381,6 +381,7 @@ const NanobotSendBox: React.FC<{ conversation_id: number }> = ({ conversation_id
         onClear={clear}
       />
       <SendBox
+        showPinnedPlan
         value={content}
         onChange={handleContentChange}
         selectedWorkspaceItems={atPath}

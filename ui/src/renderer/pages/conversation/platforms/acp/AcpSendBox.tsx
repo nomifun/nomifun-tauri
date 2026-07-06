@@ -570,6 +570,7 @@ Please check your local CLI tool authentication status`,
         onClear={clear}
       />
       <SendBox
+        showPinnedPlan
         onMobilePlusClick={isMobile ? () => setIsMobileSheetOpen(true) : undefined}
         value={content}
         onChange={handleContentChange}

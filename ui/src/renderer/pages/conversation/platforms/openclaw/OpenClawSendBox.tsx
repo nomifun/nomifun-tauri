@@ -517,6 +517,7 @@ const OpenClawSendBox: React.FC<{ conversation_id: number }> = ({ conversation_i
         onClear={clear}
       />
       <SendBox
+        showPinnedPlan
         value={content}
         onChange={handleContentChange}
         selectedWorkspaceItems={atPath}

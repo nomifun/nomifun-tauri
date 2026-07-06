@@ -728,14 +728,12 @@ const NomiSendBox: React.FC<{
         onRemove={remove}
         onClear={clear}
       />
-      {hasContextUsage && (
-        <div className='flex items-center justify-end px-1 pb-1 select-none' data-testid='nomi-context-usage-slot'>
-          <ContextUsagePill used={tokenUsage?.context_tokens} max={tokenUsage?.context_window} />
-        </div>
-      )}
-
       <SendBox
         data-testid='nomi-sendbox'
+        showPinnedPlan
+        topRightTools={
+          hasContextUsage ? <ContextUsagePill used={tokenUsage?.context_tokens} max={tokenUsage?.context_window} /> : undefined
+        }
         onMobilePlusClick={isMobile ? () => setIsMobileSheetOpen(true) : undefined}
         value={content}
         onChange={handleContentChange}
