@@ -53,7 +53,10 @@
     "skillsActive": "Use Skills · Enabled",
     "skillsAdjustAria": "Adjust the {{count}} Skills enabled for this chat",
     "skillsActiveAria": "View {{count}} Skills enabled for this chat",
-    "backToFree": "Free-form"
+    "backToFree": "Free-form",
+    "cluster": "Agent cluster",
+    "clusterAria": "Toggle agent cluster mode",
+    "clusterHint": "Multi-agent teamwork: the lead agent deliberately evaluates and splits work across independent agents; trivial tasks get a stated reason and a direct answer."
   },
   "skillsPopover": {
     "title": "Skills used in this chat",

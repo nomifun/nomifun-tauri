@@ -61,6 +61,7 @@ impl IRunRepository for SqliteRunRepository {
             total_tokens: None,
             forked_from: None,
             work_dir: p.work_dir,
+            approval_mode: None,
             created_at: now,
             updated_at: now,
         })
@@ -235,6 +236,7 @@ impl IRunRepository for SqliteRunRepository {
             preset_prompt: None,
             last_error: None,
             on_fail: p.on_fail,
+            pending_question: None,
             created_at: now,
             updated_at: now,
         })
@@ -365,6 +367,37 @@ impl IRunRepository for SqliteRunRepository {
         .bind(id)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn set_run_approval_mode(
+        &self,
+        id: &str,
+        approval_mode: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        // 迁移 030：单列写。`None` = 回到 auto（列置 NULL）。
+        sqlx::query("UPDATE orch_runs SET approval_mode = ?, updated_at = ? WHERE id = ?")
+            .bind(approval_mode)
+            .bind(now_ms())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn set_task_question(
+        &self,
+        id: &str,
+        question: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        // 迁移 030：节点挂起问题单列写。`None` = 清空（采用产出/重跑后）。状态迁移
+        // （pending/running ↔ needs_review）由调用方经既有 update_task 处理。
+        sqlx::query("UPDATE orch_run_tasks SET pending_question = ?, updated_at = ? WHERE id = ?")
+            .bind(question)
+            .bind(now_ms())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1907,6 +1940,38 @@ mod tests {
     // Fix B PRIMITIVE: `mark_run_running_tasks_cancelled` marks ONLY the run's
     // `running` tasks `cancelled` (preserving their partial output for inspection),
     // leaving settled/pending tasks and other runs untouched.
+    // 迁移 030: set_run_approval_mode / set_task_question 单列写往返——写入读回、
+    // 清空读回 None；旧行（未写过）读回 None（零回归）。
+    #[tokio::test]
+    async fn approval_mode_and_pending_question_roundtrip() {
+        let db = init_database_memory().await.unwrap();
+        let pool = db.pool().clone();
+        let ws = make_workspace(&pool).await;
+        let repo = SqliteRunRepository::new(pool);
+        let run = mk_run(&repo, Some(ws), "审批模式往返").await;
+        let task = mk_task(&repo, &run, "节点", "agent", "running", None).await;
+
+        // 旧行读回 None（迁移默认）。
+        let r0 = repo.get_run(&run).await.unwrap().unwrap();
+        assert!(r0.approval_mode.is_none(), "未写过的 run 读回 None");
+        let t0 = repo.get_task(&task).await.unwrap().unwrap();
+        assert!(t0.pending_question.is_none(), "未写过的 task 读回 None");
+
+        // 写入读回。
+        repo.set_run_approval_mode(&run, Some("manual")).await.unwrap();
+        let r1 = repo.get_run(&run).await.unwrap().unwrap();
+        assert_eq!(r1.approval_mode.as_deref(), Some("manual"));
+        repo.set_task_question(&task, Some("选方案A还是B？")).await.unwrap();
+        let t1 = repo.get_task(&task).await.unwrap().unwrap();
+        assert_eq!(t1.pending_question.as_deref(), Some("选方案A还是B？"));
+
+        // 清空读回 None。
+        repo.set_run_approval_mode(&run, None).await.unwrap();
+        assert!(repo.get_run(&run).await.unwrap().unwrap().approval_mode.is_none());
+        repo.set_task_question(&task, None).await.unwrap();
+        assert!(repo.get_task(&task).await.unwrap().unwrap().pending_question.is_none());
+    }
+
     #[tokio::test]
     async fn mark_run_running_tasks_cancelled_settles_only_running() {
         let db = init_database_memory().await.unwrap();

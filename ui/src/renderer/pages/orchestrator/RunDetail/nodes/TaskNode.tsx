@@ -6,7 +6,7 @@
 
 import React from 'react';
 import { Handle, Position, type Node, type NodeProps } from '@xyflow/react';
-import { Branch, CheckOne, CloseOne, Gavel, Lightning, Lock, Merge, Refresh, Shield, Trophy } from '@icon-park/react';
+import { Branch, CheckOne, CloseOne, Gavel, Help, Lightning, Lock, Merge, Refresh, Shield, Trophy } from '@icon-park/react';
 
 /** Task status → theme-var color + a slow-pulse hint for the running state. */
 export interface TaskStatusMeta {
@@ -152,6 +152,8 @@ export interface TaskNodeData extends Record<string, unknown> {
   /** Raw task kind off the wire (`'agent'` default | `'synthesis'`). Rendered
    * defensively via {@link normalizeTaskKind}; unknown → agent (no badge). */
   kind?: string;
+  /** 入场动画序号（需求2）：错峰淡入上浮的 `--dag-i` 延迟因子（DagCanvas 已 cap）。 */
+  enterIndex?: number;
   /** Localized "synthesis" label for the kind badge (computed in DagCanvas so the
    * node stays free of i18n wiring). */
   synthesisLabel?: string;
@@ -205,6 +207,11 @@ export interface TaskNodeData extends Record<string, unknown> {
   /** Localized terse "tok" label for the token chip (computed in DagCanvas so the
    * node stays free of i18n wiring). */
   tokensLabel?: string;
+  /** 审批模式（需求5，迁移 030）：节点挂起的决策问题原文。在场时渲染醒目的提问
+   * 徽标（缓脉冲）+ 琥珀 ring，点击节点即投影进 worker 会话作答。 */
+  pendingQuestion?: string;
+  /** Localized "待作答" text for the question badge (computed in DagCanvas). */
+  questionLabel?: string;
   /** Click handler — opens the task inspector / transcript panel. */
   onOpen: () => void;
 }
@@ -212,12 +219,34 @@ export interface TaskNodeData extends Record<string, unknown> {
 /** Strongly-typed node alias so NodeProps narrows `data` for us. */
 export type TaskFlowNode = Node<TaskNodeData, 'task'>;
 
+/** Shared pill class（meta 行小胶囊的公共原子类，样式差异走内联主题色）。 */
+const PILL_CLASS = 'inline-flex shrink-0 items-center gap-3px rd-100px px-6px py-2px text-10px font-600 leading-none';
+
+/** Tinted pill style（统一「主题色 14% 底 + 32% 描边」公式，全部主题变量）。 */
+function tintedPill(tone: string): React.CSSProperties {
+  return {
+    color: tone,
+    background: `color-mix(in srgb, ${tone} 14%, transparent)`,
+    border: `1px solid color-mix(in srgb, ${tone} 32%, transparent)`,
+  };
+}
+
+/** Neutral pill style（未定态：verifying…/judging…/iterating…）。 */
+const NEUTRAL_PILL: React.CSSProperties = {
+  color: 'var(--text-secondary)',
+  background: 'var(--color-fill-1)',
+  border: '1px solid var(--border-light)',
+};
+
 /**
  * TaskNode — a custom react-flow node rendering one DAG task as an on-brand
- * card: status dot + left status border, title, an assignment chip, and a
- * retry-count badge. The whole card is a button that opens the task's
- * transcript panel. Theme variables only (no hardcoded hex); source/target
- * handles anchor the dependency edges.
+ * card（需求2 精美化）: a status accent strip + shimmer while running, a title
+ * row (pulsing status dot + title + kind badge), a meta row (status label +
+ * verdict/winner/loop pills + assignment chip + retry badge + fan-out chip +
+ * token chip), and — in approval mode — a prominent question badge. Hover lift
+ * / press / selection ring / running glow all live in `dag-canvas.css` keyed by
+ * data attributes; the node only feeds `--node-accent` and state flags. Theme
+ * variables only (no hardcoded hex); source/target handles anchor the edges.
  */
 function TaskNodeImpl({ data, selected }: NodeProps<TaskFlowNode>) {
   const meta = taskStatusMeta(data.status);
@@ -226,19 +255,11 @@ function TaskNodeImpl({ data, selected }: NodeProps<TaskFlowNode>) {
   const isVerify = kind === 'verify';
   const isJudge = kind === 'judge';
   const isLoop = kind === 'loop';
+  const hasQuestion = Boolean(data.pendingQuestion);
   // A fan-out group needs a label AND a resolved hue; either missing → no group
   // affordance (defensive against half-parsed config).
   const inGroup = data.groupLabel != null && data.groupHue != null;
   const groupColor = inGroup ? `hsl(${data.groupHue}, 62%, 55%)` : null;
-
-  // Compose the card outline. Selection always wins; otherwise a fan-out sibling
-  // gets a soft group-hued ring layered under the base drop shadow so the whole
-  // group reads as one cohort without fighting the status left-border.
-  const baseShadow = selected
-    ? '0 0 0 3px color-mix(in srgb, rgb(var(--primary-6)) 22%, transparent), 0 6px 18px rgba(0,0,0,0.14)'
-    : groupColor
-      ? `0 0 0 2px color-mix(in srgb, ${groupColor} 38%, transparent), 0 2px 10px rgba(0,0,0,0.10)`
-      : '0 2px 10px rgba(0,0,0,0.10)';
 
   return (
     <div
@@ -252,14 +273,24 @@ function TaskNodeImpl({ data, selected }: NodeProps<TaskFlowNode>) {
           data.onOpen();
         }
       }}
-      className='nomi-dag-node group flex w-220px cursor-pointer select-none flex-col gap-8px rd-12px px-14px py-12px transition-all duration-150 outline-none'
-      style={{
-        background: 'var(--bg-2)',
-        border: `1px solid ${selected ? 'rgb(var(--primary-6))' : 'var(--border-base)'}`,
-        borderLeft: `3px solid ${meta.color}`,
-        boxShadow: baseShadow,
-      }}
+      className='nomi-dag-card nomi-dag-enter group relative flex w-220px cursor-pointer select-none flex-col gap-8px rd-12px px-14px pb-12px pt-14px outline-none'
+      data-status={data.status}
+      data-selected={selected ? 'true' : undefined}
+      data-question={hasQuestion ? 'true' : undefined}
+      data-grouped={inGroup ? 'true' : undefined}
+      style={
+        {
+          '--node-accent': meta.color,
+          '--group-accent': groupColor ?? 'transparent',
+          '--dag-i': data.enterIndex ?? 0,
+        } as React.CSSProperties
+      }
     >
+      {/* 顶部状态条纹：常态 2px 主题色；running 时叠加 shimmer 进度光带。 */}
+      <span className='nomi-dag-accent' aria-hidden='true'>
+        {meta.pulse && <span className='nomi-dag-shimmer' />}
+      </span>
+
       {/* Incoming-dependency anchor (top) */}
       <Handle
         type='target'
@@ -268,7 +299,7 @@ function TaskNodeImpl({ data, selected }: NodeProps<TaskFlowNode>) {
         style={{ width: 7, height: 7, background: 'var(--bg-5)', border: 'none' }}
       />
 
-      {/* Title row: status dot + task title (+ synthesis badge, right-aligned) */}
+      {/* Title row: status dot + task title (+ kind badge, right-aligned) */}
       <div className='flex items-start gap-8px'>
         <span
           className={`mt-4px size-9px shrink-0 rd-full ${meta.pulse ? 'nomi-dag-pulse' : ''}`}
@@ -278,57 +309,25 @@ function TaskNodeImpl({ data, selected }: NodeProps<TaskFlowNode>) {
           {data.title}
         </span>
         {isSynthesis && (
-          <span
-            className='nomi-dag-kind-badge inline-flex shrink-0 items-center gap-3px rd-100px px-6px py-2px text-10px font-600 leading-none'
-            style={{
-              color: SYNTH_ACCENT,
-              background: `color-mix(in srgb, ${SYNTH_ACCENT} 14%, transparent)`,
-              border: `1px solid color-mix(in srgb, ${SYNTH_ACCENT} 32%, transparent)`,
-            }}
-            title={data.synthesisLabel}
-          >
+          <span className={`nomi-dag-kind-badge ${PILL_CLASS}`} style={tintedPill(SYNTH_ACCENT)} title={data.synthesisLabel}>
             <Merge theme='outline' size='10' strokeWidth={4} className='line-height-0' />
             {data.synthesisLabel}
           </span>
         )}
         {isVerify && (
-          <span
-            className='nomi-dag-kind-badge inline-flex shrink-0 items-center gap-3px rd-100px px-6px py-2px text-10px font-600 leading-none'
-            style={{
-              color: VERIFY_ACCENT,
-              background: `color-mix(in srgb, ${VERIFY_ACCENT} 14%, transparent)`,
-              border: `1px solid color-mix(in srgb, ${VERIFY_ACCENT} 32%, transparent)`,
-            }}
-            title={data.verifyLabel}
-          >
+          <span className={`nomi-dag-kind-badge ${PILL_CLASS}`} style={tintedPill(VERIFY_ACCENT)} title={data.verifyLabel}>
             <Shield theme='outline' size='10' strokeWidth={4} className='line-height-0' />
             {data.verifyLabel}
           </span>
         )}
         {isJudge && (
-          <span
-            className='nomi-dag-kind-badge inline-flex shrink-0 items-center gap-3px rd-100px px-6px py-2px text-10px font-600 leading-none'
-            style={{
-              color: JUDGE_ACCENT,
-              background: `color-mix(in srgb, ${JUDGE_ACCENT} 14%, transparent)`,
-              border: `1px solid color-mix(in srgb, ${JUDGE_ACCENT} 32%, transparent)`,
-            }}
-            title={data.judgeLabel}
-          >
+          <span className={`nomi-dag-kind-badge ${PILL_CLASS}`} style={tintedPill(JUDGE_ACCENT)} title={data.judgeLabel}>
             <Gavel theme='outline' size='10' strokeWidth={4} className='line-height-0' />
             {data.judgeLabel}
           </span>
         )}
         {isLoop && (
-          <span
-            className='nomi-dag-kind-badge inline-flex shrink-0 items-center gap-3px rd-100px px-6px py-2px text-10px font-600 leading-none'
-            style={{
-              color: LOOP_ACCENT,
-              background: `color-mix(in srgb, ${LOOP_ACCENT} 14%, transparent)`,
-              border: `1px solid color-mix(in srgb, ${LOOP_ACCENT} 32%, transparent)`,
-            }}
-            title={data.loopLabel}
-          >
+          <span className={`nomi-dag-kind-badge ${PILL_CLASS}`} style={tintedPill(LOOP_ACCENT)} title={data.loopLabel}>
             <Refresh theme='outline' size='10' strokeWidth={4} className='line-height-0' />
             {data.loopLabel}
           </span>
@@ -343,11 +342,8 @@ function TaskNodeImpl({ data, selected }: NodeProps<TaskFlowNode>) {
         {isVerify && data.verifyVerdict && (() => {
           const { pass, tally } = data.verifyVerdict;
           const labels = data.verifyVerdictLabels;
-          // pass===true → success · pass===false → danger · pass===null → neutral
-          // "verifying…" (no hardcoded var(--text-tertiary) — undefined here; the
-          // defined --text-secondary / --color-fill-1 carry the neutral tone).
-          const tone =
-            pass === true ? 'var(--success)' : pass === false ? 'var(--danger)' : 'var(--text-secondary)';
+          // pass===true → success · pass===false → danger · pass===null → neutral.
+          const tone = pass === true ? 'var(--success)' : pass === false ? 'var(--danger)' : null;
           const text =
             pass === true
               ? `${labels?.pass ?? ''}${tally ? ` ${tally}` : ''}`
@@ -355,19 +351,7 @@ function TaskNodeImpl({ data, selected }: NodeProps<TaskFlowNode>) {
                 ? `${labels?.fail ?? ''}${tally ? ` ${tally}` : ''}`
                 : (labels?.pending ?? '');
           return (
-            <span
-              className='inline-flex shrink-0 items-center gap-3px rd-100px px-6px py-2px text-10px font-600 leading-none'
-              style={
-                pass === null
-                  ? { color: tone, background: 'var(--color-fill-1)', border: '1px solid var(--border-light)' }
-                  : {
-                      color: tone,
-                      background: `color-mix(in srgb, ${tone} 14%, transparent)`,
-                      border: `1px solid color-mix(in srgb, ${tone} 32%, transparent)`,
-                    }
-              }
-              title={text}
-            >
+            <span className={PILL_CLASS} style={tone ? tintedPill(tone) : NEUTRAL_PILL} title={text}>
               {pass === true && (
                 <CheckOne theme='outline' size='10' strokeWidth={4} className='shrink-0 line-height-0' />
               )}
@@ -382,27 +366,11 @@ function TaskNodeImpl({ data, selected }: NodeProps<TaskFlowNode>) {
           const { winner, judges } = data.judgeWinner;
           const labels = data.judgeWinnerLabels;
           const hasWinner = winner !== null;
-          // hasWinner → success/trophy tone · no winner / pending → neutral
-          // (defined --text-secondary / --color-fill-1 — never undefined
-          // var(--text-tertiary) / var(--fill-1)).
-          const tone = hasWinner ? 'var(--success)' : 'var(--text-secondary)';
           const text = hasWinner
             ? `${labels?.winner ?? ''} #${winner}${judges ? ` · ${judges}` : ''}`
             : (labels?.none ?? labels?.pending ?? '');
           return (
-            <span
-              className='inline-flex shrink-0 items-center gap-3px rd-100px px-6px py-2px text-10px font-600 leading-none'
-              style={
-                hasWinner
-                  ? {
-                      color: tone,
-                      background: `color-mix(in srgb, ${tone} 14%, transparent)`,
-                      border: `1px solid color-mix(in srgb, ${tone} 32%, transparent)`,
-                    }
-                  : { color: tone, background: 'var(--color-fill-1)', border: '1px solid var(--border-light)' }
-              }
-              title={text}
-            >
+            <span className={PILL_CLASS} style={hasWinner ? tintedPill('var(--success)') : NEUTRAL_PILL} title={text}>
               {hasWinner && (
                 <Trophy theme='outline' size='10' strokeWidth={4} className='shrink-0 line-height-0' />
               )}
@@ -413,11 +381,7 @@ function TaskNodeImpl({ data, selected }: NodeProps<TaskFlowNode>) {
         {isLoop && data.loopState && (() => {
           const { state, reason, iterations, maxIter } = data.loopState;
           const labels = data.loopStateLabels;
-          // state==='done' → success · state==='failed' → danger · null → neutral
-          // "iterating…" (defined --text-secondary / --color-fill-1 / --border-light
-          // — never undefined var(--text-tertiary) / var(--fill-1)).
-          const tone =
-            state === 'done' ? 'var(--success)' : state === 'failed' ? 'var(--danger)' : 'var(--text-secondary)';
+          const tone = state === 'done' ? 'var(--success)' : state === 'failed' ? 'var(--danger)' : null;
           // DONE shows the iteration tally (N/M) + reason; FAILED shows the reason;
           // null shows the neutral "iterating…" label. Reason is best-effort extra.
           const reasonSuffix = reason ? ` · ${reason}` : '';
@@ -428,19 +392,7 @@ function TaskNodeImpl({ data, selected }: NodeProps<TaskFlowNode>) {
                 ? `${labels?.failed ?? ''}${reasonSuffix}`
                 : (labels?.iterating ?? '');
           return (
-            <span
-              className='inline-flex shrink-0 items-center gap-3px rd-100px px-6px py-2px text-10px font-600 leading-none'
-              style={
-                state === null
-                  ? { color: tone, background: 'var(--color-fill-1)', border: '1px solid var(--border-light)' }
-                  : {
-                      color: tone,
-                      background: `color-mix(in srgb, ${tone} 14%, transparent)`,
-                      border: `1px solid color-mix(in srgb, ${tone} 32%, transparent)`,
-                    }
-              }
-              title={text}
-            >
+            <span className={PILL_CLASS} style={tone ? tintedPill(tone) : NEUTRAL_PILL} title={text}>
               {state === 'done' && (
                 <CheckOne theme='outline' size='10' strokeWidth={4} className='shrink-0 line-height-0' />
               )}
@@ -485,11 +437,7 @@ function TaskNodeImpl({ data, selected }: NodeProps<TaskFlowNode>) {
         {inGroup && groupColor && (
           <span
             className='inline-flex max-w-[150px] items-center gap-3px rd-100px px-6px py-2px text-10px font-500 leading-none'
-            style={{
-              color: groupColor,
-              background: `color-mix(in srgb, ${groupColor} 14%, transparent)`,
-              border: `1px solid color-mix(in srgb, ${groupColor} 30%, transparent)`,
-            }}
+            style={tintedPill(groupColor)}
             title={data.groupChipLabel}
           >
             <Branch theme='outline' size='10' strokeWidth={4} className='shrink-0 line-height-0' />
@@ -507,6 +455,23 @@ function TaskNodeImpl({ data, selected }: NodeProps<TaskFlowNode>) {
           </span>
         )}
       </div>
+
+      {/* 审批模式（需求5）：挂起的决策问题 → 醒目提问条（缓脉冲徽标 + 问题预览）。
+          点击整卡即投影进 worker 会话作答。 */}
+      {hasQuestion && (
+        <div
+          className='nomi-dag-question flex items-start gap-6px rd-8px px-8px py-6px'
+          title={data.pendingQuestion}
+        >
+          <span className='nomi-dag-question-pulse mt-1px shrink-0 line-height-0' style={{ color: 'var(--warning)' }}>
+            <Help theme='filled' size='13' />
+          </span>
+          <span className='min-w-0 flex-1 text-11px leading-15px line-clamp-2' style={{ color: 'var(--warning)' }}>
+            {data.questionLabel && <b className='mr-4px'>{data.questionLabel}</b>}
+            {data.pendingQuestion}
+          </span>
+        </div>
+      )}
 
       {/* Outgoing-dependency anchor (bottom) */}
       <Handle

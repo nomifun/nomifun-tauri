@@ -34,11 +34,13 @@ import NomiChat from '../platforms/nomi/NomiChat';
 import { useNomiModelSelection } from '../platforms/nomi/useNomiModelSelection';
 import CompanionChatPanel from '@/renderer/pages/nomi/companion/CompanionChatPanel';
 import GuidCollaboratorSelector from '@/renderer/pages/guid/components/GuidCollaboratorSelector';
+import ClusterModePill from './ClusterModePill';
 import type { TModelRange, TModelRef } from '@/common/types/orchestrator/orchestratorTypes';
 import { OrchestrationProvider } from '../orchestration/OrchestrationContext';
 import OrchestrationTopPanel from '../orchestration/OrchestrationTopPanel';
 import ConversationContentSwitcher from '../orchestration/ConversationContentSwitcher';
 import PlanApprovalBanner from '../orchestration/PlanApprovalBanner';
+import ClusterProgressStrip from '../orchestration/ClusterProgressStrip';
 import StarOfficeMonitorCard from '../platforms/openclaw/StarOfficeMonitorCard.tsx';
 // import SkillRuleGenerator from './components/SkillRuleGenerator'; // Temporarily hidden
 
@@ -233,13 +235,18 @@ const NomiConversationPanel: React.FC<{ conversation: NomiConversation; sliderTi
 
   // 会话内「协作模型」选择器:主模型选择器旁的 pill。锁定伙伴表面走
   // CompanionChatPanel(不经此面板),故此处天然只在普通会话构造。
+  // 「agent 集群」pill（需求1/5）与其同槽注入:集群模式 + 节点审批模式开关,
+  // 写回会话 extra(agent_cluster_mode / orchestrator_approval_mode)。
   const collaboratorSelectorNode = (
-    <GuidCollaboratorSelector
-      value={collaborators}
-      onChange={onCollaboratorsChange}
-      mainModel={mainModelRef}
-      className='nomi-sendbox-model-btn'
-    />
+    <>
+      <ClusterModePill conversation={conversation} />
+      <GuidCollaboratorSelector
+        value={collaborators}
+        onChange={onCollaboratorsChange}
+        mainModel={mainModelRef}
+        className='nomi-sendbox-model-btn'
+      />
+    </>
   );
 
   const { providers: healProviders, getAvailableModels: healGetAvailable } = useModelProviderList();
@@ -305,6 +312,10 @@ const NomiConversationPanel: React.FC<{ conversation: NomiConversation; sliderTi
             {/* 智能编排「编排后不自动执行」提示条:仅当本会话关联的 run 停在
                 awaiting_plan_approval 时显示,复用批准 IPC;其余情况渲染 null。 */}
             <PlanApprovalBanner />
+            {/* agent 集群实时进度层（需求4）：run 存在即显示——规划叙事 + 每节点
+                实时 chip + 审批模式提问横幅；点击 chip/横幅直接投影进该 worker。
+                纯 WS 驱动、零 LLM 成本，是「每个阶段环节都有反馈」的保障层。 */}
+            <ClusterProgressStrip />
             {/* Content-area projection (会话原生编排, F7): keeps NomiChat ALWAYS
                 mounted and just toggles its visibility, overlaying a clicked DAG
                 worker node's read-only transcript when a node is projected. Node

@@ -1775,6 +1775,13 @@ export interface ICreateConversationParams {
      *  gateway handler from the conversation's extra (deterministic, not via the
      *  LLM). Absent ⇒ Auto (every enabled model). */
     orchestrator_model_range?: TModelRange;
+    /** 「agent 集群」意图标记（需求1）：composer 顶部 toggle 选中后落此键。后端
+     *  nomi 工厂据此在常驻 subagent 提示之上追加 CLUSTER_MODE_HINT（对每个任务
+     *  刻意评估是否开集群、太简单先向用户说明原因）。 */
+    agent_cluster_mode?: boolean;
+    /** 节点级审批模式（需求5，迁移 030）：'manual' = 集群节点遇关键决策挂起向
+     *  用户提问；'auto'/缺省 = 全授权。建 run 时由网关从会话 extra 读取生效。 */
+    orchestrator_approval_mode?: string;
     /** Transient: preset opt-in skills. Consumed by backend create handler
      *  and stripped before persistence. */
     preset_enabled_skills?: string[];

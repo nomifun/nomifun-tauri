@@ -7,7 +7,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Dropdown, Menu, Spin } from '@arco-design/web-react';
-import { Brain, Comment, Down, Left, Redo, CheckOne } from '@icon-park/react';
+import { Brain, Comment, Down, Help, Left, Redo, CheckOne } from '@icon-park/react';
 import { ipcBridge } from '@/common';
 import type { TChatConversation } from '@/common/config/storage';
 import type { TModelRef, TTaskConfigUpdate } from '@/common/types/orchestrator/orchestratorTypes';
@@ -400,6 +400,27 @@ const ProjectedWorkerView: React.FC<ProjectedWorkerViewProps> = ({ payload }) =>
           </div>
         </div>
       </div>
+
+      {/* ── 审批模式（需求5）：节点挂起的决策问题——原文横幅 + 恢复路径提示。
+          用户在下方 worker 会话里直接回复选择，然后点「采用为该节点产出」继续。 */}
+      {task.status === 'needs_review' && task.pending_question?.trim() && (
+        <div className={styles.questionBanner} role='status'>
+          <span className={styles.questionIcon}>
+            <Help theme='filled' size='15' />
+          </span>
+          <div className={styles.questionBody}>
+            <span className={styles.questionEyebrow}>
+              {t('orchestrator.run.question.eyebrow', { defaultValue: '节点决策问题' })}
+            </span>
+            <span className={styles.questionContent}>{task.pending_question}</span>
+            <span className={styles.questionHint}>
+              {t('orchestrator.run.question.answerHint', {
+                defaultValue: '在下方对话框直接回复你的选择；节点产出满意后点「采用为该节点产出」继续执行。',
+              })}
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* ── Body: the worker conversation, EDITABLE (full NomiSendBox reused) ──
           Not-started / loading covered; otherwise the worker's own conversation

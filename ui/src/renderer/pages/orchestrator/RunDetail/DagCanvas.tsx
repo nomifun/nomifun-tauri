@@ -6,42 +6,23 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ReactFlow, Background, BackgroundVariant, Controls, MiniMap, type Edge, type ReactFlowInstance } from '@xyflow/react';
+import { ReactFlow, Background, BackgroundVariant, Controls, MiniMap, type Edge } from '@xyflow/react';
+import type { ReactFlowInstance } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import './dag-canvas.css';
 import { Branch } from '@icon-park/react';
 import { Spin } from '@arco-design/web-react';
-import type { TAssignment, TFleetMember, TRunTask } from '@/common/types/orchestrator/orchestratorTypes';
-import { useRunLive } from '../useRunLive';
+import type { TAssignment, TFleetMember, TRunDetail, TRunTask } from '@/common/types/orchestrator/orchestratorTypes';
+import type { LeadThinkingState } from '../useLeadThinking';
 import { layoutDag } from './layoutDag';
 import { memberLogo, memberShortLabel } from './memberLabel';
 import RolePrecipitationPanel from './RolePrecipitationPanel';
 import TaskNode, { normalizeTaskKind, type TaskFlowNode, type JudgeWinner, type LoopState, type VerifyVerdict } from './nodes/TaskNode';
-import MainNode, { type MainFlowNode } from './nodes/MainNode';
 
-/** Stable nodeTypes refs so react-flow doesn't warn about a new object each
- * render. Two frozen variants keep the backward-compatible path byte-identical:
- * `NODE_TYPES` (task-only) is used when `onOpenMain` is absent — exactly as
- * before — and `NODE_TYPES_WITH_MAIN` additionally registers the synthetic main
- * node only when a consumer opts into it. */
+/** Stable nodeTypes ref so react-flow doesn't warn about a new object each
+ * render. Task-only: the synthetic main/lead node was removed (需求5 —— main
+ * agent 贯穿全程、非首节点，不再在画布上呈现；其产出由会话内回执转述)。 */
 const NODE_TYPES = { task: TaskNode } as const;
-const NODE_TYPES_WITH_MAIN = { task: TaskNode, main: MainNode } as const;
-
-/** Stable id for the synthetic lead/main agent node injected above the root
- * tasks when `onOpenMain` is provided. Underscore-fenced so it can never collide
- * with a real task id. */
-const MAIN_NODE_ID = '__main__';
-
-/** Vertical offset (px) applied to the OUTPUT of {@link layoutDag} so every task
- * node shifts down one row, freeing the top row for the synthetic main node.
- * Applied ONLY when the main node is injected; `layoutDag` itself is never
- * touched. Matches `layoutDag`'s own `ROW_STEP` so the main→root spacing reads
- * as one consistent dependency layer. */
-const MAIN_ROW_OFFSET = 140;
-
-/** Any node this canvas can render — a task node, or (only when `onOpenMain` is
- * given) the synthetic main node. */
-type DagFlowNode = TaskFlowNode | MainFlowNode;
 
 /** Neutral verdict for a verify node whose marker is absent / unparseable / still
  * settling — renders the pill in its neutral "verifying…" state instead of a
@@ -177,31 +158,6 @@ function hueForGroup(label: string): number {
   return hash;
 }
 
-/**
- * The set of in-degree-0 ("root") task ids — tasks with no blocker among the
- * run's real tasks. Mirrors {@link layoutDag}'s edge filter (only deps whose
- * BOTH endpoints are real tasks count) so the roots we connect the synthetic
- * main node to are exactly the tasks `layoutDag` places at its top layer.
- * Used ONLY on the `onOpenMain`-provided path; never affects the default path.
- */
-function computeRootTaskIds(
-  tasks: TRunTask[],
-  deps: { blocker_task_id: string; blocked_task_id: string }[]
-): Set<string> {
-  const taskIds = new Set(tasks.map((task) => task.id));
-  const hasBlocker = new Set<string>();
-  for (const dep of deps) {
-    if (taskIds.has(dep.blocker_task_id) && taskIds.has(dep.blocked_task_id)) {
-      hasBlocker.add(dep.blocked_task_id);
-    }
-  }
-  const roots = new Set<string>();
-  for (const id of taskIds) {
-    if (!hasBlocker.has(id)) roots.add(id);
-  }
-  return roots;
-}
-
 /** fitView tuning — shared by the static `fitView` prop (initial mount) and the
  * ResizeObserver-driven refit (see below). A small padding keeps the DAG from
  * wasting the narrow conversation rail's width, while a generous maxZoom lets a
@@ -298,40 +254,41 @@ export interface OpenTaskPayload {
 
 interface DagCanvasProps {
   runId: string;
+  /** The run detail — SINGLE SOURCE (需求3 性能): the canvas no longer holds its
+   * own `useRunLive` subscription; the consumer (OrchestrationTopPanel) passes
+   * the context's live detail down, so one run has exactly ONE WS→REST loop. */
+  detail: TRunDetail | null;
+  /** First-load indicator from the shared live hook. */
+  loading: boolean;
+  /** Shared refetch (threaded into {@link OpenTaskPayload}). */
+  refetch: () => Promise<void>;
   onOpenTask: (payload: OpenTaskPayload) => void;
-  /** When provided, render a synthetic lead/main agent node above the root tasks
-   * (wired to this callback). When ABSENT, the canvas behaves EXACTLY as before
-   * — no main node, no extra edges, no layout shift (backward compatibility for
-   * the still-living RunView consumer until F9). */
-  onOpenMain?: () => void;
-  /** When the main node is rendered, highlight it (the lead conversation is the
-   * currently-projected view). Ignored when `onOpenMain` is absent. */
-  mainActive?: boolean;
+  /** Lead planning stream — drives the planning placeholder's live narration
+   * (phase keys + reasoning tail) so the user SEES the design process instead of
+   * a static "规划中" (需求3 体感). Optional: absent = static placeholder. */
+  leadThinking?: LeadThinkingState;
   /** The currently-projected task id (the conversation's content-area projection
    * state). The matching task node renders in its `selected` state so the canvas
    * mirrors EXACTLY what the content area is showing — clicking a node feels
-   * responsive instead of "nothing happened". `null`/absent → no task selected
-   * (the main conversation is projected; the synthetic main node carries its own
-   * `mainActive` ring instead). Selection is driven SOLELY by this prop —
-   * react-flow's own interaction-selection is turned off (`elementsSelectable=
-   * false`) so the canvas never fights the projection state with a discarded,
-   * flickering internal selection. */
+   * responsive instead of "nothing happened". `null`/absent → no task selected.
+   * Selection is driven SOLELY by this prop — react-flow's own
+   * interaction-selection is turned off (`elementsSelectable=false`) so the
+   * canvas never fights the projection state with a discarded, flickering
+   * internal selection. */
   activeTaskId?: string | null;
 }
 
 /**
- * DagCanvas — the visual centerpiece of 「智能编排」. Renders a run's task DAG as
- * an interactive react-flow graph: each task is a custom {@link TaskNode}, each
- * `blocker → blocked` dependency is an edge (animated while the downstream task
- * runs). Live-updates via {@link useRunLive}; clicking a node opens the worker
- * transcript panel (Task 5) through `onOpenTask`.
+ * DagCanvas — the visual centerpiece of「agent 集群」. Renders a run's task DAG
+ * as an interactive react-flow graph: each task is a custom {@link TaskNode},
+ * each `blocker → blocked` dependency is an edge (animated while the downstream
+ * task runs). Live data arrives via props from the shared orchestration context
+ * (single `useRunLive` instance); clicking a node projects the worker
+ * conversation into the content area through `onOpenTask`.
  *
- * The run title + status + run controls (cancel / approve / pause / resume) used
- * to live in this canvas' own header; they were lifted UP into {@link RunView}'s
- * shared conversation-style glass header (Task F3) so they are reachable from
- * both the 对话 and 编排画布 views and rendered exactly once. This component is
- * now canvas-only: the react-flow graph, the planning / empty states, and the
- * completed-run {@link RolePrecipitationPanel}.
+ * The synthetic lead/main agent node was REMOVED (需求5): the main agent is a
+ * through-line, not a first node — its narration lives in the conversation
+ * (receipts + ClusterProgressStrip), so the canvas shows ONLY the real task DAG.
  *
  * Positions prefer the task's persisted `graph_x/graph_y` and otherwise fall
  * back to a topological auto-layout ({@link layoutDag}). react-flow's JS-side
@@ -339,9 +296,16 @@ interface DagCanvasProps {
  * `data-theme` attribute into `colorMode` + resolved colors via a MutationObserver
  * (template: MermaidBlock).
  */
-const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onOpenTask, onOpenMain, mainActive, activeTaskId }) => {
-  const { t } = useTranslation();
-  const { detail, loading, refetch } = useRunLive(runId);
+const DagCanvas: React.FC<DagCanvasProps> = ({
+  runId,
+  detail,
+  loading,
+  refetch,
+  onOpenTask,
+  leadThinking,
+  activeTaskId,
+}) => {
+  const { t, i18n } = useTranslation();
 
   // The static `fitView` prop fits ONCE at initial mount. If the canvas ever
   // mounts inside a COLLAPSED / ~0-size
@@ -352,7 +316,7 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onOpenTask, onOpenMain, ma
   // becomes visible). The standalone orchestrator page is sized at mount, so it
   // simply gets a harmless extra refit. `wasVisibleRef` guards against thrashing
   // by only firing on the 0→visible edge.
-  const rfRef = useRef<ReactFlowInstance<DagFlowNode, Edge> | null>(null);
+  const rfRef = useRef<ReactFlowInstance<TaskFlowNode, Edge> | null>(null);
   const flowWrapRef = useRef<HTMLDivElement | null>(null);
   const wasVisibleRef = useRef(false);
   // Node-object identity cache (keyed by node id → {signature, object}). Reusing
@@ -362,7 +326,7 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onOpenTask, onOpenMain, ma
   // object every render (on click / live refetch), which resets handleBounds and
   // (with the previous declared-handles hack) permanently broke the edge
   // geometry until a remount. See the note above `buildNodes` below.
-  const nodeCacheRef = useRef<Map<string, { sig: string; node: DagFlowNode }>>(new Map());
+  const nodeCacheRef = useRef<Map<string, { sig: string; node: TaskFlowNode }>>(new Map());
   useEffect(() => {
     const el = flowWrapRef.current;
     if (!el) return;
@@ -443,10 +407,13 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onOpenTask, onOpenMain, ma
     [onOpenTask, assignmentByTask, fleetMembers, runId, refetch]
   );
 
-  const nodes = useMemo<DagFlowNode[]>(() => {
+  const nodes = useMemo<TaskFlowNode[]>(() => {
     const tasks = detail?.tasks ?? [];
     const deps = detail?.deps ?? [];
-    if (tasks.length === 0) return [];
+    if (tasks.length === 0) {
+      nodeCacheRef.current.clear();
+      return [];
+    }
     const fallback = layoutDag(tasks, deps);
     // Resolve each fan-out group's shared hue once (deterministic from the label)
     // so every sibling in a group lands on the same tint.
@@ -476,26 +443,19 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onOpenTask, onOpenMain, ma
     // unchanged, so react-flow keeps its already-measured handleBounds untouched —
     // meaning only the one node whose selection actually flipped re-measures, and
     // every other edge stays rock-steady across clicks.
-    const reuse = <T extends DagFlowNode>(id: string, sig: string, build: () => T): T => {
-      const cached = nodeCacheRef.current.get(id);
-      if (cached && cached.sig === sig) return cached.node as T;
+    const cache = nodeCacheRef.current;
+    const reuse = (id: string, sig: string, build: () => TaskFlowNode): TaskFlowNode => {
+      const cached = cache.get(id);
+      if (cached && cached.sig === sig) return cached.node;
       const node = build();
-      nodeCacheRef.current.set(id, { sig, node });
+      cache.set(id, { sig, node });
       return node;
     };
-    // BACKWARD COMPAT: when no `onOpenMain` is given we shift NOTHING — `offsetY`
-    // is 0 so the position object is computed exactly as before (and the array
-    // below holds only task nodes, with no injected main / edges).
-    const withMain = onOpenMain != null;
-    const offsetY = withMain ? MAIN_ROW_OFFSET : 0;
-    const taskNodes: TaskFlowNode[] = tasks.map((task) => {
+    const taskNodes: TaskFlowNode[] = tasks.map((task, index) => {
       const pos =
         task.graph_x != null && task.graph_y != null
-          ? { x: task.graph_x, y: task.graph_y + offsetY }
-          : (() => {
-              const base = fallback[task.id] ?? { x: 0, y: 0 };
-              return { x: base.x, y: base.y + offsetY };
-            })();
+          ? { x: task.graph_x, y: task.graph_y }
+          : (fallback[task.id] ?? { x: 0, y: 0 });
       const assignment = assignmentByTask.get(task.id);
       const member = assignment ? memberById.get(assignment.member_id) : undefined;
       // Friendly label from the fleet snapshot; fall back to the localized
@@ -509,7 +469,32 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onOpenTask, onOpenMain, ma
       const groupLabel = parseGroupLabel(task.pattern_config);
       const groupHue = groupLabel ? hueByGroup.get(groupLabel) : undefined;
       const selected = activeTaskId != null && task.id === activeTaskId;
-      const built: TaskFlowNode = {
+      const pendingQuestion = task.pending_question?.trim() ? task.pending_question : undefined;
+      // 廉价签名（需求3 性能）：手工拼渲染相关字段，替代整对象 JSON.stringify。
+      // 覆盖 data 的全部“信息源”字段——status/title/kind/output_summary（verify/
+      // judge/loop pill 全由它派生）/分组/成员/锁/attempt/tokens/提问/选中/坐标/
+      // 入场序号/语言（本地化文案随语言切换必须重建）。新增 TaskNodeData 字段时
+      // 必须同步加入这里，否则该字段变化不会触发节点对象重建（渲染不更新）。
+      const sig = [
+        i18n.language,
+        task.status,
+        task.title,
+        task.kind,
+        task.output_summary ?? '',
+        groupLabel ?? '',
+        assignment?.member_id ?? '',
+        friendly ?? '',
+        memberLogo(member) ?? '',
+        assignment?.locked ? '1' : '0',
+        task.attempt,
+        task.tokens ?? '',
+        pendingQuestion ?? '',
+        selected ? '1' : '0',
+        pos.x,
+        pos.y,
+        index,
+      ].join('');
+      return reuse(task.id, sig, () => ({
         id: task.id,
         type: 'task',
         // react-flow forwards `selected` to NodeProps.selected (TaskNode's ring).
@@ -527,6 +512,8 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onOpenTask, onOpenMain, ma
             defaultValue: t('orchestrator.run.status.unknown'),
           }),
           kind: task.kind,
+          // 入场动画序号（需求2 精美化）：错峰淡入上浮，上限之外不再递增延迟。
+          enterIndex: Math.min(index, 12),
           synthesisLabel: isSynthesis ? t('orchestrator.run.kind.synthesis') : undefined,
           verifyLabel: isVerify ? t('orchestrator.run.kind.verify') : undefined,
           verifyVerdict: isVerify ? parseVerifyVerdict(task.output_summary) : undefined,
@@ -567,92 +554,47 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onOpenTask, onOpenMain, ma
           attempt: task.attempt,
           tokens: task.tokens,
           tokensLabel: t('orchestrator.run.node.tokens'),
+          // 审批模式（需求5）：节点挂起的决策问题 → 提问徽标 + 琥珀 ring。
+          pendingQuestion,
+          questionLabel: pendingQuestion
+            ? t('orchestrator.run.question.badge', { defaultValue: '待作答' })
+            : undefined,
           onOpen: () => handleOpenTask(task),
         },
-      };
-      // Reuse the prior object when nothing render-relevant changed. `onOpen` is a
-      // function → omitted by JSON.stringify, so a same-content node reuses its
-      // object (react-flow keeps its measured handleBounds); only a node whose
-      // status/selection/data actually changed gets a fresh object + re-measure.
-      const sig = JSON.stringify(built);
-      return reuse(task.id, sig, () => built);
+      }));
     });
 
-    // BACKWARD COMPAT: without `onOpenMain` we return the task nodes untouched —
-    // identical array shape, positions, and ordering as before this prop existed.
-    if (!withMain || onOpenMain == null) return taskNodes;
-
-    // Center the main node horizontally over the in-degree-0 root tasks' top row
-    // (the layer that was originally at y=0, now shifted to y=MAIN_ROW_OFFSET).
-    const rootIds = computeRootTaskIds(tasks, deps);
-    const topRowXs = taskNodes
-      .filter((n) => rootIds.has(n.id) && n.position.y === offsetY)
-      .map((n) => n.position.x);
-    // Fall back to every node's x if the root row can't be isolated (e.g. a
-    // dependency cycle left no node at the top row) so the main node still
-    // centers sensibly instead of snapping to x=0.
-    const xsForCenter = topRowXs.length > 0 ? topRowXs : taskNodes.map((n) => n.position.x);
-    const minX = Math.min(...xsForCenter);
-    const maxX = Math.max(...xsForCenter);
-    const mainX = (minX + maxX) / 2;
-
-    const mainBuilt: MainFlowNode = {
-      id: MAIN_NODE_ID,
-      type: 'main',
-      // "You are here" highlight comes from data.active (brand ring), not the blue
-      // selection ring — keep it unselected so the two affordances stay distinct.
-      selected: false,
-      position: { x: mainX, y: 0 },
-      initialWidth: MINIMAP_NODE_W,
-      initialHeight: MINIMAP_NODE_H,
-      data: {
-        label: t('orchestrator.run.canvas.mainNode', { defaultValue: 'main · 主 agent' }),
-        active: mainActive ?? false,
-        onOpen: onOpenMain,
-      },
-    };
-    const mainNode = reuse(MAIN_NODE_ID, JSON.stringify(mainBuilt), () => mainBuilt);
-    return [mainNode, ...taskNodes];
-  }, [detail?.tasks, detail?.deps, assignmentByTask, memberById, handleOpenTask, t, onOpenMain, mainActive, activeTaskId]);
+    // 缓存清理（需求7 资源）：剔除已不在本轮 tasks 里的节点（replan/调整删除的
+    // 任务），长会话下缓存不随历史节点无界增长。
+    if (cache.size > taskNodes.length) {
+      const liveIds = new Set(tasks.map((task) => task.id));
+      for (const key of cache.keys()) {
+        if (!liveIds.has(key)) cache.delete(key);
+      }
+    }
+    return taskNodes;
+  }, [detail?.tasks, detail?.deps, assignmentByTask, memberById, handleOpenTask, t, i18n.language, activeTaskId]);
 
   const edges = useMemo<Edge[]>(() => {
     const tasks = detail?.tasks ?? [];
     const deps = detail?.deps ?? [];
     const statusById = new Map(tasks.map((task) => [task.id, task.status]));
-    const depEdges = deps.map((dep) => {
+    return deps.map((dep) => {
       const downstreamRunning = statusById.get(dep.blocked_task_id) === 'running';
       return {
         id: `${dep.blocker_task_id}->${dep.blocked_task_id}`,
         source: dep.blocker_task_id,
         target: dep.blocked_task_id,
         animated: downstreamRunning,
+        // 流光样式类（需求2）：下游 running 时边缘发亮流动，静止边保持淡雅。
+        className: downstreamRunning ? 'nomi-dag-edge-live' : undefined,
         style: {
           stroke: downstreamRunning ? 'rgb(var(--primary-6))' : 'var(--border-base)',
           strokeWidth: downstreamRunning ? 2 : 1.5,
         },
       };
     });
-
-    // BACKWARD COMPAT: without `onOpenMain` the edges are exactly the dependency
-    // edges as before — no main→root wiring.
-    if (onOpenMain == null || tasks.length === 0) return depEdges;
-
-    // Connect the synthetic main node down to each in-degree-0 root task. Reuse
-    // the resting (non-running) edge style — `var(--border-base)` via flowColors'
-    // theme — so the main→root links read as the same calm dependency layer.
-    const rootIds = computeRootTaskIds(tasks, deps);
-    const mainEdges: Edge[] = [];
-    for (const rootId of rootIds) {
-      mainEdges.push({
-        id: `e-main-${rootId}`,
-        source: MAIN_NODE_ID,
-        target: rootId,
-        animated: false,
-        style: { stroke: 'var(--border-base)', strokeWidth: 1.5 },
-      });
-    }
-    return [...mainEdges, ...depEdges];
-  }, [detail?.tasks, detail?.deps, onOpenMain]);
+  }, [detail?.tasks, detail?.deps]);
 
   // First load with no detail yet.
   if (loading && !detail) {
@@ -677,6 +619,17 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onOpenTask, onOpenMain, ma
   }
 
   const noTasks = detail.tasks.length === 0;
+  // 规划叙事（需求3 体感）：把 leadThinking 的阶段 key 逐条点亮 + reasoning 尾巴，
+  // 让用户在计划落地前就看见主 agent 的设计流程在推进。key→文案映射复用
+  // orchestrator.run.thinking.phase.*（与 RunDecisionFeed 的 phaseNarration 同源）。
+  const PHASE_I18N: Record<string, string> = {
+    planning_started: 'orchestrator.run.thinking.phase.planningStarted',
+    decomposing: 'orchestrator.run.thinking.phase.decomposing',
+    assigning: 'orchestrator.run.thinking.phase.assigning',
+    plan_ready: 'orchestrator.run.thinking.phase.planReady',
+  };
+  const phaseKeys = leadThinking?.phaseKeys ?? [];
+  const reasoningTail = (leadThinking?.reasoning ?? '').trim().slice(-160);
 
   return (
     <div className='size-full min-h-0 flex flex-col'>
@@ -698,6 +651,20 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onOpenTask, onOpenMain, ma
             <div className='max-w-320px text-12px leading-18px text-t-tertiary'>
               {t('orchestrator.run.detail.planningDesc')}
             </div>
+            {phaseKeys.length > 0 && (
+              <div className='flex max-w-340px flex-col items-stretch gap-4px' aria-live='polite'>
+                {phaseKeys.slice(-4).map((key) => (
+                  <div key={key} className='nomi-dag-phase-line text-12px leading-18px text-t-secondary'>
+                    {PHASE_I18N[key] ? t(PHASE_I18N[key]) : key}
+                  </div>
+                ))}
+              </div>
+            )}
+            {leadThinking?.active && reasoningTail && (
+              <div className='nomi-dag-reasoning-tail max-w-340px text-11px leading-16px text-t-tertiary'>
+                {reasoningTail}
+              </div>
+            )}
           </div>
         ) : (
           <ReactFlow
@@ -707,7 +674,7 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onOpenTask, onOpenMain, ma
             }}
             nodes={nodes}
             edges={edges}
-            nodeTypes={onOpenMain != null ? NODE_TYPES_WITH_MAIN : NODE_TYPES}
+            nodeTypes={NODE_TYPES}
             colorMode={theme}
             fitView
             fitViewOptions={FIT_VIEW_OPTIONS}
@@ -726,7 +693,7 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ runId, onOpenTask, onOpenMain, ma
             // via `nodesDraggable`).
             elementsSelectable={false}
           >
-            <Background variant={BackgroundVariant.Dots} gap={20} size={1.4} color={flowColors.dots} />
+            <Background variant={BackgroundVariant.Dots} gap={22} size={1.2} color={flowColors.dots} />
             <Controls showInteractive={false} />
             <MiniMap
               pannable

@@ -581,5 +581,20 @@
     "success": "Context cleared",
     "failed": "Failed to clear context",
     "button": "Clear context"
+  },
+  "cluster": {
+    "stripTitle": "Agent cluster",
+    "progress": "{{done}}/{{total}} nodes delivered",
+    "expand": "Expand cluster progress",
+    "collapse": "Collapse cluster progress",
+    "questionBanner": "Node \"{{title}}\" has a decision question for you",
+    "questionCta": "Answer →",
+    "toggleTitle": "Agent cluster",
+    "toggleDesc": "The lead agent deliberately evaluates each task for multi-agent teamwork; trivial tasks get a stated reason and a direct answer.",
+    "approvalTitle": "Node approval mode",
+    "approvalDesc": "Nodes park and ask you on key decisions — answer inside the node to continue; off = fully autonomous nodes.",
+    "pillAria": "Agent cluster settings",
+    "pill": "Cluster",
+    "approvalShort": "Approve"
   }
 }

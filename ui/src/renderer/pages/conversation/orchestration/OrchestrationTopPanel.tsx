@@ -69,9 +69,12 @@ function readInitialCollapsed(): boolean {
  *  - expanded → a width-resizable column: a left-edge drag handle to widen/narrow;
  *    a header (collapse 「›」 + 「编排画布」title + status pill {@link STATUS_META} +
  *    「规划中…」hint + compact {@link RunControls}); and a full-height body hosting
- *    the lazy {@link DagCanvas} (node → `projectTask`, main → `returnToMain`,
- *    `mainActive = projectedTaskId === null`; the completion RolePrecipitationPanel
- *    and the minimap come from the canvas itself).
+ *    the lazy {@link DagCanvas} (SINGLE data source: the context's live
+ *    detail/loading/refetch are passed down — the canvas holds no subscription of
+ *    its own; node click → `projectTask`. The synthetic main node was removed
+ *    (需求5) — returning to the main conversation lives on ProjectedWorkerView's
+ *    「← 返回 main」). The completion RolePrecipitationPanel
+ *    and the minimap come from the canvas itself.
  *  - replan: RunControls' `onReplan` opens a standard Arco Modal (not a floating
  *    window) hosting the {@link OrchestratorComposer} (fluid) prefilled with the
  *    run's goal → `runs.replan` → toast + refetch + close.
@@ -137,7 +140,7 @@ const OrchestrationTopPanel: React.FC = () => {
   const [replanAutonomy, setReplanAutonomy] = useState<AutonomyLevel>('interactive');
   const [replanSubmitting, setReplanSubmitting] = useState(false);
 
-  const { runId, detail, leadThinking, refetch, projectTask, returnToMain, projectedTaskId } = orchestration;
+  const { runId, detail, leadThinking, loading, refetch, projectTask, projectedTaskId } = orchestration;
 
   const openReplan = useCallback(() => {
     const goal = orchestration.detail?.run.goal ?? '';
@@ -299,9 +302,11 @@ const OrchestrationTopPanel: React.FC = () => {
         >
           <DagCanvas
             runId={runId}
+            detail={detail}
+            loading={loading}
+            refetch={refetch}
             onOpenTask={projectTask}
-            onOpenMain={returnToMain}
-            mainActive={projectedTaskId === null}
+            leadThinking={leadThinking}
             activeTaskId={projectedTaskId}
           />
         </Suspense>

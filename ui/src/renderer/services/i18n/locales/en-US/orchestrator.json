@@ -119,8 +119,10 @@
     "node": {
       "tokens": "tok"
     },
-    "canvas": {
-      "mainNode": "main · lead agent"
+    "question": {
+      "badge": "Awaiting answer",
+      "eyebrow": "Node decision question",
+      "answerHint": "Reply with your choice in the composer below; once the output looks right, click \"Adopt as node output\" to continue."
     },
     "timing": {
       "took": "Took {{value}}",

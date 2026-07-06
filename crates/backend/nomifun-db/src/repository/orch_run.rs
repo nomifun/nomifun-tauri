@@ -233,6 +233,25 @@ pub trait IRunRepository: Send + Sync {
         preset_prompt: Option<String>,
     ) -> Result<(), sqlx::Error>;
 
+    /// 写 run 的节点级审批模式（迁移 030）：`Some("manual")` = 审批模式；`None` =
+    /// 置 NULL（读回视作 `"auto"` 全授权）。单列写 + `updated_at`，与
+    /// [`set_task_overrides`](Self::set_task_overrides) 同理独立于既有 Params，
+    /// 避免触碰大量 `UpdateRunParams` 调用点。
+    async fn set_run_approval_mode(
+        &self,
+        id: &str,
+        approval_mode: Option<&str>,
+    ) -> Result<(), sqlx::Error>;
+
+    /// 写/清任务挂起的决策问题（迁移 030）：`Some(q)` = worker 经 nomi_task_question
+    /// 提交问题；`None` = 解决后清空（采用产出/重跑）。状态迁移（↔ `needs_review`）
+    /// 由调用方经 [`update_task`](Self::update_task) 处理，本方法只管这一列。
+    async fn set_task_question(
+        &self,
+        id: &str,
+        question: Option<&str>,
+    ) -> Result<(), sqlx::Error>;
+
     /// Delete ONE task (`DELETE FROM orch_run_tasks WHERE id = ?`). The task-keyed
     /// `ON DELETE CASCADE` FKs (migration 018) sweep out that task's dependency
     /// edges (`orch_run_task_deps`, where the task is blocker OR blocked) and its

@@ -227,7 +227,7 @@ const KnowledgeListPage: React.FC = () => {
     }
   };
 
-  const handleCardMore = (base: IKnowledgeBase, _e: React.MouseEvent) => {
+  const handleCardDelete = (base: IKnowledgeBase, _e: React.MouseEvent) => {
     purgeRef.current = false;
     Modal.confirm({
       title: t('knowledge.actions.deleteConfirm', { defaultValue: '确认删除？' }),
@@ -368,7 +368,7 @@ const KnowledgeListPage: React.FC = () => {
                   tagMap={tagMap}
                   onOpen={(b) => navigate(`/knowledge/${b.id}`)}
                   onEdit={(b) => openEdit(b)}
-                  onMore={handleCardMore}
+                  onDelete={handleCardDelete}
                 />
               ))}
 

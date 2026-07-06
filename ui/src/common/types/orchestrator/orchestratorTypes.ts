@@ -127,6 +127,10 @@ export type TRun = {
   workspace_id?: string;
   goal: string;
   autonomy: string;
+  /** 节点级审批模式 (agent 集群, migration 030): `'auto'`（默认，全授权——节点遇
+   * 抉择自行判断）或 `'manual'`（审批模式——worker 可经 nomi_task_question 挂起
+   * 提问，由用户进入节点作答）。Backend serde-defaults missing/legacy to `'auto'`. */
+  approval_mode?: string;
   max_parallel?: number;
   status: string;
   summary?: string;
@@ -175,6 +179,10 @@ export type TRunTask = {
   /** User 预置要求 (migration 025) appended to the node's worker brief, separate
    * from the planner-written `spec`. Absent/blank = none. */
   preset_prompt?: string;
+  /** 节点挂起的决策问题原文 (agent 集群审批模式, migration 030)：worker 经
+   * nomi_task_question 提交、任务转入 `needs_review` 时在场；解决（采用产出/重跑）
+   * 后清空。前端据此渲染节点提问徽标与投影视图的问题横幅。 */
+  pending_question?: string;
   /** Creation / last-update timestamps (epoch ms). Drive per-task pacing in the
    * roster + inspector (用时 = updated_at − created_at, 相对时间). */
   created_at: number;

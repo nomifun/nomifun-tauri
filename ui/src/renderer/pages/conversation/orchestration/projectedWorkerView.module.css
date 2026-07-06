@@ -197,3 +197,66 @@
   line-height: 18px;
   color: var(--text-tertiary);
 }
+
+/* ── 审批模式（需求5）：节点决策问题横幅 ──────────────────────────────── */
+
+.questionBanner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 8px 16px 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--warning) 32%, transparent);
+  background: color-mix(in srgb, var(--warning) 10%, transparent);
+  flex-shrink: 0;
+}
+
+@keyframes worker-question-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.6;
+    transform: scale(0.88);
+  }
+}
+
+.questionIcon {
+  color: var(--warning);
+  line-height: 0;
+  flex-shrink: 0;
+  margin-top: 1px;
+  animation: worker-question-pulse 1.6s ease-in-out infinite;
+}
+
+.questionBody {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.questionEyebrow {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--warning);
+}
+
+.questionContent {
+  font-size: 13px;
+  line-height: 19px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.questionHint {
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--text-secondary);
+}

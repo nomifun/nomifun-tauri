@@ -74,6 +74,11 @@ export type GuidSendDeps = {
    * "conversation N is already running". */
   autoWork: AutoWorkDraftValue;
 
+  /** 「agent 集群」模式（需求1）：composer 顶部 toggle 选中时为 true。仅 nomi
+   * 路径消费——落到会话 extra.agent_cluster_mode，后端工厂据此在常驻 subagent
+   * 提示之上追加 CLUSTER_MODE_HINT（必须刻意评估是否开集群、太简单先说明原因）。 */
+  clusterMode?: boolean;
+
   // Mention state reset
   setMentionOpen: React.Dispatch<React.SetStateAction<boolean>>;
   setMentionQuery: React.Dispatch<React.SetStateAction<string | null>>;
@@ -132,6 +137,7 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
     isGoogleAuth,
     applyAdvancedConfig,
     autoWork,
+    clusterMode,
     setMentionOpen,
     setMentionQuery,
     setMentionSelectorOpen,
@@ -323,6 +329,9 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
             selected_session_mcp_servers: selectedAllSessionMcpServers,
             preset_assistant_id,
             session_mode: selectedMode,
+            // 「agent 集群」模式（需求1）：显式选中才落键；未选不写（旧会话/普通
+            // 会话 extra 零变化）。
+            agent_cluster_mode: clusterMode || undefined,
           },
         });
 

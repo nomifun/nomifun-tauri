@@ -1106,6 +1106,12 @@ fn compose_lead_receipt(
              可据此判断是否需要追加工作：如有必要用 nomi_run_add_tasks 往同一个 run 追加任务；\
              否则继续等待，终态时会给你完整回执。不要新建编排。"
         ),
+        RunOutcome::NodeQuestion => format!(
+            "[编排回执·节点提问] 你派发的编排（run {run_id}）中有一个节点遇到决策问题、已挂起等待人工选择：\n{brief}\n\
+             本 run 处于「审批模式」：请立即用一段话提醒用户——该节点已在画布与进度条上标出提问图标，\
+             请用户点击进入该节点会话，直接查看问题并回复选择；回复后在该节点点「采用为该节点产出」即可继续。\
+             你自己不要替用户作答，也不要重复创建编排。"
+        ),
     }
 }
 
@@ -1882,5 +1888,32 @@ mod tests {
         assert_eq!(loaded[0].name, "demo-ext");
 
         services.database.close().await;
+    }
+
+    // 迁移 030: NodeQuestion 回执 arm——审批模式下节点提问的回执必须：携带 brief
+    // （节点标题+问题原文）、指示 lead 提醒用户进入节点作答、禁止 lead 代答。
+    // NodeQuestion 非终态（非 Completed/Failed），autonomous 自评分支天然不劫持它。
+    #[test]
+    fn compose_lead_receipt_node_question_directs_user_to_node() {
+        let brief = "节点『竞品调研』：定价方案选 A（订阅）还是 B（买断）？";
+        let receipt = compose_lead_receipt(
+            "run_q1",
+            RunOutcome::NodeQuestion,
+            brief,
+            "autonomous", // 即便 autonomous，非终态 outcome 也走共享 arm
+            "做个定价页",
+            3,
+            1000,
+            false,
+        );
+        assert!(receipt.contains("节点提问"), "回执须标记节点提问: {receipt}");
+        assert!(receipt.contains("run_q1"), "回执须带 run id");
+        assert!(receipt.contains(brief), "回执须携带节点标题与问题原文");
+        assert!(receipt.contains("采用为该节点产出"), "回执须指出恢复路径");
+        assert!(receipt.contains("不要替用户作答"), "审批模式下 lead 不得代答");
+        assert!(
+            !receipt.contains("[自主编排回执]"),
+            "非终态 outcome 不得被 autonomous 自评分支劫持"
+        );
     }
 }

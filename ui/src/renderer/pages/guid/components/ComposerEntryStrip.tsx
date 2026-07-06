@@ -5,7 +5,7 @@
  */
 
 import { Trigger } from '@arco-design/web-react';
-import { Lightning, Robot } from '@icon-park/react';
+import { EveryUser, Lightning, Robot } from '@icon-park/react';
 import React, { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import styles from '../index.module.css';
@@ -25,15 +25,24 @@ export interface ComposerEntryStripProps {
   onFree: () => void;
   activeSkillCount?: number;
   activeSkills?: GuidActiveSkill[];
+  /** 「agent 集群」toggle 是否选中（需求1）。 */
+  clusterActive?: boolean;
+  /** 切换「agent 集群」模式。缺省不渲染该按钮（向后兼容）。 */
+  onToggleCluster?: () => void;
 }
 
 /**
  * ComposerEntryStrip — top-edge entry bar inside the chat composer.
  *
  * Two states:
- * - Default (isPresetAgent=false): [召唤助手] [使用 Skills + inline count]
+ * - Default (isPresetAgent=false): [agent 集群] [召唤助手] [使用 Skills + inline count]
  *   (free play is the implicit default — no dedicated pill needed)
- * - Summoned (isPresetAgent=true): [persona token: avatar + label + close] [使用 Skills + inline count] ... [自由发挥]
+ * - Summoned (isPresetAgent=true): [agent 集群] [persona token: avatar + label + close]
+ *   [使用 Skills + inline count] ... [自由发挥]
+ *
+ * 「agent 集群」（需求1）是一个 toggle：选中后发送即在新会话 extra 落
+ * `agent_cluster_mode=true`——主 agent 对每个任务刻意评估是否开启多 agent 集群
+ * 协作，太简单则先在回复里说明使用简单模式的原因。
  */
 const ComposerEntryStrip: React.FC<ComposerEntryStripProps> = ({
   isPresetAgent,
@@ -44,6 +53,8 @@ const ComposerEntryStrip: React.FC<ComposerEntryStripProps> = ({
   onFree,
   activeSkillCount,
   activeSkills = [],
+  clusterActive = false,
+  onToggleCluster,
 }) => {
   const { t } = useTranslation();
   const [skillsOpen, setSkillsOpen] = useState(false);
@@ -190,10 +201,30 @@ const ComposerEntryStrip: React.FC<ComposerEntryStripProps> = ({
       </span>
     );
 
+  // --- 「agent 集群」toggle（需求1，两种状态都渲染在最左 = 召唤助手左边）---
+  const clusterButton = onToggleCluster ? (
+    <button
+      type='button'
+      className={`${styles.entryButton} ${styles.entryButtonInteractive} ${clusterActive ? styles.entryButtonActive : ''}`}
+      onClick={onToggleCluster}
+      aria-pressed={clusterActive}
+      aria-label={t('guid.entry.clusterAria', { defaultValue: '切换 agent 集群模式' })}
+      title={t('guid.entry.clusterHint', {
+        defaultValue: '多 agent 协作：主 agent 刻意评估并拆分任务给多个独立 agent 并行交付；太简单的任务会说明原因后直接作答。',
+      })}
+    >
+      <EveryUser theme='outline' size={15} strokeWidth={3} />
+      <span className={styles.entryButtonText}>{t('guid.entry.cluster', { defaultValue: 'agent 集群' })}</span>
+    </button>
+  ) : null;
+
   // --- Summoned state ---
   if (isPresetAgent) {
     return (
       <div className={styles.entryStrip}>
+        {/* agent 集群 toggle（最左） */}
+        {clusterButton}
+
         {/* Persona token */}
         <span className={`${styles.entryButton} ${styles.entryButtonActive} ${styles.entryPersonaButton}`}>
           <span className={styles.entryAvatar}>
@@ -229,6 +260,9 @@ const ComposerEntryStrip: React.FC<ComposerEntryStripProps> = ({
   // --- Default state ---
   return (
     <div className={styles.entryStrip}>
+      {/* agent 集群 toggle（最左 = 召唤助手左边） */}
+      {clusterButton}
+
       {/* Summon assistant */}
       <button
         type='button'

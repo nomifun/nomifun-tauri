@@ -62,6 +62,11 @@ pub struct OrchRunRow {
     pub forked_from: Option<String>,
     /// Working directory for an ad-hoc (workspace-less) run.
     pub work_dir: Option<String>,
+    /// 节点级审批模式（迁移 030，可空）：`NULL`/`"auto"` = 全授权（节点遇抉择自行
+    /// 判断，现状零回归）；`"manual"` = 审批模式（worker 可经 nomi_task_question
+    /// 挂起提问）。旧行读回 `None`。
+    #[serde(default)]
+    pub approval_mode: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
@@ -132,6 +137,11 @@ pub struct OrchRunTaskRow {
     /// Set by the planner in a later phase; today all planned nodes persist `None`.
     #[serde(default)]
     pub on_fail: Option<String>,
+    /// 节点挂起的决策问题原文（迁移 030，可空）：审批模式下 worker 经
+    /// nomi_task_question 提交、任务转入 `needs_review` 时在场；解决（采用产出/
+    /// 重跑）后清空。旧行读回 `None`。
+    #[serde(default)]
+    pub pending_question: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }

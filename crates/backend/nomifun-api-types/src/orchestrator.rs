@@ -249,6 +249,11 @@ pub struct Run {
     pub workspace_id: Option<String>,
     pub goal: String,
     pub autonomy: String,
+    /// 节点级审批模式（迁移 030）：`"auto"`（默认，全授权——节点遇抉择自行判断）
+    /// 或 `"manual"`（审批模式——worker 可经 `nomi_task_question` 挂起提问，由用户
+    /// 进入节点作答）。旧行/省略反序列化为 `"auto"`，零回归。
+    #[serde(default = "default_approval_mode")]
+    pub approval_mode: String,
     pub max_parallel: Option<i64>,
     pub status: String,
     pub summary: Option<String>,
@@ -313,10 +318,20 @@ pub struct RunTask {
     /// master agent / supervision tools can see WHY a node failed.
     #[serde(default)]
     pub last_error: Option<String>,
+    /// 节点挂起的决策问题原文（迁移 030）：审批模式下 worker 经 `nomi_task_question`
+    /// 提交、任务转入 `needs_review` 时在场；解决（采用产出/重跑）后清空。`None` =
+    /// 无挂起问题（或旧行）。前端据此渲染节点提问徽标与投影视图的问题横幅。
+    #[serde(default)]
+    pub pending_question: Option<String>,
     /// Creation / last-update timestamps (epoch ms). Surfaced so the UI can show
     /// per-task pacing (用时 / 相对时间) in the roster and inspector.
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// The serde default for a run's `approval_mode`: `"auto"`（全授权，现状零回归）。
+fn default_approval_mode() -> String {
+    "auto".to_string()
 }
 
 /// The serde default for a task's `kind`: `"agent"` (现状单 agent，零回归).
@@ -521,6 +536,11 @@ pub struct CreateAdhocRunRequest {
     /// default (first member) — zero behavior change for callers that omit it.
     #[serde(default)]
     pub lead_model: Option<ModelRef>,
+    /// 节点级审批模式（迁移 030）。`None`/省略 ⇒ `"auto"`（全授权，零回归）；
+    /// `Some("manual")` ⇒ 审批模式。caps_orchestrator 从会话 extra 的
+    /// `orchestrator_approval_mode` 读出后经此透传，`create_adhoc` 落到 run 行。
+    #[serde(default)]
+    pub approval_mode: Option<String>,
 }
 
 /// One planned task in a [`PlannedDag`]. Produced by the PlanProducer (主管规划)
@@ -797,6 +817,7 @@ mod tests {
     fn create_adhoc_run_request_round_trips() {
         // Full payload.
         let req = CreateAdhocRunRequest {
+            approval_mode: None,
             goal: "Build the thing.".to_string(),
             work_dir: Some("/tmp/wd".to_string()),
             model_range: ModelRange::Range {
@@ -839,6 +860,7 @@ mod tests {
     fn run_detail_round_trips() {
         let detail = RunDetail {
             run: Run {
+                approval_mode: "auto".into(),
                 id: "run_1".to_string(),
                 workspace_id: Some("ws_abc".to_string()),
                 goal: "Research and synthesize.".to_string(),
@@ -854,6 +876,7 @@ mod tests {
             },
             tasks: vec![
                 RunTask {
+                    pending_question: None,
                     last_error: None,
                     id: "task_1".to_string(),
                     run_id: "run_1".to_string(),
@@ -884,6 +907,7 @@ mod tests {
                     updated_at: 1_700_000_400_000,
                 },
                 RunTask {
+                    pending_question: None,
                     last_error: None,
                     id: "task_2".to_string(),
                     run_id: "run_1".to_string(),
@@ -1092,6 +1116,7 @@ mod tests {
 
         // Present → carried through.
         let req = CreateAdhocRunRequest {
+            approval_mode: None,
             goal: "g".to_string(),
             work_dir: None,
             model_range: ModelRange::Single { model: ModelRef { provider_id: "p".to_string(), model: "m".to_string() } },

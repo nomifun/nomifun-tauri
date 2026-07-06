@@ -187,8 +187,11 @@ pub(super) async fn build(
             nomifun_api_types::ExposureMode::PublicService
         ),
     );
-    overrides.system_prompt =
-        compose_subagent_hint(overrides.system_prompt.take(), inject_subagent_hint);
+    overrides.system_prompt = compose_subagent_hint(
+        overrides.system_prompt.take(),
+        inject_subagent_hint,
+        overrides.agent_cluster_mode,
+    );
 
     // Companion-owned sessions (local 桌面伙伴 chat + IM channel master) — AND
     // 对外伙伴 (public agent) sessions — must reply in the app's UI language, not a
@@ -750,6 +753,12 @@ fn append_knowledge_context(
 /// 「智能编排」lead 提示（不再需要 autoOrchestration 开关或 orchestrator_role 角色）。
 pub(crate) const SUBAGENT_STANDARD_HINT: &str = "遇到可并行的独立子任务，或需要成体系拆解的复杂多步任务时，可用 `nomi_spawn(tasks)` 立即并行派发子 agent（每个子任务在右侧编排画布实时可见状态与转录），或用 `nomi_run_create(goal)` 让规划器把目标拆成有依赖关系的任务 DAG（可用模型范围与工作目录自动取用、随即开跑）。派发后拿到 run_id，直接告诉用户已在后台执行、进度可在右侧编排画布查看，然后结束本轮——不要自己轮询等待，也不要重复创建：子任务全部完成或失败时系统会自动把结果回执给你，届时再向用户汇总。简单或单步问题直接作答，无需派发。";
 
+/// 「agent 集群」模式增强提示（需求1）。仅当会话 extra.agent_cluster_mode=true 且
+/// 常驻 subagent 提示已注入（同一网关前提——工具可达才不是空头支票）时，追加在
+/// `SUBAGENT_STANDARD_HINT` 之后：把「简单任务直接作答」升级为「必须刻意评估、倾向
+/// 开集群；确实太简单则先向用户说明使用简单模式的原因」。
+pub(crate) const CLUSTER_MODE_HINT: &str = "用户已为本会话显式开启「agent 集群」模式：对每一个任务（无论难度），你都必须先刻意评估是否应当用 nomi_spawn / nomi_run_create 开启多 agent 集群协作，并倾向于开启——多个独立 agent 各自拥有更充足的上下文，交付质量更高。只有当任务确实过于简单（单步可答、无可拆分的子任务）时才可不开启；此时必须在回复的开头先用一两句话向用户说明「本次使用简单模式」的原因，然后再直接作答。";
+
 /// 是否给本会话追加常驻 subagent 提示（纯策略，可单测）。提示点名的 `nomi_spawn` /
 /// `nomi_run_create` 工具只随桌面网关标配（`desktop_gateway`=true 的本地可信会话），
 /// 故必须 `has_gateway` 才注入——否则会话拿不到这些工具，提示就成了空头支票（远程
@@ -765,14 +774,25 @@ pub(crate) fn should_inject_subagent_hint(
 }
 
 /// 把 subagent 提示组合到已有的附加系统提示之后（组合而非替换，保留 preset/人格/知识
-/// 内容）。`inject` 为假时原样返回 `base`。纯函数，便于隔离测试。
-pub(crate) fn compose_subagent_hint(base: Option<String>, inject: bool) -> Option<String> {
+/// 内容）。`inject` 为假时原样返回 `base`（`cluster` 随之失效——工具不可达时集群提示
+/// 同样是空头支票）。`cluster` 为真时在标准提示后再追加「agent 集群」模式增强段。
+/// 纯函数，便于隔离测试。
+pub(crate) fn compose_subagent_hint(
+    base: Option<String>,
+    inject: bool,
+    cluster: bool,
+) -> Option<String> {
     if !inject {
         return base;
     }
+    let hint = if cluster {
+        format!("{SUBAGENT_STANDARD_HINT}\n\n{CLUSTER_MODE_HINT}")
+    } else {
+        SUBAGENT_STANDARD_HINT.to_owned()
+    };
     Some(match base {
-        Some(existing) if !existing.is_empty() => format!("{existing}\n\n{SUBAGENT_STANDARD_HINT}"),
-        _ => SUBAGENT_STANDARD_HINT.to_owned(),
+        Some(existing) if !existing.is_empty() => format!("{existing}\n\n{hint}"),
+        _ => hint,
     })
 }
 
@@ -1975,11 +1995,13 @@ mod tests {
     fn subagent_hint_injects_for_plain_desktop_session() {
         // 普通桌面会话（有网关、非伙伴、非渠道、非对外）→ 追加 subagent 提示
         assert!(super::should_inject_subagent_hint(true, false, false, false));
-        let out = super::compose_subagent_hint(Some("基础提示".to_string()), true);
+        let out = super::compose_subagent_hint(Some("基础提示".to_string()), true, false);
         let s = out.unwrap();
         assert!(s.starts_with("基础提示"));
         assert!(s.contains("nomi_spawn"));
         assert!(s.contains("nomi_run_create"));
+        // 未开集群模式 → 不含集群增强段
+        assert!(!s.contains("agent 集群"));
     }
 
     #[test]
@@ -1998,13 +2020,33 @@ mod tests {
         assert!(!super::should_inject_subagent_hint(true, false, false, true)); // public service
         // inject=false 时原样返回，不追加
         let base = Some("仅基础".to_string());
-        assert_eq!(super::compose_subagent_hint(base.clone(), false), base);
+        assert_eq!(super::compose_subagent_hint(base.clone(), false, false), base);
     }
 
     #[test]
     fn subagent_hint_handles_empty_base() {
-        let out = super::compose_subagent_hint(None, true);
+        let out = super::compose_subagent_hint(None, true, false);
         assert_eq!(out, Some(super::SUBAGENT_STANDARD_HINT.to_string()));
+    }
+
+    #[test]
+    fn cluster_hint_appends_after_standard_hint() {
+        // 集群模式（需求1）：标准提示 + 集群增强段按序追加，基础提示保留在最前。
+        let out = super::compose_subagent_hint(Some("基础提示".to_string()), true, true).unwrap();
+        assert!(out.starts_with("基础提示"));
+        let std_pos = out.find(super::SUBAGENT_STANDARD_HINT).expect("标准提示在场");
+        let cluster_pos = out.find(super::CLUSTER_MODE_HINT).expect("集群提示在场");
+        assert!(std_pos < cluster_pos, "集群段必须位于标准段之后");
+        // 集群段核心指令在场：刻意评估 + 简单模式须说明原因。
+        assert!(out.contains("刻意评估"));
+        assert!(out.contains("简单模式"));
+    }
+
+    #[test]
+    fn cluster_hint_requires_inject() {
+        // 网关不可达（inject=false）时集群标记同样无效——工具是空头支票。
+        let base = Some("仅基础".to_string());
+        assert_eq!(super::compose_subagent_hint(base.clone(), false, true), base);
     }
 
     #[test]

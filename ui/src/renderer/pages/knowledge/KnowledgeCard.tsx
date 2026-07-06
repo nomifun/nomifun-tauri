@@ -15,7 +15,7 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
-import { Earth, EditTwo, FolderOpen, LinkOne, MoreOne, SettingOne } from '@icon-park/react';
+import { Delete, Earth, EditTwo, FolderOpen, LinkOne, SettingOne } from '@icon-park/react';
 import type { IKnowledgeBase, IKnowledgeTag } from '@/common/adapter/ipcBridge';
 import { formatSize } from './useKnowledge';
 
@@ -27,7 +27,7 @@ export interface KnowledgeCardProps {
   tagMap?: Record<string, IKnowledgeTag>;
   onOpen?: (base: IKnowledgeBase) => void;
   onEdit?: (base: IKnowledgeBase) => void;
-  onMore?: (base: IKnowledgeBase, e: React.MouseEvent) => void;
+  onDelete?: (base: IKnowledgeBase, e: React.MouseEvent) => void;
 }
 
 // ─── Kind → theme color mapping ───────────────────────────────────────────────
@@ -248,7 +248,7 @@ export const KnowledgeCard: React.FC<KnowledgeCardProps> = ({
   tagMap,
   onOpen,
   onEdit,
-  onMore,
+  onDelete,
 }) => {
   const { t } = useTranslation();
   const kindConfig = getKindConfig(base.kind, t);
@@ -366,17 +366,17 @@ export const KnowledgeCard: React.FC<KnowledgeCardProps> = ({
             <EditTwo theme='outline' size={13} strokeWidth={3} />
           </div>
           <div
-            onClick={(e) => onMore?.(base, e)}
+            onClick={(e) => onDelete?.(base, e)}
             className={[
               'grid h-30px w-30px place-items-center rounded-8px',
               'border border-solid border-transparent',
               'bg-transparent text-[var(--color-text-3)] cursor-pointer',
-              'hover:border-[var(--color-border-2)] hover:bg-[var(--color-fill-2)] hover:text-[var(--color-text-1)]',
+              'hover:border-[rgba(var(--danger-6),0.28)] hover:bg-[rgba(var(--danger-6),0.08)] hover:text-[rgb(var(--danger-6))]',
               'transition-colors',
             ].join(' ')}
-            title={t('knowledge.card.actionMore', { defaultValue: '更多' })}
+            title={t('knowledge.actions.delete', { defaultValue: '删除' })}
           >
-            <MoreOne theme='outline' size={13} strokeWidth={3} />
+            <Delete theme='outline' size={13} strokeWidth={3} />
           </div>
         </div>
       </div>

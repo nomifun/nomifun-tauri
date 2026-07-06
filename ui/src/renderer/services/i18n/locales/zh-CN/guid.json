@@ -53,7 +53,10 @@
     "skillsActive": "使用 Skills · 已启用",
     "skillsAdjustAria": "调整本次会话已启用的 {{count}} 个 Skills",
     "skillsActiveAria": "查看本次会话已启用的 {{count}} 个 Skills",
-    "backToFree": "自由发挥"
+    "backToFree": "自由发挥",
+    "cluster": "agent 集群",
+    "clusterAria": "切换 agent 集群模式",
+    "clusterHint": "多 agent 协作：主 agent 刻意评估并拆分任务给多个独立 agent 并行交付；太简单的任务会说明原因后直接作答。"
   },
   "skillsPopover": {
     "title": "本次会话使用的 Skills",

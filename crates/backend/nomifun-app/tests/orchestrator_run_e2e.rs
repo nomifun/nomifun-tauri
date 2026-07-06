@@ -817,6 +817,7 @@ async fn adhoc_run_from_model_range_completes_through_engine() {
         .create_adhoc(
             "u1",
             CreateAdhocRunRequest {
+                approval_mode: None,
                 goal: "ship the conversation-native run".to_string(),
                 work_dir: Some("/tmp/adhoc-proj".to_string()),
                 model_range: ModelRange::Range {

@@ -21,4 +21,10 @@ describe('KnowledgeCard footer layout', () => {
     expect(cardSource.includes('!base.root_exists')).toBe(true);
     expect(cardSource.includes("t('knowledge.card.rootMissing'")).toBe(true);
   });
+
+  test('uses a delete icon for the destructive card action', () => {
+    expect(cardSource.includes('MoreOne')).toBe(false);
+    expect(cardSource.includes("title={t('knowledge.actions.delete'")).toBe(true);
+    expect(cardSource.includes("<Delete theme='outline' size={13} strokeWidth={3} />")).toBe(true);
+  });
 });

@@ -70,6 +70,10 @@ const GuidPage: React.FC = () => {
   // --- Drawer state ---
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [drawerMode, setDrawerMode] = useState<'assistant' | 'skills'>('assistant');
+  // 「agent 集群」模式（需求1）：composer 顶部 toggle。选中后发送即在新会话 extra
+  // 落 agent_cluster_mode=true——主 agent 对每个任务刻意评估是否开多 agent 集群，
+  // 太简单则先向用户说明使用简单模式的原因。仅 nomi 主 agent 路径消费。
+  const [clusterMode, setClusterMode] = useState(false);
 
   // --- Skills state ---
   // All available skills (builtin auto-injected + user-imported custom) merged
@@ -200,6 +204,7 @@ const GuidPage: React.FC = () => {
     isGoogleAuth: modelSelection.isGoogleAuth,
     applyAdvancedConfig: advancedConfig.applyToConversation,
     autoWork: advancedConfig.autoWork,
+    clusterMode,
 
     // Mention state reset
     setMentionOpen: mention.setMentionOpen,
@@ -694,6 +699,8 @@ const GuidPage: React.FC = () => {
                   onFree={() => { agentSelection.setSelectedAgentKey(agentSelection.defaultAgentKey); }}
                   activeSkillCount={activeSkillCount}
                   activeSkills={activeSkills}
+                  clusterActive={clusterMode}
+                  onToggleCluster={() => setClusterMode((v) => !v)}
                 />
               }
             />

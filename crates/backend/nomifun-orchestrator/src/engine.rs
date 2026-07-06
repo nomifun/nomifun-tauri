@@ -142,6 +142,12 @@ pub enum RunOutcome {
     /// [`BATCH_REPORT_MIN_NODES`] / [`BATCH_REPORT_INTERVAL`]) so a fast fan-out
     /// cannot spam the lead. Non-terminal; the run keeps running.
     BatchProgress,
+    /// A node raised a DECISION QUESTION and parked at `needs_review`
+    /// (审批模式，迁移 030): the worker called `nomi_task_question` mid-run, so the
+    /// lead must tell the USER to dive into that node (画布/进度条的提问图标 →
+    /// 投影视图), answer in the worker conversation, then 「采用为该节点产出」to
+    /// resume. Non-terminal; the run keeps running (other branches keep driving).
+    NodeQuestion,
 }
 
 impl RunOutcome {
@@ -154,6 +160,7 @@ impl RunOutcome {
             RunOutcome::AwaitingApproval => "awaiting_approval",
             RunOutcome::NodeFailed => "node_failed",
             RunOutcome::BatchProgress => "batch_progress",
+            RunOutcome::NodeQuestion => "node_question",
         }
     }
 }
@@ -249,7 +256,12 @@ pub const DEFAULT_MAX_WORKER_RETRIES: usize = 3;
 /// many nodes have completed `done` since the last report. Coupled with
 /// [`BATCH_REPORT_INTERVAL`] (BOTH must clear) so a fast fan-out cannot spam the
 /// lead conversation. Non-terminal — the run keeps driving.
-const BATCH_REPORT_MIN_NODES: usize = 3;
+///
+/// 需求4（agent 集群实时反馈）：由 3 降到 1——中途每有节点交付，最迟一个
+/// [`BATCH_REPORT_INTERVAL`] 内主 agent 就收到一次批量回执并向用户转述各节点
+/// 产出（含 `build_summary_digest` 摘要）。防刷屏由时间间隔单独兜底：20s 内多个
+/// 节点完成仍只并成一次回执。
+const BATCH_REPORT_MIN_NODES: usize = 1;
 
 /// Minimum wall-clock between two consecutive mid-run batch-progress lead reports
 /// (see [`BATCH_REPORT_MIN_NODES`]). The FIRST eligible batch fires immediately
@@ -659,6 +671,19 @@ impl RunEngine {
                     // healthy after all — do not reap.
                     if r.status == "running" && self.is_running(&run_id) {
                         false
+                    } else if r.status == "running"
+                        && self
+                            .deps
+                            .run_repo
+                            .list_tasks(&run_id)
+                            .await
+                            .map(|ts| ts.iter().any(|t| t.status == "needs_review"))
+                            .unwrap_or(false)
+                    {
+                        // 审批模式（迁移 030）：节点挂在 needs_review 等人工作答——
+                        // 合法停车（可等数小时），绝不判 stalled。用户 adopt/rerun
+                        // 后路由重启循环；此处直接放行。
+                        false
                     } else {
                         let summary = format!(
                             "编排卡死：状态「{}」超过阈值无进展，已由看门狗终止。",
@@ -868,6 +893,88 @@ impl RunEngine {
         run_service
             .adopt_task_result(&self.deps.worker, user_id, run_id, task_id)
             .await
+    }
+
+    /// 审批模式（迁移 030）— **节点提问 (`nomi_task_question`)**。worker 会话在自己的
+    /// 回合中途遇关键决策时调用：把问题原文写到 `pending_question`、任务转入
+    /// `needs_review`（挂起，下游保持阻塞）、emit `task.statusChanged` 点亮画布/进度条
+    /// 的提问徽标，并（锁外、best-effort）向 lead 回执 [`RunOutcome::NodeQuestion`]，
+    /// 由主 agent 提醒用户进入该节点作答。恢复路径：用户在 worker 会话内回答 →
+    /// 「采用为该节点产出」（adopt 清问题、置 done、重激活）或重跑。
+    ///
+    /// 守卫：run 必须归属 `user_id`（不泄露存在性——非 owner 一律 NotFound）、
+    /// `approval_mode == "manual"`（全授权 run 拒绝——worker 应自行决策）、任务属于该
+    /// run 且处于 `running`（本轮在飞）或 `needs_review`（幂等更新问题文本）。
+    /// DB 写在 per-run 锁内，与循环的 settle/终态判定串行；lead 回执在锁外。
+    pub async fn raise_task_question(
+        &self,
+        user_id: &str,
+        run_id: &str,
+        task_id: &str,
+        question: &str,
+    ) -> Result<(), AppError> {
+        let question = question.trim();
+        if question.is_empty() {
+            return Err(AppError::BadRequest("question must not be empty".into()));
+        }
+        let lock = self.deps.run_locks.for_run(run_id);
+        let (title, lead_conv_id) = {
+            let _guard = lock.lock().await;
+            let run = self
+                .deps
+                .run_repo
+                .get_run(run_id)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?
+                .ok_or_else(|| AppError::NotFound(format!("run {run_id}")))?;
+            if run.user_id != user_id {
+                return Err(AppError::NotFound(format!("run {run_id}")));
+            }
+            if run.approval_mode.as_deref() != Some("manual") {
+                return Err(AppError::BadRequest(
+                    "本编排未开启「审批模式」：不要提问，请自行选择最合理的方案继续执行，并在产出中说明你的选择理由。".into(),
+                ));
+            }
+            let task = self
+                .deps
+                .run_repo
+                .get_task(task_id)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?
+                .ok_or_else(|| AppError::NotFound(format!("task {task_id}")))?;
+            if task.run_id != run_id {
+                return Err(AppError::NotFound(format!("task {task_id} in run {run_id}")));
+            }
+            if !matches!(task.status.as_str(), "running" | "needs_review") {
+                return Err(AppError::BadRequest(
+                    "该节点当前不在执行中，无法提交决策问题。".into(),
+                ));
+            }
+            self.deps
+                .run_repo
+                .set_task_question(task_id, Some(question))
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            update_task_status(&self.deps, task_id, "needs_review").await;
+            self.deps
+                .emitter
+                .emit_task_status(run_id, task_id, "needs_review");
+            (task.title, run.lead_conv_id)
+        };
+        // Lead 回执（锁外、best-effort）：主 agent 提醒用户进入该节点作答。失败只
+        // warn——问题已落库、画布已点亮，用户仍能从 UI 发现并处理。
+        if let Some(lead_conv_id) = lead_conv_id {
+            let brief = format!("节点『{title}』提问：{question}");
+            if let Err(e) = self
+                .deps
+                .lead_reporter
+                .report(lead_conv_id, run_id, RunOutcome::NodeQuestion, &brief)
+                .await
+            {
+                warn!(run_id, task_id, error = %e, "node-question lead report failed");
+            }
+        }
+        Ok(())
     }
 
     /// UC-3a — **conversation-driven intelligent re-adjust** with the loop-vs-
@@ -1448,8 +1555,21 @@ async fn run_loop(
                                     t.status == "pending"
                                         && t.next_retry_at.is_some_and(|at| at > now)
                                 });
+                                // 审批模式（迁移 030）：有节点挂在 needs_review 等人工
+                                // 作答——合法停车，不是卡死。干净退出（run 保持
+                                // running；看门狗对此豁免），用户 adopt/rerun 后由路由
+                                // 重启循环再驱动（与 awaiting_plan_approval 的退出
+                                // 契约一致）。
+                                let awaiting_review =
+                                    tasks.iter().any(|t| t.status == "needs_review");
                                 if awaiting_retry {
                                     TerminalDecision::IdleRetry
+                                } else if awaiting_review {
+                                    info!(
+                                        run_id,
+                                        "Run loop: node(s) parked at needs_review (节点提问) — exiting until人工作答 re-drives"
+                                    );
+                                    TerminalDecision::Break
                                 } else {
                                     // Stuck (no ready, no in-flight, not terminal) —
                                     // break, never spin.
@@ -1581,11 +1701,13 @@ async fn run_loop(
         // completion may unblock downstream tasks, so the loop re-fills.
         if let Some((task_id, outcome)) = inflight.next().await {
             in_progress.remove(&task_id);
-            // Capture whether this settle is a node COMPLETION before `outcome` is
-            // moved into `settle_task_outcome` (it takes the value): `Ok(o) if o.ok`
-            // mirrors settle's own `done` arm. Retries / failures do not count.
-            let did_complete = matches!(&outcome, Ok(o) if o.ok);
-            settle_task_outcome(&deps, run_id, &task_id, outcome).await;
+            // Whether this settle actually landed the node as `done` — returned by
+            // settle itself, NOT inferred from `Ok(o) if o.ok`（评审确认缺陷：审批
+            // 模式的 needs_review park 路径 worker 同样以 ok:true 结束回合，但
+            // settle 顶部守卫提前 return、节点并未完成——按 outcome 推断会紧跟
+            // NodeQuestion 回执再发一条自相矛盾的虚假 BatchProgress）。Retries /
+            // failures / park 都不计入。
+            let did_complete = settle_task_outcome(&deps, run_id, &task_id, outcome).await;
 
             // Mid-run batch-progress heartbeat (Phase 3a Task 3). This branch is
             // reached ONLY while `inflight` is non-empty, so it is structurally
@@ -1844,12 +1966,45 @@ async fn dispatch_task(
 /// error) → AUTO-RETRY if the failure was a transient/retryable provider error and
 /// the retry budget remains (see [`settle_failed_or_retry`]), else mark `failed` +
 /// emit. Completion is what unblocks downstream tasks.
+///
+/// Returns `true` ONLY when this settle actually landed the node as `done` —
+/// the run_loop's batch-progress heartbeat keys off this instead of inferring
+/// from the raw outcome（needs_review park 也以 ok:true 回场，但并未完成）。
 async fn settle_task_outcome(
     deps: &Arc<RunEngineDeps>,
     run_id: &str,
     task_id: &str,
     outcome: Result<WorkerOutcome, AppError>,
-) {
+) -> bool {
+    // 审批模式（迁移 030）：worker 在本轮中途经 nomi_task_question 把任务置为
+    // `needs_review`（挂起等人工），随后它的回合正常结束并流到这里。此时绝不能把
+    // 状态覆盖为 done/failed：只补写 conversation_id / 产出文本 / tokens（供投影
+    // 视图与后续「采用为该节点产出」使用），保持 needs_review + pending_question
+    // 原样——下游保持阻塞，由用户进节点作答后 adopt/rerun 恢复。读失败按未挂起
+    // 处理（fail-open 到既有 settle 路径，绝不因一次读错吞掉正常结算）。
+    let parked_for_review = matches!(
+        deps.run_repo.get_task(task_id).await,
+        Ok(Some(t)) if t.status == "needs_review"
+    );
+    if parked_for_review {
+        if let Ok(o) = &outcome {
+            let _ = deps
+                .run_repo
+                .update_task(
+                    task_id,
+                    UpdateTaskParams {
+                        conversation_id: Some(Some(o.conversation_id)),
+                        output_summary: o.text.clone().map(Some),
+                        tokens: o.tokens.map(Some),
+                        next_retry_at: Some(None),
+                        ..Default::default()
+                    },
+                )
+                .await;
+        }
+        info!(run_id, task_id, "Run loop: task parked at needs_review (节点提问) — settle skipped");
+        return false;
+    }
     match outcome {
         Ok(o) if o.ok => {
             let _ = deps
@@ -1883,15 +2038,18 @@ async fn settle_task_outcome(
                 )
                 .await;
             deps.emitter.emit_task_status(run_id, task_id, "done");
+            true
         }
         Ok(o) => {
             // Worker returned but produced no final text (rate-limit / transient
             // error / timeout / empty). Auto-retry transient errors; else fail.
             settle_failed_or_retry(deps, run_id, task_id, Some(o.conversation_id), o.tokens).await;
+            false
         }
         Err(e) => {
             warn!(run_id, task_id, error = %e, "Run loop: worker errored — failing or retrying task");
             settle_failed_or_retry(deps, run_id, task_id, None, None).await;
+            false
         }
     }
 }
@@ -2145,14 +2303,13 @@ async fn build_brief_context(
     task_id: &str,
     workspace_dir: Option<&str>,
 ) -> BriefContext {
-    let goal = deps
-        .run_repo
-        .get_run(run_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|r| r.goal)
-        .unwrap_or_default();
+    let run_row = deps.run_repo.get_run(run_id).await.ok().flatten();
+    let goal = run_row.as_ref().map(|r| r.goal.clone()).unwrap_or_default();
+    // 审批模式（迁移 030）：只认显式 "manual"；读失败/缺省 = 全授权（不渲染决策段）。
+    let manual_approval = run_row
+        .as_ref()
+        .and_then(|r| r.approval_mode.as_deref())
+        .is_some_and(|m| m == "manual");
 
     let tasks = deps.run_repo.list_tasks(run_id).await.unwrap_or_default();
     // Short plan summary: the task titles in plan order, so a node sees the overall
@@ -2220,6 +2377,7 @@ async fn build_brief_context(
         plan_summary,
         ancestor_digest,
         notes_hint,
+        manual_approval,
     }
 }
 
@@ -2273,6 +2431,11 @@ pub(crate) struct BriefContext {
     /// Absolute path to the run's shared `RUN_NOTES.md` (None when the run has no
     /// shared dir). A node can read it and append its findings for other nodes.
     pub notes_hint: Option<String>,
+    /// 审批模式（迁移 030）：run 的 `approval_mode == "manual"` 时为 true——brief
+    /// 追加「决策策略」段，指示 worker 遇关键决策调用 `nomi_task_question` 挂起等
+    /// 人工。false（全授权/缺省/读失败）= 不渲染该段，brief 与既有逐字节一致
+    /// （零回归）。
+    pub manual_approval: bool,
 }
 
 /// Compose the worker's brief: role hint + task title/spec + completed upstream
@@ -2313,6 +2476,16 @@ fn compose_brief(
         out.push_str("\n用户预置要求(请优先遵守):\n");
         out.push_str(preset);
         out.push('\n');
+    }
+    // 审批模式（迁移 030）：仅 manual 追加决策策略段——遇关键决策经 nomi_task_question
+    // 挂起等人工作答；auto（全授权，缺省）不渲染任何新内容，brief 零回归。
+    if ctx.manual_approval {
+        out.push_str(
+            "\n决策策略(审批模式):\n本编排处于「审批模式」。当你遇到会显著影响方向、取舍或对外效果的关键决策问题\
+             (例如互斥方案二选一、需求歧义、可能造成破坏性影响的操作)时,不要自行猜测:调用 `nomi_task_question` 工具\
+             提交问题(简明列出候选选项与你的倾向建议),然后立即结束本轮回复,等待用户进入本会话作答后再继续。\
+             琐碎的实现细节不必提问,自行合理处理。\n",
+        );
     }
     out
 }
@@ -4480,6 +4653,22 @@ mod tests {
         worker: Arc<dyn WorkerRunner>,
         max_retries: usize,
     ) -> (RunService, RunEngine, Arc<RecordingLeadReporter>) {
+        let (svc, engine, reporter, _repo, _pool) = reporter_stack_full(worker, max_retries).await;
+        (svc, engine, reporter)
+    }
+
+    /// [`reporter_stack`] 的全量版：额外返回 run_repo + pool，供需要直接操作行
+    /// （模拟 nomi_task_question 写入 / 老化 updated_at）的审批模式测试使用。
+    async fn reporter_stack_full(
+        worker: Arc<dyn WorkerRunner>,
+        max_retries: usize,
+    ) -> (
+        RunService,
+        RunEngine,
+        Arc<RecordingLeadReporter>,
+        Arc<SqliteRunRepository>,
+        sqlx::SqlitePool,
+    ) {
         let db = init_database_memory().await.expect("db init");
         let pool = db.pool().clone();
         let run_repo = Arc::new(SqliteRunRepository::new(pool.clone()));
@@ -4495,13 +4684,13 @@ mod tests {
             emitter.clone(),
         );
         let reporter = Arc::new(RecordingLeadReporter::default());
-        let mut engine_deps = RunEngineDeps::new(run_repo, worker, emitter, ws_repo);
+        let mut engine_deps = RunEngineDeps::new(run_repo.clone(), worker, emitter, ws_repo);
         engine_deps.worker_timeout = Duration::from_secs(5);
         engine_deps.max_worker_retries = max_retries;
         engine_deps.retry_backoff_base = Duration::ZERO;
         engine_deps.lead_reporter = reporter.clone();
         let engine = RunEngine::new(Arc::new(engine_deps));
-        (run_service, engine, reporter)
+        (run_service, engine, reporter, run_repo, pool)
     }
 
     /// Create an ad-hoc run BOUND to a lead conversation (so the terminal report has
@@ -4511,6 +4700,7 @@ mod tests {
             .create_adhoc(
                 "u1",
                 CreateAdhocRunRequest {
+                    approval_mode: None,
                     goal: "chain".to_string(),
                     work_dir: Some("/tmp/lead-report".to_string()),
                     model_range: ModelRange::Single {
@@ -4701,10 +4891,8 @@ mod tests {
     /// A run that completes ≥3 nodes re-engages the lead with a THROTTLED, best-effort
     /// `batch_progress` receipt BEFORE the terminal receipt, so the master agent can
     /// OBSERVE progress and append more work (`nomi_run_add_tasks`) to the SAME run.
-    /// The 3-node chain (A→B→C) all completes `done`; on the 3rd completion the
-    /// node-count floor (BATCH_REPORT_MIN_NODES = 3) is met and the FIRST interval
-    /// gate is open (no prior report) → exactly one `batch_progress` fires mid-run,
-    /// ordered before the terminal `completed` receipt.
+    /// 需求4：BATCH_REPORT_MIN_NODES=1 —— 第 1 个节点完成、且首个 interval 门开放
+    /// （无前次回执）时即触发一次 `batch_progress`，先于终态 `completed` 回执。
     #[tokio::test]
     async fn batch_progress_reports_to_lead_midrun() {
         let worker: Arc<dyn WorkerRunner> =
@@ -4754,6 +4942,299 @@ mod tests {
                 "batch_progress must precede the terminal completed receipt, got {reports:?}"
             );
         }
+    }
+
+    // ── 审批模式（迁移 030）：节点提问 park / 看门狗豁免 / adopt 恢复 ────────────
+
+    /// 模拟审批模式 worker：第一个被派发的任务在自己的回合中途「调用
+    /// nomi_task_question」（直写 repo：pending_question + needs_review，与网关工具
+    /// 的锁内写等效），然后正常结束回合（ok:true）；后续任务正常产出。
+    /// `read_final_output` 返回定稿文本，供「采用为该节点产出」读取。
+    struct QuestionWorker {
+        repo: Arc<SqliteRunRepository>,
+        asked: Arc<Mutex<bool>>,
+    }
+    #[async_trait]
+    impl WorkerRunner for QuestionWorker {
+        async fn run(
+            &self,
+            _member: &FleetMember,
+            _workspace_dir: Option<&str>,
+            _run_id: &str,
+            task_id: &str,
+            _brief: &str,
+            _task_spec: &str,
+            _timeout: Duration,
+            on_started: Box<dyn FnOnce(i64) + Send>,
+        ) -> Result<WorkerOutcome, AppError> {
+            on_started(881);
+            let first = {
+                let mut a = self.asked.lock().unwrap();
+                if *a {
+                    false
+                } else {
+                    *a = true;
+                    true
+                }
+            };
+            if first {
+                self.repo
+                    .set_task_question(task_id, Some("定价方案选 A（订阅）还是 B（买断）？"))
+                    .await
+                    .expect("set question");
+                self.repo
+                    .update_task(
+                        task_id,
+                        UpdateTaskParams {
+                            status: Some("needs_review".to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("park needs_review");
+                return Ok(WorkerOutcome {
+                    conversation_id: 881,
+                    text: Some("我已提交决策问题，等待用户选择。".to_string()),
+                    ok: true,
+                    tokens: None,
+                });
+            }
+            Ok(WorkerOutcome {
+                conversation_id: 882,
+                text: Some("后续节点产出".to_string()),
+                ok: true,
+                tokens: None,
+            })
+        }
+        async fn read_final_output(&self, _conversation_id: &str) -> Option<String> {
+            Some("用户拍板选 A：按订阅制完成定价方案定稿。".to_string())
+        }
+    }
+
+    /// 审批模式全链路：节点提问 park（settle 不覆盖 needs_review、补写产出文本、
+    /// run 保持 running、循环干净退出）→ 看门狗豁免（老化后 reap 不判 stalled）→
+    /// 「采用为该节点产出」恢复（问题清空、节点 done、重启循环后整 run completed）。
+    #[tokio::test]
+    async fn needs_review_parks_survives_watchdog_and_resumes_via_adopt() {
+        let asked = Arc::new(Mutex::new(false));
+        let (run_service, engine, reporter, repo, pool) = {
+            // 两段构造：QuestionWorker 需要 repo，而 repo 由 stack 构造——先建 stack
+            // 拿 repo，再热插 worker 不可行（deps 不可变），故手工复刻 stack 并共享 repo。
+            let db = init_database_memory().await.expect("db init");
+            let pool = db.pool().clone();
+            let run_repo = Arc::new(SqliteRunRepository::new(pool.clone()));
+            let fleet_repo = Arc::new(SqliteFleetRepository::new(pool.clone()));
+            let ws_repo = Arc::new(SqliteOrchWorkspaceRepository::new(pool.clone()));
+            let emitter = OrchestratorRunEventEmitter::new(Arc::new(RecordingBroadcaster::new()));
+            let planner: Arc<dyn PlanProducer> = Arc::new(ChainPlanProducer);
+            let run_service = RunService::new(
+                run_repo.clone(),
+                fleet_repo,
+                ws_repo.clone(),
+                planner,
+                emitter.clone(),
+            );
+            let worker: Arc<dyn WorkerRunner> = Arc::new(QuestionWorker {
+                repo: run_repo.clone(),
+                asked: asked.clone(),
+            });
+            let reporter = Arc::new(RecordingLeadReporter::default());
+            let mut engine_deps =
+                RunEngineDeps::new(run_repo.clone(), worker, emitter, ws_repo);
+            engine_deps.worker_timeout = Duration::from_secs(5);
+            engine_deps.max_worker_retries = 0;
+            engine_deps.retry_backoff_base = Duration::ZERO;
+            engine_deps.lead_reporter = reporter.clone();
+            let engine = RunEngine::new(Arc::new(engine_deps));
+            (run_service, engine, reporter, run_repo, pool)
+        };
+        let run_id = adhoc_lead_run(&run_service, 606).await;
+        engine.start(run_id.clone());
+
+        // ① park：循环退出（is_running=false）、run 仍 running、首节点 needs_review
+        //    且 settle 只补写了产出文本（不覆盖状态）。
+        for _ in 0..100 {
+            if !engine.is_running(&run_id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!engine.is_running(&run_id), "循环必须干净退出（park）");
+        let detail = run_service.get_detail(&run_id).await.expect("detail");
+        assert_eq!(detail.run.status, "running", "park 时 run 保持 running");
+        let parked = detail
+            .tasks
+            .iter()
+            .find(|t| t.status == "needs_review")
+            .expect("有节点挂在 needs_review");
+        assert_eq!(
+            parked.pending_question.as_deref(),
+            Some("定价方案选 A（订阅）还是 B（买断）？"),
+            "问题原文在场"
+        );
+        assert_eq!(
+            parked.output_summary.as_deref(),
+            Some("我已提交决策问题，等待用户选择。"),
+            "settle 守卫补写产出文本但不覆盖状态"
+        );
+        assert!(
+            !reporter.reports.lock().unwrap().iter().any(|(_, _, o)| o == "completed" || o == "failed"),
+            "park 不产生终态回执"
+        );
+        // 评审确认缺陷的回归锁：park 的 settle 以 ok:true 回场但节点并未完成，
+        // 绝不能紧跟 NodeQuestion 再发一条自相矛盾的虚假 batch_progress。
+        assert!(
+            !reporter.reports.lock().unwrap().iter().any(|(_, _, o)| o == "batch_progress"),
+            "park 不是完成——不得触发虚假 batch_progress 回执"
+        );
+
+        // ② 看门狗豁免：把 run 行老化到 STRAND_GRACE_MS 之外，reap 不得判 stalled。
+        sqlx::query("UPDATE orch_runs SET updated_at = ? WHERE id = ?")
+            .bind(now_ms() - STRAND_GRACE_MS - 60_000)
+            .bind(&run_id)
+            .execute(&pool)
+            .await
+            .expect("age run row");
+        engine.reap_stalled_runs().await;
+        let after_reap = run_service.get_detail(&run_id).await.expect("detail");
+        assert_eq!(
+            after_reap.run.status, "running",
+            "含 needs_review 节点的 run 豁免看门狗"
+        );
+        assert!(
+            !reporter.reports.lock().unwrap().iter().any(|(_, _, o)| o == "stalled"),
+            "不得发出 stalled 回执"
+        );
+
+        // ③ adopt 恢复：run 仍 running（例外放行 needs_review），采用产出 → done +
+        //    问题清空 → 手动重启循环（镜像路由的 engine-lifecycle 决策）→ 整链完成。
+        let task_id = parked.id.clone();
+        let run_dto = engine
+            .adopt_task_result(&run_service, "u1", &run_id, &task_id)
+            .await
+            .expect("adopt 必须放行 needs_review 节点");
+        assert_eq!(run_dto.status, "running");
+        let adopted = repo.get_task(&task_id).await.unwrap().unwrap();
+        assert_eq!(adopted.status, "done", "采用后节点 done");
+        assert!(adopted.pending_question.is_none(), "采用后问题清空");
+        assert_eq!(
+            adopted.output_summary.as_deref(),
+            Some("用户拍板选 A：按订阅制完成定价方案定稿。"),
+            "采用写入 worker 定稿文本"
+        );
+        engine.start(run_id.clone());
+        assert!(
+            wait_run_status(&run_service, &run_id, "completed").await,
+            "作答采用后整 run 必须完成"
+        );
+    }
+
+    /// `raise_task_question`（nomi_task_question 的引擎入口）守卫矩阵：
+    /// 空问题 / 非审批模式 run / 非 owner / 非在飞节点一律拒绝；合法调用写入
+    /// pending_question + needs_review 并向 lead 回执 node_question。
+    #[tokio::test]
+    async fn raise_task_question_guards_and_reports() {
+        let worker: Arc<dyn WorkerRunner> =
+            Arc::new(MockWorkerRunner::with_text(777, "task output"));
+        let (run_service, engine, reporter, repo, _pool) =
+            reporter_stack_full(worker, 0).await;
+
+        // manual run（不启动引擎——手动把首节点置 running 模拟在飞）。
+        let run = run_service
+            .create_adhoc(
+                "u1",
+                CreateAdhocRunRequest {
+                    approval_mode: Some("manual".to_string()),
+                    goal: "chain".to_string(),
+                    work_dir: None,
+                    model_range: ModelRange::Single {
+                        model: ModelRef {
+                            provider_id: "prov_x".to_string(),
+                            model: "claude-opus-4-8".to_string(),
+                        },
+                    },
+                    pinned_roles: vec![],
+                    role_members: vec![],
+                    autonomy: Some("supervised".to_string()),
+                    max_parallel: None,
+                    lead_conv_id: Some(707),
+                    lead_model: None,
+                },
+            )
+            .await
+            .expect("create manual run");
+        run_service.plan(&run.id).await.expect("plan");
+        let task = run_service.get_detail(&run.id).await.unwrap().tasks[0].clone();
+        repo.update_task(
+            &task.id,
+            UpdateTaskParams {
+                status: Some("running".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // 守卫：空问题。
+        assert!(matches!(
+            engine.raise_task_question("u1", &run.id, &task.id, "  ").await,
+            Err(AppError::BadRequest(_))
+        ));
+        // 守卫：非 owner 一律 NotFound（不泄露存在性）。
+        assert!(matches!(
+            engine.raise_task_question("intruder", &run.id, &task.id, "问题?").await,
+            Err(AppError::NotFound(_))
+        ));
+
+        // 合法调用：写入 + 回执。
+        engine
+            .raise_task_question("u1", &run.id, &task.id, "选 A 还是 B？")
+            .await
+            .expect("raise ok");
+        let parked = repo.get_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(parked.status, "needs_review");
+        assert_eq!(parked.pending_question.as_deref(), Some("选 A 还是 B？"));
+        let reports = reporter.reports.lock().unwrap().clone();
+        assert!(
+            reports.iter().any(|(conv, rid, o)| *conv == 707 && rid == &run.id && o == "node_question"),
+            "须向 lead 回执 node_question，got {reports:?}"
+        );
+
+        // 守卫：非审批模式 run 拒绝提问（指示自行决策）。
+        let auto_run = adhoc_lead_run(&run_service, 707).await;
+        let auto_task = run_service.get_detail(&auto_run).await.unwrap().tasks[0].clone();
+        repo.update_task(
+            &auto_task.id,
+            UpdateTaskParams {
+                status: Some("running".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let err = engine
+            .raise_task_question("u1", &auto_run, &auto_task.id, "选 A 还是 B？")
+            .await
+            .expect_err("auto run must refuse");
+        assert!(
+            err.to_string().contains("审批模式"),
+            "拒绝文案须指示自行决策: {err}"
+        );
+    }
+
+    /// compose_brief 决策策略段：manual_approval=true 追加审批模式指令（点名
+    /// nomi_task_question）；false 与既有 brief 逐字节一致（零回归由既有测试锁定）。
+    #[test]
+    fn compose_brief_manual_approval_appends_decision_policy() {
+        let task = task_row_with_kind("agent", "任务A", "做出取舍");
+        let mut ctx = empty_brief_ctx();
+        ctx.manual_approval = true;
+        let brief = compose_brief(Some("writer"), &task, &[], &ctx);
+        assert!(brief.contains("决策策略"), "决策策略段在场");
+        assert!(brief.contains("nomi_task_question"), "点名提问工具");
+        ctx.manual_approval = false;
+        let plain = compose_brief(Some("writer"), &task, &[], &ctx);
+        assert!(!plain.contains("决策策略"), "全授权不渲染决策段");
     }
 
     /// A permanently-failed task PERSISTS a `last_error` reason, surfaced on the DTO
@@ -4977,6 +5458,7 @@ mod tests {
             .create_adhoc(
                 "u1",
                 CreateAdhocRunRequest {
+                    approval_mode: None,
                     goal: "build the chain".to_string(),
                     work_dir: Some("/tmp/adhoc-proj".to_string()),
                     model_range: ModelRange::Single {
@@ -5083,6 +5565,7 @@ mod tests {
     #[test]
     fn compose_brief_includes_role_task_and_upstream() {
         let task = OrchRunTaskRow {
+            pending_question: None,
             last_error: None,
             id: "rtask_1".to_string(),
             run_id: "run_1".to_string(),
@@ -5121,6 +5604,7 @@ mod tests {
     /// the legacy brief. Every pre-existing compose_brief test passes this.
     fn empty_brief_ctx() -> BriefContext {
         BriefContext {
+            manual_approval: false,
             goal: String::new(),
             plan_summary: String::new(),
             ancestor_digest: vec![],
@@ -5136,6 +5620,7 @@ mod tests {
         let task = task_row_with_kind("agent", "Write", "写最终报告");
         let upstream = vec![("B".to_string(), "b out".to_string())];
         let ctx = BriefContext {
+            manual_approval: false,
             goal: "构建报告".into(),
             plan_summary: "A → B → Write".into(),
             ancestor_digest: vec![("A".to_string(), "a findings".to_string())],
@@ -5166,6 +5651,7 @@ mod tests {
         let long = "x".repeat(SUMMARY_TASK_OUTPUT_LEN + 500);
         let upstream = vec![("B".to_string(), long.clone())];
         let ctx = BriefContext {
+            manual_approval: false,
             goal: "g".into(),
             plan_summary: "p".into(),
             ancestor_digest: vec![],
@@ -5185,6 +5671,7 @@ mod tests {
     /// by the kind-aware compose_brief tests.
     fn task_row_with_kind(kind: &str, title: &str, spec: &str) -> OrchRunTaskRow {
         OrchRunTaskRow {
+            pending_question: None,
             last_error: None,
             id: "rtask_k".to_string(),
             run_id: "run_1".to_string(),
@@ -5333,6 +5820,7 @@ mod tests {
     #[test]
     fn aggregate_summary_is_non_empty_and_counts_done() {
         let mk = |title: &str, status: &str, summary: Option<&str>| OrchRunTaskRow {
+            pending_question: None,
             last_error: None,
             id: format!("rtask_{title}"),
             run_id: "run_1".to_string(),
@@ -6175,6 +6663,7 @@ mod tests {
             .create_adhoc(
                 "u1",
                 CreateAdhocRunRequest {
+                    approval_mode: None,
                     goal: "share one dir".to_string(),
                     work_dir: None,
                     model_range: ModelRange::Single {
@@ -11961,6 +12450,7 @@ mod tests {
     /// Build a minimal completed-run task row for the digest test.
     fn summary_task(title: &str, status: &str, output: Option<&str>) -> OrchRunTaskRow {
         OrchRunTaskRow {
+            pending_question: None,
             last_error: None,
             id: format!("rtask_{title}"),
             run_id: "run_x".to_string(),

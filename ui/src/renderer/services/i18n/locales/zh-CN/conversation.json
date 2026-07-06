@@ -581,5 +581,20 @@
     "success": "上下文已清空",
     "failed": "清空上下文失败",
     "button": "清空上下文"
+  },
+  "cluster": {
+    "stripTitle": "agent 集群",
+    "progress": "{{done}}/{{total}} 节点已交付",
+    "expand": "展开集群进度",
+    "collapse": "收起集群进度",
+    "questionBanner": "节点「{{title}}」有决策问题待你作答",
+    "questionCta": "进入作答 →",
+    "toggleTitle": "agent 集群",
+    "toggleDesc": "主 agent 对每个任务刻意评估是否拆给多个独立 agent 并行交付；太简单会说明原因后直接作答。",
+    "approvalTitle": "节点审批模式",
+    "approvalDesc": "节点遇关键决策时挂起向你提问，由你进入该节点作答后继续；关闭则全授权由各节点自行判断。",
+    "pillAria": "agent 集群设置",
+    "pill": "集群",
+    "approvalShort": "审批"
   }
 }

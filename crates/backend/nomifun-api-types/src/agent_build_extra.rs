@@ -340,6 +340,12 @@ pub struct NomiBuildExtra {
     /// 防止自授权。接受驼峰 (`publicAgentId`) 与蛇形。缺省 `None` = 非对外会话。
     #[serde(default, alias = "publicAgentId")]
     pub public_agent_id: Option<String>,
+    /// 「agent 集群」意图标记（需求1）。用户在 composer 显式点选后写到会话 extra；
+    /// nomi 工厂据此在常驻 subagent 提示之上追加更强的 `CLUSTER_MODE_HINT`（必须
+    /// 刻意评估是否开集群、太简单须先说明原因再作答）。仅塑形提示、不授予能力——
+    /// 编排工具仍随独立门控的桌面网关走。缺省 `false` = 既有会话零变化。
+    #[serde(default, alias = "agentClusterMode")]
+    pub agent_cluster_mode: bool,
 }
 
 fn default_nomi_max_tokens() -> u32 {

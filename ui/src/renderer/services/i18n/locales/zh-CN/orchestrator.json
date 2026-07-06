@@ -119,8 +119,10 @@
     "node": {
       "tokens": "tok"
     },
-    "canvas": {
-      "mainNode": "main · 主 agent"
+    "question": {
+      "badge": "待作答",
+      "eyebrow": "节点决策问题",
+      "answerHint": "在下方对话框直接回复你的选择；节点产出满意后点「采用为该节点产出」继续执行。"
     },
     "timing": {
       "took": "用时 {{value}}",
