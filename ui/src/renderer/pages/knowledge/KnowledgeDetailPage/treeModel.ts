@@ -135,3 +135,15 @@ export function knowledgeFolderPathChain(relPath: string): string[] {
   const parts = relPath.split('/').filter(Boolean);
   return parts.map((_, index) => parts.slice(0, index + 1).join('/'));
 }
+
+export function isKnowledgePathWithin(path: string | null, folderPath: string): boolean {
+  if (!path || !folderPath) return false;
+  return path === folderPath || path.startsWith(`${folderPath}/`);
+}
+
+export function replaceKnowledgePathPrefix(path: string | null, oldPrefix: string, newPrefix: string): string | null {
+  if (!path) return path;
+  if (path === oldPrefix) return newPrefix;
+  if (path.startsWith(`${oldPrefix}/`)) return `${newPrefix}${path.slice(oldPrefix.length)}`;
+  return path;
+}

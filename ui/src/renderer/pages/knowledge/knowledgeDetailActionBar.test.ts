@@ -28,6 +28,32 @@ describe('Knowledge detail document action bar', () => {
     expect(detailSource.includes('FolderPlus')).toBe(true);
   });
 
+  test('uses compact per-node menus instead of inline delete text in the document tree', () => {
+    expect(detailSource.includes('knowledge-tree-node-row')).toBe(true);
+    expect(detailSource.includes('knowledge-tree-node-name')).toBe(true);
+    expect(detailSource.includes('knowledge-tree-node-action')).toBe(true);
+    expect(detailSource.includes('knowledge-tree-node-more')).toBe(true);
+    expect(detailSource.includes('handleTreeNodeMenuClick')).toBe(true);
+    expect(detailSource.includes("key='new-file'")).toBe(true);
+    expect(detailSource.includes("key='new-folder'")).toBe(true);
+    expect(detailSource.includes("key='rename'")).toBe(true);
+    expect(detailSource.includes("key='delete'")).toBe(true);
+    expect(detailSource.includes('deleteFolderWarning')).toBe(true);
+    expect(detailSource.includes("className='!hidden group-hover:!inline-flex shrink-0'")).toBe(false);
+  });
+
+  test('right-aligns tree row actions and reveals them only for the active row', () => {
+    expect(detailSource.includes('knowledge-doc-tree')).toBe(true);
+    expect(detailSource.includes('[&_.arco-tree-node-title-wrapper]:flex')).toBe(true);
+    expect(detailSource.includes('[&_.arco-tree-node-title]:flex-1')).toBe(true);
+    expect(detailSource.includes('knowledge-tree-node-row group flex w-full')).toBe(true);
+    expect(detailSource.includes('knowledge-tree-node-action ml-auto w-24px')).toBe(true);
+    expect(detailSource.includes('opacity-0')).toBe(true);
+    expect(detailSource.includes('group-hover:opacity-100')).toBe(true);
+    expect(detailSource.includes('focus-within:opacity-100')).toBe(true);
+    expect(detailSource.includes("aria-label={t('common.more'")).toBe(true);
+  });
+
   test('disables connector entries while Feishu knowledge creation is disabled', () => {
     expect(detailSource.includes('FEISHU_KNOWLEDGE_CREATION_ENABLED')).toBe(true);
     expect(detailSource.includes("disabled={!FEISHU_KNOWLEDGE_CREATION_ENABLED}")).toBe(true);

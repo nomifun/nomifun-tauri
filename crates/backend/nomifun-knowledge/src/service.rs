@@ -1199,6 +1199,31 @@ impl KnowledgeService {
             .map_err(|e| AppError::Internal(format!("folder create task join error: {e}")))?
     }
 
+    pub async fn delete_folder(&self, id: &str, rel_path: &str) -> Result<(), AppError> {
+        let row = self.require_base(id).await?;
+        let root = PathBuf::from(&row.root_path);
+        let rel_path = normalize_tree_rel_path(rel_path)?;
+        if rel_path.is_empty() {
+            return Err(AppError::BadRequest("folder path must not be empty".into()));
+        }
+        tokio::task::spawn_blocking(move || delete_tree_folder(&root, &rel_path))
+            .await
+            .map_err(|e| AppError::Internal(format!("folder delete task join error: {e}")))?
+    }
+
+    pub async fn rename_tree_entry(&self, id: &str, rel_path: &str, new_name: &str) -> Result<KbTreeEntry, AppError> {
+        let row = self.require_base(id).await?;
+        let root = PathBuf::from(&row.root_path);
+        let rel_path = normalize_tree_rel_path(rel_path)?;
+        if rel_path.is_empty() {
+            return Err(AppError::BadRequest("path must not be empty".into()));
+        }
+        let new_name = validate_tree_entry_name(new_name)?;
+        tokio::task::spawn_blocking(move || rename_tree_entry(&root, &rel_path, &new_name))
+            .await
+            .map_err(|e| AppError::Internal(format!("tree rename task join error: {e}")))?
+    }
+
     pub async fn read_file(&self, id: &str, rel_path: &str) -> Result<KbFileContent, AppError> {
         let row = self.require_base(id).await?;
         let path = safe_md_path(Path::new(&row.root_path), rel_path)?;
@@ -3192,6 +3217,119 @@ fn create_tree_folder(root: &Path, rel_path: &str) -> Result<KbTreeEntry, AppErr
     })
 }
 
+fn validate_tree_entry_name(name: &str) -> Result<String, AppError> {
+    let normalized = name.trim().replace('\\', "/");
+    if normalized.is_empty() || normalized.contains('/') || normalized == "." || normalized == ".." || looks_like_windows_drive_prefix(&normalized) {
+        return Err(AppError::BadRequest(format!("invalid name: {name}")));
+    }
+    if is_excluded_tree_dir_name(&normalized) {
+        return Err(AppError::BadRequest(format!(
+            "directory is excluded: {normalized}"
+        )));
+    }
+    Ok(normalized)
+}
+
+fn resolve_tree_existing_path(root: &Path, rel_path: &str) -> Result<(PathBuf, std::fs::Metadata), AppError> {
+    if !root.is_dir() {
+        return Err(AppError::NotFound("knowledge base directory not found".into()));
+    }
+    let segments: Vec<&str> = rel_path.split('/').filter(|segment| !segment.is_empty()).collect();
+    if segments.is_empty() {
+        return Err(AppError::BadRequest("path must not be empty".into()));
+    }
+
+    let mut cursor = root.to_path_buf();
+    for (idx, segment) in segments.iter().enumerate() {
+        cursor.push(segment);
+        let meta = std::fs::symlink_metadata(&cursor)
+            .map_err(|_| AppError::NotFound(format!("path not found: {rel_path}")))?;
+        if meta.file_type().is_symlink() {
+            return Err(AppError::BadRequest(format!("path crosses a symlink: {rel_path}")));
+        }
+        if idx + 1 < segments.len() && !meta.file_type().is_dir() {
+            return Err(AppError::BadRequest(format!(
+                "path is not a directory: {}",
+                segments[..=idx].join("/")
+            )));
+        }
+        if idx + 1 == segments.len() {
+            return Ok((cursor, meta));
+        }
+    }
+    Err(AppError::BadRequest("path must not be empty".into()))
+}
+
+fn remove_tree_dir_no_follow(path: &Path) -> Result<(), AppError> {
+    let entries = std::fs::read_dir(path)
+        .map_err(|e| AppError::Internal(format!("failed to read folder before delete: {e}")))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| AppError::Internal(format!("failed to read folder entry before delete: {e}")))?;
+        let child = entry.path();
+        let meta = std::fs::symlink_metadata(&child)
+            .map_err(|e| AppError::Internal(format!("failed to inspect folder entry before delete: {e}")))?;
+        if meta.file_type().is_dir() {
+            remove_tree_dir_no_follow(&child)?;
+        } else {
+            std::fs::remove_file(&child)
+                .map_err(|e| AppError::Internal(format!("failed to delete folder entry: {e}")))?;
+        }
+    }
+    std::fs::remove_dir(path)
+        .map_err(|e| AppError::Internal(format!("failed to delete folder: {e}")))?;
+    Ok(())
+}
+
+fn delete_tree_folder(root: &Path, rel_path: &str) -> Result<(), AppError> {
+    let (path, meta) = resolve_tree_existing_path(root, rel_path)?;
+    if !meta.file_type().is_dir() {
+        return Err(AppError::BadRequest(format!("path is not a directory: {rel_path}")));
+    }
+    remove_tree_dir_no_follow(&path)
+}
+
+fn rename_tree_entry(root: &Path, rel_path: &str, new_name: &str) -> Result<KbTreeEntry, AppError> {
+    let (from, meta) = resolve_tree_existing_path(root, rel_path)?;
+    let file_type = meta.file_type();
+    let is_file = file_type.is_file();
+    let is_dir = file_type.is_dir();
+    if !is_file && !is_dir {
+        return Err(AppError::BadRequest(format!("unsupported path type: {rel_path}")));
+    }
+    if is_file && !is_md(Path::new(new_name)) {
+        return Err(AppError::BadRequest("markdown files must keep a .md extension".into()));
+    }
+
+    let segments: Vec<&str> = rel_path.split('/').filter(|segment| !segment.is_empty()).collect();
+    let parent_rel = if segments.len() <= 1 {
+        String::new()
+    } else {
+        segments[..segments.len() - 1].join("/")
+    };
+    let parent = from
+        .parent()
+        .ok_or_else(|| AppError::BadRequest(format!("invalid path: {rel_path}")))?;
+    let to = parent.join(new_name);
+    match std::fs::symlink_metadata(&to) {
+        Ok(_) => return Err(AppError::Conflict(format!("path already exists: {}", join_tree_rel_path(&parent_rel, new_name)))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(AppError::Internal(format!("failed to inspect target path: {e}"))),
+    }
+
+    std::fs::rename(&from, &to)
+        .map_err(|e| AppError::Internal(format!("failed to rename tree entry: {e}")))?;
+
+    let target_meta = std::fs::metadata(&to).ok();
+    Ok(KbTreeEntry {
+        name: new_name.to_owned(),
+        rel_path: join_tree_rel_path(&parent_rel, new_name),
+        is_dir,
+        is_file,
+        size: if is_file { target_meta.as_ref().map(|m| m.len()) } else { None },
+        modified_at: target_meta.as_ref().and_then(modified_ms),
+    })
+}
+
 /// Sanitize a base name into a directory-safe mount link name, deduplicating
 /// collisions (with other mounts AND with the platform-managed companion
 /// files inside the mount root, e.g. a base literally named `README.md`)
@@ -4093,6 +4231,74 @@ mod tests {
         assert!(service.create_folder(&info.id, "_inbox/draft").await.is_err());
         assert!(service.create_folder(&info.id, "node_modules/pkg").await.is_err());
         assert!(service.create_folder(&info.id, "README.md/child").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_folder_removes_visible_markdown_tree_and_rejects_unsafe_targets() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join("docs/nested")).unwrap();
+        std::fs::write(vault.join("docs/README.md"), "# Docs").unwrap();
+        std::fs::write(vault.join("docs/nested/topic.md"), "# Topic").unwrap();
+        std::fs::write(vault.join("root.md"), "# Root").unwrap();
+
+        let info = service
+            .create_base("vault", "", Some(vault.to_str().unwrap()), None)
+            .await
+            .unwrap();
+
+        service.delete_folder(&info.id, "docs").await.unwrap();
+        assert!(!vault.join("docs").exists());
+        assert!(vault.join("root.md").exists());
+
+        assert!(service.delete_folder(&info.id, "").await.is_err());
+        assert!(service.delete_folder(&info.id, "../escape").await.is_err());
+        assert!(service.delete_folder(&info.id, "root.md").await.is_err());
+        assert!(service.delete_folder(&info.id, "_inbox").await.is_err());
+        assert!(service.delete_folder(&info.id, "node_modules").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn rename_tree_entry_renames_files_and_folders_within_the_same_parent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(vault.join("docs/nested")).unwrap();
+        std::fs::write(vault.join("docs/old.md"), "# Old").unwrap();
+        std::fs::write(vault.join("docs/nested/topic.md"), "# Topic").unwrap();
+        std::fs::write(vault.join("taken.md"), "# Taken").unwrap();
+        std::fs::write(vault.join("existing.md"), "# Existing").unwrap();
+
+        let info = service
+            .create_base("vault", "", Some(vault.to_str().unwrap()), None)
+            .await
+            .unwrap();
+
+        let file = service
+            .rename_tree_entry(&info.id, "docs/old.md", "new.md")
+            .await
+            .unwrap();
+        assert_eq!(file.rel_path, "docs/new.md");
+        assert!(file.is_file);
+        assert!(vault.join("docs/new.md").is_file());
+        assert!(!vault.join("docs/old.md").exists());
+
+        let folder = service
+            .rename_tree_entry(&info.id, "docs/nested", "renamed")
+            .await
+            .unwrap();
+        assert_eq!(folder.rel_path, "docs/renamed");
+        assert!(folder.is_dir);
+        assert!(vault.join("docs/renamed/topic.md").is_file());
+
+        assert!(service.rename_tree_entry(&info.id, "", "root").await.is_err());
+        assert!(service.rename_tree_entry(&info.id, "docs/new.md", "bad.txt").await.is_err());
+        assert!(service.rename_tree_entry(&info.id, "docs/new.md", "../escape.md").await.is_err());
+        assert!(service.rename_tree_entry(&info.id, "docs/new.md", "renamed").await.is_err());
+        assert!(service.rename_tree_entry(&info.id, "taken.md", "existing.md").await.is_err());
     }
 
     /// The per-base walk must be bounded: a walk that finishes within budget

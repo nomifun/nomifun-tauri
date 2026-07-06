@@ -2,9 +2,11 @@ import { describe, expect, test } from 'bun:test';
 import type { IKnowledgeFileEntry, IKnowledgeTreeEntry } from '@/common/adapter/ipcBridge';
 import {
   buildKnowledgeSearchTree,
+  isKnowledgePathWithin,
   knowledgeFolderPathChain,
   mergeKnowledgeTreeChildren,
   preserveKnowledgeTreeChildren,
+  replaceKnowledgePathPrefix,
 } from './KnowledgeDetailPage/treeModel';
 
 const file = (rel_path: string): IKnowledgeFileEntry => ({
@@ -84,5 +86,14 @@ describe('knowledge detail tree model', () => {
     expect(knowledgeFolderPathChain('raw/tutorials/deep')).toEqual(['raw', 'raw/tutorials', 'raw/tutorials/deep']);
     expect(knowledgeFolderPathChain('/raw//tutorials/')).toEqual(['raw', 'raw/tutorials']);
     expect(knowledgeFolderPathChain('')).toEqual([]);
+  });
+
+  test('detects and rewrites paths inside a renamed folder', () => {
+    expect(isKnowledgePathWithin('raw/tutorials/topic.md', 'raw/tutorials')).toBe(true);
+    expect(isKnowledgePathWithin('raw/tutorials', 'raw/tutorials')).toBe(true);
+    expect(isKnowledgePathWithin('raw/tutorials-old/topic.md', 'raw/tutorials')).toBe(false);
+    expect(replaceKnowledgePathPrefix('raw/tutorials/topic.md', 'raw/tutorials', 'wiki/tutorials')).toBe('wiki/tutorials/topic.md');
+    expect(replaceKnowledgePathPrefix('raw/tutorials', 'raw/tutorials', 'wiki/tutorials')).toBe('wiki/tutorials');
+    expect(replaceKnowledgePathPrefix(null, 'raw/tutorials', 'wiki/tutorials')).toBeNull();
   });
 });

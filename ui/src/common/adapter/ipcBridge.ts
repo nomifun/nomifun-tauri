@@ -3849,6 +3849,13 @@ export const knowledge = {
     (p) => `/api/knowledge/bases/${p.id}/folder`,
     (p) => ({ path: p.path })
   ),
+  deleteFolder: httpDelete<void, { id: string; path: string }>(
+    (p) => `/api/knowledge/bases/${p.id}/folder?path=${encodeURIComponent(p.path)}`
+  ),
+  renameTreeEntry: httpPost<IKnowledgeTreeEntry, { id: string; path: string; newName: string }>(
+    (p) => `/api/knowledge/bases/${p.id}/tree/rename`,
+    (p) => ({ path: p.path, new_name: p.newName })
+  ),
   readFile: httpGet<IKnowledgeFileContent, { id: string; path: string }>(
     (p) => `/api/knowledge/bases/${p.id}/file?path=${encodeURIComponent(p.path)}`,
     { timeoutMs: KB_READ_TIMEOUT_MS }

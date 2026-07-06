@@ -30,7 +30,6 @@ import {
   Menu,
   Message,
   Modal,
-  Popconfirm,
   Result,
   Spin,
   Tabs,
@@ -39,6 +38,7 @@ import {
 } from '@arco-design/web-react';
 import {
   ApiApp,
+  Delete,
   Earth,
   EditTwo,
   FileText,
@@ -78,10 +78,12 @@ import TagPicker from '../CreateStudio/TagPicker';
 import { FEISHU_KNOWLEDGE_CREATION_ENABLED } from '../CreateStudio/sourceTypes';
 import {
   buildKnowledgeSearchTree,
+  isKnowledgePathWithin,
   knowledgeFolderPathChain,
   mergeKnowledgeTreeChildren,
   parentDirOfKnowledgePath,
   preserveKnowledgeTreeChildren,
+  replaceKnowledgePathPrefix,
 } from './treeModel';
 
 // ─── Tab keys (maps to ?tab= query values) ─────────────────────────────────────
@@ -523,6 +525,9 @@ const KnowledgeDetailPage: React.FC = () => {
   const [newFilePath, setNewFilePath] = useState('');
   const [newFolderVisible, setNewFolderVisible] = useState(false);
   const [newFolderPath, setNewFolderPath] = useState('');
+  const [renameVisible, setRenameVisible] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<IKnowledgeTreeEntry | null>(null);
+  const [renameName, setRenameName] = useState('');
   const [autogenLoading, setAutogenLoading] = useState(false);
   const [refreshingSource, setRefreshingSource] = useState(false);
   const [connectorVisible, setConnectorVisible] = useState(false);
@@ -647,16 +652,22 @@ const KnowledgeDetailPage: React.FC = () => {
     [id]
   );
 
-  const openNewFileModal = () => {
-    const folder = selectedFolderPath || parentDirOfKnowledgePath(selectedPath);
+  const openNewFileModal = (folderOverride?: string) => {
+    const folder = folderOverride ?? (selectedFolderPath || parentDirOfKnowledgePath(selectedPath));
     setNewFilePath(folder ? `${folder}/` : '');
     setNewFileVisible(true);
   };
 
-  const openNewFolderModal = () => {
-    const folder = selectedFolderPath || parentDirOfKnowledgePath(selectedPath);
+  const openNewFolderModal = (folderOverride?: string) => {
+    const folder = folderOverride ?? (selectedFolderPath || parentDirOfKnowledgePath(selectedPath));
     setNewFolderPath(folder ? `${folder}/` : '');
     setNewFolderVisible(true);
+  };
+
+  const openRenameModal = (item: IKnowledgeTreeEntry) => {
+    setRenameTarget(item);
+    setRenameName(item.name);
+    setRenameVisible(true);
   };
 
   const handleCreateFile = async () => {
@@ -700,6 +711,33 @@ const KnowledgeDetailPage: React.FC = () => {
     }
   };
 
+  const handleRenameTreeEntry = async () => {
+    if (!id || !renameTarget) return;
+    let newName = renameName.trim();
+    if (!newName) return;
+    if (renameTarget.is_file && !newName.toLowerCase().endsWith('.md')) newName = `${newName}.md`;
+    const oldPath = renameTarget.rel_path;
+    const parent = parentDirOfKnowledgePath(oldPath);
+    try {
+      const renamed = await ipcBridge.knowledge.renameTreeEntry.invoke({ id, path: oldPath, newName });
+      setRenameVisible(false);
+      setRenameTarget(null);
+      setRenameName('');
+      setFileSearch('');
+      setExpandedTreeKeys((prev) =>
+        prev.map((key) => replaceKnowledgePathPrefix(key, oldPath, renamed.rel_path) ?? key)
+      );
+      setSelectedPath((prev) => replaceKnowledgePathPrefix(prev, oldPath, renamed.rel_path));
+      setSelectedFolderPath((prev) => replaceKnowledgePathPrefix(prev || null, oldPath, renamed.rel_path) || '');
+      setSelectedTreeKey((prev) => replaceKnowledgePathPrefix(prev, oldPath, renamed.rel_path));
+      await refresh();
+      await reloadTreePath(parent);
+      Message.success(t('knowledge.actions.renameOk', { defaultValue: '已重命名' }));
+    } catch (e) {
+      Message.error(String(e));
+    }
+  };
+
   const handleDeleteFile = async (path: string) => {
     if (!id) return;
     const parent = parentDirOfKnowledgePath(path);
@@ -714,6 +752,82 @@ const KnowledgeDetailPage: React.FC = () => {
       await reloadTreePath(parent);
     } catch (e) {
       Message.error(String(e));
+    }
+  };
+
+  const handleDeleteFolder = async (path: string) => {
+    if (!id) return;
+    const parent = parentDirOfKnowledgePath(path);
+    try {
+      await ipcBridge.knowledge.deleteFolder.invoke({ id, path });
+      Message.success(t('knowledge.actions.deleteFolderOk', { defaultValue: '目录已删除' }));
+      setFileSearch('');
+      setExpandedTreeKeys((prev) => prev.filter((key) => !isKnowledgePathWithin(key, path)));
+      if (isKnowledgePathWithin(selectedPath, path)) {
+        setSelectedPath(null);
+        setContent('');
+        setDraft('');
+        setEditMode(false);
+      }
+      if (isKnowledgePathWithin(selectedTreeKey, path)) {
+        setSelectedTreeKey(parent || null);
+      }
+      if (isKnowledgePathWithin(selectedFolderPath || null, path)) {
+        setSelectedFolderPath(parent);
+      }
+      await refresh();
+      await reloadTreePath(parent);
+    } catch (e) {
+      Message.error(String(e));
+    }
+  };
+
+  const confirmDeleteTreeEntry = (item: IKnowledgeTreeEntry) => {
+    if (item.is_dir) {
+      Modal.confirm({
+        title: t('knowledge.tree.deleteFolderTitle', { defaultValue: '确认删除目录？' }),
+        content: (
+          <div className='text-13px leading-20px text-[var(--color-text-2)]'>
+            <div>
+              {t('knowledge.tree.deleteFolderWarning', {
+                defaultValue: '删除目录“{{name}}”会一并清空其下所有文档和子目录，无法撤销。',
+                name: item.name,
+              })}
+            </div>
+            <div className='mt-6px break-all text-[var(--color-text-3)]'>{item.rel_path}</div>
+          </div>
+        ),
+        okButtonProps: { status: 'danger' },
+        okText: t('knowledge.actions.delete', { defaultValue: '删除' }),
+        onOk: () => handleDeleteFolder(item.rel_path),
+      });
+      return;
+    }
+
+    Modal.confirm({
+      title: t('knowledge.actions.deleteFileConfirm', { defaultValue: '确认删除该文档？' }),
+      content: <div className='break-all text-[var(--color-text-3)]'>{item.rel_path}</div>,
+      okButtonProps: { status: 'danger' },
+      okText: t('knowledge.actions.delete', { defaultValue: '删除' }),
+      onOk: () => handleDeleteFile(item.rel_path),
+    });
+  };
+
+  const handleTreeNodeMenuClick = (key: string, item: IKnowledgeTreeEntry) => {
+    if (key === 'new-file' && item.is_dir) {
+      openNewFileModal(item.rel_path);
+      return;
+    }
+    if (key === 'new-folder' && item.is_dir) {
+      openNewFolderModal(item.rel_path);
+      return;
+    }
+    if (key === 'rename') {
+      openRenameModal(item);
+      return;
+    }
+    if (key === 'delete') {
+      confirmDeleteTreeEntry(item);
     }
   };
 
@@ -965,7 +1079,7 @@ const KnowledgeDetailPage: React.FC = () => {
                   <button
                     type='button'
                     className='knowledge-doc-action inline-flex min-w-0 appearance-none items-center justify-center gap-4px rounded-8px border-none bg-transparent px-6px py-7px font-[inherit] text-11px font-500 text-[var(--color-text-2)] cursor-pointer transition-colors hover:bg-[var(--color-fill-3)] hover:text-[var(--color-text-1)] focus-visible:outline-none focus-visible:bg-[var(--color-fill-3)] focus-visible:text-[var(--color-text-1)]'
-                    onClick={openNewFileModal}
+                    onClick={() => openNewFileModal()}
                     title={t('knowledge.detail.docs.newFile', { defaultValue: '新建文档' })}
                   >
                     <Plus theme='outline' size='12' className='shrink-0' />
@@ -974,7 +1088,7 @@ const KnowledgeDetailPage: React.FC = () => {
                   <button
                     type='button'
                     className='knowledge-doc-action inline-flex min-w-0 appearance-none items-center justify-center gap-4px rounded-8px border-none bg-transparent px-6px py-7px font-[inherit] text-11px font-500 text-[var(--color-text-2)] cursor-pointer transition-colors hover:bg-[var(--color-fill-3)] hover:text-[var(--color-text-1)] focus-visible:outline-none focus-visible:bg-[var(--color-fill-3)] focus-visible:text-[var(--color-text-1)]'
-                    onClick={openNewFolderModal}
+                    onClick={() => openNewFolderModal()}
                     title={t('knowledge.detail.docs.newFolder', { defaultValue: '新建文件夹' })}
                   >
                     <FolderPlus theme='outline' size='12' className='shrink-0' />
@@ -1016,7 +1130,7 @@ const KnowledgeDetailPage: React.FC = () => {
                       />
                     ) : (
                       <Tree
-                        className='knowledge-doc-tree text-13px'
+                        className='knowledge-doc-tree text-13px [&_.arco-tree-node]:w-full [&_.arco-tree-node-title-wrapper]:flex [&_.arco-tree-node-title-wrapper]:w-full [&_.arco-tree-node-title-wrapper]:min-w-0 [&_.arco-tree-node-title-wrapper]:items-center [&_.arco-tree-node-title]:min-w-0 [&_.arco-tree-node-title]:flex-1 [&_.arco-tree-node-title]:!pr-0'
                         showLine
                         actionOnClick={['select', 'expand']}
                         selectedKeys={selectedTreeKey ? [selectedTreeKey] : []}
@@ -1053,33 +1167,65 @@ const KnowledgeDetailPage: React.FC = () => {
                         renderTitle={(node) => {
                           const item = node.dataRef as IKnowledgeTreeEntry;
                           return (
-                            <div className='group flex min-w-0 items-center justify-between gap-6px pr-4px'>
-                              <span className='flex min-w-0 items-center gap-5px'>
+                            <div className='knowledge-tree-node-row group flex w-full min-w-0 items-center gap-6px pr-1px'>
+                              <span className='knowledge-tree-node-main flex min-w-0 flex-1 items-center gap-5px'>
                                 {item.is_dir ? (
                                   <FolderOpen theme='outline' size='13' className='shrink-0 text-[var(--color-text-3)]' />
                                 ) : (
                                   <FileText theme='outline' size='13' className='shrink-0 text-[var(--color-text-3)]' />
                                 )}
-                                <span className='truncate' title={item.rel_path}>
+                                <span className='knowledge-tree-node-name block min-w-0 truncate' title={item.rel_path}>
                                   {node.title}
                                 </span>
                               </span>
-                              {item.is_file && (
-                                <Popconfirm
-                                  title={t('knowledge.actions.deleteFileConfirm')}
-                                  onOk={() => handleDeleteFile(item.rel_path)}
+                              <span className='knowledge-tree-node-action ml-auto w-24px grid shrink-0 place-items-center opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-within:opacity-100'>
+                                <Dropdown
+                                  trigger='click'
+                                  droplist={
+                                    <Menu onClickMenuItem={(key) => handleTreeNodeMenuClick(String(key), item)}>
+                                      {item.is_dir && (
+                                        <>
+                                          <Menu.Item key='new-file'>
+                                            <span className='inline-flex items-center gap-6px'>
+                                              <Plus theme='outline' size='13' />
+                                              {t('knowledge.detail.docs.newFile', { defaultValue: '新建文档' })}
+                                            </span>
+                                          </Menu.Item>
+                                          <Menu.Item key='new-folder'>
+                                            <span className='inline-flex items-center gap-6px'>
+                                              <FolderPlus theme='outline' size='13' />
+                                              {t('knowledge.detail.docs.newFolder', { defaultValue: '新建文件夹' })}
+                                            </span>
+                                          </Menu.Item>
+                                        </>
+                                      )}
+                                      <Menu.Item key='rename'>
+                                        <span className='inline-flex items-center gap-6px'>
+                                          <EditTwo theme='outline' size='13' />
+                                          {t('knowledge.actions.rename', { defaultValue: '重命名' })}
+                                        </span>
+                                      </Menu.Item>
+                                      <Menu.Item key='delete' className='!text-[rgb(var(--danger-6))]'>
+                                        <span className='inline-flex items-center gap-6px'>
+                                          <Delete theme='outline' size='13' />
+                                          {t('knowledge.actions.delete', { defaultValue: '删除' })}
+                                        </span>
+                                      </Menu.Item>
+                                    </Menu>
+                                  }
                                 >
-                                  <Button
-                                    size='mini'
-                                    status='danger'
-                                    type='text'
-                                    className='!hidden group-hover:!inline-flex shrink-0'
+                                  <button
+                                    type='button'
+                                    className='knowledge-tree-node-more grid h-22px w-22px shrink-0 place-items-center rounded-6px border-0 bg-transparent p-0 text-[var(--color-text-3)] cursor-pointer hover:bg-[var(--color-fill-2)] hover:text-[var(--color-text-1)] focus-visible:outline-none focus-visible:bg-[var(--color-fill-2)]'
+                                    onMouseDown={(e) => e.stopPropagation()}
                                     onClick={(e) => e.stopPropagation()}
+                                    title={t('common.more', { defaultValue: '更多' })}
+                                    aria-label={t('common.more', { defaultValue: '更多' })}
                                   >
-                                    {t('knowledge.actions.delete')}
-                                  </Button>
-                                </Popconfirm>
-                              )}
+                                    <More theme='outline' size='13' />
+                                  </button>
+                                </Dropdown>
+                              </span>
                             </div>
                           );
                         }}
@@ -1399,6 +1545,25 @@ const KnowledgeDetailPage: React.FC = () => {
           value={newFolderPath}
           onChange={setNewFolderPath}
           onPressEnter={() => void handleCreateFolder()}
+        />
+      </Modal>
+
+      <Modal
+        title={t('knowledge.renameTitle', { defaultValue: '重命名' })}
+        visible={renameVisible}
+        onOk={() => void handleRenameTreeEntry()}
+        onCancel={() => {
+          setRenameVisible(false);
+          setRenameTarget(null);
+          setRenameName('');
+        }}
+        autoFocus={false}
+      >
+        <Input
+          placeholder={t('knowledge.renamePlaceholder', { defaultValue: '输入新的名称' })}
+          value={renameName}
+          onChange={setRenameName}
+          onPressEnter={() => void handleRenameTreeEntry()}
         />
       </Modal>
     </div>
