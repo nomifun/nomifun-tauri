@@ -10,8 +10,10 @@ import { describe, expect, test } from 'bun:test';
 const readSource = (url: URL) => readFileSync(url, 'utf8');
 
 describe('Nomi sendbox control layout', () => {
-  test('moves context usage into the sendbox top row and removes turn metrics copy', () => {
+  test('moves context usage into the sendbox internal status row and removes turn metrics copy', () => {
     const source = readSource(new URL('./NomiSendBox.tsx', import.meta.url));
+    const sendBoxSource = readSource(new URL('../../../../components/chat/SendBox/index.tsx', import.meta.url));
+    const contextPillSource = readSource(new URL('./ContextUsagePill.tsx', import.meta.url));
     const sendBoxIndex = source.indexOf('<SendBox');
     const topRightToolsIndex = source.indexOf('topRightTools={', sendBoxIndex);
     const contextPillIndex = source.indexOf('<ContextUsagePill', topRightToolsIndex);
@@ -26,6 +28,13 @@ describe('Nomi sendbox control layout', () => {
     expect(source.includes("data-testid='nomi-turn-metrics'")).toBe(false);
     expect(source.includes('formatTurnDuration')).toBe(false);
     expect(source.includes('formatTokenCount(tokenUsage.total_tokens)')).toBe(false);
+    expect(sendBoxSource.includes("data-testid='sendbox-internal-context-tools'")).toBe(true);
+    expect(sendBoxSource.includes("data-testid='sendbox-top-right-tools'")).toBe(false);
+    expect(contextPillSource.includes("data-testid='nomi-context-usage'")).toBe(true);
+    expect(contextPillSource.includes('h-28px')).toBe(true);
+    expect(contextPillSource.includes('b-solid')).toBe(true);
+    expect(contextPillSource.includes('w-7px')).toBe(true);
+    expect(contextPillSource.includes("background: 'var(--color-fill-2)'")).toBe(false);
   });
 
   test('keeps collaborator controls next to the main model and moves cluster next to permission', () => {

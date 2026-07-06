@@ -184,6 +184,7 @@ const SendBox: React.FC<{
   className?: string;
   tools?: React.ReactNode;
   rightTools?: React.ReactNode;
+  /** Conversation-only: compact status control rendered inside the composer header row. */
   topRightTools?: React.ReactNode;
   prefix?: React.ReactNode;
   placeholder?: string;
@@ -201,7 +202,7 @@ const SendBox: React.FC<{
   selectedWorkspaceItems?: FileSelectionItem[];
   onSelectedWorkspaceItemsChange?: (items: FileSelectionItem[]) => void;
   bottomHint?: React.ReactNode;
-  /** Conversation-only: render the compact plan strip directly above the input panel. */
+  /** Conversation-only: render the compact plan strip inside the input panel status row. */
   showPinnedPlan?: boolean;
   /**
    * Mobile-only: open a parent-supplied action sheet via the `+` button.
@@ -267,6 +268,7 @@ const SendBox: React.FC<{
   const setInputRef = useLatestRef(setInput);
   const messageList = useMessageList();
   const pinnedPlan = useMemo(() => (showPinnedPlan ? derivePinnedPlan(messageList) : null), [messageList, showPinnedPlan]);
+  const hasInternalStatusRow = Boolean(pinnedPlan || topRightTools);
   const [historyNavigationIndex, setHistoryNavigationIndex] = useState<number | null>(null);
   const historyDraftRef = useRef<string | null>(null);
   const [replyQuote, setReplyQuote] = useState<ReplyQuote | null>(null);
@@ -1539,24 +1541,6 @@ const SendBox: React.FC<{
 
   return (
     <div className={`relative ${className ?? ''}`}>
-      {pinnedPlan && (
-        <div
-          className='pointer-events-none absolute left-0 right-0 bottom-[calc(100%+4px)] z-30 flex items-start justify-center px-1'
-          data-testid='sendbox-plan-overlay'
-        >
-          <div className='pointer-events-auto w-full'>
-            <PinnedPlan plan={pinnedPlan} />
-          </div>
-        </div>
-      )}
-      {topRightTools && (
-        <div
-          className='pointer-events-none absolute right-4px bottom-[calc(100%+4px)] h-36px z-40 flex items-center justify-end'
-          data-testid='sendbox-top-right-tools'
-        >
-          <div className='pointer-events-auto'>{topRightTools}</div>
-        </div>
-      )}
       <div
         ref={containerRef}
         className={`sendbox-panel relative p-16px border-3 b bg-dialog-fill-0 b-solid rd-20px flex flex-col ${isOverlayOpen ? 'overflow-visible' : 'overflow-hidden'} ${isFileDragging ? 'b-dashed sendbox-panel--dragging' : ''}`}
@@ -1638,6 +1622,23 @@ const SendBox: React.FC<{
                 }}
                 emptyText={t('messages.slash.empty', { defaultValue: 'No commands found' })}
               />
+            )}
+          </div>
+        )}
+        {hasInternalStatusRow && (
+          <div
+            className='sendbox-internal-status-row mb-8px flex w-full flex-wrap items-start gap-8px'
+            data-testid='sendbox-internal-status-row'
+          >
+            {pinnedPlan && (
+              <div className='min-w-[220px] max-w-[420px] flex-[1_1_340px]' data-testid='sendbox-internal-plan'>
+                <PinnedPlan plan={pinnedPlan} />
+              </div>
+            )}
+            {topRightTools && (
+              <div className='ml-auto flex h-28px flex-shrink-0 items-center' data-testid='sendbox-internal-context-tools'>
+                {topRightTools}
+              </div>
             )}
           </div>
         )}
