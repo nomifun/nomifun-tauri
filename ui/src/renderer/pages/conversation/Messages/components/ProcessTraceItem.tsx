@@ -20,14 +20,13 @@ import type { FileChangeInfo } from '../MessageFileChanges';
 import { isContextCompressionTip } from '../processTipModel';
 import { formatFileTargetPreview, formatWorkspaceFileTarget } from '../processFileTargetLabel';
 import {
-  buildThinkingReceiptDisplay,
   isFileReceiptRow,
   shouldShowFileListDetail,
-  shouldShowThinkingReceiptDetail,
   shouldShowToolRowDetail,
 } from '../processTraceDisplayModel';
 import type { TurnDisclosureProcessState } from '../turnDisclosureModel';
 import { getProcessItemState, mergeProcessStates } from '../turnProcessState';
+import MessageThinking from './MessageThinking';
 import MessagePermission from './MessagePermission';
 import { buildToolReceiptDetailRows, type ToolReceiptDetailRow } from './toolGroupSummaryModel';
 
@@ -38,17 +37,24 @@ export type ProcessTraceRenderableItem =
   | {
       type: 'file_summary';
       id: string;
+      msg_id?: string;
       diffs: FileChangeInfo[];
+      sourceMessageIds: string[];
+      created_at: number;
     }
   | {
       type: 'tool_summary';
       id: string;
+      msg_id?: string;
       messages: ToolProcessMessage[];
+      sourceMessageIds: string[];
+      created_at: number;
     }
   | {
       type: 'artifact';
       id: string;
       artifact: IConversationArtifact;
+      created_at: number;
     };
 
 type TranslationFn = ReturnType<typeof useTranslation>['t'];
@@ -78,22 +84,6 @@ const compactReceiptText = (value: unknown, fallback: string): string => {
 };
 
 const joinCompactText = (parts: Array<string | undefined>): string => parts.filter(Boolean).join(' ');
-
-const getThinkingDurationMs = (item: TMessage): number | undefined => {
-  if (item.type !== 'thinking') return undefined;
-  const duration = item.content.duration;
-  if (typeof duration !== 'number' || !Number.isFinite(duration) || duration <= 0) return undefined;
-  return duration;
-};
-
-const formatReceiptDuration = (ms: number | undefined, t: TranslationFn): string | undefined => {
-  if (ms === undefined) return undefined;
-  const totalSeconds = Math.max(0, Math.round(ms / 1000));
-  const sUnit = t('common.unit.second_short', { defaultValue: 's' });
-  const mUnit = t('common.unit.minute_short', { defaultValue: 'm' });
-  if (totalSeconds < 60) return `${totalSeconds}${sUnit}`;
-  return `${Math.floor(totalSeconds / 60)}${mUnit} ${totalSeconds % 60}${sUnit}`;
-};
 
 const getToolReceiptDetailDisplayTarget = (row: ToolReceiptDetailRow, workspaceRoots: string[]): string | undefined => {
   if (!row.target) return undefined;
@@ -417,48 +407,29 @@ const ProcessTraceRows: React.FC<{ rows: ProcessTraceRow[] }> = ({ rows }) => {
   );
 };
 
-const ThinkingTraceRow: React.FC<{
-  label: string;
-  detail: string;
-  state: TurnDisclosureProcessState;
-}> = ({ label, detail, state }) => {
-  const hasDetail = Boolean(detail);
-
-  if (!hasDetail) {
-    return (
-      <div className={classNames('turn-process-trace__row', `turn-process-trace__row--${state}`)}>
-        <span className='turn-process-trace__text' title={label}>
-          {label}
-        </span>
-      </div>
-    );
-  }
-
-  return (
-    <div className='turn-process-trace-thinking-inline'>
-      <div className='turn-process-trace__paragraph'>{detail}</div>
-    </div>
-  );
-};
-
 const ToolProcessTraceRows: React.FC<{
   messages: ToolProcessMessage[];
   variant?: ProcessTraceVariant;
   workspaceRoots: string[];
+  stateOverride?: TurnDisclosureProcessState;
 }> = ({
   messages,
   variant = 'list',
   workspaceRoots,
+  stateOverride,
 }) => {
   const { t } = useTranslation();
   const tools = useMemo(() => normalizeToolMessages(messages), [messages]);
   const rows = useMemo(
     () =>
-      buildToolReceiptDetailRows(tools).map((row) => ({
-        row,
-        label: formatToolReceiptDetailLabel(row, t, workspaceRoots),
-      })),
-    [t, tools, workspaceRoots]
+      buildToolReceiptDetailRows(tools).map((row) => {
+        const effectiveRow = stateOverride ? { ...row, state: stateOverride } : row;
+        return {
+          row: effectiveRow,
+          label: formatToolReceiptDetailLabel(effectiveRow, t, workspaceRoots),
+        };
+      }),
+    [stateOverride, t, tools, workspaceRoots]
   );
 
   const fileRows = rows.filter(({ row }) => isFileReceiptRow(row)).map(({ row }) => row);
@@ -550,14 +521,16 @@ const ProcessTraceItem: React.FC<{
   item: ProcessTraceRenderableItem;
   variant?: ProcessTraceVariant;
   workspaceRoots?: string[];
+  stateOverride?: TurnDisclosureProcessState;
 }> = ({
   item,
   variant = 'list',
   workspaceRoots,
+  stateOverride,
 }) => {
   const { t } = useTranslation();
   const conversationContext = useConversationContextSafe();
-  const state = getProcessItemState(item);
+  const state = stateOverride ?? getProcessItemState(item);
   const resolvedWorkspaceRoots = useMemo(
     () =>
       workspaceRoots && workspaceRoots.length
@@ -589,7 +562,14 @@ const ProcessTraceItem: React.FC<{
   }
 
   if ('type' in item && item.type === 'tool_summary') {
-    return <ToolProcessTraceRows messages={item.messages} variant={variant} workspaceRoots={resolvedWorkspaceRoots} />;
+    return (
+      <ToolProcessTraceRows
+        messages={item.messages}
+        variant={variant}
+        workspaceRoots={resolvedWorkspaceRoots}
+        stateOverride={stateOverride}
+      />
+    );
   }
 
   switch (item.type) {
@@ -599,6 +579,8 @@ const ProcessTraceItem: React.FC<{
           <div className='turn-process-trace__paragraph'>{item.content.content}</div>
         </div>
       );
+    case 'thinking':
+      return <MessageThinking message={item} variant='process' />;
     case 'tips':
       if (isContextCompressionTip(item)) {
         return (
@@ -633,7 +615,14 @@ const ProcessTraceItem: React.FC<{
     case 'tool_call':
     case 'tool_group':
     case 'acp_tool_call':
-      return <ToolProcessTraceRows messages={[item]} variant={variant} workspaceRoots={resolvedWorkspaceRoots} />;
+      return (
+        <ToolProcessTraceRows
+          messages={[item]}
+          variant={variant}
+          workspaceRoots={resolvedWorkspaceRoots}
+          stateOverride={stateOverride}
+        />
+      );
     case 'agent_status':
       return (
         <ProcessTraceRows
@@ -703,43 +692,6 @@ const ProcessTraceItem: React.FC<{
           ]}
         />
       );
-    case 'thinking': {
-      const thinkingDuration = formatReceiptDuration(getThinkingDurationMs(item), t);
-      const thinkingDisplay = buildThinkingReceiptDisplay(item.content, {
-        completedFallback: thinkingDuration
-          ? t('messages.processReceipt.thinkingCompletedDuration', {
-              duration: thinkingDuration,
-              defaultValue: 'Thought {{duration}}',
-            })
-          : t('messages.processReceipt.thinkingCompleted', { defaultValue: 'Thought' }),
-        runningFallback: t('messages.processReceipt.thinkingRunning', { defaultValue: 'Thinking' }),
-        waitingFallback: t('messages.processReceipt.thinkingWaiting', {
-          defaultValue: 'Waiting for model output',
-        }),
-      });
-      const thinkingDetail = shouldShowThinkingReceiptDetail(item.content) ? thinkingDisplay.detail : '';
-      if (thinkingDetail) {
-        const thinkingClassName = classNames(
-          variant === 'receipt' && 'turn-process-trace-receipt-detail',
-          variant !== 'receipt' && 'turn-process-trace',
-          variant !== 'receipt' && 'turn-process-trace-thinking-inline'
-        );
-        return (
-          <div className={thinkingClassName}>
-            <div className='turn-process-trace__paragraph'>{thinkingDetail}</div>
-          </div>
-        );
-      }
-      return (
-        <div className='turn-process-trace'>
-          <ThinkingTraceRow
-            label={thinkingDisplay.label}
-            detail={thinkingDetail}
-            state={state}
-          />
-        </div>
-      );
-    }
     case 'plan':
     case 'available_commands':
       return null;

@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-export type TurnDisclosureRole = 'user' | 'assistant' | 'process' | 'other';
+export type TurnDisclosureRole = 'user' | 'assistant' | 'process' | 'process_content' | 'other';
 export type TurnDisclosureProcessState = 'completed' | 'running' | 'waiting' | 'failed' | 'canceled';
 
 export interface TurnDisclosureInputItem {
@@ -31,6 +31,7 @@ export type TurnDisclosureOutputItem =
       startAt: number;
       endAt: number;
       state: TurnDisclosureProcessState;
+      processItemStates: Record<string, TurnDisclosureProcessState>;
       running: boolean;
       defaultCollapsed: boolean;
     };
@@ -70,12 +71,26 @@ const getProcessState = (entry: TurnDisclosureInputItem): TurnDisclosureProcessS
   return 'completed';
 };
 
+const getEffectiveProcessState = (
+  entry: TurnDisclosureInputItem,
+  options: { isClosed: boolean; hasFinalAssistant: boolean }
+): TurnDisclosureProcessState => {
+  const state = getProcessState(entry);
+  if (options.isClosed && options.hasFinalAssistant && (state === 'running' || state === 'waiting')) {
+    return 'completed';
+  }
+  return state;
+};
+
 const getProcessStartAt = (entry: TurnDisclosureInputItem): number => entry.processStartedAt ?? entry.createdAt;
 
 const getProcessEndAt = (entry: TurnDisclosureInputItem): number => entry.processEndedAt ?? entry.createdAt;
 
-const resolveDisclosureState = (processItems: TurnDisclosureInputItem[]): TurnDisclosureProcessState => {
-  const states = processItems.map(getProcessState);
+const resolveDisclosureState = (
+  processItems: TurnDisclosureInputItem[],
+  options: { isClosed: boolean; hasFinalAssistant: boolean }
+): TurnDisclosureProcessState => {
+  const states = processItems.map((entry) => getEffectiveProcessState(entry, options));
   if (states.includes('waiting')) return 'waiting';
   if (states.includes('running')) return 'running';
   if (states.includes('failed')) return 'failed';
@@ -83,11 +98,57 @@ const resolveDisclosureState = (processItems: TurnDisclosureInputItem[]): TurnDi
   return 'completed';
 };
 
+const buildEmptyRunningDisclosure = (
+  turnId: string,
+  segment: TurnDisclosureInputItem[]
+): TurnDisclosureOutputItem => {
+  const startEntry = segment.findLast((entry) => entry.role === 'user') ?? segment[0];
+  const startAt = startEntry ? getProcessStartAt(startEntry) : 0;
+  const endAt = segment.length ? Math.max(...segment.map(getProcessEndAt)) : startAt;
+
+  return {
+    type: 'turn_disclosure',
+    id: `turn-disclosure-${turnId}`,
+    turnId,
+    processItemIds: [],
+    sourceMessageIds: [],
+    startAt,
+    endAt,
+    state: 'running',
+    processItemStates: {},
+    running: true,
+    defaultCollapsed: false,
+  };
+};
+
+const buildEmptyRunningSegmentOutput = (
+  segment: TurnDisclosureInputItem[],
+  disclosure: TurnDisclosureOutputItem
+): TurnDisclosureOutputItem[] => {
+  const output: TurnDisclosureOutputItem[] = [];
+  let insertedDisclosure = false;
+
+  segment.forEach((entry) => {
+    if (!insertedDisclosure && entry.role !== 'user' && entry.role !== 'other') {
+      output.push(disclosure);
+      insertedDisclosure = true;
+    }
+    output.push({ type: 'item', id: entry.id });
+  });
+
+  if (!insertedDisclosure) {
+    output.push(disclosure);
+  }
+
+  return output;
+};
+
 function buildSegmentOutput(segment: TurnDisclosureInputItem[], isClosed: boolean): TurnDisclosureOutputItem[] {
   const turnId = segment[0]?.turnId;
   if (!turnId) return segment.map((entry) => ({ type: 'item', id: entry.id }));
 
   const finalAssistantIndex = segment.findLastIndex((entry) => entry.role === 'assistant');
+  const stateOptions = { isClosed, hasFinalAssistant: finalAssistantIndex !== -1 };
 
   const processItems = segment.filter((entry, index) => {
     if (entry.role === 'user' || entry.role === 'other') return false;
@@ -95,18 +156,14 @@ function buildSegmentOutput(segment: TurnDisclosureInputItem[], isClosed: boolea
   });
 
   if (!processItems.length) {
+    if (!isClosed) {
+      return buildEmptyRunningSegmentOutput(segment, buildEmptyRunningDisclosure(turnId, segment));
+    }
     return segment.map((entry) => ({ type: 'item', id: entry.id }));
   }
 
-  const state = resolveDisclosureState(processItems);
-  if (state === 'running' || state === 'waiting' || !isClosed) {
-    return segment.map((entry) => {
-      if (entry.role === 'process') {
-        return toProcessReceipt(entry);
-      }
-      return { type: 'item', id: entry.id };
-    });
-  }
+  const resolvedState = resolveDisclosureState(processItems, stateOptions);
+  const state = !isClosed && resolvedState === 'completed' ? 'running' : resolvedState;
 
   const finalOrProcessItems =
     finalAssistantIndex === -1 ? processItems : [...processItems, segment[finalAssistantIndex]].filter(Boolean);
@@ -119,8 +176,11 @@ function buildSegmentOutput(segment: TurnDisclosureInputItem[], isClosed: boolea
     startAt: Math.min(...processItems.map(getProcessStartAt)),
     endAt: Math.max(...finalOrProcessItems.map(getProcessEndAt)),
     state,
-    running: false,
-    defaultCollapsed: true,
+    processItemStates: Object.fromEntries(
+      processItems.map((entry) => [entry.id, getEffectiveProcessState(entry, stateOptions)])
+    ),
+    running: state === 'running' || state === 'waiting',
+    defaultCollapsed: state !== 'running' && state !== 'waiting',
   };
 
   const output: TurnDisclosureOutputItem[] = [];

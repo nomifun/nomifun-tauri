@@ -272,15 +272,15 @@
 
 ## 文档处理 - 强制使用内置技能
 
-**关键**：处理 Office 文档（Excel、PowerPoint、Word、PDF）时，你**必须**优先使用 skills 目录中提供的内置技能和脚本。这是默认且首选的方法。
+**关键**：处理 Office 文档（Excel、PowerPoint、Word）时，你**必须**优先使用已启用的 `officecli-pptx`、`officecli-docx`、`officecli-xlsx` 内置技能。处理 PDF 时使用用户环境中已安装的 `pypdf`、`pdfplumber`、`qpdf`、Poppler 等开源工具；缺失时先征得用户同意再安装。
 
 ### 文档任务的优先级顺序
 
-1. **首选（必需）**：使用 skills 目录中的内置脚本或已安装的开源工具
+1. **首选（必需）**：使用已启用的 OfficeCLI 技能或已安装的开源 PDF 工具
    - PDF: 仓库不再分发 proprietary PDF helper scripts；使用用户已安装的 `pypdf` / `pdfplumber` / `qpdf` / Poppler 等工具，缺失时先征得用户同意再安装
-   - PPTX: `skills/pptx/scripts/*.py` 和 `skills/pptx/ooxml/scripts/*.py`
-   - DOCX: `skills/docx/ooxml/scripts/*.py`
-   - XLSX: `skills/xlsx/recalc.py`
+   - PPTX: 使用 `officecli-pptx` 技能和 `officecli` 的 PPTX 命令
+   - DOCX: 使用 `officecli-docx` 技能和 `officecli` 的 DOCX 命令
+   - XLSX: 使用 `officecli-xlsx` 技能和 `officecli` 的 XLSX 命令
 
 2. **其次**：使用 JavaScript 库（pptxgenjs、docx、exceljs）从头创建新文档
 
@@ -289,17 +289,17 @@
 ### 工作流示例
 
 **创建演示文稿**：使用 pptxgenjs（JavaScript）
-**编辑现有 PPTX**：使用 `skills/pptx/scripts/`（解包 → 修改 → 打包）
+**编辑现有 PPTX**：使用 `officecli-pptx` 技能（先查看结构 → 增量修改 → 渲染/验证）
 **填写 PDF 表单**：使用用户已安装的 PDF 库/系统工具，缺失时先征得用户同意再安装
-**处理 Word 文档**：使用 `skills/docx/ooxml/scripts/`（解包 → 修改 → 打包）
+**处理 Word 文档**：使用 `officecli-docx` 技能（先查看结构 → 增量修改 → 渲染/验证）
 
 **禁止**：
 
-- 当内置脚本可用时安装外部工具
-- 在尝试内置脚本之前就使用 `pip install` 或 `npm install` 进行文档处理
+- 当已启用的 OfficeCLI 技能或已安装工具可用时安装外部工具
+- 在尝试 OfficeCLI 技能或已安装工具之前就使用 `pip install` 或 `npm install` 进行文档处理
 - 跳过内置工作流直接使用替代方法
 
-详细的脚本使用方法请参考技能文档（cowork-skills.zh-CN.md）。
+详细方法请参考已启用的 OfficeCLI 技能文档。
 
 ---
 
@@ -336,12 +336,8 @@
    - 仅提取相关部分
 
 3. **Office 文档**（DOCX、XLSX、PPTX）：
-   - 使用解包脚本访问特定部分：
-     ```bash
-     python skills/docx/ooxml/scripts/unpack.py <input.docx> <output_dir>
-     python skills/pptx/ooxml/scripts/unpack.py <input.pptx> <output_dir>
-     ```
-   - 从解包目录中只读取所需的特定 XML 文件
+   - 使用对应 OfficeCLI 技能先查看结构，例如 `officecli view "$FILE" outline` 或 `officecli view "$FILE" html`
+   - 只读取与任务相关的章节、工作表、幻灯片或渲染输出
 
 ### 工作流示例
 

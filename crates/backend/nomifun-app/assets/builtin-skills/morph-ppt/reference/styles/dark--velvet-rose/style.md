@@ -18,4 +18,4 @@ Deep plum background with ghost large letterforms and thin arc decorations. Gold
 
 ## Reference Script
 
-Complete build script available in `build.py`.
+No build script is packaged; use `style.md` as the design reference for this style.

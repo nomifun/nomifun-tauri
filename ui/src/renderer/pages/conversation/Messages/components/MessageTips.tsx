@@ -14,6 +14,7 @@ import { useTranslation } from 'react-i18next';
 import MarkdownView from '@renderer/components/Markdown';
 import FeedbackButton from '@renderer/components/base/FeedbackButton';
 import CollapsibleContent from '@renderer/components/chat/CollapsibleContent';
+import { MESSAGE_BODY_FONT_SIZE, MESSAGE_BODY_LINE_HEIGHT } from '../typography';
 
 const icon = {
   success: <CheckOne theme='filled' size='16' fill={theme.Color.FunctionalColor.success} className='m-t-2px' />,
@@ -196,7 +197,9 @@ const MessageTips: React.FC<{ message: IMessageTips }> = ({ message }) => {
           <div className='flex items-start gap-4px'>
             {icon[type] || icon.warning}
             <div className='flex-1 min-w-0'>
-              <MarkdownView>{`\`\`\`json\n${JSON.stringify(data, null, 2)}\n\`\`\``}</MarkdownView>
+              <MarkdownView fontSize={MESSAGE_BODY_FONT_SIZE} lineHeight={MESSAGE_BODY_LINE_HEIGHT}>
+                {`\`\`\`json\n${JSON.stringify(data, null, 2)}\n\`\`\``}
+              </MarkdownView>
             </div>
           </div>
           {type === 'error' && (

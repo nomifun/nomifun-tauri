@@ -85,24 +85,32 @@ impl Tool for WriteStdinTool {
     }
 
     fn describe(&self, input: &Value) -> String {
-        let id = input.get("session_id").and_then(|v| v.as_u64()).unwrap_or(0);
+        let id = input
+            .get("session_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let chars = input.get("chars").and_then(|v| v.as_str()).unwrap_or("");
         if chars.is_empty() {
             format!("write_stdin: poll session_id={id}")
         } else {
-            format!("write_stdin: session_id={id} <- {}", crate::truncate_utf8(chars, 40))
+            format!(
+                "write_stdin: session_id={id} <- {}",
+                crate::truncate_utf8(chars, 40)
+            )
         }
     }
 
     async fn execute(&self, input: Value) -> ToolResult {
         let id = match input.get("session_id").and_then(|v| v.as_u64()) {
             Some(i) => i,
-            None => return ToolResult::error("write_stdin: missing required parameter `session_id`"),
+            None => {
+                return ToolResult::error("write_stdin: missing required parameter `session_id`");
+            }
         };
         let chars = input.get("chars").and_then(|v| v.as_str()).unwrap_or("");
 
-        let pty = match self.store.touch(id).await {
-            Some(p) => p,
+        let (pty, read_offset) = match self.store.touch_with_offset(id).await {
+            Some(v) => v,
             None => {
                 return ToolResult::error(format!(
                     "write_stdin: unknown or finished session_id={id}"
@@ -110,8 +118,6 @@ impl Tool for WriteStdinTool {
             }
         };
 
-        // Subscribe BEFORE writing so we capture the echo of what we send.
-        let rx = pty.subscribe();
         if !chars.is_empty() {
             if let Err(e) = pty.write(chars.as_bytes()) {
                 return ToolResult::error(format!("write_stdin: write failed: {e}"));
@@ -133,7 +139,7 @@ impl Tool for WriteStdinTool {
             }
         };
         let deadline = tokio::time::Instant::now() + Duration::from_millis(yield_ms);
-        let collected = collect_until_deadline(&pty, rx, deadline).await;
+        let (collected, read_offset) = collect_until_deadline(&pty, read_offset, deadline).await;
         let text = truncate_middle(
             &String::from_utf8_lossy(&collected),
             TruncationBudget::Bytes(OUTPUT_CAP_BYTES),
@@ -145,6 +151,7 @@ impl Tool for WriteStdinTool {
             self.store.remove(id).await;
             ToolResult::text(format!("(process exited, exit_code={code})\n{text}"))
         } else {
+            self.store.update_read_offset(id, read_offset).await;
             ToolResult::text(format!("session_id={id}\n{text}"))
         }
     }
@@ -272,6 +279,33 @@ mod tests {
         assert!(
             r2.content.contains("late_line"),
             "empty poll should pick up delayed output, got: {}",
+            r2.content
+        );
+        store.terminate_all().await;
+    }
+
+    #[tokio::test]
+    async fn empty_poll_picks_up_output_emitted_between_tool_calls() {
+        let store = Arc::new(ProcessStore::new());
+        let exec = ExecCommandTool::new(store.clone(), std::env::current_dir().unwrap());
+        let r = exec
+            .execute(serde_json::json!({
+                "cmd": pty_test_helper_shell_cmd("emit-after 300 gap_line 6000"),
+                "yield_time_ms": 100
+            }))
+            .await;
+        let sid = parse_session_id(&r.content)
+            .expect("process should still be running at 100ms (it emits later)");
+
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        let writer = WriteStdinTool::new(store.clone());
+        let r2 = writer
+            .execute(serde_json::json!({"session_id": sid, "chars": "", "yield_time_ms": 5000}))
+            .await;
+        assert!(
+            r2.content.contains("gap_line"),
+            "empty poll should replay output produced while no receiver was subscribed, got: {}",
             r2.content
         );
         store.terminate_all().await;

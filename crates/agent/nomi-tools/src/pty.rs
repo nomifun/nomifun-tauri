@@ -30,6 +30,10 @@ use tokio::sync::{Notify, broadcast};
 /// subscriber drops oldest chunks rather than stalling the reader thread; the
 /// collection loop tolerates `Lagged` by continuing.
 const OUTPUT_BROADCAST_CAP: usize = 512;
+/// Durable byte backlog for output produced while no tool call is actively
+/// subscribed. This prevents short-lived commands and background output between
+/// `exec_command`/`write_stdin` calls from disappearing.
+const OUTPUT_BACKLOG_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 /// Grace period after the child exits before the exit code is published, so the
 /// reader thread can drain output still buffered in the PTY (notably on Windows,
@@ -38,6 +42,32 @@ const EXIT_DRAIN_GRACE: Duration = Duration::from_millis(120);
 
 /// Sentinel for "exit code not yet known / unavailable".
 const EXIT_UNKNOWN: i32 = i32::MIN;
+
+#[derive(Default)]
+struct OutputBacklog {
+    base_offset: usize,
+    bytes: Vec<u8>,
+}
+
+impl OutputBacklog {
+    fn push(&mut self, chunk: &[u8]) {
+        self.bytes.extend_from_slice(chunk);
+        if self.bytes.len() > OUTPUT_BACKLOG_MAX_BYTES {
+            let drain = self.bytes.len() - OUTPUT_BACKLOG_MAX_BYTES;
+            self.bytes.drain(..drain);
+            self.base_offset = self.base_offset.saturating_add(drain);
+        }
+    }
+
+    fn snapshot_from(&self, offset: usize) -> (Vec<u8>, usize) {
+        let start = offset.max(self.base_offset);
+        let rel = start.saturating_sub(self.base_offset).min(self.bytes.len());
+        (
+            self.bytes[rel..].to_vec(),
+            self.base_offset.saturating_add(self.bytes.len()),
+        )
+    }
+}
 
 /// Parameters for spawning a PTY-backed child.
 pub struct PtyParams {
@@ -64,6 +94,7 @@ pub struct Pty {
     /// the process while the waiter thread is parked in the blocking `wait()`.
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     out_tx: broadcast::Sender<Vec<u8>>,
+    backlog: Arc<Mutex<OutputBacklog>>,
     /// Child has exited (set by the waiter thread — the only source of truth).
     exited: Arc<AtomicBool>,
     /// Child exit code, or `EXIT_UNKNOWN`. Set by the waiter thread.
@@ -126,6 +157,7 @@ impl Pty {
         let pid = child.process_id();
         let killer = child.clone_killer();
         let (out_tx, _) = broadcast::channel::<Vec<u8>>(OUTPUT_BROADCAST_CAP);
+        let backlog = Arc::new(Mutex::new(OutputBacklog::default()));
 
         let exited = Arc::new(AtomicBool::new(false));
         let exit_code = Arc::new(AtomicI32::new(EXIT_UNKNOWN));
@@ -137,6 +169,7 @@ impl Pty {
             writer: Mutex::new(writer),
             killer: Mutex::new(killer),
             out_tx: out_tx.clone(),
+            backlog: backlog.clone(),
             exited: exited.clone(),
             exit_code: exit_code.clone(),
             closed: closed.clone(),
@@ -150,6 +183,7 @@ impl Pty {
         // by the waiter thread below, NOT by this loop's EOF.
         let closed_r = closed.clone();
         let closed_notify_r = closed_notify.clone();
+        let backlog_r = backlog.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             loop {
@@ -157,7 +191,13 @@ impl Pty {
                     Ok(0) => break, // EOF (Unix, or master dropped)
                     Ok(n) => {
                         // Err just means no live receivers — harmless.
-                        let _ = out_tx.send(buf[..n].to_vec());
+                        let chunk = buf[..n].to_vec();
+                        if let Ok(mut backlog) = backlog_r.lock() {
+                            backlog.push(&chunk);
+                            let _ = out_tx.send(chunk);
+                        } else {
+                            let _ = out_tx.send(chunk);
+                        }
                     }
                     Err(_) => break,
                 }
@@ -200,6 +240,27 @@ impl Pty {
     /// writing/spawning-dependent reads to avoid missing the echo.
     pub fn subscribe(&self) -> broadcast::Receiver<Vec<u8>> {
         self.out_tx.subscribe()
+    }
+
+    /// Subscribe to live output and atomically snapshot bytes emitted since
+    /// `offset`. Returns `(receiver, already_buffered_bytes, next_offset)`.
+    pub fn subscribe_from(&self, offset: usize) -> (broadcast::Receiver<Vec<u8>>, Vec<u8>, usize) {
+        match self.backlog.lock() {
+            Ok(backlog) => {
+                let rx = self.out_tx.subscribe();
+                let (snapshot, next_offset) = backlog.snapshot_from(offset);
+                (rx, snapshot, next_offset)
+            }
+            Err(_) => (self.out_tx.subscribe(), Vec::new(), offset),
+        }
+    }
+
+    /// Snapshot bytes emitted since `offset` without subscribing.
+    pub fn snapshot_from(&self, offset: usize) -> (Vec<u8>, usize) {
+        match self.backlog.lock() {
+            Ok(backlog) => backlog.snapshot_from(offset),
+            Err(_) => (Vec::new(), offset),
+        }
     }
 
     /// Whether the child has exited (waiter thread is the source of truth).

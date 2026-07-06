@@ -1,17 +1,17 @@
 # Style Index
 
-The Agent uses this table to quickly select a reference style based on the topic. After selecting, read `<directory>/style.md` to understand the design philosophy; read `build.sh` when you need an implementation reference.
+The Agent uses this table to quickly select a reference style based on the topic. After selecting, read `<directory>/style.md` to understand the design philosophy; read `build.sh` or `build.py` only when that script is packaged and you need an implementation reference.
 
 **Important Notice**:
 
-- The build.sh scripts in these styles are **for reference of design techniques only** (color schemes, shapes, Morph choreography)
+- Packaged build scripts in these styles are **for reference of design techniques only** (color schemes, shapes, Morph choreography)
 - Some scripts have text overlap, layout misalignment, and other typesetting issues -- **do not copy coordinates and dimensions verbatim**
 - When generating, you must follow the design principles in `pptx-design.md` (text readability, spacing, alignment, etc.)
 - **Learn the approach, do not copy the code**
 
 ---
 
-**Primary hex column**: bg / fg / accent — sampled from each style's `build.sh`. Use this to eyeball-match a user-specified brand color before opening any `style.md`. `-` = style has only `style.md` (no build script to extract from).
+**Primary hex column**: bg / fg / accent — sampled from packaged demo scripts when available. Use this to eyeball-match a user-specified brand color before opening any `style.md`. `-` = style has only `style.md` or no extracted script palette.
 
 ## Dark Palette (dark)
 
@@ -22,7 +22,6 @@ The Agent uses this table to quickly select a reference style based on the topic
 | dark--investor-pitch     | Investor Pitch Pro       | `#1A1A2E / #0F3460 / #16213E`  | Investor pitches, fundraising decks, business plans             | Professional, trustworthy, composed     |
 | dark--cosmic-neon        | Cosmic Neon              | `#050510 / #8A2BE2 / #00FFFF`  | Science talks, futuristic topics, physics, cosmic themes        | Sci-fi, mysterious, futuristic, neon    |
 | dark--editorial-story    | Editorial Magazine Story | `#FFFFFF / #2C3E50 / #E74C3C`  | Brand storytelling, editorial magazines, content releases       | Narrative, artistic, premium            |
-| dark--tech-cosmos        | Tech Cosmos              | `-`                            | Tech talks, architecture reviews, scientific presentations      | Futuristic, scientific, cosmic          |
 | dark--blueprint-grid     | Blueprint Grid           | `#1B3A5C / #4A90D9 / #FFFFFF`  | Technical planning, engineering blueprints, system architecture | Precise, professional, engineered       |
 | dark--diagonal-cut       | Diagonal Industrial Cut  | `#1A1A1A / #FF6600 / #FFCC00`  | Industrial, engineering, construction, manufacturing            | Rugged, powerful, bold                  |
 | dark--spotlight-stage    | Spotlight Stage          | `#0A0A0A / #FFFFFF / #FFE0B2`  | Keynotes, launch events, TED-style talks, galas                 | Dramatic, focused, theatrical           |
@@ -59,9 +58,7 @@ The Agent uses this table to quickly select a reference style based on the topic
 | Directory                | Style Name         | Primary hex (bg / fg / accent) | Best For                                                          | Mood                             |
 | ------------------------ | ------------------ | ------------------------------ | ----------------------------------------------------------------- | -------------------------------- |
 | warm--earth-organic      | Earth & Sage       | `#F5F0E8 / #8B6F47 / #A8C686`  | Eco-friendly, sustainability, organic brands                      | Warm, sincere, natural           |
-| warm--minimal-brand      | Minimal Brand      | `-`                            | Brand introductions, product launches, premium brand showcases    | Warm, refined, minimalist        |
 | warm--brand-refresh      | Brand Refresh      | `#F5F0E8 / #162040 / #1A6BFF`  | Brand launches, corporate image updates, creative proposals       | Fashionable, colorful, modern    |
-| warm--creative-marketing | Creative Marketing | `-`                            | Marketing campaigns, ad creatives, poster-style PPTs              | Bold, impactful, expressive      |
 | warm--playful-organic    | Playful Organic    | `#FFF8E7 / #3D3B3C / #FFFFFF`  | Lifestyle, pet/animal topics, children's education, storytelling  | Warm, playful, friendly          |
 | warm--sunset-mosaic      | Sunset Mosaic      | `-`                            | Engineering, infrastructure, B2B corporate, construction          | Professional, warm, grounded     |
 | warm--coral-culture      | Coral Culture      | `-`                            | Company culture decks, HR presentations, team showcases           | Warm, cultural, human-centered   |

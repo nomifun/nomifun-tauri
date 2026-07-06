@@ -135,24 +135,26 @@ await workbook.xlsx.writeFile('output.xlsx');
 - 对复杂公式使用命名范围
 - 为大型数据集冻结标题行
 
-### XLSX 脚本工作流
+### XLSX OfficeCLI 工作流
 
-对于高级 Excel 操作和公式重计算，使用 XLSX 脚本：
+对于高级 Excel 操作和公式重计算，优先使用已打包的 `officecli-xlsx` 技能和已安装的 `officecli` 命令：
 
 ```bash
-# 使用 openpyxl 引擎重新计算 Excel 公式
-python skills/xlsx/recalc.py <input.xlsx> <output.xlsx>
+FILE="workbook.xlsx"
+officecli view "$FILE" outline
+officecli validate "$FILE"
+officecli view "$FILE" html
 ```
 
-recalc.py 脚本打开工作簿，强制公式重新评估，并保存结果。当你需要确保所有计算值都是最新的时使用它。
+如果需要完整重算公式，使用 LibreOffice 或用户批准的已安装工具，并在交付前验证工作簿。
 
-**何时使用 recalc.py**:
+**何时需要重算**:
 
 - 修改后更新计算结果
 - 确保导出前公式正确评估
 - 为不支持实时计算的系统准备电子表格
 
-**注意**：openpyxl 的计算引擎支持许多常见公式，但对于复杂的 Excel 特定函数（如 XLOOKUP、动态数组）可能有限制。
+**注意**：不同工具对 XLOOKUP、动态数组等 Excel 特定函数的支持不同；以最终打开/验证结果为准。
 
 ---
 
@@ -237,37 +239,24 @@ await pptx.writeFile('presentation.pptx');
 - 使用高对比度颜色组合
 - 限制动画以增强而非分散注意力
 
-### PPTX 脚本工作流
+### PPTX OfficeCLI 工作流
 
-对于编辑现有演示文稿或使用模板，使用 PPTX 脚本：
+对于编辑现有演示文稿或使用模板，优先使用已打包的 `officecli-pptx` 技能，先检查结构再修改：
 
 ```bash
-# 解包 PPTX 为 XML 目录结构（用于检查/编辑）
-python skills/pptx/ooxml/scripts/unpack.py <input.pptx> <output_directory>
-
-# 获取幻灯片清单（标题、布局、关系）
-python skills/pptx/scripts/inventory.py <input.pptx> <output.json>
-
-# 生成缩略图网格以进行可视化审查
-python skills/pptx/scripts/thumbnail.py <input.pptx> [output_prefix] [--cols N]
-
-# 重新排列幻灯片（索引从0开始，逗号分隔）
-python skills/pptx/scripts/rearrange.py <template.pptx> <output.pptx> <indices>
-
-# 替换占位符文本/图像
-python skills/pptx/scripts/replace.py <input.pptx> <replacements.json> <output.pptx>
-
-# 将修改后的 XML 目录重新打包为 PPTX
-python skills/pptx/ooxml/scripts/pack.py <input_directory> <output.pptx>
+FILE="presentation.pptx"
+officecli view "$FILE" outline
+officecli view "$FILE" text
+officecli validate "$FILE"
+officecli view "$FILE" html
 ```
 
-**PPTX 脚本工作流示例**:
+**PPTX 工作流示例**:
 
-1. 使用 `inventory.py` 了解幻灯片结构
-2. 使用 `thumbnail.py` 进行可视化审查
-3. 使用 `rearrange.py` 重新排序幻灯片
-4. 使用 `replace.py` 更新内容
-5. 对于复杂编辑，先解包、修改 XML，然后重新打包
+1. 使用 `officecli view` 了解幻灯片结构和文本
+2. 使用 `officecli get` 定位需要修改的对象
+3. 使用 `officecli set` / `officecli add` 增量修改内容
+4. 使用 `officecli validate` 和渲染视图确认结果
 
 ---
 
@@ -547,39 +536,24 @@ await fs.writeFile('document.docx', buffer);
 - 保存前验证文档结构
 - 考虑可访问性（图像替代文本、正确的标题层次）
 
-### DOCX 脚本工作流
+### DOCX OfficeCLI 工作流
 
-对于编辑现有 Word 文档或处理修订/批注，使用 DOCX 脚本：
+对于编辑现有 Word 文档或处理修订/批注，优先使用已打包的 `officecli-docx` 技能，先检查结构再修改：
 
 ```bash
-# 解包 DOCX 为 XML 目录结构（用于检查/编辑）
-python skills/docx/ooxml/scripts/unpack.py <input.docx> <output_directory>
-
-# 提取纯文本内容
-python skills/docx/scripts/extract_text.py <input.docx> <output.txt>
-
-# 提取所有批注
-python skills/docx/scripts/extract_comments.py <input.docx> <output.json>
-
-# 接受所有修订
-python skills/docx/scripts/accept_revisions.py <input.docx> <output.docx>
-
-# 拒绝所有修订
-python skills/docx/scripts/reject_revisions.py <input.docx> <output.docx>
-
-# 将修改后的 XML 目录重新打包为 DOCX
-python skills/docx/ooxml/scripts/pack.py <input_directory> <output.docx>
+FILE="document.docx"
+officecli view "$FILE" outline
+officecli view "$FILE" text
+officecli validate "$FILE"
+officecli view "$FILE" html
 ```
 
-**DOCX 脚本工作流示例**:
+**DOCX 工作流示例**:
 
-1. 使用 `extract_text.py` 提取内容进行分析
-2. 使用 `extract_comments.py` 审查文档反馈
-3. 使用 `accept_revisions.py` 或 `reject_revisions.py` 处理修订
-4. 对于复杂编辑：
-   - 使用 `unpack.py` 解包
-   - 直接修改 `word/document.xml`
-   - 使用 `pack.py` 重新打包
+1. 使用 `officecli view` 提取结构和文本进行分析
+2. 使用 `officecli get` 定位段落、表格、批注或页眉页脚
+3. 使用 `officecli set` / `officecli add` 增量修改
+4. 使用 `officecli validate` 和渲染视图确认结果
 
 **处理修订（Track Changes）**:
 

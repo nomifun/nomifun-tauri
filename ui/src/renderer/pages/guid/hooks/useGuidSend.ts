@@ -21,6 +21,7 @@ import type { PendingConversation } from '@/renderer/pages/conversation/componen
 import { planGuidEntry, isAutoWorkEntry } from './autoWorkEntry';
 import type { AutoWorkDraftValue } from '@/renderer/pages/conversation/components/AutoWorkControl';
 import type { AcpModelInfo, AvailableAgent, EffectiveAgentInfo } from '../types';
+import type { TModelRange } from '@/common/types/orchestrator/orchestratorTypes';
 
 export type GuidSendDeps = {
   // Input state
@@ -78,6 +79,10 @@ export type GuidSendDeps = {
    * 路径消费——落到会话 extra.agent_cluster_mode，后端工厂据此在常驻 subagent
    * 提示之上追加 CLUSTER_MODE_HINT（必须刻意评估是否开集群、太简单先说明原因）。 */
   clusterMode?: boolean;
+  /** Homepage cluster model pool: main model first, followed by collaborator models. */
+  orchestratorModelRange?: TModelRange;
+  /** Node-level approval mode for agent-cluster runs. */
+  orchestratorApprovalMode?: 'auto' | 'manual';
 
   // Mention state reset
   setMentionOpen: React.Dispatch<React.SetStateAction<boolean>>;
@@ -138,6 +143,8 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
     applyAdvancedConfig,
     autoWork,
     clusterMode,
+    orchestratorModelRange,
+    orchestratorApprovalMode,
     setMentionOpen,
     setMentionQuery,
     setMentionSelectorOpen,
@@ -332,6 +339,8 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
             // 「agent 集群」模式（需求1）：显式选中才落键；未选不写（旧会话/普通
             // 会话 extra 零变化）。
             agent_cluster_mode: clusterMode || undefined,
+            orchestrator_model_range: clusterMode ? orchestratorModelRange : undefined,
+            orchestrator_approval_mode: clusterMode ? orchestratorApprovalMode : undefined,
           },
         });
 

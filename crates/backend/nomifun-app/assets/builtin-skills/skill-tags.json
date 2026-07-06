@@ -13,6 +13,7 @@
     { "name": "morph-ppt-3d", "audience_tags": ["designer", "office"], "scenario_tags": ["presentation", "design"] },
     { "name": "star-office-helper", "audience_tags": ["office", "general"], "scenario_tags": ["document"] },
     { "name": "mermaid", "audience_tags": ["developer", "office"], "scenario_tags": ["dataviz"] },
+    { "name": "ui-ux-pro-max", "audience_tags": ["designer", "developer"], "scenario_tags": ["design", "coding"] },
     { "name": "moltbook", "audience_tags": ["student", "general"], "scenario_tags": ["document"] },
     { "name": "story-roleplay", "audience_tags": ["general", "designer"], "scenario_tags": ["writing"] },
     { "name": "xiaohongshu-recruiter", "audience_tags": ["marketing"], "scenario_tags": ["social"] },

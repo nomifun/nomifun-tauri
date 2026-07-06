@@ -45,10 +45,6 @@ import {
 import ProcessTraceItem from './components/ProcessTraceItem';
 import { isContextCompressionTip } from './processTipModel';
 import { formatFileTargetPreview, splitToolReceiptTargets } from './processFileTargetLabel';
-import {
-  buildThinkingReceiptDisplay,
-  shouldShowThinkingReceiptDetail,
-} from './processTraceDisplayModel';
 import type { WriteFileResult } from './types';
 import { useAutoScroll } from './useAutoScroll';
 import { useAutoPreviewOfficeFiles } from '@/renderer/hooks/file/useAutoPreviewOfficeFiles';
@@ -87,11 +83,13 @@ type ITurnProcessDisclosureVO = {
   id: string;
   msg_id: string;
   processItems: IRenderableItem[];
+  processItemStates: Record<string, TurnDisclosureProcessState>;
   sourceMessageIds: string[];
   created_at: number;
   startAt: number;
   endAt: number;
   state: TurnDisclosureProcessState;
+  running: boolean;
   defaultCollapsed: boolean;
 };
 type IProcessReceiptVO = {
@@ -196,6 +194,7 @@ const getProcessedItemRole = (item: IRenderableItem): TurnDisclosureInputItem['r
       if (isContextCompressionTip(item)) return 'process';
       return 'assistant';
     case 'thinking':
+      return 'process_content';
     case 'tool_call':
     case 'tool_group':
     case 'agent_status':
@@ -222,15 +221,6 @@ const compactReceiptText = (value: unknown, fallback: string): string => {
   if (typeof value !== 'string') return fallback;
   const compacted = value.replace(/\s+/g, ' ').trim();
   return compacted || fallback;
-};
-
-const formatReceiptDuration = (ms: number | undefined, t: TranslationFn): string | undefined => {
-  if (ms === undefined) return undefined;
-  const totalSeconds = Math.max(0, Math.round(ms / 1000));
-  const sUnit = t('common.unit.second_short', { defaultValue: 's' });
-  const mUnit = t('common.unit.minute_short', { defaultValue: 'm' });
-  if (totalSeconds < 60) return `${totalSeconds}${sUnit}`;
-  return `${Math.floor(totalSeconds / 60)}${mUnit} ${totalSeconds % 60}${sUnit}`;
 };
 
 const getToolReceiptDisplayTarget = (part: ToolReceiptSummaryPart, workspaceRoots: string[]): string | undefined => {
@@ -440,30 +430,6 @@ const buildProcessReceiptSummary = (
   }
 
   switch (item.type) {
-    case 'thinking': {
-      const thinkingDuration = formatReceiptDuration(getThinkingDurationMs(item), t);
-      const display = buildThinkingReceiptDisplay(item.content, {
-        completedFallback: thinkingDuration
-          ? t('messages.processReceipt.thinkingCompletedDuration', {
-              duration: thinkingDuration,
-              defaultValue: 'Thought {{duration}}',
-            })
-          : t('messages.processReceipt.thinkingCompleted', { defaultValue: 'Thought' }),
-        runningFallback: t('messages.processReceipt.thinkingRunning', { defaultValue: 'Thinking' }),
-        waitingFallback: t('messages.processReceipt.thinkingWaiting', {
-          defaultValue: 'Waiting for model output',
-        }),
-      });
-      return {
-        label:
-          state === 'running'
-            ? display.label
-            : t('messages.processReceipt.thinkingCompleted', { defaultValue: 'Thought' }),
-        icon: 'thinking',
-        defaultExpanded: shouldShowThinkingReceiptDetail(item.content),
-        hasDetail: shouldShowThinkingReceiptDetail(item.content),
-      };
-    }
     case 'permission':
       return {
         label: t('messages.processReceipt.waitingPermission', {
@@ -573,17 +539,29 @@ export const ImagePreviewContext = createContext<{ inPreviewGroup: boolean }>({ 
 const renderProcessTraceItem = (
   item: IRenderableItem,
   variant: 'list' | 'receipt' = 'list',
-  workspaceRoots: string[] = []
+  workspaceRoots: string[] = [],
+  stateOverride?: TurnDisclosureProcessState
 ) => (
-  <ProcessTraceItem item={item} variant={variant} workspaceRoots={workspaceRoots} />
+  <ProcessTraceItem item={item} variant={variant} workspaceRoots={workspaceRoots} stateOverride={stateOverride} />
 );
 
-const isReadableThinkingReceipt = (item: IProcessReceiptVO): boolean =>
-  'type' in item.item && item.item.type === 'thinking' && shouldShowThinkingReceiptDetail(item.item.content);
+const getProcessItemLayoutKind = (item: IRenderableItem): string => {
+  if ('type' in item && item.type === 'text') return 'text';
+  if ('type' in item && item.type === 'thinking') return 'thinking';
+  if (
+    'type' in item &&
+    ['tool_summary', 'file_summary', 'tool_call', 'tool_group', 'acp_tool_call'].includes(item.type)
+  ) {
+    return 'tool';
+  }
+  if ('type' in item && (item.type === 'permission' || item.type === 'acp_permission')) return 'permission';
+  if ('type' in item && (item.type === 'agent_status' || item.type === 'tips' || item.type === 'artifact')) return 'status';
+  return 'other';
+};
 
-const MessageItem: React.FC<{ message: TMessage; highlighted?: boolean }> = React.memo(
+const MessageItem: React.FC<{ message: TMessage; highlighted?: boolean; hideActions?: boolean }> = React.memo(
   HOC((props) => {
-    const { message, highlighted } = props as { message: TMessage; highlighted?: boolean };
+    const { message, highlighted } = props as { message: TMessage; highlighted?: boolean; hideActions?: boolean };
     return (
       <div
         id={`message-${message.id}`}
@@ -604,11 +582,11 @@ const MessageItem: React.FC<{ message: TMessage; highlighted?: boolean }> = Reac
         {props.children}
       </div>
     );
-  })(({ message }) => {
+  })(({ message, hideActions }) => {
     const { t } = useTranslation();
     switch (message.type) {
       case 'text':
-        return <MessageText message={message}></MessageText>;
+        return <MessageText message={message} hideActions={hideActions}></MessageText>;
       case 'tips':
         return <MessageTips message={message}></MessageTips>;
       case 'tool_call':
@@ -641,7 +619,8 @@ const MessageItem: React.FC<{ message: TMessage; highlighted?: boolean }> = Reac
     prev.message.content === next.message.content &&
     prev.message.position === next.message.position &&
     prev.message.type === next.message.type &&
-    prev.highlighted === next.highlighted
+    prev.highlighted === next.highlighted &&
+    prev.hideActions === next.hideActions
 );
 
 const MessageList: React.FC<{
@@ -852,11 +831,13 @@ const MessageList: React.FC<{
           id: entry.id,
           msg_id: entry.turnId,
           processItems,
+          processItemStates: entry.processItemStates,
           sourceMessageIds: entry.sourceMessageIds,
           created_at: entry.endAt,
           startAt: entry.startAt,
           endAt: entry.endAt,
           state: entry.state,
+          running: entry.running,
           defaultCollapsed: entry.defaultCollapsed,
         };
       })
@@ -864,6 +845,26 @@ const MessageList: React.FC<{
 
     return disclosureItems;
   }, [conversationContext?.isProcessing, processedList, t, workspaceRoots]);
+
+  const lastUserTextIndex = useMemo(
+    () =>
+      displayList.findLastIndex(
+        (item) => !('type' in item && ['turn_process_disclosure', 'process_receipt', 'artifact'].includes(item.type)) &&
+          (item as TMessage).type === 'text' &&
+          (item as TMessage).position === 'right'
+      ),
+    [displayList]
+  );
+
+  const isActiveProcessTextItem = useCallback(
+    (item: IProcessedItem, index: number): boolean =>
+      conversationContext?.isProcessing === true &&
+      index > lastUserTextIndex &&
+      !('type' in item && ['turn_process_disclosure', 'process_receipt', 'artifact'].includes(item.type)) &&
+      (item as TMessage).type === 'text' &&
+      (item as TMessage).position === 'left',
+    [conversationContext?.isProcessing, lastUserTextIndex]
+  );
 
   // Use auto-scroll hook
   const {
@@ -1015,21 +1016,25 @@ const MessageList: React.FC<{
     scrollToBottom('smooth');
   };
 
-  const renderTurnDisclosure = (item: ITurnProcessDisclosureVO, highlighted: boolean) => (
-    <TurnProcessDisclosure
-      item={item}
-      highlighted={highlighted}
-      renderProcessItem={(processItem) => renderProcessTraceItem(processItem, 'list', workspaceRoots)}
-      getProcessItemKey={getProcessedItemAnchorId}
-      getProcessItemState={getProcessItemState}
-    />
-  );
+  const renderTurnDisclosure = (item: ITurnProcessDisclosureVO, highlighted: boolean) => {
+    const getDisclosureProcessItemState = (processItem: IRenderableItem): TurnDisclosureProcessState =>
+      item.processItemStates[getProcessedItemAnchorId(processItem)] ?? getProcessItemState(processItem);
+
+    return (
+      <TurnProcessDisclosure
+        item={item}
+        highlighted={highlighted}
+        renderProcessItem={(processItem) =>
+          renderProcessTraceItem(processItem, 'list', workspaceRoots, getDisclosureProcessItemState(processItem))
+        }
+        getProcessItemKey={getProcessedItemAnchorId}
+        getProcessItemState={getDisclosureProcessItemState}
+        getProcessItemLayoutKind={getProcessItemLayoutKind}
+      />
+    );
+  };
 
   const renderProcessReceipt = (item: IProcessReceiptVO, highlighted: boolean) => {
-    if (isReadableThinkingReceipt(item)) {
-      return renderProcessTraceItem(item.item, 'receipt', workspaceRoots);
-    }
-
     return (
       <TurnProcessReceipt
         receipt={item}
@@ -1097,7 +1102,14 @@ const MessageList: React.FC<{
         </div>
       );
     }
-    return <MessageItem message={item as TMessage} key={(item as TMessage).id} highlighted={highlighted}></MessageItem>;
+    return (
+      <MessageItem
+        message={item as TMessage}
+        key={(item as TMessage).id}
+        highlighted={highlighted}
+        hideActions={isActiveProcessTextItem(item, _index)}
+      ></MessageItem>
+    );
   };
 
   if (displayList.length === 0 && isMessageListLoading) {

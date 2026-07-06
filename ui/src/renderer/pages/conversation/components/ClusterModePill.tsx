@@ -6,21 +6,17 @@
 
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Popover, Switch } from '@arco-design/web-react';
+import { Button, Popover, Switch } from '@arco-design/web-react';
 import { EveryUser } from '@icon-park/react';
 import { ipcBridge } from '@/common';
 import type { TChatConversation } from '@/common/config/storage';
 
 /**
- * ClusterModePill —「agent 集群」的会话内开关 pill（需求1/5）。
+ * ClusterModePill —「agent 集群」的会话内图标开关（需求1/5）。
  *
- * 挂在 nomi composer 工具条（协作模型选择器旁），popover 内两枚开关：
- *  - **agent 集群**：写 `extra.agent_cluster_mode`。开启后主 agent 对每个任务都
- *    刻意评估是否用多 agent 集群协作；太简单则先说明原因再直接作答（后端
- *    CLUSTER_MODE_HINT 消费）。
+ * 挂在 nomi composer 工具条的权限旁边，popover 内保留两枚开关：
+ *  - **agent 集群**：写 `extra.agent_cluster_mode`。
  *  - **节点审批模式**：写 `extra.orchestrator_approval_mode`（'manual' | 'auto'）。
- *    manual 下集群节点遇关键决策会挂起提问（画布/进度条亮提问徽标），由用户
- *    进入该节点作答；auto（默认全授权）节点自行判断。建 run 时读取生效。
  *
  * 写回走 `conversation.update` 的 extra 顶层浅合并（只覆盖本键，同级键保留——
  * 与 orchestrator_model_range 的写法同源）。本地乐观态 + conversation 刷新回灌。
@@ -61,16 +57,18 @@ const ClusterModePill: React.FC<{ conversation: TChatConversation }> = ({ conver
     void persist({ orchestrator_approval_mode: next ? 'manual' : 'auto' });
   };
 
+  const ariaLabel = t('conversation.cluster.pillAria', { defaultValue: 'agent 集群设置' });
+
   const content = (
-    <div className='flex w-260px flex-col gap-12px py-2px'>
+    <div className='flex w-220px flex-col gap-10px py-2px'>
       <div className='flex items-start justify-between gap-12px'>
         <div className='flex min-w-0 flex-col gap-2px'>
           <span className='text-13px font-600 text-t-primary'>
-            {t('conversation.cluster.toggleTitle', { defaultValue: 'agent 集群' })}
+            {t('conversation.cluster.toggleTitle', { defaultValue: '集群' })}
           </span>
           <span className='text-11px leading-16px text-t-tertiary'>
             {t('conversation.cluster.toggleDesc', {
-              defaultValue: '主 agent 对每个任务刻意评估是否拆给多个独立 agent 并行交付；太简单会说明原因后直接作答。',
+              defaultValue: '需要时拆给多个 agent 并行处理。',
             })}
           </span>
         </div>
@@ -79,11 +77,11 @@ const ClusterModePill: React.FC<{ conversation: TChatConversation }> = ({ conver
       <div className='flex items-start justify-between gap-12px'>
         <div className='flex min-w-0 flex-col gap-2px'>
           <span className='text-13px font-600 text-t-primary'>
-            {t('conversation.cluster.approvalTitle', { defaultValue: '节点审批模式' })}
+            {t('conversation.cluster.approvalTitle', { defaultValue: '节点确认' })}
           </span>
           <span className='text-11px leading-16px text-t-tertiary'>
             {t('conversation.cluster.approvalDesc', {
-              defaultValue: '节点遇关键决策时挂起向你提问，由你进入该节点作答后继续；关闭则全授权由各节点自行判断。',
+              defaultValue: '关键决策先暂停，等你确认。',
             })}
           </span>
         </div>
@@ -94,33 +92,19 @@ const ClusterModePill: React.FC<{ conversation: TChatConversation }> = ({ conver
 
   return (
     <Popover content={content} trigger='click' position='top' unmountOnExit>
-      <button
-        type='button'
-        className='nomi-sendbox-model-btn'
-        aria-label={t('conversation.cluster.pillAria', { defaultValue: 'agent 集群设置' })}
-        style={
-          cluster
-            ? {
-                color: 'rgb(var(--primary-6))',
-                background: 'color-mix(in srgb, rgb(var(--primary-6)) 10%, transparent)',
-              }
-            : undefined
-        }
+      <Button
+        type='text'
+        shape='circle'
+        size='small'
+        className={`sendbox-cluster-pill ${cluster ? 'sendbox-cluster-pill--active' : ''}`}
+        aria-label={ariaLabel}
+        aria-pressed={cluster}
+        title={ariaLabel}
+        data-testid='cluster-mode-pill'
       >
-        <EveryUser theme='outline' size='14' strokeWidth={3} />
-        <span>{t('conversation.cluster.pill', { defaultValue: '集群' })}</span>
-        {approval && cluster && (
-          <span
-            className='rd-full px-4px text-10px font-600 leading-14px'
-            style={{
-              color: 'var(--warning)',
-              background: 'color-mix(in srgb, var(--warning) 14%, transparent)',
-            }}
-          >
-            {t('conversation.cluster.approvalShort', { defaultValue: '审批' })}
-          </span>
-        )}
-      </button>
+        <EveryUser theme='outline' size='15' fill='currentColor' strokeWidth={3} />
+        {cluster && <span className='sendbox-cluster-pill__dot' aria-hidden='true' />}
+      </Button>
     </Popover>
   );
 };

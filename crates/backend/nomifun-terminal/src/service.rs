@@ -63,6 +63,17 @@ pub trait TerminalSupervisionHook: Send + Sync {
     fn on_terminal_activity(&self, terminal_id: i64);
 }
 
+/// ANSI-stripped tail of a terminal's scrollback, for read-back by agents.
+#[derive(Debug, Clone)]
+pub struct TerminalOutputTail {
+    /// Human-readable text (control/escape sequences removed).
+    pub text: String,
+    /// True when older output was dropped to fit `max_bytes`.
+    pub truncated: bool,
+    /// The session's status: "running" | "exited" | "error".
+    pub status: String,
+}
+
 /// Manages terminal sessions: DB-persisted metadata + live in-memory PTYs.
 #[derive(Clone)]
 pub struct TerminalService {
@@ -777,6 +788,28 @@ impl TerminalService {
         Ok(row_to_response(&row, scrollback, &self.work_dir))
     }
 
+    /// Read the terminal's scrollback as ANSI-stripped text, keeping at most
+    /// `max_bytes` from the TAIL. The terminal analogue of a conversation's
+    /// transcript read-back — what an agent uses to SEE a command's result.
+    pub async fn read_output_tail(
+        &self,
+        id: i64,
+        max_bytes: usize,
+    ) -> Result<TerminalOutputTail, TerminalError> {
+        let resp = self.get(id).await?;
+        let raw = resp
+            .scrollback_b64
+            .and_then(|b64| BASE64.decode(b64).ok())
+            .unwrap_or_default();
+        let text = crate::ansi::strip_ansi(&raw);
+        let (tail, truncated) = tail_on_char_boundary(&text, max_bytes);
+        Ok(TerminalOutputTail {
+            text: tail,
+            truncated,
+            status: resp.last_status,
+        })
+    }
+
     /// Enumerate entries under `path` (workspace-relative) inside this terminal
     /// session's working directory. The root is server-authoritative — derived
     /// from the row's `cwd`, never a client-supplied path — so listing it grants
@@ -876,6 +909,119 @@ impl TerminalService {
         // Capture the first input line for auto-titling (cheap no-op once titled).
         self.capture_first_input(id, &bytes);
         Ok(())
+    }
+
+    /// Submit a block of text to a terminal so it EXECUTES (as if typed + Enter).
+    /// Resolves the target's agent family from its stored command/args/backend to
+    /// choose the correct submit sequence (bracketed-paste + separated CR for
+    /// agent TUIs, raw + CR for single lines / shells). Uses the raw PTY write
+    /// path — this is deliberate driving, so it does NOT arm IDMM supervision or
+    /// auto-title the way `input` (user typing) does. `Err(NotFound)` if not live.
+    pub async fn submit_text(&self, id: i64, text: &str) -> Result<(), TerminalError> {
+        if !self.live.contains_key(&id) {
+            return Err(TerminalError::NotFound(id.to_string()));
+        }
+        let is_agent = match self.describe(id).await? {
+            Some(d) => {
+                let (program, prog_args) = crate::types::resolve_command(&d.command, &d.args);
+                crate::enhance::resolve_agent_family(&program, &prog_args, d.backend.as_deref())
+                    .is_some()
+            }
+            None => false,
+        };
+        match crate::submit::encode_submit_chunks(text, is_agent) {
+            crate::submit::SubmitChunks::Single(bytes) => self.write_input(id, &bytes).await,
+            crate::submit::SubmitChunks::PasteThenCr { paste, cr } => {
+                self.write_input(id, &paste).await?;
+                tokio::time::sleep(crate::submit::TERMINAL_SUBMIT_DELAY).await;
+                self.write_input(id, &cr).await
+            }
+        }
+    }
+
+    /// Wait for a terminal turn to settle after a submit. Agent CLIs with
+    /// lifecycle hooks (claude/codex) resolve via the structured `TurnEnd` event;
+    /// shells and gemini fall back to an output-quiescence window
+    /// (`IDLE_SETTLE_WINDOW`). Never dresses `Idle` up as definitive completion.
+    pub async fn await_turn_settle(
+        &self,
+        id: i64,
+        timeout: std::time::Duration,
+    ) -> crate::submit::SettleReason {
+        use crate::submit::SettleReason;
+
+        let desc = match self.describe(id).await {
+            Ok(Some(d)) => d,
+            _ => return SettleReason::Exited,
+        };
+        let lifecycle_capable = crate::enhance::terminal_autowork_capable(
+            &desc.command,
+            &desc.args,
+            desc.backend.as_deref(),
+        );
+
+        if lifecycle_capable {
+            if let Some(mut rx) = self.subscribe_lifecycle(id) {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+                tick.tick().await; // consume the immediate first tick
+                let fut = async {
+                    loop {
+                        tokio::select! {
+                            _ = tick.tick() => {
+                                // The lifecycle channel is owned by
+                                // TerminalLifecycleServer for the whole app lifetime
+                                // (not tied to the PTY), so a dead PTY never closes it
+                                // and `Closed` effectively never fires. Poll liveness so
+                                // a crashed/killed agent terminal reports Exited promptly
+                                // instead of riding the full caller timeout to a
+                                // dishonest Timeout. Mirrors AutoWork's
+                                // `wait_terminal_turn_end`.
+                                if !self.is_alive(id) {
+                                    return SettleReason::Exited;
+                                }
+                            }
+                            ev = rx.recv() => {
+                                match ev {
+                                    Ok(event) if event.kind == crate::lifecycle::LifecycleKind::TurnEnd => {
+                                        return SettleReason::TurnEnd;
+                                    }
+                                    Ok(_) => continue,
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                        return SettleReason::Exited;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                return tokio::time::timeout(timeout, fut)
+                    .await
+                    .unwrap_or(SettleReason::Timeout);
+            }
+        }
+
+        // Idle-quiescence fallback: reset a short quiet-timer on every output
+        // chunk; if it elapses, presume settled.
+        let Some(mut out_rx) = self.subscribe_output(id) else {
+            return SettleReason::Exited;
+        };
+        let overall = tokio::time::sleep(timeout);
+        tokio::pin!(overall);
+        loop {
+            let quiet = tokio::time::sleep(crate::submit::IDLE_SETTLE_WINDOW);
+            tokio::select! {
+                _ = &mut overall => return SettleReason::Timeout,
+                _ = quiet => return SettleReason::Idle,
+                r = out_rx.recv() => match r {
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return SettleReason::Exited;
+                    }
+                }
+            }
+        }
     }
 
     /// Accumulate the first line of user input for a session, then auto-title
@@ -1364,9 +1510,23 @@ fn default_name(command: &str, backend: Option<&str>) -> String {
     }
 }
 
+/// Return the last `max_bytes` of `s` on a UTF-8 char boundary, plus whether it
+/// was truncated. Cheap and allocation-light for the common (no-truncation) path.
+fn tail_on_char_boundary(s: &str, max_bytes: usize) -> (String, bool) {
+    if s.len() <= max_bytes {
+        return (s.to_owned(), false);
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    (s[start..].to_owned(), true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::submit::SettleReason;
     use nomifun_api_types::WebSocketMessage;
     use nomifun_realtime::EventBroadcaster;
     use std::sync::Mutex;
@@ -2157,6 +2317,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_output_tail_strips_ansi_and_tails() {
+        let (svc, _bc) = service();
+        let id = svc.create("u", req("cat", &[])).await.unwrap().id;
+        svc.submit_text(id, "marker-xyz").await.unwrap();
+
+        // 等回显落入 scrollback。
+        let mut ok = false;
+        for _ in 0..40 {
+            let out = svc.read_output_tail(id, 65536).await.unwrap();
+            if out.text.contains("marker-xyz") {
+                assert!(!out.truncated);
+                assert_eq!(out.status, "running");
+                // strip_ansi 已去除裸控制符：不应含 ESC。
+                assert!(!out.text.contains('\u{1b}'));
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(ok, "tail should contain the echoed marker");
+
+        // 极小上界 → 截断标记为真。
+        let tiny = svc.read_output_tail(id, 4).await.unwrap();
+        assert!(tiny.truncated);
+        assert!(tiny.text.len() <= 4 + 3); // 允许 char-boundary 前移少量
+        svc.delete(id).await.ok();
+    }
+
+    #[tokio::test]
     async fn spawn_echo_streams_output_and_exits() {
         let (svc, bc) = service();
         let resp = svc.create("u", req("printf", &["hi-there"])).await.unwrap();
@@ -2294,6 +2483,153 @@ mod tests {
         let after = svc.get(resp.id).await.unwrap();
         assert_eq!((after.cols, after.rows), (120, 40));
         svc.kill(resp.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn submit_text_single_line_executes_via_cat_echo() {
+        // cat 会回显收到的字节。shell 后端(None) → 单行 raw+CR 一次写。
+        let (svc, _bc) = service();
+        let id = svc.create("u", req("cat", &[])).await.unwrap().id;
+        svc.submit_text(id, "hello-world").await.unwrap();
+
+        // 等 cat 把 "hello-world\r" 回显进 live scrollback。
+        let mut seen = false;
+        for _ in 0..40 {
+            if let Ok(resp) = svc.get(id).await {
+                if let Some(b64) = resp.scrollback_b64 {
+                    let s = String::from_utf8_lossy(&BASE64.decode(b64).unwrap()).to_string();
+                    if s.contains("hello-world") {
+                        seen = true;
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(seen, "cat should echo the submitted single line");
+        svc.delete(id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn submit_text_not_found_when_not_live() {
+        let (svc, _bc) = service();
+        assert!(matches!(
+            svc.submit_text(999_999, "x").await.unwrap_err(),
+            TerminalError::NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn await_turn_settle_idle_when_shell_goes_quiet() {
+        // cat(shell,无 lifecycle) 回显后即安静 → Idle。
+        let (svc, _bc) = service();
+        let id = svc.create("u", req("cat", &[])).await.unwrap().id;
+        svc.submit_text(id, "ping").await.unwrap();
+        let reason = svc
+            .await_turn_settle(id, std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(reason, SettleReason::Idle);
+        svc.delete(id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn await_turn_settle_timeout_when_output_never_quiets() {
+        // yes 持续刷输出 → 永不 idle；超时短于 idle window → Timeout。
+        let (svc, _bc) = service();
+        let id = svc.create("u", req("yes", &[])).await.unwrap().id;
+        let reason = svc
+            .await_turn_settle(id, std::time::Duration::from_millis(400))
+            .await;
+        assert_eq!(reason, SettleReason::Timeout);
+        svc.delete(id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn await_turn_settle_turn_end_via_lifecycle_for_agent_backend() {
+        use crate::lifecycle::TerminalLifecycleServer;
+        let (svc, _bc) = service();
+        let srv = std::sync::Arc::new(TerminalLifecycleServer::start().await.unwrap());
+        svc.with_terminal_lifecycle(srv.clone(), "nomicore".into());
+
+        // 进程用 cat，但声明 backend=claude → 被判为 lifecycle-capable，走 TurnEnd 路径。
+        let request = nomifun_api_types::CreateTerminalRequest {
+            name: None,
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            command: "cat".into(),
+            args: vec![],
+            env: None,
+            backend: Some("claude".into()),
+            mode: Some("default".into()),
+            cols: 80,
+            rows: 24,
+            defer_spawn: false,
+            knowledge_base_ids: None,
+        };
+        let id = svc.create("u", request).await.unwrap().id;
+
+        // settle future 与 POST future 用 tokio::join! 同任务并发（svc 非 Clone，
+        // 借用即可）。settle 先被 poll → 内部 subscribe_lifecycle 建立订阅；post
+        // 延迟 150ms 再发 turn_end hook，事件不会漏。
+        let url = format!("http://127.0.0.1:{}/hook", srv.http_port());
+        let token = srv.auth_token().to_owned();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let body = serde_json::json!({"terminal_id": id, "kind": "turn_end", "payload": {}});
+        let settle = svc.await_turn_settle(id, std::time::Duration::from_secs(5));
+        let post = async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            client.post(&url).json(&body).bearer_auth(&token).send().await.unwrap();
+        };
+        let (reason, _) = tokio::join!(settle, post);
+        assert_eq!(reason, SettleReason::TurnEnd);
+        svc.delete(id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn await_turn_settle_exited_when_lifecycle_pty_dies() {
+        use crate::lifecycle::TerminalLifecycleServer;
+        let (svc, _bc) = service();
+        let srv = std::sync::Arc::new(TerminalLifecycleServer::start().await.unwrap());
+        svc.with_terminal_lifecycle(srv.clone(), "nomicore".into());
+
+        // backend=claude → lifecycle-capable branch. The process is `cat` (long-lived
+        // until killed). The lifecycle channel is app-lifetime and never closes on PTY
+        // death, so WITHOUT the liveness poll this would ride the full 10s timeout and
+        // return a dishonest Timeout. WITH it, the 2s tick observes the dead PTY and
+        // returns Exited within a few seconds.
+        let request = nomifun_api_types::CreateTerminalRequest {
+            name: None,
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            command: "cat".into(),
+            args: vec![],
+            env: None,
+            backend: Some("claude".into()),
+            mode: Some("default".into()),
+            cols: 80,
+            rows: 24,
+            defer_spawn: false,
+            knowledge_base_ids: None,
+        };
+        let id = svc.create("u", request).await.unwrap().id;
+
+        // Kill the PTY and let the exit callback drop it from the live map.
+        svc.kill(id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !svc.live.contains_key(&id),
+            "the killed PTY must be gone from the live map before we await settle"
+        );
+
+        let started = std::time::Instant::now();
+        let reason = svc
+            .await_turn_settle(id, std::time::Duration::from_secs(10))
+            .await;
+        let elapsed = started.elapsed();
+        assert_eq!(reason, SettleReason::Exited);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must resolve via the 2s liveness tick, not ride the 10s timeout (elapsed {elapsed:?})"
+        );
+        svc.delete(id).await.ok();
     }
 
     #[tokio::test]

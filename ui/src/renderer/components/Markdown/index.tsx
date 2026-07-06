@@ -39,12 +39,14 @@ type MarkdownViewProps = {
   codeStyle?: React.CSSProperties;
   className?: string;
   onRef?: (el?: HTMLDivElement | null) => void;
+  fontSize?: string;
+  lineHeight?: string;
   /** Enable raw HTML rendering in markdown content. Use with caution — only for trusted sources. */
   allowHtml?: boolean;
 };
 
 const MarkdownView: React.FC<MarkdownViewProps> = React.memo(
-  ({ hiddenCodeCopyButton, codeStyle, className, onRef, allowHtml, children: childrenProp }) => {
+  ({ hiddenCodeCopyButton, codeStyle, className, onRef, fontSize, lineHeight, allowHtml, children: childrenProp }) => {
     const { t } = useTranslation();
 
     const normalizedChildren = useMemo(() => {
@@ -129,7 +131,7 @@ const MarkdownView: React.FC<MarkdownViewProps> = React.memo(
 
     return (
       <div className={classNames('relative w-full', className)}>
-        <ShadowView>
+        <ShadowView fontSize={fontSize} lineHeight={lineHeight}>
           <div ref={onRef} className='markdown-shadow-body'>
             <ReactMarkdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={rehypePlugins} components={components}>
               {normalizedChildren}

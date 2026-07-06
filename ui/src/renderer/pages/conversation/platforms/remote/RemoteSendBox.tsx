@@ -9,8 +9,6 @@ import type { TMessage } from '@/common/chat/chatLib';
 import { transformMessage } from '@/common/chat/chatLib';
 import CommandQueuePanel from '@/renderer/components/chat/CommandQueuePanel';
 import SendBox from '@/renderer/components/chat/SendBox';
-import ThoughtDisplay, { type ThoughtData } from '@/renderer/components/chat/ThoughtDisplay';
-import { useProcessingStartedAt } from '@/renderer/pages/conversation/platforms/useProcessingStartedAt';
 import FileAttachButton from '@/renderer/components/media/FileAttachButton';
 import FilePreview from '@/renderer/components/media/FilePreview';
 import HorizontalFileList from '@/renderer/components/media/HorizontalFileList';
@@ -34,7 +32,7 @@ import { emitter, useAddEventListener } from '@/renderer/utils/emitter';
 import { mergeFileSelectionItems } from '@/renderer/utils/file/fileSelection';
 import { buildDisplayMessage } from '@/renderer/utils/file/messageFiles';
 import { Message } from '@arco-design/web-react';
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 interface RemoteDraftData {
@@ -64,58 +62,10 @@ const RemoteSendBox: React.FC<{ conversation_id: number }> = ({ conversation_id 
 
   const [agent_name, setAgentName] = useState('Remote Agent');
   const [aiProcessing, setAiProcessing] = useState(false);
-  const processingStartedAt = useProcessingStartedAt(conversation_id, aiProcessing);
   const [hasHydratedRunningState, setHasHydratedRunningState] = useState(false);
-  const [thought, setThought] = useState<ThoughtData>({ description: '', subject: '' });
 
   const aiProcessingRef = useRef(aiProcessing);
   const hasContentInTurnRef = useRef(false);
-
-  const thoughtThrottleRef = useRef<{
-    lastUpdate: number;
-    pending: ThoughtData | null;
-    timer: ReturnType<typeof setTimeout> | null;
-  }>({ lastUpdate: 0, pending: null, timer: null });
-
-  const throttledSetThought = useMemo(() => {
-    const THROTTLE_MS = 50;
-    return (data: ThoughtData) => {
-      const now = Date.now();
-      const ref = thoughtThrottleRef.current;
-      if (now - ref.lastUpdate >= THROTTLE_MS) {
-        ref.lastUpdate = now;
-        ref.pending = null;
-        if (ref.timer) {
-          clearTimeout(ref.timer);
-          ref.timer = null;
-        }
-        setThought(data);
-      } else {
-        ref.pending = data;
-        if (!ref.timer) {
-          ref.timer = setTimeout(
-            () => {
-              ref.lastUpdate = Date.now();
-              ref.timer = null;
-              if (ref.pending) {
-                setThought(ref.pending);
-                ref.pending = null;
-              }
-            },
-            THROTTLE_MS - (now - ref.lastUpdate)
-          );
-        }
-      }
-    };
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      if (thoughtThrottleRef.current.timer) {
-        clearTimeout(thoughtThrottleRef.current.timer);
-      }
-    };
-  }, []);
 
   const { data: draftData, mutate: mutateDraft } = useRemoteSendBoxDraft(String(conversation_id));
   const atPath = draftData?.atPath ?? EMPTY_AT_PATH;
@@ -150,7 +100,6 @@ const RemoteSendBox: React.FC<{ conversation_id: number }> = ({ conversation_id 
   const atPathRef = useLatestRef(atPath);
 
   useEffect(() => {
-    setThought({ subject: '', description: '' });
     hasContentInTurnRef.current = false;
     setHasHydratedRunningState(false);
 
@@ -195,12 +144,10 @@ const RemoteSendBox: React.FC<{ conversation_id: number }> = ({ conversation_id 
             setAiProcessing(true);
             aiProcessingRef.current = true;
           }
-          throttledSetThought(message.data as ThoughtData);
           break;
         case 'finish':
           setAiProcessing(false);
           aiProcessingRef.current = false;
-          setThought({ subject: '', description: '' });
           hasContentInTurnRef.current = false;
           break;
         case 'content':
@@ -210,7 +157,6 @@ const RemoteSendBox: React.FC<{ conversation_id: number }> = ({ conversation_id 
             setAiProcessing(true);
             aiProcessingRef.current = true;
           }
-          setThought({ subject: '', description: '' });
           const transformedMessage = transformMessage(message);
           if (transformedMessage) {
             addOrUpdateMessage(transformedMessage);
@@ -225,7 +171,6 @@ const RemoteSendBox: React.FC<{ conversation_id: number }> = ({ conversation_id 
           break;
         }
         default: {
-          setThought({ subject: '', description: '' });
           const transformedMessage = transformMessage(message);
           if (transformedMessage) {
             addOrUpdateMessage(transformedMessage);
@@ -451,7 +396,6 @@ const RemoteSendBox: React.FC<{ conversation_id: number }> = ({ conversation_id 
     } finally {
       setAiProcessing(false);
       aiProcessingRef.current = false;
-      setThought({ subject: '', description: '' });
       hasContentInTurnRef.current = false;
       resetActiveExecution('stop');
     }
@@ -490,9 +434,8 @@ const RemoteSendBox: React.FC<{ conversation_id: number }> = ({ conversation_id 
         onRemove={remove}
         onClear={clear}
       />
-      <ThoughtDisplay thought={thought} running={aiProcessing} startedAt={processingStartedAt} onStop={handleStop} />
-
       <SendBox
+        showPinnedPlan
         value={content}
         onChange={handleContentChange}
         selectedWorkspaceItems={atPath}

@@ -1,0 +1,523 @@
+{
+  "version": "1.0.0",
+  "items": [
+    {
+      "domain": "product",
+      "title": "SaaS Dashboard",
+      "tags": ["saas", "dashboard", "enterprise", "operations"],
+      "summary": "Dense but calm interface for repeated scanning, comparison, and action.",
+      "guidance": [
+        "Use a persistent sidebar, compact toolbar, and table-first information architecture.",
+        "Surface status, owner, time, and next action without hiding key metadata behind hover.",
+        "Prefer restrained neutrals, one accent for actions, and clear empty/loading/error states."
+      ]
+    },
+    {
+      "domain": "product",
+      "title": "E-commerce Storefront",
+      "tags": ["ecommerce", "retail", "commerce", "product"],
+      "summary": "Conversion-focused product browsing with trustworthy product detail.",
+      "guidance": [
+        "Lead with inspectable product imagery, price, availability, and primary action.",
+        "Use filters, sort, swatches, size/state controls, and cart feedback as first-class UI.",
+        "Avoid decorative layouts that delay product comparison."
+      ]
+    },
+    {
+      "domain": "product",
+      "title": "Portfolio Site",
+      "tags": ["portfolio", "personal", "case-study", "creative"],
+      "summary": "A first-viewport identity signal followed by concrete work evidence.",
+      "guidance": [
+        "Make the person, studio, or product name the headline signal.",
+        "Show a real project thumbnail or artifact above the fold.",
+        "Use case studies with role, constraints, process, and outcome."
+      ]
+    },
+    {
+      "domain": "product",
+      "title": "Fintech Mobile App",
+      "tags": ["fintech", "mobile", "trust", "finance"],
+      "summary": "High-trust financial flows with clear risk, confirmation, and recovery paths.",
+      "guidance": [
+        "Prioritize balances, transaction status, identity, and confirmation copy.",
+        "Use conservative color semantics for gain, loss, warning, and disabled states.",
+        "Design fraud, lock, timeout, and verification states before polish."
+      ]
+    },
+    {
+      "domain": "product",
+      "title": "Healthcare Portal",
+      "tags": ["healthcare", "patient", "clinic", "trust"],
+      "summary": "Calm, accessible workflows for appointments, results, and care instructions.",
+      "guidance": [
+        "Use plain language, visible next steps, and strong contrast.",
+        "Keep appointment time, provider, location, and preparation details together.",
+        "Avoid playful ambiguity around status, alerts, or medical instructions."
+      ]
+    },
+    {
+      "domain": "product",
+      "title": "Education Product",
+      "tags": ["education", "learning", "course", "student"],
+      "summary": "Learning interface that makes progress, feedback, and next activity obvious.",
+      "guidance": [
+        "Pair content hierarchy with progress, completion, and revision states.",
+        "Use examples, practice blocks, and review checkpoints instead of long text walls.",
+        "Make assessment feedback specific and recoverable."
+      ]
+    },
+    {
+      "domain": "product",
+      "title": "AI Developer Tool",
+      "tags": ["ai", "developer", "tool", "console"],
+      "summary": "Technical product UI that values traceability, logs, configuration, and repeat use.",
+      "guidance": [
+        "Use split panes for prompt/config, output, logs, and traces.",
+        "Expose model, token, latency, version, and error metadata when relevant.",
+        "Use monospace only where it adds parsing value."
+      ]
+    },
+    {
+      "domain": "style",
+      "title": "Clean Enterprise",
+      "tags": ["minimal", "enterprise", "saas", "quiet"],
+      "summary": "Work-focused style with low visual noise and strong hierarchy.",
+      "guidance": [
+        "Use white or near-white surfaces, soft borders, and 8px or smaller card radius.",
+        "Prioritize alignment, spacing, and predictable controls over decorative graphics.",
+        "Reserve accent color for primary actions and selected states."
+      ]
+    },
+    {
+      "domain": "style",
+      "title": "Glassmorphism With Control",
+      "tags": ["glassmorphism", "translucent", "depth", "modern"],
+      "summary": "Use glass only when the background remains legible and performance is acceptable.",
+      "guidance": [
+        "Limit glass panels to overlays or hero moments; do not make every card translucent.",
+        "Keep text on solid or strongly blurred surfaces with contrast checked.",
+        "Use one depth system: shadow, blur, and border should agree."
+      ]
+    },
+    {
+      "domain": "style",
+      "title": "Editorial Product",
+      "tags": ["editorial", "story", "brand", "content"],
+      "summary": "Strong type, large images, and measured rhythm for narrative pages.",
+      "guidance": [
+        "Use oversized type only for true page-level moments.",
+        "Pair large media with short copy and clear section rhythm.",
+        "Keep interaction controls conventional even when visual direction is expressive."
+      ]
+    },
+    {
+      "domain": "style",
+      "title": "Playful Consumer",
+      "tags": ["playful", "consumer", "social", "game"],
+      "summary": "Expressive UI with motion, illustration, and friendly copy.",
+      "guidance": [
+        "Use rounded shapes and saturated accents deliberately, not everywhere.",
+        "Make primary workflows faster than the decoration.",
+        "Animate feedback and state changes; avoid animation that blocks action."
+      ]
+    },
+    {
+      "domain": "style",
+      "title": "Dark Command Center",
+      "tags": ["dark", "dashboard", "monitoring", "technical"],
+      "summary": "Dark operational UI for dense status monitoring.",
+      "guidance": [
+        "Use dark neutrals with clear elevation and high-contrast data colors.",
+        "Avoid low-contrast gray text for operational values.",
+        "Use color consistently for health, warning, error, paused, and unknown."
+      ]
+    },
+    {
+      "domain": "style",
+      "title": "Luxury Minimal",
+      "tags": ["luxury", "premium", "minimal", "brand"],
+      "summary": "Sparse layout, strong material imagery, and slow confidence.",
+      "guidance": [
+        "Use fewer objects, larger margins, and high-quality imagery.",
+        "Avoid generic gradients and overused stock backgrounds.",
+        "Use accent color sparingly; material, texture, and typography carry the brand."
+      ]
+    },
+    {
+      "domain": "typography",
+      "title": "Inter + Fraunces",
+      "tags": ["modern", "editorial", "saas", "friendly"],
+      "summary": "Clean body text with a distinctive serif display voice.",
+      "guidance": [
+        "Use Fraunces for page headlines or selected section titles.",
+        "Use Inter for UI controls, body copy, tables, and labels.",
+        "Keep body at 16px or above on marketing pages and 13-15px in dense tools."
+      ]
+    },
+    {
+      "domain": "typography",
+      "title": "Space Grotesk + Inter",
+      "tags": ["startup", "technical", "modern", "bold"],
+      "summary": "Contemporary technical voice with readable interface text.",
+      "guidance": [
+        "Use Space Grotesk for short titles, numbers, and nav brand text.",
+        "Use Inter for longer copy and form-heavy screens.",
+        "Avoid negative letter spacing; let the typeface carry the tone."
+      ]
+    },
+    {
+      "domain": "typography",
+      "title": "IBM Plex Sans + IBM Plex Mono",
+      "tags": ["developer", "data", "ai", "technical"],
+      "summary": "Reliable product type system for developer tools and data-heavy UIs.",
+      "guidance": [
+        "Use Plex Sans for UI and Plex Mono for code, IDs, and logs.",
+        "Keep monospace blocks line-height generous enough for scanning.",
+        "Use tabular numbers in metrics where available."
+      ]
+    },
+    {
+      "domain": "typography",
+      "title": "Playfair Display + Source Sans 3",
+      "tags": ["editorial", "luxury", "content", "brand"],
+      "summary": "Elegant editorial pairing for image-led pages.",
+      "guidance": [
+        "Use Playfair only for display headings and short quotes.",
+        "Use Source Sans 3 for readable body copy and controls.",
+        "Balance high-contrast type with generous line height."
+      ]
+    },
+    {
+      "domain": "typography",
+      "title": "Manrope + Lora",
+      "tags": ["calm", "professional", "healthcare", "education"],
+      "summary": "Warm professional pairing with readable UI and softer editorial moments.",
+      "guidance": [
+        "Use Manrope for navigation, cards, forms, and dense panels.",
+        "Use Lora for articles, intros, and reflective sections.",
+        "Keep form labels plain; do not use serif type inside compact controls."
+      ]
+    },
+    {
+      "domain": "color",
+      "title": "SaaS Clarity",
+      "tags": ["saas", "dashboard", "enterprise", "blue"],
+      "summary": "Trustworthy light SaaS palette with clear action emphasis.",
+      "roles": {
+        "primary": "#1D4ED8",
+        "secondary": "#0F766E",
+        "accent": "#F59E0B",
+        "background": "#F8FAFC",
+        "surface": "#FFFFFF",
+        "text": "#0F172A",
+        "border": "#CBD5E1"
+      },
+      "guidance": ["Use blue for primary action, teal for positive status, amber for attention."]
+    },
+    {
+      "domain": "color",
+      "title": "Fintech Trust",
+      "tags": ["fintech", "finance", "trust", "navy"],
+      "summary": "Conservative financial palette with high contrast.",
+      "roles": {
+        "primary": "#0B1F3A",
+        "secondary": "#2563EB",
+        "accent": "#22C55E",
+        "background": "#F3F6FA",
+        "surface": "#FFFFFF",
+        "text": "#111827",
+        "border": "#D1D5DB"
+      },
+      "guidance": ["Reserve green for confirmed gain or completion; use red only for loss or destructive states."]
+    },
+    {
+      "domain": "color",
+      "title": "Healthcare Calm",
+      "tags": ["healthcare", "wellness", "calm", "accessible"],
+      "summary": "Soft but legible healthcare palette.",
+      "roles": {
+        "primary": "#0F766E",
+        "secondary": "#2563EB",
+        "accent": "#A855F7",
+        "background": "#F8FAFC",
+        "surface": "#FFFFFF",
+        "text": "#111827",
+        "border": "#CCFBF1"
+      },
+      "guidance": ["Do not use low-contrast mint text; keep clinical data on neutral surfaces."]
+    },
+    {
+      "domain": "color",
+      "title": "Commerce Warm",
+      "tags": ["commerce", "retail", "warm", "product"],
+      "summary": "Warm commerce palette that keeps product imagery primary.",
+      "roles": {
+        "primary": "#9A3412",
+        "secondary": "#166534",
+        "accent": "#EA580C",
+        "background": "#FFF7ED",
+        "surface": "#FFFFFF",
+        "text": "#1C1917",
+        "border": "#FED7AA"
+      },
+      "guidance": ["Use warm backgrounds sparingly so product colors remain accurate."]
+    },
+    {
+      "domain": "color",
+      "title": "Dark Data",
+      "tags": ["dark", "dashboard", "monitoring", "data"],
+      "summary": "Dark UI palette with clear data state colors.",
+      "roles": {
+        "primary": "#38BDF8",
+        "secondary": "#A78BFA",
+        "accent": "#FBBF24",
+        "background": "#020617",
+        "surface": "#0F172A",
+        "text": "#F8FAFC",
+        "border": "#334155"
+      },
+      "guidance": ["Keep secondary text at #CBD5E1 or brighter on dark surfaces."]
+    },
+    {
+      "domain": "landing",
+      "title": "SaaS Landing Structure",
+      "tags": ["saas", "landing", "pricing", "testimonial"],
+      "summary": "Practical SaaS page structure that leads from offer to proof to conversion.",
+      "guidance": [
+        "Hero: literal product/category headline, one-sentence promise, product screenshot, primary CTA.",
+        "Follow with problem, workflow, integrations, proof, pricing, FAQ, and final CTA.",
+        "Keep at least a hint of the next section visible below the first viewport."
+      ]
+    },
+    {
+      "domain": "landing",
+      "title": "Portfolio Home Structure",
+      "tags": ["portfolio", "personal", "case-study", "homepage"],
+      "summary": "Identity-first portfolio structure with visible work evidence.",
+      "guidance": [
+        "Hero: name, role, specialty, and one strong project image or live artifact.",
+        "Follow with selected work, capabilities, testimonials or outcomes, writing, contact.",
+        "Avoid vague value props without real work samples."
+      ]
+    },
+    {
+      "domain": "landing",
+      "title": "App Launch Page",
+      "tags": ["mobile", "app", "launch", "consumer"],
+      "summary": "Launch page that explains the job, shows the app, and gives a fast path to install.",
+      "guidance": [
+        "Use device screenshots or product video, not abstract gradients.",
+        "Show top use cases, social proof, privacy/trust notes, and store badges.",
+        "Keep install CTA visible after the hero."
+      ]
+    },
+    {
+      "domain": "chart",
+      "title": "KPI Dashboard",
+      "tags": ["dashboard", "kpi", "metrics", "operations"],
+      "summary": "Metric layout for operational scanning.",
+      "guidance": [
+        "Use four to six top KPIs with trend delta, time range, and definition.",
+        "Pair summary cards with a table or trend chart below.",
+        "Use color only for semantic status, not arbitrary decoration."
+      ]
+    },
+    {
+      "domain": "chart",
+      "title": "Time Series Trend",
+      "tags": ["line", "trend", "timeseries", "analytics"],
+      "summary": "Best for change over time and comparison against a baseline.",
+      "guidance": [
+        "Use line or area chart with clear x-axis intervals and visible hover state.",
+        "Annotate major events instead of explaining them in long prose.",
+        "Do not use pie charts for time series."
+      ]
+    },
+    {
+      "domain": "chart",
+      "title": "Funnel Conversion",
+      "tags": ["funnel", "conversion", "growth", "sales"],
+      "summary": "Shows drop-off across ordered stages.",
+      "guidance": [
+        "Use stage labels, absolute counts, conversion rate, and drop-off delta.",
+        "Make the largest loss visually obvious and explainable.",
+        "Do not compare unrelated funnels without normalization."
+      ]
+    },
+    {
+      "domain": "chart",
+      "title": "Cohort Retention",
+      "tags": ["cohort", "retention", "heatmap", "product"],
+      "summary": "Heatmap layout for retention or repeat behavior by cohort.",
+      "guidance": [
+        "Use month/week columns and cohort rows with a single color ramp.",
+        "Freeze labels and include sample size.",
+        "Avoid rainbow palettes; they hide trend continuity."
+      ]
+    },
+    {
+      "domain": "ux",
+      "title": "Responsive Density",
+      "tags": ["responsive", "mobile", "layout", "density"],
+      "summary": "Move from dense desktop scanning to focused mobile tasks.",
+      "guidance": [
+        "Desktop can show tables and side panels; mobile should prioritize one task per screen.",
+        "Use stable grid tracks, aspect ratios, and min/max sizes for fixed-format elements.",
+        "Never rely on viewport-scaled font sizes to make copy fit."
+      ]
+    },
+    {
+      "domain": "ux",
+      "title": "Accessible Interaction States",
+      "tags": ["accessibility", "focus", "states", "contrast"],
+      "summary": "Every interactive control needs visible state and keyboard reachability.",
+      "guidance": [
+        "Design default, hover, active, focus-visible, disabled, loading, success, and error.",
+        "Do not communicate state with color alone.",
+        "Make focus rings visible against both light and dark surfaces."
+      ]
+    },
+    {
+      "domain": "ux",
+      "title": "Empty Loading Error",
+      "tags": ["empty", "loading", "error", "recovery"],
+      "summary": "Operational screens need recovery states, not blank holes.",
+      "guidance": [
+        "Empty state: explain why it is empty and offer the next action.",
+        "Loading state: preserve layout dimensions to prevent shifting.",
+        "Error state: show what failed, what data is safe, and how to retry."
+      ]
+    },
+    {
+      "domain": "ux",
+      "title": "Motion With Purpose",
+      "tags": ["animation", "motion", "feedback", "transition"],
+      "summary": "Motion should clarify causality and status.",
+      "guidance": [
+        "Use short transitions for expansion, filtering, navigation, and async feedback.",
+        "Avoid long decorative motion in repeated operational workflows.",
+        "Respect reduced-motion settings when implementing code."
+      ]
+    },
+    {
+      "domain": "stack",
+      "stack": "html-tailwind",
+      "title": "HTML + Tailwind",
+      "tags": ["html-tailwind", "tailwind", "prototype", "responsive"],
+      "summary": "Fast static UI implementation with utility classes.",
+      "guidance": [
+        "Use semantic HTML first, then Tailwind utilities for layout and states.",
+        "Define repeated component classes only when duplication becomes risky.",
+        "Use responsive prefixes to change layout, not just shrink text."
+      ]
+    },
+    {
+      "domain": "stack",
+      "stack": "react",
+      "title": "React",
+      "tags": ["react", "component", "state", "frontend"],
+      "summary": "Component implementation with explicit state surfaces.",
+      "guidance": [
+        "Model loading, empty, error, optimistic, and success states in component props.",
+        "Keep presentational components close to their data shape unless reused.",
+        "Use existing design-system primitives before adding new abstractions."
+      ]
+    },
+    {
+      "domain": "stack",
+      "stack": "nextjs",
+      "title": "Next.js",
+      "tags": ["nextjs", "react", "route", "app-router"],
+      "summary": "Product pages and app screens with routing and server/client boundaries.",
+      "guidance": [
+        "Use server components for static data and client components for interaction.",
+        "Keep first viewport meaningful with real product media or useful app UI.",
+        "Optimize images and avoid layout shift with width, height, or aspect ratio."
+      ]
+    },
+    {
+      "domain": "stack",
+      "stack": "vue",
+      "title": "Vue",
+      "tags": ["vue", "component", "composition", "frontend"],
+      "summary": "Declarative interface implementation with composition API patterns.",
+      "guidance": [
+        "Use computed values for display state and small composables for shared behavior.",
+        "Keep template conditionals readable; extract components when sections diverge.",
+        "Bind aria and disabled states together with visual state."
+      ]
+    },
+    {
+      "domain": "stack",
+      "stack": "svelte",
+      "title": "Svelte",
+      "tags": ["svelte", "component", "animation", "frontend"],
+      "summary": "Compact component implementation with built-in transitions.",
+      "guidance": [
+        "Use transitions for local state changes only when they clarify cause and effect.",
+        "Keep stores for shared state; keep simple local UI state in components.",
+        "Avoid animation that conflicts with reduced-motion needs."
+      ]
+    },
+    {
+      "domain": "stack",
+      "stack": "swiftui",
+      "title": "SwiftUI",
+      "tags": ["swiftui", "ios", "mobile", "native"],
+      "summary": "Native Apple interface with dynamic type and platform controls.",
+      "guidance": [
+        "Use platform-native navigation, lists, forms, sheets, and toolbars.",
+        "Respect Dynamic Type, safe areas, and system colors unless brand-critical.",
+        "Verify light/dark mode and accessibility sizes."
+      ]
+    },
+    {
+      "domain": "stack",
+      "stack": "react-native",
+      "title": "React Native",
+      "tags": ["react-native", "mobile", "ios", "android"],
+      "summary": "Cross-platform mobile UI with explicit platform differences.",
+      "guidance": [
+        "Use touch targets of at least 44px and avoid hover-only affordances.",
+        "Check safe areas, keyboard avoidance, and low-end device performance.",
+        "Use native navigation patterns where they differ by platform."
+      ]
+    },
+    {
+      "domain": "stack",
+      "stack": "flutter",
+      "title": "Flutter",
+      "tags": ["flutter", "mobile", "material", "cross-platform"],
+      "summary": "Cross-platform UI with strong layout primitives.",
+      "guidance": [
+        "Use constraints, flex, and intrinsic sizing deliberately to avoid overflow.",
+        "Treat text scale factor as a required QA path.",
+        "Theme components centrally, then tune per screen."
+      ]
+    },
+    {
+      "domain": "stack",
+      "stack": "shadcn",
+      "title": "shadcn/ui",
+      "tags": ["shadcn", "radix", "tailwind", "component"],
+      "summary": "Composable app UI with accessible primitives.",
+      "guidance": [
+        "Use Radix-backed controls for dialogs, menus, popovers, tabs, and selects.",
+        "Customize tokens and density before inventing new component behavior.",
+        "Keep forms and tables utilitarian, predictable, and keyboard-friendly."
+      ]
+    },
+    {
+      "domain": "prompt",
+      "title": "Design Brief Prompt",
+      "tags": ["brief", "prompt", "requirements", "design"],
+      "summary": "Minimal brief shape for UI generation or critique.",
+      "guidance": [
+        "Include product type, target user, primary workflow, visual tone, constraints, and stack.",
+        "Name required states: loading, empty, error, success, disabled, and responsive breakpoints.",
+        "Ask for concrete layout, component behavior, copy hierarchy, and verification steps."
+      ]
+    }
+  ]
+}

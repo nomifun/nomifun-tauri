@@ -23,6 +23,7 @@ use std::sync::{Arc, OnceLock};
 
 use serde_json::{Map, Value, json};
 
+use self::capability::coerce_args_to_schema;
 use crate::deps::{CallerCtx, GatewayDeps};
 
 /// A tool advertised to MCP clients via `tools/list`.
@@ -171,6 +172,7 @@ impl Registry {
     ) -> Option<Value> {
         let cap = self.by_name.get(name)?;
         let surface = ctx.surface();
+        let args = coerce_args_to_schema(&Value::Object(cap.input_schema.clone()), args.clone());
         let confirmed = args
             .get("confirm")
             .and_then(Value::as_bool)
@@ -185,7 +187,7 @@ impl Registry {
                 "danger": format!("{:?}", cap.meta.danger),
                 "note": "This action is destructive or sensitive. Restate the exact action and its target to the user, get explicit agreement, then call again with confirm=true."
             }),
-            Decision::Allow => (cap.handler)(deps, ctx, args.clone()).await,
+            Decision::Allow => (cap.handler)(deps, ctx, args).await,
         };
         Some(result)
     }
@@ -206,6 +208,7 @@ impl Registry {
     ) -> Option<Value> {
         let cap = self.by_name.get(name)?;
         let surface = ctx.surface();
+        let args = coerce_args_to_schema(&Value::Object(cap.input_schema.clone()), args.clone());
         let confirmed = args
             .get("confirm")
             .and_then(Value::as_bool)
@@ -221,8 +224,8 @@ impl Registry {
                 "note": "This action is destructive or sensitive. Restate the exact action and its target to the user, get explicit agreement, then call again with confirm=true."
             }),
             Decision::Allow => match &cap.stream {
-                Some(stream) => stream(deps, ctx, args.clone(), progress).await,
-                None => (cap.handler)(deps, ctx, args.clone()).await,
+                Some(stream) => stream(deps, ctx, args, progress).await,
+                None => (cap.handler)(deps, ctx, args).await,
             },
         };
         Some(result)

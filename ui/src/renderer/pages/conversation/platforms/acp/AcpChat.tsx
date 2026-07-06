@@ -8,7 +8,6 @@ import type { IConversationMcpStatus } from '@/common/config/storage';
 import { ConversationProvider } from '@/renderer/hooks/context/ConversationContext';
 import FlexFullContainer from '@renderer/components/layout/FlexFullContainer';
 import MessageList from '@renderer/pages/conversation/Messages/MessageList';
-import PinnedPlan from '@renderer/pages/conversation/Messages/components/PinnedPlan';
 import { ConversationArtifactProvider } from '@renderer/pages/conversation/Messages/artifacts';
 import {
   MessageListLoadingProvider,
@@ -85,7 +84,6 @@ const AcpChat: React.FC<{
           <FlexFullContainer>
             <MessageList className='flex-1' emptySlot={emptySlot} />
           </FlexFullContainer>
-          <PinnedPlan />
           <AcpE2EStreamInjector conversationId={conversation_id} />
           {!hideSendBox && (
             <AcpSendBox

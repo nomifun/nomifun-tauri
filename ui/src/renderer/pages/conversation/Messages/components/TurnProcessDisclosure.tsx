@@ -7,7 +7,7 @@
 import type { TurnDisclosureProcessState } from '../turnDisclosureModel';
 import { Down } from '@icon-park/react';
 import classNames from 'classnames';
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 export interface TurnProcessDisclosureView<T> {
@@ -16,6 +16,7 @@ export interface TurnProcessDisclosureView<T> {
   startAt: number;
   endAt: number;
   state: TurnDisclosureProcessState;
+  running: boolean;
   defaultCollapsed: boolean;
 }
 
@@ -25,6 +26,12 @@ interface TurnProcessDisclosureProps<T> {
   renderProcessItem: (item: T) => React.ReactNode;
   getProcessItemKey: (item: T) => string;
   getProcessItemState: (item: T) => TurnDisclosureProcessState;
+  getProcessItemLayoutKind?: (item: T) => string;
+}
+
+export interface TurnProcessDisclosureExpansionSnapshot {
+  itemId: string;
+  hasProcessItems: boolean;
 }
 
 const labelKeyByState: Record<TurnDisclosureProcessState, string> = {
@@ -44,6 +51,18 @@ const defaultLabelByState: Record<TurnDisclosureProcessState, string> = {
 };
 
 const sanitizeDomId = (value: string): string => value.replace(/[^A-Za-z0-9_-]/g, '_');
+
+const getDefaultExpanded = (hasProcessItems: boolean, defaultCollapsed: boolean): boolean =>
+  hasProcessItems && !defaultCollapsed;
+
+export function shouldResetTurnProcessDisclosureExpansion(
+  previous: TurnProcessDisclosureExpansionSnapshot,
+  next: TurnProcessDisclosureExpansionSnapshot
+): boolean {
+  if (previous.itemId !== next.itemId) return true;
+  if (previous.hasProcessItems !== next.hasProcessItems) return true;
+  return false;
+}
 
 const formatTurnDuration = (ms: number, t: ReturnType<typeof useTranslation>['t']): string => {
   const totalSeconds = Math.max(0, Math.round(ms / 1000));
@@ -66,17 +85,39 @@ function TurnProcessDisclosure<T>({
   renderProcessItem,
   getProcessItemKey,
   getProcessItemState,
+  getProcessItemLayoutKind,
 }: TurnProcessDisclosureProps<T>) {
   const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(!item.defaultCollapsed);
+  const hasProcessItems = item.processItems.length > 0;
+  const [expanded, setExpanded] = useState(() => getDefaultExpanded(hasProcessItems, item.defaultCollapsed));
+  const [now, setNow] = useState(() => Date.now());
+  const expansionSnapshotRef = useRef<TurnProcessDisclosureExpansionSnapshot>({
+    itemId: item.id,
+    hasProcessItems,
+  });
 
   useEffect(() => {
-    setExpanded(!item.defaultCollapsed);
-  }, [item.defaultCollapsed, item.id]);
+    const nextSnapshot: TurnProcessDisclosureExpansionSnapshot = { itemId: item.id, hasProcessItems };
+    const shouldReset = shouldResetTurnProcessDisclosureExpansion(expansionSnapshotRef.current, nextSnapshot);
+    expansionSnapshotRef.current = nextSnapshot;
+
+    if (shouldReset) {
+      setExpanded(getDefaultExpanded(hasProcessItems, item.defaultCollapsed));
+    }
+  }, [hasProcessItems, item.defaultCollapsed, item.id]);
 
   useEffect(() => {
-    if (highlighted) setExpanded(true);
-  }, [highlighted]);
+    if (highlighted && hasProcessItems) setExpanded(true);
+  }, [hasProcessItems, highlighted]);
+
+  useEffect(() => {
+    if (!item.running) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => {
+      setNow(Date.now());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [item.running]);
 
   const currentItemKey = useMemo(() => {
     const activeItem = item.processItems.findLast((processItem) => {
@@ -93,40 +134,54 @@ function TurnProcessDisclosure<T>({
     return latestItem ? getProcessItemKey(latestItem) : undefined;
   }, [getProcessItemKey, getProcessItemState, item.processItems]);
 
-  const duration = formatTurnDuration(item.endAt - item.startAt, t);
+  const durationEndAt = item.running ? now : item.endAt;
+  const duration = formatTurnDuration(durationEndAt - item.startAt, t);
   const label = t(labelKeyByState[item.state], {
     duration,
     defaultValue: defaultLabelByState[item.state],
   });
   const bodyId = `turn-process-disclosure-body-${sanitizeDomId(item.id)}`;
+  const disclosureExpanded = hasProcessItems && expanded;
 
   return (
     <div className={classNames('turn-process-disclosure', `turn-process-disclosure--${item.state}`)}>
       <button
         type='button'
-        className='turn-process-disclosure__header'
-        onClick={() => setExpanded((value) => !value)}
-        aria-expanded={expanded}
-        aria-controls={bodyId}
+        className={classNames(
+          'turn-process-disclosure__header',
+          !hasProcessItems && 'turn-process-disclosure__header--static'
+        )}
+        onClick={() => {
+          if (hasProcessItems) setExpanded((value) => !value);
+        }}
+        aria-expanded={hasProcessItems ? disclosureExpanded : undefined}
+        aria-controls={hasProcessItems ? bodyId : undefined}
       >
         <span className='turn-process-disclosure__label'>{label}</span>
-        <Down
-          theme='outline'
-          size='14'
-          fill='currentColor'
-          className={classNames('turn-process-disclosure__arrow', expanded && 'turn-process-disclosure__arrow--open')}
-        />
+        {hasProcessItems && (
+          <Down
+            theme='outline'
+            size='14'
+            fill='currentColor'
+            className={classNames(
+              'turn-process-disclosure__arrow',
+              disclosureExpanded && 'turn-process-disclosure__arrow--open'
+            )}
+          />
+        )}
       </button>
-      {expanded && (
+      {disclosureExpanded && (
         <div id={bodyId} className='turn-process-disclosure__body'>
           {item.processItems.map((processItem) => {
             const itemKey = getProcessItemKey(processItem);
             const state = getProcessItemState(processItem);
+            const layoutKind = getProcessItemLayoutKind?.(processItem) ?? 'other';
             return (
               <div
                 key={itemKey}
                 className={classNames(
                   'turn-process-disclosure__item',
+                  `turn-process-disclosure__item--${layoutKind}`,
                   `turn-process-disclosure__item--${state}`,
                   itemKey === currentItemKey && 'turn-process-disclosure__item--current'
                 )}

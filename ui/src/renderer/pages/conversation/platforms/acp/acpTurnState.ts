@@ -44,10 +44,6 @@ export function isAcpTurnBusy(state: AcpTurnState): boolean {
   return busyPhases.has(state.phase);
 }
 
-export function shouldShowAcpBottomProcessing(state: AcpTurnState): boolean {
-  return state.phase === 'waiting_first_output' || state.phase === 'starting';
-}
-
 function withStartedAt(state: AcpTurnState, processingStartedAt?: number): Pick<AcpTurnState, 'processingStartedAt'> {
   return {
     processingStartedAt: processingStartedAt ?? state.processingStartedAt ?? Date.now(),

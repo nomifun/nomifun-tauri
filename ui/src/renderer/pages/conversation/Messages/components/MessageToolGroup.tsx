@@ -23,6 +23,7 @@ import MarkdownView from '@renderer/components/Markdown';
 import { ToolConfirmationOutcome } from '@renderer/utils/common';
 import { ImagePreviewContext } from '../MessageList';
 import { COLLAPSE_CONFIG, TEXT_CONFIG } from '../constants';
+import { MESSAGE_BODY_FONT_SIZE, MESSAGE_BODY_LINE_HEIGHT } from '../typography';
 import type { ImageGenerationResult, WriteFileResult } from '../types';
 
 const CODE_STYLE = { marginTop: 4, marginBottom: 4 };
@@ -172,7 +173,9 @@ const ConfirmationDetails: React.FC<{
         const bashSnippet = `\`\`\`bash\n${confirmationDetails.command}\n\`\`\``;
         return (
           <div className='w-full max-w-100% min-w-0'>
-            <MarkdownView codeStyle={CODE_STYLE}>{bashSnippet}</MarkdownView>
+            <MarkdownView codeStyle={CODE_STYLE} fontSize={MESSAGE_BODY_FONT_SIZE} lineHeight={MESSAGE_BODY_LINE_HEIGHT}>
+              {bashSnippet}
+            </MarkdownView>
           </div>
         );
       }

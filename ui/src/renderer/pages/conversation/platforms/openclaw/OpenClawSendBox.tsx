@@ -10,8 +10,6 @@ import { transformMessage } from '@/common/chat/chatLib';
 import { uuid } from '@/common/utils';
 import CommandQueuePanel from '@/renderer/components/chat/CommandQueuePanel';
 import SendBox from '@/renderer/components/chat/SendBox';
-import ThoughtDisplay, { type ThoughtData } from '@/renderer/components/chat/ThoughtDisplay';
-import { useProcessingStartedAt } from '@/renderer/pages/conversation/platforms/useProcessingStartedAt';
 import FileAttachButton from '@/renderer/components/media/FileAttachButton';
 import FilePreview from '@/renderer/components/media/FilePreview';
 import HorizontalFileList from '@/renderer/components/media/HorizontalFileList';
@@ -36,7 +34,7 @@ import { emitter, useAddEventListener } from '@/renderer/utils/emitter';
 import { mergeFileSelectionItems } from '@/renderer/utils/file/fileSelection';
 import { buildDisplayMessage } from '@/renderer/utils/file/messageFiles';
 import { Message, Tag } from '@arco-design/web-react';
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 interface OpenClawDraftData {
@@ -65,12 +63,7 @@ const OpenClawSendBox: React.FC<{ conversation_id: number }> = ({ conversation_i
   const { setSendBoxHandler } = usePreviewContext();
 
   const [aiProcessing, setAiProcessing] = useState(false);
-  const processingStartedAt = useProcessingStartedAt(conversation_id, aiProcessing);
   const [hasHydratedRunningState, setHasHydratedRunningState] = useState(false);
-  const [thought, setThought] = useState<ThoughtData>({
-    description: '',
-    subject: '',
-  });
 
   // Use ref to sync state for immediate access in event handlers
   // 使用 ref 同步状态，以便在事件处理程序中立即访问
@@ -82,53 +75,6 @@ const OpenClawSendBox: React.FC<{ conversation_id: number }> = ({ conversation_i
 
   // Track whether the current turn was triggered by a Star Office install request
   const starOfficeInstallInFlightRef = useRef(false);
-
-  // Throttle thought updates to reduce render frequency
-  const thoughtThrottleRef = useRef<{
-    lastUpdate: number;
-    pending: ThoughtData | null;
-    timer: ReturnType<typeof setTimeout> | null;
-  }>({ lastUpdate: 0, pending: null, timer: null });
-
-  const throttledSetThought = useMemo(() => {
-    const THROTTLE_MS = 50;
-    return (data: ThoughtData) => {
-      const now = Date.now();
-      const ref = thoughtThrottleRef.current;
-      if (now - ref.lastUpdate >= THROTTLE_MS) {
-        ref.lastUpdate = now;
-        ref.pending = null;
-        if (ref.timer) {
-          clearTimeout(ref.timer);
-          ref.timer = null;
-        }
-        setThought(data);
-      } else {
-        ref.pending = data;
-        if (!ref.timer) {
-          ref.timer = setTimeout(
-            () => {
-              ref.lastUpdate = Date.now();
-              ref.timer = null;
-              if (ref.pending) {
-                setThought(ref.pending);
-                ref.pending = null;
-              }
-            },
-            THROTTLE_MS - (now - ref.lastUpdate)
-          );
-        }
-      }
-    };
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      if (thoughtThrottleRef.current.timer) {
-        clearTimeout(thoughtThrottleRef.current.timer);
-      }
-    };
-  }, []);
 
   const { data: draftData, mutate: mutateDraft } = useOpenClawSendBoxDraft(String(conversation_id));
   const atPath = draftData?.atPath ?? EMPTY_AT_PATH;
@@ -169,7 +115,6 @@ const OpenClawSendBox: React.FC<{ conversation_id: number }> = ({ conversation_i
     setAiProcessing(false);
     aiProcessingRef.current = false;
     setHasHydratedRunningState(false);
-    setThought({ subject: '', description: '' });
     hasContentInTurnRef.current = false;
 
     // Check actual conversation status from backend before resetting aiProcessing
@@ -228,7 +173,6 @@ const OpenClawSendBox: React.FC<{ conversation_id: number }> = ({ conversation_i
             setAiProcessing(true);
             aiProcessingRef.current = true;
           }
-          throttledSetThought(message.data as ThoughtData);
           break;
         case 'finish':
           {
@@ -236,7 +180,6 @@ const OpenClawSendBox: React.FC<{ conversation_id: number }> = ({ conversation_i
             // 立即重置状态（通知由集中化 hook 处理）
             setAiProcessing(false);
             aiProcessingRef.current = false;
-            setThought({ subject: '', description: '' });
             // Notify StarOfficeMonitorCard to re-detect and auto-open panel
             if (starOfficeInstallInFlightRef.current) {
               starOfficeInstallInFlightRef.current = false;
@@ -254,7 +197,6 @@ const OpenClawSendBox: React.FC<{ conversation_id: number }> = ({ conversation_i
             setAiProcessing(true);
             aiProcessingRef.current = true;
           }
-          setThought({ subject: '', description: '' });
           const transformedMessage = transformMessage(message);
           if (transformedMessage) {
             addOrUpdateMessage(transformedMessage);
@@ -269,7 +211,6 @@ const OpenClawSendBox: React.FC<{ conversation_id: number }> = ({ conversation_i
           break;
         }
         default: {
-          setThought({ subject: '', description: '' });
           const transformedMessage = transformMessage(message);
           if (transformedMessage) {
             addOrUpdateMessage(transformedMessage);
@@ -537,7 +478,6 @@ const OpenClawSendBox: React.FC<{ conversation_id: number }> = ({ conversation_i
     } finally {
       setAiProcessing(false);
       aiProcessingRef.current = false;
-      setThought({ subject: '', description: '' });
       hasContentInTurnRef.current = false;
       resetActiveExecution('stop');
     }
@@ -576,9 +516,8 @@ const OpenClawSendBox: React.FC<{ conversation_id: number }> = ({ conversation_i
         onRemove={remove}
         onClear={clear}
       />
-      <ThoughtDisplay thought={thought} running={aiProcessing} startedAt={processingStartedAt} onStop={handleStop} />
-
       <SendBox
+        showPinnedPlan
         value={content}
         onChange={handleContentChange}
         selectedWorkspaceItems={atPath}

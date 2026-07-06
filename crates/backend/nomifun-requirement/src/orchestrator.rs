@@ -25,13 +25,6 @@ use crate::service::{DEFAULT_LEASE_MS, RequirementService};
 const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(30);
 /// Hard ceiling on a single requirement turn.
 const TURN_TIMEOUT: Duration = Duration::from_secs(3600);
-/// Terminal turn: beat between writing the bracketed-paste body and writing the
-/// submit CR. The CR MUST be a separate write after this delay — modern agent
-/// TUIs (claude/codex/gemini) use paste-burst detection that suppresses
-/// auto-submit for a CR arriving in the same read() as the paste-end marker, so
-/// a CR appended to the paste leaves the text sitting unsubmitted in the input
-/// box. Matches the cron terminal executor's proven fix (`nomifun-cron`).
-const TERMINAL_SUBMIT_DELAY: Duration = Duration::from_millis(120);
 /// Idle cadence for a persistent loop with nothing to do (tag drained, claim
 /// error, or a terminal awaiting relaunch). The `wake` Notify makes a freshly
 /// created/re-pended requirement claim near-instantly; this is the safety-net
@@ -1035,21 +1028,6 @@ enum TerminalTurnEnd {
     Errored,
 }
 
-/// Build the ordered PTY write chunks for submitting a terminal prompt:
-/// `(paste, submit)`. `paste` wraps the whole (multi-line) prompt in
-/// bracketed-paste markers so the CLI's line editor inserts it as ONE paste
-/// rather than executing line-by-line on each embedded newline. `submit` is a
-/// lone carriage return, deliberately kept OUT of the paste burst (see
-/// `submit_terminal_prompt`). The markers are CSI sequences our output scanner
-/// also strips, so they never interfere with marker detection.
-fn terminal_submit_chunks(prompt: &str) -> (Vec<u8>, Vec<u8>) {
-    let mut paste = Vec::with_capacity(prompt.len() + 12);
-    paste.extend_from_slice(b"\x1b[200~");
-    paste.extend_from_slice(prompt.as_bytes());
-    paste.extend_from_slice(b"\x1b[201~");
-    (paste, vec![b'\r'])
-}
-
 /// Inject a prompt into a terminal CLI and submit it. The bracketed-paste body
 /// and the submit CR are written as SEPARATE PTY writes, with
 /// `TERMINAL_SUBMIT_DELAY` between them. A CR that rides in the same write as
@@ -1063,10 +1041,17 @@ async fn submit_terminal_prompt(
     terminal_id: i64,
     prompt: &str,
 ) -> Result<(), AppError> {
-    let (paste, submit) = terminal_submit_chunks(prompt);
-    driver.write_input(terminal_id, &paste).await?;
-    sleep(TERMINAL_SUBMIT_DELAY).await;
-    driver.write_input(terminal_id, &submit).await?;
+    // AutoWork 只驱动 lifecycle-capable 的 agent CLI（claude/codex），故 is_agent_tui=true。
+    match nomifun_terminal::encode_submit_chunks(prompt, true) {
+        nomifun_terminal::SubmitChunks::PasteThenCr { paste, cr } => {
+            driver.write_input(terminal_id, &paste).await?;
+            sleep(nomifun_terminal::TERMINAL_SUBMIT_DELAY).await;
+            driver.write_input(terminal_id, &cr).await?;
+        }
+        nomifun_terminal::SubmitChunks::Single(bytes) => {
+            driver.write_input(terminal_id, &bytes).await?;
+        }
+    }
     Ok(())
 }
 
@@ -1273,22 +1258,42 @@ mod tests {
     }
 
     #[test]
+    fn autowork_multiline_prompt_uses_paste_then_separate_cr() {
+        use nomifun_terminal::{encode_submit_chunks, SubmitChunks};
+        let prompt = "requirement #1\ndo the thing\ncall requirement_complete when done";
+        match encode_submit_chunks(prompt, true) {
+            SubmitChunks::PasteThenCr { paste, cr } => {
+                assert!(paste.starts_with(b"\x1b[200~"));
+                assert!(paste.ends_with(b"\x1b[201~"));
+                assert_eq!(cr, b"\r".to_vec());
+            }
+            other => panic!("expected PasteThenCr, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn terminal_submit_chunks_keeps_cr_out_of_the_paste_burst() {
         // Root-cause guard: the submit CR must NOT ride in the same byte burst as
         // the bracketed-paste body. Modern agent TUIs (claude/codex/gemini) use
         // paste-burst detection and SUPPRESS auto-submit for a CR that arrives in
         // the same read() as the paste-end marker — the requirement text would
         // then sit unsubmitted in the input box (the reported bug). The CR is
-        // therefore returned as a SEPARATE chunk, written after a beat.
-        let (paste, cr) = terminal_submit_chunks("line one\nline two");
-        assert!(paste.starts_with(b"\x1b[200~"), "paste must open with ESC[200~");
-        assert!(paste.ends_with(b"\x1b[201~"), "paste must close with ESC[201~");
-        assert!(
-            paste.windows(8).any(|w| w == b"line one"),
-            "paste must contain the prompt body"
-        );
-        assert!(!paste.contains(&b'\r'), "the CR must never be inside the paste burst");
-        assert_eq!(cr, b"\r", "submit chunk must be a lone carriage return (a real Enter)");
+        // therefore returned as a SEPARATE chunk, written after a beat. Now backed
+        // by the shared encoder (`nomifun_terminal::encode_submit_chunks`).
+        use nomifun_terminal::{encode_submit_chunks, SubmitChunks};
+        match encode_submit_chunks("line one\nline two", true) {
+            SubmitChunks::PasteThenCr { paste, cr } => {
+                assert!(paste.starts_with(b"\x1b[200~"), "paste must open with ESC[200~");
+                assert!(paste.ends_with(b"\x1b[201~"), "paste must close with ESC[201~");
+                assert!(
+                    paste.windows(8).any(|w| w == b"line one"),
+                    "paste must contain the prompt body"
+                );
+                assert!(!paste.contains(&b'\r'), "the CR must never be inside the paste burst");
+                assert_eq!(cr, b"\r", "submit chunk must be a lone carriage return (a real Enter)");
+            }
+            other => panic!("expected PasteThenCr for a multi-line agent-TUI prompt, got {other:?}"),
+        }
     }
 
     #[derive(Default)]

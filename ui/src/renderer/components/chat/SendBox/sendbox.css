@@ -169,6 +169,67 @@
   color: var(--text-primary) !important;
 }
 
+.sendbox-tools .sendbox-cluster-pill,
+.sendbox-tools .sendbox-cluster-pill:hover,
+.sendbox-tools .sendbox-cluster-pill:active,
+.sendbox-tools .sendbox-cluster-pill:focus,
+.sendbox-tools .sendbox-cluster-pill:focus-visible,
+.sendbox-actions .sendbox-cluster-pill,
+.sendbox-actions .sendbox-cluster-pill:hover,
+.sendbox-actions .sendbox-cluster-pill:active,
+.sendbox-actions .sendbox-cluster-pill:focus,
+.sendbox-actions .sendbox-cluster-pill:focus-visible {
+  position: relative !important;
+  width: 28px !important;
+  min-width: 28px !important;
+  height: 28px !important;
+  padding: 0 !important;
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  color: var(--text-secondary) !important;
+  flex-shrink: 0 !important;
+}
+
+.sendbox-tools .sendbox-cluster-pill:hover,
+.sendbox-tools .sendbox-cluster-pill:active,
+.sendbox-tools .sendbox-cluster-pill:focus-visible,
+.sendbox-actions .sendbox-cluster-pill:hover,
+.sendbox-actions .sendbox-cluster-pill:active,
+.sendbox-actions .sendbox-cluster-pill:focus-visible {
+  background: color-mix(in srgb, var(--color-fill-2) 78%, transparent) !important;
+  color: var(--text-primary) !important;
+}
+
+.sendbox-tools .sendbox-cluster-pill--active,
+.sendbox-tools .sendbox-cluster-pill--active:hover,
+.sendbox-tools .sendbox-cluster-pill--active:active,
+.sendbox-tools .sendbox-cluster-pill--active:focus,
+.sendbox-tools .sendbox-cluster-pill--active:focus-visible,
+.sendbox-actions .sendbox-cluster-pill--active,
+.sendbox-actions .sendbox-cluster-pill--active:hover,
+.sendbox-actions .sendbox-cluster-pill--active:active,
+.sendbox-actions .sendbox-cluster-pill--active:focus,
+.sendbox-actions .sendbox-cluster-pill--active:focus-visible {
+  background: color-mix(in srgb, rgb(var(--primary-6)) 10%, transparent) !important;
+  color: rgb(var(--primary-6)) !important;
+}
+
+.sendbox-cluster-pill__dot {
+  position: absolute;
+  right: 5px;
+  top: 5px;
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: rgb(var(--primary-6));
+  box-shadow: 0 0 0 2px var(--color-bg-1);
+}
+
+[data-theme='dark'] .sendbox-cluster-pill__dot {
+  box-shadow: 0 0 0 2px var(--color-bg-2);
+}
+
 .speech-input-control {
   display: inline-flex;
   align-items: center;

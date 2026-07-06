@@ -1,11 +1,11 @@
 import type { TMessage } from '@/common/chat/chatLib';
 import type { TChatConversation } from '@/common/config/storage';
 
-const INVALID_FILENAME_CHARS_RE = /[<>:"/\\|?*]/g;
+const INVALID_FILENAME_CHARS_RE = /[<>:"/\\|?*\u0000-\u001F]+/g;
 const padTimestampPart = (value: number): string => String(value).padStart(2, '0');
 
 export const sanitizeFileName = (name: string): string => {
-  const cleaned = name.replace(INVALID_FILENAME_CHARS_RE, '_').trim();
+  const cleaned = name.replace(INVALID_FILENAME_CHARS_RE, '_').trim().replace(/[. ]+$/g, '');
   return (cleaned || 'conversation').slice(0, 80);
 };
 

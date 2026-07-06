@@ -12,6 +12,7 @@ import { Card, Tag } from '@arco-design/web-react';
 import { createTwoFilesPatch } from 'diff';
 import React, { useMemo } from 'react';
 import MarkdownView from '@renderer/components/Markdown';
+import { MESSAGE_BODY_FONT_SIZE, MESSAGE_BODY_LINE_HEIGHT } from '../typography';
 
 const StatusTag: React.FC<{ status: string }> = ({ status }) => {
   const getTagProps = () => {
@@ -71,7 +72,9 @@ const ContentView: React.FC<{ content: NonNullable<IMessageAcpToolCall['content'
       <div className='mt-3'>
         <div className='bg-1 p-3 rounded border overflow-hidden'>
           <div className='overflow-x-auto break-words'>
-            <MarkdownView>{content.content.text}</MarkdownView>
+            <MarkdownView fontSize={MESSAGE_BODY_FONT_SIZE} lineHeight={MESSAGE_BODY_LINE_HEIGHT}>
+              {content.content.text}
+            </MarkdownView>
           </div>
         </div>
       </div>
@@ -113,7 +116,9 @@ const MessageAcpToolCall: React.FC<{ message: IMessageAcpToolCall }> = ({ messag
           {rawInput && (
             <div className='text-sm'>
               {typeof rawInput === 'string' ? (
-                <MarkdownView>{`\`\`\`\n${rawInput}\n\`\`\``}</MarkdownView>
+                <MarkdownView fontSize={MESSAGE_BODY_FONT_SIZE} lineHeight={MESSAGE_BODY_LINE_HEIGHT}>
+                  {`\`\`\`\n${rawInput}\n\`\`\``}
+                </MarkdownView>
               ) : (
                 <pre className='bg-1 p-2 rounded text-xs overflow-x-auto'>{JSON.stringify(rawInput, null, 2)}</pre>
               )}

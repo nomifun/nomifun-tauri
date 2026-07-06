@@ -11,10 +11,13 @@
     "delete": "删除",
     "deleteConfirm": "确认删除该知识库？",
     "deleteFileConfirm": "确认删除该文档？",
+    "deleteFolderOk": "目录已删除",
     "deleteOk": "已删除",
     "deleteWithFiles": "同时删除目录中的文件",
     "edit": "编辑",
     "openFolder": "打开目录",
+    "rename": "重命名",
+    "renameOk": "已重命名",
     "save": "保存",
     "saveOk": "已保存",
     "viewDetail": "查看详情"
@@ -447,6 +450,12 @@
     "modalTitle": "管理标签",
     "renameFailed": "重命名标签失败",
     "renameHint": "点击重命名"
+  },
+  "renamePlaceholder": "输入新的名称",
+  "renameTitle": "重命名",
+  "tree": {
+    "deleteFolderTitle": "确认删除目录？",
+    "deleteFolderWarning": "删除目录“{{name}}”会一并清空其下所有文档和子目录，无法撤销。"
   },
   "title": "知识库"
 }

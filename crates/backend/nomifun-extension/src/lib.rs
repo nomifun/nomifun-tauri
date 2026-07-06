@@ -55,6 +55,7 @@ pub use skill_service::{
     link_workspace_skills, list_available_skills, list_builtin_auto_skills, materialize_skills_for_agent,
     read_builtin_rule, read_builtin_skill, read_skill_info, resolve_skill_paths, scan_for_skills,
 };
+pub use skill_service::{builtin_skills_corpus_fingerprint, builtin_skills_materialize_version};
 pub use skill_service::{
     delete_assistant_rule, delete_assistant_skill, read_assistant_rule, read_assistant_skill, write_assistant_rule,
     write_assistant_skill,

@@ -311,8 +311,8 @@ impl IdmmService {
         let mut s = IdmmSettings::default();
         for r in rows {
             match r.key.as_str() {
-                PREF_BACKUP_PROVIDER => s.backup_provider_id = Some(r.value),
-                PREF_BACKUP_MODEL => s.backup_model = Some(r.value),
+                PREF_BACKUP_PROVIDER if !r.value.trim().is_empty() => s.backup_provider_id = Some(r.value),
+                PREF_BACKUP_MODEL if !r.value.trim().is_empty() => s.backup_model = Some(r.value),
                 PREF_DEFAULT_STEERING => s.default_steering_prompt = r.value,
                 _ => {}
             }
@@ -322,13 +322,35 @@ impl IdmmService {
 
     pub async fn set_settings(&self, settings: &IdmmSettings) -> Result<(), AppError> {
         let mut entries: Vec<(&str, &str)> = Vec::new();
-        if let Some(p) = &settings.backup_provider_id {
-            entries.push((PREF_BACKUP_PROVIDER, p.as_str()));
+        let provider = settings
+            .backup_provider_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+        let model = settings
+            .backup_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty());
+        let mut delete_keys: Vec<&str> = Vec::new();
+        if let Some(p) = provider {
+            entries.push((PREF_BACKUP_PROVIDER, p));
+        } else {
+            delete_keys.push(PREF_BACKUP_PROVIDER);
         }
-        if let Some(m) = &settings.backup_model {
-            entries.push((PREF_BACKUP_MODEL, m.as_str()));
+        if provider.is_some() {
+            if let Some(m) = model {
+                entries.push((PREF_BACKUP_MODEL, m));
+            } else {
+                delete_keys.push(PREF_BACKUP_MODEL);
+            }
+        } else {
+            delete_keys.push(PREF_BACKUP_MODEL);
         }
         entries.push((PREF_DEFAULT_STEERING, settings.default_steering_prompt.as_str()));
+        if !delete_keys.is_empty() {
+            self.client_prefs.delete_keys(&delete_keys).await?;
+        }
         self.client_prefs.upsert_batch(&entries).await?;
         Ok(())
     }

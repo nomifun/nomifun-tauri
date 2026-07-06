@@ -54,7 +54,7 @@ High-energy editorial design with light grey background and bold neon green bloc
 
 ## Reference Script
 
-Complete build script available in `build.py` (Python with officecli).
+No build script is packaged; use `style.md` as the design reference for this style.
 
 **Recommended slides to read for core techniques**:
 

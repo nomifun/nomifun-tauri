@@ -145,6 +145,19 @@ pub async fn build_companion_system_prompt(
          nomi_knowledge_set_binding 把库绑定到目标会话/终端/你自己（kind=\"companion\"）。绑定变更在目标下次任务启动时生效。\n\
          - 分工边界：全局记忆（nomi_memory_*）只放轻量的个人事实与偏好；知识库放成体系、可检索的领域资料。闲聊琐事不要建库。",
     );
+    // 终端操作能力（本地会话；远程 IM 走 PROFILE_LITE，无 terminal 域，不注入）。
+    if !remote {
+        system.push_str(
+            "\n\n## 操作终端会话\n\
+             主人电脑上还有「终端会话」(PTY，跑 shell 或 claude/codex/gemini 等 CLI)，你可以直接驱动：\n\
+             - nomi_list_terminals 看有哪些终端及状态(running/exited)；nomi_create_terminal 新建(preset: shell|claude|codex|gemini)。\n\
+             - nomi_terminal_send(id, text) 把命令或一段话发进去并【直接执行】——不用自己补回车、不用 base64，agent CLI 的粘贴提交也已处理好；\
+             要等它跑完并拿结果时带 wait=true(可选 timeout_secs)，会回执 settle_reason 与输出尾巴。\n\
+             - nomi_terminal_read_output(id) 读终端最近输出(已去除控制符)，用来查看命令结果或排查。\n\
+             - 目标终端已退出(exited)时先 nomi_terminal_relaunch 再发送；kill/delete 这类破坏性操作会要你确认后再做。\n\
+             主人在终端页能实时看到你的输入与执行，放心大胆地用。",
+        );
+    }
     // 智能编排能力提示（本地会话且开关开启时）：让伙伴把复杂大任务拆给隔离子 agent，
     // 自己只调度+汇总，保持对话上下文清爽（与会话归档协同）。远程 IM 不注入（工具对 Remote 硬拒）。
     if smart_orchestration && !remote {
@@ -1077,6 +1090,22 @@ mod tests {
         // On + remote → still no nudge (orchestration tools deny Remote).
         let remote = build_companion_system_prompt(&store, &profile, Some("telegram"), true).await;
         assert!(!remote.contains("调度子 agent"), "remote must never get the orchestration nudge");
+    }
+
+    #[tokio::test]
+    async fn local_prompt_teaches_terminal_tools_remote_does_not() {
+        // Local companion threads carry the terminal domain (nomi_terminal_*),
+        // so their prompt must teach driving PTY sessions. Remote (IM) sessions
+        // run PROFILE_LITE with no terminal domain, so they must NOT be taught
+        // the terminal tools (would advertise capabilities that hard-deny).
+        let store = CompanionStore::open_memory().await.unwrap();
+        let profile = CompanionProfileConfig::new("毛球", "ink");
+        let local = build_companion_system_prompt(&store, &profile, None, false).await;
+        assert!(local.contains("nomi_terminal_send"), "local prompt must teach terminal send");
+        assert!(local.contains("nomi_terminal_read_output"));
+
+        let remote = build_companion_system_prompt(&store, &profile, Some("wecom"), false).await;
+        assert!(!remote.contains("nomi_terminal_send"), "remote (IM) prompt must not teach terminal tools");
     }
 
     #[tokio::test]

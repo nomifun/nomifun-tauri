@@ -1,0 +1,7 @@
+# Temporarily disable rustfmt for this workspace.
+#
+# The workspace is large and currently has no pinned rustfmt/toolchain policy.
+# Running bare `cargo fmt` at the repository root can rewrite hundreds of Rust
+# files and hide real code changes in review. Remove this file, or set the
+# value to `false`, when the team is ready to re-enable formatting deliberately.
+disable_all_formatting = true

@@ -5,7 +5,9 @@
  */
 
 import { ipcBridge } from '@/common';
+import { configService } from '@/common/config/configService';
 import type { IMcpServer } from '@/common/config/storage';
+import type { TModelRange, TModelRef } from '@/common/types/orchestrator/orchestratorTypes';
 import { resolveLocaleKey } from '@/common/utils';
 
 import { useInputFocusRing } from '@/renderer/hooks/chat/useInputFocusRing';
@@ -20,6 +22,9 @@ import { AgentPillBarSkeleton } from './components/GuidSkeleton';
 import GuidActionRow from './components/GuidActionRow';
 import GuidCompanionPosterPreview from './components/GuidCompanionPosterPreview';
 import GuidInputCard from './components/GuidInputCard';
+import GuidClusterApprovalSelector from './components/GuidClusterApprovalSelector';
+import type { GuidClusterApprovalMode } from './components/GuidClusterApprovalSelector';
+import GuidCollaboratorSelector from './components/GuidCollaboratorSelector';
 import GuidModelSelector from './components/GuidModelSelector';
 import GuidResourceCards from './components/GuidResourceCards';
 import MentionDropdown, { MentionSelectorBadge } from './components/MentionDropdown';
@@ -74,6 +79,10 @@ const GuidPage: React.FC = () => {
   // 落 agent_cluster_mode=true——主 agent 对每个任务刻意评估是否开多 agent 集群，
   // 太简单则先向用户说明使用简单模式的原因。仅 nomi 主 agent 路径消费。
   const [clusterMode, setClusterMode] = useState(false);
+  const [clusterApprovalMode, setClusterApprovalMode] = useState<GuidClusterApprovalMode>('auto');
+  const [orchestrationCollaborators, setOrchestrationCollaborators] = useState<TModelRef[]>(
+    () => configService.get('nomi.orchestrationCollaborators') ?? []
+  );
 
   // --- Skills state ---
   // All available skills (builtin auto-injected + user-imported custom) merged
@@ -139,6 +148,30 @@ const GuidPage: React.FC = () => {
   // Only nomi uses this provider-based model picker now (Gemini runs as a
   // regular ACP backend with its own model selector).
   const modelSelection = useGuidModelSelection('nomi');
+  const mainModelRef = useMemo<TModelRef | null>(
+    () =>
+      modelSelection.current_model
+        ? { provider_id: modelSelection.current_model.id, model: modelSelection.current_model.use_model }
+        : null,
+    [modelSelection.current_model?.id, modelSelection.current_model?.use_model]
+  );
+  const handleOrchestrationCollaboratorsChange = useCallback((next: TModelRef[]) => {
+    setOrchestrationCollaborators(next);
+    void configService.set('nomi.orchestrationCollaborators', next).catch((error) => {
+      console.error('[GuidPage] Failed to save orchestration collaborators:', error);
+    });
+  }, []);
+  const orchestratorModelRange = useMemo<TModelRange | undefined>(() => {
+    if (!mainModelRef) return undefined;
+    const models = [
+      mainModelRef,
+      ...orchestrationCollaborators.filter(
+        (item) => item.provider_id !== mainModelRef.provider_id || item.model !== mainModelRef.model
+      ),
+    ];
+    return { mode: 'range', models };
+  }, [mainModelRef, orchestrationCollaborators]);
+  const orchestratorApprovalMode = clusterApprovalMode;
 
   const navState = location.state as { resetAssistant?: boolean; selectedAgentKey?: string } | null;
   const resetAssistantRequested = navState?.resetAssistant === true;
@@ -205,6 +238,8 @@ const GuidPage: React.FC = () => {
     applyAdvancedConfig: advancedConfig.applyToConversation,
     autoWork: advancedConfig.autoWork,
     clusterMode,
+    orchestratorModelRange,
+    orchestratorApprovalMode,
 
     // Mention state reset
     setMentionOpen: mention.setMentionOpen,
@@ -547,6 +582,17 @@ const GuidPage: React.FC = () => {
       setSelectedAcpModel={agentSelection.setSelectedAcpModel}
     />
   );
+  const collaboratorSelectorNode = (
+    <GuidCollaboratorSelector
+      value={orchestrationCollaborators}
+      onChange={handleOrchestrationCollaboratorsChange}
+      mainModel={mainModelRef}
+      className='nomi-sendbox-model-btn'
+    />
+  );
+  const clusterApprovalSelectorNode = (
+    <GuidClusterApprovalSelector value={clusterApprovalMode} onChange={setClusterApprovalMode} />
+  );
 
   // Advanced drafts — the same controls as the conversation header, in draft
   // mode (collected locally, applied right after the conversation is created).
@@ -583,6 +629,8 @@ const GuidPage: React.FC = () => {
       files={guidInput.files}
       onFilesUploaded={guidInput.handleFilesUploaded}
       modelSelectorNode={modelSelectorNode}
+      collaboratorSelectorNode={clusterMode ? collaboratorSelectorNode : undefined}
+      clusterApprovalSelectorNode={clusterMode ? clusterApprovalSelectorNode : undefined}
       selectedAgent={agentSelection.selectedAgent}
       effectiveModeAgent={agentSelection.currentEffectiveAgentInfo.agent_type}
       selectedMode={agentSelection.selectedMode}

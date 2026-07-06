@@ -16,10 +16,11 @@ pub(super) async fn materialize_builtin_skills(data_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
+    let materialize_version = nomifun_extension::builtin_skills_materialize_version(env!("CARGO_PKG_VERSION"));
     nomifun_extension::materialize_if_needed(
         data_dir,
         nomifun_extension::builtin_skills_corpus(),
-        env!("CARGO_PKG_VERSION"),
+        &materialize_version,
     )
     .await
     .map_err(|e| anyhow::anyhow!("Failed to materialize builtin skills: {e}"))?;

@@ -6,15 +6,16 @@
 
 import React, { Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Left, Loading, Right } from '@icon-park/react';
+import { EveryUser, Help, Left, Loading, Right } from '@icon-park/react';
 import { Modal, Spin } from '@arco-design/web-react';
 import { ipcBridge } from '@/common';
-import type { TReplanRequest } from '@/common/types/orchestrator/orchestratorTypes';
+import type { TReplanRequest, TRunTask } from '@/common/types/orchestrator/orchestratorTypes';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 import OrchestratorComposer, { type AutonomyLevel, type ComposerModelRange } from '@/renderer/pages/orchestrator/OrchestratorComposer';
 import { useModelRange } from '@/renderer/pages/orchestrator/useModelRange';
 import { RunControls } from '@/renderer/pages/orchestrator/RunDetail/RunControls';
 import { STATUS_META } from '@/renderer/pages/orchestrator/RunDetail/runStatusMeta';
+import { taskStatusMeta } from '@/renderer/pages/orchestrator/RunDetail/nodes/TaskNode';
 import { useOrchestration } from './OrchestrationContext';
 import styles from './orchestrationTopPanel.module.css';
 
@@ -26,6 +27,18 @@ const DagCanvas = React.lazy(() => import('@/renderer/pages/orchestrator/RunDeta
 
 /** Fallback color for an unknown run status — neutral tertiary text var. */
 const STATUS_FALLBACK_COLOR = 'var(--color-text-3)';
+
+/** Planning phase key → i18n key; mirrors DagCanvas and the decision feed. */
+const PHASE_I18N: Record<string, string> = {
+  planning_started: 'orchestrator.run.thinking.phase.planningStarted',
+  decomposing: 'orchestrator.run.thinking.phase.decomposing',
+  assigning: 'orchestrator.run.thinking.phase.assigning',
+  plan_ready: 'orchestrator.run.thinking.phase.planReady',
+};
+
+function isSettledDone(status: string): boolean {
+  return status === 'done' || status === 'completed';
+}
 
 /** Resizable width of the canvas pane (px), persisted across sessions. */
 const CANVAS_WIDTH_KEY = 'nomifun:orchestration-canvas-width';
@@ -142,6 +155,20 @@ const OrchestrationTopPanel: React.FC = () => {
 
   const { runId, detail, leadThinking, loading, refetch, projectTask, projectedTaskId } = orchestration;
 
+  const openTask = useCallback(
+    (task: TRunTask) => {
+      if (!detail || !runId) return;
+      projectTask({
+        task,
+        assignment: detail.assignments.find((a) => a.task_id === task.id) ?? null,
+        fleetMembers: detail.fleet_members,
+        runId,
+        refetch,
+      });
+    },
+    [detail, projectTask, refetch, runId]
+  );
+
   const openReplan = useCallback(() => {
     const goal = orchestration.detail?.run.goal ?? '';
     setReplanGoal(goal);
@@ -200,7 +227,23 @@ const OrchestrationTopPanel: React.FC = () => {
   const panelTitle = t('conversation.orchestration.panelTitle', { defaultValue: '编排画布' });
   // In-flight worker count (from the polled `runs.get` task list) — feeds the
   // RunControls「进行中 N · 排空中」draining badge.
-  const inFlightCount = detail?.tasks.filter((tk) => tk.status === 'running').length ?? 0;
+  const tasks = detail?.tasks ?? [];
+  const inFlightCount = tasks.filter((tk) => tk.status === 'running').length;
+  const questionTasks = tasks.filter((task) => task.status === 'needs_review' && task.pending_question?.trim());
+  const doneCount = tasks.filter((task) => isSettledDone(task.status)).length;
+  const planning = tasks.length === 0;
+  const phaseKeys = leadThinking.phaseKeys;
+  const latestPhase = phaseKeys.length > 0 ? phaseKeys[phaseKeys.length - 1] : null;
+  const progressText = planning
+    ? (latestPhase && PHASE_I18N[latestPhase]
+        ? t(PHASE_I18N[latestPhase])
+        : t('conversation.orchestration.planning', { defaultValue: '规划中…' }))
+    : t('conversation.cluster.progress', {
+        done: doneCount,
+        total: tasks.length,
+        defaultValue: '{{done}}/{{total}} 节点已交付',
+      });
+  const showProgressSummary = questionTasks.length > 0 || tasks.length > 0 || (planning && phaseKeys.length > 0);
 
   // ── Collapsed: thin vertical strip on the right edge ──────────────────────────
   if (collapsed) {
@@ -289,6 +332,84 @@ const OrchestrationTopPanel: React.FC = () => {
           <RunControls runId={runId} status={status} inFlightCount={inFlightCount} refetch={refetch} onReplan={openReplan} />
         </div>
       </div>
+
+      {showProgressSummary && (
+        <div className={styles.canvasProgress} data-testid='orchestration-canvas-progress'>
+          <div className={styles.canvasProgressHeader}>
+            <EveryUser theme='outline' size='14' strokeWidth={3} className={styles.canvasProgressIcon} />
+            <span className={styles.canvasProgressTitle}>
+              {t('conversation.cluster.stripTitle', { defaultValue: 'agent 集群' })}
+            </span>
+            <span className={styles.canvasProgressText}>{progressText}</span>
+          </div>
+
+          {questionTasks.map((task) => (
+            <div
+              key={task.id}
+              role='button'
+              tabIndex={0}
+              className={styles.questionBanner}
+              onClick={() => openTask(task)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  openTask(task);
+                }
+              }}
+            >
+              <span className={styles.questionPulse}>
+                <Help theme='filled' size='14' />
+              </span>
+              <span className={styles.questionText}>
+                {t('conversation.cluster.questionBanner', {
+                  title: task.title,
+                  defaultValue: '节点「{{title}}」有决策问题待你作答',
+                })}
+                <b className={styles.questionPreview}>{task.pending_question}</b>
+              </span>
+              <span className={styles.questionCta}>{t('conversation.cluster.questionCta', { defaultValue: '进入作答 →' })}</span>
+            </div>
+          ))}
+
+          {planning && phaseKeys.length > 0 && (
+            <div className={styles.phaseList} aria-live='polite'>
+              {phaseKeys.slice(-3).map((key) => (
+                <span key={key} className={styles.phaseLine}>
+                  {PHASE_I18N[key] ? t(PHASE_I18N[key]) : key}
+                </span>
+              ))}
+            </div>
+          )}
+
+          {tasks.length > 0 && (
+            <div className={`${styles.chips} nomi-roster-scroll`}>
+              {tasks.map((task) => {
+                const meta = taskStatusMeta(task.status);
+                const isActive = projectedTaskId === task.id;
+                const hasQuestion = task.status === 'needs_review' && Boolean(task.pending_question?.trim());
+                return (
+                  <button
+                    key={task.id}
+                    type='button'
+                    className={styles.chip}
+                    data-active={isActive ? 'true' : undefined}
+                    data-question={hasQuestion ? 'true' : undefined}
+                    title={`${task.title} · ${task.status}`}
+                    onClick={() => openTask(task)}
+                  >
+                    <span
+                      className={`${styles.chipDot} ${meta.pulse ? styles.chipDotPulse : ''}`}
+                      style={{ background: meta.color }}
+                    />
+                    <span className={styles.chipTitle}>{task.title}</span>
+                    {hasQuestion && <Help theme='filled' size='11' className={styles.chipQuestion} />}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Body — fills the remaining column height; react-flow lays out + draws its
           own minimap. */}

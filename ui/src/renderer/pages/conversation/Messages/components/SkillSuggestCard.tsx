@@ -13,6 +13,7 @@ import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import MarkdownView from '@renderer/components/Markdown';
 import type { SkillSuggestion } from '@renderer/utils/chat/skillSuggestParser';
+import { MESSAGE_BODY_FONT_SIZE, MESSAGE_BODY_LINE_HEIGHT } from '../typography';
 
 interface SkillSuggestCardProps {
   artifact_id: number;
@@ -86,7 +87,9 @@ const SkillSuggestCard: React.FC<SkillSuggestCardProps> = ({
       </div>
       {expanded && (
         <div className='mb-12px p-8px rd-4px bg-bg-3 max-h-240px overflow-y-auto text-12px'>
-          <MarkdownView codeStyle={CODE_STYLE}>{`\`\`\`markdown\n${suggestion.content}\n\`\`\``}</MarkdownView>
+          <MarkdownView codeStyle={CODE_STYLE} fontSize={MESSAGE_BODY_FONT_SIZE} lineHeight={MESSAGE_BODY_LINE_HEIGHT}>
+            {`\`\`\`markdown\n${suggestion.content}\n\`\`\``}
+          </MarkdownView>
         </div>
       )}
 

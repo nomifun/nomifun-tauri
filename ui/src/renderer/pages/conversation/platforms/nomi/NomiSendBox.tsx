@@ -14,8 +14,6 @@ import MobileActionSheet, {
   useAttachEntry,
 } from '@/renderer/components/chat/MobileActionSheet';
 import SendBox from '@/renderer/components/chat/SendBox';
-import ThoughtDisplay from '@/renderer/components/chat/ThoughtDisplay';
-import { useProcessingStartedAt } from '@/renderer/pages/conversation/platforms/useProcessingStartedAt';
 import FileAttachButton from '@/renderer/components/media/FileAttachButton';
 import FilePreview from '@/renderer/components/media/FilePreview';
 import HorizontalFileList from '@/renderer/components/media/HorizontalFileList';
@@ -44,12 +42,11 @@ import { emitter, useAddEventListener } from '@/renderer/utils/emitter';
 import { mergeFileSelectionItems } from '@/renderer/utils/file/fileSelection';
 import { buildDisplayMessage, collectSelectedFiles } from '@/renderer/utils/file/messageFiles';
 import type { AgentModeOption } from '@/renderer/utils/model/agentModes';
-import { Message, Tag, Tooltip } from '@arco-design/web-react';
-import { Brain, ChartHistogram, MagicHat, Shield, Time } from '@icon-park/react';
+import { Message, Tag } from '@arco-design/web-react';
+import { Brain, MagicHat, Shield } from '@icon-park/react';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { NomiMessageRuntime } from './useNomiMessage';
-import { formatTokenCount, formatTurnDuration } from './turnMetrics';
 import NomiModelSelector from './NomiModelSelector';
 import { ContextUsagePill } from './ContextUsagePill';
 import type { NomiModelSelection } from './useNomiModelSelection';
@@ -150,8 +147,11 @@ const NomiSendBox: React.FC<{
   const { checkAndUpdateTitle } = useAutoTitle();
   const { current_model } = modelSelection;
 
-  const { thought, running, hasHydratedRunningState, tokenUsage, setActiveMsgId, setWaitingResponse, resetState } =
-    turnActivity;
+  const { running, hasHydratedRunningState, tokenUsage, setActiveMsgId, setWaitingResponse, resetState } = turnActivity;
+  const hasContextUsage =
+    typeof tokenUsage?.context_window === 'number' &&
+    tokenUsage.context_window > 0 &&
+    typeof tokenUsage?.context_tokens === 'number';
 
   const { atPath, uploadFile, setAtPath, setUploadFile, content, setContent } = useSendBoxDraft(conversation_id);
 
@@ -196,7 +196,6 @@ const NomiSendBox: React.FC<{
   const removeMessagesFrom = useRemoveMessagesFrom();
   const { setSendBoxHandler } = usePreviewContext();
   const isBusy = running;
-  const processingStartedAt = useProcessingStartedAt(conversation_id, running);
 
   const setContentRef = useLatestRef(setContent);
   const contentRef = useLatestRef(content);
@@ -729,34 +728,12 @@ const NomiSendBox: React.FC<{
         onRemove={remove}
         onClear={clear}
       />
-      <ThoughtDisplay thought={thought} running={running} startedAt={processingStartedAt} onStop={handleStop} />
-
-      {!running && tokenUsage && (tokenUsage.total_tokens > 0 || (tokenUsage.elapsed_ms ?? 0) > 0) && (
-        <div
-          className='flex items-center justify-end gap-3 px-1 pb-1 text-[11px] text-3 select-none'
-          data-testid='nomi-turn-metrics'
-        >
-          {typeof tokenUsage.elapsed_ms === 'number' && tokenUsage.elapsed_ms > 0 && (
-            <Tooltip content={t('conversation.chat.turnMetrics.durationTooltip')} mini>
-              <span className='inline-flex items-center gap-1'>
-                <Time theme='outline' size='12' fill={iconColors.secondary} />
-                {formatTurnDuration(tokenUsage.elapsed_ms)}
-              </span>
-            </Tooltip>
-          )}
-          {tokenUsage.total_tokens > 0 && (
-            <Tooltip content={t('conversation.chat.turnMetrics.tokensTooltip')} mini>
-              <span className='inline-flex items-center gap-1'>
-                <ChartHistogram theme='outline' size='12' fill={iconColors.secondary} />
-                {formatTokenCount(tokenUsage.total_tokens)}
-              </span>
-            </Tooltip>
-          )}
-        </div>
-      )}
-
       <SendBox
         data-testid='nomi-sendbox'
+        showPinnedPlan
+        topRightTools={
+          hasContextUsage ? <ContextUsagePill used={tokenUsage?.context_tokens} max={tokenUsage?.context_window} /> : undefined
+        }
         onMobilePlusClick={isMobile ? () => setIsMobileSheetOpen(true) : undefined}
         value={content}
         onChange={handleContentChange}
@@ -793,7 +770,6 @@ const NomiSendBox: React.FC<{
         rightTools={
           hideModeSelector ? undefined : (
             <div className='flex items-center gap-2 min-w-0' data-testid='nomi-sendbox-config-group'>
-              <ContextUsagePill used={tokenUsage?.context_tokens} max={tokenUsage?.context_window} />
               <NomiModelSelector selection={modelSelection} className='nomi-sendbox-model-btn' />
               {collaboratorSelectorNode}
               {extraRightTools}

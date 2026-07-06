@@ -17,4 +17,4 @@ Modular rect grid with large sky-to-orange gradient circle as hero visual. Muted
 
 ## Reference Script
 
-Complete build script available in `build.py`.
+No build script is packaged; use `style.md` as the design reference for this style.

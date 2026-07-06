@@ -1,5 +1,5 @@
-pub mod bash;
 pub mod apply_patch;
+pub mod bash;
 pub mod edit;
 pub mod exec_command;
 pub mod file_cache;
@@ -16,16 +16,15 @@ pub mod registry;
 pub mod sandbox;
 pub mod tool_search;
 pub mod update_plan;
+pub mod worktree;
 pub mod write;
 pub mod write_stdin;
-pub mod worktree;
 
 /// Shared test-only helpers (path to the cross-platform `pty_test_helper` bin).
 #[cfg(test)]
 pub(crate) mod test_support;
 
-
-pub use output_truncation::{approx_token_count, truncate_middle, TruncationBudget};
+pub use output_truncation::{TruncationBudget, approx_token_count, truncate_middle};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -85,27 +84,83 @@ pub fn coerce_input_to_schema(schema: &JsonSchema, input: Value) -> Value {
     };
 
     for (key, prop_schema) in props {
-        let Some(expected) = prop_schema.get("type").and_then(Value::as_str) else {
-            continue;
-        };
-        if expected != "array" && expected != "object" {
+        let expected = schema_type_names(prop_schema);
+        if expected.iter().any(|t| *t == "string") {
             continue;
         }
         // Copy the string out (releasing the borrow) so the insert below can mutate `obj`.
         let Some(s) = obj.get(key).and_then(Value::as_str).map(str::to_owned) else {
             continue;
         };
-        if let Ok(parsed) = serde_json::from_str::<Value>(&s) {
-            let matches = (expected == "array" && parsed.is_array())
-                || (expected == "object" && parsed.is_object());
-            if matches {
-                obj.insert(key.clone(), parsed);
-            }
+        if let Some(coerced) = coerce_string_to_types(&s, &expected) {
+            obj.insert(key.clone(), coerced);
         }
     }
     input
 }
 
+fn schema_type_names(schema: &Value) -> Vec<&str> {
+    let mut types = Vec::new();
+    collect_schema_type_names(schema, &mut types);
+    types
+}
+
+fn collect_schema_type_names<'a>(schema: &'a Value, out: &mut Vec<&'a str>) {
+    match schema.get("type") {
+        Some(Value::String(s)) => out.push(s.as_str()),
+        Some(Value::Array(items)) => {
+            for item in items {
+                if let Some(s) = item.as_str() {
+                    out.push(s);
+                }
+            }
+        }
+        _ => {}
+    }
+    for key in ["oneOf", "anyOf"] {
+        if let Some(items) = schema.get(key).and_then(Value::as_array) {
+            for item in items {
+                collect_schema_type_names(item, out);
+            }
+        }
+    }
+}
+
+fn coerce_string_to_types(s: &str, expected: &[&str]) -> Option<Value> {
+    if expected.iter().any(|t| *t == "array" || *t == "object") {
+        if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+            if (expected.contains(&"array") && parsed.is_array())
+                || (expected.contains(&"object") && parsed.is_object())
+            {
+                return Some(parsed);
+            }
+        }
+    }
+
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if expected.contains(&"integer") {
+        if let Ok(n) = trimmed.parse::<i64>() {
+            return Some(Value::Number(n.into()));
+        }
+    }
+    if expected.contains(&"number") {
+        if let Ok(n) = trimmed.parse::<f64>() {
+            return serde_json::Number::from_f64(n).map(Value::Number);
+        }
+    }
+    if expected.contains(&"boolean") {
+        if trimmed.eq_ignore_ascii_case("true") {
+            return Some(Value::Bool(true));
+        }
+        if trimmed.eq_ignore_ascii_case("false") {
+            return Some(Value::Bool(false));
+        }
+    }
+    None
+}
 
 /// Write `content` to `file_path` atomically: write to a uniquely-named temp
 /// file in the same directory, then rename it over the target. Rename is atomic
@@ -248,7 +303,10 @@ mod tests {
         });
         let input = serde_json::json!({ "tasks": "[{\"name\":\"a\",\"prompt\":\"p\"}]" });
         let out = coerce_input_to_schema(&schema, input);
-        assert!(out["tasks"].is_array(), "stringified array must be parsed back");
+        assert!(
+            out["tasks"].is_array(),
+            "stringified array must be parsed back"
+        );
         assert_eq!(out["tasks"][0]["name"], "a");
         assert_eq!(out["tasks"][0]["prompt"], "p");
     }
@@ -259,6 +317,29 @@ mod tests {
         let out = coerce_input_to_schema(&schema, serde_json::json!({ "config": "{\"a\":1}" }));
         assert!(out["config"].is_object());
         assert_eq!(out["config"]["a"], 1);
+    }
+
+    #[test]
+    fn coerce_parses_stringified_scalar_properties() {
+        let schema = serde_json::json!({
+            "properties": {
+                "conversation_id": { "type": "integer" },
+                "limit": { "type": "integer" },
+                "timeout_secs": { "type": "number" },
+                "confirm": { "type": "boolean" }
+            }
+        });
+        let input = serde_json::json!({
+            "conversation_id": "8",
+            "limit": "50",
+            "timeout_secs": "1.5",
+            "confirm": "true"
+        });
+        let out = coerce_input_to_schema(&schema, input);
+        assert_eq!(out["conversation_id"], 8);
+        assert_eq!(out["limit"], 50);
+        assert_eq!(out["timeout_secs"], 1.5);
+        assert_eq!(out["confirm"], true);
     }
 
     #[test]
@@ -284,7 +365,10 @@ mod tests {
 
         // A string that parses to the WRONG shape (object where array expected) is left as-is.
         let obj_for_array = serde_json::json!({ "tasks": "{\"x\":1}" });
-        assert_eq!(coerce_input_to_schema(&schema, obj_for_array.clone()), obj_for_array);
+        assert_eq!(
+            coerce_input_to_schema(&schema, obj_for_array.clone()),
+            obj_for_array
+        );
     }
 
     #[test]

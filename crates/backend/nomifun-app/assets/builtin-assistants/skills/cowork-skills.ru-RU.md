@@ -126,15 +126,18 @@ sheet.getRow(1).fill = {
 await workbook.xlsx.writeFile('output.xlsx');
 ```
 
-### Рабочий процесс скриптов XLSX
+### Рабочий процесс OfficeCLI для XLSX
 
-Для пересчёта формул в существующих таблицах используйте скрипт recalc:
+Для существующих таблиц используйте встроенный навык `officecli-xlsx` и установленную команду `officecli`:
 
 ```bash
-# Recalculate all formulas in an Excel file using LibreOffice
-# This is useful after modifying cell values programmatically
-python skills/xlsx/recalc.py <input.xlsx> <output.xlsx>
+FILE="workbook.xlsx"
+officecli view "$FILE" outline
+officecli validate "$FILE"
+officecli view "$FILE" html
 ```
+
+Если требуется полный пересчёт формул, используйте LibreOffice или другой установленный инструмент, одобренный пользователем, и проверьте итоговую книгу перед передачей.
 
 **Быстрая справка по Python**:
 
@@ -236,32 +239,16 @@ slide.addChart(pptx.ChartType.bar, chartData, { x: 0.5, y: 3, w: 6, h: 3 });
 await pptx.writeFile('presentation.pptx');
 ```
 
-### Рабочий процесс скриптов PPTX
+### Рабочий процесс OfficeCLI для PPTX
 
-Для редактирования существующих презентаций или работы с шаблонами используйте скрипты PPTX:
+Для редактирования существующих презентаций или работы с шаблонами используйте встроенный навык `officecli-pptx` и сначала изучите структуру:
 
 ```bash
-# Unpack a presentation to access raw XML
-python skills/pptx/ooxml/scripts/unpack.py <input.pptx> <output_directory>
-
-# Extract text inventory from presentation (useful for template-based editing)
-python skills/pptx/scripts/inventory.py <input.pptx> <output.json>
-
-# Create thumbnail grid of all slides for visual analysis
-python skills/pptx/scripts/thumbnail.py <input.pptx> [output_prefix] [--cols N]
-
-# Rearrange slides by index sequence
-python skills/pptx/scripts/rearrange.py <template.pptx> <output.pptx> <indices>
-# Example: python skills/pptx/scripts/rearrange.py template.pptx output.pptx 0,34,34,50,52
-
-# Apply text replacements from JSON
-python skills/pptx/scripts/replace.py <input.pptx> <replacements.json> <output.pptx>
-
-# Pack modified XML back to PPTX
-python skills/pptx/ooxml/scripts/pack.py <input_directory> <output.pptx>
-
-# Validate PPTX structure
-python skills/pptx/ooxml/scripts/validate.py <file.pptx>
+FILE="presentation.pptx"
+officecli view "$FILE" outline
+officecli view "$FILE" text
+officecli validate "$FILE"
+officecli view "$FILE" html
 ```
 
 **Лучшие практики**:
@@ -546,20 +533,14 @@ await fs.writeFile('document.docx', buffer);
 
 ### Рабочий процесс скриптов DOCX
 
-Для редактирования существующих документов или работы с отслеживаемыми изменениями используйте скрипты DOCX:
+Для редактирования существующих документов или работы с отслеживаемыми изменениями используйте встроенный навык `officecli-docx` и сначала изучите структуру:
 
 ```bash
-# Convert document to markdown (preserves tracked changes)
-pandoc --track-changes=all <input.docx> -o output.md
-
-# Unpack a document to access raw XML
-python skills/docx/ooxml/scripts/unpack.py <input.docx> <output_directory>
-
-# Pack modified XML back to DOCX
-python skills/docx/ooxml/scripts/pack.py <input_directory> <output.docx>
-
-# Validate DOCX structure
-python skills/docx/ooxml/scripts/validate.py <file.docx>
+FILE="document.docx"
+officecli view "$FILE" outline
+officecli view "$FILE" text
+officecli validate "$FILE"
+officecli view "$FILE" html
 ```
 
 **Библиотека Python для отслеживаемых изменений**:

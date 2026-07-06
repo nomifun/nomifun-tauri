@@ -12,8 +12,6 @@ import MobileActionSheet, {
   useAttachEntry,
 } from '@/renderer/components/chat/MobileActionSheet';
 import SendBox from '@/renderer/components/chat/SendBox';
-import ThoughtDisplay from '@/renderer/components/chat/ThoughtDisplay';
-import { useProcessingStartedAt } from '@/renderer/pages/conversation/platforms/useProcessingStartedAt';
 import FileAttachButton from '@/renderer/components/media/FileAttachButton';
 import FilePreview from '@/renderer/components/media/FilePreview';
 import HorizontalFileList from '@/renderer/components/media/HorizontalFileList';
@@ -105,14 +103,8 @@ const AcpSendBox: React.FC<{
     aiProcessing,
     setAiProcessing,
     resetState,
-    hasThinkingMessage,
     slashCommands,
-    processingStartedAt: turnProcessingStartedAt,
   } = messageState;
-  // ThoughtDisplay only stands in while there is no inline thinking bubble yet.
-  const thoughtRunning = aiProcessing && !hasThinkingMessage;
-  const hydratedProcessingStartedAt = useProcessingStartedAt(conversation_id, thoughtRunning);
-  const processingStartedAt = turnProcessingStartedAt ?? hydratedProcessingStartedAt;
   const { t } = useTranslation();
   const showModeSelector = true;
   const { checkAndUpdateTitle } = useAutoTitle();
@@ -577,9 +569,8 @@ Please check your local CLI tool authentication status`,
         onRemove={remove}
         onClear={clear}
       />
-      <ThoughtDisplay running={thoughtRunning} startedAt={processingStartedAt} onStop={handleStop} />
-
       <SendBox
+        showPinnedPlan
         onMobilePlusClick={isMobile ? () => setIsMobileSheetOpen(true) : undefined}
         value={content}
         onChange={handleContentChange}

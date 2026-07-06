@@ -17,4 +17,4 @@ Combines Bauhaus color-blocking + gradient ray-fan + mosaic tiles. Deep indigo b
 
 ## Reference Script
 
-Complete build script available in `build.py`.
+No build script is packaged; use `style.md` as the design reference for this style.

@@ -82,10 +82,7 @@ pub enum LaunchTransport {
 ///
 /// `force_headless` 由调用方按 `display_available()` 与 `LaunchConfig::headful` 算好后传入，
 /// 使本函数保持纯逻辑、无平台/环境探测，单测可在任意宿主断言。
-pub fn build_chrome_args(
-    user_data_dir: &Path,
-    force_headless: bool,
-) -> Vec<String> {
+pub fn build_chrome_args(user_data_dir: &Path, force_headless: bool) -> Vec<String> {
     let mut args: Vec<String> = Vec::new();
 
     // CDP 运输开关：Unix 用 `--remote-debugging-pipe`（fd3/fd4；浏览器在父死/管道 EOF 时自退,
@@ -146,12 +143,12 @@ pub fn build_chrome_args(
 /// 返回 `Err(Other)` 给出明确诊断（行数不足 / 端口非数字）；不 panic。
 pub fn parse_devtools_active_port(content: &str) -> Result<(u16, String), BrowserError> {
     let mut lines = content.lines();
-    let port_line = lines.next().ok_or_else(|| {
-        BrowserError::Other("DevToolsActivePort empty (no port line)".into())
-    })?;
-    let ws_path = lines.next().ok_or_else(|| {
-        BrowserError::Other("DevToolsActivePort missing ws-path line".into())
-    })?;
+    let port_line = lines
+        .next()
+        .ok_or_else(|| BrowserError::Other("DevToolsActivePort empty (no port line)".into()))?;
+    let ws_path = lines
+        .next()
+        .ok_or_else(|| BrowserError::Other("DevToolsActivePort missing ws-path line".into()))?;
 
     let port: u16 = port_line.trim().parse().map_err(|e| {
         BrowserError::Other(format!(
@@ -232,7 +229,23 @@ pub async fn launch_chrome(
     }
     #[cfg(windows)]
     {
-        launch_chrome_ws(config, &args).await
+        match launch_chrome_ws(config, &args).await {
+            Ok(v) => Ok(v),
+            Err(first) if should_retry_with_startup_page(&first, &args) => {
+                tracing::warn!(
+                    target: "nomi_browser_engine::launch",
+                    error = %first,
+                    "chrome exited before DevTools port was ready; retrying with an explicit startup page"
+                );
+                let fallback_args = chrome_args_with_startup_page(&args);
+                launch_chrome_ws(config, &fallback_args).await.map_err(|second| {
+                    BrowserError::Other(format!(
+                        "chrome launch retry with startup page failed: {second}; first no-startup-window launch failed: {first}"
+                    ))
+                })
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -259,7 +272,10 @@ async fn launch_chrome_pipe(
         .inherit_fds(vec![(3, chrome_cmd_read), (4, chrome_resp_write)]);
 
     let mut child = builder.spawn().map_err(|e| {
-        BrowserError::Other(format!("spawn chrome {}: {e}", config.chrome_path.display()))
+        BrowserError::Other(format!(
+            "spawn chrome {}: {e}",
+            config.chrome_path.display()
+        ))
     })?;
 
     // 快速失败：给 chrome 一小会儿；若立即退出（坏开关 / 缺依赖）立即报错,不必等首条 CDP 命令超时。
@@ -340,7 +356,10 @@ async fn launch_chrome_ws(
         .stderr(std::process::Stdio::null());
 
     let mut child = builder.spawn().map_err(|e| {
-        BrowserError::Other(format!("spawn chrome {}: {e}", config.chrome_path.display()))
+        BrowserError::Other(format!(
+            "spawn chrome {}: {e}",
+            config.chrome_path.display()
+        ))
     })?;
 
     // 轮询 DevToolsActivePort 直到出现且可解析，或 child 提前退出，或超时。
@@ -370,6 +389,27 @@ async fn launch_chrome_ws(
         }
         tokio::time::sleep(PORT_FILE_POLL_INTERVAL).await;
     }
+}
+
+#[cfg(windows)]
+fn should_retry_with_startup_page(error: &BrowserError, args: &[String]) -> bool {
+    args.iter().any(|a| a == "--no-startup-window")
+        && matches!(
+            error,
+            BrowserError::Other(message)
+                if message.contains("chrome exited before DevTools port was ready")
+        )
+}
+
+#[cfg(windows)]
+fn chrome_args_with_startup_page(args: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != "--no-startup-window")
+        .cloned()
+        .collect();
+    out.push("about:blank".into());
+    out
 }
 
 #[cfg(test)]
@@ -410,6 +450,25 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_retry_args_replace_no_startup_window_with_startup_page() {
+        let args = vec![
+            "--remote-debugging-port=0".to_string(),
+            "--no-startup-window".to_string(),
+            "--disable-background-networking".to_string(),
+        ];
+        let fallback = chrome_args_with_startup_page(&args);
+        assert!(!fallback.iter().any(|a| a == "--no-startup-window"));
+        assert!(fallback.iter().any(|a| a == "about:blank"));
+        assert!(should_retry_with_startup_page(
+            &BrowserError::Other(
+                "chrome exited before DevTools port was ready (status exit code: 0)".into()
+            ),
+            &args
+        ));
+    }
+
     #[test]
     fn headless_flag_only_when_forced() {
         let dir = Path::new("/tmp/x");
@@ -437,7 +496,10 @@ mod tests {
         // TODO(verify-linux): 当前无条件回退 --no-sandbox（偏保守）；容器探测见
         // docs/superpowers/specs/browser-use/PLATFORM-VERIFICATION.md。
         let args = build_chrome_args(Path::new("/tmp/x"), true);
-        assert!(args.iter().any(|a| a == "--no-sandbox"), "linux must add --no-sandbox: {args:?}");
+        assert!(
+            args.iter().any(|a| a == "--no-sandbox"),
+            "linux must add --no-sandbox: {args:?}"
+        );
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -452,7 +514,10 @@ mod tests {
         let content = "54213\n/devtools/browser/4f1c0a2b-aaaa-bbbb-cccc-ddddeeeeffff\n";
         let (port, path) = parse_devtools_active_port(content).unwrap();
         assert_eq!(port, 54213);
-        assert_eq!(path, "/devtools/browser/4f1c0a2b-aaaa-bbbb-cccc-ddddeeeeffff");
+        assert_eq!(
+            path,
+            "/devtools/browser/4f1c0a2b-aaaa-bbbb-cccc-ddddeeeeffff"
+        );
         assert_eq!(
             build_ws_url(port, &path),
             "ws://127.0.0.1:54213/devtools/browser/4f1c0a2b-aaaa-bbbb-cccc-ddddeeeeffff"

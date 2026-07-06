@@ -141,11 +141,8 @@ impl Tool for ExecCommandTool {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("exec_command: spawn failed: {e}")),
         };
-        // Subscribe immediately after spawn so we don't miss the first output.
-        let rx = pty.subscribe();
-
         let deadline = tokio::time::Instant::now() + Duration::from_millis(yield_ms);
-        let collected = collect_until_deadline(&pty, rx, deadline).await;
+        let (collected, read_offset) = collect_until_deadline(&pty, 0, deadline).await;
         let text = truncate_middle(
             &String::from_utf8_lossy(&collected),
             TruncationBudget::Bytes(OUTPUT_CAP_BYTES),
@@ -160,6 +157,7 @@ impl Tool for ExecCommandTool {
                 .insert(ExecSession {
                     id: 0,
                     pty: pty.clone(),
+                    read_offset,
                     command: cmd,
                     tty,
                     last_used: tokio::time::Instant::now(),
@@ -197,7 +195,11 @@ mod tests {
         assert!(!r.is_error, "unexpected error: {}", r.content);
         assert!(r.content.contains("exit_code=0"), "got: {}", r.content);
         assert!(r.content.contains("done_marker"), "got: {}", r.content);
-        assert!(parse_session_id(&r.content).is_none(), "should not get a session_id: {}", r.content);
+        assert!(
+            parse_session_id(&r.content).is_none(),
+            "should not get a session_id: {}",
+            r.content
+        );
     }
 
     #[tokio::test]

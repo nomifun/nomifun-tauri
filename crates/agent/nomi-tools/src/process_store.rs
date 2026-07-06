@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::Mutex;
-use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::Instant;
 
@@ -29,6 +28,8 @@ const PROTECT_RECENT: usize = 8;
 pub struct ExecSession {
     pub id: u64,
     pub pty: Arc<Pty>,
+    /// Absolute byte offset in the PTY backlog consumed by the last tool call.
+    pub read_offset: usize,
     /// The command line, for display/debugging.
     pub command: String,
     pub tty: bool,
@@ -63,7 +64,9 @@ impl ProcessStore {
         s.id = id;
         let mut map = self.inner.lock().await;
         let pruned = if map.len() >= MAX_PROCESSES {
-            Self::pick_prune(&map).and_then(|pid| map.remove(&pid)).map(|e| e.pty)
+            Self::pick_prune(&map)
+                .and_then(|pid| map.remove(&pid))
+                .map(|e| e.pty)
         } else {
             None
         };
@@ -78,6 +81,23 @@ impl ProcessStore {
         let e = map.get_mut(&id)?;
         e.last_used = Instant::now();
         Some(e.pty.clone())
+    }
+
+    /// Fetch a session's `Pty` plus the durable-output cursor and refresh LRU.
+    pub async fn touch_with_offset(&self, id: u64) -> Option<(Arc<Pty>, usize)> {
+        let mut map = self.inner.lock().await;
+        let e = map.get_mut(&id)?;
+        e.last_used = Instant::now();
+        Some((e.pty.clone(), e.read_offset))
+    }
+
+    /// Persist the durable-output cursor after a collection pass.
+    pub async fn update_read_offset(&self, id: u64, read_offset: usize) {
+        let mut map = self.inner.lock().await;
+        if let Some(e) = map.get_mut(&id) {
+            e.read_offset = read_offset;
+            e.last_used = Instant::now();
+        }
     }
 
     /// Remove a session from the store, returning it (caller decides whether to
@@ -130,13 +150,7 @@ impl ProcessStore {
     /// Kill every retained session. Intended for engine shutdown so a model that
     /// spawned a pile of never-exiting REPLs doesn't leak processes.
     pub async fn terminate_all(&self) {
-        let drained: Vec<ExecSession> = self
-            .inner
-            .lock()
-            .await
-            .drain()
-            .map(|(_, e)| e)
-            .collect();
+        let drained: Vec<ExecSession> = self.inner.lock().await.drain().map(|(_, e)| e).collect();
         for e in drained {
             e.pty.kill();
         }
@@ -166,35 +180,58 @@ impl Drop for ProcessStore {
 /// drops straight into this loop to read whatever arrived in `yield_time_ms`.
 pub async fn collect_until_deadline(
     pty: &Pty,
-    mut rx: Receiver<Vec<u8>>,
+    read_offset: usize,
     deadline: Instant,
-) -> Vec<u8> {
+) -> (Vec<u8>, usize) {
+    let (mut rx, snapshot, mut read_offset) = pty.subscribe_from(read_offset);
     let mut out: Vec<u8> = Vec::with_capacity(4096);
+    out.extend_from_slice(&snapshot);
     loop {
         let now = Instant::now();
         if now >= deadline {
+            let (snapshot, next_offset) = pty.snapshot_from(read_offset);
+            out.extend_from_slice(&snapshot);
+            read_offset = next_offset;
             break;
         }
         if pty.has_exited() && pty.output_closed() {
             // Exited and the stream is closed: scoop up any residue and finish.
             while let Ok(chunk) = rx.try_recv() {
+                read_offset = read_offset.saturating_add(chunk.len());
                 out.extend_from_slice(&chunk);
             }
+            let (snapshot, next_offset) = pty.snapshot_from(read_offset);
+            out.extend_from_slice(&snapshot);
+            read_offset = next_offset;
             break;
         }
         let remaining = deadline - now;
         let closed_notify = pty.closed_notify();
         tokio::select! {
             r = rx.recv() => match r {
-                Ok(chunk) => out.extend_from_slice(&chunk),
-                Err(RecvError::Lagged(_)) => continue, // dropped oldest; keep reading
-                Err(RecvError::Closed) => break,
+                Ok(chunk) => {
+                    read_offset = read_offset.saturating_add(chunk.len());
+                    out.extend_from_slice(&chunk);
+                }
+                Err(RecvError::Lagged(_)) => {
+                    let (new_rx, snapshot, next_offset) = pty.subscribe_from(read_offset);
+                    out.extend_from_slice(&snapshot);
+                    read_offset = next_offset;
+                    rx = new_rx;
+                    continue;
+                }
+                Err(RecvError::Closed) => {
+                    let (snapshot, next_offset) = pty.snapshot_from(read_offset);
+                    out.extend_from_slice(&snapshot);
+                    read_offset = next_offset;
+                    break;
+                }
             },
             _ = closed_notify.notified() => { /* re-evaluate finish on next loop */ }
             _ = tokio::time::sleep(remaining) => break,
         }
     }
-    out
+    (out, read_offset)
 }
 
 #[cfg(test)]
@@ -223,6 +260,7 @@ mod tests {
         ExecSession {
             id: 0,
             pty,
+            read_offset: 0,
             command: "sleep".into(),
             tty: false,
             last_used: Instant::now(),
@@ -253,7 +291,11 @@ mod tests {
             }
             ids.push(id);
         }
-        assert_eq!(store.len().await, MAX_PROCESSES, "store must cap at MAX_PROCESSES");
+        assert_eq!(
+            store.len().await,
+            MAX_PROCESSES,
+            "store must cap at MAX_PROCESSES"
+        );
 
         // The 8 most-recently-inserted ids are protected and must survive.
         for id in ids.iter().rev().take(PROTECT_RECENT) {

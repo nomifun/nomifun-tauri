@@ -107,6 +107,28 @@ impl SidecarClient {
             .map(|p| p.value)
     }
 
+    async fn strategy_with_default_steering(&self, strategy: &DecisionStrategy) -> DecisionStrategy {
+        if strategy
+            .freeform_policy
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty())
+        {
+            return strategy.clone();
+        }
+        let Some(default_policy) = self
+            .pref(PREF_DEFAULT_STEERING)
+            .await
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        else {
+            return strategy.clone();
+        };
+        let mut merged = strategy.clone();
+        merged.freeform_policy = Some(default_policy);
+        merged
+    }
+
     /// Resolve effective `(provider_id, model)` from the watch's `bypass_model` +
     /// global defaults. `model` falls back to the global default, then to empty
     /// (the provider's default).
@@ -160,9 +182,10 @@ impl SidecarClient {
             };
         };
         let used = (provider_id.clone(), model.clone());
+        let effective_strategy = self.strategy_with_default_steering(strategy).await;
         let user = match &open_question {
-            Some(oq) => build_open_question_prompt(strategy, oq.question, context, oq.max_answer_chars),
-            None => build_user_prompt(strategy, class, detail, context),
+            Some(oq) => build_open_question_prompt(&effective_strategy, oq.question, context, oq.max_answer_chars),
+            None => build_user_prompt(&effective_strategy, class, detail, context),
         };
 
         // First attempt.
@@ -278,6 +301,19 @@ mod tests {
             }
         }
     }
+
+    struct CapturingCompleter {
+        last_user: Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl Completer for CapturingCompleter {
+        async fn complete(&self, _p: &str, _m: &str, _s: &str, user: &str) -> Result<String, ()> {
+            *self.last_user.lock().unwrap() = Some(user.to_string());
+            Ok(r#"{"action":"retry","confidence":0.9}"#.into())
+        }
+    }
+
     #[async_trait]
     impl Completer for ScriptedCompleter {
         async fn complete(&self, _p: &str, _m: &str, _s: &str, _u: &str) -> Result<String, ()> {
@@ -332,6 +368,35 @@ mod tests {
         let client = SidecarClient::new(comp, prefs);
         assert!(client.resolve_backup(&BypassModelRef::default()).await.is_none());
         assert!(!client.backup_resolvable(&BypassModelRef::default()).await);
+    }
+
+    #[tokio::test]
+    async fn sidecar_uses_global_default_steering_when_watch_policy_empty() {
+        let prefs = Arc::new(MockPrefs::with(&[
+            (PREF_BACKUP_PROVIDER, "global_prov"),
+            (PREF_DEFAULT_STEERING, "prefer option 2 when safe"),
+        ]));
+        let comp = Arc::new(CapturingCompleter { last_user: Mutex::new(None) });
+        let client = SidecarClient::new(comp.clone(), prefs);
+
+        let out = client
+            .decide(
+                &BypassModelRef::default(),
+                &DecisionStrategy::default(),
+                StallClass::Decision,
+                "pick an option",
+                "ctx",
+                None,
+                None,
+            )
+            .await;
+
+        assert!(!out.provider_failed);
+        let prompt = comp.last_user.lock().unwrap().clone().unwrap();
+        assert!(
+            prompt.contains("prefer option 2 when safe"),
+            "global default steering prompt must be applied to an empty per-watch policy; prompt was: {prompt}"
+        );
     }
 
     #[tokio::test]

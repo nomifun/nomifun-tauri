@@ -8,7 +8,7 @@ import type { TurnDisclosureProcessState } from '../turnDisclosureModel';
 import { Spin } from '@arco-design/web-react';
 import { Attention, Brain, CheckOne, Edit, FolderOpen, Right, Terminal } from '@icon-park/react';
 import classNames from 'classnames';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 
 export type TurnProcessReceiptIcon = 'tool' | 'file' | 'edit' | 'thinking' | 'permission' | 'status';
 
@@ -28,7 +28,23 @@ interface TurnProcessReceiptProps<T> {
   renderProcessItem: (item: T) => React.ReactNode;
 }
 
+export interface TurnProcessReceiptExpansionSnapshot {
+  receiptId: string;
+  canExpand: boolean;
+}
+
 const sanitizeDomId = (value: string): string => value.replace(/[^A-Za-z0-9_-]/g, '_');
+
+const getDefaultExpanded = (defaultExpanded: boolean, canExpand: boolean): boolean => defaultExpanded && canExpand;
+
+export function shouldResetTurnProcessReceiptExpansion(
+  previous: TurnProcessReceiptExpansionSnapshot,
+  next: TurnProcessReceiptExpansionSnapshot
+): boolean {
+  if (previous.receiptId !== next.receiptId) return true;
+  if (previous.canExpand !== next.canExpand) return true;
+  return false;
+}
 
 const ReceiptIcon: React.FC<{
   icon: TurnProcessReceiptIcon;
@@ -46,10 +62,20 @@ const ReceiptIcon: React.FC<{
 
 function TurnProcessReceipt<T>({ receipt, highlighted = false, renderProcessItem }: TurnProcessReceiptProps<T>) {
   const canExpand = receipt.hasDetail === true;
-  const [expanded, setExpanded] = useState(receipt.defaultExpanded && canExpand);
+  const [expanded, setExpanded] = useState(() => getDefaultExpanded(receipt.defaultExpanded, canExpand));
+  const expansionSnapshotRef = useRef<TurnProcessReceiptExpansionSnapshot>({
+    receiptId: receipt.id,
+    canExpand,
+  });
 
   useEffect(() => {
-    setExpanded(receipt.defaultExpanded && canExpand);
+    const nextSnapshot: TurnProcessReceiptExpansionSnapshot = { receiptId: receipt.id, canExpand };
+    const shouldReset = shouldResetTurnProcessReceiptExpansion(expansionSnapshotRef.current, nextSnapshot);
+    expansionSnapshotRef.current = nextSnapshot;
+
+    if (shouldReset) {
+      setExpanded(getDefaultExpanded(receipt.defaultExpanded, canExpand));
+    }
   }, [canExpand, receipt.defaultExpanded, receipt.id]);
 
   useEffect(() => {

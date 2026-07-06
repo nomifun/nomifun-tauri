@@ -1073,13 +1073,39 @@ impl SessionProbe for TerminalProbe {
             // plain y/n / numbered text), so a Confirm is a no-op here.
             WakeAction::Wait(_) | WakeAction::Stop(_) | WakeAction::Confirm { .. } => return Ok(()),
         };
-        let bytes = encode_terminal_input(&text);
+        // IDMM's terminal session metadata only carries the declared backend, not
+        // the full launcher command/args. Treat that declared backend as the
+        // agent-family signal so backend-only terminal presets still get the
+        // shared paste-then-CR submit path.
+        let is_agent = self
+            .driver
+            .describe(self.terminal_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|d| d.backend)
+            .map(|b| nomifun_terminal::enhance::resolve_agent_family(&b, &[], Some(&b)).is_some())
+            .unwrap_or(false);
         // Track the payload's lines so the CLI's echo of them isn't re-detected.
         self.note_injection(&text);
-        self.driver
-            .write_input(self.terminal_id, &bytes)
-            .await
-            .map_err(|e| AppError::Internal(format!("terminal inject failed: {e}")))
+        match nomifun_terminal::encode_submit_chunks(&text, is_agent) {
+            nomifun_terminal::SubmitChunks::Single(bytes) => self
+                .driver
+                .write_input(self.terminal_id, &bytes)
+                .await
+                .map_err(|e| AppError::Internal(format!("terminal inject failed: {e}"))),
+            nomifun_terminal::SubmitChunks::PasteThenCr { paste, cr } => {
+                self.driver
+                    .write_input(self.terminal_id, &paste)
+                    .await
+                    .map_err(|e| AppError::Internal(format!("terminal inject failed: {e}")))?;
+                tokio::time::sleep(nomifun_terminal::TERMINAL_SUBMIT_DELAY).await;
+                self.driver
+                    .write_input(self.terminal_id, &cr)
+                    .await
+                    .map_err(|e| AppError::Internal(format!("terminal inject failed: {e}")))
+            }
+        }
     }
 
     async fn snapshot_context(&self, max_chars: usize) -> Result<String, AppError> {
@@ -1121,33 +1147,6 @@ impl SessionProbe for TerminalProbe {
             None => Err(AppError::NotFound(format!("terminal {} not found", self.terminal_id))),
         }
     }
-}
-
-/// Encode wake text for a PTY so the answer actually SUBMITS (like a human
-/// typing it + Enter). Routing is by single-line vs multi-line, NOT length:
-/// any single logical line (no interior newline) is sent raw + CR — this is the
-/// fix for the pitfall where a longer answer (an option label like "2) 方案B",
-/// CJK, or a model's free-text reply) was wrapped in bracketed paste, which
-/// INSERTS the text without executing it: the answer sat unsubmitted in the
-/// input box and the trailing CR showed up as a stray newline (most visibly on
-/// Windows). Trailing CR/LF are stripped first (a trailing newline would
-/// otherwise mis-route a single-line answer into the paste path). Only genuinely
-/// multi-line content is wrapped in bracketed paste so its interior newlines
-/// don't submit per line; a final CR still submits the block. NO marker is added
-/// — the CLI must read exactly these bytes; the echo is suppressed via the
-/// probe's shared `recent_injections` queue.
-fn encode_terminal_input(text: &str) -> Vec<u8> {
-    let trimmed = text.trim_end_matches(|c| c == '\r' || c == '\n');
-    let mut bytes = Vec::with_capacity(trimmed.len() + 16);
-    if trimmed.contains('\n') {
-        bytes.extend_from_slice(b"\x1b[200~");
-        bytes.extend_from_slice(trimmed.as_bytes());
-        bytes.extend_from_slice(b"\x1b[201~");
-    } else {
-        bytes.extend_from_slice(trimmed.as_bytes());
-    }
-    bytes.push(b'\r');
-    bytes
 }
 
 #[cfg(test)]
@@ -1277,45 +1276,17 @@ mod tests {
     }
 
     #[test]
-    fn encode_single_token_is_raw_with_cr() {
-        let bytes = encode_terminal_input("y");
-        // Clean bytes — no marker corrupts what the CLI's y/n reader sees.
-        assert_eq!(bytes, b"y\r");
-        assert!(!bytes.windows(6).any(|w| w == b"\x1b[200~"));
-    }
-
-    #[test]
-    fn encode_multiline_uses_bracketed_paste() {
-        let bytes = encode_terminal_input("line one\nline two\nplease continue");
-        assert!(bytes.windows(6).any(|w| w == b"\x1b[200~"));
-        assert!(bytes.windows(6).any(|w| w == b"\x1b[201~"));
-        assert_eq!(*bytes.last().unwrap(), b'\r');
-    }
-
-    #[test]
-    fn encode_long_single_line_submits_raw_not_paste() {
-        // Regression: a decision answer longer than 8 bytes but with NO interior
-        // newline (an option label, CJK, a model reply) must still SUBMIT —
-        // raw bytes + CR — not get wrapped in bracketed paste (which left it
-        // sitting unsubmitted in the input box; the Windows "a newline got typed,
-        // nothing ran" pitfall).
-        let answer = "2) 方案B 看起来更稳妥";
-        let bytes = encode_terminal_input(answer);
-        assert!(
-            !bytes.windows(6).any(|w| w == b"\x1b[200~"),
-            "a single-line answer must not use bracketed paste"
+    fn idmm_single_line_stays_raw_plus_cr() {
+        use nomifun_terminal::{encode_submit_chunks, SubmitChunks};
+        // 单行答复（option label / continue）必须 raw+CR、一次写，绝不 bracketed-paste。
+        assert_eq!(
+            encode_submit_chunks("2) 方案B", false),
+            SubmitChunks::Single("2) 方案B\r".as_bytes().to_vec())
         );
-        assert_eq!(*bytes.last().unwrap(), b'\r', "must end with CR to submit");
-        assert!(bytes.starts_with(answer.as_bytes()), "answer text sent verbatim before the CR");
-        assert_eq!(bytes.len(), answer.len() + 1, "exactly the answer + one CR");
-    }
-
-    #[test]
-    fn encode_strips_trailing_newline_then_submits() {
-        // A trailing newline must not mis-route a single-line answer into the
-        // paste path; it is stripped and the answer submits with a single CR.
-        assert_eq!(encode_terminal_input("answer text here\n"), b"answer text here\r");
-        assert_eq!(encode_terminal_input("done\r\n"), b"done\r");
+        assert_eq!(
+            encode_submit_chunks("continue", true),
+            SubmitChunks::Single(b"continue\r".to_vec())
+        );
     }
 
     // ── Chat-conversation gating + end-of-turn decision signal ──
@@ -1844,6 +1815,7 @@ mod tests {
     /// what a `WakeAction` was encoded to. Only `write_input`/`subscribe_*` matter.
     struct CapturingDriver {
         written: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        backend: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -1859,7 +1831,15 @@ mod tests {
             true
         }
         async fn describe(&self, _id: i64) -> Result<Option<nomifun_terminal::TerminalDescription>, TermError> {
-            unimplemented!()
+            Ok(Some(nomifun_terminal::TerminalDescription {
+                user_id: "u1".into(),
+                cwd: ".".into(),
+                command: "$SHELL".into(),
+                args: vec![],
+                backend: self.backend.clone(),
+                mode: None,
+                last_status: "running".into(),
+            }))
         }
         async fn read_autowork(&self, _id: i64) -> Result<Option<String>, TermError> {
             unimplemented!()
@@ -1884,7 +1864,10 @@ mod tests {
         // terminal/ACP CLI self-manages its model. A Failover must degrade to the
         // same "continue" nudge a Retry produces — never error, never a no-op.
         let written = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let driver = Arc::new(CapturingDriver { written: written.clone() });
+        let driver = Arc::new(CapturingDriver {
+            written: written.clone(),
+            backend: None,
+        });
         let probe = TerminalProbe::new(driver.clone(), 7);
 
         probe.inject(&WakeAction::Failover).await.expect("failover inject ok");
@@ -1893,7 +1876,33 @@ mod tests {
         let w = written.lock().unwrap();
         assert_eq!(w.len(), 2, "both injects must write to the PTY");
         assert_eq!(w[0], w[1], "Failover must encode to the same bytes as Retry on a terminal");
-        assert_eq!(w[0], encode_terminal_input("continue"), "degrades to the continue nudge");
+        // "continue" is single-line → the shared encoder keeps it raw + CR, one write.
+        assert_eq!(w[0], b"continue\r".to_vec(), "degrades to the continue nudge");
+    }
+
+    #[tokio::test]
+    async fn terminal_inject_backend_agent_multiline_uses_paste_then_cr() {
+        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let driver = Arc::new(CapturingDriver {
+            written: written.clone(),
+            backend: Some("claude".into()),
+        });
+        let probe = TerminalProbe::new(driver.clone(), 7);
+
+        probe
+            .inject(&WakeAction::AnswerChoice("line one\nline two".into()))
+            .await
+            .expect("multiline answer inject ok");
+
+        let w = written.lock().unwrap();
+        assert_eq!(w.len(), 2, "agent multiline injection must split paste and CR");
+        assert!(w[0].starts_with(b"\x1b[200~"));
+        assert!(w[0].ends_with(b"\x1b[201~"));
+        assert!(
+            w[0].windows(b"line one\nline two".len()).any(|x| x == b"line one\nline two"),
+            "paste body should contain the multiline answer"
+        );
+        assert_eq!(w[1], b"\r".to_vec(), "submit CR must be its own write");
     }
 
     #[tokio::test]

@@ -22,6 +22,16 @@
     0 10px 24px rgba(15, 23, 42, 0.035);
 }
 
+.message-item {
+  --conversation-message-font-size: 14px;
+  --conversation-message-line-height: 22px;
+}
+
+.message-text-body {
+  font-size: var(--conversation-message-font-size);
+  line-height: var(--conversation-message-line-height);
+}
+
 .message-error-note--user_llm_provider {
   --message-error-accent: #2563eb;
   --message-error-accent-alt: #13c1b8;
@@ -337,19 +347,6 @@
     max-height: 120px;
   }
 
-  /* Message body — keep body type compact so messages don't dominate the screen */
-  .message-item .markdown-shadow {
-    font-size: 14px !important;
-    line-height: 1.4 !important;
-  }
-
-  .message-item .markdown-shadow p,
-  .message-item .markdown-shadow li,
-  .message-item .markdown-shadow blockquote {
-    font-size: 14px !important;
-    line-height: 1.4 !important;
-  }
-
   /* Vertical rhythm between consecutive messages on mobile.
      Desktop reserves space for the hover-revealed copy/time row beneath each
      bubble; that row is hidden on mobile, so add the spacing back here so
@@ -358,10 +355,6 @@
     margin-top: 16px !important;
   }
 
-  /* Apply consistent line-height to user message text */
-  .message-item .whitespace-pre-wrap {
-    line-height: 1.4 !important;
-  }
 }
 
 .turn-process-disclosure {
@@ -370,7 +363,7 @@
 }
 
 .turn-process-disclosure--running {
-  color: var(--color-primary-6, #165dff);
+  color: var(--color-text-3, #86909c);
 }
 
 .turn-process-disclosure--waiting {
@@ -409,6 +402,14 @@
   color: var(--color-text-2, #4e5969);
 }
 
+.turn-process-disclosure__header--static {
+  cursor: default;
+}
+
+.turn-process-disclosure__header--static:hover {
+  color: inherit;
+}
+
 .turn-process-disclosure__header:focus-visible {
   border-radius: 6px;
   box-shadow: 0 0 0 2px var(--color-primary-light-3, #bedaff);
@@ -434,13 +435,60 @@
 .turn-process-disclosure__body {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 8px 0 2px;
+  gap: 0;
+  padding: 12px 0 2px;
 }
 
 .turn-process-disclosure__item {
   min-width: 0;
   color: var(--color-text-3, #86909c);
+  margin-top: 14px;
+}
+
+.turn-process-disclosure__item:first-child {
+  margin-top: 0;
+}
+
+.turn-process-disclosure__item--text + .turn-process-disclosure__item--text,
+.turn-process-disclosure__item--tool + .turn-process-disclosure__item--tool,
+.turn-process-disclosure__item--thinking + .turn-process-disclosure__item--thinking,
+.turn-process-disclosure__item--status + .turn-process-disclosure__item--status,
+.turn-process-disclosure__item--permission + .turn-process-disclosure__item--permission {
+  margin-top: 4px;
+}
+
+.turn-process-disclosure__body .turn-process-trace,
+.turn-process-disclosure__body .turn-process-trace-tool {
+  gap: 3px;
+}
+
+.turn-process-disclosure__body .turn-process-trace__paragraph {
+  color: var(--color-text-1, #1d2129);
+  font-size: var(--conversation-message-font-size);
+  line-height: var(--conversation-message-line-height);
+}
+
+.turn-process-disclosure__body .turn-process-trace__row {
+  min-height: 20px;
+  color: var(--color-text-3, #86909c);
+  font-size: var(--conversation-message-font-size);
+  line-height: var(--conversation-message-line-height);
+}
+
+.turn-process-disclosure__body .turn-process-trace__row--running {
+  color: var(--color-text-3, #86909c);
+}
+
+.turn-process-disclosure__body .turn-process-trace__row--waiting {
+  color: var(--color-warning-6, #ff7d00);
+}
+
+.turn-process-disclosure__body .turn-process-trace__row--failed {
+  color: var(--color-danger-6, #f53f3f);
+}
+
+.turn-process-disclosure__body .turn-process-trace__row--canceled {
+  color: var(--color-text-4, #c9cdd4);
 }
 
 .turn-process-disclosure__item .message-error-note,
@@ -562,9 +610,9 @@
   background: transparent;
   color: var(--color-text-3, #86909c);
   font: inherit;
-  font-size: 14px;
+  font-size: var(--conversation-message-font-size, 14px);
   font-weight: 400;
-  line-height: 22px;
+  line-height: var(--conversation-message-line-height, 22px);
   padding: 0;
   text-align: left;
 }
@@ -588,7 +636,7 @@ button.turn-process-trace__row:focus-visible {
 }
 
 .turn-process-trace__row--running {
-  color: var(--color-primary-6, #165dff);
+  color: var(--color-text-3, #86909c);
 }
 
 .turn-process-trace__row--waiting {
@@ -612,8 +660,8 @@ button.turn-process-trace__row:focus-visible {
 
 .turn-process-trace__paragraph {
   color: var(--color-text-2, #4e5969);
-  font-size: 14px;
-  line-height: 1.7;
+  font-size: var(--conversation-message-font-size, 14px);
+  line-height: var(--conversation-message-line-height, 22px);
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -644,7 +692,6 @@ button.turn-process-trace__row:focus-visible {
   border-left: 1px solid var(--color-border-2, #e5e6eb);
 }
 
-.turn-process-trace-thinking-inline > .turn-process-trace__paragraph,
 .turn-process-trace-receipt-detail > .turn-process-trace__paragraph {
   color: var(--color-text-1, #1d2129);
 }

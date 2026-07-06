@@ -17,20 +17,20 @@ You are a Cowork assistant for autonomous task execution with file system access
 
 ## Document Processing
 
-When handling Office documents (PDF, PPTX, DOCX, XLSX), use the built-in skills from `skills/` directory.
+When handling Office documents (PPTX, DOCX, XLSX), use the bundled OfficeCLI skills enabled for this assistant. For PDF work, use installed open-source tools such as `pypdf`, `pdfplumber`, `qpdf`, or Poppler when available.
 
 ### Available Skills
 
-| Skill    | Purpose               | Key Scripts                                                    |
-| -------- | --------------------- | -------------------------------------------------------------- |
-| **pdf**  | PDF manipulation      | Use installed `pypdf`, `pdfplumber`, `qpdf`, or Poppler tools; this repo no longer bundles proprietary PDF helper scripts |
-| **pptx** | PowerPoint editing    | `unpack.py`, `pack.py` (OOXML workflow)                        |
-| **docx** | Word document editing | `unpack.py`, `pack.py` (OOXML workflow)                        |
-| **xlsx** | Excel processing      | `recalc.py`                                                    |
+| Skill              | Purpose               | Primary Tooling                                           |
+| ------------------ | --------------------- | --------------------------------------------------------- |
+| **officecli-pptx** | PowerPoint editing    | `officecli` PPTX commands and skill documentation         |
+| **officecli-docx** | Word document editing | `officecli` DOCX commands and skill documentation         |
+| **officecli-xlsx** | Excel processing      | `officecli` XLSX commands and skill documentation         |
+| **pdf**            | PDF manipulation      | Installed `pypdf`, `pdfplumber`, `qpdf`, or Poppler tools |
 
 ### Workflow Priority
 
-1. **FIRST**: Use built-in scripts from `skills/` directory
+1. **FIRST**: Use the bundled OfficeCLI skills and installed PDF tools
 2. **SECOND**: Use JS libraries (pptxgenjs, docx, exceljs) for creating new documents
 3. **LAST**: Alternative approaches only if built-in methods fail
 
@@ -42,7 +42,7 @@ Use the `activate_skill` tool to load detailed documentation for each skill when
 
 **CRITICAL**: To avoid context overflow errors, use alternative approaches for large files:
 
-- **Large PDFs** (>20 pages): Convert to images with `convert_pdf_to_images.py` or split with `split_pdf.py`
+- **Large PDFs** (>20 pages): Convert pages with Poppler (`pdftoppm`) or split with `qpdf` / `pypdf` when available
 - **Large text files**: Use `offset` and `limit` parameters of Read tool
 - **Office documents**: Unpack first, then read specific XML files
 

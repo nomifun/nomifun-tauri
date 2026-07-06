@@ -29,7 +29,7 @@ describe('buildTurnDisclosureItems', () => {
     const result = buildTurnDisclosureItems(
       [
         item('user', 'user', { createdAt: 1000 }),
-        item('thinking', 'process', { createdAt: 2000 }),
+        item('analysis', 'process', { createdAt: 2000 }),
         item('tool', 'process', { createdAt: 3000 }),
         item('final', 'assistant', { createdAt: 5000 }),
       ],
@@ -47,17 +47,17 @@ describe('buildTurnDisclosureItems', () => {
     if (disclosure.type !== 'turn_disclosure') return;
     expect(disclosure.defaultCollapsed).toBe(true);
     expect(disclosure.state).toBe('completed');
-    expect(disclosure.processItemIds).toEqual(['thinking', 'tool']);
+    expect(disclosure.processItemIds).toEqual(['analysis', 'tool']);
     expect(disclosure.startAt).toBe(2000);
     expect(disclosure.endAt).toBe(5000);
-    expect(disclosure.sourceMessageIds).toEqual(['thinking', 'tool']);
+    expect(disclosure.sourceMessageIds).toEqual(['analysis', 'tool']);
   });
 
-  test('uses completed thinking intervals when calculating disclosure duration', () => {
+  test('uses completed process intervals when calculating disclosure duration', () => {
     const result = buildTurnDisclosureItems(
       [
         item('user', 'user', { createdAt: 0 }),
-        item('thinking', 'process', {
+        item('analysis', 'process', {
           createdAt: 35000,
           processStartedAt: 1000,
           processEndedAt: 35000,
@@ -71,7 +71,7 @@ describe('buildTurnDisclosureItems', () => {
     const disclosure = result[1];
     expect(disclosure.type).toBe('turn_disclosure');
     if (disclosure.type !== 'turn_disclosure') return;
-    expect(disclosure.processItemIds).toEqual(['thinking', 'tool']);
+    expect(disclosure.processItemIds).toEqual(['analysis', 'tool']);
     expect(disclosure.startAt).toBe(1000);
     expect(disclosure.endAt).toBe(35600);
   });
@@ -96,48 +96,158 @@ describe('buildTurnDisclosureItems', () => {
     ]);
   });
 
-  test('renders unfinished running process steps as inline receipts before the final answer exists', () => {
+  test('renders unfinished running process steps as a live turn disclosure before the final answer exists', () => {
     const result = buildTurnDisclosureItems([
       item('user', 'user', { createdAt: 1000 }),
-      item('thinking', 'process', { createdAt: 2000, processState: 'running' }),
-      item('tool', 'process', { createdAt: 3000 }),
+      item('analysis', 'process', { createdAt: 2000, processStartedAt: 1500, processState: 'running' }),
+      item('tool', 'process', { createdAt: 3000, processEndedAt: 3200 }),
     ]);
 
-    expect(result).toEqual([
-      { type: 'item', id: 'user' },
-      { type: 'process_receipt', id: 'receipt-thinking', itemId: 'thinking' },
-      { type: 'process_receipt', id: 'receipt-tool', itemId: 'tool' },
+    expect(result.map((entry) => (entry.type === 'item' ? entry.id : entry.id))).toEqual([
+      'user',
+      'turn-disclosure-turn-1',
     ]);
+    const disclosure = result[1];
+    expect(disclosure.type).toBe('turn_disclosure');
+    if (disclosure.type !== 'turn_disclosure') return;
+    expect(disclosure.state).toBe('running');
+    expect(disclosure.running).toBe(true);
+    expect(disclosure.defaultCollapsed).toBe(false);
+    expect(disclosure.processItemIds).toEqual(['analysis', 'tool']);
+    expect(disclosure.startAt).toBe(1500);
+    expect(disclosure.endAt).toBe(3200);
   });
 
-  test('keeps running assistant text visible and renders process steps as receipts', () => {
+  test('keeps a live disclosure visible while the current turn waits for the first process item', () => {
+    const result = buildTurnDisclosureItems([
+      item('user', 'user', { createdAt: 1000 }),
+    ]);
+
+    expect(result.map((entry) => (entry.type === 'item' ? entry.id : entry.id))).toEqual([
+      'user',
+      'turn-disclosure-turn-1',
+    ]);
+    const disclosure = result[1];
+    expect(disclosure.type).toBe('turn_disclosure');
+    if (disclosure.type !== 'turn_disclosure') return;
+    expect(disclosure.state).toBe('running');
+    expect(disclosure.running).toBe(true);
+    expect(disclosure.defaultCollapsed).toBe(false);
+    expect(disclosure.processItemIds).toEqual([]);
+    expect(disclosure.sourceMessageIds).toEqual([]);
+    expect(disclosure.startAt).toBe(1000);
+    expect(disclosure.endAt).toBe(1000);
+  });
+
+  test('keeps the current turn disclosure visible between active process phases', () => {
+    const result = buildTurnDisclosureItems([
+      item('user', 'user', { createdAt: 1000 }),
+      item('tool', 'process', { createdAt: 2000, processState: 'completed' }),
+    ]);
+
+    expect(result.map((entry) => (entry.type === 'item' ? entry.id : entry.id))).toEqual([
+      'user',
+      'turn-disclosure-turn-1',
+    ]);
+    const disclosure = result[1];
+    expect(disclosure.type).toBe('turn_disclosure');
+    if (disclosure.type !== 'turn_disclosure') return;
+    expect(disclosure.state).toBe('running');
+    expect(disclosure.running).toBe(true);
+    expect(disclosure.defaultCollapsed).toBe(false);
+    expect(disclosure.processItemIds).toEqual(['tool']);
+    expect(disclosure.processItemStates).toEqual({ tool: 'completed' });
+  });
+
+  test('keeps thinking items inside the process disclosure content', () => {
+    const result = buildTurnDisclosureItems([
+      item('user', 'user', { createdAt: 1000 }),
+      item('thinking', 'process_content', { createdAt: 1500, processState: 'running' }),
+      item('tool', 'process', { createdAt: 2000, processState: 'running' }),
+    ]);
+
+    expect(result.map((entry) => (entry.type === 'item' ? entry.id : entry.id))).toEqual([
+      'user',
+      'turn-disclosure-turn-1',
+    ]);
+    const disclosure = result[1];
+    expect(disclosure.type).toBe('turn_disclosure');
+    if (disclosure.type !== 'turn_disclosure') return;
+    expect(disclosure.processItemIds).toEqual(['thinking', 'tool']);
+  });
+
+  test('does not archive an empty disclosure when a turn closes without process items', () => {
+    const result = buildTurnDisclosureItems(
+      [
+        item('user', 'user', { createdAt: 1000 }),
+      ],
+      { tailClosed: true }
+    );
+
+    expect(result).toEqual([{ type: 'item', id: 'user' }]);
+  });
+
+  test('collapses stale running process steps after a closed turn has a final answer', () => {
+    const result = buildTurnDisclosureItems(
+      [
+        item('user', 'user', { createdAt: 1000 }),
+        item('tool', 'process', { createdAt: 2000, processState: 'running' }),
+        item('final', 'assistant', { createdAt: 3000 }),
+      ],
+      { tailClosed: true }
+    );
+
+    expect(result.map((entry) => (entry.type === 'item' ? entry.id : entry.id))).toEqual([
+      'user',
+      'turn-disclosure-turn-1',
+      'final',
+    ]);
+    const disclosure = result[1];
+    expect(disclosure.type).toBe('turn_disclosure');
+    if (disclosure.type !== 'turn_disclosure') return;
+    expect(disclosure.state).toBe('completed');
+    expect(disclosure.processItemStates).toEqual({ tool: 'completed' });
+  });
+
+  test('keeps running assistant text visible after the live disclosure', () => {
     const result = buildTurnDisclosureItems([
       item('user', 'user', { createdAt: 1000 }),
       item('progress-note', 'assistant', { createdAt: 1500 }),
-      item('thinking', 'process', { createdAt: 2000, processState: 'running' }),
+      item('scan', 'process', { createdAt: 2000, processState: 'running' }),
       item('partial-answer', 'assistant', { createdAt: 3000 }),
     ]);
 
-    expect(result).toEqual([
-      { type: 'item', id: 'user' },
-      { type: 'item', id: 'progress-note' },
-      { type: 'process_receipt', id: 'receipt-thinking', itemId: 'thinking' },
-      { type: 'item', id: 'partial-answer' },
+    expect(result.map((entry) => (entry.type === 'item' ? entry.id : entry.id))).toEqual([
+      'user',
+      'turn-disclosure-turn-1',
+      'partial-answer',
     ]);
+    const disclosure = result[1];
+    expect(disclosure.type).toBe('turn_disclosure');
+    if (disclosure.type !== 'turn_disclosure') return;
+    expect(disclosure.state).toBe('running');
+    expect(disclosure.processItemIds).toEqual(['progress-note', 'scan']);
   });
 
-  test('keeps waiting confirmation steps visible as inline receipts', () => {
+  test('keeps waiting confirmation steps visible in the live disclosure', () => {
     const result = buildTurnDisclosureItems([
       item('user', 'user', { createdAt: 1000 }),
       item('permission', 'process', { createdAt: 2000, processState: 'waiting' }),
       item('partial-answer', 'assistant', { createdAt: 3000 }),
     ]);
 
-    expect(result).toEqual([
-      { type: 'item', id: 'user' },
-      { type: 'process_receipt', id: 'receipt-permission', itemId: 'permission' },
-      { type: 'item', id: 'partial-answer' },
+    expect(result.map((entry) => (entry.type === 'item' ? entry.id : entry.id))).toEqual([
+      'user',
+      'turn-disclosure-turn-1',
+      'partial-answer',
     ]);
+    const disclosure = result[1];
+    expect(disclosure.type).toBe('turn_disclosure');
+    if (disclosure.type !== 'turn_disclosure') return;
+    expect(disclosure.state).toBe('waiting');
+    expect(disclosure.running).toBe(true);
+    expect(disclosure.defaultCollapsed).toBe(false);
+    expect(disclosure.processItemIds).toEqual(['permission']);
   });
 
   test('surfaces failed process state on a completed disclosure', () => {
@@ -157,7 +267,7 @@ describe('buildTurnDisclosureItems', () => {
     expect(disclosure.state).toBe('failed');
   });
 
-  test('keeps a completed process-only tail as a receipt until the request has a final answer or closes', () => {
+  test('keeps a completed process-only tail inside the live disclosure until the request closes', () => {
     const result = buildTurnDisclosureItems([
       item('user', 'user', { createdAt: 1000 }),
       item('tool', 'process', { createdAt: 2000, processState: 'completed' }),
@@ -165,31 +275,43 @@ describe('buildTurnDisclosureItems', () => {
 
     expect(result.map((entry) => (entry.type === 'item' ? entry.id : entry.id))).toEqual([
       'user',
-      'receipt-tool',
+      'turn-disclosure-turn-1',
     ]);
-    expect(result[1]).toEqual({ type: 'process_receipt', id: 'receipt-tool', itemId: 'tool' });
+    const disclosure = result[1];
+    expect(disclosure.type).toBe('turn_disclosure');
+    if (disclosure.type !== 'turn_disclosure') return;
+    expect(disclosure.state).toBe('running');
+    expect(disclosure.processItemIds).toEqual(['tool']);
   });
 
-  test('keeps a completed tail with assistant text readable until the request closes', () => {
+  test('keeps a completed tail in the live disclosure while assistant text remains readable', () => {
     const result = buildTurnDisclosureItems([
       item('user', 'user', { createdAt: 1000 }),
       item('tool', 'process', { createdAt: 2000, processState: 'completed' }),
       item('assistant-text', 'assistant', { createdAt: 3000 }),
     ]);
 
-    expect(result).toEqual([
-      { type: 'item', id: 'user' },
-      { type: 'process_receipt', id: 'receipt-tool', itemId: 'tool' },
-      { type: 'item', id: 'assistant-text' },
+    expect(result.map((entry) => (entry.type === 'item' ? entry.id : entry.id))).toEqual([
+      'user',
+      'turn-disclosure-turn-1',
+      'assistant-text',
     ]);
+    const disclosure = result[1];
+    expect(disclosure.type).toBe('turn_disclosure');
+    if (disclosure.type !== 'turn_disclosure') return;
+    expect(disclosure.state).toBe('running');
+    expect(disclosure.processItemIds).toEqual(['tool']);
   });
 
   test('collapses a completed process-only segment once the next user request closes it', () => {
-    const result = buildTurnDisclosureItems([
-      item('user-1', 'user', { turnId: 'turn-1', createdAt: 1000 }),
-      item('tool-1', 'process', { turnId: 'turn-1', createdAt: 2000, processState: 'completed' }),
-      item('user-2', 'user', { turnId: 'turn-2', createdAt: 3000 }),
-    ]);
+    const result = buildTurnDisclosureItems(
+      [
+        item('user-1', 'user', { turnId: 'turn-1', createdAt: 1000 }),
+        item('tool-1', 'process', { turnId: 'turn-1', createdAt: 2000, processState: 'completed' }),
+        item('user-2', 'user', { turnId: 'turn-2', createdAt: 3000 }),
+      ],
+      { tailClosed: true }
+    );
 
     expect(result.map((entry) => (entry.type === 'item' ? entry.id : entry.id))).toEqual([
       'user-1',
@@ -230,13 +352,13 @@ describe('buildTurnDisclosureItems', () => {
 
   test('renders process steps without a visible user request as inline receipts', () => {
     const result = buildTurnDisclosureItems([
-      item('thinking', 'process', { turnId: undefined, createdAt: 1000, processState: 'completed' }),
+      item('scan', 'process', { turnId: undefined, createdAt: 1000, processState: 'completed' }),
       item('tool', 'process', { turnId: undefined, createdAt: 1500, processState: 'completed' }),
       item('assistant-text', 'assistant', { turnId: undefined, createdAt: 2000 }),
     ]);
 
     expect(result).toEqual([
-      { type: 'process_receipt', id: 'receipt-thinking', itemId: 'thinking' },
+      { type: 'process_receipt', id: 'receipt-scan', itemId: 'scan' },
       { type: 'process_receipt', id: 'receipt-tool', itemId: 'tool' },
       { type: 'item', id: 'assistant-text' },
     ]);
@@ -247,7 +369,7 @@ describe('assignTurnIdsFromUserRequests', () => {
   test('groups all assistant and process messages after one user request into the same turn', () => {
     const result = assignTurnIdsFromUserRequests([
       item('user', 'user', { turnId: undefined, createdAt: 1000 }),
-      item('thinking', 'process', { turnId: undefined, createdAt: 1500 }),
+      item('scan', 'process', { turnId: undefined, createdAt: 1500 }),
       item('progress', 'assistant', { turnId: undefined, createdAt: 2000 }),
       item('tool', 'process', { turnId: undefined, createdAt: 2500 }),
       item('final', 'assistant', { turnId: undefined, createdAt: 3000 }),

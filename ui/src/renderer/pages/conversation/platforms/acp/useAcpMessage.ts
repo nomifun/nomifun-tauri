@@ -14,9 +14,9 @@ import { useAddOrUpdateMessage } from '@/renderer/pages/conversation/Messages/ho
 import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conversationCache';
 import { isConversationProcessing } from '@/renderer/pages/conversation/utils/conversationRuntime';
 import { warmupConversation } from '@/renderer/pages/conversation/utils/warmupConversation';
-import type { ThoughtData } from '@/renderer/components/chat/ThoughtDisplay';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
-import { acpTurnReducer, initialAcpTurnState, isAcpTurnBusy, shouldShowAcpBottomProcessing } from './acpTurnState';
+import type { ThoughtData } from '../thoughtTypes';
+import { acpTurnReducer, initialAcpTurnState, isAcpTurnBusy } from './acpTurnState';
 
 export type UseAcpMessageReturn = {
   thought: ThoughtData;
@@ -39,7 +39,7 @@ export const useAcpMessage = (conversation_id: number, options?: { skipWarmup?: 
   const addOrUpdateMessage = useAddOrUpdateMessage();
   const [turnState, dispatchTurn] = useReducer(acpTurnReducer, initialAcpTurnState);
   const running = isAcpTurnBusy(turnState);
-  const aiProcessing = shouldShowAcpBottomProcessing(turnState);
+  const aiProcessing = running;
   const [hasHydratedRunningState, setHasHydratedRunningState] = useState(false);
   const [thought, setThought] = useState<ThoughtData>({
     description: '',

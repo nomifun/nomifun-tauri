@@ -18,7 +18,9 @@ const createInitStyle = (
   currentTheme = 'light',
   cssVars?: Record<string, string>,
   customCss?: string,
-  isMobile?: boolean
+  isMobile?: boolean,
+  fontSize?: string,
+  lineHeight?: string
 ) => {
   const style = document.createElement('style');
   // Inject external CSS variables into Shadow DOM for dark mode support
@@ -28,8 +30,9 @@ const createInitStyle = (
         .join('\n    ')
     : '';
 
-  const lineHeight = isMobile ? '19.6px' : '28px';
-  const fontSize = isMobile ? '14px' : '16px';
+  const resolvedFontSize = fontSize ?? (isMobile ? '14px' : '16px');
+  const resolvedLineHeight = lineHeight ?? (isMobile ? '19.6px' : '28px');
+  const usesExplicitTypography = Boolean(fontSize || lineHeight);
 
   style.innerHTML = `
   /* Shadow DOM CSS variable definitions */
@@ -38,8 +41,8 @@ const createInitStyle = (
   }
 
   * {
-    line-height:${lineHeight};
-    font-size:${fontSize};
+    line-height:${resolvedLineHeight};
+    font-size:${resolvedFontSize};
     color: inherit;
   }
 
@@ -58,12 +61,12 @@ const createInitStyle = (
     margin-block-end:0px;
   }
   .markdown-shadow-body p {
-    margin-block-start: 16px;
-    margin-block-end: 16px;
+    margin-block-start: ${usesExplicitTypography ? '10px' : '16px'};
+    margin-block-end: ${usesExplicitTypography ? '10px' : '16px'};
   }
   .markdown-shadow-body li {
-    margin-block-start: 6px;
-    margin-block-end: 6px;
+    margin-block-start: ${usesExplicitTypography ? '4px' : '6px'};
+    margin-block-end: ${usesExplicitTypography ? '4px' : '6px'};
   }
   a{
     color:${theme.Color.PrimaryColor};
@@ -73,16 +76,16 @@ const createInitStyle = (
     overflow-wrap: anywhere;
   }
   h1{
-    font-size: 24px;
-    line-height: 32px;
+    font-size: ${usesExplicitTypography ? resolvedFontSize : '24px'};
+    line-height: ${usesExplicitTypography ? resolvedLineHeight : '32px'};
     font-weight: bold;
   }
   h2,h3,h4,h5,h6{
-    font-size: 16px;
-    line-height: 24px;
+    font-size: ${usesExplicitTypography ? resolvedFontSize : '16px'};
+    line-height: ${usesExplicitTypography ? resolvedLineHeight : '24px'};
     font-weight: bold;
-    margin-top: 20px;
-    margin-bottom: 12px;
+    margin-top: ${usesExplicitTypography ? '12px' : '20px'};
+    margin-bottom: ${usesExplicitTypography ? '8px' : '12px'};
   }
   code span{
     font-size:13px;
@@ -258,7 +261,15 @@ const getKatexStyleSheet = (): CSSStyleSheet | null => {
 
 type ShadowDivElement = HTMLDivElement & { __init__shadow?: boolean };
 
-const ShadowView = ({ children }: { children: React.ReactNode }) => {
+const ShadowView = ({
+  children,
+  fontSize,
+  lineHeight,
+}: {
+  children: React.ReactNode;
+  fontSize?: string;
+  lineHeight?: string;
+}) => {
   const [root, setRoot] = useState<ShadowRoot | null>(null);
   const styleRef = React.useRef<HTMLStyleElement | null>(null);
   const [customCss, setCustomCss] = useState<string>('');
@@ -310,7 +321,7 @@ const ShadowView = ({ children }: { children: React.ReactNode }) => {
       if (styleRef.current) {
         styleRef.current.remove();
       }
-      const newStyle = createInitStyle(currentTheme, cssVars, customCss, isMobile);
+      const newStyle = createInitStyle(currentTheme, cssVars, customCss, isMobile, fontSize, lineHeight);
       styleRef.current = newStyle;
       shadowRoot.appendChild(newStyle);
 
@@ -321,7 +332,7 @@ const ShadowView = ({ children }: { children: React.ReactNode }) => {
         shadowRoot.adoptedStyleSheets = [...shadowRoot.adoptedStyleSheets, katexSheet];
       }
     },
-    [customCss, isMobile]
+    [customCss, fontSize, isMobile, lineHeight]
   );
 
   React.useEffect(() => {

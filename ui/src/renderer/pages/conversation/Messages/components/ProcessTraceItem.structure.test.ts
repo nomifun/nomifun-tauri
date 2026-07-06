@@ -18,29 +18,22 @@ describe('ProcessTraceItem Codex-style execution rows', () => {
     expect(source.includes('messages.toolDetailOutput')).toBe(true);
   });
 
-  test('keeps completed thinking as Codex-style process evidence, not legacy standalone thinking', () => {
-    expect(source.includes('thinkingCompletedWithDuration')).toBe(false);
-    expect(source.includes('formatProcessDuration')).toBe(false);
-    expect(source.includes("if (item.content.status === 'done') return null;")).toBe(false);
-    expect(source.includes('ThinkingTraceRow')).toBe(true);
-    expect(source.includes('messages.processReceipt.thinkingCompletedDuration')).toBe(true);
-  });
-
-  test('renders readable thinking as solid process text without a toggle row', () => {
-    expect(source.includes('const thinkingClassName = classNames(')).toBe(true);
-    expect(source.includes("variant === 'receipt' && 'turn-process-trace-receipt-detail'")).toBe(true);
-    expect(source.includes("variant !== 'receipt' && 'turn-process-trace'")).toBe(true);
-    expect(source.includes("variant !== 'receipt' && 'turn-process-trace-thinking-inline'")).toBe(true);
-  });
-
-  test('does not use default-expanded thinking toggles for readable thinking text', () => {
+  test('renders thinking as neutral process content instead of legacy receipts', () => {
+    expect(source.includes('ThinkingStreamPanel')).toBe(false);
+    expect(source.includes('useStreamingThinkingText')).toBe(false);
+    expect(source.includes('shouldAutoCollapseThinkingStreamPanel')).toBe(false);
+    expect(source.includes('turn-process-thinking-stream')).toBe(false);
+    expect(source.includes("case 'thinking':")).toBe(true);
+    expect(source.includes('<MessageThinking message={item} variant')).toBe(true);
+    expect(source.includes('ThinkingTraceRow')).toBe(false);
+    expect(source.includes('messages.processReceipt.thinkingCompletedDuration')).toBe(false);
+    expect(source.includes('messages.processReceipt.thinkingRunning')).toBe(false);
+    expect(source.includes('messages.processReceipt.thinkingWaiting')).toBe(false);
+    expect(source.includes('turn-process-trace-thinking-inline')).toBe(false);
     expect(source.includes('defaultExpanded={shouldShowThinkingReceiptDetail(item.content)}')).toBe(false);
-    expect(source.includes('defaultExpanded?: boolean')).toBe(false);
   });
 
-  test('renders running thinking and context compression as lightweight process rows', () => {
-    expect(source.includes('messages.processReceipt.thinkingRunning')).toBe(true);
-    expect(source.includes('messages.processReceipt.thinkingWaiting')).toBe(true);
+  test('renders context compression as lightweight process rows', () => {
     expect(source.includes('messages.processReceipt.contextCompressed')).toBe(true);
   });
 
@@ -55,5 +48,11 @@ describe('ProcessTraceItem Codex-style execution rows', () => {
     expect(source.includes('turn-process-trace-file-list')).toBe(true);
     expect(source.includes('messages.processReceipt.readTargets')).toBe(true);
     expect(source.includes('messages.processReceipt.fileEditTargets')).toBe(true);
+  });
+
+  test('can render closed process details with an effective state override', () => {
+    expect(source.includes('stateOverride?: TurnDisclosureProcessState')).toBe(true);
+    expect(source.includes('const state = stateOverride ?? getProcessItemState(item);')).toBe(true);
+    expect(source.includes('stateOverride={stateOverride}')).toBe(true);
   });
 });

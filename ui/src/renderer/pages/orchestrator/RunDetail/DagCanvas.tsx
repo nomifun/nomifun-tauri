@@ -287,8 +287,8 @@ interface DagCanvasProps {
  * conversation into the content area through `onOpenTask`.
  *
  * The synthetic lead/main agent node was REMOVED (需求5): the main agent is a
- * through-line, not a first node — its narration lives in the conversation
- * (receipts + ClusterProgressStrip), so the canvas shows ONLY the real task DAG.
+ * through-line, not a first node — its narration lives in receipts and the
+ * canvas-side progress summary, so the canvas shows ONLY the real task DAG.
  *
  * Positions prefer the task's persisted `graph_x/graph_y` and otherwise fall
  * back to a topological auto-layout ({@link layoutDag}). react-flow's JS-side

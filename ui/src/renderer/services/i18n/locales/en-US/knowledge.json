@@ -11,10 +11,13 @@
     "delete": "Delete",
     "deleteConfirm": "Delete this knowledge base?",
     "deleteFileConfirm": "Delete this document?",
+    "deleteFolderOk": "Folder deleted",
     "deleteOk": "Deleted",
     "deleteWithFiles": "Also delete files in the directory",
     "edit": "Edit",
     "openFolder": "Open folder",
+    "rename": "Rename",
+    "renameOk": "Renamed",
     "save": "Save",
     "saveOk": "Saved",
     "viewDetail": "View details"
@@ -447,6 +450,12 @@
     "modalTitle": "Manage Tags",
     "renameFailed": "Failed to rename tag",
     "renameHint": "Click to rename"
+  },
+  "renamePlaceholder": "Enter a new name",
+  "renameTitle": "Rename",
+  "tree": {
+    "deleteFolderTitle": "Delete folder?",
+    "deleteFolderWarning": "Deleting “{{name}}” will remove all documents and subfolders inside it. This cannot be undone."
   },
   "title": "Knowledge"
 }

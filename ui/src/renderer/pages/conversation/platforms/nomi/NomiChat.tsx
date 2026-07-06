@@ -9,7 +9,6 @@ import type { ConversationContextValue } from '@/renderer/hooks/context/Conversa
 import { ConversationProvider } from '@/renderer/hooks/context/ConversationContext';
 import FlexFullContainer from '@renderer/components/layout/FlexFullContainer';
 import MessageList from '@renderer/pages/conversation/Messages/MessageList';
-import PinnedPlan from '@renderer/pages/conversation/Messages/components/PinnedPlan';
 import { ConversationArtifactProvider } from '@renderer/pages/conversation/Messages/artifacts';
 import {
   MessageListLoadingProvider,
@@ -117,7 +116,6 @@ const NomiChat: React.FC<{
               loadingOlder={historyPaging.loadingOlder}
             />
           </FlexFullContainer>
-          <PinnedPlan />
           {!hideSendBox && (
             <NomiSendBox
               conversation_id={conversation_id}

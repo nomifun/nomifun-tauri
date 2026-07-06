@@ -268,6 +268,49 @@ async fn settings_roundtrip() {
 }
 
 #[tokio::test]
+async fn settings_update_clears_optional_backup_fields_when_absent() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let initial = json!({
+        "backup_provider_id": "prov-old",
+        "backup_model": "model-old",
+        "default_steering_prompt": "old policy"
+    });
+    let resp = app
+        .clone()
+        .oneshot(json_with_token("PUT", "/api/idmm/settings", initial, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let cleared = json!({ "default_steering_prompt": "" });
+    let resp = app
+        .clone()
+        .oneshot(json_with_token("PUT", "/api/idmm/settings", cleared, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/api/idmm/settings", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let j = body_json(resp).await;
+    assert!(
+        j["data"].get("backup_provider_id").is_none() || j["data"]["backup_provider_id"].is_null(),
+        "clearing the global backup provider must remove the stored preference; got {j:?}"
+    );
+    assert!(
+        j["data"].get("backup_model").is_none() || j["data"]["backup_model"].is_null(),
+        "clearing the global backup model must remove the stored preference; got {j:?}"
+    );
+    assert_eq!(j["data"]["default_steering_prompt"], "");
+}
+
+#[tokio::test]
 async fn terminal_target_unknown_kind_is_rejected() {
     let (mut app, services) = build_app().await;
     let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;

@@ -11,8 +11,14 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import styles from './MessageThinking.module.css';
 
-const MessageThinking: React.FC<{ message: IMessageThinking }> = ({ message }) => {
+interface MessageThinkingProps {
+  message: IMessageThinking;
+  variant?: 'standalone' | 'process';
+}
+
+const MessageThinking: React.FC<MessageThinkingProps> = ({ message, variant = 'standalone' }) => {
   const { t } = useTranslation();
+  const isProcessVariant = variant === 'process';
 
   const formatElapsedTime = (seconds: number): string => {
     const sUnit = t('common.unit.second_short', { defaultValue: 's' });
@@ -26,20 +32,13 @@ const MessageThinking: React.FC<{ message: IMessageThinking }> = ({ message }) =
 
   const { content: text, status, subject } = message.content;
   const isDone = status === 'done';
-  const [expanded, setExpanded] = useState(!isDone);
+  const [expanded, setExpanded] = useState(true);
   const [elapsedTime, setElapsedTime] = useState(() => {
     const initialStartedAt = message.created_at ?? Date.now();
     return isDone ? 0 : Math.max(0, Math.floor((Date.now() - initialStartedAt) / 1000));
   });
   const startTimeRef = useRef<number>(message.created_at ?? Date.now());
   const bodyRef = useRef<HTMLDivElement>(null);
-
-  // Auto-collapse when status changes to done
-  useEffect(() => {
-    if (isDone) {
-      setExpanded(false);
-    }
-  }, [isDone]);
 
   // Elapsed timer for active thinking
   useEffect(() => {
@@ -66,15 +65,21 @@ const MessageThinking: React.FC<{ message: IMessageThinking }> = ({ message }) =
     : `${subject || t('conversation.thinking.label', { defaultValue: 'Thinking...' })} · ${formatElapsedTime(elapsedTime)}`;
 
   return (
-    <div className={styles.container}>
-      <div className={styles.header} onClick={() => setExpanded((v) => !v)}>
+    <div className={`${styles.container} ${isProcessVariant ? styles.containerProcess : ''}`}>
+      <div
+        className={`${styles.header} ${isProcessVariant ? styles.headerProcess : ''}`}
+        onClick={() => setExpanded((v) => !v)}
+      >
         <span className={styles.headerIcon}>{!isDone ? <Spin size={12} /> : <Brain theme='outline' size='14' />}</span>
         <span className={styles.summary}>{summaryText}</span>
         <span className={`${styles.arrow} ${expanded ? styles.arrowExpanded : ''}`}>
           <Right theme='outline' size='12' />
         </span>
       </div>
-      <div ref={bodyRef} className={`${styles.body} ${!expanded ? styles.collapsed : ''}`}>
+      <div
+        ref={bodyRef}
+        className={`${styles.body} ${isProcessVariant ? styles.bodyProcess : ''} ${!expanded ? styles.collapsed : ''}`}
+      >
         {text}
       </div>
     </div>

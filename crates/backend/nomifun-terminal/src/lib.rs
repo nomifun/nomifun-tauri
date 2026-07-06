@@ -12,6 +12,7 @@ pub mod pty;
 pub mod routes;
 pub mod service;
 pub mod state;
+pub mod submit;
 pub mod title;
 pub mod types;
 
@@ -21,6 +22,7 @@ pub use enhance::{apply_enhancement, resolve_agent_family, terminal_autowork_cap
 pub use events::TerminalEventEmitter;
 pub use lifecycle::{LifecycleKind, TerminalLifecycleEvent, TerminalLifecycleServer};
 pub use routes::terminal_routes;
-pub use service::{TerminalService, TerminalSupervisionHook};
+pub use service::{TerminalService, TerminalSupervisionHook, TerminalOutputTail};
 pub use state::TerminalRouterState;
+pub use submit::{encode_submit_chunks, SubmitChunks, SettleReason, IDLE_SETTLE_WINDOW, TERMINAL_SUBMIT_DELAY};
 pub use title::{TerminalTitleCompleter, clamp_title, fallback_title, TITLE_MAX_CHARS};
