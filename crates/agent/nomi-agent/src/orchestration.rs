@@ -14,6 +14,11 @@ use nomi_types::tool::ToolResult;
 
 use nomi_tools::registry::ToolRegistry;
 
+const RECOVERED_PARTIAL_WRITE_KEY: &str = "__nomi_recovered_partial_write";
+const RECOVERED_PARTIAL_WRITE_RESULT_HINT: &str = "\
+Recovered a partial Write from an output-token cutoff. The file now contains the generated prefix only. \
+Read the file, inspect the tail, then append or edit small chunks until the deliverable is complete before finalizing.";
+
 /// The combined output of a tool execution batch: protocol content blocks
 /// paired with per-call context modifiers (None for non-skill tools).
 pub struct ToolCallOutcome {
@@ -158,6 +163,19 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+fn append_recovered_partial_write_hint(tool_name: &str, input: &serde_json::Value, content: String) -> String {
+    if tool_name == "Write"
+        && input
+            .get(RECOVERED_PARTIAL_WRITE_KEY)
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        format!("{content}\n\n{RECOVERED_PARTIAL_WRITE_RESULT_HINT}")
+    } else {
+        content
+    }
+}
+
 async fn execute_single(
     registry: &ToolRegistry,
     call: &ContentBlock,
@@ -235,6 +253,7 @@ async fn execute_single(
             } else {
                 r.content.clone()
             };
+            let error_content = append_recovered_partial_write_hint(name, input, error_content);
             let content = truncate_result(&error_content, max_size);
             let content = nomi_compact::compact_output(&content, compaction_level);
             let content = if toon_enabled {
@@ -965,6 +984,49 @@ mod tests {
                 "secret must be redacted, got: {content}"
             );
             assert!(content.contains("REDACTED"), "should show a redaction placeholder: {content}");
+        } else {
+            panic!("expected ToolResult");
+        }
+    }
+
+    #[tokio::test]
+    async fn recovered_partial_write_result_tells_model_to_continue() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(
+            nomi_tools::write::WriteTool::new(None).with_cwd(Some(dir.path().to_path_buf())),
+        ));
+        let call = ContentBlock::ToolUse {
+            id: "partial-write".into(),
+            name: "Write".into(),
+            input: json!({
+                "file_path": "index.html",
+                "content": "<html><body>partial",
+                RECOVERED_PARTIAL_WRITE_KEY: true
+            }),
+            extra: None,
+        };
+
+        let (result, _) = execute_single(
+            &registry,
+            &call,
+            None,
+            nomi_compact::CompactionLevel::Off,
+            false,
+        )
+        .await;
+
+        let written = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
+        assert_eq!(written, "<html><body>partial");
+        if let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &result
+        {
+            assert!(!is_error);
+            assert!(content.contains("Created"));
+            assert!(content.contains("Recovered a partial Write from an output-token cutoff"));
+            assert!(content.contains("Read the file"));
+            assert!(content.contains("append or edit small chunks"));
         } else {
             panic!("expected ToolResult");
         }

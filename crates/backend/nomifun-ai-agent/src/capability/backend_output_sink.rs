@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -18,6 +19,18 @@ pub struct BackendOutputSink {
     /// Accumulates this turn's assistant text so the `<nomi-mem-citation>`
     /// block can be parsed at stream end. Reset on each stream start.
     turn_text: Mutex<String>,
+    /// Tool calls that have been announced to the frontend but have not yet
+    /// produced a tool result. Used to resolve partial provider tool-call
+    /// streams before an automatic continuation pass.
+    active_tool_calls: Mutex<HashMap<String, ActiveToolCall>>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveToolCall {
+    call_id: String,
+    name: String,
+    args: serde_json::Value,
+    input: Option<serde_json::Value>,
 }
 
 /// Parse the `update_plan` tool result content into frontend plan entries.
@@ -38,6 +51,7 @@ impl BackendOutputSink {
             event_tx,
             distill_dir: None,
             turn_text: Mutex::new(String::new()),
+            active_tool_calls: Mutex::new(HashMap::new()),
         }
     }
 
@@ -54,6 +68,80 @@ impl BackendOutputSink {
             None
         } else {
             Some(format!("nomi-{id}"))
+        }
+    }
+
+    fn remember_active_tool_call(
+        &self,
+        call_id: String,
+        name: String,
+        args: serde_json::Value,
+        input: Option<serde_json::Value>,
+    ) {
+        match self.active_tool_calls.lock() {
+            Ok(mut active) => {
+                active.insert(
+                    call_id.clone(),
+                    ActiveToolCall {
+                        call_id,
+                        name,
+                        args,
+                        input,
+                    },
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "Failed to record active tool call for continuation cleanup"
+                );
+            }
+        }
+    }
+
+    fn forget_active_tool_call(&self, call_id: &str) {
+        match self.active_tool_calls.lock() {
+            Ok(mut active) => {
+                active.remove(call_id);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "Failed to clear active tool call after tool result"
+                );
+            }
+        }
+    }
+
+    pub(crate) fn complete_active_tool_calls_for_auto_continue(&self, reason: &str) {
+        let interrupted: Vec<ActiveToolCall> = match self.active_tool_calls.lock() {
+            Ok(mut active) => active.drain().map(|(_, data)| data).collect(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "Failed to resolve active tool calls before automatic continuation"
+                );
+                Vec::new()
+            }
+        };
+
+        if interrupted.is_empty() {
+            return;
+        }
+
+        let output = format!(
+            "Automatic continuation recovered from {reason}; this partial tool call was skipped and the task is continuing in smaller steps."
+        );
+        for active in interrupted {
+            let _ = self.event_tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+                call_id: active.call_id,
+                name: active.name,
+                args: active.args,
+                status: ToolCallStatus::Completed,
+                input: active.input,
+                output: Some(output.clone()),
+                description: Some("Automatic continuation".to_owned()),
+            }));
         }
     }
 
@@ -114,6 +202,13 @@ impl OutputSink for BackendOutputSink {
             "Emitting nomi tool_call progress event"
         );
 
+        self.remember_active_tool_call(
+            call_id.clone(),
+            name.to_owned(),
+            parsed_input.clone().unwrap_or(serde_json::Value::Null),
+            parsed_input.clone(),
+        );
+
         let _ = self.event_tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
             call_id,
             name: name.to_owned(),
@@ -159,6 +254,13 @@ impl OutputSink for BackendOutputSink {
             "Emitting nomi tool_call event"
         );
 
+        self.remember_active_tool_call(
+            call_id.clone(),
+            name.to_owned(),
+            parsed_input.clone(),
+            Some(parsed_input.clone()),
+        );
+
         let _ = self.event_tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
             call_id,
             name: name.to_owned(),
@@ -188,6 +290,8 @@ impl OutputSink for BackendOutputSink {
             tracing::error!(tool = name, "Cannot emit tool_result with empty tool_use_id");
             return;
         };
+
+        self.forget_active_tool_call(&call_id);
 
         let status = if is_error {
             ToolCallStatus::Error
@@ -345,6 +449,48 @@ mod tests {
             }
             other => panic!("Expected ToolCall, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn complete_active_tool_calls_for_auto_continue_marks_pending_tool_completed() {
+        let (sink, mut rx) = make_sink();
+        sink.emit_tool_call_delta(
+            "call_write_1",
+            "Write",
+            Some(r#"{"file_path":"/tmp/index.html"}"#),
+        );
+        let _running = rx.try_recv().unwrap();
+
+        sink.complete_active_tool_calls_for_auto_continue("output token limit");
+
+        match rx.try_recv().unwrap() {
+            AgentStreamEvent::ToolCall(data) => {
+                assert_eq!(data.call_id, "nomi-call_write_1");
+                assert_eq!(data.name, "Write");
+                assert_eq!(data.status, ToolCallStatus::Completed);
+                assert_eq!(data.input.as_ref().unwrap()["file_path"], "/tmp/index.html");
+                assert!(
+                    data.output
+                        .as_deref()
+                        .unwrap()
+                        .contains("Automatic continuation recovered from output token limit")
+                );
+            }
+            other => panic!("Expected ToolCall, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn complete_active_tool_calls_for_auto_continue_ignores_finished_tool() {
+        let (sink, mut rx) = make_sink();
+        sink.emit_tool_call("call_read_1", "Read", r#"{"path":"/tmp/a.txt"}"#);
+        let _running = rx.try_recv().unwrap();
+        sink.emit_tool_result("call_read_1", "Read", false, "ok");
+        let _completed = rx.try_recv().unwrap();
+
+        sink.complete_active_tool_calls_for_auto_continue("output token limit");
+
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

@@ -1026,6 +1026,8 @@ const TOOL_PROGRESS_PREVIEW_FIELDS: &[&str] = &[
     "skill",
 ];
 
+const RECOVERED_PARTIAL_WRITE_KEY: &str = "__nomi_recovered_partial_write";
+
 fn tool_argument_value_progress_preview(input: &Value) -> Option<Value> {
     let Value::Object(map) = input else {
         return None;
@@ -1151,6 +1153,231 @@ fn extract_json_string_field(arguments: &str, key: &str) -> Option<String> {
     }
 
     None
+}
+
+fn extract_json_string_field_lossy(arguments: &str, key: &str) -> Option<String> {
+    if let Some(value) = extract_json_string_field(arguments, key) {
+        return Some(value);
+    }
+
+    let quoted_key = format!("\"{key}\"");
+    let mut search_from = 0usize;
+
+    while let Some(relative_pos) = arguments[search_from..].find(&quoted_key) {
+        let mut cursor = search_from + relative_pos + quoted_key.len();
+        cursor = skip_json_whitespace(arguments, cursor);
+        if arguments[cursor..].chars().next()? != ':' {
+            search_from = cursor;
+            continue;
+        }
+        cursor += ':'.len_utf8();
+        cursor = skip_json_whitespace(arguments, cursor);
+        if arguments[cursor..].chars().next()? != '"' {
+            search_from = cursor;
+            continue;
+        }
+        cursor += '"'.len_utf8();
+
+        let mut escaped = false;
+        for (offset, ch) in arguments[cursor..].char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                let end = cursor + offset;
+                return decode_json_string_fragment_lossy(&arguments[cursor..end]);
+            }
+        }
+
+        return decode_json_string_fragment_lossy(&arguments[cursor..]);
+    }
+
+    None
+}
+
+fn decode_json_string_fragment_lossy(raw: &str) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+
+    let mut decoded = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('"') => decoded.push('"'),
+            Some('\\') => decoded.push('\\'),
+            Some('/') => decoded.push('/'),
+            Some('b') => decoded.push('\u{0008}'),
+            Some('f') => decoded.push('\u{000C}'),
+            Some('n') => decoded.push('\n'),
+            Some('r') => decoded.push('\r'),
+            Some('t') => decoded.push('\t'),
+            Some('u') => {
+                let mut hex = String::with_capacity(4);
+                for _ in 0..4 {
+                    if let Some(h) = chars.next() {
+                        hex.push(h);
+                    }
+                }
+                if hex.len() == 4
+                    && let Ok(code) = u32::from_str_radix(&hex, 16)
+                    && let Some(c) = char::from_u32(code)
+                {
+                    decoded.push(c);
+                }
+            }
+            Some(other) => decoded.push(other),
+            None => break,
+        }
+    }
+
+    Some(decoded)
+}
+
+fn partial_write_input(file_path: String, content: String) -> Option<Value> {
+    if file_path.trim().is_empty() || content.trim().is_empty() {
+        return None;
+    }
+
+    Some(json!({
+        "file_path": file_path,
+        "content": content,
+        RECOVERED_PARTIAL_WRITE_KEY: true
+    }))
+}
+
+fn partial_write_input_from_jsonish(arguments: &str) -> Option<Value> {
+    let file_path = extract_json_string_field_lossy(arguments, "file_path")
+        .or_else(|| extract_json_string_field_lossy(arguments, "filePath"))
+        .or_else(|| extract_json_string_field_lossy(arguments, "path"))?;
+    let content = extract_json_string_field_lossy(arguments, "content")?;
+    partial_write_input(file_path, content)
+}
+
+fn partial_write_input_from_text_block(block: &str) -> Option<Value> {
+    if block.starts_with('{') {
+        let name = extract_json_string_field_lossy(block, "name")?;
+        if name.trim() != "Write" {
+            return None;
+        }
+        return partial_write_input_from_jsonish(block);
+    }
+
+    let name = str_between(block, "<function=", ">")?.trim();
+    if name != "Write" {
+        return None;
+    }
+    let file_path = extract_xml_parameter_text(block, "file_path")
+        .or_else(|| extract_xml_parameter_text(block, "filePath"))
+        .or_else(|| extract_xml_parameter_text(block, "path"))?;
+    let content = extract_xml_parameter_text(block, "content")?;
+    partial_write_input(file_path, content)
+}
+
+fn recover_length_structured_tool_calls(
+    state: &mut StreamState,
+    auto_tool_id: bool,
+) -> Vec<LlmEvent> {
+    let mut events = Vec::new();
+
+    for tc in state.tool_calls.drain(..) {
+        if tc.name.trim().is_empty() {
+            continue;
+        }
+        let id = if tc.id.is_empty() && auto_tool_id {
+            generate_call_id()
+        } else {
+            tc.id
+        };
+        if id.trim().is_empty() {
+            continue;
+        }
+
+        if let Ok(input) = serde_json::from_str::<Value>(&tc.arguments) {
+            events.push(LlmEvent::ToolUse {
+                id,
+                name: tc.name,
+                input,
+                extra: tc.extra,
+            });
+            continue;
+        }
+
+        if tc.name == "Write"
+            && let Some(input) = partial_write_input_from_jsonish(&tc.arguments)
+        {
+            events.push(LlmEvent::ToolUse {
+                id,
+                name: tc.name,
+                input,
+                extra: tc.extra,
+            });
+        }
+    }
+
+    events
+}
+
+fn text_tool_call_blocks(text: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("<tool_call>") {
+        let after = &rest[start + "<tool_call>".len()..];
+        match after.find("</tool_call>") {
+            Some(end) => {
+                out.push((after[..end].to_string(), true));
+                rest = &after[end + "</tool_call>".len()..];
+            }
+            None => {
+                out.push((after.to_string(), false));
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn recover_length_text_tool_calls(state: &mut StreamState) -> Vec<LlmEvent> {
+    let mut blocks = text_tool_call_blocks(&state.reasoning_buf);
+    if blocks.is_empty() {
+        blocks = text_tool_call_blocks(&state.content_buf);
+    }
+
+    let mut events = Vec::new();
+    for (index, (block, closed)) in blocks.into_iter().enumerate() {
+        if closed {
+            continue;
+        }
+        let Some(input) = partial_write_input_from_text_block(block.trim()) else {
+            continue;
+        };
+        let progress = state.get_or_create_text_tool(index);
+        if progress.id.is_empty() {
+            progress.id = generate_call_id();
+        }
+        events.push(LlmEvent::ToolUse {
+            id: progress.id.clone(),
+            name: "Write".to_string(),
+            input,
+            extra: None,
+        });
+    }
+
+    if events.is_empty() {
+        recover_text_tool_calls(state).unwrap_or_default()
+    } else {
+        events
+    }
 }
 
 fn skip_json_whitespace(input: &str, mut index: usize) -> usize {
@@ -1376,10 +1603,22 @@ fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id: bool) -> V
                 }
             }
             "length" => {
-                state.pending_done = Some(LlmEvent::Done {
-                    stop_reason: StopReason::MaxTokens,
-                    usage: TokenUsage::default(),
-                });
+                let mut recovered = recover_length_structured_tool_calls(state, auto_tool_id);
+                if recovered.is_empty() {
+                    recovered = recover_length_text_tool_calls(state);
+                }
+                if recovered.is_empty() {
+                    state.pending_done = Some(LlmEvent::Done {
+                        stop_reason: StopReason::MaxTokens,
+                        usage: TokenUsage::default(),
+                    });
+                } else {
+                    events.extend(recovered);
+                    state.pending_done = Some(LlmEvent::Done {
+                        stop_reason: StopReason::ToolUse,
+                        usage: TokenUsage::default(),
+                    });
+                }
             }
             _ => {}
         }
@@ -1392,6 +1631,7 @@ fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id: bool) -> V
 mod tests {
     use super::{parse_sse_chunk, parse_text_tool_calls, StreamState};
     use nomi_types::llm::LlmEvent;
+    use nomi_types::message::StopReason;
     use serde_json::json;
 
     /// Qwen XML form (the exact shape step-3.7-flash emitted in session 18 that
@@ -1472,6 +1712,63 @@ mod tests {
                 .all(|event| !matches!(event, LlmEvent::ThinkingDelta(_) | LlmEvent::TextDelta(_))),
             "text-form tool call markup should not be streamed as visible assistant or thinking text"
         );
+    }
+
+    #[test]
+    fn length_finish_recovers_partial_structured_write_tool_call() {
+        let mut state = StreamState::new();
+
+        let chunk = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_write","type":"function","function":{"name":"Write","arguments":"{\"file_path\":\"/tmp/index.html\",\"content\":\"<html><body>hello"}}]},"finish_reason":"length","index":0}]}"#;
+        let events = parse_sse_chunk(chunk, &mut state, true);
+
+        let recovered = events
+            .iter()
+            .find_map(|event| match event {
+                LlmEvent::ToolUse { id, name, input, .. } => Some((id, name, input)),
+                _ => None,
+            })
+            .expect("length-truncated Write arguments should be recovered as an executable tool call");
+
+        assert_eq!(recovered.0, "call_write");
+        assert_eq!(recovered.1, "Write");
+        assert_eq!(recovered.2["file_path"], "/tmp/index.html");
+        assert_eq!(recovered.2["content"], "<html><body>hello");
+        assert_eq!(recovered.2[super::RECOVERED_PARTIAL_WRITE_KEY], true);
+        assert!(matches!(
+            state.pending_done,
+            Some(LlmEvent::Done {
+                stop_reason: StopReason::ToolUse,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn length_finish_recovers_partial_text_write_tool_call() {
+        let mut state = StreamState::new();
+
+        let chunk = r#"{"choices":[{"delta":{"reasoning_content":"<tool_call>{\"name\":\"Write\",\"arguments\":{\"file_path\":\"/tmp/index.html\",\"content\":\"<main>hello"},"finish_reason":"length","index":0}]}"#;
+        let events = parse_sse_chunk(chunk, &mut state, true);
+
+        let recovered = events
+            .iter()
+            .find_map(|event| match event {
+                LlmEvent::ToolUse { name, input, .. } => Some((name, input)),
+                _ => None,
+            })
+            .expect("length-truncated text-form Write should be recovered as an executable tool call");
+
+        assert_eq!(recovered.0, "Write");
+        assert_eq!(recovered.1["file_path"], "/tmp/index.html");
+        assert_eq!(recovered.1["content"], "<main>hello");
+        assert_eq!(recovered.1[super::RECOVERED_PARTIAL_WRITE_KEY], true);
+        assert!(matches!(
+            state.pending_done,
+            Some(LlmEvent::Done {
+                stop_reason: StopReason::ToolUse,
+                ..
+            })
+        ));
     }
 
     #[test]
