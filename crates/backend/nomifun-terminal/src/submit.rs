@@ -52,6 +52,21 @@ pub fn encode_submit_chunks(text: &str, is_agent_tui: bool) -> SubmitChunks {
     }
 }
 
+/// Why `await_turn_settle` returned. `Idle` is a heuristic (output went quiet),
+/// never a definitive "the agent declared done" — reported honestly as such.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettleReason {
+    /// A structured `TurnEnd` lifecycle event arrived (claude/codex).
+    TurnEnd,
+    /// No lifecycle signal (shell/gemini); PTY output was quiet for the window.
+    Idle,
+    /// Neither TurnEnd nor an idle window before the caller's timeout.
+    Timeout,
+    /// The PTY exited during the wait.
+    Exited,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -24,5 +24,5 @@ pub use lifecycle::{LifecycleKind, TerminalLifecycleEvent, TerminalLifecycleServ
 pub use routes::terminal_routes;
 pub use service::{TerminalService, TerminalSupervisionHook};
 pub use state::TerminalRouterState;
-pub use submit::{encode_submit_chunks, SubmitChunks, IDLE_SETTLE_WINDOW, TERMINAL_SUBMIT_DELAY};
+pub use submit::{encode_submit_chunks, SubmitChunks, SettleReason, IDLE_SETTLE_WINDOW, TERMINAL_SUBMIT_DELAY};
 pub use title::{TerminalTitleCompleter, clamp_title, fallback_title, TITLE_MAX_CHARS};

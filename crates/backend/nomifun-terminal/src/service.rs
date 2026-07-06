@@ -906,6 +906,72 @@ impl TerminalService {
         }
     }
 
+    /// Wait for a terminal turn to settle after a submit. Agent CLIs with
+    /// lifecycle hooks (claude/codex) resolve via the structured `TurnEnd` event;
+    /// shells and gemini fall back to an output-quiescence window
+    /// (`IDLE_SETTLE_WINDOW`). Never dresses `Idle` up as definitive completion.
+    pub async fn await_turn_settle(
+        &self,
+        id: i64,
+        timeout: std::time::Duration,
+    ) -> crate::submit::SettleReason {
+        use crate::submit::SettleReason;
+
+        let desc = match self.describe(id).await {
+            Ok(Some(d)) => d,
+            _ => return SettleReason::Exited,
+        };
+        let lifecycle_capable = crate::enhance::terminal_autowork_capable(
+            &desc.command,
+            &desc.args,
+            desc.backend.as_deref(),
+        );
+
+        if lifecycle_capable {
+            if let Some(mut rx) = self.subscribe_lifecycle(id) {
+                let fut = async {
+                    loop {
+                        match rx.recv().await {
+                            Ok(ev) if ev.kind == crate::lifecycle::LifecycleKind::TurnEnd => {
+                                return SettleReason::TurnEnd;
+                            }
+                            Ok(_) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                return SettleReason::Exited;
+                            }
+                        }
+                    }
+                };
+                return tokio::time::timeout(timeout, fut)
+                    .await
+                    .unwrap_or(SettleReason::Timeout);
+            }
+        }
+
+        // Idle-quiescence fallback: reset a short quiet-timer on every output
+        // chunk; if it elapses, presume settled.
+        let Some(mut out_rx) = self.subscribe_output(id) else {
+            return SettleReason::Exited;
+        };
+        let overall = tokio::time::sleep(timeout);
+        tokio::pin!(overall);
+        loop {
+            let quiet = tokio::time::sleep(crate::submit::IDLE_SETTLE_WINDOW);
+            tokio::select! {
+                _ = &mut overall => return SettleReason::Timeout,
+                _ = quiet => return SettleReason::Idle,
+                r = out_rx.recv() => match r {
+                    Ok(_) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return SettleReason::Exited;
+                    }
+                }
+            }
+        }
+    }
+
     /// Accumulate the first line of user input for a session, then auto-title
     /// from it. Fires for ALL sessions (shell AND agent CLIs): titling from the
     /// user's first input line is reliable and immediate, independent of the
@@ -1395,6 +1461,7 @@ fn default_name(command: &str, backend: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::submit::SettleReason;
     use nomifun_api_types::WebSocketMessage;
     use nomifun_realtime::EventBroadcaster;
     use std::sync::Mutex;
@@ -2356,6 +2423,71 @@ mod tests {
             svc.submit_text(999_999, "x").await.unwrap_err(),
             TerminalError::NotFound(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn await_turn_settle_idle_when_shell_goes_quiet() {
+        // cat(shell,无 lifecycle) 回显后即安静 → Idle。
+        let (svc, _bc) = service();
+        let id = svc.create("u", req("cat", &[])).await.unwrap().id;
+        svc.submit_text(id, "ping").await.unwrap();
+        let reason = svc
+            .await_turn_settle(id, std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(reason, SettleReason::Idle);
+        svc.delete(id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn await_turn_settle_timeout_when_output_never_quiets() {
+        // yes 持续刷输出 → 永不 idle；超时短于 idle window → Timeout。
+        let (svc, _bc) = service();
+        let id = svc.create("u", req("yes", &[])).await.unwrap().id;
+        let reason = svc
+            .await_turn_settle(id, std::time::Duration::from_millis(400))
+            .await;
+        assert_eq!(reason, SettleReason::Timeout);
+        svc.delete(id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn await_turn_settle_turn_end_via_lifecycle_for_agent_backend() {
+        use crate::lifecycle::TerminalLifecycleServer;
+        let (svc, _bc) = service();
+        let srv = std::sync::Arc::new(TerminalLifecycleServer::start().await.unwrap());
+        svc.with_terminal_lifecycle(srv.clone(), "nomicore".into());
+
+        // 进程用 cat，但声明 backend=claude → 被判为 lifecycle-capable，走 TurnEnd 路径。
+        let request = nomifun_api_types::CreateTerminalRequest {
+            name: None,
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            command: "cat".into(),
+            args: vec![],
+            env: None,
+            backend: Some("claude".into()),
+            mode: Some("default".into()),
+            cols: 80,
+            rows: 24,
+            defer_spawn: false,
+            knowledge_base_ids: None,
+        };
+        let id = svc.create("u", request).await.unwrap().id;
+
+        // settle future 与 POST future 用 tokio::join! 同任务并发（svc 非 Clone，
+        // 借用即可）。settle 先被 poll → 内部 subscribe_lifecycle 建立订阅；post
+        // 延迟 150ms 再发 turn_end hook，事件不会漏。
+        let url = format!("http://127.0.0.1:{}/hook", srv.http_port());
+        let token = srv.auth_token().to_owned();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let body = serde_json::json!({"terminal_id": id, "kind": "turn_end", "payload": {}});
+        let settle = svc.await_turn_settle(id, std::time::Duration::from_secs(5));
+        let post = async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            client.post(&url).json(&body).bearer_auth(&token).send().await.unwrap();
+        };
+        let (reason, _) = tokio::join!(settle, post);
+        assert_eq!(reason, SettleReason::TurnEnd);
+        svc.delete(id).await.ok();
     }
 
     #[tokio::test]
