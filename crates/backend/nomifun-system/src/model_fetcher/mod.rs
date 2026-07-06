@@ -188,6 +188,7 @@ fn supports_url_fix(platform: &str) -> bool {
             | "minimax-code"
             | "minimax-coding-plan"
             | "ark-coding-plan"
+            | "ark-agent-plan"
             | "stepfun-plan"
             | "dashscope-coding"
             | "glm-coding-plan"
@@ -265,6 +266,7 @@ mod tests {
         assert!(!supports_url_fix("minimax-code"));
         assert!(!supports_url_fix("minimax-coding-plan"));
         assert!(!supports_url_fix("ark-coding-plan"));
+        assert!(!supports_url_fix("ark-agent-plan"));
         assert!(!supports_url_fix("stepfun-plan"));
         assert!(!supports_url_fix("dashscope-coding"));
         assert!(!supports_url_fix("glm-coding-plan"));

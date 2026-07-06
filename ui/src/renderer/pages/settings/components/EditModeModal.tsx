@@ -10,6 +10,7 @@ import { ipcBridge } from '@/common';
 import useModeModeList from '@renderer/hooks/agent/useModeModeList';
 import { getProviderLogo } from '@/renderer/utils/model/modelPlatforms';
 import { normalizeApiKeyList, validateApiKeysForSave } from '@/common/utils/apiKeys';
+import { platformHasNoModelsEndpoint } from '@/common/utils/platformConstants';
 
 /**
  * 供应商 Logo 组件
@@ -109,7 +110,8 @@ const EditModeModal = ModalHOC<{ data?: IProvider; onChange(data: IProvider): vo
             const providerBaseUrl = values.base_url ?? data?.base_url ?? '';
             let normalizedApiKey = isBedrock ? '' : normalizeApiKeyList(values.api_key);
 
-            if (!isBedrock && !isFullUrl) {
+            // 套餐网关（Coding/Agent Plan）无 /models 目录，跳过保存前 Key 探测。
+            if (!isBedrock && !isFullUrl && !platformHasNoModelsEndpoint(data?.platform)) {
               setIsSaving(true);
               const validation = await validateApiKeysForSave(values.api_key, (key) =>
                 testApiKeyForProvider(key, providerBaseUrl)

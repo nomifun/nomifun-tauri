@@ -263,6 +263,58 @@ async fn fetch_models_ark_coding_plan_falls_back_to_supported_coding_models() {
     assert!(models.iter().any(|model| model == "ark-code-latest"));
 }
 
+#[tokio::test]
+async fn fetch_models_ark_agent_plan_uses_remote_catalog_when_available() {
+    // When the Agent Plan endpoint serves an OpenAI-style /models catalog,
+    // that live list is returned verbatim.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .and(header("Authorization", "Bearer plan-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "doubao-seed-2.0-code"}, {"id": "kimi-k2.6"}]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let (router, db) = setup().await;
+    let id = create_provider(&db, "ark-agent-plan", &mock_server.uri(), "plan-key").await;
+    let req = post_request(&format!("/api/providers/{id}/models"), json!({}));
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let models = json["data"]["models"].as_array().unwrap();
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0], "doubao-seed-2.0-code");
+    assert_eq!(models[1], "kimi-k2.6");
+}
+
+#[tokio::test]
+async fn fetch_models_ark_agent_plan_falls_back_when_catalog_unavailable() {
+    // The plan gateway commonly only routes /chat/completions and 404s on
+    // /models. That must not surface as an error — the known switchable set
+    // is returned instead, always including the ark-code-latest router alias.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&mock_server)
+        .await;
+
+    let (router, db) = setup().await;
+    let id = create_provider(&db, "ark-agent-plan", &mock_server.uri(), "plan-key").await;
+    let req = post_request(&format!("/api/providers/{id}/models"), json!({}));
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let models = json["data"]["models"].as_array().unwrap();
+    assert!(models.iter().any(|model| model == "ark-code-latest"));
+    // No fixed_base_url — the known-correct base is never auto-rewritten.
+    assert!(json["data"].get("fixed_base_url").is_none());
+}
+
 // ---------------------------------------------------------------------------
 // Tests: OpenAI-compatible with mock
 // ---------------------------------------------------------------------------

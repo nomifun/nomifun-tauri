@@ -962,6 +962,7 @@ fn uses_configured_openai_chat_base(platform: &str) -> bool {
         platform,
         "ark"
             | "ark-coding-plan"
+            | "ark-agent-plan"
             | "stepfun"
             | "stepfun-plan"
             | "dashscope-coding"
@@ -1747,6 +1748,10 @@ mod tests {
             (
                 "ark-coding-plan",
                 "https://ark.cn-beijing.volces.com/api/coding/v3",
+            ),
+            (
+                "ark-agent-plan",
+                "https://ark.cn-beijing.volces.com/api/plan/v3",
             ),
             ("stepfun-plan", "https://api.stepfun.com/step_plan/v1"),
             (
