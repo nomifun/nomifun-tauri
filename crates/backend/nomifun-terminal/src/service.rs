@@ -962,16 +962,35 @@ impl TerminalService {
 
         if lifecycle_capable {
             if let Some(mut rx) = self.subscribe_lifecycle(id) {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+                tick.tick().await; // consume the immediate first tick
                 let fut = async {
                     loop {
-                        match rx.recv().await {
-                            Ok(ev) if ev.kind == crate::lifecycle::LifecycleKind::TurnEnd => {
-                                return SettleReason::TurnEnd;
+                        tokio::select! {
+                            _ = tick.tick() => {
+                                // The lifecycle channel is owned by
+                                // TerminalLifecycleServer for the whole app lifetime
+                                // (not tied to the PTY), so a dead PTY never closes it
+                                // and `Closed` effectively never fires. Poll liveness so
+                                // a crashed/killed agent terminal reports Exited promptly
+                                // instead of riding the full caller timeout to a
+                                // dishonest Timeout. Mirrors AutoWork's
+                                // `wait_terminal_turn_end`.
+                                if !self.is_alive(id) {
+                                    return SettleReason::Exited;
+                                }
                             }
-                            Ok(_) => continue,
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                return SettleReason::Exited;
+                            ev = rx.recv() => {
+                                match ev {
+                                    Ok(event) if event.kind == crate::lifecycle::LifecycleKind::TurnEnd => {
+                                        return SettleReason::TurnEnd;
+                                    }
+                                    Ok(_) => continue,
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                        return SettleReason::Exited;
+                                    }
+                                }
                             }
                         }
                     }
@@ -2562,6 +2581,54 @@ mod tests {
         };
         let (reason, _) = tokio::join!(settle, post);
         assert_eq!(reason, SettleReason::TurnEnd);
+        svc.delete(id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn await_turn_settle_exited_when_lifecycle_pty_dies() {
+        use crate::lifecycle::TerminalLifecycleServer;
+        let (svc, _bc) = service();
+        let srv = std::sync::Arc::new(TerminalLifecycleServer::start().await.unwrap());
+        svc.with_terminal_lifecycle(srv.clone(), "nomicore".into());
+
+        // backend=claude → lifecycle-capable branch. The process is `cat` (long-lived
+        // until killed). The lifecycle channel is app-lifetime and never closes on PTY
+        // death, so WITHOUT the liveness poll this would ride the full 10s timeout and
+        // return a dishonest Timeout. WITH it, the 2s tick observes the dead PTY and
+        // returns Exited within a few seconds.
+        let request = nomifun_api_types::CreateTerminalRequest {
+            name: None,
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            command: "cat".into(),
+            args: vec![],
+            env: None,
+            backend: Some("claude".into()),
+            mode: Some("default".into()),
+            cols: 80,
+            rows: 24,
+            defer_spawn: false,
+            knowledge_base_ids: None,
+        };
+        let id = svc.create("u", request).await.unwrap().id;
+
+        // Kill the PTY and let the exit callback drop it from the live map.
+        svc.kill(id).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !svc.live.contains_key(&id),
+            "the killed PTY must be gone from the live map before we await settle"
+        );
+
+        let started = std::time::Instant::now();
+        let reason = svc
+            .await_turn_settle(id, std::time::Duration::from_secs(10))
+            .await;
+        let elapsed = started.elapsed();
+        assert_eq!(reason, SettleReason::Exited);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must resolve via the 2s liveness tick, not ride the 10s timeout (elapsed {elapsed:?})"
+        );
         svc.delete(id).await.ok();
     }
 
