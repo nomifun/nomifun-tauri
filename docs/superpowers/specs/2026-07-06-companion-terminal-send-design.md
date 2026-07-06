@@ -44,7 +44,7 @@
 - **`nomi_terminal_send`**（DangerTier::Write，`deny_on(Channel)`，与 write_input 同门禁）：
   - 参数 `{ id, text（纯文本，无 base64）, wait?=false, timeout_secs?=300 }`。
   - 行为：会话须 running（exited 报错并提示先 `nomi_terminal_relaunch`）→ `submit_text` → `wait=true` 时 `await_turn_settle` 后附带输出尾巴。
-  - 返回 `{ submitted, backend, settle_reason?, output_tail? }`。
+  - 返回 `{ submitted, id, settle_reason?, output_tail?, note? }`（fire-and-forget 带 note 提示用 read_output 查看；wait=true 带 settle_reason + output_tail）。
 - **`nomi_terminal_read_output`**（DangerTier::Read）：
   - 参数 `{ id, max_bytes?（默认尾部 16KiB）}`。
   - 行为：透传后端已有的 scrollback，解码 + 剥离 ANSI 转义，返回 `{ text, truncated, status }`——终端版的 `nomi_conversation_status`。
