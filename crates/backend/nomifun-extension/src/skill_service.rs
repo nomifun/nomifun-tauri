@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use include_dir::{Dir, include_dir};
+use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::constants::{
@@ -31,6 +32,40 @@ pub const BUILTIN_SKILLS_ENV_VAR: &str = "NOMIFUN_BUILTIN_SKILLS_PATH";
 /// `include_dir` directly.
 pub fn builtin_skills_corpus() -> &'static Dir<'static> {
     &BUILTIN_SKILLS
+}
+
+/// Build the on-disk materialization version for the embedded builtin skill
+/// corpus. This deliberately includes a content fingerprint, not just the app
+/// version, so asset-only changes refresh `{data_dir}/builtin-skills` even
+/// when the crate version stays unchanged during development.
+pub fn builtin_skills_materialize_version(app_version: &str) -> String {
+    let fingerprint = builtin_skills_corpus_fingerprint();
+    format!("{app_version}+skills.{}", &fingerprint[..12])
+}
+
+/// Deterministic SHA-256 fingerprint for the embedded builtin skill corpus.
+pub fn builtin_skills_corpus_fingerprint() -> String {
+    let mut files = Vec::new();
+    collect_corpus_files(&BUILTIN_SKILLS, &mut files);
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut hasher = Sha256::new();
+    for (path, contents) in files {
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+        hasher.update(contents);
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn collect_corpus_files(dir: &'static Dir<'static>, out: &mut Vec<(String, &'static [u8])>) {
+    for file in dir.files() {
+        out.push((file.path().to_string_lossy().into_owned(), file.contents()));
+    }
+    for subdir in dir.dirs() {
+        collect_corpus_files(subdir, out);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1731,6 +1766,16 @@ mod tests {
     use serial_test::serial;
     use std::io::Write;
     use tempfile::TempDir;
+
+    #[test]
+    fn builtin_skills_materialize_version_includes_corpus_fingerprint() {
+        let fingerprint = builtin_skills_corpus_fingerprint();
+        assert_eq!(fingerprint.len(), 64);
+        assert!(fingerprint.chars().all(|ch| ch.is_ascii_hexdigit()));
+
+        let version = builtin_skills_materialize_version("1.2.3");
+        assert_eq!(version, format!("1.2.3+skills.{}", &fingerprint[..12]));
+    }
 
     /// Build a `SkillPaths` rooted at a temp dir for self-evolution path/write tests.
     fn test_paths(tmp: &TempDir) -> SkillPaths {

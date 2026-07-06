@@ -18,4 +18,4 @@ Sky blue background with 3D gradient spheres and frosted glass roundRect cards. 
 
 ## Reference Script
 
-Complete build script available in `build.py`.
+No build script is packaged; use `style.md` as the design reference for this style.

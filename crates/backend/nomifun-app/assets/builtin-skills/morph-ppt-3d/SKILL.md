@@ -241,7 +241,7 @@ Choose a palette that matches the **topic mood** — don't default to generic bl
 - One color dominates (60-70% visual weight), 1-2 supporting tones, one accent
 - On light backgrounds: use Body Text color for copy, Muted for captions
 - On dark backgrounds: use Secondary or `FFFFFF` for copy, Muted for captions
-- For additional inspiration, browse `../../styles/INDEX.md` — 50+ visual styles organized by mood (dark, light, warm, vivid, bw). Read `style.md` for design philosophy, `build.sh` for implementation reference. **Learn the approach, do not copy coordinates verbatim**
+- For additional inspiration, browse the sibling Morph style library at `../morph-ppt/reference/styles/INDEX.md` — 51 visual styles organized by mood (dark, light, warm, vivid, bw). Read `style.md` for design philosophy; use any packaged `build.sh` / `build.py` only as optional technique reference. **Learn the approach, do not copy coordinates verbatim**
 
 ### Font Pairings (pick one per deck)
 

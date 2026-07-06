@@ -55,7 +55,7 @@ A scene actor that lands on `opacity=0.7` in the content core is usually a mis-c
 
 ### Palette Selection — pick for mood, not for habit
 
-There are no universal palette formulas for morph decks. The four pptx canonical palettes (Executive navy / Forest & moss / Warm terracotta / Charcoal minimal) still apply, but morph decks pick more freely from the 52-style library because cross-slide motion amplifies color mood.
+There are no universal palette formulas for morph decks. The four pptx canonical palettes (Executive navy / Forest & moss / Warm terracotta / Charcoal minimal) still apply, but morph decks pick more freely from the 51-style library because cross-slide motion amplifies color mood.
 
 Decision path:
 
@@ -251,4 +251,4 @@ Format: `EFFECT[-DIRECTION][-DURATION][-TRIGGER]`. See `officecli help pptx anim
 
 ## 7) Style References
 
-52 visual style directories in `reference/styles/` — see `reference/styles/INDEX.md` for the catalog. Lookup workflow is in SKILL.md §Style library lookup workflow. Key rule: **learn the approach, do not copy coordinates** (the style build.sh files have known typesetting bugs per `INDEX.md` L5-11).
+51 visual style directories in `reference/styles/` — see `reference/styles/INDEX.md` for the catalog. Lookup workflow is in SKILL.md §Style library lookup workflow. Key rule: **learn the approach, do not copy coordinates** (the packaged style demo scripts have known typesetting limitations per `INDEX.md` L5-11).

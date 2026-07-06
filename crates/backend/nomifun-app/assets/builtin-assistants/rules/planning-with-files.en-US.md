@@ -21,7 +21,7 @@ findings.md       → Store research and findings
 progress.md       → Session log and test results
 ```
 
-**Templates are available at:** `assistant/planning-with-files/templates/`
+Use the three filenames above as the templates. Create them directly in the current workspace and fill in the task-specific sections as you go.
 
 ## When to Use This Pattern
 

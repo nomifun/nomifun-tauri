@@ -54,7 +54,7 @@ Elegant and lively color scheme, suitable for corporate training, online courses
 
 ## Reference Script
 
-Complete build script is in `build.sh`.
+No build script is packaged; use `style.md` as the design reference for this style.
 
 **Recommended slides to read for understanding core design techniques**:
 

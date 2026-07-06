@@ -27,4 +27,4 @@ Clean minimal SaaS design with light blue-grey background and electric purple ac
 
 ## Reference Script
 
-Complete build script available in `build.py`.
+No build script is packaged; use `style.md` as the design reference for this style.

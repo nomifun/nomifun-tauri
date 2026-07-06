@@ -126,15 +126,18 @@ sheet.getRow(1).fill = {
 await workbook.xlsx.writeFile('output.xlsx');
 ```
 
-### XLSX Scripts Workflow
+### XLSX OfficeCLI Workflow
 
-For recalculating formulas in existing spreadsheets, use the recalc script:
+For existing spreadsheets, use the bundled `officecli-xlsx` skill and the installed `officecli` command:
 
 ```bash
-# Recalculate all formulas in an Excel file using LibreOffice
-# This is useful after modifying cell values programmatically
-python skills/xlsx/recalc.py <input.xlsx> <output.xlsx>
+FILE="workbook.xlsx"
+officecli view "$FILE" outline
+officecli validate "$FILE"
+officecli view "$FILE" html
 ```
+
+If full spreadsheet recalculation is required, use LibreOffice or another user-approved installed tool and verify the resulting workbook before delivery.
 
 **Python Quick Reference**:
 
@@ -236,32 +239,16 @@ slide.addChart(pptx.ChartType.bar, chartData, { x: 0.5, y: 3, w: 6, h: 3 });
 await pptx.writeFile('presentation.pptx');
 ```
 
-### PPTX Scripts Workflow
+### PPTX OfficeCLI Workflow
 
-For editing existing presentations or working with templates, use the PPTX scripts:
+For editing existing presentations or working with templates, use the bundled `officecli-pptx` skill and inspect before modifying:
 
 ```bash
-# Unpack a presentation to access raw XML
-python skills/pptx/ooxml/scripts/unpack.py <input.pptx> <output_directory>
-
-# Extract text inventory from presentation (useful for template-based editing)
-python skills/pptx/scripts/inventory.py <input.pptx> <output.json>
-
-# Create thumbnail grid of all slides for visual analysis
-python skills/pptx/scripts/thumbnail.py <input.pptx> [output_prefix] [--cols N]
-
-# Rearrange slides by index sequence
-python skills/pptx/scripts/rearrange.py <template.pptx> <output.pptx> <indices>
-# Example: python skills/pptx/scripts/rearrange.py template.pptx output.pptx 0,34,34,50,52
-
-# Apply text replacements from JSON
-python skills/pptx/scripts/replace.py <input.pptx> <replacements.json> <output.pptx>
-
-# Pack modified XML back to PPTX
-python skills/pptx/ooxml/scripts/pack.py <input_directory> <output.pptx>
-
-# Validate PPTX structure
-python skills/pptx/ooxml/scripts/validate.py <file.pptx>
+FILE="presentation.pptx"
+officecli view "$FILE" outline
+officecli view "$FILE" text
+officecli validate "$FILE"
+officecli view "$FILE" html
 ```
 
 **Best Practices**:
@@ -526,22 +513,16 @@ const buffer = await Packer.toBuffer(doc);
 await fs.writeFile('document.docx', buffer);
 ```
 
-### DOCX Scripts Workflow
+### DOCX OfficeCLI Workflow
 
-For editing existing documents or working with tracked changes, use the DOCX scripts:
+For editing existing documents or working with tracked changes, use the bundled `officecli-docx` skill and inspect before modifying:
 
 ```bash
-# Convert document to markdown (preserves tracked changes)
-pandoc --track-changes=all <input.docx> -o output.md
-
-# Unpack a document to access raw XML
-python skills/docx/ooxml/scripts/unpack.py <input.docx> <output_directory>
-
-# Pack modified XML back to DOCX
-python skills/docx/ooxml/scripts/pack.py <input_directory> <output.docx>
-
-# Validate DOCX structure
-python skills/docx/ooxml/scripts/validate.py <file.docx>
+FILE="document.docx"
+officecli view "$FILE" outline
+officecli view "$FILE" text
+officecli validate "$FILE"
+officecli view "$FILE" html
 ```
 
 **Python Document Library for Tracked Changes**:

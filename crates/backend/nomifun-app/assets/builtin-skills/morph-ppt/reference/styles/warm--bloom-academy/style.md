@@ -19,4 +19,4 @@ Educational design with organic blob ellipses using layered soft-edge technique.
 
 ## Reference Script
 
-Complete build script available in `build.py`.
+No build script is packaged; use `style.md` as the design reference for this style.

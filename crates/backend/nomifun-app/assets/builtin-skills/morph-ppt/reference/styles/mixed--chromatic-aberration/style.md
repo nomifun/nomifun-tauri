@@ -79,7 +79,7 @@ Dramatic tech-creative design simulating CRT monitor chromatic aberration effect
 
 ## Reference Script
 
-Complete build script available in `build.py` (Python with officecli).
+No build script is packaged; use `style.md` as the design reference for this style.
 
 **Recommended slides to read for core techniques**:
 

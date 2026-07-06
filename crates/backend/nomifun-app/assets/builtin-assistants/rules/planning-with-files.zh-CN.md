@@ -21,7 +21,7 @@ findings.md       → 存储研究和发现
 progress.md       → 会话日志和测试结果
 ```
 
-**模板文件位置：** `assistant/planning-with-files/templates/`
+直接使用上面的三个文件名作为模板。在当前工作区创建它们，并随着任务推进填写对应内容。
 
 ## 何时使用此模式
 

@@ -34,4 +34,4 @@ The !!rule actor creates a dramatic journey from subtle horizontal line to compl
 
 ## Reference Script
 
-Complete build script available in `build.py`.
+No build script is packaged; use `style.md` as the design reference for this style.
