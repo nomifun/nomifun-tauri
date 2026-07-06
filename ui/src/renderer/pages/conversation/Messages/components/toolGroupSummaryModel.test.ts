@@ -10,6 +10,7 @@ import {
   buildToolReceiptDetailRows,
   buildToolReceiptSummaryParts,
   buildToolSummaryDescriptor,
+  getToolReceiptIconFromSummaryParts,
 } from './toolGroupSummaryModel';
 
 const tool = (item: Partial<NormalizedToolCall> & Pick<NormalizedToolCall, 'key' | 'name'>): NormalizedToolCall => ({
@@ -105,6 +106,27 @@ describe('buildToolReceiptSummaryParts', () => {
       { action: 'read_files', count: 1, state: 'completed', target: 'MessageList.tsx' },
       { action: 'run_commands', count: 1, state: 'running', target: 'bun test MessageList' },
     ]);
+  });
+});
+
+describe('getToolReceiptIconFromSummaryParts', () => {
+  test('maps file-list summaries to the file receipt icon', () => {
+    const parts = buildToolReceiptSummaryParts([tool({ key: 'list', name: 'Glob', description: 'ui/src/**/*.tsx' })], 'completed');
+
+    expect(getToolReceiptIconFromSummaryParts(parts)).toBe('file');
+  });
+
+  test('maps command and edit summaries to distinct Codex-style receipt icons', () => {
+    expect(
+      getToolReceiptIconFromSummaryParts(
+        buildToolReceiptSummaryParts([tool({ key: 'run', name: 'Bash', description: 'dir' })], 'completed')
+      )
+    ).toBe('tool');
+    expect(
+      getToolReceiptIconFromSummaryParts(
+        buildToolReceiptSummaryParts([tool({ key: 'write', name: 'Write', input: '{"file_path":"a.ts"}' })], 'completed')
+      )
+    ).toBe('edit');
   });
 });
 

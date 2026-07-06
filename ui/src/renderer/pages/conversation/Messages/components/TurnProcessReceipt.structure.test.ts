@@ -44,4 +44,25 @@ describe('TurnProcessReceipt expandable detail structure', () => {
     expect(html.includes('turn-process-receipt__arrow')).toBe(false);
     expect(html.includes('duplicated detail')).toBe(false);
   });
+
+  test('renders a stable visible icon marker before every receipt label', () => {
+    const iconCases: Array<[TestReceipt['icon'], string]> = [
+      ['tool', 'terminal'],
+      ['file', 'file'],
+      ['edit', 'edit'],
+      ['status', 'status'],
+    ];
+
+    for (const [icon, marker] of iconCases) {
+      const html = renderToStaticMarkup(
+        React.createElement(TurnProcessReceipt, {
+          receipt: { ...baseReceipt, id: `receipt-${icon}`, icon, state: 'completed' },
+          renderProcessItem: () => React.createElement('div', null, 'detail'),
+        })
+      );
+
+      expect(html.includes(`data-receipt-icon="${marker}"`)).toBe(true);
+      expect(html.indexOf('turn-process-receipt__icon')).toBeLessThan(html.indexOf('turn-process-receipt__label'));
+    }
+  });
 });

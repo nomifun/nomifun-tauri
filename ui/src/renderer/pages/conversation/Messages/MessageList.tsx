@@ -40,6 +40,7 @@ import TurnProcessReceipt, { type TurnProcessReceiptIcon } from './components/Tu
 import {
   buildToolReceiptSummaryParts,
   buildToolSummaryDescriptor,
+  getToolReceiptIconFromSummaryParts,
   type ToolReceiptSummaryPart,
 } from './components/toolGroupSummaryModel';
 import ProcessTraceItem from './components/ProcessTraceItem';
@@ -390,7 +391,7 @@ const buildProcessReceiptSummary = (
           });
     return {
       label,
-      icon: getToolReceiptIcon(item.messages),
+      icon: getToolReceiptIconFromSummaryParts(receiptParts) ?? getToolReceiptIcon(item.messages),
       defaultExpanded: state === 'waiting',
       hasDetail: true,
     };

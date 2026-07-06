@@ -553,6 +553,18 @@
   align-items: center;
   justify-content: center;
   color: currentColor;
+  line-height: 0;
+}
+
+.turn-process-receipt__icon svg {
+  display: block;
+}
+
+.turn-process-receipt__icon .arco-spin {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
 }
 
 .turn-process-receipt__label {
