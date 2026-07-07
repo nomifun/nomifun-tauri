@@ -1,19 +1,11 @@
 {
-  "version": "0.2.9",
-  "notes": "- Improves message send responsiveness by reducing focus warmup debounce.\r\n- Improves LLM provider performance by sharing one process-wide HTTP client and increasing prompt-cache reuse.\r\n- Adds TTFT and cache-read token measurement for OpenAI-compatible providers.\r\n- Removes the built-in superpowers integration from the desktop bundle.",
-  "pub_date": "2026-07-07T09:57:26.901Z",
+  "version": "0.2.10",
+  "notes": "Changes: hardened agent message rendering, improved expired web auth session handling, and published Windows installer/updater assets for v0.2.10.",
+  "pub_date": "2026-07-07T15:06:39.186Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODNFL0ZJb01oK0FxUG1lUmZoemxyL1FXd2FZUmdhanFjUXdSdlZxUFQ2ZW91ZElhRlZ3OGViMHBJQ09uNGFVN1RibUlGZWdjVmpmVlRxLzNHSmVUU2dVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNDE2OTI5CWZpbGU6Tm9taUZ1bl8wLjIuOV94NjQtc2V0dXAuZXhlClJabGF5dTBpZjZjQk5rRENDVEYrMHF1cXpaWmRLb0swUEVsQVd2MGVRVitBNUp4bUFiWExXakRueldPNlJucFZLTWdJaHFoNCs4YUJMU0hDd0p6cURRPT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.9/NomiFun_0.2.9_x64-setup.exe"
-    },
-    "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODAzVXdhMGE2clVGN0R1emYvNStZQ0VEaFBFTGVpNnBSVkRLdFd2dHhOM1VMU0pYcnZBcDRHZWd0UGl6QjYzbS9Jd3RBV1NJYVArSXYrbzhPNktIS0FrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNDE4MDUzCWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6CjFoN3lsQi9yS1pmTElNMUhkdi84dTZDTEptV202MTdkUnZsdXQ2UEszeXdORkdONUxtdVEwMHRqR0cwa3BJNUhlcUtobU00c3ZaMTlpN2Q4WVRqMkN3PT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.9/NomiFun.app.tar.gz"
-    },
-    "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODAzVXdhMGE2clVGN0R1emYvNStZQ0VEaFBFTGVpNnBSVkRLdFd2dHhOM1VMU0pYcnZBcDRHZWd0UGl6QjYzbS9Jd3RBV1NJYVArSXYrbzhPNktIS0FrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNDE4MDUzCWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6CjFoN3lsQi9yS1pmTElNMUhkdi84dTZDTEptV202MTdkUnZsdXQ2UEszeXdORkdONUxtdVEwMHRqR0cwa3BJNUhlcUtobU00c3ZaMTlpN2Q4WVRqMkN3PT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.9/NomiFun.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODhrZkdQdlh4Ykk4RGthbTFCQWdIQ2tNYWowbEIzL3FpbXJOL3ZWdUszaGMvNTZESlZyTDFqcGJnU0xJcmU0NytleEF3dDRUZy9RZEZ1dGdZUWljNXdnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNDM2Nzk3CWZpbGU6Tm9taUZ1bl8wLjIuMTBfeDY0LXNldHVwLmV4ZQpaY1BoMzEyeTBiY3lMNU5PSFplQ1dwa0VrZFNJNENNMXBPY3pjTzBibytvcXM5ME9zRktwckpyOUEwMEM5cStJWjZINE52V2ZWbDBNRzNsTWdvV1ZDZz09Cg==",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.10/NomiFun_0.2.10_x64-setup.exe"
     }
   }
 }
