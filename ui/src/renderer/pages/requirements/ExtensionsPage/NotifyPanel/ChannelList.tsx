@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { Button, Empty, Popconfirm, Switch, Table, Tag } from '@arco-design/web-react';
 import { useContainerWidth } from '@renderer/hooks/ui/useContainerWidth';
 import { ipcBridge } from '@/common';
+import { isHandledAuthExpiredHttpError } from '@/common/adapter/httpBridge';
 import type { IWebhook } from '@/common/adapter/ipcBridge';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 import ChannelFormModal from './ChannelFormModal';
@@ -36,6 +37,7 @@ const ChannelList: React.FC = () => {
       const list = await ipcBridge.webhook.list.invoke();
       setChannels(list);
     } catch (e) {
+      if (isHandledAuthExpiredHttpError(e)) return;
       setError(String(e));
     } finally {
       setLoading(false);
@@ -51,6 +53,7 @@ const ChannelList: React.FC = () => {
       await ipcBridge.webhook.test.invoke({ id });
       message.success(t('webhook.messages.testOk'));
     } catch (e) {
+      if (isHandledAuthExpiredHttpError(e)) return;
       message.error(t('webhook.messages.testError', { error: String(e) }));
     }
   };
@@ -61,6 +64,7 @@ const ChannelList: React.FC = () => {
       message.success(t('webhook.messages.deleteOk'));
       void loadChannels();
     } catch (e) {
+      if (isHandledAuthExpiredHttpError(e)) return;
       message.error(String(e));
     }
   };

@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Checkbox, Empty, Select, Table, Tag } from '@arco-design/web-react';
 import { ipcBridge } from '@/common';
+import { isHandledAuthExpiredHttpError } from '@/common/adapter/httpBridge';
 import type { ITagSetting, ITagSummary, IWebhook } from '@/common/adapter/ipcBridge';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 
@@ -63,6 +64,7 @@ const RoutingRuleList: React.FC = () => {
       );
       setSettings(next);
     } catch (e) {
+      if (isHandledAuthExpiredHttpError(e)) return;
       message.error(String(e));
     } finally {
       setLoading(false);
@@ -82,6 +84,7 @@ const RoutingRuleList: React.FC = () => {
       setSettings((prev) => ({ ...prev, [tag]: result }));
       message.success(t('webhook.messages.updateOk'));
     } catch (e) {
+      if (isHandledAuthExpiredHttpError(e)) return;
       message.error(String(e));
     }
   };
@@ -95,6 +98,7 @@ const RoutingRuleList: React.FC = () => {
       setSettings((prev) => ({ ...prev, [tag]: result }));
       message.success(t('webhook.messages.updateOk'));
     } catch (e) {
+      if (isHandledAuthExpiredHttpError(e)) return;
       message.error(String(e));
     }
   };

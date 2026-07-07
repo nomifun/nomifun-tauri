@@ -1,6 +1,7 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { isDesktopShell } from '@renderer/utils/platform';
 import { configService } from '@/common/config/configService';
+import { AUTH_EXPIRED_EVENT } from '@/common/adapter/httpBridge';
 import { consumeQrLoginResume } from './qrLoginResume';
 // M6: CSRF removed with legacy webserver — stub functions for compatibility, re-implement in M7
 const withCsrfToken = <T extends Record<string, unknown>>(data: T): T => data;
@@ -201,6 +202,20 @@ export const AuthProvider: React.FC<React.PropsWithChildren> = ({ children }) =>
       abortRef.current?.abort();
     };
   }, [refresh]);
+
+  useEffect(() => {
+    if (isDesktopRuntime || typeof window === 'undefined') return undefined;
+    const handleAuthExpired = () => {
+      abortRef.current?.abort();
+      setUser(null);
+      setStatus('unauthenticated');
+      setNeedsSetup(false);
+      setReady(true);
+      clearAuthCache();
+    };
+    window.addEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
+    return () => window.removeEventListener(AUTH_EXPIRED_EVENT, handleAuthExpired);
+  }, []);
 
   const login = useCallback(async ({ username, password, remember }: LoginParams): Promise<LoginResult> => {
     try {

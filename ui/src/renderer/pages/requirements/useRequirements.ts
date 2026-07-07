@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { ipcBridge } from '@/common';
+import { isHandledAuthExpiredHttpError } from '@/common/adapter/httpBridge';
 import type { IListRequirementsParams, IRequirement } from '@/common/adapter/ipcBridge';
 
 export function useRequirements(params: IListRequirementsParams) {
@@ -18,6 +19,7 @@ export function useRequirements(params: IListRequirementsParams) {
       setTotal(res.total);
       setError(null);
     } catch (e) {
+      if (isHandledAuthExpiredHttpError(e)) return;
       console.error('Failed to load requirements', e);
       setError(String(e));
     } finally {
@@ -54,6 +56,7 @@ export function useRequirementTags() {
       const res = await ipcBridge.requirements.tags.invoke();
       setTags(res.map((t) => ({ tag: t.tag, done: t.done, total: t.total })));
     } catch (e) {
+      if (isHandledAuthExpiredHttpError(e)) return;
       console.error('Failed to load tags', e);
     }
   }, []);

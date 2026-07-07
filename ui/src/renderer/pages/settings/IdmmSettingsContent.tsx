@@ -8,6 +8,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button, Input, Message, Select } from '@arco-design/web-react';
 import { ipcBridge } from '@/common';
+import { isHandledAuthExpiredHttpError } from '@/common/adapter/httpBridge';
 import type { IIdmmSettings } from '@/common/adapter/ipcBridge';
 import { useProvidersQuery } from '@renderer/hooks/agent/useModelProviderList';
 
@@ -43,6 +44,7 @@ const IdmmSettingsContent: React.FC = () => {
       setSettings(saved);
       Message.success(t('idmm.settings.saved'));
     } catch (e) {
+      if (isHandledAuthExpiredHttpError(e)) return;
       Message.error(String(e));
     } finally {
       setSaving(false);

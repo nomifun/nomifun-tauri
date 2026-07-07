@@ -50,6 +50,9 @@ const CSRF_HEADER_NAME = 'x-csrf-token';
 /** Local-trust header the desktop webview presents (must match `nomifun_auth::LOCAL_TRUST_HEADER`). */
 const LOCAL_TRUST_HEADER = 'x-nomi-local-trust';
 
+/** Window event emitted when an HTTP API response proves the browser session is expired. */
+export const AUTH_EXPIRED_EVENT = 'nomifun:auth-expired';
+
 /**
  * The per-boot local-trust secret injected by the Tauri desktop shell, or null
  * in WebUI browser mode (where auth is via login/JWT cookie instead).
@@ -187,6 +190,10 @@ export class BackendHttpError extends Error {
   readonly code: string;
   /** Backend-provided human message from `ErrorResponse.error`, or the raw body when parse failed. */
   readonly backendMessage: string;
+  /** True when the backend rejected a browser session token as missing/expired/invalid. */
+  readonly authExpired: boolean;
+  /** True when the WebUI login redirect/event handler was eligible to handle this error. */
+  readonly authExpiredHandled: boolean;
   /** Structured backend metadata from `ErrorResponse.details`, when present. */
   readonly details: unknown;
   /** Raw parsed body (object on JSON response, string on text/non-JSON). */
@@ -205,11 +212,19 @@ export class BackendHttpError extends Error {
     } else if (typeof body === 'string') {
       backendMessage = body;
     }
-    super(`Backend ${method} ${path} failed (${status}): ${JSON.stringify(body)}`);
+    const authExpired = isAuthExpiredResponse(status, body);
+    const authExpiredHandled = authExpired && isWebUiBrowserMode();
+    super(
+      authExpired
+        ? `Backend ${method} ${path} failed (${status}): authentication expired`
+        : `Backend ${method} ${path} failed (${status}): ${JSON.stringify(body)}`
+    );
     this.name = 'BackendHttpError';
     this.status = status;
     this.code = code;
     this.backendMessage = backendMessage;
+    this.authExpired = authExpired;
+    this.authExpiredHandled = authExpiredHandled;
     this.details = details;
     this.body = body;
   }
@@ -234,6 +249,88 @@ export function isBackendHttpError(error: unknown): error is BackendHttpError {
     return true;
   }
   return false;
+}
+
+function bodyStringField(body: unknown, key: 'code' | 'error'): string {
+  if (!body || typeof body !== 'object') return '';
+  const value = (body as Record<string, unknown>)[key];
+  return typeof value === 'string' ? value : '';
+}
+
+function isAuthExpiredResponse(status: number, body: unknown): boolean {
+  if (status !== 403) return false;
+  const code = bodyStringField(body, 'code');
+  const error = bodyStringField(body, 'error').toLowerCase();
+  if (code !== 'FORBIDDEN') return false;
+  return (
+    error.includes('invalid or expired token') ||
+    error.includes('authentication required') ||
+    error.includes('user not found')
+  );
+}
+
+export function isAuthExpiredHttpError(error: unknown): boolean {
+  return isBackendHttpError(error) && (error.authExpired === true || isAuthExpiredResponse(error.status, error.body));
+}
+
+export function isHandledAuthExpiredHttpError(error: unknown): boolean {
+  return isBackendHttpError(error) && error.authExpiredHandled === true;
+}
+
+function clearBrowserAuthArtifacts(): void {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const keysToRemove: string[] = [];
+      for (let i = 0; i < localStorage.length; i += 1) {
+        const key = localStorage.key(i);
+        if (key && /auth|csrf|token/i.test(key)) {
+          keysToRemove.push(key);
+        }
+      }
+      keysToRemove.forEach((key) => localStorage.removeItem(key));
+    }
+  } catch {
+    // Best-effort cleanup only.
+  }
+
+  try {
+    if (typeof document !== 'undefined') {
+      document.cookie = `${CSRF_COOKIE_NAME}=; Path=/; Max-Age=0`;
+      document.cookie = `csrf-token=; Path=/; Max-Age=0`;
+    }
+  } catch {
+    // Best-effort cleanup only.
+  }
+}
+
+function emitAuthExpiredEvent(): void {
+  if (typeof window === 'undefined' || typeof window.dispatchEvent !== 'function') return;
+  const event =
+    typeof CustomEvent === 'function'
+      ? new CustomEvent(AUTH_EXPIRED_EVENT)
+      : typeof Event === 'function'
+        ? new Event(AUTH_EXPIRED_EVENT)
+        : ({ type: AUTH_EXPIRED_EVENT } as Event);
+  window.dispatchEvent(event);
+}
+
+function handleHttpAuthExpired(): void {
+  // Desktop shell requests should be trusted by x-nomi-local-trust, not redirected
+  // into the WebUI login flow. If a desktop request reaches this branch, keep the
+  // original backend error visible so the trust-header path can be diagnosed.
+  if (!isWebUiBrowserMode()) return;
+
+  clearBrowserAuthArtifacts();
+  emitAuthExpiredEvent();
+
+  setTimeout(() => {
+    try {
+      if (window.location.pathname === '/login' || window.location.hash.includes('/login')) return;
+      window.location.hash = '/login';
+    } catch {
+      // Nothing else to do; the thrown BackendHttpError still reaches callers.
+    }
+  }, 0);
 }
 
 /**
@@ -382,7 +479,15 @@ export async function httpRequest<T>(
     } catch {
       errorBody = rawText;
     }
-    if (options?.silentStatuses?.includes(response.status)) {
+    const authExpired = isAuthExpiredResponse(response.status, errorBody);
+    if (authExpired) {
+      handleHttpAuthExpired();
+    }
+    if (authExpired) {
+      if (isDebugEnabled('debug:http') && !isNoisyPath) {
+        console.debug(`[httpBridge] ${method} ${path} → ${response.status} (auth-expired)`, errorBody);
+      }
+    } else if (options?.silentStatuses?.includes(response.status)) {
       console.debug(`[httpBridge] ${method} ${path} → ${response.status} (silenced)`, errorBody);
     } else {
       console.error(`[httpBridge] ${method} ${path} → ${response.status}`, errorBody);

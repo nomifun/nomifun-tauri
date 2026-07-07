@@ -6,6 +6,7 @@
 
 import { bridge, logger } from '@/platform';
 import { WEBUI_DEFAULT_PORT } from '@/common/config/constants';
+import { AUTH_EXPIRED_EVENT } from './httpBridge';
 
 interface CustomWindow extends Window {
   __bridgeEmitter?: { emit: (name: string, data: unknown) => void };
@@ -38,6 +39,16 @@ const win = window as CustomWindow;
   let shouldReconnect = true; // Flag to control reconnection
 
   const messageQueue: QueuedMessage[] = [];
+
+  const emitAuthExpired = () => {
+    const event =
+      typeof CustomEvent === 'function'
+        ? new CustomEvent(AUTH_EXPIRED_EVENT)
+        : typeof Event === 'function'
+          ? new Event(AUTH_EXPIRED_EVENT)
+          : ({ type: AUTH_EXPIRED_EVENT } as Event);
+    window.dispatchEvent(event);
+  };
 
   // 1.发送队列中积压的消息，确保在重新建立连接后不会丢事件
   const flushQueue = () => {
@@ -126,6 +137,7 @@ const win = window as CustomWindow;
           // 关闭 socket 并跳转到登录页
           // Close the socket and redirect to login page
           socket?.close();
+          emitAuthExpired();
 
           // 已在登录页则不再重定向，防止无限刷新循环
           // Skip redirect if already on login page to prevent infinite reload loop
@@ -169,6 +181,7 @@ const win = window as CustomWindow;
           window.clearTimeout(reconnectTimer);
           reconnectTimer = null;
         }
+        emitAuthExpired();
         // 已在登录页则不再重定向，防止无限刷新循环
         // Skip redirect if already on login page to prevent infinite reload loop
         if (window.location.pathname === '/login' || window.location.hash.includes('/login')) {

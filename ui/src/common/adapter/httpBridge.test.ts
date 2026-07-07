@@ -5,9 +5,40 @@
  */
 
 import { describe, expect, test } from 'bun:test';
-import { httpRequest, isBackendHttpError } from './httpBridge';
+import {
+  AUTH_EXPIRED_EVENT,
+  httpRequest,
+  isAuthExpiredHttpError,
+  isBackendHttpError,
+  isHandledAuthExpiredHttpError,
+} from './httpBridge';
 
 const realFetch = globalThis.fetch;
+
+const realWindow = (globalThis as { window?: Window }).window;
+const realDocument = (globalThis as { document?: Document }).document;
+
+function installBrowserGlobals(windowPatch: Partial<Window> & { __backendPort?: number; __nomiLocalTrust?: string }) {
+  (globalThis as { window?: unknown }).window = {
+    location: { pathname: '/requirements/extensions', hash: '' },
+    dispatchEvent: () => true,
+    ...windowPatch,
+  };
+  (globalThis as { document?: unknown }).document = { cookie: '' };
+}
+
+function restoreBrowserGlobals() {
+  if (realWindow === undefined) {
+    delete (globalThis as { window?: Window }).window;
+  } else {
+    (globalThis as { window?: Window }).window = realWindow;
+  }
+  if (realDocument === undefined) {
+    delete (globalThis as { document?: Document }).document;
+  } else {
+    (globalThis as { document?: Document }).document = realDocument;
+  }
+}
 
 describe('httpRequest client deadline + network-failure diagnosis', () => {
   test('aborts and throws a legible timeout error when the request exceeds timeoutMs', async () => {
@@ -63,6 +94,79 @@ describe('httpRequest client deadline + network-failure diagnosis', () => {
       expect(JSON.stringify(res)).toBe(JSON.stringify([{ id: 'kb_1' }]));
     } finally {
       globalThis.fetch = realFetch;
+    }
+  });
+
+  test('webui invalid-session HTTP failures trigger auth-expired handling', async () => {
+    const emitted: string[] = [];
+    const location = { pathname: '/requirements/extensions', hash: '' };
+    installBrowserGlobals({
+      location: location as Location,
+      dispatchEvent: ((event: Event) => {
+        emitted.push(event.type);
+        return true;
+      }) as Window['dispatchEvent'],
+    });
+    globalThis.fetch = (() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ success: false, error: 'Forbidden: Invalid or expired token', code: 'FORBIDDEN' }), {
+          status: 403,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      )) as unknown as typeof fetch;
+
+    try {
+      let caught: unknown;
+      try {
+        await httpRequest('GET', '/api/requirements/tags');
+      } catch (e) {
+        caught = e;
+      }
+
+      expect(isAuthExpiredHttpError(caught)).toBe(true);
+      expect(isHandledAuthExpiredHttpError(caught)).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(location.hash).toBe('/login');
+      expect(emitted.includes(AUTH_EXPIRED_EVENT)).toBe(true);
+    } finally {
+      globalThis.fetch = realFetch;
+      restoreBrowserGlobals();
+    }
+  });
+
+  test('desktop local-trust requests do not redirect to login when a mocked 403 is returned', async () => {
+    const location = { pathname: '/settings/model', hash: '' };
+    let capturedHeaders: Record<string, string> | undefined;
+    installBrowserGlobals({
+      __backendPort: 25808,
+      __nomiLocalTrust: 'local-secret',
+      location: location as Location,
+    });
+    globalThis.fetch = ((_url: string, init?: RequestInit) => {
+      capturedHeaders = init?.headers as Record<string, string>;
+      return Promise.resolve(
+        new Response(JSON.stringify({ success: false, error: 'Forbidden: Invalid or expired token', code: 'FORBIDDEN' }), {
+          status: 403,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      );
+    }) as unknown as typeof fetch;
+
+    try {
+      let caught: unknown;
+      try {
+        await httpRequest('PUT', '/api/idmm/settings', { default_steering_prompt: '' });
+      } catch (e) {
+        caught = e;
+      }
+
+      expect(isAuthExpiredHttpError(caught)).toBe(true);
+      expect(isHandledAuthExpiredHttpError(caught)).toBe(false);
+      expect(capturedHeaders?.['x-nomi-local-trust']).toBe('local-secret');
+      expect(location.hash).toBe('');
+    } finally {
+      globalThis.fetch = realFetch;
+      restoreBrowserGlobals();
     }
   });
 });

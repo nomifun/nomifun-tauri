@@ -16,6 +16,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { ipcBridge } from '@/common';
+import { isHandledAuthExpiredHttpError } from '@/common/adapter/httpBridge';
 import type { ITagSummary } from '@/common/adapter/ipcBridge';
 
 export function useWorkspaceTags() {
@@ -26,6 +27,7 @@ export function useWorkspaceTags() {
       const res = await ipcBridge.requirements.tags.invoke();
       setTags(res);
     } catch (e) {
+      if (isHandledAuthExpiredHttpError(e)) return;
       console.error('Failed to load tags', e);
     }
   }, []);
