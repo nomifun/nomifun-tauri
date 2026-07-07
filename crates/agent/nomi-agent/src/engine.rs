@@ -784,6 +784,7 @@ impl AgentEngine {
                 reasoning_effort: self.current_reasoning_effort.clone(),
             };
 
+            let stream_start = std::time::Instant::now();
             let mut rx = self.provider.stream(&request).await?;
             let mut assistant_text = String::new();
             let mut thinking_text = String::new();
@@ -794,6 +795,7 @@ impl AgentEngine {
 
             let mut cancelled_midstream = false;
             let mut idle_activity_active = false;
+            let mut first_token_logged = false;
             loop {
                 let event = match &self.cancel_token {
                     Some(token) => {
@@ -825,6 +827,32 @@ impl AgentEngine {
                     idle_activity_active = false;
                 }
                 let Some(event) = event else { break };
+                // Time-to-first-token: elapsed from issuing the request to the
+                // first content-bearing event of the turn. Always logged at debug;
+                // surfaced as INFO only when the user opted into cache diagnostics
+                // (same gate as cache-break diagnostics). Purely observational.
+                if !first_token_logged
+                    && matches!(
+                        &event,
+                        LlmEvent::TextDelta(_)
+                            | LlmEvent::ThinkingDelta(_)
+                            | LlmEvent::ToolUse { .. }
+                            | LlmEvent::ToolUseDelta { .. }
+                    )
+                {
+                    first_token_logged = true;
+                    let ttft_ms = stream_start.elapsed().as_millis();
+                    tracing::debug!(
+                        target: "nomi_agent",
+                        ttft_ms = ttft_ms as u64,
+                        turn = turn + 1,
+                        "first token received"
+                    );
+                    if self.compact_config.cache_diagnostics {
+                        self.output
+                            .emit_info(&format!("TTFT: {ttft_ms} ms (turn {})", turn + 1));
+                    }
+                }
                 match event {
                     LlmEvent::TextDelta(text) => {
                         self.output.emit_text_delta(&text, &self.current_msg_id);

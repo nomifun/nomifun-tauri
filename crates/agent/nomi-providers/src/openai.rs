@@ -550,6 +550,11 @@ struct StreamState {
     text_tool_calls: Vec<TextToolCallAccumulator>,
     input_tokens: u64,
     output_tokens: u64,
+    /// Cache-read (prompt-cache hit) tokens reported by the provider, if any.
+    /// Informational: surfaced into the Done event's usage so the cache-hit rate
+    /// is observable for domestic OpenAI-compatible providers (DeepSeek/GLM/Qwen/…)
+    /// that do automatic prefix caching. 0 when the provider reports none.
+    cache_read_tokens: u64,
     /// Deferred Done event: populated when finish_reason arrives, emitted on
     /// [DONE] so the final usage-only chunk has a chance to update token counts.
     pending_done: Option<LlmEvent>,
@@ -574,6 +579,7 @@ impl StreamState {
             text_tool_calls: Vec::new(),
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: 0,
             pending_done: None,
             content_buf: String::new(),
             reasoning_buf: String::new(),
@@ -596,7 +602,7 @@ impl StreamState {
                     input_tokens: self.input_tokens,
                     output_tokens: self.output_tokens,
                     cache_creation_tokens: 0,
-                    cache_read_tokens: 0,
+                    cache_read_tokens: self.cache_read_tokens,
                 },
             },
             other => other,
@@ -1483,6 +1489,23 @@ fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id: bool) -> V
         state.output_tokens = usage["completion_tokens"]
             .as_u64()
             .unwrap_or(state.output_tokens);
+
+        // Cache-read tokens for diagnostics only (does not alter the input_tokens
+        // accounting above). Domestic OpenAI-compatible providers do automatic
+        // prefix caching: DeepSeek reports `prompt_cache_hit_tokens`; OpenAI-style
+        // endpoints report `prompt_tokens_details.cached_tokens`. Surfacing this
+        // into the Done usage lets the shared CacheBreakDetector observe their
+        // cache-hit rate (previously hardcoded to 0 → reported as "no caching").
+        let cached = if cache_hit > 0 {
+            cache_hit
+        } else {
+            usage["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap_or(0)
+        };
+        if cached > 0 {
+            state.cache_read_tokens = cached;
+        }
     }
 
     let Some(choice) = json["choices"].as_array().and_then(|c| c.first()) else {
