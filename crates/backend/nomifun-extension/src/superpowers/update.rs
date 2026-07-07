@@ -213,11 +213,14 @@ pub(crate) async fn install_superpowers_overlay_from_bytes(
     }
 
     // Locate the skills tree inside the archive (GitHub zipball wraps it in
-    // `<repo>-<sha>/skills/`), move it out to become the overlay staging dir.
+    // `<repo>-<sha>/skills/`), and lay it out under the overlay's `.nomi/skills/`
+    // (the layout the nomi loader expects from an extra skill root), stamping the
+    // version at the overlay root.
     let skills_root = locate_skills_root(&extract_dir).ok_or_else(|| {
         ExtensionError::Verify("no skills directory found in downloaded archive".into())
     })?;
-    tokio::fs::rename(&skills_root, &overlay_staging).await?;
+    tokio::fs::create_dir_all(overlay_staging.join(".nomi")).await?;
+    tokio::fs::rename(&skills_root, overlay_staging.join(".nomi").join("skills")).await?;
     tokio::fs::write(overlay_staging.join(VERSION_FILE), version).await?;
 
     // Atomic swap into place (reuses the Windows-safe rename/restore logic).
@@ -343,10 +346,10 @@ mod tests {
             .unwrap();
 
         let overlay = tmp.path().join(SUPERPOWERS_OVERLAY_DIR);
-        assert!(overlay.join("brainstorming/SKILL.md").is_file());
-        assert!(overlay.join("test-driven-development/SKILL.md").is_file());
+        assert!(overlay.join(".nomi/skills/brainstorming/SKILL.md").is_file());
+        assert!(overlay.join(".nomi/skills/test-driven-development/SKILL.md").is_file());
         assert_eq!(installed_overlay_version(tmp.path()).as_deref(), Some("6.0.4"));
-        // effective dir now prefers the overlay.
+        // effective dir now prefers the overlay (newer than the baseline version).
         assert_eq!(super::super::effective_superpowers_dir(tmp.path()), overlay);
         // extraction scratch is cleaned up.
         assert!(!tmp.path().join(DL_TMP).exists());

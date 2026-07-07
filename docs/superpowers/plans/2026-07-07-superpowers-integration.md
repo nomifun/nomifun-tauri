@@ -163,3 +163,11 @@
 - **占位**：无 TBD；测试意图具体（含拒坏包/host/sha256/回退）。
 - **类型一致**：`effective_superpowers_dir`、`is_coding_scenario`、`SUPERPOWERS_BOOTSTRAP`、`commit_staging_dir`、`install_superpowers_overlay`、`SuperpowersRelease` 在定义任务与消费任务间命名一致。
 - **顺序依赖**：T2(helper)→T3(baseline)；T7(zip_safe)+T8(err/dep)→T9→T10→T11；T1→T3；T4→T5,T12。
+
+---
+
+## 交付状态（2026-07-07）
+- ✅ **Phase 1 已交付**（T1–T6）：内置语料库 + 启动物化 + 有效目录 + 编码场景判定 + nomi `extra_skill_dirs` 喂入 + `using-superpowers` 引导注入。nomifun-ai-agent 619 / nomifun-extension 403 lib 测试全绿，nomifun-app 编译通过。
+- ✅ **Phase 2 已交付**（T7–T11）：zip 安全共享化 + Download/Verify 错误 + GitHub 下载/校验/原子替换 overlay + 查询最新 Release + 周期 janitor（默认开，env 可调）。全部纯逻辑单测覆盖。
+- ⏸️ **Phase 2.5（ACP）未实现，作为后续项**：让 superpowers 对 ACP（外部 Claude Code/codex）生效需跨 conversation-service 的技能解析（`AcpSkillManager` / `resolve_skill_paths` 纳入 superpowers 目录）与 ACP prompt 管线（`first_message_injector` 的 `preset_context` 追加引导）两处协同，且**无法在本环境端到端验证**（需真机外部 CLI）。接入点已定位：`capability/first_message_injector.rs` 的 `InjectionConfig.preset_context`、`skill_service::link_workspace_skills`。
+- ⏸️ **Phase 3（可选增强）未实现**：引擎循环级 `ConditionalSkillManager::activate_for_paths` 接入（`engine.rs:1050`，需给 `AgentEngine` 加字段/改构造器/`SkillTool` 共享可变——高危）、`SkillWatcher` 活会话热切、settings-UI 开关（DB 迁移 + 前端 `bun run build`）。

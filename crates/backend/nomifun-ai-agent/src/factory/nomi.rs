@@ -201,10 +201,13 @@ pub(super) async fn build(
     let superpowers_active = crate::capability::superpowers_scenario::is_coding_scenario(
         &crate::capability::superpowers_scenario::ScenarioSignals {
             workspace: Some(std::path::PathBuf::from(&ctx.workspace)),
+            // File tools are absent for PublicService (clamped) and for
+            // restricted-allowlist sessions (orchestration workers) — neither
+            // should get the methodology bootstrap.
             file_tools_enabled: !matches!(
                 overrides.exposure,
                 nomifun_api_types::ExposureMode::PublicService
-            ),
+            ) && overrides.allowed_tools.is_empty(),
             scenario_tags: Vec::new(),
         },
     );

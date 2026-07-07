@@ -125,7 +125,14 @@ async fn materialize_baseline_unlocked(data_dir: &Path, version: &str) -> Result
         let _ = tokio::fs::remove_dir_all(&staging).await;
     }
     tokio::fs::create_dir_all(&staging).await?;
-    write_dir_recursive(superpowers_corpus(), &staging).await?;
+    // Skills are materialized under `.nomi/skills/` so that when this root is
+    // passed to the nomi loader as an extra skill dir, its `--add-dir`
+    // expansion (`<root>/.nomi/skills`) discovers them. Placing them at the
+    // top level would make the loader look in a non-existent `.nomi/skills`
+    // and silently load nothing.
+    let skills_dir = staging.join(".nomi").join("skills");
+    tokio::fs::create_dir_all(&skills_dir).await?;
+    write_dir_recursive(superpowers_corpus(), &skills_dir).await?;
     tokio::fs::write(staging.join(VERSION_FILE), version).await?;
     commit_staging_dir(&target, &staging, &old).await
 }
@@ -145,31 +152,52 @@ async fn baseline_looks_usable(target: &Path) -> bool {
             .unwrap_or(false)
 }
 
-/// The directory whose immediate children are superpowers skill directories.
-/// Prefers a populated hot-updated overlay (`{data_dir}/superpowers`), else the
-/// embedded baseline. Returns the baseline path even if neither exists yet
-/// (the caller materializes the baseline at startup). This is the path fed to
-/// the nomi engine's `extra_skill_dirs` and linked into ACP workspaces.
+/// The superpowers skill root to feed the nomi engine (`extra_skill_dirs`) and
+/// link into ACP workspaces. Its skills live under `<root>/.nomi/skills/`.
+///
+/// Prefers a populated hot-updated overlay (`{data_dir}/superpowers`), but only
+/// when the overlay is not strictly older than the embedded baseline — so an
+/// app upgrade that ships a newer baseline is never shadowed by a stale overlay.
+/// Falls back to the embedded baseline (`{data_dir}/superpowers-baseline`), whose
+/// path is returned even if neither exists yet (the caller materializes the
+/// baseline at startup).
 pub fn effective_superpowers_dir(data_dir: &Path) -> PathBuf {
     let overlay = data_dir.join(SUPERPOWERS_OVERLAY_DIR);
-    if dir_has_skill(&overlay) {
-        return overlay;
+    if root_has_superpowers_skills(&overlay) {
+        let overlay_version = read_root_version(&overlay).unwrap_or_default();
+        if overlay_not_older_than(&overlay_version, SUPERPOWERS_BUNDLED_VERSION.trim()) {
+            return overlay;
+        }
     }
     data_dir.join(SUPERPOWERS_BASELINE_DIR)
 }
 
-/// True if `dir` contains at least one immediate subdirectory with a
-/// `SKILL.md` — i.e. it holds at least one real skill.
-fn dir_has_skill(dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+/// True if `root` holds superpowers skills in its `.nomi/skills/` layout (i.e.
+/// at least one subdirectory there has a `SKILL.md`).
+fn root_has_superpowers_skills(root: &Path) -> bool {
+    let skills = root.join(".nomi").join("skills");
+    let Ok(entries) = std::fs::read_dir(&skills) else {
         return false;
     };
-    for entry in entries.flatten() {
-        if entry.path().join("SKILL.md").is_file() {
-            return true;
-        }
+    entries.flatten().any(|e| e.path().join("SKILL.md").is_file())
+}
+
+/// Read a root's `.version` stamp, if present and non-empty.
+fn read_root_version(root: &Path) -> Option<String> {
+    std::fs::read_to_string(root.join(VERSION_FILE))
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether an overlay of version `overlay` should still win over the embedded
+/// `baseline` version. True unless the baseline is strictly newer (semver;
+/// build metadata ignored). Non-semver versions keep the overlay.
+fn overlay_not_older_than(overlay: &str, baseline: &str) -> bool {
+    match (semver::Version::parse(overlay), semver::Version::parse(baseline)) {
+        (Ok(o), Ok(b)) => o >= b,
+        _ => true,
     }
-    false
 }
 
 #[cfg(test)]
@@ -223,8 +251,13 @@ mod tests {
 
         let baseline = tmp.path().join(SUPERPOWERS_BASELINE_DIR);
         assert!(
-            baseline.join("using-superpowers").join("SKILL.md").is_file(),
-            "baseline must contain the using-superpowers bootstrap"
+            baseline
+                .join(".nomi")
+                .join("skills")
+                .join("using-superpowers")
+                .join("SKILL.md")
+                .is_file(),
+            "baseline must expose skills under .nomi/skills so the nomi loader finds them"
         );
         assert_eq!(
             std::fs::read_to_string(baseline.join(VERSION_FILE)).unwrap(),
@@ -235,8 +268,19 @@ mod tests {
         assert!(!wrote_again, "version gate should skip the second materialize");
     }
 
+    /// Write a fake overlay skill (under the `.nomi/skills/` layout) with a
+    /// `.version` stamp.
+    async fn seed_overlay(root: &std::path::Path, version: &str) {
+        let skill = root.join(".nomi").join("skills").join("test-driven-development");
+        tokio::fs::create_dir_all(&skill).await.unwrap();
+        tokio::fs::write(skill.join("SKILL.md"), b"---\nname: x\n---\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join(VERSION_FILE), version).await.unwrap();
+    }
+
     #[tokio::test]
-    async fn effective_dir_prefers_populated_overlay() {
+    async fn effective_dir_prefers_overlay_when_not_older() {
         let tmp = TempDir::new().unwrap();
         materialize_superpowers_baseline(tmp.path()).await.unwrap();
 
@@ -246,12 +290,8 @@ mod tests {
             tmp.path().join(SUPERPOWERS_BASELINE_DIR)
         );
 
-        // A populated overlay (has a skill dir) wins.
-        let overlay_skill = tmp.path().join(SUPERPOWERS_OVERLAY_DIR).join("test-driven-development");
-        tokio::fs::create_dir_all(&overlay_skill).await.unwrap();
-        tokio::fs::write(overlay_skill.join("SKILL.md"), b"---\nname: x\n---\n")
-            .await
-            .unwrap();
+        // A populated overlay newer than the baseline wins.
+        seed_overlay(&tmp.path().join(SUPERPOWERS_OVERLAY_DIR), "999.0.0").await;
         assert_eq!(
             effective_superpowers_dir(tmp.path()),
             tmp.path().join(SUPERPOWERS_OVERLAY_DIR)
@@ -259,9 +299,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn effective_dir_falls_back_when_overlay_older_than_baseline() {
+        let tmp = TempDir::new().unwrap();
+        // Overlay has skills but is older than the embedded baseline (e.g. the
+        // app upgraded past a stale hot-updated overlay) → baseline must win.
+        seed_overlay(&tmp.path().join(SUPERPOWERS_OVERLAY_DIR), "0.0.1").await;
+        assert_eq!(
+            effective_superpowers_dir(tmp.path()),
+            tmp.path().join(SUPERPOWERS_BASELINE_DIR),
+            "a stale overlay must not shadow a newer embedded baseline"
+        );
+    }
+
+    #[tokio::test]
     async fn effective_dir_ignores_empty_overlay() {
         let tmp = TempDir::new().unwrap();
-        // An empty overlay dir (no skill inside) must not shadow the baseline.
+        // An empty overlay dir (no .nomi/skills) must not shadow the baseline.
         tokio::fs::create_dir_all(tmp.path().join(SUPERPOWERS_OVERLAY_DIR))
             .await
             .unwrap();

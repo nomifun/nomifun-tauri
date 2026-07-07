@@ -119,6 +119,7 @@ fn make_nomi_config() -> NomiResolvedConfig {
         in_process_spawn: true,
         allowed_tools: Vec::new(),
         write_root: None,
+        superpowers_skill_dirs: Vec::new(),
     }
 }
 

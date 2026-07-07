@@ -29,9 +29,10 @@ pub struct ScenarioSignals {
 }
 
 /// Files / dirs whose presence in a workspace marks it as a software project.
+/// Deliberately excludes `.nomi` (a nomifun artifact, not a code-project signal)
+/// to avoid treating every nomifun-touched workspace as a coding scenario.
 const PROJECT_MARKERS: &[&str] = &[
     ".git",
-    ".nomi",
     "Cargo.toml",
     "package.json",
     "tsconfig.json",
