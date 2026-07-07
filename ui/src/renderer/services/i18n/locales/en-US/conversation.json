@@ -470,6 +470,9 @@
   },
   "contextUsage": {
     "contextUsed": "context used",
+    "title": "Context window",
+    "percentLine": "{{pct}}% used ({{remaining}}% remaining)",
+    "tokenLine": "{{used}} tokens used, {{max}} total",
     "tooltip": "Context {{used}} / {{max}} tokens ({{pct}}%). Auto-compacts near the limit."
   },
   "sessionMetrics": {

@@ -1,10 +1,11 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use nomifun_ai_agent::{
     AgentSendError, AgentStreamEvent,
     protocol::events::{
         PlanEventData, ThinkingEventData,
-        tool_call::{AcpToolCallSessionUpdateKind, AcpToolCallStatus, ToolCallStatus},
+        tool_call::{AcpToolCallSessionUpdateKind, AcpToolCallStatus, ToolCallEventData, ToolCallStatus},
     },
 };
 
@@ -289,6 +290,7 @@ impl StreamRelay {
         let mut text_segments: Vec<PersistedTextSegment> = Vec::new();
         let mut active_text: Option<TextSegmentState> = None;
         let mut active_thinking: Option<ThinkingSegmentState> = None;
+        let mut active_tool_calls: HashMap<String, ToolCallEventData> = HashMap::new();
         let mut used_primary_segment_msg_id = false;
         let mut first_agent_event_logged = false;
         let mut first_visible_output_logged = false;
@@ -450,6 +452,9 @@ impl StreamRelay {
                             if suppress_error {
                                 info!("StreamRelay suppressing pre-response error pending model failover");
                             } else {
+                                if let Some(reason) = Self::incomplete_tool_reason(&event) {
+                                    self.fail_active_tool_calls(&mut active_tool_calls, reason).await;
+                                }
                                 self.forward_to_websocket(&event);
                             }
                             let outcome = self
@@ -482,6 +487,14 @@ impl StreamRelay {
                             // externally-visible action with a side effect — no
                             // failover after this, or the tool would re-run.
                             emitted_response = true;
+                            match data.status {
+                                ToolCallStatus::Running => {
+                                    active_tool_calls.insert(data.call_id.clone(), data.clone());
+                                }
+                                ToolCallStatus::Completed | ToolCallStatus::Error => {
+                                    active_tool_calls.remove(&data.call_id);
+                                }
+                            }
                             self.complete_active_thinking(&mut active_thinking).await;
                             self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
                                 .await;
@@ -1118,6 +1131,51 @@ impl StreamRelay {
         }
     }
 
+    fn incomplete_tool_reason(event: &AgentStreamEvent) -> Option<&'static str> {
+        match event {
+            AgentStreamEvent::Error(_) => Some("error"),
+            AgentStreamEvent::Finish(data) => match data.stop_reason {
+                Some(nomifun_ai_agent::protocol::events::TurnStopReason::MaxTokens) => Some("max_tokens"),
+                Some(nomifun_ai_agent::protocol::events::TurnStopReason::MaxTurnRequests) => {
+                    Some("max_turn_requests")
+                }
+                Some(nomifun_ai_agent::protocol::events::TurnStopReason::Refusal) => Some("refusal"),
+                Some(nomifun_ai_agent::protocol::events::TurnStopReason::Cancelled) => Some("cancelled"),
+                Some(nomifun_ai_agent::protocol::events::TurnStopReason::EndTurn) => Some("end_turn"),
+                None => Some("finish"),
+            },
+            _ => None,
+        }
+    }
+
+    async fn fail_active_tool_calls(
+        &self,
+        active_tool_calls: &mut HashMap<String, ToolCallEventData>,
+        reason: &str,
+    ) {
+        if active_tool_calls.is_empty() {
+            return;
+        }
+
+        let output = format!("The turn ended before this tool completed: {reason}");
+        let failed: Vec<ToolCallEventData> = active_tool_calls
+            .drain()
+            .map(|(_, mut data)| {
+                data.status = ToolCallStatus::Error;
+                data.output = Some(output.clone());
+                data
+            })
+            .collect();
+
+        for data in failed {
+            let event = AgentStreamEvent::ToolCall(data);
+            self.forward_to_websocket(&event);
+            if let AgentStreamEvent::ToolCall(data) = &event {
+                self.persist_tool_call(data).await;
+            }
+        }
+    }
+
     /// Persist an ACP (Claude CLI) tool call event.
     /// First event (ToolCall) inserts; subsequent events (ToolCallUpdate) update.
     #[tracing::instrument(skip_all)]
@@ -1705,6 +1763,56 @@ mod tests {
             outcome.emitted_response,
             "a forwarded ToolCall must mark the turn as having emitted a response"
         );
+    }
+
+    #[tokio::test]
+    async fn run_marks_active_tool_call_error_when_turn_hits_max_tokens() {
+        use nomifun_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+        use nomifun_ai_agent::protocol::events::TurnStopReason;
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(nomifun_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+
+        let relay = StreamRelay::new(
+            "1".into(),
+            "asst-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        );
+
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "tc-write".into(),
+            name: "Write".into(),
+            args: json!({"file_path": "/tmp/index.html"}),
+            status: ToolCallStatus::Running,
+            description: None,
+            input: Some(json!({"file_path": "/tmp/index.html"})),
+            output: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData {
+            session_id: None,
+            stop_reason: Some(TurnStopReason::MaxTokens),
+        }))
+        .unwrap();
+
+        let outcome = relay.consume(rx).await;
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+
+        let updates = repo.take_updates();
+        let (_, update) = updates
+            .iter()
+            .find(|(id, _)| id == "tc-write")
+            .expect("active tool call should be marked failed when the turn is truncated");
+        assert_eq!(update.status.as_ref().map(|v| v.as_deref()), Some(Some("error")));
+        let content: serde_json::Value = serde_json::from_str(update.content.as_deref().expect("updated content")).unwrap();
+        assert_eq!(content["status"], "error");
+        assert_eq!(content["output"], "The turn ended before this tool completed: max_tokens");
     }
 
     #[tokio::test]

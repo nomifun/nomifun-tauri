@@ -89,8 +89,11 @@ export type ConfigKeyMap = {
   'agent.browserUse.siteMemory': boolean | undefined;
   // Human takeover / approval (browser-use sub-setting): irreversible browser
   // actions + gated cross-origin POSTs are held for the user's approval instead of
-  // hard-blocked. OFF by default (opt-in). Read by the backend agent factory.
+  // hard-blocked. ON by default. Read by the backend agent factory.
   'agent.browserUse.takeover': boolean | undefined;
+  // Dangerous Browser Use approval bypass: skips Browser-specific irreversible
+  // action and gated egress confirmations. OFF by default.
+  'agent.browserUse.unrestrictedApproval': boolean | undefined;
   // Visual fallback (browser-use sub-setting): when DOM/aria anchoring fails, the
   // agent screenshots the page and asks the vision model to locate the target, then
   // clicks the mapped point. OFF by default (opt-in, vision-token cost). Read by the

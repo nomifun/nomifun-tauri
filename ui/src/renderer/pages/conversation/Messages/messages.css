@@ -384,12 +384,11 @@
   width: 100%;
   min-height: 34px;
   align-items: center;
-  gap: 6px;
+  gap: 12px;
   border: 0;
   border-bottom: 1px solid var(--color-border-2, #e5e6eb);
   background: transparent;
   color: inherit;
-  cursor: pointer;
   font: inherit;
   font-size: 13px;
   font-weight: 500;
@@ -398,19 +397,35 @@
   text-align: left;
 }
 
-.turn-process-disclosure__header:hover {
+.turn-process-disclosure__toggle {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  line-height: inherit;
+  padding: 0;
+  text-align: left;
+}
+
+.turn-process-disclosure__toggle:hover {
   color: var(--color-text-2, #4e5969);
 }
 
-.turn-process-disclosure__header--static {
+.turn-process-disclosure__header--static .turn-process-disclosure__toggle {
   cursor: default;
 }
 
-.turn-process-disclosure__header--static:hover {
+.turn-process-disclosure__header--static .turn-process-disclosure__toggle:hover {
   color: inherit;
 }
 
-.turn-process-disclosure__header:focus-visible {
+.turn-process-disclosure__toggle:focus-visible,
+.turn-process-disclosure__expand-thinking:focus-visible {
   border-radius: 6px;
   box-shadow: 0 0 0 2px var(--color-primary-light-3, #bedaff);
   outline: none;
@@ -437,6 +452,44 @@
   flex-direction: column;
   gap: 0;
   padding: 12px 0 2px;
+}
+
+.turn-process-disclosure__header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  margin-left: auto;
+  min-width: 0;
+}
+
+.turn-process-disclosure__expand-thinking {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  border: 0;
+  background: transparent;
+  color: var(--color-text-3, #86909c);
+  cursor: pointer;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 22px;
+  padding: 0;
+  white-space: nowrap;
+}
+
+.turn-process-disclosure__expand-thinking-icon {
+  flex: none;
+  transition: transform 0.16s ease;
+}
+
+.turn-process-disclosure__expand-thinking-icon--open {
+  transform: rotate(180deg);
+}
+
+.turn-process-disclosure__expand-thinking:hover {
+  color: var(--color-text-2, #4e5969);
 }
 
 .turn-process-disclosure__item {
@@ -553,6 +606,18 @@
   align-items: center;
   justify-content: center;
   color: currentColor;
+  line-height: 0;
+}
+
+.turn-process-receipt__icon svg {
+  display: block;
+}
+
+.turn-process-receipt__icon .arco-spin {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
 }
 
 .turn-process-receipt__label {

@@ -111,6 +111,7 @@ fn make_nomi_config() -> NomiResolvedConfig {
         browser_persistent_login: false,
         browser_site_memory: false,
         browser_takeover: false,
+        browser_unrestricted_approval: false,
         browser_visual_fallback: false,
         goal: None,
         browser_secret_vault: None,

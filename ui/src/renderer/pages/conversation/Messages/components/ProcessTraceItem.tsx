@@ -61,6 +61,11 @@ type TranslationFn = ReturnType<typeof useTranslation>['t'];
 
 type ProcessTraceVariant = 'list' | 'receipt';
 
+export type ProcessTraceItemExpansionControls = {
+  expanded?: boolean;
+  onExpandedChange?: (expanded: boolean) => void;
+};
+
 type ProcessTraceRow = {
   key: string;
   label: string;
@@ -522,11 +527,13 @@ const ProcessTraceItem: React.FC<{
   variant?: ProcessTraceVariant;
   workspaceRoots?: string[];
   stateOverride?: TurnDisclosureProcessState;
+  thinkingExpansion?: ProcessTraceItemExpansionControls;
 }> = ({
   item,
   variant = 'list',
   workspaceRoots,
   stateOverride,
+  thinkingExpansion,
 }) => {
   const { t } = useTranslation();
   const conversationContext = useConversationContextSafe();
@@ -580,7 +587,14 @@ const ProcessTraceItem: React.FC<{
         </div>
       );
     case 'thinking':
-      return <MessageThinking message={item} variant='process' />;
+      return (
+        <MessageThinking
+          message={item}
+          variant='process'
+          expanded={thinkingExpansion?.expanded}
+          onExpandedChange={thinkingExpansion?.onExpandedChange}
+        />
+      );
     case 'tips':
       if (isContextCompressionTip(item)) {
         return (

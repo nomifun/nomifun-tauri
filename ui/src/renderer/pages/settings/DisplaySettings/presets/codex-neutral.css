@@ -1,0 +1,296 @@
+/* ============================================================================
+ * Codex Neutral
+ *
+ * A restrained black / white / gray preset for long coding and planning
+ * sessions. Light mode mirrors the Codex reference: white work surface, soft
+ * gray sider, black primary action. Dark mode flips the axis to near-black
+ * work surfaces with silver primary emphasis, while keeping semantic states
+ * readable enough to remain useful.
+ * ========================================================================== */
+
+/* ===== Light ===== */
+:root,
+body {
+  /* Primary */
+  --color-primary: #171717;
+  --primary: #171717;
+  --color-primary-light-1: #f5f5f5;
+  --color-primary-light-2: #e5e5e5;
+  --color-primary-light-3: #d4d4d4;
+  --color-primary-light-4: #a3a3a3;
+  --color-primary-dark-1: #000000;
+  --primary-rgb: 23, 23, 23;
+
+  /* Brand */
+  --brand: #404040;
+  --brand-light: #f5f5f5;
+  --brand-hover: #d4d4d4;
+  --color-brand-fill: #404040;
+  --color-brand-bg: #f5f5f5;
+
+  /* Neutral brand scale */
+  --aou-1: #fafafa;
+  --aou-2: #f5f5f5;
+  --aou-3: #e5e5e5;
+  --aou-4: #d4d4d4;
+  --aou-5: #a3a3a3;
+  --aou-6: #737373;
+  --aou-7: #525252;
+  --aou-8: #404040;
+  --aou-9: #262626;
+  --aou-10: #171717;
+
+  /* Background */
+  --bg-base: #ffffff;
+  --color-bg-1: #fafafa;
+  --bg-1: #fafafa;
+  --color-bg-2: #f4f4f3;
+  --bg-2: #f4f4f3;
+  --color-bg-3: #e7e7e5;
+  --bg-3: #e7e7e5;
+  --color-bg-4: #d6d6d3;
+  --bg-4: #d6d6d3;
+  --bg-5: #b9b9b5;
+  --bg-6: #8a8a86;
+  --bg-8: #565652;
+  --bg-9: #272725;
+  --bg-10: #111110;
+  --color-bg-5: #ffffff;
+  --color-bg-popup: #ffffff;
+  --color-bg-white: #ffffff;
+
+  /* Interactive */
+  --bg-hover: rgba(0, 0, 0, 0.045);
+  --bg-active: rgba(0, 0, 0, 0.08);
+
+  /* Fill */
+  --fill: #f6f6f5;
+  --color-fill: #f6f6f5;
+  --fill-0: #ffffff;
+  --fill-white-to-black: #ffffff;
+  --dialog-fill-0: #ffffff;
+  --inverse: #ffffff;
+  --color-fill-1: rgba(0, 0, 0, 0.025);
+  --color-fill-2: rgba(0, 0, 0, 0.055);
+  --color-fill-3: rgba(0, 0, 0, 0.1);
+  --color-fill-4: rgba(0, 0, 0, 0.16);
+
+  /* Text */
+  --color-text-1: #191919;
+  --text-primary: #191919;
+  --color-text-2: #4b4b4b;
+  --text-secondary: #4b4b4b;
+  --color-text-3: #7a7a76;
+  --color-text-4: #b8b8b4;
+  --text-disabled: #b8b8b4;
+  --text-0: #000000;
+  --text-white: #ffffff;
+
+  /* Border */
+  --color-border: #e0e0de;
+  --color-border-1: #ededeb;
+  --color-border-2: #e0e0de;
+  --color-border-3: #cfcfcb;
+  --color-border-4: #b8b8b4;
+  --border-base: #e0e0de;
+  --border-light: #ededeb;
+  --border-special: #d8d8d5;
+
+  /* Semantic */
+  --success: #1f883d;
+  --warning: #9a6700;
+  --danger: #cf222e;
+  --info: #57606a;
+
+  /* Components */
+  --message-user-bg: #eeeeec;
+  --message-tips-bg: #f5f5f4;
+  --workspace-btn-bg: #f0f0ef;
+  --color-guid-agent-bar: #eeeeec;
+  --sider-section-title-color: #777774;
+
+  /* Terminal */
+  --terminal-surface-bg: #111111;
+  --terminal-border: rgba(0, 0, 0, 0.12);
+
+  /* Arco primary scale */
+  --primary-1: 245, 245, 245;
+  --primary-2: 229, 229, 229;
+  --primary-3: 212, 212, 212;
+  --primary-4: 163, 163, 163;
+  --primary-5: 82, 82, 82;
+  --primary-6: 23, 23, 23;
+  --primary-7: 0, 0, 0;
+
+  /* Arco secondary */
+  --color-secondary: #f2f2f1;
+  --color-secondary-hover: #e8e8e6;
+  --color-secondary-active: #ddddda;
+  --color-secondary-disabled: #f7f7f6;
+
+  /* Arco misc */
+  --color-tooltip-bg: #272725;
+  --color-mask-bg: rgba(17, 17, 16, 0.5);
+  --color-spin-layer-bg: rgba(255, 255, 255, 0.66);
+  --color-menu-light-bg: #ffffff;
+  --color-menu-dark-bg: #272725;
+}
+
+/* ===== Dark ===== */
+[data-theme='dark'],
+[data-theme='dark'] body {
+  /* Primary */
+  --color-primary: #e5e5e5;
+  --primary: #e5e5e5;
+  --color-primary-light-1: rgba(255, 255, 255, 0.08);
+  --color-primary-light-2: rgba(255, 255, 255, 0.14);
+  --color-primary-light-3: rgba(255, 255, 255, 0.22);
+  --color-primary-light-4: rgba(255, 255, 255, 0.34);
+  --color-primary-dark-1: #f5f5f5;
+  --primary-rgb: 229, 229, 229;
+
+  /* Brand */
+  --brand: #d4d4d4;
+  --brand-light: #262626;
+  --brand-hover: #737373;
+  --color-brand-fill: #d4d4d4;
+  --color-brand-bg: #262626;
+
+  /* Neutral brand scale */
+  --aou-1: #171717;
+  --aou-2: #262626;
+  --aou-3: #404040;
+  --aou-4: #525252;
+  --aou-5: #737373;
+  --aou-6: #a3a3a3;
+  --aou-7: #d4d4d4;
+  --aou-8: #e5e5e5;
+  --aou-9: #f5f5f5;
+  --aou-10: #fafafa;
+
+  /* Background */
+  --bg-base: #0f0f0f;
+  --color-bg-1: #151515;
+  --bg-1: #151515;
+  --color-bg-2: #1e1e1e;
+  --bg-2: #1e1e1e;
+  --color-bg-3: #2a2a2a;
+  --bg-3: #2a2a2a;
+  --color-bg-4: #363636;
+  --bg-4: #363636;
+  --bg-5: #474747;
+  --bg-6: #666666;
+  --bg-8: #9a9a9a;
+  --bg-9: #d4d4d4;
+  --bg-10: #f5f5f5;
+  --color-bg-5: #242424;
+  --color-bg-popup: #202020;
+  --color-bg-white: #202020;
+
+  /* Interactive */
+  --bg-hover: rgba(255, 255, 255, 0.07);
+  --bg-active: rgba(255, 255, 255, 0.12);
+
+  /* Fill */
+  --fill: #1e1e1e;
+  --color-fill: #1e1e1e;
+  --fill-0: rgba(255, 255, 255, 0.08);
+  --fill-white-to-black: #000000;
+  --dialog-fill-0: #202020;
+  --inverse: #ffffff;
+  --color-fill-1: rgba(255, 255, 255, 0.04);
+  --color-fill-2: rgba(255, 255, 255, 0.07);
+  --color-fill-3: rgba(255, 255, 255, 0.12);
+  --color-fill-4: rgba(255, 255, 255, 0.18);
+
+  /* Text */
+  --color-text-1: #f5f5f5;
+  --text-primary: #f5f5f5;
+  --color-text-2: #c7c7c7;
+  --text-secondary: #c7c7c7;
+  --color-text-3: #969696;
+  --color-text-4: #686868;
+  --text-disabled: #686868;
+  --text-0: #ffffff;
+  --text-white: #ffffff;
+
+  /* Border */
+  --color-border: #303030;
+  --color-border-1: #282828;
+  --color-border-2: #303030;
+  --color-border-3: #424242;
+  --color-border-4: #575757;
+  --border-base: #303030;
+  --border-light: #282828;
+  --border-special: #454545;
+
+  /* Semantic */
+  --success: #3fb950;
+  --warning: #d29922;
+  --danger: #ff7b72;
+  --info: #c9d1d9;
+
+  /* Components */
+  --message-user-bg: #2a2a2a;
+  --message-tips-bg: #242424;
+  --workspace-btn-bg: #242424;
+  --color-guid-agent-bar: #242424;
+  --sider-section-title-color: #969696;
+
+  /* Terminal */
+  --terminal-surface-bg: #0f0f0f;
+  --terminal-border: rgba(255, 255, 255, 0.1);
+
+  /* Arco primary scale */
+  --primary-1: 38, 38, 38;
+  --primary-2: 64, 64, 64;
+  --primary-3: 82, 82, 82;
+  --primary-4: 115, 115, 115;
+  --primary-5: 163, 163, 163;
+  --primary-6: 229, 229, 229;
+  --primary-7: 245, 245, 245;
+
+  /* Arco secondary */
+  --color-secondary: rgba(255, 255, 255, 0.08);
+  --color-secondary-hover: rgba(255, 255, 255, 0.12);
+  --color-secondary-active: rgba(255, 255, 255, 0.16);
+  --color-secondary-disabled: rgba(255, 255, 255, 0.04);
+
+  /* Arco misc */
+  --color-tooltip-bg: #363636;
+  --color-mask-bg: rgba(0, 0, 0, 0.68);
+  --color-spin-layer-bg: rgba(21, 21, 21, 0.68);
+  --color-menu-light-bg: #202020;
+  --color-menu-dark-bg: #151515;
+}
+
+/* ===== Signature touches ===== */
+
+.arco-btn-primary:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(.arco-btn-status-success) {
+  box-shadow: none;
+  transition: background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.arco-btn-primary:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(.arco-btn-status-success):hover {
+  box-shadow: 0 0 0 3px rgba(var(--primary-6), 0.12);
+}
+
+[data-theme='dark'] .arco-btn-primary:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(.arco-btn-status-success) {
+  color: #171717;
+}
+
+[data-theme='light'] .layout-sider {
+  background-image: linear-gradient(180deg, rgba(0, 0, 0, 0.025) 0%, rgba(0, 0, 0, 0) 42%);
+}
+
+[data-theme='dark'] .layout-sider {
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.035) 0%, rgba(255, 255, 255, 0) 42%);
+}
+
+[data-theme='dark'] .arco-select-popup,
+[data-theme='dark'] .arco-dropdown-menu,
+[data-theme='dark'] .arco-popover-content,
+[data-theme='dark'] .arco-modal {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.48);
+}

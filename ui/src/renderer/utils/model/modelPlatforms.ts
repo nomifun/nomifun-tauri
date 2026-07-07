@@ -46,6 +46,7 @@ export type PlatformType =
   | 'moonshot-global'
   | 'ark'
   | 'ark-coding-plan'
+  | 'ark-agent-plan'
   | 'qianfan'
   | 'qianfan-coding-plan'
   | 'hunyuan'
@@ -279,6 +280,13 @@ export const MODEL_PLATFORMS: PlatformConfig[] = [
     logo: buildLogoAssetUrl('ai-china/volcengine.svg'),
     platform: 'ark-coding-plan',
     base_url: 'https://ark.cn-beijing.volces.com/api/coding/v3',
+  },
+  {
+    name: 'Doubao / Ark Agent Plan',
+    value: 'Ark-Agent-Plan',
+    logo: buildLogoAssetUrl('ai-china/volcengine.svg'),
+    platform: 'ark-agent-plan',
+    base_url: 'https://ark.cn-beijing.volces.com/api/plan/v3',
   },
   {
     name: 'Qianfan',

@@ -14,9 +14,16 @@ import styles from './MessageThinking.module.css';
 interface MessageThinkingProps {
   message: IMessageThinking;
   variant?: 'standalone' | 'process';
+  expanded?: boolean;
+  onExpandedChange?: (expanded: boolean) => void;
 }
 
-const MessageThinking: React.FC<MessageThinkingProps> = ({ message, variant = 'standalone' }) => {
+const MessageThinking: React.FC<MessageThinkingProps> = ({
+  message,
+  variant = 'standalone',
+  expanded,
+  onExpandedChange,
+}) => {
   const { t } = useTranslation();
   const isProcessVariant = variant === 'process';
 
@@ -32,13 +39,20 @@ const MessageThinking: React.FC<MessageThinkingProps> = ({ message, variant = 's
 
   const { content: text, status, subject } = message.content;
   const isDone = status === 'done';
-  const [expanded, setExpanded] = useState(true);
+  const defaultExpanded = expanded ?? (isProcessVariant ? !isDone : true);
+  const [internalExpanded, setInternalExpanded] = useState(() => defaultExpanded);
+  const resolvedExpanded = expanded ?? internalExpanded;
   const [elapsedTime, setElapsedTime] = useState(() => {
     const initialStartedAt = message.created_at ?? Date.now();
     return isDone ? 0 : Math.max(0, Math.floor((Date.now() - initialStartedAt) / 1000));
   });
   const startTimeRef = useRef<number>(message.created_at ?? Date.now());
   const bodyRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (expanded !== undefined) return;
+    setInternalExpanded(defaultExpanded);
+  }, [defaultExpanded, expanded, message.id, message.msg_id]);
 
   // Elapsed timer for active thinking
   useEffect(() => {
@@ -55,10 +69,18 @@ const MessageThinking: React.FC<MessageThinkingProps> = ({ message, variant = 's
 
   // Auto-scroll to bottom during streaming
   useEffect(() => {
-    if (!isDone && expanded && bodyRef.current) {
+    if (!isDone && resolvedExpanded && bodyRef.current) {
       bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
     }
-  }, [text, isDone, expanded]);
+  }, [text, isDone, resolvedExpanded]);
+
+  const handleToggle = () => {
+    const nextExpanded = !resolvedExpanded;
+    if (expanded === undefined) {
+      setInternalExpanded(nextExpanded);
+    }
+    onExpandedChange?.(nextExpanded);
+  };
 
   const summaryText = isDone
     ? t('conversation.thinking.complete', { defaultValue: 'Thought complete' })
@@ -68,17 +90,17 @@ const MessageThinking: React.FC<MessageThinkingProps> = ({ message, variant = 's
     <div className={`${styles.container} ${isProcessVariant ? styles.containerProcess : ''}`}>
       <div
         className={`${styles.header} ${isProcessVariant ? styles.headerProcess : ''}`}
-        onClick={() => setExpanded((v) => !v)}
+        onClick={handleToggle}
       >
         <span className={styles.headerIcon}>{!isDone ? <Spin size={12} /> : <Brain theme='outline' size='14' />}</span>
         <span className={styles.summary}>{summaryText}</span>
-        <span className={`${styles.arrow} ${expanded ? styles.arrowExpanded : ''}`}>
+        <span className={`${styles.arrow} ${resolvedExpanded ? styles.arrowExpanded : ''}`}>
           <Right theme='outline' size='12' />
         </span>
       </div>
       <div
         ref={bodyRef}
-        className={`${styles.body} ${isProcessVariant ? styles.bodyProcess : ''} ${!expanded ? styles.collapsed : ''}`}
+        className={`${styles.body} ${isProcessVariant ? styles.bodyProcess : ''} ${!resolvedExpanded ? styles.collapsed : ''}`}
       >
         {text}
       </div>

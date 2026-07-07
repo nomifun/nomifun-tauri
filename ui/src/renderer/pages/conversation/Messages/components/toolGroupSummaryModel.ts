@@ -22,6 +22,8 @@ export type ToolReceiptAction =
   | 'load_tools'
   | 'generic';
 
+export type ToolReceiptIcon = 'tool' | 'file' | 'edit';
+
 export interface ToolReceiptSummaryPart {
   action: ToolReceiptAction;
   count: number;
@@ -39,6 +41,16 @@ export interface ToolReceiptDetailRow {
   output?: string;
   truncated?: boolean;
 }
+
+const toolReceiptIconByAction: Record<ToolReceiptAction, ToolReceiptIcon> = {
+  read_files: 'file',
+  edit_files: 'edit',
+  run_commands: 'tool',
+  search_code: 'file',
+  list_files: 'file',
+  load_tools: 'tool',
+  generic: 'tool',
+};
 
 const stateMatchesTool = (state: TurnDisclosureProcessState, tool: NormalizedToolCall): boolean => {
   if (state === 'running') return tool.status === 'running' || tool.status === 'pending';
@@ -148,12 +160,19 @@ const getFileTarget = (tool: NormalizedToolCall): string | undefined => {
   return extractFileTargetFromText(tool.input);
 };
 
+const normalizeToolSearchText = (value: string): string => value.replace(/[_-]+/g, ' ').toLowerCase();
+
 const getToolSearchText = (tool: NormalizedToolCall): string =>
-  `${tool.name ?? ''} ${tool.description ?? ''} ${tool.key ?? ''}`.toLowerCase();
+  normalizeToolSearchText(`${tool.name ?? ''} ${tool.description ?? ''} ${tool.key ?? ''}`);
+
+const getToolNameSearchText = (tool: NormalizedToolCall): string =>
+  normalizeToolSearchText(`${tool.name ?? ''} ${tool.key ?? ''}`);
 
 const classifyToolForReceipt = (tool: NormalizedToolCall): ToolReceiptAction => {
   const text = getToolSearchText(tool);
+  const nameText = getToolNameSearchText(tool);
 
+  if (/\b(bash|shell|exec|execute|terminal|command|run)\b/.test(nameText)) return 'run_commands';
   if (/\b(grep|rg|search|find)\b/.test(text)) return 'search_code';
   if (/\b(glob|list|ls|directory|dir)\b/.test(text)) return 'list_files';
   if (/\b(write|edit|patch|update|modify|replace)\b/.test(text)) return 'edit_files';
@@ -214,6 +233,14 @@ export const buildToolReceiptSummaryParts = (
     state: mergeProcessStates(value.states),
     ...(value.targets.length ? { target: Array.from(new Set(value.targets)).join(', ') } : {}),
   }));
+};
+
+export const getToolReceiptIconFromSummaryParts = (parts: ToolReceiptSummaryPart[]): ToolReceiptIcon | undefined => {
+  const focusedPart =
+    parts.findLast((part) => part.state === 'running' || part.state === 'waiting') ??
+    parts.findLast((part) => part.state === 'failed' || part.state === 'canceled') ??
+    parts.at(-1);
+  return focusedPart ? toolReceiptIconByAction[focusedPart.action] : undefined;
 };
 
 export const buildToolReceiptDetailRows = (tools: NormalizedToolCall[]): ToolReceiptDetailRow[] =>

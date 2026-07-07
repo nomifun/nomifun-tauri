@@ -470,6 +470,9 @@
   },
   "contextUsage": {
     "contextUsed": "上下文已使用",
+    "title": "背景信息窗口",
+    "percentLine": "已用 {{pct}}%（剩余 {{remaining}}%）",
+    "tokenLine": "已用 {{used}} 标记，共 {{max}}",
     "tooltip": "上下文 {{used}} / {{max}} tokens（{{pct}}%）。接近上限将自动压缩。"
   },
   "sessionMetrics": {

@@ -24,7 +24,10 @@ describe('ProcessTraceItem Codex-style execution rows', () => {
     expect(source.includes('shouldAutoCollapseThinkingStreamPanel')).toBe(false);
     expect(source.includes('turn-process-thinking-stream')).toBe(false);
     expect(source.includes("case 'thinking':")).toBe(true);
-    expect(source.includes('<MessageThinking message={item} variant')).toBe(true);
+    expect(source.includes('<MessageThinking')).toBe(true);
+    expect(source.includes('message={item}')).toBe(true);
+    expect(source.includes("variant='process'")).toBe(true);
+    expect(source.includes('expanded={thinkingExpansion?.expanded}')).toBe(true);
     expect(source.includes('ThinkingTraceRow')).toBe(false);
     expect(source.includes('messages.processReceipt.thinkingCompletedDuration')).toBe(false);
     expect(source.includes('messages.processReceipt.thinkingRunning')).toBe(false);

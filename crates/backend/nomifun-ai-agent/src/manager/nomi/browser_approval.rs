@@ -38,6 +38,7 @@ pub struct DesktopApprovalGate {
     confirmations: Arc<RwLock<Vec<Confirmation>>>,
     approval_manager: Arc<ToolApprovalManager>,
     timeout: Duration,
+    unrestricted_approval: bool,
 }
 
 impl DesktopApprovalGate {
@@ -48,12 +49,14 @@ impl DesktopApprovalGate {
         event_tx: broadcast::Sender<AgentStreamEvent>,
         confirmations: Arc<RwLock<Vec<Confirmation>>>,
         approval_manager: Arc<ToolApprovalManager>,
+        unrestricted_approval: bool,
     ) -> Self {
         Self {
             event_tx,
             confirmations,
             approval_manager,
             timeout: BROWSER_APPROVAL_TIMEOUT,
+            unrestricted_approval,
         }
     }
 
@@ -65,13 +68,15 @@ impl DesktopApprovalGate {
             action: Some("browser_approval".to_string()),
             description: ask.description(),
             command_type: Some("browser".to_string()),
-            // Mirror the tool-approval options the frontend already understands. No
-            // "always" option: a browser approval is granted ONCE (an irreversible action
-            // or an egress destination should not be blanket-remembered here).
             options: vec![
                 ConfirmationOption {
                     label: "messages.confirmation.yesAllowOnce".to_string(),
                     value: json!("proceed_once"),
+                    params: None,
+                },
+                ConfirmationOption {
+                    label: "messages.confirmation.yesAllowAlways".to_string(),
+                    value: json!("proceed_always"),
                     params: None,
                 },
                 ConfirmationOption {
@@ -91,6 +96,14 @@ impl DesktopApprovalGate {
 #[async_trait::async_trait]
 impl BrowserApprovalGate for DesktopApprovalGate {
     async fn request_approval(&self, ask: ApprovalAsk) -> ApprovalDecision {
+        let category = ToolCategory::Irreversible;
+        let category_key = category.to_string();
+        // Browser egress approval runs below the normal tool-approval layer, so it must
+        // explicitly honor the same session auto-approval policy here.
+        if self.unrestricted_approval || self.approval_manager.is_auto_approved(&category_key) {
+            return ApprovalDecision::Approve;
+        }
+
         let call_id = generate_id();
 
         // Register the oneshot FIRST — before the confirmation can possibly be seen and
@@ -99,7 +112,7 @@ impl BrowserApprovalGate for DesktopApprovalGate {
         // timeout, which is safe, but registering first avoids that entirely).
         let rx = self
             .approval_manager
-            .request_approval(&call_id, &ToolCategory::Irreversible);
+            .request_approval(&call_id, &category);
 
         // Raise the confirmation: push into the shared store + broadcast on the event
         // stream. The desktop `MessagePermission` UI renders it; the user resolves it via
@@ -133,7 +146,7 @@ impl BrowserApprovalGate for DesktopApprovalGate {
 mod tests {
     use super::*;
     use nomi_browser::ApprovalKind;
-    use nomi_protocol::commands::ApprovalScope;
+    use nomi_protocol::commands::{ApprovalScope, SessionMode};
 
     fn ask() -> ApprovalAsk {
         ApprovalAsk {
@@ -152,7 +165,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel(16);
         let confirmations = Arc::new(RwLock::new(Vec::new()));
         let mgr = Arc::new(ToolApprovalManager::new());
-        let gate = DesktopApprovalGate::new(tx, confirmations.clone(), mgr.clone());
+        let gate = DesktopApprovalGate::new(tx, confirmations.clone(), mgr.clone(), false);
 
         let confs_for_task = confirmations.clone();
         let handle = tokio::spawn(async move { gate.request_approval(ask()).await });
@@ -196,7 +209,6 @@ mod tests {
     #[tokio::test]
     async fn timeout_fails_closed_to_deny() {
         // Never resolve → the bounded await must fail-closed to Deny.
-        tokio::time::pause();
         let (tx, _rx) = broadcast::channel(16);
         let confirmations = Arc::new(RwLock::new(Vec::new()));
         let mgr = Arc::new(ToolApprovalManager::new());
@@ -206,11 +218,77 @@ mod tests {
             confirmations: confirmations.clone(),
             approval_manager: mgr,
             timeout: Duration::from_millis(50),
+            unrestricted_approval: false,
         };
         let handle = tokio::spawn(async move { gate.request_approval(ask()).await });
-        tokio::time::advance(Duration::from_millis(60)).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
         let decision = handle.await.unwrap();
         assert_eq!(decision, ApprovalDecision::Deny, "timeout must fail-closed to Deny");
         assert!(confirmations.read().unwrap().is_empty(), "stale confirmation cleaned up on timeout");
+    }
+
+    #[test]
+    fn browser_approval_confirmation_has_allow_always() {
+        let conf = DesktopApprovalGate::build_confirmation("call-browser", &ask());
+        let values: Vec<_> = conf.options.iter().map(|o| o.value.clone()).collect();
+        assert!(values.contains(&json!("proceed_once")));
+        assert!(values.contains(&json!("proceed_always")));
+        assert!(values.contains(&json!("cancel")));
+    }
+
+    #[tokio::test]
+    async fn unrestricted_gate_approves_without_confirmation() {
+        let (tx, _rx) = broadcast::channel(16);
+        let confirmations = Arc::new(RwLock::new(Vec::new()));
+        let mgr = Arc::new(ToolApprovalManager::new());
+        let gate = DesktopApprovalGate::new(tx, confirmations.clone(), mgr, true);
+
+        let decision = gate.request_approval(ask()).await;
+
+        assert_eq!(decision, ApprovalDecision::Approve);
+        assert!(
+            confirmations.read().unwrap().is_empty(),
+            "unrestricted Browser approval should not publish a confirmation"
+        );
+    }
+
+    #[tokio::test]
+    async fn yolo_session_mode_approves_without_confirmation() {
+        let (tx, _rx) = broadcast::channel(16);
+        let confirmations = Arc::new(RwLock::new(Vec::new()));
+        let mgr = Arc::new(ToolApprovalManager::new());
+        mgr.set_mode(SessionMode::Yolo);
+        let gate = DesktopApprovalGate {
+            event_tx: tx,
+            confirmations: confirmations.clone(),
+            approval_manager: mgr,
+            timeout: Duration::from_millis(50),
+            unrestricted_approval: false,
+        };
+
+        let decision = gate.request_approval(ask()).await;
+
+        assert_eq!(decision, ApprovalDecision::Approve);
+        assert!(
+            confirmations.read().unwrap().is_empty(),
+            "yolo/full-auto sessions should not publish Browser approval confirmations"
+        );
+    }
+
+    #[tokio::test]
+    async fn always_approved_irreversible_category_skips_prompt() {
+        let (tx, _rx) = broadcast::channel(16);
+        let confirmations = Arc::new(RwLock::new(Vec::new()));
+        let mgr = Arc::new(ToolApprovalManager::new());
+        mgr.add_auto_approve(&ToolCategory::Irreversible.to_string());
+        let gate = DesktopApprovalGate::new(tx, confirmations.clone(), mgr, false);
+
+        let decision = gate.request_approval(ask()).await;
+
+        assert_eq!(decision, ApprovalDecision::Approve);
+        assert!(
+            confirmations.read().unwrap().is_empty(),
+            "session-level always approval should bypass future Browser prompts"
+        );
     }
 }

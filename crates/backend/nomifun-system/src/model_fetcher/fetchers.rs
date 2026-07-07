@@ -26,6 +26,7 @@ pub(crate) async fn fetch_for_platform(
         "minimax" => Ok(minimax_models()),
         "minimax-code" | "minimax-coding-plan" => Ok(minimax_code_models()),
         "ark-coding-plan" => Ok(ark_coding_plan_models()),
+        "ark-agent-plan" => fetch_ark_agent_plan(client, &config.base_url, &config.api_key).await,
         "stepfun-plan" => Ok(stepfun_plan_models()),
         "dashscope-coding" => {
             fetch_dashscope_coding(client, &config.base_url, &config.api_key).await
@@ -293,6 +294,52 @@ fn ark_coding_plan_models() -> Vec<ModelInfo> {
     fallback_models(&["ark-code-latest"])
 }
 
+// ---------------------------------------------------------------------------
+// Ark Agent Plan (remote catalog with fallback)
+// ---------------------------------------------------------------------------
+
+/// Switchable model set exposed by the Agent Plan router, used when the plan
+/// gateway does not serve a `/models` catalog (the `/api/plan/v3` endpoint
+/// only routes `/chat/completions` — `/models` returns 404). `ark-code-latest`
+/// is the console-switchable router alias (recommended). The rest are the
+/// concrete IDs verified to be accepted by the Agent Plan endpoint; other Ark
+/// model IDs return `UnsupportedModel` there. Users can still type any ID.
+const ARK_AGENT_PLAN_FALLBACK_MODELS: &[&str] = &[
+    "ark-code-latest",
+    "doubao-seed-2.0-code",
+    "doubao-seed-2.0-pro",
+    "doubao-seed-2.0-lite",
+    "deepseek-v4-flash",
+    "glm-5.2",
+    "kimi-k2.6",
+    "minimax-m2.7",
+];
+
+/// Ark Agent Plan: pull the model list from the official OpenAI-compatible
+/// `/models` endpoint on the coding/agent base URL. The subscription gateway
+/// often only routes `/chat/completions` (per Volcengine's "plan keys are for
+/// coding/agent tools, not arbitrary API calls" policy), so on any failure or
+/// empty catalog we fall back to the known switchable set rather than error.
+/// Mirrors the fetch-then-fallback pattern used by `fetch_anthropic` /
+/// `fetch_gemini`.
+async fn fetch_ark_agent_plan(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<ModelInfo>, AppError> {
+    match fetch_openai_compatible(client, base_url, api_key).await {
+        Ok(models) if !models.is_empty() => Ok(models),
+        Ok(_) => {
+            warn!("Ark Agent Plan models API returned empty list, using fallback");
+            Ok(fallback_models(ARK_AGENT_PLAN_FALLBACK_MODELS))
+        }
+        Err(e) => {
+            warn!(error = %e, "Ark Agent Plan models API unavailable, using fallback list");
+            Ok(fallback_models(ARK_AGENT_PLAN_FALLBACK_MODELS))
+        }
+    }
+}
+
 fn stepfun_plan_models() -> Vec<ModelInfo> {
     fallback_models(&[
         "step-3.7-flash",
@@ -490,6 +537,16 @@ mod tests {
         assert!(
             qianfan_coding_plan_models().contains(&ModelInfo::Id("qianfan-code-latest".into()))
         );
+    }
+
+    #[test]
+    fn ark_agent_plan_fallback_includes_router_alias_and_families() {
+        let models = fallback_models(ARK_AGENT_PLAN_FALLBACK_MODELS);
+        // Router alias must be present — it is the recommended, console-switchable entry.
+        assert!(models.contains(&ModelInfo::Id("ark-code-latest".into())));
+        // A couple of the concrete IDs verified against the live Agent Plan endpoint.
+        assert!(models.contains(&ModelInfo::Id("glm-5.2".into())));
+        assert!(models.contains(&ModelInfo::Id("deepseek-v4-flash".into())));
     }
 
     #[test]

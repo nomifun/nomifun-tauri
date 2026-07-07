@@ -52,6 +52,10 @@
   "turnWaiting": "等待确认 {{duration}}",
   "turnFailed": "处理失败 {{duration}}",
   "turnCanceled": "已取消 {{duration}}",
+  "turnProcess": {
+    "expandAllThinkingProcess": "展开全部思考过程",
+    "collapseAllThinkingProcess": "收起全部思考过程"
+  },
   "planTodoList": "待办列表",
   "planProgress": "已完成 {{done}}/{{total}}",
   "fileChanges": "文件变更",

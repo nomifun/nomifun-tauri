@@ -116,6 +116,15 @@ impl ToolApprovalManager {
             .unwrap_or(false)
     }
 
+    /// Return true only for explicit per-category "always allow" grants.
+    /// Unlike [`Self::is_auto_approved`], this intentionally ignores session mode.
+    pub fn has_auto_approve_grant(&self, category: &str) -> bool {
+        self.auto_approved
+            .lock()
+            .map(|auto| auto.contains(category))
+            .unwrap_or(false)
+    }
+
     /// Set the session approval mode. Takes effect immediately.
     pub fn set_mode(&self, mode: SessionMode) {
         if let Ok(mut current) = self.session_mode.lock() {

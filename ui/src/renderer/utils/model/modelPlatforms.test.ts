@@ -22,6 +22,15 @@ describe('MODEL_PLATFORMS coding plan presets', () => {
     expect(coding.name.includes('Coding Plan')).toBe(true);
     expect(coding.platform).toBe('ark-coding-plan');
     expect(coding.base_url).toBe('https://ark.cn-beijing.volces.com/api/coding/v3');
+
+    const agent = platform('Ark-Agent-Plan');
+    expect(agent.name.includes('Agent Plan')).toBe(true);
+    expect(agent.platform).toBe('ark-agent-plan');
+    // Agent Plan has its OWN endpoint: /api/plan/v3 (OpenAI-compat) — distinct
+    // from Coding Plan's /api/coding/v3 and from pay-as-you-go /api/v3.
+    // The quota is determined by the endpoint + key; the wrong path fails auth
+    // or bills the wrong plan.
+    expect(agent.base_url).toBe('https://ark.cn-beijing.volces.com/api/plan/v3');
   });
 
   test('uses dedicated platform keys for domestic coding plan endpoints', () => {

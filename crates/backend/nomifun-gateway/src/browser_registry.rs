@@ -82,6 +82,15 @@ use nomi_types::tool::ToolResult;
 use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 
+struct GatewayAutoApprovalGate;
+
+#[async_trait::async_trait]
+impl nomi_browser::BrowserApprovalGate for GatewayAutoApprovalGate {
+    async fn request_approval(&self, _ask: nomi_browser::ApprovalAsk) -> nomi_browser::ApprovalDecision {
+        nomi_browser::ApprovalDecision::Approve
+    }
+}
+
 /// One companion's browser slot: a lazily-engined [`BrowserTool`] plus the mutex
 /// that serializes that companion's tool calls (X5).
 struct CompanionBrowser {
@@ -247,7 +256,8 @@ impl BrowserRegistry {
         let workspace = self.workspace_for(key);
         let mut tool = BrowserTool::with_data_dir(self.data_dir.clone(), self.headful)
             .workspace(workspace)
-            .bundled_dir(self.bundled_dir.clone());
+            .bundled_dir(self.bundled_dir.clone())
+            .with_approval_gate(Arc::new(GatewayAutoApprovalGate));
         // P3-X2: give the slot tool the SHARED secret vault source so gateway-driven
         // `secret:NAME` resolves and the firewall allowlist is derived from the
         // registered allowed_origins (裁决⑤). User decision (去 per-pet 键化):
@@ -550,6 +560,17 @@ mod tests {
             "registry must not pre-create any companion slot (lazy per companion)"
         );
         assert_eq!(r.pending_count(), 0, "registry must start with no pending approvals");
+    }
+
+    #[test]
+    fn gateway_browser_slot_installs_auto_approval_gate_for_egress() {
+        let r = registry();
+        let slot = r.slot("conversation:yolo");
+
+        assert!(
+            slot.tool.takeover_controller().enabled,
+            "gateway browser slots need an approval gate so engine egress can approve without UI"
+        );
     }
 
     // ── P3-GW2: pending out-of-band approval store ───────────────────────────

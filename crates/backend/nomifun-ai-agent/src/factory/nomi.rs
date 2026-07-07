@@ -360,9 +360,12 @@ pub(super) async fn build(
     // P7A: site-memory LIVE 值。host_default=false（OFF）——把站点交互持久化到磁盘是隐私相关行为，
     // 须用户在 System Settings 显式 opt-in。
     let browser_site_memory_default = read_bool_pref(&deps, PREF_BROWSER_SITE_MEMORY, false).await;
-    // Phase D: takeover/审批 gate LIVE 值。host_default=false（OFF）——人机接管 + 跨域 POST 审批
-    // 须用户在 System Settings 显式 opt-in（否则维持 fail-closed 硬挡）。
-    let browser_takeover_default = read_bool_pref(&deps, PREF_BROWSER_TAKEOVER, false).await;
+    // Phase D: takeover/approval gate LIVE value. host_default=true (ON): install a gate by
+    // default. Non-yolo sessions can prompt for risky Browser actions / gated cross-origin
+    // POSTs; full-auto/yolo sessions still install the gate, but the gate approves directly.
+    let browser_takeover_default = read_bool_pref(&deps, PREF_BROWSER_TAKEOVER, true).await;
+    let browser_unrestricted_approval_default =
+        read_bool_pref(&deps, PREF_BROWSER_UNRESTRICTED_APPROVAL, false).await;
     // P7B: visual-fallback LIVE 值。host_default=false（OFF）——每次兜底都过一遍视觉模型，有额外 token
     // 成本，须用户在 System Settings 显式 opt-in。
     let browser_visual_fallback_default =
@@ -427,9 +430,10 @@ pub(super) async fn build(
         //  - **显式 `extra.session_mode` 仍胜出**：用户在权限选择器里手动降级为
         //    `default` / `auto_edit` 会写偏好并经 extra 传入，这里的 `.or_else` 让显式值
         //    优先，降级正常生效。
-        //  - 高危逃生舱（browser full-power 跨域 / takeover / 跨域 POST 审批 /
-        //    computer-use 桌面控制）各自读 `read_bool_pref`、**绝不看 session_mode**
-        //    （不变量⑧），与本默认正交、保持原状 —— yolo 不会放开它们。
+        //  - Full-power evaluate and desktop-control toggles remain separate System Settings
+        //    and are not granted by session_mode. Browser approval prompts are ordinary
+        //    permission friction: full-auto/yolo is honored by the Browser approval gate, so
+        //    gated Browser actions approve without UI.
         session_mode: overrides
             .session_mode
             .clone()
@@ -448,8 +452,9 @@ pub(super) async fn build(
         browser_persistent_login: browser_persistent_login_default,
         // P7A: site-memory LIVE 值（默认 OFF，opt-in；无 per-session override）。
         browser_site_memory: browser_site_memory_default,
-        // Phase D: takeover/审批 gate LIVE 值（默认 OFF，opt-in；无 per-session override）。
+        // Phase D: takeover/审批 gate LIVE 值（产品默认 ON；无 per-session override）。
         browser_takeover: browser_takeover_default,
+        browser_unrestricted_approval: browser_unrestricted_approval_default,
         // P7B: visual-fallback LIVE 值（默认 OFF，opt-in；无 per-session override）。
         browser_visual_fallback: browser_visual_fallback_default,
         goal: overrides.goal.clone().map(|g| {
@@ -585,9 +590,11 @@ const PREF_BROWSER_PERSISTENT_LOGIN: &str = "agent.browserUse.persistentLogin";
 /// **P7A**: browser-use 站点记忆开关（opt-in，隐私相关）。`true` → 跨会话记住站点结构 + 注入 hints；
 /// 缺/`false`（host_default）→ OFF（不持久化、零行为变化）。前端 System Settings 写。
 const PREF_BROWSER_SITE_MEMORY: &str = "agent.browserUse.siteMemory";
-/// **Phase D**: browser-use 人机接管 + 跨域 POST 审批（opt-in，安全）。`true` → 注入审批 gate
-/// （不可逆动作 + 被门控出口浮给用户）；缺/`false`（host_default）→ OFF（fail-closed 硬挡）。前端 System Settings 写。
+/// **Phase D**: browser-use 人机接管 + 跨域 POST 审批 gate。`true` → 注入审批 gate
+/// （默认会话浮给用户；full-auto/yolo 直接通过）；缺失时 host_default=true。前端 System Settings 写。
 const PREF_BROWSER_TAKEOVER: &str = "agent.browserUse.takeover";
+/// **Phase D**: browser-use 显式无限制审批开关。`true` → Browser approval gate 不再浮出确认。
+const PREF_BROWSER_UNRESTRICTED_APPROVAL: &str = "agent.browserUse.unrestrictedApproval";
 /// **P7B**: browser-use 视觉兜底点击（opt-in，有 token 成本）。`true` → DOM/aria 锚定失败时截图交视觉
 /// 模型定位再点；缺/`false`（host_default）→ OFF（不注入 locator、零行为变化）。前端 System Settings 写。
 const PREF_BROWSER_VISUAL_FALLBACK: &str = "agent.browserUse.visualFallback";
@@ -962,6 +969,7 @@ fn uses_configured_openai_chat_base(platform: &str) -> bool {
         platform,
         "ark"
             | "ark-coding-plan"
+            | "ark-agent-plan"
             | "stepfun"
             | "stepfun-plan"
             | "dashscope-coding"
@@ -1281,6 +1289,16 @@ fn resolve_mcp_servers(
     servers
 }
 
+fn resolved_session_mode(overrides: &NomiBuildExtra) -> String {
+    overrides
+        .session_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("yolo")
+        .to_owned()
+}
+
 /// Desktop Gateway MCP stdio bridge config for the nomi engine, mirroring the
 /// ACP assembler's `gateway_mcp_server`. Caller conversation + user ids ride
 /// along for self-protection and data scoping; the companion binding (when present)
@@ -1300,6 +1318,10 @@ fn gateway_mcp_to_config(
     env.insert(
         GatewayMcpConfig::ENV_USER_ID.into(),
         overrides.user_id.clone().unwrap_or_default(),
+    );
+    env.insert(
+        GatewayMcpConfig::ENV_SESSION_MODE.into(),
+        resolved_session_mode(overrides),
     );
     if let Some(companion_id) = overrides
         .companion_id
@@ -1491,6 +1513,11 @@ mod tests {
         assert_eq!(
             env.get(GatewayMcpConfig::ENV_PROFILE).map(String::as_str),
             Some(GatewayMcpConfig::PROFILE_WORK)
+        );
+        assert_eq!(
+            env.get("NOMI_GW_MCP_SESSION_MODE").map(String::as_str),
+            Some("yolo"),
+            "gateway bridge must receive the resolved default full-auto session mode"
         );
     }
 
@@ -1747,6 +1774,10 @@ mod tests {
             (
                 "ark-coding-plan",
                 "https://ark.cn-beijing.volces.com/api/coding/v3",
+            ),
+            (
+                "ark-agent-plan",
+                "https://ark.cn-beijing.volces.com/api/plan/v3",
             ),
             ("stepfun-plan", "https://api.stepfun.com/step_plan/v1"),
             (

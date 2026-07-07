@@ -39,6 +39,30 @@ describe('turn process disclosure content layout', () => {
     expect(disclosureSource.includes('{disclosureExpanded && (')).toBe(true);
   });
 
+  test('offers a one-click control to expand all completed thinking blocks', () => {
+    expect(disclosureSource.includes('getProcessItemCanExpandAll')).toBe(true);
+    expect(disclosureSource.includes('expandAllProcessItemKeys')).toBe(true);
+    expect(disclosureSource.includes('turn-process-disclosure__expand-thinking')).toBe(true);
+    expect(disclosureSource.includes('const hasExpandableProcessItems = expandableProcessItemKeys.length > 0')).toBe(true);
+    expect(disclosureSource.includes('const allExpandableProcessItemsExpanded =')).toBe(true);
+    expect(disclosureSource.includes('setExpandAllProcessItemKeys(new Set())')).toBe(true);
+    expect(disclosureSource.includes('turn-process-disclosure__header-actions')).toBe(true);
+    expect(disclosureSource.includes('turn-process-disclosure__toggle')).toBe(true);
+    expect(disclosureSource.includes("messages.turnProcess.expandAllThinkingProcess")).toBe(true);
+    expect(disclosureSource.includes("messages.turnProcess.collapseAllThinkingProcess")).toBe(true);
+    expect(disclosureSource.indexOf("className='turn-process-disclosure__header-actions'")).toBeGreaterThan(
+      disclosureSource.indexOf('turn-process-disclosure__header')
+    );
+    expect(disclosureSource.indexOf("className='turn-process-disclosure__header-actions'")).toBeLessThan(
+      disclosureSource.indexOf("className='turn-process-disclosure__body'")
+    );
+    expect(cssSource.includes('.turn-process-disclosure__header-actions')).toBe(true);
+    expect(cssSource.includes('.turn-process-disclosure__toggle')).toBe(true);
+    expect(messageListSource.includes('getProcessItemCanExpandAll={isCompletedThinkingProcessItem}')).toBe(true);
+    expect(disclosureSource.includes('expanded: expandAllProcessItemKeys.has(itemKey)')).toBe(true);
+    expect(messageListSource.includes('expansionControls')).toBe(true);
+  });
+
   test('uses tighter same-kind spacing and clearer cross-kind spacing', () => {
     expect(cssRuleFor('.turn-process-disclosure__body').includes('gap: 0')).toBe(true);
     expect(cssRuleFor('.turn-process-disclosure__item').includes('margin-top: 14px')).toBe(true);

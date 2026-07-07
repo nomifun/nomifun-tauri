@@ -48,7 +48,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { NomiMessageRuntime } from './useNomiMessage';
 import NomiModelSelector from './NomiModelSelector';
-import { ContextUsagePill } from './ContextUsagePill';
+import { ContextUsageRing } from './ContextUsageRing';
 import type { NomiModelSelection } from './useNomiModelSelection';
 
 const useNomiSendBoxDraft = getSendBoxDraftHook('nomi', {
@@ -731,9 +731,6 @@ const NomiSendBox: React.FC<{
       <SendBox
         data-testid='nomi-sendbox'
         showPinnedPlan
-        topRightTools={
-          hasContextUsage ? <ContextUsagePill used={tokenUsage?.context_tokens} max={tokenUsage?.context_window} /> : undefined
-        }
         onMobilePlusClick={isMobile ? () => setIsMobileSheetOpen(true) : undefined}
         value={content}
         onChange={handleContentChange}
@@ -770,6 +767,7 @@ const NomiSendBox: React.FC<{
         rightTools={
           hideModeSelector ? undefined : (
             <div className='flex items-center gap-2 min-w-0' data-testid='nomi-sendbox-config-group'>
+              {hasContextUsage && <ContextUsageRing used={tokenUsage?.context_tokens} max={tokenUsage?.context_window} />}
               <NomiModelSelector selection={modelSelection} className='nomi-sendbox-model-btn' />
               {collaboratorSelectorNode}
               {extraRightTools}

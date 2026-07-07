@@ -52,6 +52,10 @@
   "turnWaiting": "Waiting for confirmation {{duration}}",
   "turnFailed": "Failed {{duration}}",
   "turnCanceled": "Canceled {{duration}}",
+  "turnProcess": {
+    "expandAllThinkingProcess": "Expand all thinking process",
+    "collapseAllThinkingProcess": "Collapse all thinking process"
+  },
   "planTodoList": "To do list",
   "planProgress": "{{done}}/{{total}} done",
   "fileChanges": "File Changes",

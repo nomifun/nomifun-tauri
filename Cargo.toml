@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/agent/*", "crates/backend/*", "crates/shared/*", "apps/web", "apps/desktop"]
 
 [workspace.package]
-version = "0.2.6"
+version = "0.2.7"
 edition = "2024"
 license = "Apache-2.0"
 repository = "local/nomifun-tauri"
@@ -243,3 +243,36 @@ debug = "line-tables-only"
 
 [profile.test.package."*"]
 debug = false
+
+# Size-optimized release profile. The packaged `nomifun-desktop.exe` is the first
+# and largest file the NSIS installer writes, and an oversized *unsigned* binary
+# is the dominant cause of end-user "Extract: error writing to file
+# nomifun-desktop.exe" failures: the longer the write window, the more likely
+# antivirus real-time scanning locks/quarantines the half-written exe (and the
+# bigger the download). Cargo's default release profile (no LTO,
+# codegen-units=16) left the binary at ~140 MB. These knobs cut the machine-code
+# bulk without changing runtime behavior:
+#   opt-level = 3      keep the default speed-optimized codegen (NOT "s"/"z"): the
+#                      LTO + codegen-units=1 win below is the main size lever, so
+#                      keeping opt-level=3 guarantees runtime perf >= the old build
+#                      (which was opt-level=3 but had NO LTO). Slightly larger than
+#                      opt-level="s" would be, but still far below the ~140 MB baseline.
+#   lto = "thin"       cross-crate dead-code elimination. Deliberately NOT fat
+#                      `true`: the desktop binary already embeds ui/dist (~34 MB)
+#                      and needs RUST_MIN_STACK=128MB for opt-level=3 codegen
+#                      (see .cargo/config.toml); fat LTO's memory/link pressure
+#                      would worsen the known intermittent rust-lld heap
+#                      corruption. Thin LTO keeps most of the size win, lighter.
+#   codegen-units = 1  let the optimizer see whole crates → smaller output.
+#   strip = true       drop residual symbol tables (also shrinks the non-Windows
+#                      appimage/deb/rpm/dmg artifacts).
+# NOT panic = "abort": the codebase relies on panic = "unwind" to isolate a
+# panicking tool from the agent process (nomi-agent/src/orchestration.rs,
+# apps/desktop/src/main.rs catch_unwind boundaries) and a test asserts unwind
+# semantics (nomifun-ai-agent/src/protocol/acp.rs). Aborting would turn a single
+# tool panic into a full-process crash — a real behavior regression.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

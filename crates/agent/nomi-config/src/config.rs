@@ -346,6 +346,10 @@ pub struct BrowserConfig {
     /// 同范式，host_default=false=OFF——视觉兜底每次都过一遍视觉模型，有额外 token 成本，须用户显式 opt-in）。
     #[serde(default)]
     pub visual_fallback: bool,
+    /// Explicit Browser Use approval bypass. Default false; host settings may set
+    /// this from `agent.browserUse.unrestrictedApproval`.
+    #[serde(default)]
+    pub unrestricted_approval: bool,
     /// **浏览器来源**（「浏览器模式」的来源维度，与 `headless` 正交）。`"managed"`（默认）=
     /// 内置/下载的 Chrome for Testing；`"system"` = 用户系统已装的 Chrome/Edge 本体优先
     /// （未探到回退 managed）。**两种来源都用专属 user-data-dir 起独立托管实例**（红线：绝不
@@ -368,6 +372,7 @@ impl Default for BrowserConfig {
             persistent_login: false,
             site_memory: false,
             visual_fallback: false,
+            unrestricted_approval: false,
             source: default_browser_source(),
         }
     }
@@ -831,6 +836,8 @@ fn merge_config_files(global: ConfigFile, project: ConfigFile) -> ConfigFile {
         // P7B visual-fallback——任一层开启即开（与 full_power 同 OR 合并语义）。运行时由 backend factory 经
         // client_preferences LIVE 覆写（host_default=false），这里只是 toml 合并。
         visual_fallback: global.tools.browser.visual_fallback || project.tools.browser.visual_fallback,
+        unrestricted_approval: global.tools.browser.unrestricted_approval
+            || project.tools.browser.unrestricted_approval,
         // 浏览器来源——project 非默认（显式设了 "system"/其它）则覆盖 global，否则用 global（与
         // browser_path 同「project 非默认优先」语义）。运行时由 backend factory 经 client_preferences
         // LIVE 覆写（config.tools.browser.source），这里只是 toml 合并。

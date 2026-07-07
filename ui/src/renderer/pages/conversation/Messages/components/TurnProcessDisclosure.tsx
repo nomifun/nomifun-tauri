@@ -7,7 +7,7 @@
 import type { TurnDisclosureProcessState } from '../turnDisclosureModel';
 import { Down } from '@icon-park/react';
 import classNames from 'classnames';
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 export interface TurnProcessDisclosureView<T> {
@@ -23,15 +23,21 @@ export interface TurnProcessDisclosureView<T> {
 interface TurnProcessDisclosureProps<T> {
   item: TurnProcessDisclosureView<T>;
   highlighted?: boolean;
-  renderProcessItem: (item: T) => React.ReactNode;
+  renderProcessItem: (item: T, expansionControls?: TurnProcessDisclosureExpansionControls) => React.ReactNode;
   getProcessItemKey: (item: T) => string;
   getProcessItemState: (item: T) => TurnDisclosureProcessState;
   getProcessItemLayoutKind?: (item: T) => string;
+  getProcessItemCanExpandAll?: (item: T) => boolean;
 }
 
 export interface TurnProcessDisclosureExpansionSnapshot {
   itemId: string;
   hasProcessItems: boolean;
+}
+
+export interface TurnProcessDisclosureExpansionControls {
+  expanded: boolean;
+  onExpandedChange: (expanded: boolean) => void;
 }
 
 const labelKeyByState: Record<TurnDisclosureProcessState, string> = {
@@ -86,10 +92,12 @@ function TurnProcessDisclosure<T>({
   getProcessItemKey,
   getProcessItemState,
   getProcessItemLayoutKind,
+  getProcessItemCanExpandAll,
 }: TurnProcessDisclosureProps<T>) {
   const { t } = useTranslation();
   const hasProcessItems = item.processItems.length > 0;
   const [expanded, setExpanded] = useState(() => getDefaultExpanded(hasProcessItems, item.defaultCollapsed));
+  const [expandAllProcessItemKeys, setExpandAllProcessItemKeys] = useState<Set<string>>(() => new Set());
   const [now, setNow] = useState(() => Date.now());
   const expansionSnapshotRef = useRef<TurnProcessDisclosureExpansionSnapshot>({
     itemId: item.id,
@@ -103,6 +111,7 @@ function TurnProcessDisclosure<T>({
 
     if (shouldReset) {
       setExpanded(getDefaultExpanded(hasProcessItems, item.defaultCollapsed));
+      setExpandAllProcessItemKeys(new Set());
     }
   }, [hasProcessItems, item.defaultCollapsed, item.id]);
 
@@ -134,6 +143,54 @@ function TurnProcessDisclosure<T>({
     return latestItem ? getProcessItemKey(latestItem) : undefined;
   }, [getProcessItemKey, getProcessItemState, item.processItems]);
 
+  const expandableProcessItemKeys = useMemo(() => {
+    if (!getProcessItemCanExpandAll) return [];
+    return item.processItems.filter(getProcessItemCanExpandAll).map(getProcessItemKey);
+  }, [getProcessItemCanExpandAll, getProcessItemKey, item.processItems]);
+
+  useEffect(() => {
+    if (!expandableProcessItemKeys.length) {
+      setExpandAllProcessItemKeys((previous) => (previous.size > 0 ? new Set() : previous));
+      return;
+    }
+
+    const validKeys = new Set(expandableProcessItemKeys);
+    setExpandAllProcessItemKeys((previous) => {
+      const next = new Set([...previous].filter((key) => validKeys.has(key)));
+      return next.size === previous.size ? previous : next;
+    });
+  }, [expandableProcessItemKeys]);
+
+  const hasExpandableProcessItems = expandableProcessItemKeys.length > 0;
+  const allExpandableProcessItemsExpanded =
+    hasExpandableProcessItems && expandableProcessItemKeys.every((itemKey) => expandAllProcessItemKeys.has(itemKey));
+
+  const handleToggleAllProcessItems = useCallback(() => {
+    if (allExpandableProcessItemsExpanded) {
+      setExpandAllProcessItemKeys(new Set());
+      return;
+    }
+    setExpandAllProcessItemKeys(new Set(expandableProcessItemKeys));
+  }, [allExpandableProcessItemsExpanded, expandableProcessItemKeys]);
+
+  const getExpansionControls = useCallback(
+    (itemKey: string): TurnProcessDisclosureExpansionControls => ({
+      expanded: expandAllProcessItemKeys.has(itemKey),
+      onExpandedChange: (nextExpanded) => {
+        setExpandAllProcessItemKeys((previous) => {
+          const next = new Set(previous);
+          if (nextExpanded) {
+            next.add(itemKey);
+          } else {
+            next.delete(itemKey);
+          }
+          return next;
+        });
+      },
+    }),
+    [expandAllProcessItemKeys]
+  );
+
   const durationEndAt = item.running ? now : item.endAt;
   const duration = formatTurnDuration(durationEndAt - item.startAt, t);
   const label = t(labelKeyByState[item.state], {
@@ -145,37 +202,72 @@ function TurnProcessDisclosure<T>({
 
   return (
     <div className={classNames('turn-process-disclosure', `turn-process-disclosure--${item.state}`)}>
-      <button
-        type='button'
+      <div
         className={classNames(
           'turn-process-disclosure__header',
           !hasProcessItems && 'turn-process-disclosure__header--static'
         )}
-        onClick={() => {
-          if (hasProcessItems) setExpanded((value) => !value);
-        }}
-        aria-expanded={hasProcessItems ? disclosureExpanded : undefined}
-        aria-controls={hasProcessItems ? bodyId : undefined}
       >
-        <span className='turn-process-disclosure__label'>{label}</span>
-        {hasProcessItems && (
-          <Down
-            theme='outline'
-            size='14'
-            fill='currentColor'
-            className={classNames(
-              'turn-process-disclosure__arrow',
-              disclosureExpanded && 'turn-process-disclosure__arrow--open'
-            )}
-          />
+        <button
+          type='button'
+          className='turn-process-disclosure__toggle'
+          onClick={() => {
+            if (hasProcessItems) setExpanded((value) => !value);
+          }}
+          aria-expanded={hasProcessItems ? disclosureExpanded : undefined}
+          aria-controls={hasProcessItems ? bodyId : undefined}
+        >
+          <span className='turn-process-disclosure__label'>{label}</span>
+          {hasProcessItems && (
+            <Down
+              theme='outline'
+              size='14'
+              fill='currentColor'
+              className={classNames(
+                'turn-process-disclosure__arrow',
+                disclosureExpanded && 'turn-process-disclosure__arrow--open'
+              )}
+            />
+          )}
+        </button>
+        {disclosureExpanded && hasExpandableProcessItems && (
+          <div className='turn-process-disclosure__header-actions'>
+            <button
+              type='button'
+              className='turn-process-disclosure__expand-thinking'
+              onClick={handleToggleAllProcessItems}
+            >
+              <Down
+                theme='outline'
+                size='14'
+                fill='currentColor'
+                className={classNames(
+                  'turn-process-disclosure__expand-thinking-icon',
+                  allExpandableProcessItemsExpanded && 'turn-process-disclosure__expand-thinking-icon--open'
+                )}
+              />
+              <span>
+                {allExpandableProcessItemsExpanded
+                  ? t('messages.turnProcess.collapseAllThinkingProcess', {
+                      defaultValue: 'Collapse all thinking process',
+                    })
+                  : t('messages.turnProcess.expandAllThinkingProcess', {
+                      defaultValue: 'Expand all thinking process',
+                    })}
+              </span>
+            </button>
+          </div>
         )}
-      </button>
+      </div>
       {disclosureExpanded && (
         <div id={bodyId} className='turn-process-disclosure__body'>
           {item.processItems.map((processItem) => {
             const itemKey = getProcessItemKey(processItem);
             const state = getProcessItemState(processItem);
             const layoutKind = getProcessItemLayoutKind?.(processItem) ?? 'other';
+            const expansionControls = getProcessItemCanExpandAll?.(processItem)
+              ? getExpansionControls(itemKey)
+              : undefined;
             return (
               <div
                 key={itemKey}
@@ -186,7 +278,7 @@ function TurnProcessDisclosure<T>({
                   itemKey === currentItemKey && 'turn-process-disclosure__item--current'
                 )}
               >
-                {renderProcessItem(processItem)}
+                {renderProcessItem(processItem, expansionControls)}
               </div>
             );
           })}

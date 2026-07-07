@@ -443,6 +443,17 @@ fn gateway_mcp_server(
             platform.to_owned(),
         ));
     }
+    if let Some(mode) = extra
+        .session_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        env.push(EnvVariable::new(
+            GatewayMcpConfig::ENV_SESSION_MODE.to_owned(),
+            mode.to_owned(),
+        ));
+    }
     env.push(EnvVariable::new(
         GatewayMcpConfig::ENV_PROFILE.to_owned(),
         GatewayMcpConfig::default_profile_for_session(extra.channel_platform.as_deref()).to_owned(),
@@ -602,6 +613,7 @@ mod tests {
             }),
             user_id: Some("u1".into()),
             companion_id: Some("companion_9".into()),
+            session_mode: Some("yolo".into()),
             ..Default::default()
         };
         let servers = resolve_mcp_servers(&config, "conv-1", vec![]);
@@ -635,6 +647,11 @@ mod tests {
             rendered.contains(GatewayMcpConfig::ENV_PROFILE),
             "got {rendered}"
         );
+        assert!(
+            rendered.contains(GatewayMcpConfig::ENV_SESSION_MODE),
+            "got {rendered}"
+        );
+        assert!(rendered.contains("yolo"), "got {rendered}");
         assert!(
             rendered.contains(GatewayMcpConfig::PROFILE_WORK),
             "got {rendered}"

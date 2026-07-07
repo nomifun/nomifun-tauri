@@ -3,6 +3,7 @@ import type { ProtocolDetectionResponse, ProtocolType } from '@/common/utils/pro
 import { ipcBridge } from '@/common';
 import { prefixedId } from '@/common/utils';
 import { normalizeApiKeyList, validateApiKeysForSave } from '@/common/utils/apiKeys';
+import { platformHasNoModelsEndpoint } from '@/common/utils/platformConstants';
 import { isGoogleApisHost } from '@/common/utils/urlValidation';
 import ModalHOC from '@/renderer/utils/ui/ModalHOC';
 import { copyText } from '@/renderer/utils/ui/clipboard';
@@ -415,7 +416,9 @@ const AddPlatformModal = ModalHOC<{
         const providerBaseUrl = isBedrock ? '' : values.base_url || selectedPlatform?.base_url || '';
         let normalizedApiKey = '';
 
-        if (!isBedrock && !isFullUrl) {
+        // 订阅套餐网关（Coding/Agent Plan）没有 /models 目录，用 /models 探测会把
+        // 合法 Key 误判为不可用 —— 跳过保存前探测，交由心跳检测校验。
+        if (!isBedrock && !isFullUrl && !platformHasNoModelsEndpoint(providerPlatform)) {
           setIsSaving(true);
           const validation = await validateApiKeysForSave(values.api_key, (key) =>
             testApiKeyForProvider(key, providerBaseUrl)
@@ -920,6 +923,8 @@ const AddPlatformModal = ModalHOC<{
           void modelListState.mutate();
         }}
         onTestKey={async (key) => {
+          // 套餐网关无 /models 目录，探测会误判为无效；交给心跳检测（真实对话）校验。
+          if (platformHasNoModelsEndpoint(selectedPlatform?.platform)) return true;
           return testApiKeyForProvider(key, actualBaseUrl);
         }}
       />

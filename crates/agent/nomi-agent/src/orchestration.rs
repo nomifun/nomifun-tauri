@@ -14,6 +14,11 @@ use nomi_types::tool::ToolResult;
 
 use nomi_tools::registry::ToolRegistry;
 
+const RECOVERED_PARTIAL_WRITE_KEY: &str = "__nomi_recovered_partial_write";
+const RECOVERED_PARTIAL_WRITE_RESULT_HINT: &str = "\
+Recovered a partial Write from an output-token cutoff. The file now contains the generated prefix only. \
+Read the file, inspect the tail, then append or edit small chunks until the deliverable is complete before finalizing.";
+
 /// The combined output of a tool execution batch: protocol content blocks
 /// paired with per-call context modifiers (None for non-skill tools).
 pub struct ToolCallOutcome {
@@ -158,6 +163,19 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+fn append_recovered_partial_write_hint(tool_name: &str, input: &serde_json::Value, content: String) -> String {
+    if tool_name == "Write"
+        && input
+            .get(RECOVERED_PARTIAL_WRITE_KEY)
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+    {
+        format!("{content}\n\n{RECOVERED_PARTIAL_WRITE_RESULT_HINT}")
+    } else {
+        content
+    }
+}
+
 async fn execute_single(
     registry: &ToolRegistry,
     call: &ContentBlock,
@@ -235,6 +253,7 @@ async fn execute_single(
             } else {
                 r.content.clone()
             };
+            let error_content = append_recovered_partial_write_hint(name, input, error_content);
             let content = truncate_result(&error_content, max_size);
             let content = nomi_compact::compact_output(&content, compaction_level);
             let content = if toon_enabled {
@@ -318,7 +337,9 @@ pub async fn execute_tool_calls_with_approval(
                 return false;
             }
             let category = tool.category_for(input);
+            let tool_auto_approve = tool.auto_approve_invocation(input, category);
             let needs_approval = !auto_approve
+                && !tool_auto_approve
                 && !allow_list.contains(&name.to_string())
                 && !approval_manager.is_auto_approved(&category.to_string());
             !needs_approval
@@ -399,9 +420,13 @@ pub async fn execute_tool_calls_with_approval(
             .map(|t| t.category_for(input))
             .unwrap_or(ToolCategory::Exec);
         let description = tool.map(|t| t.describe(input)).unwrap_or_default();
+        let tool_auto_approve = tool
+            .map(|t| t.auto_approve_invocation(input, category))
+            .unwrap_or(false);
 
         // Check if approval is needed
         let needs_approval = !auto_approve
+            && !tool_auto_approve
             && !allow_list.contains(&name.to_string())
             && !approval_manager.is_auto_approved(&category.to_string());
 
@@ -877,6 +902,76 @@ mod tests {
         }
     }
 
+    struct BrowserLikeApprovalTool;
+
+    #[async_trait::async_trait]
+    impl Tool for BrowserLikeApprovalTool {
+        fn name(&self) -> &str {
+            "BrowserLike"
+        }
+        fn description(&self) -> &str {
+            "Browser-like approval policy test tool"
+        }
+        fn input_schema(&self) -> serde_json::Value {
+            json!({ "type": "object" })
+        }
+        fn is_concurrency_safe(&self, _input: &serde_json::Value) -> bool {
+            false
+        }
+        async fn execute(&self, _input: serde_json::Value) -> nomi_types::tool::ToolResult {
+            nomi_types::tool::ToolResult {
+                content: "ok".to_string(),
+                is_error: false,
+                images: Vec::new(),
+            }
+        }
+        fn category(&self) -> nomi_protocol::events::ToolCategory {
+            nomi_protocol::events::ToolCategory::Exec
+        }
+        fn category_for(&self, input: &serde_json::Value) -> nomi_protocol::events::ToolCategory {
+            if input
+                .get("irreversible")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                nomi_protocol::events::ToolCategory::Irreversible
+            } else {
+                nomi_protocol::events::ToolCategory::Exec
+            }
+        }
+        fn auto_approve_invocation(
+            &self,
+            _input: &serde_json::Value,
+            category: nomi_protocol::events::ToolCategory,
+        ) -> bool {
+            category != nomi_protocol::events::ToolCategory::Irreversible
+        }
+    }
+
+    #[derive(Default)]
+    struct CapturingEmitter {
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CapturingEmitter {
+        fn has_tool_request(&self) -> bool {
+            self.events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.contains(r#""type":"tool_request""#))
+        }
+    }
+
+    impl nomi_protocol::writer::ProtocolEmitter for CapturingEmitter {
+        fn emit(&self, event: &nomi_protocol::events::ProtocolEvent) -> std::io::Result<()> {
+            let encoded = serde_json::to_string(event)
+                .map_err(|e| std::io::Error::other(format!("serialize protocol event: {e}")))?;
+            self.events.lock().unwrap().push(encoded);
+            Ok(())
+        }
+    }
+
     fn make_registry_with_deferred() -> ToolRegistry {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(MockDeferredTool {
@@ -888,6 +983,90 @@ mod tests {
         }));
         registry.register(Box::new(MockNonDeferredTool));
         registry
+    }
+
+    #[tokio::test]
+    async fn tool_level_auto_approval_skips_prompt_for_safe_invocation() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(BrowserLikeApprovalTool));
+        let calls = vec![ContentBlock::ToolUse {
+            id: "safe-browser-call".into(),
+            name: "BrowserLike".into(),
+            input: json!({ "action": "scroll" }),
+            extra: None,
+        }];
+        let approval_manager = std::sync::Arc::new(nomi_protocol::ToolApprovalManager::new());
+        let writer_capture = std::sync::Arc::new(CapturingEmitter::default());
+        let writer: std::sync::Arc<dyn nomi_protocol::writer::ProtocolEmitter> = writer_capture.clone();
+
+        let outcome = execute_tool_calls_with_approval(
+            &registry,
+            &calls,
+            &approval_manager,
+            &writer,
+            "msg-safe",
+            false,
+            &[],
+            None,
+            nomi_compact::CompactionLevel::Off,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.results.len(), 1);
+        assert!(
+            !writer_capture.has_tool_request(),
+            "safe Browser-like calls should not emit approval prompts"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_level_auto_approval_still_prompts_for_irreversible_invocation() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(BrowserLikeApprovalTool));
+        let calls = vec![ContentBlock::ToolUse {
+            id: "danger-browser-call".into(),
+            name: "BrowserLike".into(),
+            input: json!({ "action": "click", "irreversible": true }),
+            extra: None,
+        }];
+        let approval_manager = std::sync::Arc::new(nomi_protocol::ToolApprovalManager::new());
+        let writer_capture = std::sync::Arc::new(CapturingEmitter::default());
+        let writer: std::sync::Arc<dyn nomi_protocol::writer::ProtocolEmitter> = writer_capture.clone();
+        let am = approval_manager.clone();
+        let writer_for_task = writer_capture.clone();
+
+        tokio::spawn(async move {
+            loop {
+                if writer_for_task.has_tool_request() {
+                    am.resolve("danger-browser-call", nomi_protocol::ToolApprovalResult::Approved);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        });
+
+        let outcome = execute_tool_calls_with_approval(
+            &registry,
+            &calls,
+            &approval_manager,
+            &writer,
+            "msg-danger",
+            false,
+            &[],
+            None,
+            nomi_compact::CompactionLevel::Off,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.results.len(), 1);
+        assert!(
+            writer_capture.has_tool_request(),
+            "irreversible Browser-like calls must still prompt"
+        );
     }
 
     struct MockSecretTool;
@@ -965,6 +1144,49 @@ mod tests {
                 "secret must be redacted, got: {content}"
             );
             assert!(content.contains("REDACTED"), "should show a redaction placeholder: {content}");
+        } else {
+            panic!("expected ToolResult");
+        }
+    }
+
+    #[tokio::test]
+    async fn recovered_partial_write_result_tells_model_to_continue() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(
+            nomi_tools::write::WriteTool::new(None).with_cwd(Some(dir.path().to_path_buf())),
+        ));
+        let call = ContentBlock::ToolUse {
+            id: "partial-write".into(),
+            name: "Write".into(),
+            input: json!({
+                "file_path": "index.html",
+                "content": "<html><body>partial",
+                RECOVERED_PARTIAL_WRITE_KEY: true
+            }),
+            extra: None,
+        };
+
+        let (result, _) = execute_single(
+            &registry,
+            &call,
+            None,
+            nomi_compact::CompactionLevel::Off,
+            false,
+        )
+        .await;
+
+        let written = std::fs::read_to_string(dir.path().join("index.html")).unwrap();
+        assert_eq!(written, "<html><body>partial");
+        if let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &result
+        {
+            assert!(!is_error);
+            assert!(content.contains("Created"));
+            assert!(content.contains("Recovered a partial Write from an output-token cutoff"));
+            assert!(content.contains("Read the file"));
+            assert!(content.contains("append or edit small chunks"));
         } else {
             panic!("expected ToolResult");
         }

@@ -87,7 +87,7 @@ impl ApprovalAsk {
         match &self.kind {
             ApprovalKind::IrreversibleAction { action, description } => format!(
                 "The agent wants to run `{action}` ({description}) — this is irreversible \
-                 (may submit / pay / delete / send) and your session auto-approves."
+                 (may submit / pay / delete / send) and requires Browser approval."
             ),
             ApprovalKind::CrossOriginPost { host, size, field_names } => {
                 let fields = if field_names.is_empty() {

@@ -15,6 +15,8 @@ use nomi_agent::session::Session;
 use nomi_config::config::{CliArgs, Config};
 use nomi_mcp::manager::McpManager;
 use nomi_protocol::commands::SessionMode;
+#[cfg(feature = "browser-use")]
+use nomi_protocol::events::ToolCategory;
 use nomi_protocol::{ToolApprovalManager, ToolApprovalResult};
 use nomifun_api_types::{AgentModeResponse, SlashCommandItem};
 use nomifun_common::{
@@ -33,6 +35,7 @@ use crate::types::{NomiResolvedConfig, SendMessageData};
 
 pub struct NomiAgentManager {
     runtime: AgentRuntime,
+    backend_output_sink: Arc<BackendOutputSink>,
     engine: Mutex<AgentEngine>,
     /// Static slash command metadata captured at bootstrap so UI lookups do
     /// not wait behind an active `engine.run()` turn.
@@ -105,6 +108,26 @@ pub(crate) const KNOWLEDGE_WRITE_TOOL_NAME: &str = "knowledge_write";
 /// pushes during every pass; any leftover after the cap is left in the inbox
 /// and drained by the NEXT turn (late delivery, never lost).
 const MAX_STEERING_RACE_TAIL_RERUNS: usize = 3;
+
+/// Cap on automatic continuation passes when a model response is truncated
+/// before the task is complete. This keeps the UX moving without letting a bad
+/// prompt or provider loop spend unbounded tokens.
+const MAX_TRUNCATION_AUTO_CONTINUES: usize = 2;
+
+fn truncation_continuation_prompt(attempt: usize, max_attempts: usize, reason: &str) -> String {
+    format!(
+        "[Automatic continuation {attempt}/{max_attempts}]\n\
+The previous pass reached {reason} before the user's request was fully delivered.\n\n\
+Recovery mode:\n\
+- Continue the same task from the last valid state. Do not restart unless necessary.\n\
+- If a file write or tool argument was interrupted, do not repeat the same oversized call.\n\
+- Do not call Write with a full large file in one call.\n\
+- First create a small complete deliverable that satisfies the user request end-to-end.\n\
+- Then improve it by using Bash, Edit, or Write to append or edit in chunks; keep each chunk small.\n\
+- For HTML/CSS/JS deliverables, prefer a concise valid file first, then add sections/styles incrementally.\n\
+- Before finalizing, verify the target file exists in the active workspace and briefly report what was created."
+    )
+}
 
 /// Prepend the one-shot knowledge prelude to the first user turn, if present.
 pub(crate) fn apply_knowledge_prelude(prelude: Option<String>, content: &str) -> String {
@@ -183,9 +206,10 @@ impl NomiAgentManager {
             nomi_memory::paths::auto_memory_dir(std::path::Path::new(&workspace))
         };
 
-        let sink: Arc<dyn OutputSink> = Arc::new(
+        let backend_output_sink = Arc::new(
             BackendOutputSink::new(runtime.event_sender()).with_distill_dir(distill_dir.clone()),
         );
+        let sink: Arc<dyn OutputSink> = backend_output_sink.clone();
 
         let cli_args = CliArgs {
             provider: Some(config_extra.provider.clone()),
@@ -273,6 +297,7 @@ impl NomiAgentManager {
         // P7B: 把会话的 visual-fallback LIVE 值灌进 BrowserConfig.visual_fallback（默认 OFF，opt-in）。
         // bootstrap 据它给 BrowserTool 注入会话模型的 VisualLocator（锚定失败时截图交视觉模型定位再点）。
         config.tools.browser.visual_fallback = config_extra.browser_visual_fallback;
+        config.tools.browser.unrestricted_approval = config_extra.browser_unrestricted_approval;
         // 「浏览器模式」两开关（与上面的 opt-in 开关正交，每会话 LIVE）：
         // - 静默：silent(默认 true) → headless。facade 由 !headless 得 headful；无显示器时引擎本就强制 headless。
         // - 来源：source("managed"/"system") → facade 解析为 ChromeSource（system=系统 Chrome/Edge 优先，
@@ -360,11 +385,16 @@ impl NomiAgentManager {
         // fail-closed (irreversible stays Blocked, gated egress fails). Threaded into the
         // native BrowserTool inside bootstrap (no-op if browser-use is off).
         #[cfg(feature = "browser-use")]
-        if config_extra.browser_takeover {
+        if should_install_browser_approval_gate(
+            config_extra.browser_takeover,
+            config_extra.browser_unrestricted_approval,
+            approval_manager.as_ref(),
+        ) {
             let gate = crate::manager::nomi::browser_approval::DesktopApprovalGate::new(
                 runtime.event_sender(),
                 confirmations.clone(),
                 approval_manager.clone(),
+                config_extra.browser_unrestricted_approval,
             );
             bootstrap = bootstrap.approval_gate(Arc::new(gate));
         }
@@ -503,6 +533,7 @@ impl NomiAgentManager {
 
         Ok(Self {
             runtime,
+            backend_output_sink,
             engine: Mutex::new(engine),
             slash_commands,
             mcp_managers: result.mcp_managers,
@@ -615,13 +646,12 @@ impl crate::agent_task::IAgentTask for NomiAgentManager {
         let mut engine = self.engine.lock().await;
         engine.set_steering_inbox(Some(self.steering_inbox.clone()));
 
-        // Each iteration runs one engine pass. The in-engine injection points
-        // catch ~all steering mid-turn; this loop only re-runs to absorb the
-        // sub-millisecond tail where a steer landed AFTER the engine's final
-        // drain but before run returned — so no interjection is ever lost, and
-        // the whole thing stays inside one turn-claim (no 409).
+        // Each iteration runs one engine pass inside the same turn claim. Most
+        // passes finish naturally; this loop re-runs only to absorb steering
+        // race-tail interjections or to continue after bounded truncation.
         let mut run_input = content;
         let mut race_tail_reruns = 0usize;
+        let mut truncation_auto_continues = 0usize;
         let result = loop {
             let r = if self.distill_cfg.tools.cooperative_cancel {
                 // Cooperative cancel (F0.4, opt-in): install a token, cancel it on
@@ -694,6 +724,39 @@ impl crate::agent_task::IAgentTask for NomiAgentManager {
                     tracing::warn!(
                         conversation_id = %self.runtime.conversation_id(),
                         "Nomi steering race-tail cap reached; any leftover deferred to next turn"
+                    );
+                }
+            }
+            if let Some(Ok(agent_result)) = &r {
+                let reason = match agent_result.stop_reason {
+                    nomi_types::message::StopReason::MaxTokens => Some("the output token limit"),
+                    nomi_types::message::StopReason::MaxTurns => Some("the per-turn request cap"),
+                    _ => None,
+                };
+                if let Some(reason) = reason {
+                    if truncation_auto_continues < MAX_TRUNCATION_AUTO_CONTINUES {
+                        truncation_auto_continues += 1;
+                        info!(
+                            conversation_id = %self.runtime.conversation_id(),
+                            attempt = truncation_auto_continues,
+                            max_attempts = MAX_TRUNCATION_AUTO_CONTINUES,
+                            stop_reason = ?agent_result.stop_reason,
+                            "Nomi turn truncated; auto-continuing before Finish"
+                        );
+                        self.backend_output_sink
+                            .complete_active_tool_calls_for_auto_continue(reason);
+                        run_input = truncation_continuation_prompt(
+                            truncation_auto_continues,
+                            MAX_TRUNCATION_AUTO_CONTINUES,
+                            reason,
+                        );
+                        continue;
+                    }
+                    tracing::warn!(
+                        conversation_id = %self.runtime.conversation_id(),
+                        attempts = truncation_auto_continues,
+                        stop_reason = ?agent_result.stop_reason,
+                        "Nomi truncation auto-continue cap reached; emitting final Finish"
                     );
                 }
             }
@@ -1002,6 +1065,17 @@ fn parse_session_mode(s: &str) -> SessionMode {
     }
 }
 
+#[cfg(feature = "browser-use")]
+fn should_install_browser_approval_gate(
+    browser_takeover: bool,
+    browser_unrestricted_approval: bool,
+    approval_manager: &ToolApprovalManager,
+) -> bool {
+    browser_takeover
+        || browser_unrestricted_approval
+        || approval_manager.is_auto_approved(&ToolCategory::Irreversible.to_string())
+}
+
 fn nomi_engine_error_to_send_error(error_msg: String) -> AgentSendError {
     let lower = error_msg.to_ascii_lowercase();
     if lower.contains("provider error") || lower.contains("provider:") || lower.contains("api error:") {
@@ -1014,6 +1088,11 @@ fn nomi_engine_error_to_send_error(error_msg: String) -> AgentSendError {
 mod tests {
     use super::*;
     use crate::agent_task::IAgentTask;
+    use nomi_providers::{LlmProvider, ProviderError};
+    use nomi_tools::registry::ToolRegistry;
+    use nomi_types::llm::{LlmEvent, LlmRequest};
+    use nomi_types::message::{ContentBlock, Role, StopReason};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     async fn assert_no_stop_signal(agent: &NomiAgentManager) {
         let notified = agent.cancel_notify.notified();
@@ -1050,6 +1129,7 @@ mod tests {
             browser_persistent_login: false,
             browser_site_memory: false,
             browser_takeover: false,
+            browser_unrestricted_approval: false,
             browser_visual_fallback: false,
             goal: None,
             browser_secret_vault: None,
@@ -1057,7 +1137,253 @@ mod tests {
             in_process_spawn: true,
             allowed_tools: Vec::new(),
             write_root: None,
-        }    }
+        }
+    }
+
+    struct ScriptedProvider {
+        calls: AtomicUsize,
+        responses: Vec<Vec<LlmEvent>>,
+        requests: std::sync::Mutex<Vec<LlmRequest>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(responses: Vec<Vec<LlmEvent>>) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                responses,
+                requests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn requests(&self) -> Vec<LlmRequest> {
+            self.requests
+                .lock()
+                .expect("request capture lock poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ScriptedProvider {
+        async fn stream(
+            &self,
+            request: &LlmRequest,
+        ) -> Result<tokio::sync::mpsc::Receiver<LlmEvent>, ProviderError> {
+            self.requests
+                .lock()
+                .expect("request capture lock poisoned")
+                .push(request.clone());
+            let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            let events = self
+                .responses
+                .get(index)
+                .unwrap_or_else(|| panic!("unexpected provider call {index}"))
+                .clone();
+            let (tx, rx) = tokio::sync::mpsc::channel(events.len().max(1));
+            tokio::spawn(async move {
+                for event in events {
+                    let _ = tx.send(event).await;
+                }
+            });
+            Ok(rx)
+        }
+    }
+
+    fn make_test_engine_config() -> Config {
+        let mut config = Config::resolve(&CliArgs {
+            provider: Some("anthropic".into()),
+            api_key: Some("sk-test-key".into()),
+            base_url: None,
+            model: Some("claude-sonnet-4-20250514".into()),
+            max_tokens: Some(4096),
+            max_turns: Some(10),
+            system_prompt: None,
+            profile: None,
+            auto_approve: true,
+            project_dir: Some(PathBuf::from("/project")),
+        })
+        .expect("test config should resolve");
+        config.session.enabled = false;
+        config
+    }
+
+    fn make_agent_with_provider(provider: Arc<dyn LlmProvider>) -> NomiAgentManager {
+        let runtime = AgentRuntime::new("conv-auto-continue", "/project", 128);
+        let backend_output_sink = Arc::new(BackendOutputSink::new(runtime.event_sender()));
+        let output: Arc<dyn OutputSink> = backend_output_sink.clone();
+        let config = make_test_engine_config();
+        let mut engine = AgentEngine::new_with_provider(
+            provider,
+            config.clone(),
+            ToolRegistry::new(),
+            output,
+            PathBuf::from("/project"),
+        );
+        let approval_manager = Arc::new(ToolApprovalManager::new());
+        engine.set_approval_manager(approval_manager.clone());
+
+        NomiAgentManager {
+            runtime,
+            backend_output_sink,
+            engine: Mutex::new(engine),
+            slash_commands: Vec::new(),
+            mcp_managers: Vec::new(),
+            approval_manager,
+            confirmations: Arc::new(std::sync::RwLock::new(Vec::new())),
+            cancel_notify: Arc::new(Notify::new()),
+            steering_inbox: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            distill_dir: None,
+            distill_cfg: Arc::new(config),
+            knowledge_prelude: std::sync::Mutex::new(None),
+            knowledge_auto_rag: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn send_message_auto_continues_after_max_tokens_before_finish() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                LlmEvent::TextDelta("partial".into()),
+                LlmEvent::Done {
+                    stop_reason: StopReason::MaxTokens,
+                    usage: Default::default(),
+                },
+            ],
+            vec![
+                LlmEvent::TextDelta(" done".into()),
+                LlmEvent::Done {
+                    stop_reason: StopReason::EndTurn,
+                    usage: Default::default(),
+                },
+            ],
+        ]));
+        let agent = make_agent_with_provider(provider.clone());
+        let mut rx = agent.subscribe();
+
+        agent
+            .send_message(SendMessageData {
+                content: "create the file".into(),
+                msg_id: "msg-1".into(),
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                origin: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(provider.calls(), 2, "MaxTokens should trigger one continuation pass");
+
+        let mut completed_reasons = Vec::new();
+        let mut finish_reason = None;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentStreamEvent::TurnCompleted(data) => completed_reasons.push(data.stop_reason),
+                AgentStreamEvent::Finish(data) => finish_reason = data.stop_reason,
+                _ => {}
+            }
+        }
+
+        assert_eq!(completed_reasons, vec![Some(TurnStopReason::EndTurn)]);
+        assert_eq!(finish_reason, Some(TurnStopReason::EndTurn));
+    }
+
+    #[tokio::test]
+    async fn max_tokens_continuation_prompt_forbids_repeating_large_write() {
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                LlmEvent::ToolUseDelta {
+                    id: "call-large-write".into(),
+                    name: "Write".into(),
+                    input: None,
+                },
+                LlmEvent::Done {
+                    stop_reason: StopReason::MaxTokens,
+                    usage: Default::default(),
+                },
+            ],
+            vec![LlmEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: Default::default(),
+            }],
+        ]));
+        let agent = make_agent_with_provider(provider.clone());
+        let mut rx = agent.subscribe();
+
+        agent
+            .send_message(SendMessageData {
+                content: "create a polished single page site".into(),
+                msg_id: "msg-1".into(),
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                origin: None,
+            })
+            .await
+            .unwrap();
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        let continuation_text = requests[1]
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::User)
+            .and_then(|message| {
+                message.content.iter().find_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+            })
+            .expect("continuation request should contain a user text prompt");
+
+        assert!(continuation_text.contains("Do not call Write with a full large file in one call"));
+        assert!(continuation_text.contains("First create a small complete deliverable"));
+        assert!(continuation_text.contains("append or edit in chunks"));
+        assert!(continuation_text.contains("verify the target file exists"));
+
+        let mut recovered_tool_status = None;
+        while let Ok(event) = rx.try_recv() {
+            if let AgentStreamEvent::ToolCall(data) = event
+                && data.call_id == "nomi-call-large-write"
+                && data.status == crate::protocol::events::tool_call::ToolCallStatus::Completed
+            {
+                recovered_tool_status = data.output;
+            }
+        }
+
+        assert!(
+            recovered_tool_status
+                .as_deref()
+                .is_some_and(|output| output.contains("Automatic continuation recovered from the output token limit")),
+            "automatic continuation should resolve the truncated tool card without marking it failed"
+        );
+    }
+
+    #[cfg(feature = "browser-use")]
+    #[test]
+    fn yolo_session_installs_browser_approval_gate_without_takeover_pref() {
+        let mgr = ToolApprovalManager::new();
+        mgr.set_mode(SessionMode::Yolo);
+
+        assert!(
+            should_install_browser_approval_gate(false, false, &mgr),
+            "full-auto/yolo sessions need the Browser gate so gated egress can approve without UI"
+        );
+    }
+
+    #[cfg(feature = "browser-use")]
+    #[test]
+    fn default_session_without_browser_approval_pref_does_not_install_browser_gate() {
+        let mgr = ToolApprovalManager::new();
+
+        assert!(
+            !should_install_browser_approval_gate(false, false, &mgr),
+            "default sessions without Browser approval prefs should keep the old fail-closed path"
+        );
+    }
 
     #[tokio::test]
     async fn nomi_agent_returns_correct_type() {

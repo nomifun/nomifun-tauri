@@ -7,7 +7,7 @@
 import { configService } from '@/common/config/configService';
 import { ipcBridge } from '@/common';
 import NomiScrollArea from '@/renderer/components/base/NomiScrollArea';
-import { Alert, Button, Message, Radio, Switch } from '@arco-design/web-react';
+import { Alert, Button, Message, Modal, Radio, Switch } from '@arco-design/web-react';
 import React, { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useSettingsViewMode } from '../settingsViewContext';
@@ -27,7 +27,8 @@ const BrowserUseSettingsContent: React.FC = () => {
   const [persistentLogin, setPersistentLogin] = useState(true);
   const [fullPower, setFullPower] = useState(false);
   const [siteMemory, setSiteMemory] = useState(false);
-  const [takeover, setTakeover] = useState(false);
+  const [takeover, setTakeover] = useState(true);
+  const [unrestrictedApproval, setUnrestrictedApproval] = useState(false);
   const [visualFallback, setVisualFallback] = useState(false);
   // Phase 2b「登录我的浏览器」:是否有可见登录窗口开着 + 操作进行中。
   const [loginOpen, setLoginOpen] = useState(false);
@@ -44,7 +45,8 @@ const BrowserUseSettingsContent: React.FC = () => {
     setPersistentLogin(storedPersistentLogin);
     setFullPower(storedPersistentLogin ? false : storedFullPower);
     setSiteMemory(configService.get('agent.browserUse.siteMemory') ?? false);
-    setTakeover(configService.get('agent.browserUse.takeover') ?? false);
+    setTakeover(configService.get('agent.browserUse.takeover') ?? true);
+    setUnrestrictedApproval(configService.get('agent.browserUse.unrestrictedApproval') ?? false);
     setVisualFallback(configService.get('agent.browserUse.visualFallback') ?? false);
 
     if (storedPersistentLogin && storedFullPower) {
@@ -172,6 +174,27 @@ const BrowserUseSettingsContent: React.FC = () => {
     [persistBoolean]
   );
 
+  const handleUnrestrictedApprovalChange = useCallback(
+    (checked: boolean) => {
+      if (!checked) {
+        setUnrestrictedApproval(false);
+        persistBoolean('agent.browserUse.unrestrictedApproval', false, () => setUnrestrictedApproval(true));
+        return;
+      }
+
+      Modal.confirm({
+        title: t('settings.browserUnrestrictedApprovalConfirmTitle'),
+        content: t('settings.browserUnrestrictedApprovalConfirmContent'),
+        okText: t('settings.browserUnrestrictedApprovalConfirmOk'),
+        onOk: () => {
+          setUnrestrictedApproval(true);
+          persistBoolean('agent.browserUse.unrestrictedApproval', true, () => setUnrestrictedApproval(false));
+        },
+      });
+    },
+    [persistBoolean, t]
+  );
+
   const handleVisualFallbackChange = useCallback(
     (checked: boolean) => {
       setVisualFallback(checked);
@@ -227,6 +250,16 @@ const BrowserUseSettingsContent: React.FC = () => {
               </PreferenceRow>
               <PreferenceRow label={t('settings.browserTakeover')} description={t('settings.browserTakeoverDesc')}>
                 <Switch checked={takeover} disabled={!browserUse} onChange={handleTakeoverChange} />
+              </PreferenceRow>
+              <PreferenceRow
+                label={t('settings.browserUnrestrictedApproval')}
+                description={t('settings.browserUnrestrictedApprovalDesc')}
+              >
+                <Switch
+                  checked={unrestrictedApproval}
+                  disabled={!browserUse}
+                  onChange={handleUnrestrictedApprovalChange}
+                />
               </PreferenceRow>
               <PreferenceRow
                 label={t('settings.browserVisualFallback')}
