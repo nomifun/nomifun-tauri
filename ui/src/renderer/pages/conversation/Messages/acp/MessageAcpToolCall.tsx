@@ -5,6 +5,7 @@
  */
 
 import type { IMessageAcpToolCall } from '@/common/chat/chatLib';
+import { toDisplayText } from '@/common/chat/displayText';
 import FileChangesPanel from '@/renderer/components/base/FileChangesPanel';
 import { useDiffPreviewHandlers } from '@/renderer/hooks/file/useDiffPreviewHandlers';
 import { parseDiff } from '@/renderer/utils/file/diffUtils';
@@ -15,14 +16,15 @@ import MarkdownView from '@renderer/components/Markdown';
 import { MESSAGE_BODY_FONT_SIZE, MESSAGE_BODY_LINE_HEIGHT } from '../typography';
 
 const StatusTag: React.FC<{ status: string }> = ({ status }) => {
+  const statusText = toDisplayText(status);
   const getTagProps = () => {
-    switch (status) {
+    switch (statusText) {
       case 'pending':
         return { color: 'blue', text: 'Pending' };
       case 'in_progress':
         return { color: 'orange', text: 'In Progress' };
       default:
-        return { color: 'gray', text: status };
+        return { color: 'gray', text: statusText };
     }
   };
 
@@ -62,7 +64,11 @@ const DiffContentView: React.FC<{ old_text: string; new_text: string; path: stri
 const ContentView: React.FC<{ content: NonNullable<IMessageAcpToolCall['content']['update']['content']>[number] }> = ({ content }) => {
   if (content.type === 'diff') {
     return (
-      <DiffContentView old_text={content.old_text || ''} new_text={content.new_text || ''} path={content.path || ''} />
+      <DiffContentView
+        old_text={toDisplayText(content.old_text)}
+        new_text={toDisplayText(content.new_text)}
+        path={toDisplayText(content.path)}
+      />
     );
   }
 
@@ -73,7 +79,7 @@ const ContentView: React.FC<{ content: NonNullable<IMessageAcpToolCall['content'
         <div className='bg-1 p-3 rounded border overflow-hidden'>
           <div className='overflow-x-auto break-words'>
             <MarkdownView fontSize={MESSAGE_BODY_FONT_SIZE} lineHeight={MESSAGE_BODY_LINE_HEIGHT}>
-              {content.content.text}
+              {toDisplayText(content.content.text)}
             </MarkdownView>
           </div>
         </div>
@@ -110,8 +116,8 @@ const MessageAcpToolCall: React.FC<{ message: IMessageAcpToolCall }> = ({ messag
       <div className='flex items-start gap-3'>
         <div className='flex-1 min-w-0'>
           <div className='flex items-center gap-2 mb-2'>
-            <span className='font-medium text-t-primary'>{title || getKindDisplayName(kind)}</span>
-            <StatusTag status={status} />
+            <span className='font-medium text-t-primary'>{toDisplayText(title) || getKindDisplayName(toDisplayText(kind))}</span>
+            <StatusTag status={toDisplayText(status)} />
           </div>
           {rawInput && (
             <div className='text-sm'>
@@ -120,7 +126,7 @@ const MessageAcpToolCall: React.FC<{ message: IMessageAcpToolCall }> = ({ messag
                   {`\`\`\`\n${rawInput}\n\`\`\``}
                 </MarkdownView>
               ) : (
-                <pre className='bg-1 p-2 rounded text-xs overflow-x-auto'>{JSON.stringify(rawInput, null, 2)}</pre>
+                <pre className='bg-1 p-2 rounded text-xs overflow-x-auto'>{toDisplayText(rawInput)}</pre>
               )}
             </div>
           )}

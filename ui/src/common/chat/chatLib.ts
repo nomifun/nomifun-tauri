@@ -4,9 +4,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { AcpPermissionRequest, PlanUpdate, ToolCallUpdate } from '@/common/types/platform/acpTypes';
+import type {
+  AcpPermissionRequest,
+  PlanUpdate,
+  ToolCallContentItem,
+  ToolCallUpdate,
+} from '@/common/types/platform/acpTypes';
 import type { IResponseMessage } from '../adapter/ipcBridge';
 import { uuid } from '../utils';
+import { optionalDisplayText, toDisplayText } from './displayText';
 
 /**
  * 安全的路径拼接函数，兼容Windows和Mac
@@ -246,7 +252,15 @@ export type IMessageAgentStatus = IMessage<
   'agent_status',
   {
     backend: string; // Agent identifier: 'claude', 'qwen', 'codex', 'remote', etc.
-    status: 'connecting' | 'connected' | 'authenticated' | 'session_active' | 'preparing' | 'prepared' | 'error';
+    status:
+      | 'connecting'
+      | 'connected'
+      | 'authenticated'
+      | 'session_active'
+      | 'preparing'
+      | 'prepared'
+      | 'disconnected'
+      | 'error';
     /** Display name for the agent (e.g. extension-contributed adapter name) / Agent 显示名称 */
     agent_name?: string;
     // Optional legacy fields for backward compatibility
@@ -275,20 +289,23 @@ export const mergeAcpToolCallContent = (
 });
 
 type ResponseTextData = {
-  content: string;
+  content: unknown;
   replace?: boolean;
   cronMeta?: CronMessageMeta;
-  teammate_message?: boolean;
-  sender_name?: string;
-  sender_backend?: string;
-  sender_conversation_id?: number;
+  teammate_message?: unknown;
+  sender_name?: unknown;
+  sender_backend?: unknown;
+  sender_conversation_id?: unknown;
 };
+
+const isObject = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
 
 const isResponseTextData = (data: unknown): data is ResponseTextData =>
   typeof data === 'object' &&
   data !== null &&
   'content' in data &&
-  typeof (data as { content?: unknown }).content === 'string';
+  !Array.isArray(data);
 
 export const isTextContentReplacement = (content: IMessageText['content'] | undefined): boolean =>
   content?.replace === true;
@@ -390,9 +407,6 @@ export interface IConfirmation<Option extends any = any> {
   screenshot?: string;
 }
 
-const isObject = (value: unknown): value is Record<string, unknown> =>
-  typeof value === 'object' && value !== null && !Array.isArray(value);
-
 const AGENT_ERROR_OWNERSHIPS = new Set<AgentErrorOwnership>([
   'nomifun',
   'user_agent',
@@ -484,6 +498,248 @@ export const normalizeAgentStreamError = (value: unknown): AgentStreamErrorInfo 
   };
 };
 
+const normalizeTipType = (value: unknown): IMessageTips['content']['type'] =>
+  value === 'success' || value === 'warning' || value === 'error' ? value : 'warning';
+
+const normalizeThinkingStatus = (value: unknown): IMessageThinking['content']['status'] =>
+  value === 'done' ? 'done' : 'thinking';
+
+const finiteNumber = (value: unknown): number | undefined =>
+  typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+
+const normalizeToolGroupStatus = (value: unknown): IMessageToolGroup['content'][number]['status'] => {
+  switch (value) {
+    case 'Success':
+    case 'Error':
+    case 'Canceled':
+    case 'Pending':
+    case 'Confirming':
+    case 'Executing':
+      return value;
+    default:
+      return 'Executing';
+  }
+};
+
+const normalizeToolGroupResultDisplay = (
+  value: unknown
+): IMessageToolGroup['content'][number]['result_display'] | undefined => {
+  if (value == null) return undefined;
+  if (typeof value === 'string') return value;
+  if (!isObject(value)) return toDisplayText(value);
+
+  if ('file_diff' in value || 'file_name' in value) {
+    return {
+      file_diff: toDisplayText(value.file_diff),
+      file_name: toDisplayText(value.file_name),
+    };
+  }
+  if ('img_url' in value || 'relative_path' in value) {
+    return {
+      img_url: toDisplayText(value.img_url),
+      relative_path: toDisplayText(value.relative_path),
+    };
+  }
+
+  return toDisplayText(value);
+};
+
+const normalizeToolGroupConfirmationDetails = (
+  value: unknown
+): IMessageToolGroup['content'][number]['confirmationDetails'] | undefined => {
+  if (!isObject(value)) return undefined;
+  const type = value.type;
+  const title = toDisplayText(value.title);
+
+  if (type === 'edit') {
+    return {
+      type,
+      title,
+      file_name: toDisplayText(value.file_name),
+      file_diff: toDisplayText(value.file_diff),
+      ...(typeof value.isModifying === 'boolean' ? { isModifying: value.isModifying } : {}),
+    };
+  }
+  if (type === 'exec') {
+    return {
+      type,
+      title,
+      rootCommand: toDisplayText(value.rootCommand),
+      command: toDisplayText(value.command),
+    };
+  }
+  if (type === 'info') {
+    return {
+      type,
+      title,
+      prompt: toDisplayText(value.prompt),
+      ...(Array.isArray(value.urls) ? { urls: value.urls.map((url) => toDisplayText(url)) } : {}),
+    };
+  }
+  if (type === 'mcp') {
+    return {
+      type,
+      title,
+      tool_name: toDisplayText(value.tool_name),
+      tool_display_name: toDisplayText(value.tool_display_name),
+      server_name: toDisplayText(value.server_name),
+    };
+  }
+
+  return undefined;
+};
+
+const normalizeToolGroupContent = (value: unknown): IMessageToolGroup['content'] => {
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .filter(isObject)
+    .map((item) => {
+      const resultDisplay = normalizeToolGroupResultDisplay(item.result_display);
+      const confirmationDetails = normalizeToolGroupConfirmationDetails(item.confirmationDetails);
+      return {
+        call_id: optionalDisplayText(item.call_id) ?? optionalDisplayText(item.id) ?? uuid(),
+        description: toDisplayText(item.description),
+        name: toDisplayText(item.name, 'Tool'),
+        render_output_as_markdown:
+          typeof item.render_output_as_markdown === 'boolean' ? item.render_output_as_markdown : false,
+        status: normalizeToolGroupStatus(item.status),
+        ...(resultDisplay !== undefined ? { result_display: resultDisplay } : {}),
+        ...(confirmationDetails ? { confirmationDetails } : {}),
+      };
+    });
+};
+
+const normalizePermissionParams = (params: unknown): Record<string, string> | undefined => {
+  if (!isObject(params)) return undefined;
+  return Object.fromEntries(Object.entries(params).map(([key, value]) => [key, toDisplayText(value)]));
+};
+
+const normalizePermissionContent = (value: unknown): IConfirmation => {
+  const data = isObject(value) ? value : {};
+  const options = Array.isArray(data.options)
+    ? data.options.filter(isObject).map((option, index) => {
+        const params = normalizePermissionParams(option.params);
+        return {
+          label: toDisplayText(option.label, `Option ${index + 1}`),
+          value: option.value,
+          ...(params ? { params } : {}),
+        };
+      })
+    : [];
+
+  return {
+    id: toDisplayText(data.id, uuid()),
+    description: toDisplayText(data.description ?? data.title, ''),
+    call_id: toDisplayText(data.call_id ?? data.id, ''),
+    options,
+    ...(data.title != null ? { title: toDisplayText(data.title) } : {}),
+    ...(data.action != null ? { action: toDisplayText(data.action) } : {}),
+    ...(data.command_type != null ? { command_type: toDisplayText(data.command_type) } : {}),
+    ...(data.screenshot != null ? { screenshot: toDisplayText(data.screenshot) } : {}),
+  };
+};
+
+const normalizeAcpPermissionOptionKind = (
+  value: unknown
+): AcpPermissionRequest['options'][number]['kind'] => {
+  switch (value) {
+    case 'allow_once':
+    case 'allow_always':
+    case 'reject_once':
+    case 'reject_always':
+      return value;
+    default:
+      return 'allow_once';
+  }
+};
+
+const normalizeAcpPermissionContent = (value: unknown): AcpPermissionRequest => {
+  const data = isObject(value) ? value : {};
+  const toolCall = isObject(data.tool_call) ? data.tool_call : {};
+  const rawInput = isObject(toolCall.raw_input)
+    ? Object.fromEntries(Object.entries(toolCall.raw_input).map(([key, entry]) => [key, entry]))
+    : undefined;
+
+  return {
+    session_id: toDisplayText(data.session_id),
+    options: Array.isArray(data.options)
+      ? data.options.filter(isObject).map((option, index) => ({
+          option_id: toDisplayText(option.option_id, `option_${index}`),
+          name: toDisplayText(option.name ?? option.label, `Option ${index + 1}`),
+          kind: normalizeAcpPermissionOptionKind(option.kind),
+        }))
+      : [],
+    tool_call: {
+      tool_call_id: toDisplayText(toolCall.tool_call_id ?? data.call_id),
+      ...(rawInput ? { raw_input: rawInput } : {}),
+      ...(toolCall.status != null ? { status: toDisplayText(toolCall.status) } : {}),
+      ...(toolCall.title != null ? { title: toDisplayText(toolCall.title) } : {}),
+      ...(toolCall.kind != null ? { kind: toDisplayText(toolCall.kind) } : {}),
+    },
+  };
+};
+
+const normalizeAcpToolCallContent = (value: unknown): IMessageAcpToolCall['content'] => {
+  if (!isObject(value)) return value as IMessageAcpToolCall['content'];
+  const update = isObject(value.update) ? value.update : undefined;
+  if (!update) return value as unknown as IMessageAcpToolCall['content'];
+  const content = Array.isArray(update.content)
+    ? update.content.filter(isObject).map((item): ToolCallContentItem => {
+        const normalized: ToolCallContentItem = {
+          ...(item as unknown as ToolCallContentItem),
+          type: item.type === 'diff' ? 'diff' : 'content',
+          ...(item.path != null ? { path: toDisplayText(item.path) } : {}),
+          ...(item.old_text != null ? { old_text: toDisplayText(item.old_text) } : {}),
+          ...(item.new_text != null ? { new_text: toDisplayText(item.new_text) } : {}),
+        };
+        if (isObject(item.content)) {
+          normalized.content = {
+            type: 'text',
+            text: toDisplayText(item.content.text),
+          };
+        }
+        return normalized;
+      })
+    : undefined;
+
+  return ({
+    ...value,
+    update: {
+      ...update,
+      tool_call_id: toDisplayText(update.tool_call_id),
+      status: toDisplayText(update.status, 'pending') as IMessageAcpToolCall['content']['update']['status'],
+      title: toDisplayText(update.title, 'Tool'),
+      kind: toDisplayText(update.kind, 'execute') as IMessageAcpToolCall['content']['update']['kind'],
+      ...(content ? { content } : {}),
+    },
+  } as unknown) as IMessageAcpToolCall['content'];
+};
+
+const normalizeAgentStatusContent = (value: unknown): IMessageAgentStatus['content'] => {
+  const data = isObject(value) ? value : {};
+  const status =
+    data.status === 'connecting' ||
+    data.status === 'connected' ||
+    data.status === 'authenticated' ||
+    data.status === 'session_active' ||
+    data.status === 'preparing' ||
+    data.status === 'prepared' ||
+    data.status === 'disconnected' ||
+    data.status === 'error'
+      ? data.status
+      : 'error';
+
+  return {
+    backend: toDisplayText(data.backend, 'agent'),
+    status,
+    ...(data.agent_name != null ? { agent_name: toDisplayText(data.agent_name) } : {}),
+    ...(data.session_id != null ? { session_id: toDisplayText(data.session_id) } : {}),
+    ...(typeof data.is_connected === 'boolean' ? { is_connected: data.is_connected } : {}),
+    ...(typeof data.has_active_session === 'boolean' ? { has_active_session: data.has_active_session } : {}),
+  };
+};
+
 /**
  * @description 将后端返回的消息转换为前端消息
  * */
@@ -494,9 +750,7 @@ export const transformMessage = (message: IResponseMessage): TMessage | undefine
       const errorData = message.data;
       const structuredError = normalizeAgentStreamError(errorData);
       const errorText =
-        typeof errorData === 'string'
-          ? errorData
-          : ((errorData as { message?: string })?.message ?? JSON.stringify(errorData));
+        (isObject(errorData) ? optionalDisplayText(errorData.message) : undefined) ?? toDisplayText(errorData);
       return {
         id: uuid(),
         type: 'tips',
@@ -512,15 +766,12 @@ export const transformMessage = (message: IResponseMessage): TMessage | undefine
       };
     }
     case 'tips': {
-      const data = message.data as {
-        content: string;
-        type?: 'error' | 'success' | 'warning';
-        error?: unknown;
-      };
-      const tipType = data.type ?? 'warning';
+      const data = isObject(message.data) ? message.data : { content: message.data };
+      const content = toDisplayText(data.content);
+      const tipType = normalizeTipType(data.type);
       const structuredError =
         tipType === 'error'
-          ? (normalizeAgentStreamError(data.error) ?? normalizeAgentStreamError({ ...data, message: data.content }))
+          ? (normalizeAgentStreamError(data.error) ?? normalizeAgentStreamError({ ...data, message: content }))
           : undefined;
       return {
         id: uuid(),
@@ -530,7 +781,7 @@ export const transformMessage = (message: IResponseMessage): TMessage | undefine
         conversation_id: message.conversation_id,
         created_at,
         content: {
-          content: data.content,
+          content,
           type: tipType,
           ...(structuredError ? { error: structuredError } : {}),
         },
@@ -551,16 +802,18 @@ export const transformMessage = (message: IResponseMessage): TMessage | undefine
         created_at,
         content: isRichData
           ? {
-              content: data.content,
+              content: toDisplayText(data.content),
               cronMeta: data.cronMeta,
               ...(shouldReplace ? { replace: true } : {}),
               ...(data.teammate_message ? { teammateMessage: true } : {}),
-              ...(data.sender_name ? { senderName: data.sender_name } : {}),
-              ...(data.sender_backend ? { senderAgentType: data.sender_backend } : {}),
-              ...(data.sender_conversation_id != null ? { senderConversationId: data.sender_conversation_id } : {}),
+              ...(typeof data.sender_name === 'string' ? { senderName: data.sender_name } : {}),
+              ...(typeof data.sender_backend === 'string' ? { senderAgentType: data.sender_backend } : {}),
+              ...(typeof data.sender_conversation_id === 'number'
+                ? { senderConversationId: data.sender_conversation_id }
+                : {}),
             }
           : {
-              content: data as string,
+              content: toDisplayText(data),
               ...(shouldReplace ? { replace: true } : {}),
             },
         ...(message.hidden && { hidden: true }),
@@ -584,7 +837,7 @@ export const transformMessage = (message: IResponseMessage): TMessage | undefine
         msg_id: message.msg_id,
         conversation_id: message.conversation_id,
         created_at,
-        content: message.data as any,
+        content: normalizeToolGroupContent(message.data),
       };
     }
     case 'agent_status': {
@@ -595,7 +848,7 @@ export const transformMessage = (message: IResponseMessage): TMessage | undefine
         position: 'center',
         conversation_id: message.conversation_id,
         created_at,
-        content: message.data as any,
+        content: normalizeAgentStatusContent(message.data),
       };
     }
     case 'permission': {
@@ -606,7 +859,7 @@ export const transformMessage = (message: IResponseMessage): TMessage | undefine
         position: 'left',
         conversation_id: message.conversation_id,
         created_at,
-        content: message.data as any,
+        content: normalizePermissionContent(message.data),
       };
     }
     case 'acp_permission': {
@@ -617,7 +870,7 @@ export const transformMessage = (message: IResponseMessage): TMessage | undefine
         position: 'left',
         conversation_id: message.conversation_id,
         created_at,
-        content: message.data as any,
+        content: normalizeAcpPermissionContent(message.data),
       };
     }
     case 'acp_tool_call': {
@@ -628,7 +881,7 @@ export const transformMessage = (message: IResponseMessage): TMessage | undefine
         position: 'left',
         conversation_id: message.conversation_id,
         created_at,
-        content: message.data as any,
+        content: normalizeAcpToolCallContent(message.data),
       };
     }
     case 'plan': {
@@ -643,13 +896,8 @@ export const transformMessage = (message: IResponseMessage): TMessage | undefine
       };
     }
     case 'thinking': {
-      const data = message.data as {
-        content: string;
-        subject?: string;
-        duration?: number;
-        duration_ms?: number;
-        status: 'thinking' | 'done';
-      };
+      const data = isObject(message.data) ? message.data : { content: message.data };
+      const duration = finiteNumber(data.duration) ?? finiteNumber(data.duration_ms);
       return {
         id: uuid(),
         type: 'thinking',
@@ -658,10 +906,10 @@ export const transformMessage = (message: IResponseMessage): TMessage | undefine
         conversation_id: message.conversation_id,
         created_at,
         content: {
-          content: data.content,
-          subject: data.subject,
-          duration: data.duration ?? data.duration_ms,
-          status: data.status,
+          content: toDisplayText(data.content),
+          ...(data.subject != null ? { subject: toDisplayText(data.subject) } : {}),
+          ...(duration !== undefined ? { duration } : {}),
+          status: normalizeThinkingStatus(data.status),
         },
       };
     }
@@ -717,6 +965,7 @@ export const composeMessage = (
   };
 
   if (message.type === 'tool_group') {
+    if (!Array.isArray(message.content)) return list;
     const remainingToolsMap = new Map(message.content.map((t) => [t.call_id, t] as const));
     if (remainingToolsMap.size === 0) return list;
 

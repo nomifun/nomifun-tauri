@@ -42,6 +42,31 @@ describe('normalizeAcpToolCall', () => {
     expect(result?.nonFatalFailure).toBe(true);
   });
 
+  it('extracts nested ACP execute commands without leaking structured values into descriptions', () => {
+    const result = normalizeAcpToolCall({
+      type: 'acp_tool_call',
+      id: 'msg-1',
+      conversation_id: 1,
+      content: {
+        session_id: 'session-1',
+        update: {
+          sessionUpdate: 'tool_call_update',
+          tool_call_id: 'tool-1',
+          title: 'Bash',
+          kind: 'execute',
+          status: 'in_progress',
+          rawInput: {
+            command: {
+              cmd: 'codex --version',
+            },
+          },
+        },
+      },
+    } as any);
+
+    expect(result?.description).toBe('codex --version');
+  });
+
   it('marks failed ACP read/search probes as non-fatal process outcomes', () => {
     const result = normalizeAcpToolCall({
       type: 'acp_tool_call',

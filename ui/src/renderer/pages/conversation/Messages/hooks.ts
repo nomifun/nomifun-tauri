@@ -6,6 +6,7 @@
 
 import { ipcBridge } from '@/common';
 import type { AgentStreamErrorInfo, IMessageThinking, IMessageTips, TMessage } from '@/common/chat/chatLib';
+import { toDisplayText } from '@/common/chat/displayText';
 import {
   composeMessage,
   mergeAcpToolCallContent,
@@ -40,19 +41,21 @@ function getMessageIndexKey(message: TMessage): string | undefined {
   return message.msg_id;
 }
 
-const compactThinkingStreamText = (value: string): string => value.replace(/\s+/g, ' ').trim();
+const compactThinkingStreamText = (value: unknown): string => toDisplayText(value).replace(/\s+/g, ' ').trim();
 
-export function mergeThinkingStreamContent(existing: string, incoming: string): string {
-  if (!incoming) return existing;
-  if (!existing) return incoming;
-  if (incoming === existing) return existing;
-  const existingCompact = compactThinkingStreamText(existing);
-  const incomingCompact = compactThinkingStreamText(incoming);
-  if (incomingCompact === existingCompact) return existing;
-  if (incomingCompact && existingCompact.startsWith(incomingCompact)) return existing;
-  if (existingCompact && incomingCompact.startsWith(existingCompact)) return incoming;
-  if (incoming.startsWith(existing)) return incoming;
-  return existing + incoming;
+export function mergeThinkingStreamContent(existing: unknown, incoming: unknown): string {
+  const existingText = toDisplayText(existing);
+  const incomingText = toDisplayText(incoming);
+  if (!incomingText) return existingText;
+  if (!existingText) return incomingText;
+  if (incomingText === existingText) return existingText;
+  const existingCompact = compactThinkingStreamText(existingText);
+  const incomingCompact = compactThinkingStreamText(incomingText);
+  if (incomingCompact === existingCompact) return existingText;
+  if (incomingCompact && existingCompact.startsWith(incomingCompact)) return existingText;
+  if (existingCompact && incomingCompact.startsWith(existingCompact)) return incomingText;
+  if (incomingText.startsWith(existingText)) return incomingText;
+  return existingText + incomingText;
 }
 
 // 使用 WeakMap 缓存索引，当列表被 GC 时自动清理

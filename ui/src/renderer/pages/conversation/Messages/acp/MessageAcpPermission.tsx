@@ -5,6 +5,7 @@
  */
 
 import type { IMessageAcpPermission } from '@/common/chat/chatLib';
+import { optionalDisplayText, toDisplayText } from '@/common/chat/displayText';
 import { conversation } from '@/common/adapter/ipcBridge';
 import { Button, Card, Radio, Typography } from '@arco-design/web-react';
 import React, { useState } from 'react';
@@ -30,7 +31,10 @@ const MessageAcpPermission: React.FC<MessageAcpPermissionProps> = React.memo(({ 
       };
     }
 
-    const displayTitle = tool_call.title || tool_call.raw_input?.description || t('messages.permissionRequest');
+    const displayTitle =
+      optionalDisplayText(tool_call.title) ||
+      optionalDisplayText(tool_call.raw_input?.description) ||
+      t('messages.permissionRequest');
 
     // 简单的图标映射
     const kindIcons: Record<string, string> = {
@@ -42,7 +46,7 @@ const MessageAcpPermission: React.FC<MessageAcpPermissionProps> = React.memo(({ 
 
     return {
       title: displayTitle,
-      icon: kindIcons[tool_call.kind || 'execute'] || '⚡',
+      icon: kindIcons[toDisplayText(tool_call.kind, 'execute')] || '⚡',
     };
   };
   const { title, icon } = getToolInfo();
@@ -93,7 +97,7 @@ const MessageAcpPermission: React.FC<MessageAcpPermissionProps> = React.memo(({ 
           <div>
             <Text className='text-xs text-t-secondary mb-1'>{t('messages.command')}</Text>
             <code className='text-xs bg-1 p-2 rounded block text-t-primary break-all'>
-              {tool_call.raw_input?.command || tool_call.title}
+              {toDisplayText(tool_call.raw_input?.command || tool_call.title)}
             </code>
           </div>
         )}
@@ -103,8 +107,8 @@ const MessageAcpPermission: React.FC<MessageAcpPermissionProps> = React.memo(({ 
             <Radio.Group direction='vertical' size='mini' value={selected} onChange={setSelected}>
               {options && options.length > 0 ? (
                 options.map((option, index) => {
-                  const optionName = option?.name || `${t('messages.option')} ${index + 1}`;
-                  const option_id = option?.option_id || `option_${index}`;
+                  const optionName = optionalDisplayText(option?.name) || `${t('messages.option')} ${index + 1}`;
+                  const option_id = optionalDisplayText(option?.option_id) || `option_${index}`;
                   return (
                     <div key={option_id} data-testid={`message-acp-permission-option-${option_id}`}>
                       <Radio value={option_id}>{optionName}</Radio>

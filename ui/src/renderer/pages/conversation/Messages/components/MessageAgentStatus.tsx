@@ -5,6 +5,7 @@
  */
 
 import type { IMessageAgentStatus } from '@/common/chat/chatLib';
+import { toDisplayText } from '@/common/chat/displayText';
 import { Badge, Typography } from '@arco-design/web-react';
 import React from 'react';
 import { useTranslation } from 'react-i18next';
@@ -24,12 +25,14 @@ const MessageAgentStatus: React.FC<MessageAgentStatusProps> = ({ message }) => {
   const { t } = useTranslation();
   const { backend, status, agent_name } = message.content;
   const { cliAgents } = useConversationAgents();
+  const backendText = toDisplayText(backend, 'agent');
+  const agentNameText = toDisplayText(agent_name);
 
   // Resolve display name: agent_name (extension/custom) > detected agent name > capitalized backend
   const display_name =
-    agent_name ||
-    cliAgents.find((a) => a.backend === backend || a.agent_type === backend)?.name ||
-    backend.charAt(0).toUpperCase() + backend.slice(1);
+    agentNameText ||
+    cliAgents.find((a) => a.backend === backendText || a.agent_type === backendText)?.name ||
+    backendText.charAt(0).toUpperCase() + backendText.slice(1);
 
   // Hide disconnected status from historical messages (no longer emitted but may exist in DB)
   if ((status as string) === 'disconnected') return null;

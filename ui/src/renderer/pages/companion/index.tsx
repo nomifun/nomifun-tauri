@@ -9,6 +9,7 @@ import { useTranslation } from 'react-i18next';
 import { ipcBridge } from '@/common';
 import { isBackendHttpError } from '@/common/adapter/httpBridge';
 import type { ICompanionProfile, ICompanionSuggestion, IResponseMessage } from '@/common/adapter/ipcBridge';
+import { extractResponseTextChunk } from '@/common/chat/displayText';
 import MarkdownView from '@/renderer/components/Markdown';
 import LocalImageView from '@/renderer/components/media/LocalImageView';
 import { usePasteService } from '@/renderer/hooks/file/usePasteService';
@@ -681,11 +682,7 @@ const CompanionPage: React.FC = () => {
       switch (message.type) {
         case 'content':
         case 'text': {
-          const payload = message.data;
-          const chunk =
-            typeof payload === 'string'
-              ? payload
-              : ((payload as { content?: string } | null)?.content ?? '');
+          const chunk = extractResponseTextChunk(message.data);
           if (!chunk || !message.msg_id) return;
           if (!slot.segments.has(message.msg_id)) slot.order.push(message.msg_id);
           slot.segments.set(
@@ -767,11 +764,7 @@ const CompanionPage: React.FC = () => {
       switch (message.type) {
         case 'content':
         case 'text': {
-          const payload = message.data;
-          const chunk =
-            typeof payload === 'string'
-              ? payload
-              : ((payload as { content?: string } | null)?.content ?? '');
+          const chunk = extractResponseTextChunk(message.data);
           if (!chunk || !message.msg_id) return;
           if (!segmentsRef.current.has(message.msg_id)) segmentOrderRef.current.push(message.msg_id);
           segmentsRef.current.set(

@@ -60,13 +60,26 @@ const stateMatchesTool = (state: TurnDisclosureProcessState, tool: NormalizedToo
   return tool.status === 'pending' || tool.status === 'running';
 };
 
-const compactToolText = (value?: string): string => value?.replace(/\s+/g, ' ').trim() ?? '';
+const compactToolText = (value?: unknown): string => {
+  if (value == null) return '';
+  const text =
+    typeof value === 'string'
+      ? value
+      : (() => {
+          try {
+            return JSON.stringify(value, null, 2);
+          } catch {
+            return String(value);
+          }
+        })();
+  return text.replace(/\s+/g, ' ').trim();
+};
 
 const formatToolTarget = (tool: NormalizedToolCall): string => {
   if (classifyToolForReceipt(tool) === 'run_commands') return getCommandTarget(tool);
 
-  const name = tool.name?.trim();
-  const description = tool.description?.trim();
+  const name = compactToolText(tool.name);
+  const description = compactToolText(tool.description);
   if (name && description && description !== name) return `${name} ${description}`;
   return name || description || tool.key;
 };
@@ -163,10 +176,10 @@ const getFileTarget = (tool: NormalizedToolCall): string | undefined => {
 const normalizeToolSearchText = (value: string): string => value.replace(/[_-]+/g, ' ').toLowerCase();
 
 const getToolSearchText = (tool: NormalizedToolCall): string =>
-  normalizeToolSearchText(`${tool.name ?? ''} ${tool.description ?? ''} ${tool.key ?? ''}`);
+  normalizeToolSearchText(`${compactToolText(tool.name)} ${compactToolText(tool.description)} ${tool.key ?? ''}`);
 
 const getToolNameSearchText = (tool: NormalizedToolCall): string =>
-  normalizeToolSearchText(`${tool.name ?? ''} ${tool.key ?? ''}`);
+  normalizeToolSearchText(`${compactToolText(tool.name)} ${tool.key ?? ''}`);
 
 const classifyToolForReceipt = (tool: NormalizedToolCall): ToolReceiptAction => {
   const text = getToolSearchText(tool);

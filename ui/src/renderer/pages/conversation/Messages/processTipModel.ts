@@ -5,8 +5,9 @@
  */
 
 import type { IMessageTips } from '@/common/chat/chatLib';
+import { toDisplayText } from '@/common/chat/displayText';
 
 const CONTEXT_COMPRESSION_PATTERN = /\b(?:microcompact|autocompact|context compaction|context compact|compact(?:ed|ion)?)\b/i;
 
 export const isContextCompressionTip = (message: IMessageTips): boolean =>
-  CONTEXT_COMPRESSION_PATTERN.test(message.content.content);
+  CONTEXT_COMPRESSION_PATTERN.test(toDisplayText(message.content.content));

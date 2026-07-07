@@ -1,4 +1,5 @@
 import type { IMessageAcpToolCall, IMessageToolCall, IMessageToolGroup } from './chatLib';
+import { toDisplayText } from './displayText';
 
 export type NormalizedToolStatus = 'pending' | 'running' | 'completed' | 'error' | 'canceled';
 
@@ -16,18 +17,11 @@ export interface NormalizedToolCall {
   conversationId?: number;
 }
 
-const formatValue = (value: unknown): string => {
-  if (typeof value === 'string') return value;
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
-};
+const formatValue = (value: unknown): string => toDisplayText(value);
 
 // ===== tool_group → NormalizedToolCall[] =====
 
-function normalizeToolGroupStatus(status: string): NormalizedToolStatus {
+function normalizeToolGroupStatus(status: unknown): NormalizedToolStatus {
   switch (status) {
     case 'Success':
       return 'completed';
@@ -64,10 +58,16 @@ export function normalizeToolGroup(message: IMessageToolGroup): NormalizedToolCa
     // The branches only ran when it was present before, so behavior is unchanged.
     if (confirmationDetails) {
       const type = confirmationDetails.type;
-      if (type === 'edit') desc = confirmationDetails.file_name;
-      if (type === 'exec') desc = confirmationDetails.command;
-      if (type === 'info') desc = confirmationDetails.urls?.join(';') || confirmationDetails.title;
-      if (type === 'mcp') desc = confirmationDetails.server_name + ':' + confirmationDetails.tool_name;
+      if (type === 'edit') desc = toDisplayText(confirmationDetails.file_name);
+      if (type === 'exec') desc = toDisplayText(confirmationDetails.command);
+      if (type === 'info') {
+        desc =
+          confirmationDetails.urls?.map((url) => toDisplayText(url)).join(';') ||
+          toDisplayText(confirmationDetails.title);
+      }
+      if (type === 'mcp') {
+        desc = `${toDisplayText(confirmationDetails.server_name)}:${toDisplayText(confirmationDetails.tool_name)}`;
+      }
     }
 
     let input: string | undefined;
@@ -79,8 +79,8 @@ export function normalizeToolGroup(message: IMessageToolGroup): NormalizedToolCa
     }
 
     return {
-      key: call_id,
-      name,
+      key: toDisplayText(call_id),
+      name: toDisplayText(name, 'Tool'),
       status: normalizeToolGroupStatus(status),
       description: desc,
       input,
@@ -91,7 +91,7 @@ export function normalizeToolGroup(message: IMessageToolGroup): NormalizedToolCa
 
 // ===== acp_tool_call → NormalizedToolCall =====
 
-function normalizeAcpStatus(status: string): NormalizedToolStatus {
+function normalizeAcpStatus(status: unknown): NormalizedToolStatus {
   switch (status) {
     case 'completed':
       return 'completed';
@@ -106,18 +106,32 @@ function normalizeAcpStatus(status: string): NormalizedToolStatus {
 }
 
 const shellCommandTitles = new Set(['bash', 'shell', 'terminal', 'command', 'cmd', 'powershell']);
+const shellCommandFieldNames = ['command', 'cmd', 'script', 'shell', 'bash'];
 
-const hasShellCommandInput = (value: unknown): boolean => {
-  if (!value || typeof value !== 'object') return false;
+const pickStringField = (record: Record<string, unknown>, fields: string[]): string | undefined => {
+  for (const field of fields) {
+    const value = record[field];
+    if (typeof value === 'string' && value.trim()) return value;
+  }
+  return undefined;
+};
+
+const pickShellCommandInput = (value: unknown): string | undefined => {
+  if (!value || typeof value !== 'object') return undefined;
   const record = value as Record<string, unknown>;
 
-  for (const key of ['command', 'cmd', 'script', 'shell', 'bash']) {
-    const field = record[key];
-    if (typeof field === 'string' && field.trim()) return true;
+  const direct = pickStringField(record, shellCommandFieldNames);
+  if (direct) return direct;
+
+  for (const fieldValue of Object.values(record)) {
+    const nested = pickShellCommandInput(fieldValue);
+    if (nested) return nested;
   }
 
-  return Object.values(record).some(hasShellCommandInput);
+  return undefined;
 };
+
+const hasShellCommandInput = (value: unknown): boolean => Boolean(pickShellCommandInput(value));
 
 const isNonFatalAcpToolFailure = (
   update: AcpToolCallUpdateCompat,
@@ -127,17 +141,17 @@ const isNonFatalAcpToolFailure = (
   if (update.kind === 'read') return true;
   if (update.kind !== 'execute') return false;
   if (hasShellCommandInput(rawInput)) return true;
-  return shellCommandTitles.has((update.title ?? '').trim().toLowerCase());
+  return shellCommandTitles.has(toDisplayText(update.title).trim().toLowerCase());
 };
 
 const buildParamSummary = (kind: string, rawInput?: Record<string, unknown>): string | undefined => {
   if (!rawInput) return undefined;
 
   if (kind === 'read' || kind === 'edit') {
-    return (rawInput.file_path as string) || (rawInput.path as string) || (rawInput.file_name as string);
+    return pickStringField(rawInput, ['file_path', 'path', 'file_name']);
   }
   if (kind === 'execute') {
-    return rawInput.command as string;
+    return pickShellCommandInput(rawInput.command) || pickShellCommandInput(rawInput);
   }
   if (kind === 'search' || kind === 'grep') {
     const parts: string[] = [];
@@ -153,7 +167,7 @@ const buildParamSummary = (kind: string, rawInput?: Record<string, unknown>): st
     return parts.length > 0 ? parts.join(' ') : undefined;
   }
   if (kind === 'write') {
-    return (rawInput.file_path as string) || (rawInput.path as string);
+    return pickStringField(rawInput, ['file_path', 'path']);
   }
 
   for (const key of ['file_path', 'command', 'path', 'pattern', 'query', 'url']) {
@@ -196,14 +210,16 @@ export function normalizeAcpToolCall(message: IMessageAcpToolCall): NormalizedTo
       .join('\n');
   }
 
-  const keyParam = buildParamSummary(update.kind, rawInput);
+  const kind = toDisplayText(update.kind, 'execute');
+  const keyParam = buildParamSummary(kind, rawInput);
+  const commandText = pickShellCommandInput(rawInput);
 
   return {
-    key: update.tool_call_id,
-    name: update.title,
+    key: toDisplayText(update.tool_call_id),
+    name: toDisplayText(update.title, 'Tool'),
     status: normalizeAcpStatus(update.status),
     ...(isNonFatalAcpToolFailure(update, rawInput) ? { nonFatalFailure: true } : {}),
-    description: keyParam || (rawInput?.command as string) || update.kind,
+    description: keyParam || commandText || kind,
     input,
     output,
     truncated: content?._compact?.truncated === true,
@@ -214,7 +230,7 @@ export function normalizeAcpToolCall(message: IMessageAcpToolCall): NormalizedTo
 
 // ===== tool_call → NormalizedToolCall =====
 
-function normalizeToolCallStatus(status?: string): NormalizedToolStatus {
+function normalizeToolCallStatus(status?: unknown): NormalizedToolStatus {
   switch (status) {
     case 'completed':
       return 'completed';
@@ -238,12 +254,12 @@ export function normalizeToolCall(message: IMessageToolCall): NormalizedToolCall
       : undefined;
 
   return {
-    key: call_id,
-    name,
+    key: toDisplayText(call_id),
+    name: toDisplayText(name, 'Tool'),
     status: normalizeToolCallStatus(status),
-    description: description || undefined,
+    description: description ? formatValue(description) : undefined,
     input: displayInput,
-    output,
+    output: output ? toDisplayText(output) : undefined,
   };
 }
 

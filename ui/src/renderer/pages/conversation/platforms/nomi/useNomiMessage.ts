@@ -6,6 +6,7 @@
 
 import { ipcBridge } from '@/common';
 import { transformMessage } from '@/common/chat/chatLib';
+import { extractResponseTextChunk, optionalDisplayText, toDisplayText } from '@/common/chat/displayText';
 import type { IResponseMessage } from '@/common/adapter/ipcBridge';
 import type { TChatConversation, TokenUsageData } from '@/common/config/storage';
 import { prefixedId, uuid } from '@/common/utils';
@@ -17,6 +18,57 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'r
 import type { ThoughtData } from '../thoughtTypes';
 import { processLocalCronResponse } from './localCronCommands';
 import { initialNomiTurnState, isTurnRunning, nomiTurnReducer } from './nomiTurnState';
+
+type NomiToolGroupRuntimeTool = {
+  status: string;
+  name?: string;
+  description?: string;
+};
+
+export const getNomiToolGroupRuntimeState = (data: unknown): {
+  tools: NomiToolGroupRuntimeTool[];
+  hasActive: boolean;
+  hasAny: boolean;
+  confirmingDescription?: string;
+  executingDescription?: string;
+} => {
+  const tools = Array.isArray(data)
+    ? data
+        .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object' && !Array.isArray(item))
+        .map((tool) => ({
+          status: toDisplayText(tool.status),
+          ...(tool.name != null ? { name: toDisplayText(tool.name) } : {}),
+          ...(tool.description != null ? { description: toDisplayText(tool.description) } : {}),
+        }))
+    : [];
+  const activeStatuses = new Set(['Executing', 'Confirming', 'Pending']);
+  const hasActive = tools.some((tool) => activeStatuses.has(tool.status));
+  const confirmingTool = tools.find((tool) => tool.status === 'Confirming');
+  const executingTool = tools.find((tool) => tool.status === 'Executing');
+
+  return {
+    tools,
+    hasActive,
+    hasAny: tools.length > 0,
+    confirmingDescription: confirmingTool
+      ? optionalDisplayText(confirmingTool.description) || optionalDisplayText(confirmingTool.name) || 'Tool execution'
+      : undefined,
+    executingDescription: executingTool
+      ? optionalDisplayText(executingTool.description) || optionalDisplayText(executingTool.name) || 'Tool'
+      : undefined,
+  };
+};
+
+const normalizeThoughtData = (data: unknown): ThoughtData => {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    return { subject: '', description: toDisplayText(data) };
+  }
+  const record = data as Record<string, unknown>;
+  return {
+    subject: record.subject != null ? toDisplayText(record.subject) : '',
+    description: record.description != null ? toDisplayText(record.description) : '',
+  };
+};
 
 export const useNomiMessage = (
   conversation_id: number,
@@ -183,16 +235,7 @@ export const useNomiMessage = (
       }
 
       if ((message.type === 'content' || message.type === 'text') && message.msg_id) {
-        const payload = message.data;
-        const chunk =
-          typeof payload === 'string'
-            ? payload
-            : typeof payload === 'object' &&
-                payload !== null &&
-                'content' in payload &&
-                typeof (payload as { content?: unknown }).content === 'string'
-              ? ((payload as { content: string }).content ?? '')
-              : '';
+        const chunk = extractResponseTextChunk(message.data);
 
         if (chunk) {
           const previous = messageBufferRef.current.get(message.msg_id) ?? '';
@@ -203,7 +246,7 @@ export const useNomiMessage = (
       switch (message.type) {
         case 'thought':
           dispatchTurn({ type: 'activity' });
-          throttledSetThought(message.data as ThoughtData);
+          throttledSetThought(normalizeThoughtData(message.data));
           break;
         case 'start':
           dispatchTurn({ type: 'activity' });
@@ -263,26 +306,22 @@ export const useNomiMessage = (
         case 'tool_group':
           {
             // Check if any tools are executing or awaiting confirmation
-            const tools = message.data as Array<{ status: string; name?: string; description?: string }>;
-            const activeStatuses = new Set(['Executing', 'Confirming', 'Pending']);
-            const hasActive = tools.some((tool) => activeStatuses.has(tool.status));
-            dispatchTurn({ type: 'toolGroup', hasActive, hasAny: tools.length > 0 });
+            const toolState = getNomiToolGroupRuntimeState(message.data);
+            dispatchTurn({ type: 'toolGroup', hasActive: toolState.hasActive, hasAny: toolState.hasAny });
 
             // If tools are awaiting confirmation, update thought hint
-            const confirmingTool = tools.find((tool) => tool.status === 'Confirming');
-            if (confirmingTool) {
+            if (toolState.confirmingDescription) {
               setThought({
                 subject: 'Awaiting Confirmation',
                 // Prefer the contextual description (file/command/pattern) over the
                 // bare tool name so the status reads e.g. "edit src/auth.ts".
-                description: confirmingTool.description || confirmingTool.name || 'Tool execution',
+                description: toolState.confirmingDescription,
               });
-            } else if (hasActive) {
-              const executingTool = tools.find((tool) => tool.status === 'Executing');
-              if (executingTool) {
+            } else if (toolState.hasActive) {
+              if (toolState.executingDescription) {
                 setThought({
                   subject: 'Executing',
-                  description: executingTool.description || executingTool.name || 'Tool',
+                  description: toolState.executingDescription,
                 });
               }
             } else if (!turnStateRef.current.streamRunning) {

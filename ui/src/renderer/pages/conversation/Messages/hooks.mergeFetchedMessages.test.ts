@@ -152,4 +152,16 @@ describe('mergeThinkingStreamContent', () => {
       )
     ).toBe('用户要求我写一个贪吃蛇游戏，包括：\n\n1. 游戏窗口\n2. 蛇的移动\n3. 食物生成');
   });
+
+  test('stringifies malformed thinking stream chunks instead of throwing', () => {
+    let result = '';
+    let error: unknown;
+    try {
+      result = mergeThinkingStreamContent({ existing: true } as any, { incoming: true } as any);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeUndefined();
+    expect(result.includes('"incoming": true')).toBe(true);
+  });
 });

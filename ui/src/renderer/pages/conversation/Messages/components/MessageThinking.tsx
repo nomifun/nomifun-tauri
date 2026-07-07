@@ -5,6 +5,7 @@
  */
 
 import type { IMessageThinking } from '@/common/chat/chatLib';
+import { toDisplayText } from '@/common/chat/displayText';
 import { Spin } from '@arco-design/web-react';
 import { Brain, Right } from '@icon-park/react';
 import React, { useEffect, useRef, useState } from 'react';
@@ -37,7 +38,8 @@ const MessageThinking: React.FC<MessageThinkingProps> = ({
     return `${minutes}${mUnit} ${remaining}${sUnit}`;
   };
 
-  const { content: text, status, subject } = message.content;
+  const { status, subject } = message.content;
+  const text = toDisplayText(message.content.content);
   const isDone = status === 'done';
   const defaultExpanded = expanded ?? (isProcessVariant ? !isDone : true);
   const [internalExpanded, setInternalExpanded] = useState(() => defaultExpanded);
@@ -84,7 +86,7 @@ const MessageThinking: React.FC<MessageThinkingProps> = ({
 
   const summaryText = isDone
     ? t('conversation.thinking.complete', { defaultValue: 'Thought complete' })
-    : `${subject || t('conversation.thinking.label', { defaultValue: 'Thinking...' })} · ${formatElapsedTime(elapsedTime)}`;
+    : `${toDisplayText(subject) || t('conversation.thinking.label', { defaultValue: 'Thinking...' })} · ${formatElapsedTime(elapsedTime)}`;
 
   return (
     <div className={`${styles.container} ${isProcessVariant ? styles.containerProcess : ''}`}>

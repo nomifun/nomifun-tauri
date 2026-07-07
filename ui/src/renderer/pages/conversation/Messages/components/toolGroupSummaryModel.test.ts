@@ -126,6 +126,29 @@ describe('buildToolReceiptSummaryParts', () => {
       { action: 'run_commands', count: 1, state: 'completed', target: 'grep -rn "missing" .' },
     ]);
   });
+
+  test('handles structured tool descriptions without throwing during receipt rendering', () => {
+    const parts = buildToolReceiptSummaryParts(
+      [
+        tool({
+          key: 'structured',
+          name: 'Bash',
+          description: { command: 'codex --version' } as any,
+          status: 'running',
+        }),
+      ],
+      'running'
+    );
+
+    expect(parts).toEqual([
+      {
+        action: 'run_commands',
+        count: 1,
+        state: 'running',
+        target: '{ "command": "codex --version" }',
+      },
+    ]);
+  });
 });
 
 describe('getToolReceiptIconFromSummaryParts', () => {

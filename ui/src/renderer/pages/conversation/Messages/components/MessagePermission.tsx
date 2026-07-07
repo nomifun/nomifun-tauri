@@ -5,6 +5,7 @@
  */
 
 import type { IMessagePermission } from '@/common/chat/chatLib';
+import { optionalDisplayText, toDisplayText } from '@/common/chat/displayText';
 import { ipcBridge } from '@/common';
 import { Button, Card, Image, Radio, Typography } from '@arco-design/web-react';
 import React, { useState } from 'react';
@@ -26,13 +27,18 @@ const actionIcons: Record<string, string> = {
 const MessagePermission: React.FC<MessagePermissionProps> = React.memo(({ message }) => {
   const { t } = useTranslation();
   const { options = [], description, title, action, call_id, command_type, screenshot } = message.content || {};
+  const descriptionText = optionalDisplayText(description);
+  const titleText = optionalDisplayText(title);
+  const actionText = optionalDisplayText(action);
+  const commandTypeText = optionalDisplayText(command_type);
+  const screenshotSrc = optionalDisplayText(screenshot);
 
   const [selected, setSelected] = useState<string | null>(null);
   const [isResponding, setIsResponding] = useState(false);
   const [hasResponded, setHasResponded] = useState(false);
 
-  const icon = actionIcons[action || ''] || '🔐';
-  const displayTitle = title || description || t('messages.permissionRequest');
+  const icon = actionIcons[actionText || ''] || '🔐';
+  const displayTitle = titleText || descriptionText || t('messages.permissionRequest');
 
   const handleConfirm = async () => {
     if (hasResponded || !selected) return;
@@ -62,20 +68,20 @@ const MessagePermission: React.FC<MessagePermissionProps> = React.memo(({ messag
           <span className='text-2xl'>{icon}</span>
           <Text className='block'>{displayTitle}</Text>
         </div>
-        {command_type && (
+        {commandTypeText && (
           <div>
             <Text className='text-xs text-t-secondary mb-1'>{t('messages.command')}</Text>
-            <code className='text-xs bg-1 p-2 rounded block text-t-primary break-all'>{command_type}</code>
+            <code className='text-xs bg-1 p-2 rounded block text-t-primary break-all'>{commandTypeText}</code>
           </div>
         )}
-        {description && description !== displayTitle && (
+        {descriptionText && descriptionText !== displayTitle && (
           <div>
-            <Text className='text-xs text-t-secondary'>{description}</Text>
+            <Text className='text-xs text-t-secondary'>{descriptionText}</Text>
           </div>
         )}
-        {screenshot && (
+        {screenshotSrc && (
           <div className='rounded-md overflow-hidden border' style={{ borderColor: 'var(--border-2)' }}>
-            <Image src={screenshot} alt={t('messages.browserApprovalPreview')} width='100%' style={{ maxHeight: 320, objectFit: 'contain' }} />
+            <Image src={screenshotSrc} alt={t('messages.browserApprovalPreview')} width='100%' style={{ maxHeight: 320, objectFit: 'contain' }} />
           </div>
         )}
         {!hasResponded && (
@@ -89,7 +95,7 @@ const MessagePermission: React.FC<MessagePermissionProps> = React.memo(({ messag
                     data-testid={`message-permission-option-${String(option.value) || `option_${index}`}`}
                   >
                     <Radio value={String(option.value)}>
-                      {t(option.label, { ...option.params, defaultValue: option.label })}
+                      {t(toDisplayText(option.label), { ...option.params, defaultValue: toDisplayText(option.label) })}
                     </Radio>
                   </div>
                 ))

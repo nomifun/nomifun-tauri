@@ -355,6 +355,7 @@ const getToolReceiptIcon = (
   }
 
   if (latestMessage.type === 'tool_group') {
+    if (!Array.isArray(latestMessage.content)) return 'tool';
     const latestTool = latestMessage.content.findLast(Boolean);
     const confirmationType = latestTool?.confirmationDetails?.type;
     if (confirmationType === 'edit') return 'edit';

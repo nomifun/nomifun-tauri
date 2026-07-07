@@ -5,6 +5,7 @@
  */
 
 import type { IMessageToolCall } from '@/common/chat/chatLib';
+import { toDisplayText } from '@/common/chat/displayText';
 import { normalizeToolCall } from '@/common/chat/normalizeToolCall';
 import type { NormalizedToolStatus } from '@/common/chat/normalizeToolCall';
 import KnowledgeSearchChip from './KnowledgeSearchChip';
@@ -32,9 +33,9 @@ const statusToBadge = (status: NormalizedToolStatus): BadgeProps['status'] => {
 };
 
 const ReplacePreview: React.FC<{ message: IMessageToolCall }> = ({ message }) => {
-  const file_path = message.content.args?.file_path || message.content.input?.file_path || '';
-  const old_string = message.content.args?.old_string ?? message.content.input?.old_string ?? '';
-  const new_string = message.content.args?.new_string ?? message.content.input?.new_string ?? '';
+  const file_path = toDisplayText(message.content.args?.file_path ?? message.content.input?.file_path);
+  const old_string = toDisplayText(message.content.args?.old_string ?? message.content.input?.old_string);
+  const new_string = toDisplayText(message.content.args?.new_string ?? message.content.input?.new_string);
 
   const diffText = useMemo(() => {
     return createTwoFilesPatch(file_path, file_path, old_string, new_string, '', '', { context: 3 });
@@ -69,7 +70,7 @@ const MessageToolCall: React.FC<{ message: IMessageToolCall }> = ({ message }) =
 
   const normalized = normalizeToolCall(message);
   if (!normalized) {
-    return <div className='text-t-primary'>{name}</div>;
+    return <div className='text-t-primary'>{toDisplayText(name)}</div>;
   }
 
   const hasDetail = normalized.input || normalized.output;

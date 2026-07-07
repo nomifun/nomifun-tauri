@@ -6,6 +6,7 @@
 
 import { ipcBridge } from '@/common';
 import type { IMessageToolGroup } from '@/common/chat/chatLib';
+import { optionalDisplayText, toDisplayText } from '@/common/chat/displayText';
 import { iconColors } from '@/renderer/styles/colors';
 import { Alert, Button, Image, Message, Radio, Tag, Tooltip } from '@arco-design/web-react';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
@@ -100,8 +101,8 @@ const useConfirmationButtons = (
       default: {
         const mcpProps = confirmationDetails;
         question = t('messages.confirmation.allowMCPTool', {
-          toolName: mcpProps.tool_name,
-          serverName: mcpProps.server_name,
+          toolName: toDisplayText(mcpProps.tool_name),
+          serverName: toDisplayText(mcpProps.server_name),
         });
         options.push(
           {
@@ -110,14 +111,14 @@ const useConfirmationButtons = (
           },
           {
             label: t('messages.confirmation.yesAlwaysAllowTool', {
-              toolName: mcpProps.tool_name,
-              serverName: mcpProps.server_name,
+              toolName: toDisplayText(mcpProps.tool_name),
+              serverName: toDisplayText(mcpProps.server_name),
             }),
             value: ToolConfirmationOutcome.ProceedAlwaysTool,
           },
           {
             label: t('messages.confirmation.yesAlwaysAllowServer', {
-              serverName: mcpProps.server_name,
+              serverName: toDisplayText(mcpProps.server_name),
             }),
             value: ToolConfirmationOutcome.ProceedAlwaysServer,
           },
@@ -170,7 +171,7 @@ const ConfirmationDetails: React.FC<{
       case 'edit':
         return null; // Rendered separately below with hooks support
       case 'exec': {
-        const bashSnippet = `\`\`\`bash\n${confirmationDetails.command}\n\`\`\``;
+        const bashSnippet = `\`\`\`bash\n${toDisplayText(confirmationDetails.command)}\n\`\`\``;
         return (
           <div className='w-full max-w-100% min-w-0'>
             <MarkdownView codeStyle={CODE_STYLE} fontSize={MESSAGE_BODY_FONT_SIZE} lineHeight={MESSAGE_BODY_LINE_HEIGHT}>
@@ -180,9 +181,9 @@ const ConfirmationDetails: React.FC<{
         );
       }
       case 'info':
-        return <span className='text-t-primary'>{confirmationDetails.prompt}</span>;
+        return <span className='text-t-primary'>{toDisplayText(confirmationDetails.prompt)}</span>;
       case 'mcp':
-        return <span className='text-t-primary'>{confirmationDetails.tool_display_name}</span>;
+        return <span className='text-t-primary'>{toDisplayText(confirmationDetails.tool_display_name)}</span>;
     }
   }, [confirmationDetails]);
 
@@ -196,9 +197,9 @@ const ConfirmationDetails: React.FC<{
     <div>
       {confirmationDetails.type === 'edit' ? (
         <EditConfirmationDiff
-          diff={confirmationDetails?.file_diff || ''}
-          file_name={confirmationDetails.file_name}
-          title={isConfirm ? confirmationDetails.title : content.description}
+          diff={toDisplayText(confirmationDetails?.file_diff)}
+          file_name={toDisplayText(confirmationDetails.file_name)}
+          title={isConfirm ? toDisplayText(confirmationDetails.title) : toDisplayText(content.description)}
         />
       ) : (
         node
@@ -431,16 +432,18 @@ const ToolResultDisplay: React.FC<{
   content: IMessageToolGroupProps['message']['content'][number];
 }> = ({ content }) => {
   const { result_display, name } = content;
+  const toolName = toDisplayText(name);
 
   // 图片生成特殊处理 Special handling for image generation
-  if (name === 'ImageGeneration' && typeof result_display === 'object') {
+  if (toolName === 'ImageGeneration' && typeof result_display === 'object' && result_display !== null) {
     const result = result_display as ImageGenerationResult;
     // 如果有 img_url 才显示图片，否则显示错误信息
-    if (result.img_url) {
+    const imgUrl = optionalDisplayText(result.img_url);
+    if (imgUrl) {
       return (
         <LocalImageView
-          src={result.img_url}
-          alt={result.relative_path || result.img_url}
+          src={imgUrl}
+          alt={optionalDisplayText(result.relative_path) || imgUrl}
           className='max-w-100% max-h-100%'
         />
       );
@@ -449,7 +452,7 @@ const ToolResultDisplay: React.FC<{
   }
 
   // 将结果转换为字符串 Convert result to string
-  const display = typeof result_display === 'string' ? result_display : JSON.stringify(result_display, null, 2);
+  const display = toDisplayText(result_display);
 
   // 使用 CollapsibleContent 包装长内容
   // Wrap long content with CollapsibleContent
@@ -467,48 +470,59 @@ const ToolResultDisplay: React.FC<{
 
 const MessageToolGroup: React.FC<IMessageToolGroupProps> = ({ message }) => {
   const { t } = useTranslation();
+  const toolContent = Array.isArray(message.content) ? message.content : [];
 
   // 收集所有 WriteFile 结果用于汇总显示 / Collect all WriteFile results for summary display
   const writeFileResults = useMemo(() => {
-    return message.content
+    return toolContent
       .filter(
         (item) =>
-          item.name === 'WriteFile' &&
+          toDisplayText(item.name) === 'WriteFile' &&
           item.result_display &&
           typeof item.result_display === 'object' &&
           'file_diff' in item.result_display
       )
-      .map((item) => item.result_display as WriteFileResult);
-  }, [message.content]);
+      .map((item) => {
+        const result = item.result_display as WriteFileResult;
+        return {
+          file_diff: toDisplayText(result.file_diff),
+          file_name: toDisplayText(result.file_name),
+        };
+      });
+  }, [toolContent]);
 
   // 找到第一个 WriteFile 的索引 / Find the index of first WriteFile
   const firstWriteFileIndex = useMemo(() => {
-    return message.content.findIndex(
+    return toolContent.findIndex(
       (item) =>
-        item.name === 'WriteFile' &&
+        toDisplayText(item.name) === 'WriteFile' &&
         item.result_display &&
         typeof item.result_display === 'object' &&
         'file_diff' in item.result_display
     );
-  }, [message.content]);
+  }, [toolContent]);
 
   return (
     <div>
-      {message.content.map((content, index) => {
+      {toolContent.map((content, index) => {
         const { status, call_id, name, description, result_display, confirmationDetails } = content;
-        const isLoading = status !== 'Success' && status !== 'Error' && status !== 'Canceled';
+        const statusText = toDisplayText(status);
+        const callIdText = toDisplayText(call_id, `tool-${index}`);
+        const nameText = toDisplayText(name, 'Tool');
+        const descriptionText = optionalDisplayText(description);
+        const isLoading = statusText !== 'Success' && statusText !== 'Error' && statusText !== 'Canceled';
         // status === "Confirming" &&
         if (confirmationDetails) {
           return (
             <ConfirmationDetails
-              key={call_id}
+              key={callIdText}
               content={content}
               onConfirm={(outcome) => {
                 ipcBridge.conversation.confirmMessage
                   .invoke({
                     confirm_key: outcome,
                     msg_id: message.id,
-                    call_id: call_id,
+                    call_id: callIdText,
                     conversation_id: message.conversation_id,
                   })
                   .then(() => {
@@ -523,12 +537,12 @@ const MessageToolGroup: React.FC<IMessageToolGroupProps> = ({ message }) => {
         }
 
         // WriteFile 特殊处理：使用 MessageFileChanges 汇总显示 / WriteFile special handling: use MessageFileChanges for summary display
-        if (name === 'WriteFile' && typeof result_display !== 'string') {
+        if (nameText === 'WriteFile' && typeof result_display !== 'string') {
           if (result_display && typeof result_display === 'object' && 'file_diff' in result_display) {
             // 只在第一个 WriteFile 位置显示汇总组件 / Only show summary component at first WriteFile position
             if (index === firstWriteFileIndex && writeFileResults.length > 0) {
               return (
-                <div className='w-full min-w-0' key={call_id}>
+                <div className='w-full min-w-0' key={callIdText}>
                   <MessageFileChanges writeFileChanges={writeFileResults} />
                 </div>
               );
@@ -539,25 +553,32 @@ const MessageToolGroup: React.FC<IMessageToolGroupProps> = ({ message }) => {
         }
 
         // ImageGeneration 特殊处理：单独展示图片，不用 Alert 包裹 Special handling for ImageGeneration: display image separately without Alert wrapper
-        if (name === 'ImageGeneration' && typeof result_display === 'object') {
+        if (nameText === 'ImageGeneration' && typeof result_display === 'object' && result_display !== null) {
           const result = result_display as ImageGenerationResult;
-          if (result.img_url) {
-            return <ImageDisplay key={call_id} imgUrl={result.img_url} relativePath={result.relative_path} />;
+          const imgUrl = optionalDisplayText(result.img_url);
+          if (imgUrl) {
+            return (
+              <ImageDisplay
+                key={callIdText}
+                imgUrl={imgUrl}
+                relativePath={optionalDisplayText(result.relative_path)}
+              />
+            );
           }
         }
 
         // 通用工具调用展示 Generic tool call display
         // 将可展开的长内容放在 Alert 下方，保持 Alert 仅展示头部信息
         return (
-          <div key={call_id}>
+          <div key={callIdText}>
             <Alert
               className={ALERT_CLASSES}
               type={
-                status === 'Error'
+                statusText === 'Error'
                   ? 'error'
-                  : status === 'Success'
+                  : statusText === 'Success'
                     ? 'success'
-                    : status === 'Canceled'
+                    : statusText === 'Canceled'
                       ? 'warning'
                       : 'info'
               }
@@ -569,20 +590,20 @@ const MessageToolGroup: React.FC<IMessageToolGroupProps> = ({ message }) => {
               content={
                 <div>
                   <Tag className={'mr-4px'}>
-                    {name}
-                    {status === 'Canceled' ? `(${t('messages.canceledExecution')})` : ''}
+                    {nameText}
+                    {statusText === 'Canceled' ? `(${t('messages.canceledExecution')})` : ''}
                   </Tag>
                 </div>
               }
             />
 
-            {(description || result_display || status === 'Error') && (
+            {(descriptionText || result_display || statusText === 'Error') && (
               <div className='mt-8px'>
-                {description && (
+                {descriptionText && (
                   <div
-                    className={`text-12px text-t-secondary mb-2 ${status === 'Error' ? 'whitespace-pre-wrap break-words' : 'truncate'}`}
+                    className={`text-12px text-t-secondary mb-2 ${statusText === 'Error' ? 'whitespace-pre-wrap break-words' : 'truncate'}`}
                   >
-                    {description}
+                    {descriptionText}
                   </div>
                 )}
                 {result_display && (
@@ -593,7 +614,7 @@ const MessageToolGroup: React.FC<IMessageToolGroupProps> = ({ message }) => {
                     <ToolResultDisplay content={content} />
                   </div>
                 )}
-                {status === 'Error' && (
+                {statusText === 'Error' && (
                   <div className='mt-4px flex justify-end'>
                     <FeedbackButton module='conversation-session' />
                   </div>

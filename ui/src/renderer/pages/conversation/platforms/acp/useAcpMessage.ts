@@ -7,6 +7,7 @@
 import { ipcBridge } from '@/common';
 import { transformMessage } from '@/common/chat/chatLib';
 import type { AvailableCommand } from '@/common/chat/chatLib';
+import { toDisplayText } from '@/common/chat/displayText';
 import type { SlashCommandItem } from '@/common/chat/slash/types';
 import type { IResponseMessage } from '@/common/adapter/ipcBridge';
 import type { TokenUsageData } from '@/common/config/storage';
@@ -17,6 +18,32 @@ import { warmupConversation } from '@/renderer/pages/conversation/utils/warmupCo
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import type { ThoughtData } from '../thoughtTypes';
 import { acpTurnReducer, initialAcpTurnState, isAcpTurnBusy } from './acpTurnState';
+
+export const normalizeAcpSlashCommands = (commands: unknown): SlashCommandItem[] => {
+  if (!Array.isArray(commands)) return [];
+
+  return commands
+    .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object' && !Array.isArray(item))
+    .flatMap((command) => {
+      let name = '';
+      if (typeof command.name === 'string') {
+        name = command.name;
+      } else if (typeof command.command === 'string') {
+        name = command.command;
+      }
+      if (!name.trim()) return [];
+
+      return [
+        {
+          name,
+          description: command.description != null ? toDisplayText(command.description) : '',
+          kind: 'template' as const,
+          source: 'acp' as const,
+          selectionBehavior: 'insert' as const,
+        },
+      ];
+    });
+};
 
 export type UseAcpMessageReturn = {
   thought: ThoughtData;
@@ -323,12 +350,12 @@ export const useAcpMessage = (conversation_id: number, options?: { skipWarmup?: 
                 const obj = raw as Record<string, unknown>;
                 if (obj.teammate_message && !obj.teammateMessage) {
                   tmMsg.content = {
-                    content: (obj.content as string) ?? '',
+                    content: obj.content != null ? toDisplayText(obj.content) : '',
                     teammateMessage: true,
-                    ...(obj.sender_name ? { senderName: obj.sender_name as string } : {}),
-                    ...(obj.sender_backend ? { senderAgentType: obj.sender_backend as string } : {}),
-                    ...(obj.sender_conversation_id != null
-                      ? { senderConversationId: obj.sender_conversation_id as number }
+                    ...(typeof obj.sender_name === 'string' ? { senderName: obj.sender_name } : {}),
+                    ...(typeof obj.sender_backend === 'string' ? { senderAgentType: obj.sender_backend } : {}),
+                    ...(typeof obj.sender_conversation_id === 'number'
+                      ? { senderConversationId: obj.sender_conversation_id }
                       : {}),
                   };
                 }
@@ -363,15 +390,7 @@ export const useAcpMessage = (conversation_id: number, options?: { skipWarmup?: 
         case 'available_commands': {
           const cmdData = message.data as { commands?: AvailableCommand[] };
           if (cmdData?.commands && Array.isArray(cmdData.commands)) {
-            setSlashCommands(
-              cmdData.commands.map((c) => ({
-                name: c.name,
-                description: c.description,
-                kind: 'template' as const,
-                source: 'acp' as const,
-                selectionBehavior: 'insert' as const,
-              }))
-            );
+            setSlashCommands(normalizeAcpSlashCommands(cmdData.commands));
           }
           break;
         }
@@ -542,15 +561,7 @@ export const useAcpMessage = (conversation_id: number, options?: { skipWarmup?: 
       .then((result) => {
         if (cancelled) return;
         if (!result || !Array.isArray(result) || result.length === 0) return;
-        setSlashCommands(
-          result.map((c) => ({
-            name: c.command,
-            description: c.description,
-            kind: 'template' as const,
-            source: 'acp' as const,
-            selectionBehavior: 'insert' as const,
-          }))
-        );
+        setSlashCommands(normalizeAcpSlashCommands(result));
       })
       .catch(() => {});
     return () => {
@@ -573,15 +584,7 @@ export const useAcpMessage = (conversation_id: number, options?: { skipWarmup?: 
       .invoke({ conversation_id })
       .then((result) => {
         if (!result || !Array.isArray(result) || result.length === 0) return;
-        setSlashCommands(
-          result.map((c) => ({
-            name: c.command,
-            description: c.description,
-            kind: 'template' as const,
-            source: 'acp' as const,
-            selectionBehavior: 'insert' as const,
-          }))
-        );
+        setSlashCommands(normalizeAcpSlashCommands(result));
       })
       .catch(() => {});
   }, [conversation_id]);

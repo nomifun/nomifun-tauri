@@ -5,6 +5,7 @@
  */
 
 import type { IMessageText } from '@/common/chat/chatLib';
+import { toDisplayText } from '@/common/chat/displayText';
 import { NOMIFUN_FILES_MARKER } from '@/common/config/constants';
 import { useConversationContextSafe } from '@/renderer/hooks/context/ConversationContext';
 import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
@@ -101,16 +102,13 @@ const MessageText: React.FC<{ message: IMessageText; hideActions?: boolean }> = 
   // Filter think tags from content before rendering
   // 在渲染前过滤 think 标签
   const contentToRender = useMemo(() => {
-    let content = message.content.content;
-    if (typeof content === 'string') {
-      if (hasThinkTags(content)) {
-        content = stripThinkTags(content);
-      }
-      // Strip any inline [SKILL_SUGGEST] blocks (now handled via separate skill_suggest message type)
-      if (hasSkillSuggest(content)) {
-        content = stripSkillSuggest(content);
-      }
-      return content;
+    let content = toDisplayText(message.content.content);
+    if (hasThinkTags(content)) {
+      content = stripThinkTags(content);
+    }
+    // Strip any inline [SKILL_SUGGEST] blocks (now handled via separate skill_suggest message type)
+    if (hasSkillSuggest(content)) {
+      content = stripSkillSuggest(content);
     }
     return content;
   }, [message.content.content]);
@@ -140,7 +138,7 @@ const MessageText: React.FC<{ message: IMessageText; hideActions?: boolean }> = 
   }, [isUserMessage, messageList, message.msg_id]);
 
   // 过滤空内容，避免渲染空DOM
-  if (!message.content.content || (typeof message.content.content === 'string' && !message.content.content.trim())) {
+  if (!contentToRender.trim()) {
     return null;
   }
 

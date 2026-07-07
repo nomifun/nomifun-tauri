@@ -5,6 +5,7 @@
  */
 
 import type { IMessageTips } from '@/common/chat/chatLib';
+import { toDisplayText } from '@/common/chat/displayText';
 import { Collapse, Tag } from '@arco-design/web-react';
 import { Attention, CheckOne } from '@icon-park/react';
 import { theme } from '@/platform';
@@ -54,7 +55,8 @@ const useFormatContent = (content: string) => {
 
 const MessageTips: React.FC<{ message: IMessageTips }> = ({ message }) => {
   const { t } = useTranslation();
-  const { content, type } = message.content;
+  const { type } = message.content;
+  const content = toDisplayText(message.content.content);
   const structuredError = type === 'error' ? message.content.error : undefined;
   const { json, data } = useFormatContent(content);
 

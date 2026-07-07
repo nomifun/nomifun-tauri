@@ -6,6 +6,7 @@
 
 import type { IConversationArtifact } from '@/common/adapter/ipcBridge';
 import type { IMessageAcpToolCall, IMessageToolCall, IMessageToolGroup, TMessage } from '@/common/chat/chatLib';
+import { toDisplayText } from '@/common/chat/displayText';
 import { normalizeToolMessages } from '@/common/chat/normalizeToolCall';
 import { useConversationContextSafe } from '@/renderer/hooks/context/ConversationContext';
 import { usePreviewLauncher } from '@/renderer/hooks/file/usePreviewLauncher';
@@ -628,7 +629,7 @@ const ProcessTraceItem: React.FC<{
         <div className='turn-process-trace'>
           <div className='turn-process-trace__paragraph-row'>
             <TraceRowIcon kind='system' />
-            <div className='turn-process-trace__paragraph'>{item.content.content}</div>
+            <div className='turn-process-trace__paragraph'>{toDisplayText(item.content.content)}</div>
           </div>
         </div>
       );
