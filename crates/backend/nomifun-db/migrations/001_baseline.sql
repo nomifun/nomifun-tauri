@@ -246,8 +246,8 @@ CREATE INDEX IF NOT EXISTS idx_agent_metadata_sort_order ON agent_metadata(sort_
 
 -- Seed agent_metadata with builtin agents.
 --
--- Values are the post-001/003/004/010/012/032 final state of the legacy migration
--- chain: npm adapter package pins from 032, ACP handshake captures (agent_capabilities
+-- Values are the post-001/003/004/010/012 final state of the legacy migration
+-- chain: bun package pins from 004, ACP handshake captures (agent_capabilities
 -- / auth_methods) from 003, command/binary_name fixes for Qoder/Vibe/Kiro from
 -- 003, and the internal agent display name "Nomi" from 012. Agents without a
 -- 003 handshake capture (Claude, Codex, Gemini, OpenCode, Cursor, Hermes,
@@ -260,8 +260,8 @@ INSERT OR IGNORE INTO agent_metadata
 VALUES
     -- ACP builtin agents
     ('agent_builtin_claude', '/api/assets/logos/ai-major/claude.svg', 'Claude Code',
-     'claude', 'acp', 'builtin', '{"binary_name":"claude","bridge_binary":"npm"}',
-     1, 'npm', '["exec","--yes","--package","@agentclientprotocol/claude-agent-acp@0.33.1","--","claude-agent-acp"]', '[]',
+     'claude', 'acp', 'builtin', '{"binary_name":"claude","bridge_binary":"bun"}',
+     1, 'bun', '["x","--bun","@agentclientprotocol/claude-agent-acp@0.33.1"]', '[]',
      '[".claude/skills"]',
      '{"supports_side_question":true,"self_identity_sticky":true,"session_load_via_meta_field":true,"supports_team":true}',
      'bypassPermissions',
@@ -270,8 +270,8 @@ VALUES
      unixepoch('now','subsec')*1000, unixepoch('now','subsec')*1000),
 
     ('agent_builtin_codex', '/api/assets/logos/tools/coding/codex.svg', 'Codex CLI',
-     'codex', 'acp', 'builtin', '{"binary_name":"codex","bridge_binary":"npm"}',
-     1, 'npm', '["exec","--yes","--package","@zed-industries/codex-acp@0.14.0","--","codex-acp"]', '[]',
+     'codex', 'acp', 'builtin', '{"binary_name":"codex","bridge_binary":"bun"}',
+     1, 'bun', '["x","--bun","@zed-industries/codex-acp@0.14.0"]', '[]',
      '[".codex/skills"]',
      '{"supports_side_question":false,"supports_team":true}',
      'full-access',
@@ -301,8 +301,8 @@ VALUES
      unixepoch('now','subsec')*1000, unixepoch('now','subsec')*1000),
 
     ('agent_builtin_codebuddy', '/api/assets/logos/tools/coding/codebuddy.svg', 'CodeBuddy',
-     'codebuddy', 'acp', 'builtin', '{"binary_name":"codebuddy","bridge_binary":"npm"}',
-     1, 'npm', '["exec","--yes","--package","@tencent-ai/codebuddy-code@2.97.0","--","codebuddy","--acp"]', '[]',
+     'codebuddy', 'acp', 'builtin', '{"binary_name":"codebuddy","bridge_binary":"bun"}',
+     1, 'bun', '["x","--bun","@tencent-ai/codebuddy-code@2.97.0","--acp"]', '[]',
      '[".codebuddy/skills"]',
      '{"supports_side_question":false,"supports_team":true}',
      'bypassPermissions',

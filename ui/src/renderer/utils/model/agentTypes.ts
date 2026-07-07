@@ -83,7 +83,7 @@ export type AgentMetadata = {
   /** True iff the backend resolved the spawn command on `$PATH` at hydrate time. */
   available: boolean;
 
-  /** Pre-resolution spawn command as stored in the catalog (e.g. "npm"). */
+  /** Pre-resolution spawn command as stored in the catalog (e.g. "bun"). */
   command?: string;
   args?: string[];
   env?: AgentEnvEntry[];

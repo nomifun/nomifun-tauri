@@ -516,8 +516,8 @@ pub enum UnavailableReason {
     /// this bucket (handled in `decode_row`); for everyone else this
     /// is a seed-data bug.
     NoCommand,
-    /// Bridge binary (`agent_source_info.bridge_binary`, e.g. `npm`
-    /// for `npm exec --package @pkg -- bin`) is not on `$PATH`.
+    /// Bridge binary (`agent_source_info.bridge_binary`, e.g. `bun`
+    /// for `bun x @pkg`) is not on `$PATH`.
     BridgeMissing { bridge: String },
     /// Primary CLI (`agent_source_info.binary_name`, e.g. `claude`
     /// for the bridged Claude row) is not on `$PATH`.
@@ -546,8 +546,8 @@ impl std::fmt::Display for UnavailableReason {
 /// source of truth for `available` — callers never re-run `which()`
 /// themselves.
 ///
-/// Bridge-based rows (e.g. `npm exec --package @pkg -- bin`) require
-/// both `npm` (the spawn command) and the wrapped CLI (`claude`, recorded in
+/// Bridge-based rows (e.g. `bun x @pkg`) require both `bun` (the spawn
+/// command) and the wrapped CLI (`claude`, recorded in
 /// `agent_source_info.binary_name`) to be present. Direct-CLI rows
 /// have `spawn command == primary binary`, so the primary-binary check
 /// is a no-op for them.
@@ -586,9 +586,6 @@ fn probe_resolved_command(meta: &AgentMetadata) -> Result<PathBuf, UnavailableRe
 mod tests {
     use super::*;
     use nomifun_db::{SqliteAgentMetadataRepository, init_database_memory};
-    use std::sync::{Mutex, MutexGuard};
-
-    static PATH_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     async fn registry() -> Arc<AgentRegistry> {
         let db = init_database_memory().await.unwrap();
@@ -596,52 +593,6 @@ mod tests {
         let reg = AgentRegistry::new(repo);
         reg.hydrate().await.unwrap();
         reg
-    }
-
-    struct PathEnvGuard {
-        _lock: MutexGuard<'static, ()>,
-        original: Option<std::ffi::OsString>,
-    }
-
-    impl PathEnvGuard {
-        fn set(path: &std::path::Path) -> Self {
-            let lock = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let original = std::env::var_os("PATH");
-            unsafe {
-                std::env::set_var("PATH", path);
-            }
-            Self {
-                _lock: lock,
-                original,
-            }
-        }
-    }
-
-    impl Drop for PathEnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.original {
-                    Some(path) => std::env::set_var("PATH", path),
-                    None => std::env::remove_var("PATH"),
-                }
-            }
-        }
-    }
-
-    fn write_fake_exe(dir: &std::path::Path, name: &str) {
-        #[cfg(windows)]
-        {
-            std::fs::write(dir.join(format!("{name}.cmd")), "@echo off\r\nexit /b 0\r\n").unwrap();
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let path = dir.join(name);
-            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).unwrap();
-        }
     }
 
     #[tokio::test]
@@ -658,28 +609,12 @@ mod tests {
     async fn find_builtin_claude_has_bridge_command() {
         let reg = registry().await;
         let m = reg.find_builtin_by_backend("claude").await.unwrap();
-        assert_eq!(m.command.as_deref(), Some("npm"));
+        assert_eq!(m.command.as_deref(), Some("bun"));
         assert!(m.behavior_policy.supports_side_question);
         assert_eq!(
             m.native_skills_dirs.as_deref(),
             Some(&[".claude/skills".to_string()][..])
         );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn claude_and_codex_are_available_with_npm_without_bun() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        write_fake_exe(tmp.path(), "npm");
-        write_fake_exe(tmp.path(), "claude");
-        write_fake_exe(tmp.path(), "codex");
-        let _path_guard = PathEnvGuard::set(tmp.path());
-
-        let reg = registry().await;
-
-        let claude = reg.find_builtin_by_backend("claude").await.unwrap();
-        let codex = reg.find_builtin_by_backend("codex").await.unwrap();
-        assert!(claude.available, "Claude should not require bun when npm is present");
-        assert!(codex.available, "Codex should not require bun when npm is present");
     }
 
     #[tokio::test]
