@@ -72,6 +72,12 @@ pub async fn create_router(services: &AppServices) -> Router {
         }
     });
 
+    // Periodic superpowers skills auto-update: a best-effort background janitor
+    // that checks the upstream GitHub release on boot + every N hours and installs
+    // a newer version as the overlay corpus, broadcasting `superpowers.updated`.
+    // Enabled by default; `NOMIFUN_SUPERPOWERS_AUTOUPDATE=0` disables it.
+    super::superpowers_updater::spawn_superpowers_updater(services.data_dir.clone(), services.event_bus.clone());
+
     let (states, channel_components) = build_module_states(services).await;
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),

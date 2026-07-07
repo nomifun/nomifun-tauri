@@ -122,6 +122,21 @@ pub fn parse_latest_release(bytes: &[u8]) -> Result<SuperpowersRelease, Extensio
     })
 }
 
+/// Decide whether a fetched release `latest` should replace the current
+/// effective version `current`. Prefers semver (install only on a strictly newer
+/// version, ignoring build metadata); falls back to plain inequality when either
+/// side is not valid semver. Empty `latest` never installs.
+pub fn should_install_release(latest: &str, current: &str) -> bool {
+    let (latest, current) = (latest.trim(), current.trim());
+    if latest.is_empty() {
+        return false;
+    }
+    match (semver::Version::parse(latest), semver::Version::parse(current)) {
+        (Ok(l), Ok(c)) => l > c,
+        _ => latest != current,
+    }
+}
+
 /// Fetch `url` into memory with host allowlisting, a timeout, and a size cap.
 async fn fetch_bytes(url: &str) -> Result<Vec<u8>, ExtensionError> {
     if !host_allowed(url) {
@@ -411,5 +426,20 @@ mod tests {
             "missing zipball_url"
         );
         assert!(parse_latest_release(b"not json").is_err());
+    }
+
+    #[test]
+    fn should_install_release_prefers_semver_then_falls_back() {
+        assert!(should_install_release("6.0.4", "6.0.3"), "newer installs");
+        assert!(!should_install_release("6.0.3", "6.0.3"), "same skips");
+        assert!(!should_install_release("6.0.2", "6.0.3"), "downgrade blocked");
+        // Baseline stamp carries build metadata (`+sp.<fp>`), which semver ignores.
+        assert!(should_install_release("6.0.4", "6.0.3+sp.abcdef012345"));
+        assert!(!should_install_release("6.0.3", "6.0.3+sp.abcdef012345"));
+        // Non-semver versions fall back to plain inequality.
+        assert!(should_install_release("nightly-2", "nightly-1"));
+        assert!(!should_install_release("nightly-1", "nightly-1"));
+        // Empty latest never installs.
+        assert!(!should_install_release("", "6.0.3"));
     }
 }

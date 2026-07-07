@@ -47,7 +47,7 @@ pub use superpowers::{
 };
 pub use superpowers::update::{
     SuperpowersRelease, fetch_latest_release, install_superpowers_overlay, installed_overlay_version, parse_latest_release,
-    superpowers_repo,
+    should_install_release, superpowers_repo,
 };
 pub use template::{resolve_env_map, resolve_env_templates, resolve_file_reference};
 pub use types::*;

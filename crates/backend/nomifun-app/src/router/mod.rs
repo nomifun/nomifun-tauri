@@ -8,6 +8,7 @@ mod health;
 mod model_failover;
 mod routes;
 mod state;
+mod superpowers_updater;
 mod trace;
 
 pub use routes::{create_router, create_router_with_all_state, create_router_with_states};
