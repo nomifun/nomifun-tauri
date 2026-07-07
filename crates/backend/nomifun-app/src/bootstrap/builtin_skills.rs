@@ -9,6 +9,18 @@ use tracing::warn;
 /// the same binary. When `NOMIFUN_BUILTIN_SKILLS_PATH` is set, skip
 /// materialization — the override path is the source of truth in that mode.
 pub(super) async fn materialize_builtin_skills(data_dir: &Path) -> Result<()> {
+    // Superpowers baseline corpus (built-in obra/superpowers skills). Independent
+    // of the builtin-skills override below and always materialized. Best-effort:
+    // superpowers is an enhancement, not core, so a failure must NOT block startup
+    // — sessions simply won't get superpowers until a later successful materialize
+    // (the periodic updater retries, and a newer overlay can supersede it).
+    if let Err(e) = nomifun_extension::materialize_superpowers_baseline(data_dir).await {
+        warn!(
+            error = %e,
+            "failed to materialize superpowers baseline corpus (continuing without it)"
+        );
+    }
+
     let skip = std::env::var(nomifun_extension::BUILTIN_SKILLS_ENV_VAR)
         .map(|v| !v.is_empty())
         .unwrap_or(false);
