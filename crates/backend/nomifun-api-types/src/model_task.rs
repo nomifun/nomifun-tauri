@@ -95,6 +95,29 @@ impl ModelProfile {
     }
 }
 
+/// Request body for `POST /api/model-profiles` (upsert one profile).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelProfileUpsertRequest {
+    pub provider_id: String,
+    pub model: String,
+    #[serde(default)]
+    pub tasks: Vec<ModelTask>,
+    #[serde(default)]
+    pub traits: Vec<ModelTrait>,
+    #[serde(default)]
+    pub params: Option<serde_json::Value>,
+    /// Defaults to `User` when omitted (this endpoint is the user-edit path).
+    #[serde(default)]
+    pub source: Option<ProfileSource>,
+}
+
+/// Body identifying a single profile (`POST /api/model-profiles/delete`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelProfileKeyRequest {
+    pub provider_id: String,
+    pub model: String,
+}
+
 // --- Name/platform substring seeds (extend the model_capability.rs heuristic) ---
 
 /// Substrings implying text-to-speech. `whisper` is excluded (that's ASR).

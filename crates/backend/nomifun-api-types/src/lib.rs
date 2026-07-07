@@ -142,9 +142,10 @@ pub use mcp::{
 };
 pub use model_capability::{infer_generation_capabilities, infer_model_modalities};
 pub use dispatch_target::{resolve_dispatch_target, DispatchTarget, RequestShape};
-pub use model_catalog::{resolve_models, CatalogModelRef};
+pub use model_catalog::{resolve_models, CatalogModelRef, ResolveModelsRequest, ResolveModelsResponse};
 pub use model_task::{
-    derive_tasks_and_traits, ModelProfile, ModelTask, ModelTrait, ProfileSource,
+    derive_tasks_and_traits, ModelProfile, ModelProfileKeyRequest, ModelProfileUpsertRequest,
+    ModelTask, ModelTrait, ProfileSource,
 };
 pub use office::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DetectStarOfficeRequest,

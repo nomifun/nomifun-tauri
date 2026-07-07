@@ -7,14 +7,17 @@ use std::path::PathBuf;
 
 use nomifun_api_types::{
     ApiResponse, ClientPreferencesResponse, CreateProviderRequest, DetectProtocolRequest, FetchModelsAnonymousRequest,
-    FetchModelsRequest, FetchModelsResponse, ProtocolDetectionResponse, ProviderResponse, SystemInfoResponse,
-    SystemSettingsResponse, UpdateCheckRequest, UpdateCheckResult, UpdateClientPreferencesRequest,
-    UpdateProviderRequest, UpdateSettingsRequest, UpdateWorkDirRequest,
+    FetchModelsRequest, FetchModelsResponse, ModelProfile, ModelProfileKeyRequest,
+    ModelProfileUpsertRequest, ProtocolDetectionResponse, ProviderResponse, ResolveModelsRequest,
+    ResolveModelsResponse, SystemInfoResponse, SystemSettingsResponse, UpdateCheckRequest,
+    UpdateCheckResult, UpdateClientPreferencesRequest, UpdateProviderRequest, UpdateSettingsRequest,
+    UpdateWorkDirRequest,
 };
 use nomifun_common::AppError;
 
 use crate::client_pref::ClientPrefService;
 use crate::model_fetcher::ModelFetchService;
+use crate::model_profile::ModelProfileService;
 use crate::protocol::ProtocolDetectionService;
 use crate::provider::ProviderService;
 use crate::settings::SettingsService;
@@ -27,6 +30,7 @@ pub struct SystemRouterState {
     pub client_pref_service: ClientPrefService,
     pub provider_service: ProviderService,
     pub model_fetch_service: ModelFetchService,
+    pub model_profile_service: ModelProfileService,
     pub protocol_detection_service: ProtocolDetectionService,
     pub version_check_service: VersionCheckService,
     /// Data directory root — used to arm a factory reset (write the marker that
@@ -69,6 +73,10 @@ pub fn system_routes(state: SystemRouterState) -> Router {
         .route("/api/providers/fetch-models", post(fetch_models_anonymous))
         .route("/api/providers/{id}", delete(delete_provider).put(update_provider))
         .route("/api/providers/{id}/models", post(fetch_models))
+        // Multimodal model hub: authoritative per-model capability profiles.
+        .route("/api/model-profiles", get(list_model_profiles).post(upsert_model_profile))
+        .route("/api/model-profiles/delete", post(delete_model_profile))
+        .route("/api/model-profiles/resolve", post(resolve_model_profiles))
         .route("/api/system/info", get(get_system_info))
         .route("/api/system/check-update", post(check_update))
         .route("/api/system/factory-reset", post(factory_reset))
@@ -200,6 +208,52 @@ async fn detect_protocol(
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     let result = state.protocol_detection_service.detect_protocol(&req).await?;
     Ok(Json(ApiResponse::ok(result)))
+}
+
+// ===========================================================================
+// Model-profile handlers (multimodal model hub)
+// ===========================================================================
+
+async fn list_model_profiles(
+    State(state): State<SystemRouterState>,
+) -> Result<Json<ApiResponse<Vec<ModelProfile>>>, AppError> {
+    let profiles = state.model_profile_service.list().await?;
+    Ok(Json(ApiResponse::ok(profiles)))
+}
+
+async fn upsert_model_profile(
+    State(state): State<SystemRouterState>,
+    body: Result<Json<ModelProfileUpsertRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ModelProfile>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let profile = state.model_profile_service.upsert(req).await?;
+    Ok(Json(ApiResponse::ok(profile)))
+}
+
+async fn delete_model_profile(
+    State(state): State<SystemRouterState>,
+    body: Result<Json<ModelProfileKeyRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    state
+        .model_profile_service
+        .delete(&req.provider_id, &req.model)
+        .await?;
+    Ok(Json(ApiResponse::success()))
+}
+
+/// Resolve enabled models supporting a task (+ required traits) across all
+/// providers. Composes the provider list with stored profiles via the pure
+/// [`nomifun_api_types::resolve_models`] authority.
+async fn resolve_model_profiles(
+    State(state): State<SystemRouterState>,
+    body: Result<Json<ResolveModelsRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ResolveModelsResponse>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let providers = state.provider_service.list().await?;
+    let profiles = state.model_profile_service.list().await?;
+    let models = nomifun_api_types::resolve_models(&providers, &profiles, req.task, &req.required_traits);
+    Ok(Json(ApiResponse::ok(ResolveModelsResponse { models })))
 }
 
 // ===========================================================================

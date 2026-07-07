@@ -19,6 +19,20 @@ pub struct CatalogModelRef {
     pub model: String,
 }
 
+/// Request body for `POST /api/model-profiles/resolve`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveModelsRequest {
+    pub task: ModelTask,
+    #[serde(default)]
+    pub required_traits: Vec<ModelTrait>,
+}
+
+/// Response body for `POST /api/model-profiles/resolve`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolveModelsResponse {
+    pub models: Vec<CatalogModelRef>,
+}
+
 /// Whether a model (given its resolved tasks/traits) satisfies the query.
 fn matches(tasks: &[ModelTask], traits: &[ModelTrait], task: ModelTask, required: &[ModelTrait]) -> bool {
     tasks.contains(&task) && required.iter().all(|rt| traits.contains(rt))

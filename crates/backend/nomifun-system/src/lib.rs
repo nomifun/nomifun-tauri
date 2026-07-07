@@ -3,6 +3,7 @@ pub mod bedrock_probe;
 pub mod client_pref;
 pub mod model_classify;
 pub mod model_fetcher;
+pub mod model_profile;
 pub mod protocol;
 pub mod provider;
 pub mod provider_deletion;
@@ -15,6 +16,7 @@ pub use bedrock_probe::{ConnectionTestRouterState, ConnectionTestService, connec
 pub use client_pref::ClientPrefService;
 pub use model_classify::{ModelGenerationSuggestion, suggest_generation_capabilities};
 pub use model_fetcher::ModelFetchService;
+pub use model_profile::ModelProfileService;
 pub use protocol::ProtocolDetectionService;
 pub use provider::ProviderService;
 pub use provider_deletion::{ProviderDeletionCoordinator, SharedProviderDeletionCoordinator};

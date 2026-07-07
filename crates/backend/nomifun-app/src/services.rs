@@ -17,10 +17,11 @@ use nomifun_common::OnConversationDelete;
 use nomifun_conversation::runtime_state::ConversationRuntimeStateService;
 use nomifun_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, ICompanionTokenRepository,
-    IConversationRepository, IMcpServerRepository, IProviderRepository, IUserRepository,
-    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteCompanionTokenRepository,
-    SqliteConversationRepository, SqliteMcpServerRepository, SqliteProviderRepository,
-    SqliteRemoteAgentRepository, SqliteTerminalRepository, SqliteUserRepository,
+    IConversationRepository, IMcpServerRepository, IModelProfileRepository, IProviderRepository,
+    IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    SqliteCompanionTokenRepository, SqliteConversationRepository, SqliteMcpServerRepository,
+    SqliteModelProfileRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
+    SqliteTerminalRepository, SqliteUserRepository, UpsertModelProfileParams,
 };
 use nomifun_realtime::{BroadcastEventBus, WebSocketManager};
 use nomifun_terminal::{TerminalEventEmitter, TerminalLifecycleServer, TerminalService};
@@ -37,6 +38,8 @@ pub struct AppServices {
     pub companion_token_validator: Arc<CompanionTokenValidator>,
     /// Provider repository (exposed for the mint-time model-availability guard).
     pub provider_repo: Arc<dyn IProviderRepository>,
+    /// Authoritative per-model capability profiles (multimodal model hub).
+    pub model_profile_repo: Arc<dyn IModelProfileRepository>,
     pub cookie_config: Arc<CookieConfig>,
     pub qr_token_store: Arc<QrTokenStore>,
     pub ws_manager: Arc<WebSocketManager>,
@@ -193,6 +196,8 @@ impl AppServices {
 
         let remote_agent_repo = Arc::new(SqliteRemoteAgentRepository::new(database.pool().clone()));
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
+        let model_profile_repo: Arc<dyn IModelProfileRepository> =
+            Arc::new(SqliteModelProfileRepository::new(database.pool().clone()));
         // User-configured MCP servers — injected into ACP `session/new`
         // so the agent gets the operator's tools (ELECTRON-1JG fix).
         let mcp_server_repo: Arc<dyn IMcpServerRepository> =
@@ -654,6 +659,10 @@ impl AppServices {
         let provider_repo_for_services: Arc<dyn IProviderRepository> =
             provider_repo.clone() as Arc<dyn nomifun_db::IProviderRepository>;
 
+        // Seed authoritative capability profiles for any provider models that
+        // lack one (multimodal model hub). Best-effort: never blocks boot on error.
+        reconcile_model_profiles(&provider_repo_for_services, &model_profile_repo).await;
+
         let factory = build_agent_factory(AgentFactoryDeps {
             skill_manager: AcpSkillManager::new(skill_paths.clone()),
             remote_agent_repo,
@@ -735,6 +744,7 @@ impl AppServices {
             companion_token_repo,
             companion_token_validator,
             provider_repo: provider_repo_for_services,
+            model_profile_repo: model_profile_repo.clone(),
             cookie_config: Arc::new(CookieConfig::from_env()),
             qr_token_store: Arc::new(QrTokenStore::new()),
             ws_manager: Arc::new(WebSocketManager::new()),
@@ -766,6 +776,62 @@ impl AppServices {
             creation_service,
             knowledge_service,
         })
+    }
+}
+
+/// Ensure every provider model has an authoritative [`nomifun_db::ModelProfileRow`].
+/// Models without a stored profile are seeded from the name/platform heuristic
+/// (`source = "inferred"`); existing profiles (incl. user overrides) are left
+/// untouched. Best-effort — logs and returns on any error so boot never fails
+/// on profile reconciliation.
+async fn reconcile_model_profiles(
+    provider_repo: &Arc<dyn IProviderRepository>,
+    model_profile_repo: &Arc<dyn IModelProfileRepository>,
+) {
+    let providers = match provider_repo.list().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("model-profile reconcile: failed to list providers: {e}");
+            return;
+        }
+    };
+    let existing = model_profile_repo.list().await.unwrap_or_default();
+    let has_profile = |provider_id: &str, model: &str| {
+        existing
+            .iter()
+            .any(|r| r.provider_id == provider_id && r.model == model)
+    };
+
+    let mut seeded = 0usize;
+    for provider in &providers {
+        let models: Vec<String> = serde_json::from_str(&provider.models).unwrap_or_default();
+        for model in models {
+            if has_profile(&provider.id, &model) {
+                continue;
+            }
+            let (tasks, traits) =
+                nomifun_api_types::derive_tasks_and_traits(&provider.platform, &model);
+            let tasks_json = serde_json::to_string(&tasks).unwrap_or_else(|_| "[]".to_string());
+            let traits_json = serde_json::to_string(&traits).unwrap_or_else(|_| "[]".to_string());
+            if let Err(e) = model_profile_repo
+                .upsert(&UpsertModelProfileParams {
+                    provider_id: &provider.id,
+                    model: &model,
+                    tasks: &tasks_json,
+                    traits: &traits_json,
+                    params: "{}",
+                    source: "inferred",
+                })
+                .await
+            {
+                tracing::warn!("model-profile reconcile: upsert {}/{} failed: {e}", provider.id, model);
+            } else {
+                seeded += 1;
+            }
+        }
+    }
+    if seeded > 0 {
+        tracing::info!("model-profile reconcile: seeded {seeded} inferred profile(s)");
     }
 }
 
