@@ -389,6 +389,9 @@
   "minimap": {
     "searchAria": "Search conversation",
     "searchHint": "Click here to search keywords",
+    "locatorAria": "Open question history",
+    "locatorHint": "Question history",
+    "locatorItemAria": "Jump to question {{index}}",
     "empty": "No Q&A turns yet",
     "noMatch": "No matching content found",
     "count": "{{count}} turns"

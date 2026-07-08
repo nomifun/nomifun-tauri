@@ -50,6 +50,7 @@ import type { WriteFileResult } from './types';
 import { useAutoScroll } from './useAutoScroll';
 import { useAutoPreviewOfficeFiles } from '@/renderer/hooks/file/useAutoPreviewOfficeFiles';
 import SelectionReplyButton from './components/SelectionReplyButton';
+import ConversationQuestionLocator from '../components/ConversationTitleMinimap/ConversationQuestionLocator';
 import {
   assignTurnIdsFromUserRequests,
   buildTurnDisclosureItems,
@@ -525,8 +526,8 @@ const buildProcessReceiptSummary = (
 };
 
 const highlightStyle: React.CSSProperties = {
-  backgroundColor: 'var(--color-aou-1)',
-  boxShadow: '0 0 0 1px var(--color-aou-6-brand) inset',
+  backgroundColor: 'var(--aou-1)',
+  boxShadow: '0 0 0 1px var(--aou-6) inset',
   borderRadius: '12px',
 };
 
@@ -1142,6 +1143,8 @@ const MessageList: React.FC<{
 
   return (
     <div className='relative flex-1 h-full'>
+      <ConversationQuestionLocator conversation_id={conversationContext?.conversation_id} />
+
       {/* Use PreviewGroup to wrap all messages for cross-message image preview */}
       <Image.PreviewGroup actionsLayout={['zoomIn', 'zoomOut', 'originalSize', 'rotateLeft', 'rotateRight']}>
         <ImagePreviewContext.Provider value={{ inPreviewGroup: true }}>

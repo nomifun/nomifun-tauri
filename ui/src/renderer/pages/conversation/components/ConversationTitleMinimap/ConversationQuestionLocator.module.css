@@ -1,0 +1,164 @@
+.root {
+  position: absolute;
+  left: 16px;
+  top: 50%;
+  z-index: 35;
+  display: flex;
+  min-width: 44px;
+  align-items: center;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+
+.track {
+  display: flex;
+  width: 32px;
+  max-height: min(44vh, 220px);
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 7px;
+  overflow-y: auto;
+  padding: 10px 0;
+  pointer-events: auto;
+  scrollbar-width: none;
+}
+
+.track::-webkit-scrollbar {
+  display: none;
+}
+
+.bar {
+  display: flex;
+  width: 32px;
+  height: 8px;
+  align-items: center;
+  justify-content: flex-start;
+  cursor: pointer;
+  border: 0;
+  background: transparent;
+  outline: none;
+  padding: 0;
+}
+
+.barLine {
+  display: block;
+  width: 14px;
+  height: 2px;
+  border-radius: 999px;
+  background: var(--color-text-4);
+  opacity: 0.72;
+  transition:
+    width 0.14s cubic-bezier(0.2, 0.8, 0.2, 1),
+    background-color 0.14s ease,
+    opacity 0.14s ease;
+}
+
+.bar:hover .barLine,
+.bar:focus-visible .barLine,
+.barActive .barLine {
+  width: 28px;
+  background: var(--color-text-1);
+  opacity: 0.96;
+}
+
+.bar:focus-visible .barLine {
+  box-shadow: 0 0 0 2px color-mix(in srgb, rgb(var(--primary-6)) 26%, transparent);
+}
+
+.previewCard {
+  position: absolute;
+  left: 46px;
+  top: 50%;
+  box-sizing: border-box;
+  display: flex;
+  width: max-content;
+  min-width: 260px;
+  max-width: min(520px, calc(100vw - 128px));
+  max-height: min(180px, 46vh);
+  flex-direction: column;
+  gap: 6px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--color-border-2) 82%, transparent);
+  border-radius: 18px;
+  background: var(--color-bg-2);
+  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.14), 0 1px 7px rgba(15, 23, 42, 0.06);
+  color: inherit;
+  cursor: pointer;
+  opacity: 0;
+  padding: 12px 16px;
+  pointer-events: none;
+  text-align: left;
+  transform: translate(-10px, -50%) scale(0.985);
+  transform-origin: left center;
+  transition:
+    opacity 0.14s ease,
+    transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1),
+    box-shadow 0.16s ease;
+  will-change: opacity, transform;
+}
+
+.root:hover .previewCard,
+.root:focus-within .previewCard {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translate(0, -50%) scale(1);
+}
+
+.previewCard:hover,
+.previewCard:focus-visible {
+  box-shadow: 0 14px 34px rgba(15, 23, 42, 0.16), 0 2px 9px rgba(15, 23, 42, 0.07);
+  outline: none;
+}
+
+.previewTitle {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--color-text-1);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 20px;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.previewExcerpt {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--color-text-3);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 20px;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+@media (max-width: 767px) {
+  .root {
+    display: none;
+  }
+}
+
+@media (max-height: 520px) {
+  .root {
+    top: 46%;
+  }
+
+  .previewCard {
+    padding: 10px 14px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .barLine,
+  .previewCard {
+    transition: none;
+  }
+
+  .root:hover .previewCard,
+  .root:focus-within .previewCard {
+    transform: translate(0, -50%) scale(1);
+  }
+}

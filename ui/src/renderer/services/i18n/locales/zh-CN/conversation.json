@@ -389,6 +389,9 @@
   "minimap": {
     "searchAria": "搜索会话",
     "searchHint": "点击这里搜索关键词",
+    "locatorAria": "打开提问历史",
+    "locatorHint": "提问历史",
+    "locatorItemAria": "跳转到第 {{index}} 个提问",
     "empty": "暂无问答内容",
     "noMatch": "未找到匹配内容",
     "count": "{{count}} 条"
