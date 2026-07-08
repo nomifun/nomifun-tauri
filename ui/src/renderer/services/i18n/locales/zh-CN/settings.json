@@ -304,6 +304,19 @@
   "about": "关于",
   "advancedSettings": "高级设置",
   "addModel": "添加模型",
+  "modelModality": "模态能力",
+  "modelModalityTip": "声明该模型能做什么——探测与调用据此选择正确的端点",
+  "modelVisionInput": "支持图片输入（视觉）",
+  "modelTask": {
+    "chat": "对话",
+    "image_generation": "图像生成",
+    "image_edit": "图像编辑",
+    "video_generation": "视频生成",
+    "speech_synthesis": "语音合成 (TTS)",
+    "speech_recognition": "语音识别 (ASR)",
+    "embedding": "向量 (Embedding)",
+    "rerank": "重排 (Rerank)"
+  },
   "editModel": "编辑模型平台",
   "modelPlatform": "模型平台",
   "modelProvider": "模型供应商",
@@ -1184,11 +1197,27 @@
     "railTitle": "模型&Agent",
     "sectionAgents": "Agents",
     "sectionModels": "模型",
+    "sectionCreation": "创作模型",
     "sectionGlobal": "全局模型配置",
     "globalConfigTip": "IDMM、旁路模型、记忆总结、伙伴对话等全局默认模型对话配置入口。",
     "idmmTab": "IDMM 默认配置",
     "failoverTab": "故障转移队列",
-    "activityTab": "决策活动"
+    "activityTab": "决策活动",
+    "creation": {
+      "title": "创作模型",
+      "note": "创意工坊按模型名自动识别图像/视频生成能力,作为建议默认值。若某平台模型未被识别,可在下方将整个平台标记为对应能力。",
+      "filterAll": "全部",
+      "filterImage": "图像生成",
+      "filterVideo": "视频生成",
+      "capImage": "图像生成",
+      "capVideo": "视频生成",
+      "modelCount": "{{count}} 个模型",
+      "markAs": "标记为",
+      "markHint": "将该平台下所有已启用模型标记为具备此生成能力(覆盖自动识别结果)。",
+      "empty": "暂无创作模型",
+      "emptyHint": "已配置的模型里没有识别到图像/视频生成模型。可为对应平台添加生成类模型,或用上方标记按钮手动标注。",
+      "emptyNoProviders": "尚未配置任何模型平台。请先在「模型」中添加平台与模型。"
+    }
   },
   "otherHub": {
     "title": "其他",

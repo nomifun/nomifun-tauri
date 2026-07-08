@@ -45,6 +45,21 @@ pub struct GatewayDeps {
     /// IDMM supervision config (same instance as `/api/idmm` so save also
     /// arms/stops the live supervisor).
     pub idmm_service: Arc<IdmmService>,
+    /// 创意工坊 (Creative Workshop) canvas index — backs the read-only
+    /// `nomi_workshop_list_canvases` capability. Main-db rows only (the canvas
+    /// bodies live on disk in the workshop service); the same table the
+    /// `/api/workshop/*` routes read.
+    pub workshop_repo: Arc<dyn nomifun_db::IWorkshopRepository>,
+    /// 创意工坊 canvas/asset service — the SAME singleton the `/api/workshop/*`
+    /// routes use (so the 画布助手 agent-op queue is shared: the gateway enqueues
+    /// while an open frontend polls/acks the SAME in-memory queue). Backs
+    /// `nomi_workshop_get_canvas` / `nomi_workshop_list_assets` /
+    /// `nomi_workshop_apply_ops`.
+    pub workshop_service: Arc<nomifun_workshop::WorkshopService>,
+    /// 生成引擎 (creation) media task queue — the SAME singleton the
+    /// `/api/creation/*` routes use. Backs `nomi_workshop_generate` /
+    /// `nomi_workshop_get_task` (submit + inspect generation tasks).
+    pub creation_service: Arc<nomifun_creation::CreationService>,
     /// Knowledge base registry + bindings (same instance the conversation
     /// service mounts from at task start).
     pub knowledge_service: Arc<KnowledgeService>,

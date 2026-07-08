@@ -283,6 +283,7 @@ async fn agent_provider_health_check(
     let req = ProviderHealthCheckRequest {
         provider_id: p.provider_id,
         model: p.model,
+        task: None,
     };
     match deps.agent_service.provider_health_check(req).await {
         Ok(resp) => ok(resp),

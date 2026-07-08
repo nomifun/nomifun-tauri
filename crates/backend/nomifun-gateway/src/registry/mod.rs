@@ -80,6 +80,7 @@ impl Registry {
         crate::caps_files::register(&mut caps);
         crate::caps_mcp::register(&mut caps);
         crate::caps_agent::register(&mut caps);
+        crate::caps_workshop::register(&mut caps);
         #[cfg(feature = "browser-use")]
         crate::caps_browser::register(&mut caps);
         #[cfg(feature = "computer-use")]

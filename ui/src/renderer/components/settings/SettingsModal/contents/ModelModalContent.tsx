@@ -42,6 +42,7 @@ import { isNewApiPlatform, NEW_API_PROTOCOL_OPTIONS } from '@/renderer/utils/mod
 import EditModeModal from '@/renderer/pages/settings/components/EditModeModal';
 import NomiScrollArea from '@/renderer/components/base/NomiScrollArea';
 import { useProvidersQuery } from '@/renderer/hooks/agent/useModelProviderList';
+import { useModelProfiles } from '@/renderer/hooks/agent/useModelProfiles';
 import { useContainerWidth } from '@/renderer/hooks/ui/useContainerWidth';
 import { useSettingsViewMode } from '../settingsViewContext';
 import { consumePendingDeepLink } from '@/renderer/hooks/system/useDeepLink';
@@ -369,6 +370,7 @@ const ModelModalContent: React.FC = () => {
   const [collapseKey, setCollapseKey] = useState<Record<string, boolean>>({});
   const [healthCheckLoading, setHealthCheckLoading] = useState<Record<string, boolean>>({});
   const { data, mutate } = useProvidersQuery();
+  const { profileFor } = useModelProfiles();
   const [message, messageContext] = useArcoMessage();
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
@@ -956,6 +958,21 @@ const ModelModalContent: React.FC = () => {
                                 <span className='text-14px text-t-primary min-w-0 truncate' title={model}>
                                   {model}
                                 </span>
+
+                                {/* 模态徽章 / Modality badges — non-chat tasks (image/tts/asr/...) surfaced. */}
+                                {(profileFor(platform.id, model)?.tasks ?? [])
+                                  .filter((tk) => tk !== 'chat')
+                                  .map((tk) => (
+                                    <Tag
+                                      key={tk}
+                                      size='small'
+                                      color='purple'
+                                      bordered
+                                      className='shrink-0 select-none'
+                                    >
+                                      {t(`settings.modelTask.${tk}`)}
+                                    </Tag>
+                                  ))}
 
                                 {/* New API 协议标签（点击循环切换）/ New API protocol badge (click to cycle) */}
                                 {isNewApiProvider && (

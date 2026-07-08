@@ -179,6 +179,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn string_session_id_is_usable_after_schema_coercion() {
+        let store = Arc::new(ProcessStore::new());
+        let tool = WriteStdinTool::new(store);
+        let input = crate::coerce_input_to_schema(
+            &tool.input_schema(),
+            serde_json::json!({"session_id": "4242", "yield_time_ms": "5000"}),
+        );
+
+        assert_eq!(input["session_id"].as_u64(), Some(4242));
+        assert_eq!(input["yield_time_ms"].as_u64(), Some(5000));
+
+        let r = tool.execute(input).await;
+        assert!(r.is_error, "unknown session must error: {}", r.content);
+        assert!(
+            r.content.contains("unknown or finished session_id=4242"),
+            "coerced string id should be parsed as the numeric session id: {}",
+            r.content
+        );
+    }
+
+    #[tokio::test]
     async fn missing_session_id_is_error() {
         let store = Arc::new(ProcessStore::new());
         let tool = WriteStdinTool::new(store);

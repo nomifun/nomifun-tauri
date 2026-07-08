@@ -30,6 +30,12 @@ nomifun-db.workspace = true
 nomifun-terminal.workspace = true
 nomifun-idmm.workspace = true
 nomifun-knowledge.workspace = true
+# 创意工坊 (Creative Workshop): canvas/asset service (read canvas state + apply
+# agent ops) and the 生成引擎 (creation) task queue (trigger/inspect generation).
+# Both back the caps_workshop 画布助手 tools. Dependency direction gateway →
+# workshop / creation only (neither deps gateway — no cycle).
+nomifun-workshop.workspace = true
+nomifun-creation.workspace = true
 # 助手 (assistants) service: caps_orchestrator folds each ENABLED assistant's
 # persona/skills/model into the run's fleet snapshot (P4 Task 2). Dependency
 # direction gateway → nomifun-assistant only (no cycle — assistant does not dep gateway).

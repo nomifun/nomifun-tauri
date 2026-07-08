@@ -1,0 +1,63 @@
+{
+  "title": "创意工坊",
+  "subtitle": "在一张无限画布上，用节点与连线组织素材与 AI 生成，图片、视频、文本自由混排创作。",
+  "nav": {
+    "entry": "创意工坊"
+  },
+  "list": {
+    "searchPlaceholder": "搜索画布...",
+    "newCanvas": "新建画布",
+    "createFirst": "新建第一张画布",
+    "loadError": "加载失败",
+    "retry": "重试",
+    "filterEmpty": "没有匹配的画布",
+    "empty": {
+      "title": "还没有画布",
+      "desc": "创建一张无限画布，开始你的 AI 视觉创作。"
+    },
+    "card": {
+      "nodeCount": "{{count}} 个节点",
+      "updatedAt": "{{time}} 更新",
+      "thumbAlt": "画布缩略图",
+      "open": "打开",
+      "rename": "重命名",
+      "delete": "删除"
+    }
+  },
+  "actions": {
+    "createFailed": "创建失败",
+    "renameOk": "已重命名",
+    "renameFailed": "重命名失败",
+    "deleteOk": "画布已删除",
+    "deleteFailed": "删除失败",
+    "deleteConfirmTitle": "删除画布",
+    "deleteConfirmContent": "确定删除「{{title}}」吗？此操作不可撤销。"
+  },
+  "rename": {
+    "title": "重命名画布",
+    "label": "画布名称",
+    "placeholder": "输入画布名称",
+    "required": "请输入画布名称"
+  },
+  "editor": {
+    "back": "返回",
+    "backToList": "返回画布列表",
+    "renameHint": "点击重命名",
+    "saved": "已保存",
+    "saving": "保存中...",
+    "saveFailed": "保存失败",
+    "loadError": "画布加载失败",
+    "retry": "重试",
+    "nodeCount": "{{count}} 个节点",
+    "canvasComingSoon": "画布编辑器即将上线",
+    "canvasComingSoonDesc": "无限画布交互（平移 / 缩放 / 节点 / 连线）将在此呈现。"
+  },
+  "time": {
+    "justNow": "刚刚",
+    "minutesAgo": "{{count}} 分钟前",
+    "hoursAgo": "{{count}} 小时前",
+    "yesterday": "昨天",
+    "daysAgo": "{{count}} 天前",
+    "weeksAgo": "上周"
+  }
+}

@@ -28,6 +28,9 @@ const PublicCompanionRosterPage = React.lazy(() => import('@renderer/pages/publi
 const PublicAgentDetailPage = React.lazy(() => import('@renderer/pages/publicCompanion/PublicAgentDetailPage'));
 const KnowledgeListPage = React.lazy(() => import('@renderer/pages/knowledge/KnowledgeListPage'));
 const KnowledgeDetailPage = React.lazy(() => import('@renderer/pages/knowledge/KnowledgeDetailPage'));
+const WorkshopListPage = React.lazy(() => import('@renderer/pages/workshop'));
+const WorkshopCanvasPage = React.lazy(() => import('@renderer/pages/workshop/CanvasPage'));
+const AssetLibraryPage = React.lazy(() => import('@renderer/pages/assets'));
 const CompanionPage = React.lazy(() => import('@renderer/pages/companion'));
 const ConversationShell = React.lazy(() => import('@renderer/pages/conversation/components/ConversationShell'));
 
@@ -224,6 +227,11 @@ const PanelRoute: React.FC<{ layout: React.ReactElement }> = ({ layout }) => {
           <Route path='/public-companions/:id' element={withRouteFallback(PublicAgentDetailPage)} />
           <Route path='/knowledge' element={withRouteFallback(KnowledgeListPage)} />
           <Route path='/knowledge/:id' element={withRouteFallback(KnowledgeDetailPage)} />
+          {/* 资产库 (Asset Library) — platform-level management of workshop assets. */}
+          <Route path='/assets' element={withRouteFallback(AssetLibraryPage)} />
+          {/* 创意工坊 (Creative Workshop) — infinite-canvas AI visual creation. */}
+          <Route path='/workshop' element={withRouteFallback(WorkshopListPage)} />
+          <Route path='/workshop/:id' element={withRouteFallback(WorkshopCanvasPage)} />
         </Route>
         <Route path='*' element={<Navigate to={status === 'authenticated' ? '/guid' : '/login'} replace />} />
       </Routes>

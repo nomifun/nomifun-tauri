@@ -1,0 +1,200 @@
+{
+  "background": {
+    "dots": "Dots",
+    "lines": "Lines",
+    "blank": "Blank"
+  },
+  "toolbar": {
+    "undo": "Undo (Ctrl+Z)",
+    "redo": "Redo (Ctrl+Shift+Z)",
+    "background": "Background: {{style}}",
+    "addNode": "Add node",
+    "assets": "Asset library (A)",
+    "help": "Keyboard shortcuts (?)"
+  },
+  "zoom": {
+    "out": "Zoom out",
+    "in": "Zoom in",
+    "slider": "Zoom",
+    "reset": "Reset to 100%",
+    "fit": "Fit view"
+  },
+  "menu": {
+    "newNode": "New node here",
+    "image": "Image",
+    "imageUpload": "Upload image",
+    "text": "Text",
+    "video": "Video",
+    "videoUpload": "Upload video",
+    "generator": "Generator card",
+    "flowNodes": "Flow nodes",
+    "loop": "Loop node",
+    "compare": "Compare node",
+    "output": "Output node",
+    "compareUpstream": "Compare with upstream",
+    "duplicate": "Duplicate",
+    "delete": "Delete",
+    "deleteEdge": "Delete edge",
+    "paste": "Paste"
+  },
+  "toast": {
+    "uploadFailed": "Upload failed",
+    "savedToLibrary": "Saved to asset library",
+    "saveToLibraryFailed": "Failed to save to library",
+    "downloadFailed": "Download failed",
+    "maskDeferred": "Inpainting becomes available once the generator card is wired up",
+    "groupNeedTwo": "Select at least two groupable nodes",
+    "noUpstreamImage": "This image has no upstream image source to compare"
+  },
+  "preview": {
+    "zoomIn": "Zoom in",
+    "zoomOut": "Zoom out",
+    "download": "Download",
+    "close": "Close",
+    "prev": "Previous",
+    "next": "Next",
+    "loadFailed": "Failed to load image"
+  },
+  "shortcuts": {
+    "title": "Shortcuts",
+    "close": "Close",
+    "k": {
+      "pan": "Left / middle drag",
+      "zoom": "Scroll",
+      "boxSelect": "Ctrl/⌘ + drag",
+      "addSelect": "Shift / Ctrl + click",
+      "selectAll": "Ctrl/⌘ + A",
+      "copy": "Ctrl/⌘ + C",
+      "paste": "Ctrl/⌘ + V",
+      "duplicate": "Ctrl/⌘ + D",
+      "group": "Ctrl/⌘ + G",
+      "ungroup": "Ctrl/⌘ + Shift + G",
+      "delete": "Delete / Backspace",
+      "undo": "Ctrl/⌘ + Z",
+      "redo": "Ctrl/⌘ + Shift + Z / Ctrl + Y",
+      "assets": "A",
+      "escape": "Esc",
+      "connect": "Drag the right anchor"
+    },
+    "d": {
+      "pan": "Pan the canvas",
+      "zoom": "Zoom anchored at the cursor",
+      "boxSelect": "Box select",
+      "addSelect": "Add / toggle selection",
+      "selectAll": "Select all",
+      "copy": "Copy nodes",
+      "paste": "Paste (incl. system clipboard image / text)",
+      "duplicate": "Duplicate",
+      "group": "Group",
+      "ungroup": "Ungroup",
+      "delete": "Delete selected nodes or edges",
+      "undo": "Undo",
+      "redo": "Redo",
+      "assets": "Open / close asset library",
+      "escape": "Clear selection / close overlays",
+      "connect": "Connect; drop on empty space to quick-create"
+    }
+  },
+  "node": {
+    "delete": "Delete",
+    "comingSoon": "Coming soon",
+    "kind": {
+      "loop": "Loop node",
+      "compare": "Compare node",
+      "output": "Output node",
+      "group": "Group"
+    },
+    "image": {
+      "emptyTitle": "Upload image",
+      "emptyHint": "Click to choose, or drop an image here",
+      "loadFailed": "Failed to load image",
+      "preview": "Preview",
+      "download": "Download",
+      "saveToLibrary": "Save to library",
+      "aspectLock": "Lock aspect ratio",
+      "aspectFree": "Free aspect ratio",
+      "edit": {
+        "label": "Edit",
+        "crop": "Crop",
+        "split": "Grid split",
+        "upscale": "Upscale",
+        "mask": "Inpaint"
+      }
+    },
+    "text": {
+      "placeholder": "Type text…",
+      "empty": "Double-click to edit",
+      "smaller": "Decrease font size",
+      "larger": "Increase font size"
+    },
+    "video": {
+      "emptyTitle": "Upload video",
+      "emptyHint": "Click to choose, or drop a video here",
+      "loadFailed": "Failed to load video",
+      "download": "Download",
+      "saveToLibrary": "Save to library"
+    },
+    "generator": {
+      "title": "{{mode}} generation",
+      "promptEmpty": "No prompt yet",
+      "results": "{{count}} result(s)",
+      "configure": "Configure",
+      "comingSoonHint": "Generation is coming soon (M7)",
+      "mode": {
+        "image": "Image",
+        "text": "Text",
+        "video": "Video"
+      },
+      "status": {
+        "idle": "Not configured",
+        "queued": "Queued",
+        "running": "Generating",
+        "success": "Done",
+        "error": "Error"
+      }
+    },
+    "loop": {
+      "title": "Loop",
+      "noTarget": "Drag the right anchor to a generator card",
+      "noModel": "The target card has no usable model",
+      "count": "Rounds",
+      "start": "Start",
+      "batch": "Batch",
+      "template": "Count injection",
+      "templatePlaceholder": "Generating image {i}",
+      "previewLabel": "This round",
+      "success": "OK",
+      "failed": "Failed",
+      "done": "Done",
+      "run": "Run loop",
+      "stop": "Stop",
+      "mode": {
+        "serial": "Serial",
+        "parallel": "Parallel"
+      },
+      "targetMode": {
+        "image": "Image gen",
+        "video": "Video gen",
+        "text": "Text gen"
+      }
+    },
+    "compare": {
+      "title": "Compare",
+      "divider": "Compare divider",
+      "needTwo": "Wire two image sources to compare ({{n}}/2)"
+    },
+    "output": {
+      "title": "Output preview",
+      "empty": "Wire a node into the left to inspect its current result",
+      "preview": "Open preview",
+      "textUpstream": "(upstream text node)",
+      "loadFailed": "Failed to load"
+    },
+    "group": {
+      "defaultTitle": "Group",
+      "ungroup": "Ungroup (keep members)",
+      "deleteWithChildren": "Delete group & members",
+      "rename": "Rename group"
+    }
+  }
+}

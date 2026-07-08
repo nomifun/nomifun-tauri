@@ -1,0 +1,78 @@
+{
+  "card": {
+    "title": "生成卡片"
+  },
+  "mode": {
+    "image": "图像",
+    "video": "视频",
+    "text": "文本"
+  },
+  "status": {
+    "idle": "空闲",
+    "queued": "排队中",
+    "running": "生成中",
+    "success": "完成",
+    "error": "失败"
+  },
+  "model": {
+    "placeholder": "选择模型",
+    "search": "搜索模型…",
+    "emptyNoMatch": "没有匹配的模型",
+    "emptyNoProviders": "尚未配置模型平台",
+    "goToHub": "前往模型中心"
+  },
+  "prompt": {
+    "placeholder": "描述你想生成的内容，输入 @ 引用素材…"
+  },
+  "mention": {
+    "title": "引用素材",
+    "onCanvas": "画布",
+    "inLibrary": "资产库",
+    "assetLabel": "资产库素材",
+    "missing": "已失效",
+    "remove": "移除引用"
+  },
+  "input": {
+    "upstream": "上游连线"
+  },
+  "param": {
+    "size": "尺寸",
+    "count": "数量",
+    "quality": "质量",
+    "duration": "时长",
+    "seconds": "秒",
+    "resolution": "分辨率",
+    "aspect": "比例",
+    "audio": "生成声音",
+    "watermark": "添加水印"
+  },
+  "size": {
+    "square": "1:1",
+    "landscape43": "4:3",
+    "portrait34": "3:4",
+    "wide169": "16:9",
+    "tall916": "9:16",
+    "twoK": "2K",
+    "fourK": "4K"
+  },
+  "quality": {
+    "auto": "自动",
+    "high": "高",
+    "medium": "中",
+    "low": "低"
+  },
+  "run": {
+    "run": "生成",
+    "regenerate": "重新生成",
+    "cancel": "取消",
+    "noModel": "请先选择模型"
+  },
+  "result": {
+    "continuePlaceholder": "继续编辑：输入指令回车…",
+    "continue": "继续编辑",
+    "loading": "加载中…",
+    "loadFailed": "加载失败",
+    "toTextNode": "转为文本节点",
+    "batch": "{{count}} 张"
+  }
+}

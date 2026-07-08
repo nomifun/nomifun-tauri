@@ -30,9 +30,16 @@ import autowork from './autowork.json';
 import nomi from './nomi.json';
 import knowledge from './knowledge.json';
 import publicCompanion from './publicCompanion.json';
+import assetLibrary from './assetLibrary.json';
 import sessionList from './sessionList.json';
 import modelFailover from './modelFailover.json';
 import orchestrator from './orchestrator.json';
+import workshop from './workshop.json';
+import workshopCanvas from './workshopCanvas.json';
+import workshopAssets from './workshopAssets.json';
+import workshopEditor from './workshopEditor.json';
+import workshopGeneration from './workshopGeneration.json';
+import workshopAssistant from './workshopAssistant.json';
 
 export default {
   common,
@@ -62,7 +69,14 @@ export default {
   nomi,
   knowledge,
   publicCompanion,
+  assetLibrary,
   sessionList,
   modelFailover,
   orchestrator,
+  workshop,
+  workshopCanvas,
+  workshopAssets,
+  workshopEditor,
+  workshopGeneration,
+  workshopAssistant,
 };

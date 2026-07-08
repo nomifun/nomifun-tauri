@@ -304,6 +304,19 @@
   "about": "About",
   "advancedSettings": "Advanced Settings",
   "addModel": "Add Model",
+  "modelModality": "Modality",
+  "modelModalityTip": "Declare what this model does — probing and calls pick the correct endpoint from this.",
+  "modelVisionInput": "Accepts image input (vision)",
+  "modelTask": {
+    "chat": "Chat",
+    "image_generation": "Image Generation",
+    "image_edit": "Image Editing",
+    "video_generation": "Video Generation",
+    "speech_synthesis": "Speech Synthesis (TTS)",
+    "speech_recognition": "Speech Recognition (ASR)",
+    "embedding": "Embedding",
+    "rerank": "Rerank"
+  },
   "editModel": "Edit Model Platform",
   "modelPlatform": "Model Platform",
   "modelProvider": "Model Provider",
@@ -1183,11 +1196,27 @@
     "railTitle": "Model & Agent",
     "sectionAgents": "Agents",
     "sectionModels": "Models",
+    "sectionCreation": "Creation Models",
     "sectionGlobal": "Global Model Config",
     "globalConfigTip": "Global default model settings for IDMM, the bypass model, memory summarization, and companion chat.",
     "idmmTab": "IDMM Defaults",
     "failoverTab": "Failover Queue",
-    "activityTab": "Decision Activity"
+    "activityTab": "Decision Activity",
+    "creation": {
+      "title": "Creation Models",
+      "note": "The Creative Workshop detects image/video generation from the model name as a suggested default. If a platform's model isn't recognized, mark the whole platform with the capability below.",
+      "filterAll": "All",
+      "filterImage": "Image",
+      "filterVideo": "Video",
+      "capImage": "Image Gen",
+      "capVideo": "Video Gen",
+      "modelCount": "{{count}} models",
+      "markAs": "Mark as",
+      "markHint": "Mark every enabled model under this platform as having this generation capability (overrides auto-detection).",
+      "empty": "No creation models",
+      "emptyHint": "No image/video generation models were detected among your configured models. Add generation models to a platform, or mark one with the buttons above.",
+      "emptyNoProviders": "No model platforms configured yet. Add a platform and models under \"Models\" first."
+    }
   },
   "otherHub": {
     "title": "Other",

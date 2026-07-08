@@ -15,6 +15,7 @@ nomifun-knowledge.workspace = true
 nomifun-terminal.workspace = true
 nomifun-api-types.workspace = true
 nomifun-net.workspace = true
+reqwest.workspace = true
 axum.workspace = true
 base64.workspace = true
 tokio.workspace = true

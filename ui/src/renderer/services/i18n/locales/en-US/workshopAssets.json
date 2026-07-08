@@ -1,0 +1,125 @@
+{
+  "title": "Asset Library",
+  "subtitle": "Upload, organize and reuse your image, video and text material.",
+  "close": "Close",
+  "search": {
+    "placeholder": "Search assets..."
+  },
+  "kind": {
+    "all": "All",
+    "image": "Images",
+    "video": "Videos",
+    "text": "Text"
+  },
+  "collection": {
+    "all": "All collections",
+    "ungrouped": "Ungrouped",
+    "trigger": "Collection"
+  },
+  "upload": {
+    "button": "Upload",
+    "dropTitle": "Drop to upload",
+    "dropDesc": "Drop images or videos here to add them to the library",
+    "cancel": "Cancel upload",
+    "failed": "Upload failed",
+    "tooLarge": "File too large (64MB max)",
+    "aborted": "Canceled",
+    "clearDone": "Clear finished",
+    "queue": "Upload queue"
+  },
+  "newText": {
+    "button": "Text",
+    "title": "New Text Asset",
+    "titleLabel": "Title",
+    "titlePlaceholder": "Name this snippet",
+    "contentLabel": "Content",
+    "contentPlaceholder": "Enter the text — great for saving reusable prompts",
+    "collectionLabel": "Collection",
+    "collectionPlaceholder": "Pick or type a collection (optional)",
+    "titleRequired": "Please enter a title",
+    "contentRequired": "Please enter some content",
+    "created": "Text asset created",
+    "createFailed": "Creation failed",
+    "submit": "Create",
+    "cancel": "Cancel"
+  },
+  "card": {
+    "insert": "Insert into canvas",
+    "edit": "Edit",
+    "delete": "Delete",
+    "download": "Download",
+    "select": "Select",
+    "video": "Video",
+    "textFallback": "Empty text"
+  },
+  "detail": {
+    "title": "Asset Details",
+    "insert": "Insert into canvas",
+    "edit": "Edit",
+    "delete": "Delete",
+    "download": "Download",
+    "copyText": "Copy text",
+    "copiedText": "Text copied",
+    "prev": "Previous",
+    "next": "Next",
+    "kind": "Type",
+    "collection": "Collection",
+    "tags": "Tags",
+    "dimensions": "Dimensions",
+    "size": "Size",
+    "createdAt": "Created",
+    "noTags": "No tags",
+    "ungrouped": "Ungrouped",
+    "origin": {
+      "title": "Provenance",
+      "prompt": "Prompt",
+      "model": "Model",
+      "provider": "Provider",
+      "params": "Parameters",
+      "copyPrompt": "Copy prompt",
+      "copied": "Prompt copied"
+    }
+  },
+  "edit": {
+    "title": "Edit Asset",
+    "titleLabel": "Title",
+    "titlePlaceholder": "Enter a title",
+    "collectionLabel": "Collection",
+    "collectionPlaceholder": "Pick or type a collection (e.g. character / scene)",
+    "tagsLabel": "Tags",
+    "tagsPlaceholder": "Type a tag and press Enter",
+    "removeFromLibrary": "Remove from library",
+    "removeFromLibraryHint": "The asset stays on the canvas but no longer shows in the library.",
+    "save": "Save",
+    "cancel": "Cancel",
+    "saved": "Saved",
+    "removed": "Removed from library",
+    "saveFailed": "Save failed",
+    "titleRequired": "Please enter a title"
+  },
+  "delete": {
+    "confirmTitle": "Delete asset",
+    "confirmContent": "Delete \"{{title}}\"? The file will be permanently removed and cannot be undone.",
+    "ok": "Delete",
+    "cancel": "Cancel",
+    "done": "Asset deleted",
+    "failed": "Delete failed"
+  },
+  "empty": {
+    "title": "Your library is empty",
+    "desc": "Upload images or videos, or create a text asset to start collecting material.",
+    "uploadCta": "Upload material",
+    "newTextCta": "New text",
+    "filterTitle": "No matching assets",
+    "filterDesc": "Try a different keyword or filter.",
+    "clearFilters": "Clear filters"
+  },
+  "count": {
+    "total": "{{count}} items",
+    "loadingMore": "Loading...",
+    "end": "You've reached the end"
+  },
+  "insertOk": "Inserted into canvas",
+  "loadError": "Failed to load assets",
+  "retry": "Retry"
+}

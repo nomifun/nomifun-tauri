@@ -1,0 +1,37 @@
+[package]
+name = "nomifun-workshop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nomifun-common.workspace = true
+nomifun-api-types.workspace = true
+nomifun-auth.workspace = true
+nomifun-db.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# JSON Schema for the agent-op vocabulary (画布助手): the same `AgentOp` type the
+# gateway's `nomi_workshop_apply_ops` capability exposes to LLMs (single source →
+# no schema/validation drift). Same major as the gateway's `schemars = "1"`.
+schemars = "1"
+tokio.workspace = true
+axum.workspace = true
+# `RequestBodyLimitLayer` for the asset-upload route (raise past the app default).
+tower-http.workspace = true
+tracing.workspace = true
+# MIME detection for uploaded assets (by filename) + serve Content-Type.
+mime_guess.workspace = true
+# Thumbnail decode/encode. The workspace pins `image` with only the `png`
+# feature (computer-use); a workshop upload can be any of png/jpeg/gif/webp and
+# thumbnails are re-encoded as JPEG, so we ADD those codec features here (unioned
+# with the workspace's `png`, `default-features = false` inherited). No root
+# Cargo.toml change.
+image = { workspace = true, features = ["jpeg", "gif", "webp"] }
+# Canvas export (.zip: canvas.json + manifest.json + referenced asset files) and
+# import. Deflate compression rides the workspace `zip`'s default features.
+zip.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

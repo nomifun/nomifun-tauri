@@ -12,7 +12,7 @@
  * backend spec.
  */
 
-import type { IProvider, ModelCapability } from '@/common/config/storage';
+import type { IProvider, ModelCapability, ModelProfile, ModelTask, ModelTrait } from '@/common/config/storage';
 
 export interface CreateProviderRequest {
   /**
@@ -103,6 +103,12 @@ export type ProviderHealthCheckErrorKind =
 export interface ProviderHealthCheckRequest {
   provider_id: string;
   model: string;
+  /**
+   * Which task to probe. Omit → backend uses the model's stored profile primary
+   * task, falling back to a name/platform heuristic. Send an explicit task so
+   * image/tts/asr models are probed at the correct endpoint.
+   */
+  task?: ModelTask;
 }
 
 export interface ProviderHealthCheckResponse {
@@ -115,4 +121,42 @@ export interface ProviderHealthCheckResponse {
   error_kind?: ProviderHealthCheckErrorKind;
   http_status?: number;
   timeout_stage?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Model-profile endpoints (multimodal model hub) — mirror
+// crates/backend/nomifun-api-types/src/{model_task,model_catalog}.rs
+// ---------------------------------------------------------------------------
+
+/** Body for `POST /api/model-profiles` (upsert one profile). */
+export interface ModelProfileUpsertRequest {
+  provider_id: string;
+  model: string;
+  tasks: ModelTask[];
+  traits: ModelTrait[];
+  params?: Record<string, unknown>;
+  /** Defaults to 'user' server-side (this is the user-edit path). */
+  source?: ModelProfile['source'];
+}
+
+/** Body identifying a single profile (`POST /api/model-profiles/delete`). */
+export interface ModelProfileKeyRequest {
+  provider_id: string;
+  model: string;
+}
+
+/** A concrete (provider, model) selection returned by resolve. */
+export interface CatalogModelRef {
+  provider_id: string;
+  model: string;
+}
+
+/** Body for `POST /api/model-profiles/resolve`. */
+export interface ResolveModelsRequest {
+  task: ModelTask;
+  required_traits?: ModelTrait[];
+}
+
+export interface ResolveModelsResponse {
+  models: CatalogModelRef[];
 }

@@ -39,6 +39,8 @@ nomifun-terminal = { path = "crates/backend/nomifun-terminal" }
 nomifun-assistant = { path = "crates/backend/nomifun-assistant" }
 nomifun-secret = { path = "crates/backend/nomifun-secret" }
 nomifun-public-agent = { path = "crates/backend/nomifun-public-agent" }
+nomifun-workshop = { path = "crates/backend/nomifun-workshop" }
+nomifun-creation = { path = "crates/backend/nomifun-creation" }
 nomifun-app = { path = "crates/backend/nomifun-app" }
 
 # --- Internal crates: shared ---

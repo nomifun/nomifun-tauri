@@ -1,10 +1,13 @@
-import type { IProvider } from '@/common/config/storage';
+import { ipcBridge } from '@/common';
+import type { IProvider, ModelTask } from '@/common/config/storage';
 import ModalHOC from '@/renderer/utils/ui/ModalHOC';
 import NomiModal from '@/renderer/components/base/NomiModal';
-import { Button, Select, Tag } from '@arco-design/web-react';
+import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
+import { Button, Checkbox, Select, Tag } from '@arco-design/web-react';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import useModeModeList from '@renderer/hooks/agent/useModeModeList';
+import { deriveDefaultTasks } from '@renderer/hooks/agent/useModelProfiles';
 import {
   isNewApiPlatform,
   NEW_API_PROTOCOL_OPTIONS,
@@ -12,13 +15,32 @@ import {
 } from '@/renderer/utils/model/modelPlatforms';
 import { ContextLimitSelect } from './ContextLimitSelect';
 
+/** Display order of modality/task options in the selector. */
+const TASK_ORDER: ModelTask[] = [
+  'chat',
+  'image_generation',
+  'image_edit',
+  'video_generation',
+  'speech_synthesis',
+  'speech_recognition',
+  'embedding',
+  'rerank',
+];
+
 const AddModelModal = ModalHOC<{ data?: IProvider; onSubmit: (model: IProvider) => void }>(
   ({ modalProps, data, onSubmit, modalCtrl }) => {
     const { t } = useTranslation();
+    const [message, messageHolder] = useArcoMessage();
     const [model, setModel] = useState('');
     const [modelProtocol, setModelProtocol] = useState<string>('openai');
     const [contextLimit, setContextLimit] = useState<number | undefined>();
+    const [tasks, setTasks] = useState<ModelTask[]>(['chat']);
+    const [visionInput, setVisionInput] = useState(false);
     const isNewApi = isNewApiPlatform(data?.platform ?? '');
+    const taskOptions = useMemo(
+      () => TASK_ORDER.map((v) => ({ label: t(`settings.modelTask.${v}`), value: v })),
+      [t]
+    );
     const { data: modelList, isLoading } = useModeModeList(data?.platform ?? '', data?.base_url, data?.api_key);
     const existingModels = data?.models || [];
     const optionsList = useMemo(() => {
@@ -38,10 +60,12 @@ const AddModelModal = ModalHOC<{ data?: IProvider; onSubmit: (model: IProvider) 
         setModel('');
         setModelProtocol('openai');
         setContextLimit(undefined);
+        setTasks(['chat']);
+        setVisionInput(false);
       }
     }, [modalProps.visible]);
 
-    const handleConfirm = useCallback(() => {
+    const handleConfirm = useCallback(async () => {
       if (!model || !data) return;
       const nextContextLimits = { ...data.model_context_limits };
       if (contextLimit && contextLimit > 0) {
@@ -62,26 +86,43 @@ const AddModelModal = ModalHOC<{ data?: IProvider; onSubmit: (model: IProvider) 
       }
 
       onSubmit(updatedData);
+
+      // Persist the authoritative capability profile for the new model so probing
+      // and dispatch pick the correct endpoint (source=user = authoritative).
+      try {
+        await ipcBridge.modelProfile.upsert.invoke({
+          provider_id: data.id,
+          model,
+          tasks: tasks.length > 0 ? tasks : ['chat'],
+          traits: visionInput ? ['vision_input'] : [],
+          source: 'user',
+        });
+      } catch (e) {
+        console.error('model profile upsert failed', e);
+        message.warning(t('settings.saveModelConfigFailed', { defaultValue: '模型能力保存失败' }));
+      }
       modalCtrl.close();
-    }, [contextLimit, data, existingModels, model, modelProtocol, isNewApi, onSubmit, modalCtrl]);
+    }, [contextLimit, data, existingModels, model, modelProtocol, isNewApi, tasks, visionInput, onSubmit, modalCtrl, message, t]);
 
     return (
-      <NomiModal
-        visible={modalProps.visible}
-        onCancel={modalCtrl.close}
-        header={{ title: t('settings.addModel'), showClose: true }}
-        style={{ maxHeight: '90vh' }}
-        contentStyle={{
-          background: 'var(--dialog-fill-0)',
-          borderRadius: 16,
-          padding: '20px 24px',
-          overflow: 'auto',
-        }}
-        onOk={handleConfirm}
-        okText={t('common.confirm')}
-        cancelText={t('common.cancel')}
-        okButtonProps={{ disabled: !model }}
-      >
+      <>
+        {messageHolder}
+        <NomiModal
+          visible={modalProps.visible}
+          onCancel={modalCtrl.close}
+          header={{ title: t('settings.addModel'), showClose: true }}
+          style={{ maxHeight: '90vh' }}
+          contentStyle={{
+            background: 'var(--dialog-fill-0)',
+            borderRadius: 16,
+            padding: '20px 24px',
+            overflow: 'auto',
+          }}
+          onOk={handleConfirm}
+          okText={t('common.confirm')}
+          cancelText={t('common.cancel')}
+          okButtonProps={{ disabled: !model }}
+        >
         <div className='flex flex-col gap-16px pt-20px'>
           <div className='space-y-8px'>
             <div className='text-13px font-500 text-t-secondary'>{t('settings.addModelPlaceholder')}</div>
@@ -91,6 +132,7 @@ const AddModelModal = ModalHOC<{ data?: IProvider; onSubmit: (model: IProvider) 
               loading={isLoading}
               onChange={(value: string) => {
                 setModel(value);
+                setTasks(deriveDefaultTasks(data?.platform ?? '', value));
                 if (isNewApi) setModelProtocol(detectNewApiProtocol(value));
               }}
               value={model}
@@ -104,6 +146,25 @@ const AddModelModal = ModalHOC<{ data?: IProvider; onSubmit: (model: IProvider) 
               {t('settings.contextLimit', { defaultValue: '上下文窗口 (tokens)' })}
             </div>
             <ContextLimitSelect value={contextLimit} onChange={setContextLimit} />
+          </div>
+
+          {/* 模态能力 / Modality — declares what the model does; probing & dispatch pick the endpoint from this. */}
+          <div className='space-y-8px'>
+            <div className='text-13px font-500 text-t-secondary'>{t('settings.modelModality')}</div>
+            <Select
+              mode='multiple'
+              value={tasks}
+              onChange={(v: ModelTask[]) => setTasks(v)}
+              options={taskOptions}
+              placeholder={t('settings.modelModality')}
+              triggerProps={{ getPopupContainer: (node) => node.parentElement || document.body }}
+            />
+            <div className='text-11px text-t-secondary leading-4'>{t('settings.modelModalityTip')}</div>
+            {tasks.includes('chat') && (
+              <Checkbox checked={visionInput} onChange={setVisionInput} className='!pl-0'>
+                <span className='text-12px text-t-secondary'>{t('settings.modelVisionInput')}</span>
+              </Checkbox>
+            )}
           </div>
 
           {/* New API 协议选择 / New API Protocol Selection */}
@@ -139,7 +200,8 @@ const AddModelModal = ModalHOC<{ data?: IProvider; onSubmit: (model: IProvider) 
           {/* <div className='text-12px tet-t-tertiary leading-5 bg-fill-1 rd-8px px-12px py-10px border border-dashed border-border-2'>{t('settings.addModelTips')}</div> */}
         </div>
         {/* <div className='text-12px text-t-secondary leading-5 my-4'>{model ? t('settings.addModelSelectedHint', { model }) : t('settings.addModelHint')}</div> */}
-      </NomiModal>
+        </NomiModal>
+      </>
     );
   }
 );

@@ -359,8 +359,8 @@ impl OnConversationDelete for WorkerTaskManagerImpl {
 }
 
 /// Conversation-delete hook that removes a conversation's on-disk nomi state:
-/// the global `nomi-sessions/*_{id}.json` file (+ index entry) and any
-/// auto-provisioned `{label}-temp-{id}` workspace under `work_dir/conversations`.
+/// the global `nomi-sessions/*_{id}.json` file (+ index entry) and any legacy
+/// id-named temp workspace under `work_dir/conversations`.
 ///
 /// Without this, those files outlive the conversation. The session dir is keyed
 /// only by the reusable integer conversation id, so an orphan could later be
@@ -384,8 +384,10 @@ impl OnConversationDelete for NomiSessionFilesCascade {
             warn!(conversation_id, error = %e, "Failed to delete nomi session file on conversation delete (non-fatal)");
         }
 
-        // 2) auto-provisioned temp workspace(s) named `{label}-temp-{id}`. Exact
-        //    suffix match is id-safe (`-temp-3` never matches `-temp-13`).
+        // 2) legacy auto-provisioned temp workspace(s) named `{label}-temp-{id}`.
+        //    Exact suffix match is id-safe (`-temp-3` never matches `-temp-13`).
+        //    New token-named managed workspaces are deleted by ConversationService
+        //    while it still has the full conversation row.
         let conv_dir = self.work_dir.join("conversations");
         let suffix = format!("-temp-{id}");
         if let Ok(entries) = std::fs::read_dir(&conv_dir) {

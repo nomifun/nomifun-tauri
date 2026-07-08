@@ -12,6 +12,7 @@ pub enum ModelType {
     Vision,
     FunctionCalling,
     ImageGeneration,
+    VideoGeneration,
     WebSearch,
     Reasoning,
     Embedding,
@@ -73,6 +74,11 @@ pub enum ProviderHealthCheckErrorKind {
 pub struct ProviderHealthCheckRequest {
     pub provider_id: String,
     pub model: String,
+    /// Which task to probe. `None` → look up the model's stored profile primary
+    /// task, falling back to Chat. Lets image/tts/asr models be probed at the
+    /// correct endpoint instead of always hitting `/chat/completions`.
+    #[serde(default)]
+    pub task: Option<crate::model_task::ModelTask>,
 }
 
 /// Response body for `POST /api/agents/provider-health-check`.
@@ -367,6 +373,7 @@ mod tests {
             ModelType::Vision,
             ModelType::FunctionCalling,
             ModelType::ImageGeneration,
+            ModelType::VideoGeneration,
             ModelType::WebSearch,
             ModelType::Reasoning,
             ModelType::Embedding,
@@ -377,6 +384,19 @@ mod tests {
             let parsed: ModelType = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, mt);
         }
+    }
+
+    #[test]
+    fn test_model_type_generation_variants_serialize_snake_case() {
+        // The workshop/creation surfaces rely on these exact wire strings.
+        assert_eq!(
+            serde_json::to_string(&ModelType::ImageGeneration).unwrap(),
+            r#""image_generation""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ModelType::VideoGeneration).unwrap(),
+            r#""video_generation""#
+        );
     }
 
     // -- ModelCapability --

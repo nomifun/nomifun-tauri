@@ -1,0 +1,63 @@
+{
+  "title": "Creative Workshop",
+  "subtitle": "Compose media and AI generation on one infinite canvas — mix images, video, and text freely with nodes and connections.",
+  "nav": {
+    "entry": "Creative Workshop"
+  },
+  "list": {
+    "searchPlaceholder": "Search canvases...",
+    "newCanvas": "New canvas",
+    "createFirst": "Create your first canvas",
+    "loadError": "Failed to load",
+    "retry": "Retry",
+    "filterEmpty": "No matching canvases",
+    "empty": {
+      "title": "No canvases yet",
+      "desc": "Create an infinite canvas to start your AI visual creation."
+    },
+    "card": {
+      "nodeCount": "{{count}} nodes",
+      "updatedAt": "Updated {{time}}",
+      "thumbAlt": "Canvas thumbnail",
+      "open": "Open",
+      "rename": "Rename",
+      "delete": "Delete"
+    }
+  },
+  "actions": {
+    "createFailed": "Failed to create",
+    "renameOk": "Renamed",
+    "renameFailed": "Failed to rename",
+    "deleteOk": "Canvas deleted",
+    "deleteFailed": "Failed to delete",
+    "deleteConfirmTitle": "Delete canvas",
+    "deleteConfirmContent": "Delete \"{{title}}\"? This cannot be undone."
+  },
+  "rename": {
+    "title": "Rename canvas",
+    "label": "Canvas name",
+    "placeholder": "Enter a canvas name",
+    "required": "Please enter a canvas name"
+  },
+  "editor": {
+    "back": "Back",
+    "backToList": "Back to canvases",
+    "renameHint": "Click to rename",
+    "saved": "Saved",
+    "saving": "Saving...",
+    "saveFailed": "Save failed",
+    "loadError": "Failed to load canvas",
+    "retry": "Retry",
+    "nodeCount": "{{count}} nodes",
+    "canvasComingSoon": "Canvas editor coming soon",
+    "canvasComingSoonDesc": "The infinite canvas (pan / zoom / nodes / connections) will render here."
+  },
+  "time": {
+    "justNow": "just now",
+    "minutesAgo": "{{count}}m ago",
+    "hoursAgo": "{{count}}h ago",
+    "yesterday": "yesterday",
+    "daysAgo": "{{count}}d ago",
+    "weeksAgo": "last week"
+  }
+}

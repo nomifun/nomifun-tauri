@@ -14,6 +14,7 @@ import { blurActiveElement } from '@renderer/utils/ui/focus';
 import { isDesktopShell } from '@renderer/utils/platform';
 import { useKnowledgeInboxPending } from '@renderer/pages/knowledge/useKnowledge';
 import {
+  SiderAssetLibraryEntry,
   SiderAssistantSkillsEntry,
   SiderConversationEntry,
   SiderKnowledgeEntry,
@@ -25,6 +26,7 @@ import {
   SiderRequirementsEntry,
   SiderScheduledEntry,
   SiderSectionHeader,
+  SiderWorkshopEntry,
 } from './SiderNav';
 import SiderFooter from './SiderFooter';
 
@@ -87,7 +89,9 @@ const Sider: React.FC<SiderProps> = ({ onSessionClick, collapsed = false }) => {
   const handleScheduledClick = () => navTo('/scheduled');
   const handleRequirementsClick = () => navTo('/requirements');
   const handleKnowledgeClick = () => navTo('/knowledge');
+  const handleAssetLibraryClick = () => navTo('/assets');
   const handleNomiClick = () => navTo('/nomi');
+  const handleWorkshopClick = () => navTo('/workshop');
   const handlePublicServiceClick = () => navTo('/public-companions');
   const handleAssistantSkillsClick = () => navTo('/assistants?tab=assistants');
   const handleMcpClick = () => navTo('/mcp');
@@ -180,6 +184,14 @@ const Sider: React.FC<SiderProps> = ({ onSessionClick, collapsed = false }) => {
               siderTooltipProps={siderTooltipProps}
               onClick={handleNomiClick}
             />
+            {/* Creative Workshop (创意工坊) — infinite-canvas AI creation surface */}
+            <SiderWorkshopEntry
+              isMobile={isMobile}
+              isActive={pathname.startsWith('/workshop')}
+              collapsed={collapsed}
+              siderTooltipProps={siderTooltipProps}
+              onClick={handleWorkshopClick}
+            />
             {/* 对外服务 — public-facing customer-service agents (对外伙伴), a domain
                 fully separate from the desktop-companion group above. */}
             <SiderSectionHeader label={t('common.siderSection.publicService')} collapsed={collapsed} />
@@ -200,6 +212,14 @@ const Sider: React.FC<SiderProps> = ({ onSessionClick, collapsed = false }) => {
               siderTooltipProps={siderTooltipProps}
               onClick={handleKnowledgeClick}
               dot={pendingInboxCount > 0}
+            />
+            {/* Asset library — unified management of creative-workshop assets */}
+            <SiderAssetLibraryEntry
+              isMobile={isMobile}
+              isActive={pathname.startsWith('/assets')}
+              collapsed={collapsed}
+              siderTooltipProps={siderTooltipProps}
+              onClick={handleAssetLibraryClick}
             />
             {/* 自动化 — automation platforms */}
             <SiderSectionHeader label={t('common.siderSection.automation')} collapsed={collapsed} />

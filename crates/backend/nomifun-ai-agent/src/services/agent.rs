@@ -20,7 +20,7 @@ use nomifun_api_types::{
     ProviderHealthCheckResponse,
 };
 use nomifun_common::AppError;
-use nomifun_db::IProviderRepository;
+use nomifun_db::{IModelProfileRepository, IProviderRepository};
 
 use super::provider_health::ProviderHealthCheckService;
 use crate::registry::AgentRegistry;
@@ -35,10 +35,16 @@ impl AgentService {
     pub fn new(
         registry: Arc<AgentRegistry>,
         provider_repo: Arc<dyn IProviderRepository>,
+        model_profile_repo: Arc<dyn IModelProfileRepository>,
         encryption_key: [u8; 32],
         data_dir: PathBuf,
     ) -> Arc<Self> {
-        let provider_health = ProviderHealthCheckService::new(provider_repo, encryption_key, data_dir.clone());
+        let provider_health = ProviderHealthCheckService::new(
+            provider_repo,
+            model_profile_repo,
+            encryption_key,
+            data_dir.clone(),
+        );
         Arc::new(Self {
             registry,
             data_dir,

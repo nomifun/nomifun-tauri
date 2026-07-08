@@ -14,6 +14,7 @@ mod idmm_intervention;
 mod knowledge;
 mod mcp_server;
 mod message;
+mod model_profile;
 mod oauth_token;
 mod orchestrator;
 mod provider;
@@ -25,6 +26,7 @@ mod tag_setting;
 mod terminal_session;
 mod user;
 mod webhook;
+mod workshop;
 
 pub use acp_session::AcpSessionRow;
 pub use agent_metadata::{AgentMetadataRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams};
@@ -49,6 +51,7 @@ pub use knowledge::{
 };
 pub use mcp_server::McpServerRow;
 pub use message::MessageRow;
+pub use model_profile::{ModelProfileRow, UpsertModelProfileParams};
 pub use oauth_token::OAuthTokenRow;
 pub use orchestrator::{
     FleetMemberRow, FleetRow, OrchAssignmentRow, OrchRunRow, OrchRunTaskDepRow, OrchRunTaskRow,
@@ -63,3 +66,4 @@ pub use tag_setting::TagSettingRow;
 pub use terminal_session::TerminalSessionRow;
 pub use user::User;
 pub use webhook::WebhookRow;
+pub use workshop::{CreationTaskRow, WorkshopAssetRow, WorkshopCanvasRow};

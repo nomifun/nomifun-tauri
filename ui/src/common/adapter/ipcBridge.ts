@@ -54,6 +54,7 @@ import type {
   IMcpServer,
   IProvider,
   ISessionMcpServer,
+  ModelProfile,
   TChatConversation,
   TProviderWithModel,
 } from '../config/storage';
@@ -74,8 +75,12 @@ import type {
   CreateProviderRequest,
   FetchModelsAnonymousRequest,
   FetchModelsResponse,
+  ModelProfileKeyRequest,
+  ModelProfileUpsertRequest,
   ProviderHealthCheckRequest,
   ProviderHealthCheckResponse,
+  ResolveModelsRequest,
+  ResolveModelsResponse,
   UpdateProviderRequest,
 } from '../types/provider/providerApi';
 import type { SpeechToTextRequest, SpeechToTextResult } from '../types/provider/speech';
@@ -909,6 +914,17 @@ export const mode = {
    */
   fetchModelList: httpPost<FetchModelsResponse, FetchModelsAnonymousRequest>('/api/providers/fetch-models'),
   detectProtocol: httpPost<ProtocolDetectionResponse, ProtocolDetectionRequest>('/api/providers/detect-protocol'),
+};
+
+// ---------------------------------------------------------------------------
+// Model profiles (multimodal model hub) — routed to /api/model-profiles/*
+// ---------------------------------------------------------------------------
+
+export const modelProfile = {
+  list: httpGet<ModelProfile[], void>('/api/model-profiles'),
+  upsert: httpPost<ModelProfile, ModelProfileUpsertRequest>('/api/model-profiles'),
+  remove: httpPost<void, ModelProfileKeyRequest>('/api/model-profiles/delete'),
+  resolve: httpPost<ResolveModelsResponse, ResolveModelsRequest>('/api/model-profiles/resolve'),
 };
 
 // ---------------------------------------------------------------------------

@@ -158,6 +158,10 @@ impl GatewayMcpConfig {
         // up & track multi-agent orchestration runs (nomi_run_create/status/result).
         // Desktop-only domain (caps_orchestrator denies Remote), so safe here.
         "orchestrator",
+        // 创意工坊 (Creative Workshop) canvas assistant: companion + desktop/
+        // conversation agents read canvases, apply node ops, and trigger
+        // generation (nomi_workshop_*). Desktop-side domain.
+        "workshop",
     ];
     pub const DESKTOP_DOMAINS: &'static [&'static str] = &[
         "conversation",
@@ -168,6 +172,7 @@ impl GatewayMcpConfig {
         "browser",
         "computer",
         "orchestrator",
+        "workshop",
     ];
     pub const ADMIN_DOMAINS: &'static [&'static str] = &[
         "system",
@@ -181,6 +186,7 @@ impl GatewayMcpConfig {
         "memory",
         "provider",
         "confirmation",
+        "workshop",
     ];
     const EMPTY_DOMAINS: &'static [&'static str] = &[];
 
@@ -348,6 +354,14 @@ mod tests {
                 .unwrap()
                 .contains(&"requirement")
         );
+        // 创意工坊 tools must be exposed to the working/desktop/admin profiles
+        // (companion + desktop/conversation agents drive the canvas assistant)
+        // but NOT to the lite/channel profile (IM sessions don't manipulate a
+        // canvas). Guards against the domain silently dropping out of a profile.
+        assert!(GatewayMcpConfig::WORK_DOMAINS.contains(&"workshop"));
+        assert!(GatewayMcpConfig::DESKTOP_DOMAINS.contains(&"workshop"));
+        assert!(GatewayMcpConfig::ADMIN_DOMAINS.contains(&"workshop"));
+        assert!(!GatewayMcpConfig::LITE_DOMAINS.contains(&"workshop"));
         assert_eq!(
             GatewayMcpConfig::domains_for_profile("typo-profile"),
             Some(&[][..])

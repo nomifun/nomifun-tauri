@@ -147,7 +147,17 @@ fn coerce_string_to_types(s: &str, expected: &[&str]) -> Option<Value> {
         }
     }
     if expected.contains(&"number") {
+        if let Ok(n) = trimmed.parse::<i64>() {
+            return Some(Value::Number(n.into()));
+        }
         if let Ok(n) = trimmed.parse::<f64>() {
+            if n.is_finite()
+                && n.fract() == 0.0
+                && n >= i64::MIN as f64
+                && n <= i64::MAX as f64
+            {
+                return Some(Value::Number((n as i64).into()));
+            }
             return serde_json::Number::from_f64(n).map(Value::Number);
         }
     }
@@ -347,6 +357,24 @@ mod tests {
         assert_eq!(out["limit"], 50);
         assert_eq!(out["timeout_secs"], 1.5);
         assert_eq!(out["confirm"], true);
+    }
+
+    #[test]
+    fn coerce_number_typed_integer_string_still_supports_u64_consumers() {
+        let schema = serde_json::json!({
+            "properties": {
+                "session_id": { "type": "number" },
+                "yield_time_ms": { "type": "number" }
+            }
+        });
+        let input = serde_json::json!({
+            "session_id": "4242",
+            "yield_time_ms": "3000"
+        });
+        let out = coerce_input_to_schema(&schema, input);
+
+        assert_eq!(out["session_id"].as_u64(), Some(4242));
+        assert_eq!(out["yield_time_ms"].as_u64(), Some(3000));
     }
 
     #[test]

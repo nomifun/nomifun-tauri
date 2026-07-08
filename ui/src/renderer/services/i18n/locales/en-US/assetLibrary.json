@@ -1,0 +1,66 @@
+{
+  "title": "Asset Library",
+  "subtitle": "One place to manage the images, videos and text you collect in the Creative Workshop — upload, group, tag, batch-organize and reuse.",
+  "actionFailed": "Action failed",
+  "cancel": "Cancel",
+  "sort": {
+    "createdDesc": "Newest",
+    "createdAsc": "Oldest",
+    "updatedDesc": "Recently updated",
+    "nameAsc": "Name",
+    "sizeDesc": "Size"
+  },
+  "tagFilter": {
+    "label": "Tags"
+  },
+  "selection": {
+    "count": "{{count}} selected",
+    "selectAll": "Select page",
+    "clear": "Clear selection"
+  },
+  "bulk": {
+    "moveToCollection": "Move to collection",
+    "addTags": "Add tags",
+    "download": "Download",
+    "removeFromLibrary": "Remove from library",
+    "delete": "Delete",
+    "partial": "{{ok}} succeeded, {{fail}} failed",
+    "doneMove": "Moved {{count}} items",
+    "doneTag": "Tagged {{count}} items",
+    "doneRemove": "Removed {{count}} items",
+    "doneDelete": "Deleted {{count}} items",
+    "downloadStarted": "Started downloading {{count}} items"
+  },
+  "moveModal": {
+    "title": "Move to collection",
+    "label": "Target collection",
+    "placeholder": "Pick or type a collection; leave empty to ungroup",
+    "ok": "Move"
+  },
+  "tagModal": {
+    "title": "Add tags in bulk",
+    "label": "Tags",
+    "placeholder": "Type a tag and press Enter",
+    "ok": "Add",
+    "empty": "Enter at least one tag"
+  },
+  "renameCollection": {
+    "trigger": "Rename collection",
+    "title": "Rename collection",
+    "label": "New collection name",
+    "placeholder": "Enter a new collection name",
+    "ok": "Rename",
+    "done": "Updated {{count}} items",
+    "required": "Please enter a new collection name"
+  },
+  "removeConfirm": {
+    "title": "Remove from library",
+    "content": "The {{count}} selected items will be removed from the library and no longer shown here. Any not used by a canvas may be reclaimed by later cleanup. Continue?",
+    "ok": "Remove"
+  },
+  "deleteConfirm": {
+    "title": "Delete assets",
+    "content": "Permanently delete the {{count}} selected items? This cannot be undone.",
+    "ok": "Delete"
+  }
+}

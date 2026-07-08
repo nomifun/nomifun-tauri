@@ -20,6 +20,12 @@ interface SegmentedTabsProps {
   className?: string;
   /** Size of the control. `md` (default) suits page-level primary tabs. */
   size?: 'sm' | 'md';
+  /**
+   * Stretch to fill the available width, splitting it evenly across segments,
+   * instead of hugging its content. Use inside fixed-width surfaces (e.g. canvas
+   * cards) so the bar fills the row rather than leaving empty space on the right.
+   */
+  block?: boolean;
 }
 
 /**
@@ -28,16 +34,18 @@ interface SegmentedTabsProps {
  * inactive segments are quiet text that brightens on hover. Themed entirely
  * through CSS variables so it tracks light/dark and the preset palettes.
  *
- * Overflows horizontally (with hidden scrollbar) so the bar stays usable as
- * more sections are added over time.
+ * Content-width by default (overflows horizontally with a hidden scrollbar as
+ * more sections are added); pass `block` to fill the container width evenly
+ * without introducing an inner horizontal scroller.
  */
-const SegmentedTabs: React.FC<SegmentedTabsProps> = ({ items, activeKey, onChange, className, size = 'md' }) => {
+const SegmentedTabs: React.FC<SegmentedTabsProps> = ({ items, activeKey, onChange, className, size = 'md', block = false }) => {
   const heightClass = size === 'sm' ? 'h-30px px-12px text-13px' : 'h-36px px-16px text-14px';
   return (
     <div
       role='tablist'
       className={classNames(
-        'inline-flex items-center gap-2px p-4px rounded-12px bg-[var(--color-fill-2)] max-w-full overflow-x-auto scrollbar-hide',
+        'items-center gap-2px p-4px rounded-12px bg-[var(--color-fill-2)]',
+        block ? 'flex w-full box-border overflow-visible' : 'inline-flex max-w-full box-border overflow-x-auto scrollbar-hide',
         className
       )}
     >
@@ -51,7 +59,8 @@ const SegmentedTabs: React.FC<SegmentedTabsProps> = ({ items, activeKey, onChang
             aria-selected={active}
             onClick={() => onChange(item.key)}
             className={classNames(
-              'group relative shrink-0 inline-flex items-center justify-center gap-6px rounded-9px font-[500] leading-none cursor-pointer transition-all duration-200 select-none border-none outline-none bg-transparent',
+              'group relative inline-flex box-border items-center justify-center gap-6px rounded-9px font-[500] leading-none cursor-pointer transition-all duration-200 select-none border-none outline-none bg-transparent',
+              block ? 'flex-1 min-w-0' : 'shrink-0',
               heightClass,
               active
                 ? '!bg-primary-1 !text-primary-6 shadow-[0_1px_2px_rgba(0,0,0,0.05),0_2px_8px_rgba(0,0,0,0.06)]'

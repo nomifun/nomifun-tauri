@@ -9,11 +9,11 @@ use nomi_agent::output::OutputSink;
 use nomi_agent::output::null_sink::NullSink;
 use nomi_config::config::{CliArgs, Config};
 use nomifun_api_types::{
-    HealthStatus, ProviderHealthCheckErrorKind, ProviderHealthCheckRequest,
-    ProviderHealthCheckResponse,
+    resolve_dispatch_target, HealthStatus, ModelTask, ProviderHealthCheckErrorKind,
+    ProviderHealthCheckRequest, ProviderHealthCheckResponse, RequestShape,
 };
 use nomifun_common::AppError;
-use nomifun_db::{IProviderRepository, models::Provider};
+use nomifun_db::{IModelProfileRepository, IProviderRepository, models::Provider};
 use regex::Regex;
 use tracing::{info, warn};
 
@@ -23,6 +23,7 @@ use crate::factory::nomi::{
 use crate::types::NomiResolvedConfig;
 
 const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+const MODALITY_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const OPENAI_MODEL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
 const HEALTH_CHECK_PROMPT: &str = "Reply with exactly OK.";
@@ -30,6 +31,7 @@ const HEALTH_CHECK_MSG_ID: &str = "provider-health-check";
 
 pub struct ProviderHealthCheckService {
     provider_repo: Arc<dyn IProviderRepository>,
+    model_profile_repo: Arc<dyn IModelProfileRepository>,
     encryption_key: [u8; 32],
     data_dir: PathBuf,
 }
@@ -37,11 +39,13 @@ pub struct ProviderHealthCheckService {
 impl ProviderHealthCheckService {
     pub fn new(
         provider_repo: Arc<dyn IProviderRepository>,
+        model_profile_repo: Arc<dyn IModelProfileRepository>,
         encryption_key: [u8; 32],
         data_dir: PathBuf,
     ) -> Self {
         Self {
             provider_repo,
+            model_profile_repo,
             encryption_key,
             data_dir,
         }
@@ -67,19 +71,59 @@ impl ProviderHealthCheckService {
             .map_err(|e| AppError::Internal(format!("Failed to load provider config: {e}")))?
             .ok_or_else(|| AppError::BadRequest(format!("Provider '{provider_id}' not found")))?;
 
-        let config = self.resolve_probe_config(&row, model)?;
-        if should_use_openai_model_probe(&row.platform, &config) {
-            return run_openai_model_probe(
-                row.id,
-                row.platform,
-                model.to_owned(),
-                config.api_key,
-                config.base_url,
-            )
-            .await;
+        // Determine which task to probe. Authority order: explicit request >
+        // stored profile primary task > name/platform heuristic > Chat. This is
+        // what makes image/tts/asr models probe their correct endpoint instead
+        // of always hitting /chat/completions (the StepFun 404 root cause).
+        let profile = self.model_profile_repo.get(provider_id, model).await.ok().flatten();
+        let task = req
+            .task
+            .or_else(|| {
+                profile
+                    .as_ref()
+                    .and_then(|p| serde_json::from_str::<Vec<ModelTask>>(&p.tasks).ok())
+                    .and_then(|tasks| tasks.first().copied())
+            })
+            .unwrap_or_else(|| {
+                nomifun_api_types::derive_tasks_and_traits(&row.platform, model)
+                    .0
+                    .first()
+                    .copied()
+                    .unwrap_or(ModelTask::Chat)
+            });
+
+        if task == ModelTask::Chat {
+            let config = self.resolve_probe_config(&row, model)?;
+            if should_use_openai_model_probe(&row.platform, &config) {
+                return run_openai_model_probe(
+                    row.id,
+                    row.platform,
+                    model.to_owned(),
+                    config.api_key,
+                    config.base_url,
+                )
+                .await;
+            }
+            return run_probe(row.id, row.platform, config).await;
         }
 
-        run_probe(row.id, row.platform, config).await
+        // Non-chat task: probe the correct endpoint via the dispatch resolver.
+        let params: serde_json::Value = profile
+            .as_ref()
+            .and_then(|p| serde_json::from_str(&p.params).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let api_key = nomifun_common::decrypt_string(&row.api_key_encrypted, &self.encryption_key)?;
+        run_modality_probe(
+            row.id,
+            row.platform,
+            model.to_owned(),
+            task,
+            api_key,
+            row.base_url,
+            row.is_full_url,
+            params,
+        )
+        .await
     }
 
     fn resolve_probe_config(
@@ -325,6 +369,159 @@ async fn run_probe(
             log_health_check_result(&response);
             Ok(response)
         }
+    }
+}
+
+/// Probe a non-chat model at its correct endpoint (resolved by task), sending
+/// the smallest valid request. Success = HTTP 2xx. For multipart tasks (image
+/// edit / speech recognition) the probe sends no file, so a plain
+/// "invalid_request" (missing file) still proves the model + endpoint are
+/// reachable and is treated as healthy.
+#[allow(clippy::too_many_arguments)]
+async fn run_modality_probe(
+    provider_id: String,
+    platform: String,
+    model: String,
+    task: ModelTask,
+    api_key: String,
+    base_url: String,
+    is_full_url: bool,
+    params: serde_json::Value,
+) -> Result<ProviderHealthCheckResponse, AppError> {
+    let started = Instant::now();
+    let target = resolve_dispatch_target(&platform, &base_url, is_full_url, task, &params);
+    let key = primary_api_key(&api_key);
+    let client = nomifun_net::http_client();
+
+    info!(
+        provider_id = %provider_id,
+        platform = %platform,
+        model = %model,
+        task = ?task,
+        url = %target.url,
+        "Modality health check started"
+    );
+
+    let send = async {
+        let rb = client.post(&target.url).bearer_auth(&key);
+        match target.shape {
+            RequestShape::Json => rb.json(&minimal_json_body(task, &model, &params)).send().await,
+            RequestShape::Multipart => rb.multipart(minimal_multipart_form(task, &model)).send().await,
+        }
+    };
+
+    let response = match tokio::time::timeout(MODALITY_PROBE_TIMEOUT, send).await {
+        Ok(Ok(resp)) => {
+            let status = resp.status();
+            if status.is_success() {
+                healthy_response(provider_id, platform, model, started.elapsed())
+            } else {
+                let body = truncate_body(&resp.text().await.unwrap_or_default());
+                let message = format!("Provider error: API error {}: {body}", status.as_u16());
+                let reachable_only = matches!(task, ModelTask::ImageEdit | ModelTask::SpeechRecognition)
+                    && classify_error(&message, false) == ProviderHealthCheckErrorKind::InvalidRequest;
+                if reachable_only {
+                    healthy_response(provider_id, platform, model, started.elapsed())
+                } else {
+                    unhealthy_response(provider_id, platform, model, started.elapsed(), message, None)
+                }
+            }
+        }
+        Ok(Err(error)) => unhealthy_response(
+            provider_id,
+            platform,
+            model,
+            started.elapsed(),
+            format!("Connection error: {error}"),
+            None,
+        ),
+        Err(_) => unhealthy_response(
+            provider_id,
+            platform,
+            model,
+            started.elapsed(),
+            format!("Modality probe timeout ({}s)", MODALITY_PROBE_TIMEOUT.as_secs()),
+            Some("modality_probe".into()),
+        ),
+    };
+    log_health_check_result(&response);
+    Ok(response)
+}
+
+/// The smallest valid JSON body for a task, overlaying known service-config
+/// params (image size/steps/etc.) so a provider requiring them still validates.
+fn minimal_json_body(task: ModelTask, model: &str, params: &serde_json::Value) -> serde_json::Value {
+    use serde_json::json;
+    match task {
+        ModelTask::ImageGeneration => {
+            let mut body =
+                json!({ "model": model, "prompt": "health check", "n": 1, "response_format": "b64_json" });
+            for key in ["size", "steps", "cfg_scale", "text_mode", "quality"] {
+                if let Some(v) = params.get(key) {
+                    body[key] = v.clone();
+                }
+            }
+            body
+        }
+        ModelTask::VideoGeneration => json!({ "model": model, "prompt": "health check" }),
+        ModelTask::SpeechSynthesis => json!({
+            "model": model,
+            "input": "hi",
+            "voice": params.get("voice").and_then(|v| v.as_str()).unwrap_or("alloy"),
+        }),
+        ModelTask::Embedding => json!({ "model": model, "input": "health check" }),
+        ModelTask::Rerank => json!({ "model": model, "query": "a", "documents": ["b"] }),
+        // Chat goes through the engine path; ImageEdit/SpeechRecognition are multipart.
+        _ => json!({ "model": model }),
+    }
+}
+
+/// Minimal multipart form for file-based tasks. The probe sends no file (a
+/// missing-file 400 still proves reachability), only the model (+ prompt).
+fn minimal_multipart_form(task: ModelTask, model: &str) -> reqwest::multipart::Form {
+    let mut form = reqwest::multipart::Form::new().text("model", model.to_string());
+    if matches!(task, ModelTask::ImageEdit) {
+        form = form.text("prompt", "health check");
+    }
+    form
+}
+
+/// First usable key from a (possibly comma/newline-separated multi-)key string.
+fn primary_api_key(raw: &str) -> String {
+    raw.split(['\n', ','])
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn truncate_body(body: &str) -> String {
+    const MAX_CHARS: usize = 500;
+    if body.chars().count() <= MAX_CHARS {
+        body.to_string()
+    } else {
+        let mut s: String = body.chars().take(MAX_CHARS).collect();
+        s.push('…');
+        s
+    }
+}
+
+fn healthy_response(
+    provider_id: String,
+    platform: String,
+    model: String,
+    elapsed: Duration,
+) -> ProviderHealthCheckResponse {
+    ProviderHealthCheckResponse {
+        provider_id,
+        platform,
+        model,
+        status: HealthStatus::Healthy,
+        elapsed_ms: elapsed_ms(elapsed),
+        message: None,
+        error_kind: None,
+        http_status: None,
+        timeout_stage: None,
     }
 }
 
@@ -625,5 +822,89 @@ mod tests {
             Some(ProviderHealthCheckErrorKind::RateLimited)
         );
         assert_eq!(response.http_status, Some(429));
+    }
+
+    #[tokio::test]
+    async fn modality_probe_image_generation_success_is_healthy() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/generations"))
+            .and(header("authorization", "Bearer sk-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "b64_json": "AAAA" }]
+            })))
+            .mount(&server)
+            .await;
+
+        let response = run_modality_probe(
+            "p1".to_owned(),
+            "stepfun-plan".to_owned(),
+            "step-image-edit-2".to_owned(),
+            ModelTask::ImageGeneration,
+            "sk-test".to_owned(),
+            server.uri(),
+            false,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status, HealthStatus::Healthy);
+        assert_eq!(response.error_kind, None);
+    }
+
+    #[tokio::test]
+    async fn modality_probe_model_invalid_is_unhealthy_not_found() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Reproduces the StepFun 404 shape — but now at the CORRECT image endpoint.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/images/generations"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "error": { "message": "The model \"x\" does not exist", "type": "model_invalid" }
+            })))
+            .mount(&server)
+            .await;
+
+        let response = run_modality_probe(
+            "p1".to_owned(),
+            "stepfun-plan".to_owned(),
+            "x".to_owned(),
+            ModelTask::ImageGeneration,
+            "sk-test".to_owned(),
+            server.uri(),
+            false,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status, HealthStatus::Unhealthy);
+        assert_eq!(response.error_kind, Some(ProviderHealthCheckErrorKind::NotFound));
+        assert_eq!(response.http_status, Some(404));
+    }
+
+    #[test]
+    fn primary_api_key_takes_first_of_multi() {
+        assert_eq!(primary_api_key("k1,k2,k3"), "k1");
+        assert_eq!(primary_api_key("\n k1 \n k2 "), "k1");
+        assert_eq!(primary_api_key(""), "");
+    }
+
+    #[test]
+    fn minimal_image_body_overlays_params() {
+        let body = minimal_json_body(
+            ModelTask::ImageGeneration,
+            "m",
+            &serde_json::json!({ "steps": 8, "text_mode": true }),
+        );
+        assert_eq!(body["prompt"], "health check");
+        assert_eq!(body["steps"], 8);
+        assert_eq!(body["text_mode"], true);
     }
 }

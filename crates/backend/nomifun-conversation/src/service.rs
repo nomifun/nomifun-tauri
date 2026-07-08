@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nomifun_ai_agent::types::{BuildTaskOptions, SendMessageData};
@@ -42,6 +42,7 @@ use crate::stream_relay::{RelayTerminal, StreamRelay, spawn_turn_writeback_repor
 use std::sync::RwLock;
 
 const MAX_CRON_CONTINUATIONS_PER_TURN: usize = 4;
+const TEMP_WORKSPACE_ID_EXTRA_KEY: &str = "temp_workspace_id";
 
 /// Parse a string conversation id (the service's public-API / in-memory key
 /// form) into the integer key the repo now uses. A non-numeric id yields an
@@ -415,7 +416,7 @@ impl ConversationService {
         }
 
         // Determine whether the user chose this workspace ("custom") or we
-        // auto-provision one under `{data_dir}/conversations/{label}-temp-{id}/`.
+        // auto-provision one under `{data_dir}/conversations/{label}-temp-{token}/`.
         // `is_custom_workspace` is the authoritative signal consumed later to
         // decide whether we should wire skill symlinks (temp workspaces only
         // — user-chosen paths must not be mutated).
@@ -432,33 +433,35 @@ impl ConversationService {
             extra["workspace"] = serde_json::Value::String(workspace.clone());
         }
 
-        // For auto-provisioned (temp) workspaces the directory name embeds the
-        // conversation id, which is now minted by the DB at `create()`. We
-        // therefore defer the actual directory creation and the
-        // `extra.workspace` write until after the row exists (and `new_id` is
-        // known). The edge-whitespace guard, however, only depends on the data
-        // dir (`workspace_root`) — the `{label}-temp-{id}` segment is never
-        // whitespace — so we validate it loudly here, before any persist, by
-        // probing a placeholder path. This preserves the "fail before write"
-        // contract of the original flow.
-        let auto_workspace_label = if user_supplied_workspace.is_none() {
+        // For auto-provisioned (temp) workspaces the directory name uses a
+        // durable random token, not the integer conversation id. Integer ids can
+        // repeat after DB/environment resets; the token keeps on-disk temp
+        // workspaces bound to a single conversation instance. We can mint and
+        // validate it before the DB insert, while deferring directory creation
+        // and the `extra.workspace` write until after the row exists.
+        let auto_workspace = if user_supplied_workspace.is_none() {
             let label = conversation_label(&req.r#type, extra.get("backend"));
-            let probe_path = self
-                .workspace_root
-                .join("conversations")
-                .join(format!("{label}-temp-0"));
+            let (temp_workspace_id, probe_path) = allocate_temp_workspace_id(&self.workspace_root, &label);
             if workspace_path_has_edge_whitespace_segment(&probe_path) {
                 return Err(AppError::WorkspacePathEdgeWhitespace(probe_path.display().to_string()));
             }
-            Some(label)
+            Some((label, temp_workspace_id))
         } else {
             None
         };
 
-        // Strip the request-only custom_workspace toggle — it was read above
-        // and must not be persisted as an extra field.
+        // Strip request-only / derived workspace flags and then stamp the
+        // backend-owned temp workspace token for auto-provisioned sessions.
         if let Some(obj) = extra.as_object_mut() {
             obj.remove("custom_workspace");
+            obj.remove("is_temporary_workspace");
+            obj.remove(TEMP_WORKSPACE_ID_EXTRA_KEY);
+            if let Some((_, temp_workspace_id)) = auto_workspace.as_ref() {
+                obj.insert(
+                    TEMP_WORKSPACE_ID_EXTRA_KEY.to_owned(),
+                    serde_json::Value::String(temp_workspace_id.clone()),
+                );
+            }
         }
 
         // Consume transient skill-shaping inputs and freeze the initial
@@ -492,9 +495,9 @@ impl ConversationService {
         let initial_skills = compute_initial_skills(&auto_inject_names, &preset_enabled, &exclude_auto_inject);
 
         // Skill symlinks are wired into the auto-provisioned workspace *after*
-        // the row is created, because the workspace directory name embeds the
-        // DB-minted conversation id. Capture the inputs now (the `skills`
-        // snapshot below consumes `initial_skills` into `extra`).
+        // the row is created, when the tokenized workspace path is materialized.
+        // Capture the inputs now (the `skills` snapshot below consumes
+        // `initial_skills` into `extra`).
         let skills_for_links = initial_skills.clone();
 
         if let Some(obj) = extra.as_object_mut() {
@@ -648,16 +651,13 @@ impl ConversationService {
 
         let new_id = self.conversation_repo.create(&row).await?;
 
-        // Now that the conversation id exists, provision the auto (temp)
-        // workspace whose directory name embeds it: create the directory, wire
-        // skill symlinks (temp workspaces only), record the path in `extra`,
-        // and persist the updated `extra` back. User-supplied workspaces are
-        // left untouched (already in `extra` and validated above).
-        if let Some(label) = auto_workspace_label.as_ref() {
-            let ws_path = self
-                .workspace_root
-                .join("conversations")
-                .join(format!("{label}-temp-{new_id}"));
+        // Now that the row exists, provision the auto (temp) workspace: create
+        // the tokenized directory, wire skill symlinks (temp workspaces only),
+        // record the path in `extra`, and persist the updated `extra` back.
+        // User-supplied workspaces are left untouched (already in `extra` and
+        // validated above).
+        if let Some((label, temp_workspace_id)) = auto_workspace.as_ref() {
+            let ws_path = auto_temp_workspace_path(&self.workspace_root, label, temp_workspace_id);
             std::fs::create_dir_all(&ws_path)
                 .map_err(|e| AppError::Internal(format!("Failed to create workspace: {e}")))?;
 
@@ -1118,6 +1118,7 @@ impl ConversationService {
             .source
             .as_deref()
             .and_then(|s| string_to_enum::<ConversationSource>(s).ok());
+        let managed_temp_workspace = managed_temp_workspace_path_from_row(&self.workspace_root, &existing);
 
         self.conversation_repo.delete(conv_id).await?;
         // No FK / CASCADE on `acp_session`: clean it up here so non-ACP
@@ -1137,6 +1138,18 @@ impl ConversationService {
             self.delete_hooks.read().map(|guard| guard.clone()).unwrap_or_default();
         for hook in hooks {
             hook.on_conversation_deleted(conv_id).await;
+        }
+
+        if let Some(path) = managed_temp_workspace
+            && path.exists()
+            && let Err(err) = std::fs::remove_dir_all(&path)
+        {
+            warn!(
+                conversation_id = conv_id,
+                workspace = %path.display(),
+                error = %ErrorChain(&err),
+                "Failed to remove managed temp workspace on conversation delete"
+            );
         }
 
         // Drop the in-memory knowledge signature so the map does not retain
@@ -2525,11 +2538,12 @@ impl ConversationService {
     }
 
     async fn ensure_auto_workspace_skill_links(&self, row: &ConversationRow, build_opts: &BuildTaskOptions) {
-        let expected_workspace = self.workspace_root.join("conversations").join(format!(
-            "{}-temp-{}",
-            conversation_label(&build_opts.agent_type, build_opts.extra.get("backend")),
-            row.id
-        ));
+        let expected_workspace = auto_workspace_path_for_row(
+            &self.workspace_root,
+            row,
+            &build_opts.agent_type,
+            &build_opts.extra,
+        );
 
         let stored_workspace = build_opts.workspace.trim();
         let workspace = if stored_workspace.is_empty() {
@@ -2604,11 +2618,7 @@ impl ConversationService {
 
         let stored_workspace = build_opts.workspace.trim();
         let workspace = if stored_workspace.is_empty() {
-            self.workspace_root.join("conversations").join(format!(
-                "{}-temp-{}",
-                conversation_label(&build_opts.agent_type, build_opts.extra.get("backend")),
-                row.id
-            ))
+            auto_workspace_path_for_row(&self.workspace_root, row, &build_opts.agent_type, &build_opts.extra)
         } else {
             PathBuf::from(stored_workspace)
         };
@@ -2978,6 +2988,71 @@ fn validate_runtime_workspace_path(workspace: &str) -> Result<String, AppError> 
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
+
+fn allocate_temp_workspace_id(workspace_root: &Path, label: &str) -> (String, PathBuf) {
+    for _ in 0..16 {
+        let temp_workspace_id = generate_prefixed_id("ws");
+        let path = auto_temp_workspace_path(workspace_root, label, &temp_workspace_id);
+        if !path.exists() {
+            return (temp_workspace_id, path);
+        }
+    }
+
+    let temp_workspace_id = format!("{}-{}", generate_prefixed_id("ws"), now_ms());
+    let path = auto_temp_workspace_path(workspace_root, label, &temp_workspace_id);
+    (temp_workspace_id, path)
+}
+
+fn auto_temp_workspace_path(workspace_root: &Path, label: &str, temp_workspace_id: &str) -> PathBuf {
+    workspace_root
+        .join("conversations")
+        .join(format!("{label}-temp-{temp_workspace_id}"))
+}
+
+fn temp_workspace_id_from_extra(extra: &serde_json::Value) -> Option<&str> {
+    extra.get(TEMP_WORKSPACE_ID_EXTRA_KEY)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn legacy_temp_workspace_id(row: &ConversationRow) -> String {
+    format!("legacy-{}-{}", row.id, row.created_at)
+}
+
+fn auto_workspace_path_for_row(
+    workspace_root: &Path,
+    row: &ConversationRow,
+    agent_type: &AgentType,
+    extra: &serde_json::Value,
+) -> PathBuf {
+    let label = conversation_label(agent_type, extra.get("backend"));
+    let temp_workspace_id = temp_workspace_id_from_extra(extra)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| legacy_temp_workspace_id(row));
+    auto_temp_workspace_path(workspace_root, &label, &temp_workspace_id)
+}
+
+fn managed_temp_workspace_path_from_row(workspace_root: &Path, row: &ConversationRow) -> Option<PathBuf> {
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).ok()?;
+    let temp_workspace_id = temp_workspace_id_from_extra(&extra)?;
+    let agent_type: AgentType = string_to_enum(&row.r#type).ok()?;
+    let label = conversation_label(&agent_type, extra.get("backend"));
+    let expected = auto_temp_workspace_path(workspace_root, &label, temp_workspace_id);
+
+    if let Some(stored_workspace) = extra
+        .get("workspace")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if PathBuf::from(stored_workspace) != expected {
+            return None;
+        }
+    }
+
+    Some(expected)
+}
 
 /// Compute the label used in auto-provisioned workspace directory names.
 ///

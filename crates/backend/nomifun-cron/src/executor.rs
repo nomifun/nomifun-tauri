@@ -33,6 +33,7 @@ use crate::types::{CronJob, ExecutionMode};
 pub const RETRY_INTERVAL_MS: u64 = 30_000;
 const SYSTEM_DEFAULT_USER_ID: &str = "system_default_user";
 const SKILL_SUGGEST_TURN_TIMEOUT: Duration = Duration::from_secs(120);
+const TEMP_WORKSPACE_ID_EXTRA_KEY: &str = "temp_workspace_id";
 
 /// Parse a string-keyed conversation id into the integer DB/service key. Cron
 /// keeps ids as `String`/`&str` through its agent path and converts only at the
@@ -503,8 +504,14 @@ impl JobExecutor {
             .unwrap_or_default();
 
         if response_workspace.is_empty() {
-            let fallback_workspace =
-                default_temp_workspace_path(&self.work_dir, &agent_type, job, &conversation_id);
+            let fallback_workspace = default_temp_workspace_path(
+                &self.work_dir,
+                &agent_type,
+                job,
+                &conversation_id,
+                Some(response.created_at),
+                &response.extra,
+            );
             std::fs::create_dir_all(&fallback_workspace).map_err(|err| {
                 CronError::Scheduler(format!(
                     "create fallback cron workspace {}: {err}",
@@ -1390,6 +1397,8 @@ fn default_temp_workspace_path(
     agent_type: &AgentType,
     job: &CronJob,
     conversation_id: &str,
+    conversation_created_at: Option<i64>,
+    extra: &serde_json::Value,
 ) -> std::path::PathBuf {
     let label = if *agent_type == AgentType::Acp {
         job.agent_config
@@ -1402,9 +1411,20 @@ fn default_temp_workspace_path(
         agent_type.serde_name().to_owned()
     };
 
+    let temp_workspace_id = extra
+        .get(TEMP_WORKSPACE_ID_EXTRA_KEY)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| match conversation_created_at {
+            Some(created_at) => format!("legacy-{conversation_id}-{created_at}"),
+            None => format!("legacy-{conversation_id}"),
+        });
+
     data_dir
         .join("conversations")
-        .join(format!("{label}-temp-{conversation_id}"))
+        .join(format!("{label}-temp-{temp_workspace_id}"))
 }
 
 fn schedule_description_ref(schedule: &crate::types::CronSchedule) -> Option<&str> {
@@ -1512,6 +1532,52 @@ mod tests {
         })
         .await
         .expect("agent send should complete");
+    }
+
+    #[test]
+    fn default_temp_workspace_path_uses_backend_minted_token() {
+        let job = sample_job();
+        let path = default_temp_workspace_path(
+            Path::new("/work"),
+            &AgentType::Acp,
+            &job,
+            "1",
+            Some(1000),
+            &serde_json::json!({ "temp_workspace_id": "ws_abc" }),
+        );
+
+        assert_eq!(
+            path,
+            Path::new("/work")
+                .join("conversations")
+                .join("acp-temp-ws_abc")
+        );
+    }
+
+    #[test]
+    fn default_temp_workspace_path_legacy_fallback_includes_created_at() {
+        let job = sample_job();
+        let first = default_temp_workspace_path(
+            Path::new("/work"),
+            &AgentType::Acp,
+            &job,
+            "1",
+            Some(1000),
+            &serde_json::json!({}),
+        );
+        let second = default_temp_workspace_path(
+            Path::new("/work"),
+            &AgentType::Acp,
+            &job,
+            "1",
+            Some(2000),
+            &serde_json::json!({}),
+        );
+
+        assert_ne!(
+            first, second,
+            "cron fallback workspace must not be derived solely from reusable conversation_id"
+        );
     }
 
     // -- handle_busy tests ---------------------------------------------------

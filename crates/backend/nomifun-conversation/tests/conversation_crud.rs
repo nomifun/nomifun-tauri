@@ -10,6 +10,7 @@ use nomifun_conversation::skill_resolver::SkillResolver;
 use nomifun_db::{SqliteConversationRepository, init_database_memory};
 use nomifun_realtime::EventBroadcaster;
 use serde_json::json;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 // ── Test infrastructure ────────────────────────────────────────────
@@ -92,6 +93,12 @@ impl SkillResolver for EmptySkillResolver {
 }
 
 async fn setup() -> (ConversationService, Arc<TestBroadcaster>, Arc<dyn IWorkerTaskManager>) {
+    setup_with_workspace_root(std::env::temp_dir()).await
+}
+
+async fn setup_with_workspace_root(
+    workspace_root: PathBuf,
+) -> (ConversationService, Arc<TestBroadcaster>, Arc<dyn IWorkerTaskManager>) {
     let db = init_database_memory().await.unwrap();
     let repo = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
     let broadcaster = Arc::new(TestBroadcaster::new());
@@ -101,7 +108,7 @@ async fn setup() -> (ConversationService, Arc<TestBroadcaster>, Arc<dyn IWorkerT
         Arc::new(nomifun_db::SqliteAcpSessionRepository::new(db.pool().clone()));
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(NoopTaskManager);
     let svc = ConversationService::new(
-        std::env::temp_dir(),
+        workspace_root,
         broadcaster.clone(),
         Arc::new(EmptySkillResolver),
         task_mgr.clone(),
@@ -118,6 +125,14 @@ fn make_create_req() -> CreateConversationRequest {
     serde_json::from_value(json!({
         "type": "acp",
         "extra": { "workspace": "/home/user/project" }
+    }))
+    .unwrap()
+}
+
+fn make_auto_workspace_create_req() -> CreateConversationRequest {
+    serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "backend": "claude" }
     }))
     .unwrap()
 }
@@ -150,6 +165,69 @@ async fn t1_1_create_with_defaults() {
     assert_eq!(events[0].data["action"], "created");
     assert_eq!(events[0].data["conversation_id"], resp.id);
     assert_eq!(events[0].data["source"], "nomifun");
+}
+
+#[tokio::test]
+async fn auto_workspace_does_not_reuse_path_when_integer_id_restarts() {
+    let root = std::env::temp_dir().join(format!(
+        "nomifun-conv-reset-{}",
+        nomifun_common::generate_prefixed_id("test")
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+
+    let (svc1, _, _) = setup_with_workspace_root(root.clone()).await;
+    let first = svc1
+        .create(USER_ID, make_auto_workspace_create_req())
+        .await
+        .unwrap();
+    assert_eq!(first.id, 1, "first in-memory DB should allocate id=1");
+    let first_workspace = first.extra["workspace"].as_str().unwrap().to_owned();
+    std::fs::write(PathBuf::from(&first_workspace).join("old-session.txt"), "pollution").unwrap();
+
+    let (svc2, _, _) = setup_with_workspace_root(root.clone()).await;
+    let second = svc2
+        .create(USER_ID, make_auto_workspace_create_req())
+        .await
+        .unwrap();
+    assert_eq!(second.id, 1, "reset in-memory DB should allocate id=1 again");
+    let second_workspace = second.extra["workspace"].as_str().unwrap();
+
+    assert_ne!(
+        second_workspace, first_workspace,
+        "auto workspace path must not be derived solely from the reusable integer conversation id"
+    );
+    assert!(
+        !PathBuf::from(second_workspace).join("old-session.txt").exists(),
+        "new temp workspace must not expose files from a prior deleted/reset conversation"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn delete_removes_managed_auto_workspace() {
+    let root = std::env::temp_dir().join(format!(
+        "nomifun-conv-delete-{}",
+        nomifun_common::generate_prefixed_id("test")
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+
+    let (svc, _, _) = setup_with_workspace_root(root.clone()).await;
+    let conv = svc
+        .create(USER_ID, make_auto_workspace_create_req())
+        .await
+        .unwrap();
+    let workspace = PathBuf::from(conv.extra["workspace"].as_str().unwrap());
+    assert!(workspace.exists(), "precondition: auto workspace exists after create");
+
+    svc.delete(USER_ID, &conv.id.to_string()).await.unwrap();
+
+    assert!(
+        !workspace.exists(),
+        "deleting a conversation must remove its backend-managed temporary workspace"
+    );
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]

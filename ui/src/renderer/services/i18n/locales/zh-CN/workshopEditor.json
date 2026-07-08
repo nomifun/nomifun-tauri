@@ -1,0 +1,83 @@
+{
+  "title": "图片编辑器",
+  "tabs": {
+    "crop": "裁剪",
+    "mask": "遮罩",
+    "split": "切分",
+    "upscale": "放大"
+  },
+  "common": {
+    "cancel": "取消",
+    "apply": "应用",
+    "applying": "处理中…",
+    "close": "关闭"
+  },
+  "stage": {
+    "zoomIn": "放大",
+    "zoomOut": "缩小",
+    "resetView": "适应窗口",
+    "hint": "滚轮缩放 · 空格拖动查看"
+  },
+  "crop": {
+    "aspect": "裁剪比例",
+    "free": "自由",
+    "original": "原图",
+    "size": "裁剪尺寸",
+    "width": "宽度",
+    "height": "高度",
+    "position": "位置",
+    "hint": "拖动裁剪框移动，拖动手柄调整大小；在框外按下可重新框选。"
+  },
+  "mask": {
+    "tool": "画笔工具",
+    "brush": "涂抹",
+    "erase": "擦除",
+    "brushSize": "笔刷大小",
+    "undo": "撤销",
+    "redo": "重做",
+    "clear": "清空",
+    "promptLabel": "修改要求",
+    "promptPlaceholder": "描述你希望如何修改涂抹的区域…",
+    "hint": "涂抹要重绘的区域（红色）；导出的遮罩中涂抹处为透明、其余为白色。"
+  },
+  "split": {
+    "mode": "切分方式",
+    "equal": "等分",
+    "custom": "自定义",
+    "grid": "网格",
+    "rows": "行",
+    "cols": "列",
+    "gap": "接缝间隔",
+    "lines": "分割线",
+    "addVertical": "垂直线",
+    "addHorizontal": "水平线",
+    "noLines": "尚未添加分割线",
+    "vLine": "垂直",
+    "hLine": "水平",
+    "lineGap": "间隔",
+    "result": "切分结果",
+    "pieces": "块数",
+    "pieceSize": "单块尺寸",
+    "hintEqual": "按行列等分；接缝间隔会在每条分割线两侧各裁掉一半，去除 AI 宫格图的拼接缝。",
+    "hintCustom": "添加分割线后可在画布上拖动微调；每条线可单独设置接缝间隔。"
+  },
+  "upscale": {
+    "target": "目标尺寸（最长边）",
+    "algo": "放大算法",
+    "progressive": "高清渐进",
+    "progressiveDesc": "多次 2 倍逐步放大，边缘更平滑",
+    "bilinear": "双线性",
+    "bilinearDesc": "一次性平滑插值，速度快",
+    "nearest": "最近邻",
+    "nearestDesc": "保留硬边像素，适合像素图",
+    "summary": "尺寸对比",
+    "before": "原始",
+    "after": "放大后",
+    "estSize": "预计大小",
+    "hint": "本地插值放大不会新增细节，仅提升分辨率；需要更清晰的结果请使用 AI 超分。"
+  },
+  "errors": {
+    "loadFailed": "图片加载失败",
+    "exportFailed": "处理失败"
+  }
+}

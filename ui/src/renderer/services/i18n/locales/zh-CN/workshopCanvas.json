@@ -1,0 +1,200 @@
+{
+  "background": {
+    "dots": "点阵",
+    "lines": "网格线",
+    "blank": "空白"
+  },
+  "toolbar": {
+    "undo": "撤销 (Ctrl+Z)",
+    "redo": "重做 (Ctrl+Shift+Z)",
+    "background": "背景：{{style}}",
+    "addNode": "新建节点",
+    "assets": "资产库 (A)",
+    "help": "快捷键帮助 (?)"
+  },
+  "zoom": {
+    "out": "缩小",
+    "in": "放大",
+    "slider": "缩放",
+    "reset": "重置为 100%",
+    "fit": "适应视图"
+  },
+  "menu": {
+    "newNode": "在此新建节点",
+    "image": "图片",
+    "imageUpload": "上传图片",
+    "text": "文本",
+    "video": "视频",
+    "videoUpload": "上传视频",
+    "generator": "生成卡片",
+    "flowNodes": "流程节点",
+    "loop": "循环节点",
+    "compare": "对比节点",
+    "output": "输出节点",
+    "compareUpstream": "与上游对比",
+    "duplicate": "复制副本",
+    "delete": "删除",
+    "deleteEdge": "删除连线",
+    "paste": "粘贴"
+  },
+  "toast": {
+    "uploadFailed": "上传失败",
+    "savedToLibrary": "已存入资产库",
+    "saveToLibraryFailed": "存入资产库失败",
+    "downloadFailed": "下载失败",
+    "maskDeferred": "局部重绘将在生成卡片接通后可用",
+    "groupNeedTwo": "请选择至少两个可分组的节点",
+    "noUpstreamImage": "该图片没有可对比的上游图源"
+  },
+  "preview": {
+    "zoomIn": "放大",
+    "zoomOut": "缩小",
+    "download": "下载",
+    "close": "关闭",
+    "prev": "上一张",
+    "next": "下一张",
+    "loadFailed": "图片加载失败"
+  },
+  "shortcuts": {
+    "title": "快捷键",
+    "close": "关闭",
+    "k": {
+      "pan": "左键 / 中键拖拽",
+      "zoom": "滚轮",
+      "boxSelect": "Ctrl/⌘ + 拖拽",
+      "addSelect": "Shift / Ctrl + 点击",
+      "selectAll": "Ctrl/⌘ + A",
+      "copy": "Ctrl/⌘ + C",
+      "paste": "Ctrl/⌘ + V",
+      "duplicate": "Ctrl/⌘ + D",
+      "group": "Ctrl/⌘ + G",
+      "ungroup": "Ctrl/⌘ + Shift + G",
+      "delete": "Delete / Backspace",
+      "undo": "Ctrl/⌘ + Z",
+      "redo": "Ctrl/⌘ + Shift + Z / Ctrl + Y",
+      "assets": "A",
+      "escape": "Esc",
+      "connect": "拖拽右侧锚点"
+    },
+    "d": {
+      "pan": "平移画布",
+      "zoom": "以指针为锚缩放",
+      "boxSelect": "框选",
+      "addSelect": "追加 / 取消选择",
+      "selectAll": "全选",
+      "copy": "复制节点",
+      "paste": "粘贴（含系统剪贴板图片 / 文本）",
+      "duplicate": "复制副本",
+      "group": "打组",
+      "ungroup": "解组",
+      "delete": "删除选中节点或连线",
+      "undo": "撤销",
+      "redo": "重做",
+      "assets": "打开 / 关闭资产库",
+      "escape": "取消选择 / 关闭浮层",
+      "connect": "连线；拖到空白处快捷建节点"
+    }
+  },
+  "node": {
+    "delete": "删除",
+    "comingSoon": "即将上线",
+    "kind": {
+      "loop": "循环节点",
+      "compare": "对比节点",
+      "output": "输出节点",
+      "group": "分组"
+    },
+    "image": {
+      "emptyTitle": "上传图片",
+      "emptyHint": "点击选择，或将图片拖到此处",
+      "loadFailed": "图片加载失败",
+      "preview": "预览",
+      "download": "下载",
+      "saveToLibrary": "存入资产库",
+      "aspectLock": "锁定比例",
+      "aspectFree": "自由比例",
+      "edit": {
+        "label": "编辑",
+        "crop": "裁剪",
+        "split": "宫格切分",
+        "upscale": "放大",
+        "mask": "局部重绘"
+      }
+    },
+    "text": {
+      "placeholder": "输入文本…",
+      "empty": "双击编辑文本",
+      "smaller": "缩小字号",
+      "larger": "放大字号"
+    },
+    "video": {
+      "emptyTitle": "上传视频",
+      "emptyHint": "点击选择，或将视频拖到此处",
+      "loadFailed": "视频加载失败",
+      "download": "下载",
+      "saveToLibrary": "存入资产库"
+    },
+    "generator": {
+      "title": "{{mode}}生成",
+      "promptEmpty": "尚未填写提示词",
+      "results": "{{count}} 张产物",
+      "configure": "配置生成",
+      "comingSoonHint": "生成能力即将接通（M7）",
+      "mode": {
+        "image": "图像",
+        "text": "文本",
+        "video": "视频"
+      },
+      "status": {
+        "idle": "待配置",
+        "queued": "排队中",
+        "running": "生成中",
+        "success": "已完成",
+        "error": "失败"
+      }
+    },
+    "loop": {
+      "title": "循环",
+      "noTarget": "拖右侧锚点连到生成卡片",
+      "noModel": "目标卡片无可用模型",
+      "count": "次数",
+      "start": "起始",
+      "batch": "批次",
+      "template": "计数注入",
+      "templatePlaceholder": "现在生成第 {i} 张",
+      "previewLabel": "本轮注入",
+      "success": "成功",
+      "failed": "失败",
+      "done": "已完成",
+      "run": "运行循环",
+      "stop": "中止",
+      "mode": {
+        "serial": "串行",
+        "parallel": "并发"
+      },
+      "targetMode": {
+        "image": "图像生成",
+        "video": "视频生成",
+        "text": "文本生成"
+      }
+    },
+    "compare": {
+      "title": "对比",
+      "divider": "对比分界线",
+      "needTwo": "连入两个图源以对比（当前 {{n}}/2）"
+    },
+    "output": {
+      "title": "输出检视",
+      "empty": "从左侧连入一个节点以检视其当前结果",
+      "preview": "大图预览",
+      "textUpstream": "（上游文本节点）",
+      "loadFailed": "加载失败"
+    },
+    "group": {
+      "defaultTitle": "分组",
+      "ungroup": "解组（保留子节点）",
+      "deleteWithChildren": "删除组与内容",
+      "rename": "重命名分组"
+    }
+  }
+}

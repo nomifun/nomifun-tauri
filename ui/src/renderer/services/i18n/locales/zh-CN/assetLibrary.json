@@ -1,0 +1,66 @@
+{
+  "title": "资产库",
+  "subtitle": "统一管理你在创意工坊中沉淀的图片、视频与文本素材：上传、分组、打标签、批量整理与复用。",
+  "actionFailed": "操作失败",
+  "cancel": "取消",
+  "sort": {
+    "createdDesc": "最新",
+    "createdAsc": "最早",
+    "updatedDesc": "最近更新",
+    "nameAsc": "名称",
+    "sizeDesc": "大小"
+  },
+  "tagFilter": {
+    "label": "标签"
+  },
+  "selection": {
+    "count": "已选 {{count}} 项",
+    "selectAll": "全选本页",
+    "clear": "取消选择"
+  },
+  "bulk": {
+    "moveToCollection": "移到集合",
+    "addTags": "加标签",
+    "download": "下载",
+    "removeFromLibrary": "移出库",
+    "delete": "删除",
+    "partial": "{{ok}} 项成功，{{fail}} 项失败",
+    "doneMove": "已移动 {{count}} 项",
+    "doneTag": "已为 {{count}} 项添加标签",
+    "doneRemove": "已移出 {{count}} 项",
+    "doneDelete": "已删除 {{count}} 项",
+    "downloadStarted": "已开始下载 {{count}} 项"
+  },
+  "moveModal": {
+    "title": "移动到集合",
+    "label": "目标集合",
+    "placeholder": "选择或输入集合名，留空则移出分组",
+    "ok": "移动"
+  },
+  "tagModal": {
+    "title": "批量添加标签",
+    "label": "标签",
+    "placeholder": "输入标签后回车",
+    "ok": "添加",
+    "empty": "请至少输入一个标签"
+  },
+  "renameCollection": {
+    "trigger": "重命名集合",
+    "title": "重命名集合",
+    "label": "新集合名",
+    "placeholder": "输入新的集合名",
+    "ok": "重命名",
+    "done": "已更新 {{count}} 项",
+    "required": "请输入新的集合名"
+  },
+  "removeConfirm": {
+    "title": "移出资产库",
+    "content": "选中的 {{count}} 项将从资产库移出，不再显示于此。未被任何画布使用的资产可能在后续清理中被回收。确定继续？",
+    "ok": "移出"
+  },
+  "deleteConfirm": {
+    "title": "删除资产",
+    "content": "确定永久删除选中的 {{count}} 项？该操作不可撤销。",
+    "ok": "删除"
+  }
+}

@@ -1,0 +1,144 @@
+/**
+ * @license
+ * Copyright 2025-2026 NomiFun (nomifun.com)
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Workshop infinite-canvas theming. We reset react-flow's default node chrome
+ * (our node components draw their own cards), theme the MiniMap chrome via
+ * react-flow's own CSS variables, and skin the edges + zoom slider. Theme
+ * variables only — JS-prop colors (dots, minimap fill/mask) are hex-mirrored in
+ * `theme.ts`.
+ */
+
+.nomi-ws-flow {
+  background: var(--color-bg-1);
+}
+
+/* Custom node hosts render their own card → strip default node chrome. */
+.nomi-ws-flow .react-flow__node-image,
+.nomi-ws-flow .react-flow__node-text,
+.nomi-ws-flow .react-flow__node-video,
+.nomi-ws-flow .react-flow__node-generator,
+.nomi-ws-flow .react-flow__node-loop,
+.nomi-ws-flow .react-flow__node-compare,
+.nomi-ws-flow .react-flow__node-output,
+.nomi-ws-flow .react-flow__node-group {
+  background: transparent;
+  border: none;
+  border-radius: 13px;
+  padding: 0;
+  font-size: inherit;
+  color: inherit;
+}
+
+/* Edges — bezier in the brand tint; brighter when hovered / selected. */
+.nomi-ws-flow .react-flow__edge-path {
+  stroke: color-mix(in srgb, rgb(var(--primary-6)) 62%, var(--color-border-3));
+  stroke-width: 2;
+  transition: stroke 0.12s, stroke-width 0.12s;
+}
+.nomi-ws-flow .react-flow__edge:hover .react-flow__edge-path,
+.nomi-ws-flow .react-flow__edge.selected .react-flow__edge-path {
+  stroke: rgb(var(--primary-6));
+  stroke-width: 2.5;
+}
+
+/* Live connection line while dragging from an anchor. */
+.nomi-ws-flow .react-flow__connection-path {
+  stroke: rgb(var(--primary-6));
+  stroke-width: 2.5;
+}
+
+/* Connection handles: subtle at rest, emphasised while a connection is in flight. */
+.nomi-ws-flow .react-flow__handle {
+  transition: transform 0.1s, box-shadow 0.1s;
+}
+.nomi-ws-flow .react-flow__handle.connectionindicator:hover {
+  transform: scale(1.25);
+}
+.nomi-ws-flow .react-flow__handle-connecting {
+  box-shadow: 0 0 0 4px color-mix(in srgb, rgb(var(--primary-6)) 30%, transparent);
+}
+.nomi-ws-flow .react-flow__handle-valid {
+  background: rgb(var(--success-6)) !important;
+  box-shadow: 0 0 0 5px color-mix(in srgb, rgb(var(--success-6)) 32%, transparent);
+}
+
+/* Selection marquee. */
+.nomi-ws-flow .react-flow__selection {
+  background: color-mix(in srgb, rgb(var(--primary-6)) 10%, transparent);
+  border: 1px solid rgb(var(--primary-6));
+}
+
+/* MiniMap rounded chrome. */
+.nomi-ws-flow .react-flow__minimap {
+  border-radius: 11px;
+  overflow: hidden;
+}
+
+/* Zoom slider (bottom control bar). */
+.nomi-ws-zoom-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+}
+.nomi-ws-zoom-slider::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 3px;
+  background: var(--color-fill-3);
+}
+.nomi-ws-zoom-slider::-moz-range-track {
+  height: 3px;
+  border-radius: 3px;
+  background: var(--color-fill-3);
+}
+.nomi-ws-zoom-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  margin-top: -5px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: rgb(var(--primary-6));
+  border: 2px solid var(--color-bg-2);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+  cursor: pointer;
+}
+.nomi-ws-zoom-slider::-moz-range-thumb {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: rgb(var(--primary-6));
+  border: 2px solid var(--color-bg-2);
+  cursor: pointer;
+}
+
+/* Loop-node drive edges: accented cyan, dashed + marching-ants (animated). */
+.nomi-ws-flow .react-flow__edge.nomi-ws-loop-edge .react-flow__edge-path {
+  stroke: #06b6d4;
+  stroke-width: 2.5;
+  stroke-dasharray: 6 4;
+}
+.nomi-ws-flow .react-flow__edge.nomi-ws-loop-edge.selected .react-flow__edge-path,
+.nomi-ws-flow .react-flow__edge.nomi-ws-loop-edge:hover .react-flow__edge-path {
+  stroke: #22d3ee;
+  stroke-width: 3;
+}
+
+/* Group input-group edges: dashed neutral to read as "feeds as references". */
+.nomi-ws-flow .react-flow__edge.nomi-ws-group-edge .react-flow__edge-path {
+  stroke: color-mix(in srgb, rgb(var(--primary-6)) 50%, var(--color-border-3));
+  stroke-dasharray: 3 4;
+}
+
+/* Drag-over affordance while dropping files / assets onto the canvas. */
+.nomi-ws-dropzone-active::after {
+  content: '';
+  position: absolute;
+  inset: 6px;
+  pointer-events: none;
+  border-radius: 16px;
+  border: 2px dashed rgb(var(--primary-6));
+  background: color-mix(in srgb, rgb(var(--primary-6)) 6%, transparent);
+  z-index: 20;
+}

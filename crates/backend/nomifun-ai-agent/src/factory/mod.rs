@@ -116,7 +116,7 @@ pub struct AgentFactoryDeps {
     pub acp_agent_service: Arc<AcpSessionSyncService>,
     pub data_dir: PathBuf,
     /// Root for auto-provisioned temp workspaces
-    /// (`{work_dir}/conversations/{label}-temp-{id}`). Defaults to the data
+    /// (`{work_dir}/conversations/{label}-temp-{token}`). Defaults to the data
     /// dir at composition; kept as its own field so the fallback in
     /// `FactoryContext::resolve` stays in sync with `ConversationService`,
     /// which provisions under `AppConfig.work_dir` — a `--work-dir` /

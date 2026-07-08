@@ -20,6 +20,8 @@ use nomifun_auth::{
 use nomifun_channel::channel_routes;
 use nomifun_companion::{companion_public_routes, companion_routes};
 use nomifun_public_agent::public_agent_routes;
+use nomifun_workshop::{workshop_public_routes, workshop_routes};
+use nomifun_creation::creation_routes;
 use nomifun_conversation::{conversation_ops_routes, conversation_routes};
 use nomifun_cron::cron_routes;
 use nomifun_extension::{extension_routes, hub_routes, skill_routes};
@@ -99,6 +101,17 @@ pub async fn create_router(services: &AppServices) -> Router {
         )),
         idmm_service: states.idmm.service.clone(),
         knowledge_service: services.knowledge_service.clone(),
+        // 创意工坊 canvas index: a fresh repo over the same pool the workshop
+        // routes/service use, backing the read-only nomi_workshop_list_canvases cap.
+        workshop_repo: Arc::new(nomifun_db::SqliteWorkshopRepository::new(
+            services.database.pool().clone(),
+        )),
+        // 创意工坊 canvas/asset + 生成引擎 services: the SAME singletons the
+        // `/api/workshop/*` + `/api/creation/*` routes use, so the 画布助手 agent-op
+        // queue is shared (gateway enqueues; an open frontend polls/acks the same
+        // in-memory queue) and generation tasks land on the one live task queue.
+        workshop_service: services.workshop_service.clone(),
+        creation_service: services.creation_service.clone(),
         autowork_orchestrator: states.requirement.orchestrator.clone(),
         // System domain: reuse the SAME service instances the system routes use
         // (states.system is still owned here; it is moved into `system_routes`
@@ -409,6 +422,17 @@ pub fn create_router_with_all_state(
     let public_agent_authenticated = public_agent_routes(states.public_agent.clone())
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // 创意工坊 (Creative Workshop) canvas/asset routes + 生成引擎 (creation) task
+    // routes — owner-only management surface, behind auth middleware (same as
+    // knowledge). The read-only binary serve routes (`/files/{id}`,
+    // `/canvas-thumbs/{id}`) are split off into `workshop_public_routes` below,
+    // mounted auth-exempt like the companion figure images. `states.workshop`
+    // is cloned so both routers share the one live service (agent-op queue etc).
+    let workshop_authenticated = workshop_routes(states.workshop.clone())
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let creation_authenticated = creation_routes(states.creation)
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // Knowledge Base platform routes protected by auth middleware
     let knowledge_authenticated = knowledge_routes(states.knowledge)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -502,6 +526,13 @@ pub fn create_router_with_all_state(
     // unguessable ids; listing/creation stay authenticated. See `companion_public_routes`.
     let companion_public = companion_public_routes(states.companion);
 
+    // 创意工坊 asset/thumbnail serving — exempt from auth for the same reason as
+    // companion figure images: `<img>`/`<video>` subresource loads can't carry
+    // the local-trust header, so an authenticated route would 403 every asset
+    // preview and canvas gallery thumbnail. GET-only, opaque unguessable ids
+    // (`wsa_`/`wsc_` + uuidv7); listing/upload/mutation stay authenticated.
+    let workshop_public = workshop_public_routes(states.workshop);
+
     // WebSocket upgrade route — exempt from CSRF (no cookie-based
     // double-submit) but still gets security response headers.
     let ws_routes = Router::new()
@@ -564,6 +595,8 @@ pub fn create_router_with_all_state(
         .merge(idmm_authenticated)
         .merge(companion_authenticated)
         .merge(public_agent_authenticated)
+        .merge(workshop_authenticated)
+        .merge(creation_authenticated)
         .merge(knowledge_authenticated)
         .merge(webhook_authenticated)
         .merge(orchestrator_authenticated)
@@ -596,6 +629,7 @@ pub fn create_router_with_all_state(
     .merge(office_proxy)
     .merge(public_assets)
     .merge(companion_public)
+    .merge(workshop_public)
     .layer(middleware::from_fn(security_headers_middleware));
 
     // Raise the default request body limit from axum's 2MB default to

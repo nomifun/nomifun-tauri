@@ -46,6 +46,8 @@ use nomifun_orchestrator::{
 };
 use nomifun_companion::CompanionRouterState;
 use nomifun_public_agent::PublicAgentRouterState;
+use nomifun_workshop::WorkshopRouterState;
+use nomifun_creation::CreationRouterState;
 use nomifun_realtime::{NoopMessageRouter, WsHandlerState};
 use nomifun_requirement::RequirementRouterState;
 use nomifun_shell::ShellRouterState;
@@ -84,6 +86,10 @@ pub struct ModuleStates {
     pub knowledge: KnowledgeRouterState,
     pub companion: CompanionRouterState,
     pub public_agent: PublicAgentRouterState,
+    /// 创意工坊 (Creative Workshop) canvas/asset domain.
+    pub workshop: WorkshopRouterState,
+    /// 生成引擎 (creation) media task queue.
+    pub creation: CreationRouterState,
     pub webhook: WebhookRouterState,
     /// 智能编排 (orchestration): fleet + workspace CRUD state (P0).
     pub orchestrator: OrchestratorRouterState,
@@ -101,7 +107,7 @@ fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::P
         dirs::home_dir().unwrap_or_else(std::env::temp_dir),
     ];
     // Auto-provisioned per-conversation workspaces live under
-    // `{work_dir}/conversations/{label}-temp-{id}/`. On Windows the
+    // `{work_dir}/conversations/{label}-temp-{token}/`. On Windows the
     // operator may put `work_dir` on a separate drive (e.g. `X:\Nomi`)
     // that's neither under `temp_dir` nor `home_dir`, which previously
     // caused `/api/fs/list` to 403 every Hermes-mode session
@@ -180,6 +186,7 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
     let agent_service = AgentService::new(
         services.agent_registry.clone(),
         provider_repo,
+        services.model_profile_repo.clone(),
         encryption_key,
         services.data_dir.clone(),
     );
@@ -217,6 +224,8 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
         knowledge: KnowledgeRouterState::new(services.knowledge_service.clone()),
         companion: companion_state,
         public_agent: PublicAgentRouterState::new(services.public_agent_service.clone()),
+        workshop: build_workshop_state(services),
+        creation: build_creation_state(services),
         webhook: build_webhook_state(services),
         // P3b: arm IDMM supervision on the orchestrator engine's DEDICATED
         // ConversationService (the one worker turns run on) by handing it the
@@ -316,6 +325,9 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
         provider_service: ProviderService::new(provider_repo.clone(), encryption_key)
             .with_deletion_coordinator(deletion_coordinator),
         model_fetch_service: ModelFetchService::new_dynamic(provider_repo, encryption_key),
+        model_profile_service: nomifun_system::ModelProfileService::new(
+            services.model_profile_repo.clone(),
+        ),
         protocol_detection_service: ProtocolDetectionService::new_dynamic(),
         version_check_service: VersionCheckService::new_dynamic(env!("CARGO_PKG_VERSION").to_owned()),
         data_dir: services.data_dir.clone(),
@@ -923,6 +935,27 @@ pub fn build_webhook_state(services: &AppServices) -> WebhookRouterState {
     let sender: Arc<dyn nomifun_webhook::WebhookSender> = Arc::new(nomifun_webhook::DefaultWebhookSender::new());
     let service = nomifun_webhook::WebhookService::new(webhook_repo, tag_setting_repo, sender);
     WebhookRouterState { service }
+}
+
+/// Build the 创意工坊 (Creative Workshop) router state, reusing the singleton
+/// `workshop_service` (canvas/asset CRUD + on-disk docs/binaries).
+pub fn build_workshop_state(services: &AppServices) -> WorkshopRouterState {
+    WorkshopRouterState::new(services.workshop_service.clone())
+}
+
+/// Build the 生成引擎 (creation) router state, reusing the singleton
+/// `creation_service`, and settle any task left live by a previous process
+/// (boot reconciliation — "running ⟺ live worker" invariant). The reconcile is
+/// detached + best-effort, mirroring the other boot-resume tasks.
+pub fn build_creation_state(services: &AppServices) -> CreationRouterState {
+    let service = services.creation_service.clone();
+    {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service.reconcile_on_boot().await;
+        });
+    }
+    CreationRouterState::new(service)
 }
 
 /// Wraps [`ConversationService::cancel`] so the [`RunEngine`] can end an

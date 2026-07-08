@@ -1,0 +1,83 @@
+{
+  "title": "Image Editor",
+  "tabs": {
+    "crop": "Crop",
+    "mask": "Mask",
+    "split": "Split",
+    "upscale": "Upscale"
+  },
+  "common": {
+    "cancel": "Cancel",
+    "apply": "Apply",
+    "applying": "Processing…",
+    "close": "Close"
+  },
+  "stage": {
+    "zoomIn": "Zoom in",
+    "zoomOut": "Zoom out",
+    "resetView": "Fit to window",
+    "hint": "Scroll to zoom · hold Space to pan"
+  },
+  "crop": {
+    "aspect": "Aspect ratio",
+    "free": "Free",
+    "original": "Original",
+    "size": "Crop size",
+    "width": "Width",
+    "height": "Height",
+    "position": "Position",
+    "hint": "Drag the frame to move, drag a handle to resize; press outside to draw a new frame."
+  },
+  "mask": {
+    "tool": "Brush tool",
+    "brush": "Paint",
+    "erase": "Erase",
+    "brushSize": "Brush size",
+    "undo": "Undo",
+    "redo": "Redo",
+    "clear": "Clear",
+    "promptLabel": "Edit prompt",
+    "promptPlaceholder": "Describe how you want the painted area changed…",
+    "hint": "Paint the area to repaint (red). In the exported mask the painted area is transparent and the rest is white."
+  },
+  "split": {
+    "mode": "Split mode",
+    "equal": "Even",
+    "custom": "Custom",
+    "grid": "Grid",
+    "rows": "Rows",
+    "cols": "Cols",
+    "gap": "Seam gap",
+    "lines": "Split lines",
+    "addVertical": "Vertical",
+    "addHorizontal": "Horizontal",
+    "noLines": "No split lines yet",
+    "vLine": "Vertical",
+    "hLine": "Horizontal",
+    "lineGap": "Gap",
+    "result": "Result",
+    "pieces": "Pieces",
+    "pieceSize": "Piece size",
+    "hintEqual": "Split evenly by rows and columns; the seam gap trims half its width on each side of every line to remove AI grid-image seams.",
+    "hintCustom": "After adding a line, drag it on the canvas to fine-tune; each line has its own seam gap."
+  },
+  "upscale": {
+    "target": "Target size (longest edge)",
+    "algo": "Algorithm",
+    "progressive": "HD progressive",
+    "progressiveDesc": "Steps up 2× at a time for smoother edges",
+    "bilinear": "Bilinear",
+    "bilinearDesc": "Single smooth resample, fast",
+    "nearest": "Nearest",
+    "nearestDesc": "Keeps hard pixels, good for pixel art",
+    "summary": "Size comparison",
+    "before": "Original",
+    "after": "Upscaled",
+    "estSize": "Est. size",
+    "hint": "Local interpolation only raises resolution without adding detail; use AI super-resolution for a sharper result."
+  },
+  "errors": {
+    "loadFailed": "Failed to load image",
+    "exportFailed": "Processing failed"
+  }
+}

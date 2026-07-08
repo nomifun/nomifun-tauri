@@ -1,0 +1,78 @@
+{
+  "card": {
+    "title": "Generation"
+  },
+  "mode": {
+    "image": "Image",
+    "video": "Video",
+    "text": "Text"
+  },
+  "status": {
+    "idle": "Idle",
+    "queued": "Queued",
+    "running": "Generating",
+    "success": "Done",
+    "error": "Failed"
+  },
+  "model": {
+    "placeholder": "Select model",
+    "search": "Search models…",
+    "emptyNoMatch": "No matching models",
+    "emptyNoProviders": "No model platforms configured",
+    "goToHub": "Open Model Hub"
+  },
+  "prompt": {
+    "placeholder": "Describe what to generate — type @ to reference assets…"
+  },
+  "mention": {
+    "title": "Reference assets",
+    "onCanvas": "Canvas",
+    "inLibrary": "Library",
+    "assetLabel": "Library asset",
+    "missing": "Unavailable",
+    "remove": "Remove reference"
+  },
+  "input": {
+    "upstream": "Upstream link"
+  },
+  "param": {
+    "size": "Size",
+    "count": "Count",
+    "quality": "Quality",
+    "duration": "Duration",
+    "seconds": "s",
+    "resolution": "Resolution",
+    "aspect": "Aspect",
+    "audio": "Generate audio",
+    "watermark": "Watermark"
+  },
+  "size": {
+    "square": "1:1",
+    "landscape43": "4:3",
+    "portrait34": "3:4",
+    "wide169": "16:9",
+    "tall916": "9:16",
+    "twoK": "2K",
+    "fourK": "4K"
+  },
+  "quality": {
+    "auto": "Auto",
+    "high": "High",
+    "medium": "Medium",
+    "low": "Low"
+  },
+  "run": {
+    "run": "Generate",
+    "regenerate": "Regenerate",
+    "cancel": "Cancel",
+    "noModel": "Select a model first"
+  },
+  "result": {
+    "continuePlaceholder": "Continue editing — type an instruction, press Enter…",
+    "continue": "Continue editing",
+    "loading": "Loading…",
+    "loadFailed": "Failed to load",
+    "toTextNode": "Turn into text node",
+    "batch": "{{count}} images"
+  }
+}
