@@ -13,6 +13,7 @@
  */
 
 import type { IConfirmation } from '@/common/chat/chatLib';
+import { bridge } from '@/platform';
 import {
   noopEmitter,
   shellEmitter,
@@ -661,7 +662,7 @@ export const starOffice = {
 export const dialog = {
   showOpen: shellProvider<string[] | undefined, ShellOpenDialogOptions | void>(
     (opts) => tauriOpenDialog(opts || undefined),
-    undefined
+    (opts) => bridge.invoke<string[] | undefined>('show-open', opts || undefined)
   ),
 };
 

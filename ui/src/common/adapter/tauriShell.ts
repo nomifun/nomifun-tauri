@@ -52,13 +52,15 @@ export interface ShellEmitter<Params> {
 /** A provider backed by a Tauri call, with a web-safe fallback for the browser. */
 export function shellProvider<Data, Params = void>(
   handler: (params: Params) => Promise<Data>,
-  webFallback: Data | (() => Data | Promise<Data>)
+  webFallback: Data | ((params: Params) => Data | Promise<Data>)
 ): ShellProvider<Data, Params> {
   return {
     provider: () => {},
     invoke: async (params: Params): Promise<Data> => {
       if (isTauri()) return handler(params);
-      return typeof webFallback === 'function' ? (webFallback as () => Data | Promise<Data>)() : webFallback;
+      return typeof webFallback === 'function'
+        ? (webFallback as (p: Params) => Data | Promise<Data>)(params)
+        : webFallback;
     },
   };
 }
