@@ -20,18 +20,20 @@
  *      `cargo sweep --maxsize` to trim the OLDEST artifacts back under the cap.
  *      `--maxsize` is a no-op when already small (unlike `--time 1`, which would
  *      wrongly delete still-valid deps that simply haven't changed in a day).
- *   4. Hard backstop: if build.noindex STILL exceeds CAP_GB, nuke debug/ + release/
- *      intermediates wholesale (all-or-nothing on Windows; see invariants below).
- *      This is the "can never silently balloon" guarantee.
+ *   4. Hard backstop: if build.noindex or target STILL exceeds CAP_GB, nuke
+ *      debug/ + release/ intermediates (all-or-nothing on Windows for profile
+ *      dirs; release bundles are preserved). This is the "can never silently
+ *      balloon" guarantee.
  *
  * Release build split (so the heavy reclaim never delays compile start):
  *   --pre   cheap, output-cleaning preflight run by tauri's beforeBuildCommand
  *           BEFORE the release compile: drop the stale bundle (old installers) +
  *           junk. Runs in seconds, so cargo starts compiling immediately.
  *   --post  heavy reclaim run AFTER a successful release build: nuke the debug
- *           (dev) profile + flycheck — dead weight for a release. NEVER touches
- *           release/ intermediates or the freshly-built bundle. NOTE: the next
- *           dev build is therefore a cold rebuild (debug was reclaimed).
+ *           (dev) profiles + flycheck — dead weight for a release, including
+ *           known target/<triple>/debug dirs. NEVER touches release/
+ *           intermediates or the freshly-built bundle. NOTE: the next dev build
+ *           is therefore a cold rebuild (debug was reclaimed).
  *   --release  full reclaim = --pre + --post in one shot. This is `bun run clean`
  *           (reclaim everything on demand, without building).
  *
@@ -54,7 +56,9 @@
  *   - Fast in the normal case: GC + du checks only; cargo-sweep runs ONLY when
  *     a dir is genuinely over cap.
  *   - Safe: only ever deletes regenerable build artifacts, never source code.
- *     Does NOT touch <target-triple> dirs (e.g. an intended Linux/cross build).
+ *     Only touches known Rust target triple dirs for supported desktop targets
+ *     (Linux/macOS/Windows), and preserves release/bundle outputs when trimming
+ *     release intermediates.
  *   - Idempotent: a second run in a row is a near no-op.
  *
  * Usage (always via package.json / tauri beforeBuildCommand, never by hand):
@@ -74,6 +78,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const BUILD_DIR = join(ROOT, 'build.noindex');
 const TARGET_DIR = join(ROOT, 'target');
 const isWin = process.platform === 'win32';
+const KNOWN_TARGET_TRIPLE_RE = /^(x86_64|aarch64)-unknown-linux-gnu$|^(x86_64|aarch64)-pc-windows-msvc$|^(x86_64|aarch64|universal)-apple-darwin$/;
 
 // ── Tunables ───────────────────────────────────────────────────────────────
 // Steady state after GC is ~3-4G, so these caps leave generous headroom and
@@ -136,6 +141,65 @@ function dirSizeGB(dir) {
 function fmtGB(gb) {
   if (gb < 1) return `${(gb * 1024).toFixed(0)}M`;
   return `${gb.toFixed(1)}G`;
+}
+
+function relPath(p) {
+  return p.startsWith(ROOT) ? p.slice(ROOT.length + 1) : p;
+}
+
+/** Known target/<triple>/ dirs that this project may create for desktop builds. */
+function knownTargetTripleDirs() {
+  if (!existsSync(TARGET_DIR)) return [];
+  try {
+    return readdirSync(TARGET_DIR, { withFileTypes: true })
+      .filter((ent) => ent.isDirectory() && KNOWN_TARGET_TRIPLE_RE.test(ent.name))
+      .map((ent) => ({ name: ent.name, dir: join(TARGET_DIR, ent.name) }));
+  } catch {
+    return [];
+  }
+}
+
+/** Incremental cache dirs across default and known target-triple profiles. */
+function incrementalCacheDirs() {
+  const dirs = [
+    join(BUILD_DIR, 'debug', 'incremental'),
+    join(BUILD_DIR, 'release', 'incremental'),
+    join(TARGET_DIR, 'debug', 'incremental'),
+    join(TARGET_DIR, 'release', 'incremental'),
+  ];
+  for (const { dir } of knownTargetTripleDirs()) {
+    dirs.push(join(dir, 'debug', 'incremental'));
+    dirs.push(join(dir, 'release', 'incremental'));
+  }
+  return dirs;
+}
+
+/** Remove stale bundle outputs across default and known target-triple release dirs. */
+function removeStaleBundleDirs() {
+  rmDir(join(TARGET_DIR, 'release', 'bundle'), 'target/release/bundle (stale installers)');
+  for (const { name, dir } of knownTargetTripleDirs()) {
+    rmDir(join(dir, 'release', 'bundle'), `target/${name}/release/bundle (stale installers)`);
+  }
+}
+
+/**
+ * Clear release intermediates while preserving release/bundle. This protects
+ * freshly built installers and updater signatures while reclaiming deps/build/
+ * .fingerprint/incremental/root binaries that cargo can regenerate.
+ */
+function clearReleaseIntermediatesPreservingBundle(releaseDir, label) {
+  if (!existsSync(releaseDir)) return;
+  let removed = 0;
+  try {
+    for (const ent of readdirSync(releaseDir, { withFileTypes: true })) {
+      if (ent.name === 'bundle') continue;
+      rmSync(join(releaseDir, ent.name), { recursive: true, force: true });
+      removed++;
+    }
+    if (removed > 0) log(`  removed ${label} intermediates (kept release/bundle)`);
+  } catch (e) {
+    log(`  WARN: could not clear ${label} intermediates: ${e.message}`);
+  }
 }
 
 /**
@@ -221,9 +285,7 @@ function nukeProfileAllOrNothing(profileDir, label) {
 /** Drop the regenerable incremental cache on both profiles (warmth-only lever). */
 function dropIncrementalCaches(reason) {
   log(`  ${reason} — dropping incremental cache (regenerable; costs only rebuild warmth)`);
-  rmDir(join(BUILD_DIR, 'debug', 'incremental'), 'build.noindex/debug/incremental');
-  rmDir(join(BUILD_DIR, 'release', 'incremental'), 'build.noindex/release/incremental');
-  rmDir(join(TARGET_DIR, 'debug', 'incremental'), 'target/debug/incremental');
+  for (const dir of incrementalCacheDirs()) rmDir(dir, relPath(dir));
 }
 
 /**
@@ -234,7 +296,7 @@ function dropIncrementalCaches(reason) {
  */
 function preReleaseClean() {
   log('pre-release: dropping stale bundle + junk (fast — compile starts now)...');
-  rmDir(join(TARGET_DIR, 'release', 'bundle'), 'target/release/bundle (stale installers)');
+  removeStaleBundleDirs();
   rmGlob(BUILD_DIR, /^_.*\.(log|json|out|err)$/, 'leftover log/json');
   rmDir(join(BUILD_DIR, 'tmp'), 'build.noindex/tmp');
 }
@@ -251,6 +313,9 @@ function reclaimDebugDeadWeight() {
   killStaleLockers(); // release locks before wholesale deletes (Windows)
   nukeProfileAllOrNothing(join(BUILD_DIR, 'debug'), 'build.noindex/debug');
   nukeProfileAllOrNothing(join(TARGET_DIR, 'debug'), 'target/debug');
+  for (const { name, dir } of knownTargetTripleDirs()) {
+    nukeProfileAllOrNothing(join(dir, 'debug'), `target/${name}/debug`);
+  }
   rmDir(join(TARGET_DIR, 'flycheck0'), 'target/flycheck0');
 }
 
@@ -262,14 +327,14 @@ function cargoSweepInstalled() {
   } catch { return false; }
 }
 
-/** Windows: warn (never auto-delete) when the build drive is running low. */
+/** Warn (never auto-delete unrelated files) when the build drive is running low. */
 function freeSpaceWarn() {
-  if (!isWin) return;
   try {
     const s = statfsSync(ROOT);
     const freeGB = (s.bsize * s.bavail) / 1024 ** 3;
-    if (freeGB < 50) {
-      log(`WARN: only ${fmtGB(freeGB)} free on the build drive — run a --release build to reclaim, or 'cargo clean'`);
+    const warnGB = isWin ? 50 : 20;
+    if (freeGB < warnGB) {
+      log(`WARN: only ${fmtGB(freeGB)} free on the build drive — run 'bun run clean' to reclaim, or 'cargo clean'`);
     }
   } catch { /* statfsSync unavailable — skip */ }
 }
@@ -388,7 +453,7 @@ try {
     // 1) Per-unit incremental GC — keeps warmth, drops dead sessions.
     //    Covers the split build-dir AND the target/ fallback (older cargo that
     //    ignores the build-dir key puts intermediates under target/ instead).
-    for (const incrDir of [join(BUILD_DIR, 'debug', 'incremental'), join(TARGET_DIR, 'debug', 'incremental')]) {
+    for (const incrDir of incrementalCacheDirs()) {
       if (!existsSync(incrDir)) continue;
       const incrGB = dirSizeGB(incrDir);
       pruneIncrementalSessions(incrDir);
@@ -409,8 +474,9 @@ try {
       if (haveSweep) cargoSweepMaxsize(BUILD_DIR, BUILD_MAXSIZE_GB, 'build.noindex');
       else dropIncrementalCaches('build.noindex over soft cap, cargo-sweep absent');
     }
-    if (dirSizeGB(TARGET_DIR) > TARGET_MAXSIZE_GB && haveSweep) {
-      cargoSweepMaxsize(TARGET_DIR, TARGET_MAXSIZE_GB, 'target');
+    if (dirSizeGB(TARGET_DIR) > TARGET_MAXSIZE_GB) {
+      if (haveSweep) cargoSweepMaxsize(TARGET_DIR, TARGET_MAXSIZE_GB, 'target');
+      else dropIncrementalCaches('target over soft cap, cargo-sweep absent');
     }
 
     // 4) Hard backstop — the "can never silently balloon" guarantee. Covers BOTH
@@ -424,6 +490,18 @@ try {
       // release/ holds only intermediates here (final binaries land in target/),
       // so dropping it is safe; the next release build is simply a cold one.
       nukeProfileAllOrNothing(join(BUILD_DIR, 'release'), 'build.noindex/release (cap exceeded)');
+    }
+
+    const targetNowGB = dirSizeGB(TARGET_DIR);
+    if (targetNowGB > CAP_GB) {
+      log(`WARN: target is ${fmtGB(targetNowGB)} > cap ${CAP_GB}G — reclaiming debug profiles + release intermediates as last resort`);
+      killStaleLockers();
+      nukeProfileAllOrNothing(join(TARGET_DIR, 'debug'), 'target/debug (cap exceeded)');
+      clearReleaseIntermediatesPreservingBundle(join(TARGET_DIR, 'release'), 'target/release (cap exceeded)');
+      for (const { name, dir } of knownTargetTripleDirs()) {
+        nukeProfileAllOrNothing(join(dir, 'debug'), `target/${name}/debug (cap exceeded)`);
+        clearReleaseIntermediatesPreservingBundle(join(dir, 'release'), `target/${name}/release (cap exceeded)`);
+      }
     }
   }
 

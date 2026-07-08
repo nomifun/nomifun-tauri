@@ -114,6 +114,10 @@ for t in "${TRIPLES[@]}"; do
 done
 
 echo ""
+echo "▶ 清理 Linux 构建后 debug/flycheck 中间产物(保留 release 安装包与 updater 签名)..."
+bun scripts/prune-build.mjs --post
+
+echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "✅ 全部完成,安装包已汇总到 $DIST :"
 for f in "${COLLECTED[@]}"; do

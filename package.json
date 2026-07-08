@@ -17,6 +17,7 @@
     "make:latest": "bun scripts/make-latest-json.mjs",
     "release:mac": "bun scripts/run-mac-release.mjs",
     "release:win": "bun scripts/run-win-release.mjs",
+    "release:linux": "bun scripts/run-linux-release.mjs",
     "build:ui": "bun run --filter=./ui build",
     "serve:web": "bun scripts/prune-build.mjs && bun scripts/free-ports.mjs 8787 && cargo run -p nomifun-web",
     "test": "bun scripts/prune-build.mjs && cargo test",
