@@ -214,6 +214,86 @@ body[arco-theme='dark'] .sider-soft-popover .arco-popover-arrow {
   opacity: 1 !important;
 }
 
+/* Knowledge detail page: keep text contrast tied to semantic foreground tokens,
+   while active states use the current theme color only as a soft surface/accent. */
+.knowledge-detail-tabs .arco-tabs-nav,
+.knowledge-detail-tabs .arco-tabs-header-nav {
+  border-bottom-color: var(--color-border-2) !important;
+}
+
+.knowledge-detail-tabs .arco-tabs-nav-tab,
+.knowledge-detail-tabs .arco-tabs-header-title {
+  color: var(--color-text-2) !important;
+}
+
+.knowledge-detail-tabs .arco-tabs-nav-tab:hover,
+.knowledge-detail-tabs .arco-tabs-header-title:hover,
+.knowledge-detail-tabs .arco-tabs-nav-tab-active,
+.knowledge-detail-tabs .arco-tabs-header-title-active {
+  color: var(--color-text-1) !important;
+}
+
+.knowledge-detail-tabs .arco-tabs-nav-tab-active,
+.knowledge-detail-tabs .arco-tabs-header-title-active {
+  font-weight: 600;
+}
+
+.knowledge-detail-tabs .arco-tabs-nav-ink,
+.knowledge-detail-tabs .arco-tabs-header-ink {
+  background-color: rgb(var(--primary-6)) !important;
+}
+
+.knowledge-detail-settings-input,
+.knowledge-detail-settings-input .arco-input-inner-wrapper,
+.knowledge-detail-settings-input.arco-input,
+.knowledge-detail-settings-input.arco-textarea {
+  background-color: var(--color-fill-1) !important;
+  border-color: var(--color-border-2) !important;
+  color: var(--color-text-1) !important;
+}
+
+.knowledge-detail-settings-input:hover,
+.knowledge-detail-settings-input:hover .arco-input-inner-wrapper,
+.knowledge-detail-settings-input.arco-input:hover,
+.knowledge-detail-settings-input.arco-textarea:hover {
+  background-color: var(--color-fill-2) !important;
+  border-color: var(--color-border-3) !important;
+}
+
+.knowledge-detail-settings-input.arco-input-focus,
+.knowledge-detail-settings-input.arco-textarea-focus,
+.knowledge-detail-settings-input .arco-input-inner-wrapper-focus,
+.knowledge-detail-settings-input:focus,
+.knowledge-detail-settings-input:focus-within {
+  background-color: var(--color-bg-2) !important;
+  border-color: rgba(var(--primary-6), 0.36) !important;
+  box-shadow: 0 0 0 3px rgba(var(--primary-6), 0.12) !important;
+}
+
+.knowledge-detail-settings-input .arco-input,
+.knowledge-detail-settings-input textarea,
+.knowledge-detail-settings-input.arco-input,
+.knowledge-detail-settings-input.arco-textarea {
+  color: var(--color-text-1) !important;
+}
+
+.knowledge-detail-settings-input .arco-input::placeholder,
+.knowledge-detail-settings-input textarea::placeholder,
+.knowledge-detail-settings-input.arco-input::placeholder,
+.knowledge-detail-settings-input.arco-textarea::placeholder {
+  color: var(--color-text-4) !important;
+  opacity: 1 !important;
+}
+
+.knowledge-detail-danger-panel {
+  background: color-mix(in srgb, var(--danger) 7%, var(--color-bg-2));
+  border-color: color-mix(in srgb, var(--danger) 30%, var(--color-border-2)) !important;
+}
+
+.knowledge-detail-danger-title {
+  color: var(--color-text-1) !important;
+}
+
 /* Modal form controls need visible idle outlines so fields don't disappear into the dialog surface. */
 .arco-modal
   .arco-input:not(.arco-input-disabled):not(.arco-input-error):not(.arco-input-warning):not(.arco-input-focus):not(

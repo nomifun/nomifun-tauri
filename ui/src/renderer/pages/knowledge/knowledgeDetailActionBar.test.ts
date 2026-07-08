@@ -61,4 +61,18 @@ describe('Knowledge detail document action bar', () => {
     expect(detailSource.includes("onClick={() => setConnectorVisible(true)}")).toBe(false);
     expect(detailSource.includes("onConnectorOpen={() => setConnectorVisible(true)}")).toBe(false);
   });
+
+  test('uses theme-aware contrast for detail badges, active tabs, and settings fields', () => {
+    expect(detailSource.includes('knowledge-detail-soft-active')).toBe(true);
+    expect(detailSource.includes('knowledge-detail-kind-badge')).toBe(true);
+    expect(detailSource.includes('knowledge-detail-user-tag')).toBe(true);
+    expect(detailSource.includes('knowledge-detail-add-tag')).toBe(true);
+    expect(detailSource.includes('knowledge-detail-tabs')).toBe(true);
+    expect(detailSource.includes('knowledge-detail-settings-input')).toBe(true);
+    expect(detailSource.includes('knowledge-detail-danger-panel')).toBe(true);
+    expect(detailSource.includes("textClass: 'text-[rgb(var(--primary-5))]'")).toBe(false);
+    expect(detailSource.includes("textClass: 'text-[rgb(var(--success-5))]'")).toBe(false);
+    expect(detailSource.includes("textClass: 'text-[rgb(var(--warning-5))]'")).toBe(false);
+    expect(detailSource.includes('!bg-primary-1 !text-primary-6 font-600')).toBe(false);
+  });
 });

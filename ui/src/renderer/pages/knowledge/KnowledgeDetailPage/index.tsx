@@ -110,7 +110,7 @@ function getKindConfig(kind: IKnowledgeBase['kind'], t: TFunction): KindConfig {
       return {
         label: t('knowledge.card.kindLocal', { defaultValue: '本地文件夹' }),
         bgClass: 'bg-[rgba(var(--primary-6),0.1)]',
-        textClass: 'text-[rgb(var(--primary-5))]',
+        textClass: 'text-[var(--color-text-1)]',
         borderClass: 'border-[rgba(var(--primary-6),0.3)]',
         iconBg: 'rgba(var(--primary-6),0.1)',
         iconBorder: 'rgba(var(--primary-6),0.3)',
@@ -120,7 +120,7 @@ function getKindConfig(kind: IKnowledgeBase['kind'], t: TFunction): KindConfig {
       return {
         label: t('knowledge.card.kindWeb', { defaultValue: '网页' }),
         bgClass: 'bg-[rgba(var(--success-6),0.1)]',
-        textClass: 'text-[rgb(var(--success-5))]',
+        textClass: 'text-[var(--color-text-1)]',
         borderClass: 'border-[rgba(var(--success-6),0.3)]',
         iconBg: 'rgba(var(--success-6),0.1)',
         iconBorder: 'rgba(var(--success-6),0.3)',
@@ -130,7 +130,7 @@ function getKindConfig(kind: IKnowledgeBase['kind'], t: TFunction): KindConfig {
       return {
         label: t('knowledge.card.kindFeishu', { defaultValue: '飞书' }),
         bgClass: 'bg-[rgba(var(--warning-6),0.12)]',
-        textClass: 'text-[rgb(var(--warning-5))]',
+        textClass: 'text-[var(--color-text-1)]',
         borderClass: 'border-[rgba(var(--warning-6),0.3)]',
         iconBg: 'rgba(var(--warning-6),0.12)',
         iconBorder: 'rgba(var(--warning-6),0.3)',
@@ -178,6 +178,13 @@ function collectKnowledgeDirKeys(nodes: IKnowledgeTreeEntry[]): string[] {
   visit(nodes);
   return keys;
 }
+
+const knowledgeDetailSoftActiveClass =
+  'knowledge-detail-soft-active border border-solid border-[rgba(var(--primary-6),0.26)] bg-[rgba(var(--primary-6),0.12)] text-[var(--color-text-1)] shadow-[inset_0_0_0_1px_rgba(var(--primary-6),0.06)]';
+const knowledgeDetailSegmentIdleClass =
+  'border border-solid border-transparent text-[var(--color-text-2)] hover:bg-[var(--color-fill-2)] hover:text-[var(--color-text-1)]';
+const knowledgeDetailSettingsLabelClass = 'block text-13px font-600 text-[var(--color-text-1)]';
+const knowledgeDetailSettingsInputClass = 'knowledge-detail-settings-input';
 
 // ─── Settings Tab (D5) ────────────────────────────────────────────────────────
 
@@ -305,32 +312,34 @@ const SettingsTab: React.FC<SettingsTabProps> = ({ base, allTags, createTag, onR
       <div className='flex flex-col gap-16px'>
         {/* Name */}
         <div className='flex flex-col gap-7px'>
-          <label className='block text-13px text-[var(--color-text-2)]'>
+          <label className={knowledgeDetailSettingsLabelClass}>
             {t('knowledge.detail.settings.labelName', { defaultValue: '名称' })}
           </label>
           <Input
             value={editName}
             onChange={setEditName}
+            className={knowledgeDetailSettingsInputClass}
             placeholder={t('knowledge.detail.settings.namePlaceholder', { defaultValue: '知识库名称' })}
           />
         </div>
 
         {/* Description */}
         <div className='flex flex-col gap-7px'>
-          <label className='block text-13px text-[var(--color-text-2)]'>
+          <label className={knowledgeDetailSettingsLabelClass}>
             {t('knowledge.detail.settings.labelDesc', { defaultValue: '描述（注入会话提示词）' })}
           </label>
           <Input.TextArea
             value={editDesc}
             onChange={setEditDesc}
             autoSize={{ minRows: 3, maxRows: 8 }}
+            className={knowledgeDetailSettingsInputClass}
             placeholder={t('knowledge.detail.settings.descPlaceholder', { defaultValue: '简要描述知识库内容和用途' })}
           />
         </div>
 
         {/* Tags */}
         <div className='flex flex-col gap-7px'>
-          <label className='block text-13px text-[var(--color-text-2)]'>
+          <label className={knowledgeDetailSettingsLabelClass}>
             {t('knowledge.detail.settings.labelTags', { defaultValue: '标签' })}
           </label>
           <TagPicker value={editTags} onChange={setEditTags} tags={allTags} createTag={createTag} />
@@ -346,7 +355,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({ base, allTags, createTag, onR
 
       {/* ─── Source section (varies by kind) ─── */}
       <div className='flex flex-col gap-7px'>
-        <label className='block text-13px text-[var(--color-text-2)]'>
+        <label className={knowledgeDetailSettingsLabelClass}>
           {t('knowledge.detail.settings.labelSource', { defaultValue: '来源' })}
           {' · '}
           {base.kind === 'local' && t('knowledge.card.kindLocal', { defaultValue: '本地文件夹' })}
@@ -357,7 +366,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({ base, allTags, createTag, onR
 
         {base.kind === 'local' && (
           <div className='flex items-center gap-9px'>
-            <Input value={base.root_path} readOnly className='flex-1' />
+            <Input value={base.root_path} readOnly className={`${knowledgeDetailSettingsInputClass} flex-1`} />
             <Button
               icon={<FolderOpen theme='outline' size='14' />}
               onClick={() => {
@@ -406,13 +415,13 @@ const SettingsTab: React.FC<SettingsTabProps> = ({ base, allTags, createTag, onR
       </div>
 
       {/* ─── Danger zone ─── */}
-      <div className='box-border rd-12px border border-solid border-[rgba(var(--danger-6),0.3)] p-16px mt-8px'>
-        <div className='text-13px font-700 text-[rgb(var(--danger-6))] mb-10px'>
+      <div className='knowledge-detail-danger-panel box-border rd-12px border border-solid p-16px mt-8px'>
+        <div className='knowledge-detail-danger-title text-13px font-700 text-[var(--color-text-1)] mb-10px'>
           {t('knowledge.detail.settings.dangerTitle', { defaultValue: '危险操作' })}
         </div>
         {/* Export */}
         <div className='flex items-center justify-between gap-12px mb-9px'>
-          <p className='m-0 text-12px text-[var(--color-text-3)]'>
+          <p className='m-0 text-12px text-[var(--color-text-2)]'>
             {t('knowledge.detail.settings.exportDesc', { defaultValue: '导出为 .zip 备份包' })}
           </p>
           <Button size='small' loading={exporting} onClick={() => void handleExport()}>
@@ -421,10 +430,10 @@ const SettingsTab: React.FC<SettingsTabProps> = ({ base, allTags, createTag, onR
         </div>
         {/* Delete */}
         <div className='flex items-center justify-between gap-12px'>
-          <p className='m-0 text-12px text-[var(--color-text-3)]'>
+          <p className='m-0 text-12px text-[var(--color-text-2)]'>
             {t('knowledge.detail.settings.deleteDesc', { defaultValue: '删除此知识库' })}
             {!base.managed && (
-              <span className='block text-11px mt-2px text-[var(--color-text-3)]'>
+              <span className='block text-11px mt-2px text-[var(--color-text-2)]'>
                 {t('knowledge.detail.settings.deleteLocalHint', { defaultValue: '（本地引用目录不会被删除）' })}
               </span>
             )}
@@ -960,7 +969,7 @@ const KnowledgeDetailPage: React.FC = () => {
                 {/* Kind badge */}
                 {kindConfig && (
                   <span
-                    className={`inline-flex items-center rounded-6px px-8px py-2px text-10px font-600 border border-solid ${kindConfig.bgClass} ${kindConfig.textClass} ${kindConfig.borderClass}`}
+                    className={`knowledge-detail-kind-badge inline-flex items-center rounded-6px px-8px py-2px text-10px font-600 border border-solid ${kindConfig.bgClass} ${kindConfig.textClass} ${kindConfig.borderClass}`}
                   >
                     {kindConfig.label}
                   </span>
@@ -971,7 +980,7 @@ const KnowledgeDetailPage: React.FC = () => {
                   return (
                     <span
                       key={tagKey}
-                      className='inline-flex items-center gap-5px text-11px text-[var(--color-text-2)] bg-[var(--color-fill-2)] border border-solid border-[var(--color-border-3)] rounded-6px px-8px py-2px'
+                      className='knowledge-detail-user-tag inline-flex items-center gap-5px text-11px font-500 text-[var(--color-text-1)] bg-[var(--color-fill-2)] border border-solid border-[var(--color-border-3)] rounded-6px px-8px py-2px'
                     >
                       {tag?.color && (
                         <i className='w-6px h-6px rounded-full inline-block' style={{ background: tag.color }} />
@@ -982,7 +991,7 @@ const KnowledgeDetailPage: React.FC = () => {
                 })}
                 {/* Add tag placeholder (leads to settings tab) */}
                 <span
-                  className='text-11px text-[var(--color-text-3)] cursor-pointer border border-dashed border-[var(--color-border-3)] rounded-6px px-8px py-2px hover:text-[rgb(var(--primary-6))] hover:border-[rgba(var(--primary-6),0.5)]'
+                  className='knowledge-detail-add-tag text-11px font-500 text-[var(--color-text-2)] bg-[var(--color-fill-1)] cursor-pointer border border-dashed border-[var(--color-border-3)] rounded-6px px-8px py-2px transition-colors hover:bg-[rgba(var(--primary-6),0.1)] hover:text-[var(--color-text-1)] hover:border-[rgba(var(--primary-6),0.36)]'
                   onClick={() => setTab('set')}
                 >
                   + {t('knowledge.detail.addTag', { defaultValue: '标签' })}
@@ -1056,7 +1065,7 @@ const KnowledgeDetailPage: React.FC = () => {
         )}
 
         {/* ─── Tabs ──────────────────────────────────────────────────────────── */}
-        <Tabs activeTab={activeTab} onChange={(k) => setTab(k)} type='line'>
+        <Tabs className='knowledge-detail-tabs' activeTab={activeTab} onChange={(k) => setTab(k)} type='line'>
           {/* Tab: Documents */}
           <Tabs.TabPane key='docs' title={t('knowledge.detail.tabDocs', { defaultValue: '文档' })}>
             {/* ── Document tree + viewer (D2 redesign) ── */}
@@ -1264,10 +1273,10 @@ const KnowledgeDetailPage: React.FC = () => {
                         <div className='inline-flex bg-[var(--color-fill-2)] border border-solid border-[var(--color-border-3)] rd-8px p-2px'>
                           <button
                             className={classNames(
-                              'border-none bg-transparent text-12px px-12px py-5px rd-6px cursor-pointer font-inherit',
+                              'bg-transparent text-12px px-12px py-5px rd-6px cursor-pointer font-inherit transition-colors',
                               !editMode
-                                ? '!bg-primary-1 !text-primary-6 font-600'
-                                : 'text-[var(--color-text-3)] hover:text-[var(--color-text-2)]'
+                                ? `${knowledgeDetailSoftActiveClass} font-600`
+                                : knowledgeDetailSegmentIdleClass
                             )}
                             onClick={() => setEditMode(false)}
                           >
@@ -1275,10 +1284,10 @@ const KnowledgeDetailPage: React.FC = () => {
                           </button>
                           <button
                             className={classNames(
-                              'border-none bg-transparent text-12px px-12px py-5px rd-6px cursor-pointer font-inherit',
+                              'bg-transparent text-12px px-12px py-5px rd-6px cursor-pointer font-inherit transition-colors',
                               editMode
-                                ? '!bg-primary-1 !text-primary-6 font-600'
-                                : 'text-[var(--color-text-3)] hover:text-[var(--color-text-2)]'
+                                ? `${knowledgeDetailSoftActiveClass} font-600`
+                                : knowledgeDetailSegmentIdleClass
                             )}
                             onClick={startEdit}
                           >

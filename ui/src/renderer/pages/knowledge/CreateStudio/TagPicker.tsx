@@ -15,6 +15,7 @@
 import React, { useCallback, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Message, Spin } from '@arco-design/web-react';
+import { CheckOne } from '@icon-park/react';
 import type { IKnowledgeTag } from '@/common/adapter/ipcBridge';
 
 // ─── Props ──────────────────────────────────────────────────────────────────
@@ -80,14 +81,23 @@ const TagPicker: React.FC<TagPickerProps> = ({ value, onChange, tags, createTag 
           <div
             key={tag.key}
             onClick={() => toggleTag(tag.key)}
+            style={selected ? { background: 'color-mix(in srgb, rgb(var(--primary-6)) 18%, var(--color-bg-2))' } : undefined}
             className={[
-              'knowledge-studio-tag-chip cursor-pointer select-none rounded-8px px-10px py-5px text-12px font-500 transition-[background-color,color,box-shadow]',
+              'knowledge-studio-tag-chip inline-flex min-h-28px min-w-48px items-center justify-center gap-6px box-border cursor-pointer select-none rounded-9px border border-solid px-9px py-5px text-12px font-600 transition-[background-color,border-color,color,box-shadow,transform]',
               selected
-                ? 'bg-[rgba(var(--primary-6),0.12)] text-[rgb(var(--primary-6))] shadow-[inset_0_0_0_1px_rgba(var(--primary-6),0.22)]'
-                : 'bg-[var(--color-fill-1)] text-[var(--color-text-2)] shadow-[inset_0_0_0_1px_rgba(0,0,0,0.035)] hover:bg-[var(--color-fill-2)] hover:text-[var(--color-text-1)]',
+                ? 'knowledge-studio-tag-chip-active border-[rgba(var(--primary-6),0.58)] text-[var(--color-text-1)] shadow-[0_0_0_2px_rgba(var(--primary-6),0.14),inset_0_1px_0_rgba(255,255,255,0.08)]'
+                : 'knowledge-studio-tag-chip-idle border-[var(--color-border-2)] bg-[var(--color-fill-1)] text-[var(--color-text-2)] shadow-[inset_0_0_0_1px_rgba(0,0,0,0.035)] hover:border-[var(--color-border-3)] hover:bg-[var(--color-fill-2)] hover:text-[var(--color-text-1)]',
             ].join(' ')}
           >
-            {tag.label}
+            {selected && (
+              <span
+                className='knowledge-studio-tag-chip-check grid h-15px w-15px shrink-0 place-items-center rounded-full border border-solid border-[rgba(var(--primary-6),0.46)] bg-[rgba(var(--primary-6),0.16)] text-[var(--color-text-1)] transition-[background-color,border-color,color]'
+                aria-hidden='true'
+              >
+                <CheckOne theme='outline' size='10' strokeWidth={4} />
+              </span>
+            )}
+            <span className='knowledge-studio-tag-chip-label leading-16px'>{tag.label}</span>
           </div>
         );
       })}
