@@ -7,21 +7,26 @@ import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const version = readWorkspaceVersion();
-const fixtureTriple = 'x86_64-test-windows-msvc';
-const fixtureDir = join(root, 'target', fixtureTriple, 'release', 'bundle', 'nsis');
 const testDir = join(root, 'build.noindex', 'make-latest-json-test');
+const targetDir = join(testDir, 'target');
 const outPath = join(testDir, 'latest.json');
-const artifact = join(fixtureDir, `NomiFun_${version}_x64-setup.exe`);
-const sig = `${artifact}.sig`;
 const existingNotes = `Existing release notes for ${version}`;
 
 rmSync(testDir, { recursive: true, force: true });
-rmSync(join(root, 'target', fixtureTriple), { recursive: true, force: true });
-mkdirSync(fixtureDir, { recursive: true });
 mkdirSync(testDir, { recursive: true });
 
-writeFileSync(artifact, 'fake installer');
-writeFileSync(sig, 'fake signature');
+const windowsFixtureDir = join(targetDir, 'x86_64-test-windows-msvc', 'release', 'bundle', 'nsis');
+const windowsArtifact = join(windowsFixtureDir, `NomiFun_${version}_x64-setup.exe`);
+writeArtifactWithSig(windowsArtifact, 'fake windows installer', 'fake windows signature');
+
+const linuxFixtureDir = join(targetDir, 'x86_64-unknown-linux-gnu', 'release', 'bundle');
+const appImageArtifact = join(linuxFixtureDir, 'appimage', `NomiFun_${version}_amd64.AppImage`);
+const debArtifact = join(linuxFixtureDir, 'deb', `NomiFun_${version}_amd64.deb`);
+const rpmArtifact = join(linuxFixtureDir, 'rpm', `NomiFun-${version}-1.x86_64.rpm`);
+writeArtifactWithSig(rpmArtifact, 'fake rpm', 'fake rpm signature');
+writeArtifactWithSig(debArtifact, 'fake deb', 'fake deb signature');
+writeArtifactWithSig(appImageArtifact, 'fake appimage', 'fake appimage signature');
+
 writeFileSync(
   outPath,
   JSON.stringify(
@@ -43,7 +48,7 @@ writeFileSync(
 
 try {
   const scriptPath = join(root, 'scripts', 'make-latest-json.mjs');
-  const result = spawnSync('bun', [scriptPath, '--out', outPath, '--repo', 'example/repo'], {
+  const result = spawnSync('bun', [scriptPath, '--out', outPath, '--repo', 'example/repo', '--target-dir', targetDir], {
     cwd: root,
     encoding: 'utf8',
   });
@@ -55,9 +60,19 @@ try {
   assert.equal(manifest.notes, existingNotes);
   assert.ok(manifest.platforms['darwin-x86_64']);
   assert.ok(manifest.platforms['windows-x86_64']);
+  assert.equal(
+    manifest.platforms['linux-x86_64'].url,
+    `https://github.com/example/repo/releases/download/v${version}/NomiFun_${version}_amd64.AppImage`,
+  );
+  assert.equal(manifest.platforms['linux-x86_64'].signature, 'fake appimage signature');
 } finally {
   rmSync(testDir, { recursive: true, force: true });
-  rmSync(join(root, 'target', fixtureTriple), { recursive: true, force: true });
+}
+
+function writeArtifactWithSig(path, artifactContent, signatureContent) {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, artifactContent);
+  writeFileSync(`${path}.sig`, signatureContent);
 }
 
 function readWorkspaceVersion() {

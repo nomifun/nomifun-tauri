@@ -124,6 +124,10 @@ Use this order for every desktop release.
    bun run make:latest
    ```
 
+   Linux uploads include `.AppImage`, `.deb`, and `.rpm`, but the updater
+   manifest should point at the `.AppImage`. `make:latest` applies that
+   preference explicitly when several signed Linux bundles exist.
+
 5. **Merge `latest.json` before publishing.** `bun run make:latest` preserves
    existing real platform entries and fills the entries for the current build
    machine. If platforms are built on different machines, carry the newest

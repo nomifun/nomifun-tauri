@@ -22,11 +22,10 @@
  * 单一真源 = 根 Cargo.toml [workspace.package].version。纯 node:fs，无第三方依赖。
  */
 import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync, copyFileSync } from 'node:fs';
-import { dirname, join, basename } from 'node:path';
+import { dirname, join, basename, isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const TARGET = join(ROOT, 'target');
 const DEFAULT_OUT = join(ROOT, 'apps/desktop/updater/latest.json');
 const DEFAULT_REPO = 'nomifun/nomifun-tauri';
 const ALL_KEYS = ['windows-x86_64', 'windows-aarch64', 'darwin-x86_64', 'darwin-aarch64', 'linux-x86_64', 'linux-aarch64'];
@@ -45,6 +44,12 @@ function flag(name, fallback = undefined) {
 const repo = flag('repo', DEFAULT_REPO);
 const out = flag('out', DEFAULT_OUT);
 const collect = flag('collect', false) === true;
+const targetDirArg = flag('target-dir', join(ROOT, 'target'));
+if (typeof targetDirArg !== 'string') {
+  console.error('✗ --target-dir 需要目录路径。');
+  process.exit(1);
+}
+const TARGET = isAbsolute(targetDirArg) ? targetDirArg : resolve(ROOT, targetDirArg);
 const version = flag('version') || readWorkspaceVersion();
 const notesArg = flag('notes');
 const notesFile = flag('notes-file');
@@ -139,6 +144,45 @@ function findSigs(bundleDir) {
   return found;
 }
 
+// Tauri may emit signatures for more than one bundle type on a platform. The
+// updater manifest must pick the package type the runtime updater can install,
+// while release uploads can still include every manual installer.
+function artifactPriority(key, artifact) {
+  const name = basename(artifact).toLowerCase();
+  const order = key.startsWith('linux-')
+    ? ['.appimage', '.deb', '.rpm']
+    : key.startsWith('windows-')
+      ? ['-setup.exe', '.exe', '.msi']
+      : key.startsWith('darwin-')
+        ? ['.app.tar.gz', '.tar.gz', '.dmg']
+        : [];
+
+  const index = order.findIndex((suffix) => name.endsWith(suffix));
+  return index === -1 ? order.length : index;
+}
+
+function compareCandidates(key, a, b) {
+  const byPriority = artifactPriority(key, a.artifact) - artifactPriority(key, b.artifact);
+  if (byPriority !== 0) return byPriority;
+  return basename(a.artifact).localeCompare(basename(b.artifact), 'en');
+}
+
+function collectCandidate(key, candidate) {
+  const current = collected[key];
+  if (!current) {
+    collected[key] = candidate;
+    return;
+  }
+
+  const nextIsBetter = compareCandidates(key, candidate, current) < 0;
+  const kept = nextIsBetter ? candidate : current;
+  const ignored = nextIsBetter ? current : candidate;
+  console.warn(
+    `  ! ${key} 多个候选产物，选择 ${basename(kept.artifact)} 作为 updater 包，仍会上传 ${basename(ignored.artifact)}。`,
+  );
+  collected[key] = kept;
+}
+
 // ── 扫描 target/ ────────────────────────────────────────────────────────────
 if (!existsSync(TARGET)) {
   console.error(`✗ 找不到 target/（${rel(TARGET)}）。先构建更新产物：bun run build:updater`);
@@ -168,10 +212,7 @@ for (const { dir, triple } of bundleDirs) {
     const signature = readFileSync(sig, 'utf8').trim();
     const url = `https://github.com/${repo}/releases/download/v${version}/${name}`;
     for (const key of keys) {
-      if (collected[key]) {
-        console.warn(`  ! ${key} 多个候选产物，后者覆盖：${basename(collected[key].artifact)} → ${name}`);
-      }
-      collected[key] = { url, signature, artifact, sig };
+      collectCandidate(key, { url, signature, artifact, sig });
     }
     uploads.add(artifact);
     uploads.add(sig);

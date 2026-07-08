@@ -95,6 +95,9 @@ bun run build:linux --config apps/desktop/tauri.updater.conf.json
 bun run make:latest
 ```
 
+Linux 会同时产出 `.AppImage`、`.deb`、`.rpm` 时，`latest.json` 的 updater
+条目使用 `.AppImage`；`.deb` / `.rpm` 作为手动下载安装包上传到 Release。
+
 ## latest.json
 
 `bun run make:latest` 会扫描当前机器的 updater 产物和 `.sig`，把对应平台写入：

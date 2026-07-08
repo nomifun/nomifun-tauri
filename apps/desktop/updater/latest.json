@@ -1,11 +1,11 @@
 {
   "version": "0.2.13",
   "notes": "- 修复 Linux 桌面交互问题。\n- 新增 Linux 一键发版流程，产出 .deb / .AppImage / .rpm 与 Tauri updater 签名产物。\n- 优化 WebUI 项目目录与文件选择器体验。\n- 支持模型模态能力编辑，并完善技能中心元数据本地化。",
-  "pub_date": "2026-07-08T18:02:47.574Z",
+  "pub_date": "2026-07-08T18:08:45.747Z",
   "platforms": {
     "linux-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODJFM1FrTCtDNGplOFlyQ01ZaWdYOW5WOXBFNGh1c1ZCaUJhaGJGbTVPa04yem5randFMWcwSjdLUnd1bTg1RlhZZytualRnZHBCQ0NGRUhZQ3poRHdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNTMzNzY2CWZpbGU6Tm9taUZ1bi0wLjIuMTMtMS54ODZfNjQucnBtCkdNRWJidkVNeTZKZmt4MWxGbklEM0VOdGpIV01kb1dlbkVKNEtrTjJWQU4wRi9hM1RtQjZFVjlhbnlDT3FHTkt0RjB3RmhkbG9rZkJjbkR1ZVpzN0NnPT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.13/NomiFun-0.2.13-1.x86_64.rpm"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODBWMFdrRDZqMlVNKzk5YUpIRERrdFhnKzFmWWNZbFlhd1pVMmgza3VRZ0tIUitEMXpYcmF4YmZuYUcwS3R0TWxoMjR2YTNZSU5IcThGbWNRcXZic2dZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNTMzNzY2CWZpbGU6Tm9taUZ1bl8wLjIuMTNfYW1kNjQuQXBwSW1hZ2UKekVGeHdmclhOaW1xK2xidGJEbWJPQ09vU1F3S3ZkcVVSRmViUEN0b3pFQlhXYWtQLzBKc1B1NkhwYUlrQVppUTYyYXBLZ1pkMUhFNDJBUXEzM2FMRFE9PQo=",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.13/NomiFun_0.2.13_amd64.AppImage"
     }
   }
 }

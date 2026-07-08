@@ -237,6 +237,8 @@ bun run make:latest
 ```
 
 Linux 不走 macOS 公证或 Windows Authenticode，但仍需要 Tauri updater `.sig`。
+Linux 发布会上传 `.AppImage`、`.deb`、`.rpm`；其中 `latest.json` 的 updater
+条目应指向 `.AppImage`，`bun run make:latest` 会在多个签名 Linux 包里显式选择它。
 
 ## 合并 latest.json
 
