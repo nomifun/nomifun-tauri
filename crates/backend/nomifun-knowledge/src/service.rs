@@ -6,8 +6,10 @@
 //! rather than cached in the database.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
+use std::time::Duration;
 
 use futures_util::{StreamExt, stream};
 use nomifun_api_types::{ConnectorCredentialSummary, ConnectorSyncState, KnowledgeMountInfo, KnowledgeSource, KnowledgeSourceEntry, KnowledgeSourceMode, KnowledgeTag, UpdateKnowledgeTagRequest};
@@ -50,6 +52,7 @@ pub const WRITEBACK_EAGERNESS: &[&str] = &["conservative", "aggressive"];
 /// Excluded from the prompt TOC — unreviewed content is not authoritative
 /// navigation.
 pub const KB_INBOX_REL_DIR: &str = "_inbox";
+const TURN_WRITEBACK_LLM_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Opaque, copy-pasteable document handle: `kdoc_` + URL-safe base64 (no pad)
 /// of `{kb_id}\x1f{rel_path}`. The model treats it as an opaque token and
@@ -357,6 +360,12 @@ pub enum TurnWritebackStatus {
     Written,
     Partial,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnWritebackPhase {
+    Extracting,
+    Writing,
 }
 
 #[derive(Debug, Clone)]
@@ -1552,6 +1561,20 @@ impl KnowledgeService {
     /// still decides staged/direct/disabled placement, and eagerness is passed only
     /// to the extractor prompt.
     pub async fn finalize_turn_writeback(&self, req: TurnWritebackRequest) -> TurnWritebackReport {
+        self.finalize_turn_writeback_with_progress(req, |_| async {}).await
+    }
+
+    /// Same as [`Self::finalize_turn_writeback`], but reports coarse visible
+    /// progress to the caller without turning write-back into a durable queue.
+    pub async fn finalize_turn_writeback_with_progress<F, Fut>(
+        &self,
+        req: TurnWritebackRequest,
+        mut progress: F,
+    ) -> TurnWritebackReport
+    where
+        F: FnMut(TurnWritebackPhase) -> Fut,
+        Fut: Future<Output = ()>,
+    {
         if req.mounts.is_empty() {
             return TurnWritebackReport::status(TurnWritebackStatus::Disabled);
         }
@@ -1568,6 +1591,7 @@ impl KnowledgeService {
         let Some(completer) = self.completer() else {
             return TurnWritebackReport::status(TurnWritebackStatus::NoCompleter);
         };
+        progress(TurnWritebackPhase::Extracting).await;
 
         let redacted_user = nomi_redact::redact_secrets_owned(req.user_text);
         let redacted_assistant = nomi_redact::redact_secrets_owned(req.assistant_text);
@@ -1582,14 +1606,18 @@ impl KnowledgeService {
         let mut parsed = None;
         let mut last_parse_error = None;
         for _ in 0..2 {
-            let raw = match completer
-                .complete(crate::turn_writeback::TURN_WRITEBACK_SYSTEM, &prompt)
-                .await
+            let raw = match complete_turn_writeback_llm(
+                &completer,
+                crate::turn_writeback::TURN_WRITEBACK_SYSTEM,
+                &prompt,
+                "extract",
+            )
+            .await
             {
                 Ok(raw) => raw,
                 Err(e) => {
                     tracing::debug!(error = %e, "turn writeback provider call failed");
-                    return TurnWritebackReport::failed(e.to_string());
+                    return TurnWritebackReport::failed(e);
                 }
             };
 
@@ -1615,6 +1643,7 @@ impl KnowledgeService {
         if candidate_count == 0 {
             return TurnWritebackReport::status(TurnWritebackStatus::NoCandidate);
         }
+        progress(TurnWritebackPhase::Writing).await;
 
         let mounted_ids: HashSet<String> = req.mounts.iter().map(|m| m.id.clone()).collect();
         let bound_kb_ids: Vec<String> = req.mounts.iter().map(|m| m.id.clone()).collect();
@@ -1834,10 +1863,13 @@ impl KnowledgeService {
         }
 
         let prompt = crate::turn_writeback::build_turn_writeback_merge_prompt(existing, proposal);
-        let raw = completer
-            .complete(crate::turn_writeback::TURN_WRITEBACK_MERGE_SYSTEM, &prompt)
-            .await
-            .map_err(|e| e.to_string())?;
+        let raw = complete_turn_writeback_llm(
+            completer,
+            crate::turn_writeback::TURN_WRITEBACK_MERGE_SYSTEM,
+            &prompt,
+            "merge",
+        )
+        .await?;
         let out = crate::turn_writeback::parse_turn_writeback_merge_output(&raw)?;
         let merged = nomi_redact::redact_secrets_owned(out.content.trim().to_owned());
         if merged.trim().is_empty() {
@@ -3308,6 +3340,22 @@ fn first_heading(path: &Path) -> Option<String> {
     let text = String::from_utf8_lossy(&buf[..n]);
     let title = first_atx_heading(&text)?;
     Some(title.chars().take(60).collect())
+}
+
+async fn complete_turn_writeback_llm(
+    completer: &Arc<dyn KnowledgeCompleter>,
+    system: &'static str,
+    prompt: &str,
+    stage: &'static str,
+) -> Result<String, String> {
+    match tokio::time::timeout(TURN_WRITEBACK_LLM_TIMEOUT, completer.complete(system, prompt)).await {
+        Ok(Ok(raw)) => Ok(raw),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!(
+            "turn writeback {stage} timed out after {}s",
+            TURN_WRITEBACK_LLM_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 pub(crate) fn is_md(path: &Path) -> bool {

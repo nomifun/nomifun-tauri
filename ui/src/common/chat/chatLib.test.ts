@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, test } from 'bun:test';
-import { transformMessage } from './chatLib';
+import { transformKnowledgeWritebackEvent, transformMessage } from './chatLib';
 
 const baseWire = (overrides: Record<string, unknown>) =>
   ({
@@ -115,5 +115,48 @@ describe('transformMessage runtime field normalization', () => {
     if (message?.type !== 'agent_status') throw new Error('expected agent_status message');
     expect(message.content.backend).toBe('{\n  "name": "codex"\n}');
     expect(message.content.status).toBe('disconnected');
+  });
+
+  test('converts knowledge writeback events into assistant message status updates', () => {
+    const message = transformKnowledgeWritebackEvent({
+      conversation_id: 1,
+      msg_id: 'assistant-turn-1',
+      status: 'writing',
+      attempt_id: 'attempt-1',
+      started_at: 1000,
+      updated_at: 1200,
+      retryable: false,
+      candidates: 2,
+    });
+
+    expect(message?.type).toBe('text');
+    expect(message?.msg_id).toBe('assistant-turn-1');
+    expect(message?.content.content).toBe('');
+    expect(message?.content.knowledge_writeback?.status).toBe('writing');
+    expect(message?.content.knowledge_writeback?.attempt_id).toBe('attempt-1');
+  });
+
+  test('preserves persisted knowledge writeback state when hydrating text messages', () => {
+    const message = transformMessage(
+      baseWire({
+        type: 'content',
+        data: {
+          content: 'Final answer.',
+          knowledge_writeback: {
+            status: 'failed',
+            attempt_id: 'attempt-1',
+            retryable: true,
+            failures: [{ kb_id: 'kb_1', rel_path: 'notes.md', error: 'disk full' }],
+          },
+        },
+      })
+    );
+
+    expect(message?.type).toBe('text');
+    if (message?.type !== 'text') throw new Error('expected text message');
+    expect(message.content.content).toBe('Final answer.');
+    expect(message.content.knowledge_writeback?.status).toBe('failed');
+    expect(message.content.knowledge_writeback?.retryable).toBe(true);
+    expect(message.content.knowledge_writeback?.failures?.[0]?.error).toBe('disk full');
   });
 });

@@ -32,4 +32,9 @@ describe('MessageText process action chrome', () => {
     expect(source.includes('fontSize={MESSAGE_BODY_FONT_SIZE}')).toBe(true);
     expect(source.includes('lineHeight={MESSAGE_BODY_LINE_HEIGHT}')).toBe(true);
   });
+
+  test('keeps the knowledge writeback icon optically centered with the status text', () => {
+    expect(source.includes('h-14px w-14px shrink-0 items-center justify-center self-center leading-none')).toBe(true);
+    expect(source.includes("className='block shrink-0'")).toBe(true);
+  });
 });

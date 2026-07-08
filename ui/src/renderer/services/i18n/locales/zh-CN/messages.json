@@ -56,6 +56,18 @@
     "expandAllThinkingProcess": "展开全部思考过程",
     "collapseAllThinkingProcess": "收起全部思考过程"
   },
+  "knowledgeWriteback": {
+    "started": "正在准备回写知识库",
+    "extracting": "正在提取可沉淀知识",
+    "writing": "正在写入知识库",
+    "written": "知识库回写完成 {{count}} 条",
+    "partial": "知识库部分回写完成，失败 {{failures}} 条",
+    "failed": "知识库回写失败",
+    "noCandidate": "未发现需要回写的知识",
+    "noCompleter": "知识库回写不可用",
+    "disabled": "知识库回写未启用",
+    "interrupted": "知识库回写中断"
+  },
   "planTodoList": "待办列表",
   "planProgress": "已完成 {{done}}/{{total}}",
   "fileChanges": "文件变更",

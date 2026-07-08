@@ -43,8 +43,9 @@ pub use routes::knowledge_routes;
 pub use service::{
     AutogenOutcome, ConsumerInfo, InboxDiff, InboxEntry, InboxMergeResult, KB_INBOX_REL_DIR, KnowledgeBinding,
     KnowledgeService, MountOutcome, RefreshSourceSummary, TurnWritebackFailure, TurnWritebackReport,
-    TurnWritebackRequest, TurnWritebackStatus, WriteMode, WriteOp, WriteOutcome, WritePolicy, WriteRequest,
-    WriteResolution, WriteSurface, WriteTargetSpec, decode_doc_handle, encode_doc_handle, resolve_write_policy,
+    TurnWritebackPhase, TurnWritebackRequest, TurnWritebackStatus, WriteMode, WriteOp, WriteOutcome, WritePolicy,
+    WriteRequest, WriteResolution, WriteSurface, WriteTargetSpec, decode_doc_handle, encode_doc_handle,
+    resolve_write_policy,
 };
 pub use source_url::{HttpFetcher, PageFetcher, UrlFetcher};
 pub use state::KnowledgeRouterState;
