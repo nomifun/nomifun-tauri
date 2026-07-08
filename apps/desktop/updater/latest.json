@@ -1,15 +1,11 @@
 {
-  "version": "0.2.12",
-  "notes": "Changes: show knowledge writeback progress in chat; add Codex-style question locator; polish knowledge detail tag styling.",
-  "pub_date": "2026-07-08T16:45:33.002Z",
+  "version": "0.2.13",
+  "notes": "- 修复 Linux 桌面交互问题。\n- 新增 Linux 一键发版流程，产出 .deb / .AppImage / .rpm 与 Tauri updater 签名产物。\n- 优化 WebUI 项目目录与文件选择器体验。\n- 支持模型模态能力编辑，并完善技能中心元数据本地化。",
+  "pub_date": "2026-07-08T18:02:47.574Z",
   "platforms": {
-    "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODNldGhPWXhESWFaV0hpUklaRUh1eUpYQmFWcEpDZkxJOG5XWTJqVFRLYWdrU0YyRm5kY0pOZkZxMHd2UWc1S0NZVHR0SGg5UHQxWk4yaXlhTUh0dndnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNTI5MDM4CWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6Cklic1Zmb0VxMmgzcncwSHJoTVpKOFNtTldHZ1lXS282bGZMWXJYZVh1bzgyQkpJemkxQnlkV2ppQXBRa05rYlhzU0llUnFadjlTN05YSnh1M1lQdUNnPT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.12/NomiFun.app.tar.gz"
-    },
-    "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODNldGhPWXhESWFaV0hpUklaRUh1eUpYQmFWcEpDZkxJOG5XWTJqVFRLYWdrU0YyRm5kY0pOZkZxMHd2UWc1S0NZVHR0SGg5UHQxWk4yaXlhTUh0dndnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNTI5MDM4CWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6Cklic1Zmb0VxMmgzcncwSHJoTVpKOFNtTldHZ1lXS282bGZMWXJYZVh1bzgyQkpJemkxQnlkV2ppQXBRa05rYlhzU0llUnFadjlTN05YSnh1M1lQdUNnPT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.12/NomiFun.app.tar.gz"
+    "linux-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODJFM1FrTCtDNGplOFlyQ01ZaWdYOW5WOXBFNGh1c1ZCaUJhaGJGbTVPa04yem5randFMWcwSjdLUnd1bTg1RlhZZytualRnZHBCQ0NGRUhZQ3poRHdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNTMzNzY2CWZpbGU6Tm9taUZ1bi0wLjIuMTMtMS54ODZfNjQucnBtCkdNRWJidkVNeTZKZmt4MWxGbklEM0VOdGpIV01kb1dlbkVKNEtrTjJWQU4wRi9hM1RtQjZFVjlhbnlDT3FHTkt0RjB3RmhkbG9rZkJjbkR1ZVpzN0NnPT0K",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.13/NomiFun-0.2.13-1.x86_64.rpm"
     }
   }
 }
