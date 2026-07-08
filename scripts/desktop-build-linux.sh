@@ -7,8 +7,10 @@
 #   bun run build:linux x64           # 显式 x86_64
 #   bun run build:linux arm64         # 显式 aarch64(见下方交叉编译警告)
 #   bun run build:linux x64 arm64     # 两个都打
+#   bun run build:linux --config apps/desktop/tauri.updater.conf.json
+#                                     # 未知 --xxx 选项会原样透传给 tauri build
 #   bun run build:linux -- --bundles deb
-#                                     # `--` 之后的参数原样透传给 tauri build
+#                                     # `--` 之后的参数也会原样透传给 tauri build
 #
 # 架构别名:
 #   x64   / x86_64        -> x86_64-unknown-linux-gnu
@@ -52,6 +54,9 @@ for arg in "$@"; do
   if [[ "$seen_dashdash" -eq 1 ]]; then
     PASSTHRU+=("$arg")
   elif [[ "$arg" == "--" ]]; then
+    seen_dashdash=1
+  elif [[ "$arg" == --* ]]; then
+    PASSTHRU+=("$arg")
     seen_dashdash=1
   else
     SELECT+=("$arg")

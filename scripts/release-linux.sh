@@ -46,6 +46,7 @@ EnvRelease="${NOMIFUN_RELEASE_ENV_FILE:-apps/desktop/signing/.env.release}"
 UpdaterConf="apps/desktop/tauri.updater.conf.json"
 LatestJson="apps/desktop/updater/latest.json"
 DistDir="dist/desktop"
+BuildLinuxScript="scripts/desktop-build-linux.sh"
 
 Version=""
 Notes=""
@@ -248,6 +249,7 @@ gh_bin="$(command -v gh || true)"
 [[ -n "$gh_bin" ]] || fail "未找到 gh CLI。安装：https://cli.github.com/"
 [[ -f "$KeyFile" ]] || fail "缺少 updater 私钥 $KeyFile（从密钥库拷入，keyID F3AA272E60AA7952）。"
 [[ -f "$UpdaterConf" ]] || fail "缺少 updater overlay 配置 $UpdaterConf。"
+[[ -x "$BuildLinuxScript" ]] || fail "缺少可执行 Linux 构建脚本 $BuildLinuxScript。"
 
 CurVer="$(read_workspace_version || true)"
 [[ -n "$CurVer" ]] || fail "无法从 Cargo.toml 读取 [workspace.package].version。"
@@ -364,11 +366,8 @@ fi
 clean_old_linux_artifacts
 
 echo "▶ 构建 Linux 安装包与 updater 产物（Rust release，耗时较长）..."
-if [[ "${#BuildSelects[@]}" -eq 0 ]]; then
-  bun run build:linux -- --config "$UpdaterConf" || fail "构建失败。"
-else
-  bun run build:linux "${BuildSelects[@]}" -- --config "$UpdaterConf" || fail "构建失败。"
-fi
+BuildArgs=("${BuildSelects[@]}" --config "$UpdaterConf")
+bash "$BuildLinuxScript" "${BuildArgs[@]}" || fail "构建失败。"
 
 echo "▶ 合并 latest.json ..."
 if [[ -n "$NotesTmp" ]]; then

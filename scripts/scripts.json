@@ -22,6 +22,7 @@
     "make:latest":   { "group": "build", "desc": "扫描本机更新产物，生成/合并自动更新清单 latest.json" },
     "release:mac":   { "group": "build", "desc": "一键 macOS 发版：自动判定追加/首发；首发用 -Version 打版本号 + -NotesFile/-Notes 建 Release；-DryRun 只预检" },
     "release:win":   { "group": "build", "desc": "一键 Windows 发版：自动判定追加/首发；首发用 -Version 打版本号 + -NotesFile/-Notes 建 Release；-DryRun 只预检" },
+    "release:linux": { "group": "build", "desc": "一键 Linux 发版：自动判定追加/首发；首发用 -Version 打版本号 + -NotesFile/-Notes 建 Release；-DryRun 只预检" },
     "build:ui":      { "group": "build", "desc": "前端生产构建 → ui/dist" },
     "serve:web":     { "group": "serve", "desc": "启动 Web 服务器，托管已构建的前端" },
     "test":          { "group": "test",  "desc": "运行全部 Rust 测试（含 doctest）" },
