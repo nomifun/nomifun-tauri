@@ -1,6 +1,11 @@
 {
   "title": "Creative Workshop",
   "subtitle": "Compose media and AI generation on one infinite canvas — mix images, video, and text freely with nodes and connections.",
+  "beta": {
+    "tag": "Beta",
+    "notice": "Creative Workshop is in Beta — features may be unstable, error out, or change, and it is not recommended for regular use yet.",
+    "navTooltip": "Creative Workshop (Beta)"
+  },
   "nav": {
     "entry": "Creative Workshop"
   },

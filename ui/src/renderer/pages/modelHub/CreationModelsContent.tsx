@@ -13,6 +13,7 @@ import { ipcBridge } from '@/common';
 import type { IProvider, ModelCapability } from '@/common/config/storage';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 import { useProvidersQuery } from '@/renderer/hooks/agent/useModelProviderList';
+import { useModelProfiles } from '@/renderer/hooks/agent/useModelProfiles';
 import NomiScrollArea from '@/renderer/components/base/NomiScrollArea';
 import SegmentedTabs, { type SegmentedTabItem } from '@/renderer/components/base/SegmentedTabs';
 import { useSettingsViewMode } from '@/renderer/components/settings/SettingsModal/settingsViewContext';
@@ -49,6 +50,7 @@ const CreationModelsContent: React.FC = () => {
   const viewMode = useSettingsViewMode();
   const isPageMode = viewMode === 'page';
   const { data, mutate } = useProvidersQuery();
+  const { profiles } = useModelProfiles();
   const [message, messageContext] = useArcoMessage();
   const [filter, setFilter] = useState<Filter>('all');
 
@@ -59,16 +61,16 @@ const CreationModelsContent: React.FC = () => {
 
   const counts = useMemo(
     () => ({
-      all: getCreationModels(data, undefined).length,
-      image_generation: getCreationModels(data, 'image_generation').length,
-      video_generation: getCreationModels(data, 'video_generation').length,
+      all: getCreationModels(data, undefined, profiles).length,
+      image_generation: getCreationModels(data, 'image_generation', profiles).length,
+      video_generation: getCreationModels(data, 'video_generation', profiles).length,
     }),
-    [data]
+    [data, profiles]
   );
 
   const groups = useMemo(
-    () => groupCreationModelsByProvider(getCreationModels(data, filter === 'all' ? undefined : filter)),
-    [data, filter]
+    () => groupCreationModelsByProvider(getCreationModels(data, filter === 'all' ? undefined : filter, profiles)),
+    [data, filter, profiles]
   );
 
   const filterItems: SegmentedTabItem[] = [

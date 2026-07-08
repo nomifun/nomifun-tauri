@@ -17,7 +17,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
-import { Button, Form, Input, Modal, Result, Spin } from '@arco-design/web-react';
+import { Alert, Button, Form, Input, Modal, Result, Spin } from '@arco-design/web-react';
 import { Delete, EditTwo, LinkOne, Platte, Plus, Search } from '@icon-park/react';
 import { useLayoutContext } from '@renderer/hooks/context/LayoutContext';
 import { useArcoMessage } from '@renderer/utils/ui/useArcoMessage';
@@ -297,8 +297,11 @@ const WorkshopListPage: React.FC = () => {
               <Platte theme='outline' size='22' fill='currentColor' className='block' style={{ lineHeight: 0 }} />
             </span>
             <div className='min-w-0'>
-              <h1 className='m-0 mb-3px text-22px font-bold text-[var(--color-text-1)] tracking-tight'>
+              <h1 className='m-0 mb-3px flex items-center gap-8px text-22px font-bold text-[var(--color-text-1)] tracking-tight'>
                 {t('workshop.title', { defaultValue: '创意工坊' })}
+                <span className='shrink-0 text-10px font-600 leading-none tracking-wide uppercase px-6px py-3px rd-5px bg-[rgba(var(--primary-6),0.12)] text-[rgb(var(--primary-6))]'>
+                  {t('workshop.beta.tag', { defaultValue: 'Beta' })}
+                </span>
               </h1>
               <p className='m-0 text-13px text-[var(--color-text-3)] leading-19px max-w-560px'>
                 {t('workshop.subtitle', {
@@ -328,6 +331,15 @@ const WorkshopListPage: React.FC = () => {
             </div>
           )}
         </div>
+
+        {/* Beta / not-recommended notice — persistent while the workshop is in beta. */}
+        <Alert
+          type='warning'
+          showIcon
+          content={t('workshop.beta.notice', {
+            defaultValue: '创意工坊目前处于 Beta 阶段，功能尚不稳定、可能出错或调整，暂不建议正式使用。',
+          })}
+        />
 
         {/* Body states */}
         {error ? (

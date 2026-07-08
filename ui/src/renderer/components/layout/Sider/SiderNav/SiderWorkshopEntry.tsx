@@ -29,10 +29,12 @@ const SiderWorkshopEntry: React.FC<SiderWorkshopEntryProps> = ({
 }) => {
   const { t } = useTranslation();
   const label = t('workshop.nav.entry', { defaultValue: '创意工坊' });
+  const betaLabel = t('workshop.beta.tag', { defaultValue: 'Beta' });
+  const tooltipContent = t('workshop.beta.navTooltip', { defaultValue: '创意工坊（Beta）' });
 
   if (collapsed) {
     return (
-      <Tooltip {...siderTooltipProps} content={label} position='right'>
+      <Tooltip {...siderTooltipProps} content={tooltipContent} position='right'>
         <div
           className={classNames(
             'w-full h-34px flex items-center justify-center cursor-pointer transition-colors rd-8px text-t-primary',
@@ -53,7 +55,7 @@ const SiderWorkshopEntry: React.FC<SiderWorkshopEntryProps> = ({
   }
 
   return (
-    <Tooltip {...siderTooltipProps} content={label} position='right'>
+    <Tooltip {...siderTooltipProps} content={tooltipContent} position='right'>
       <div
         className={classNames(
           'box-border group h-34px w-full flex items-center justify-start gap-8px pl-10px pr-8px rd-0.5rem cursor-pointer shrink-0 transition-all text-t-primary',
@@ -72,6 +74,12 @@ const SiderWorkshopEntry: React.FC<SiderWorkshopEntryProps> = ({
           />
         </span>
         <span className='collapsed-hidden text-14px font-[500] leading-24px'>{label}</span>
+        <span
+          className='collapsed-hidden ml-auto shrink-0 text-9px font-600 leading-none tracking-wide uppercase px-4px py-2px rd-4px bg-[rgba(var(--primary-6),0.12)] text-[rgb(var(--primary-6))]'
+          aria-hidden='true'
+        >
+          {betaLabel}
+        </span>
       </div>
     </Tooltip>
   );

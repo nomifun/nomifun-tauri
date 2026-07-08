@@ -17,6 +17,7 @@
 
 import { useMemo } from 'react';
 import { useProvidersQuery, useModelProviderList } from '@renderer/hooks/agent/useModelProviderList';
+import { useModelProfiles } from '@renderer/hooks/agent/useModelProfiles';
 import { getCreationModels } from '@renderer/pages/modelHub/creationModels';
 import type { GenMode, ModelGroup, ModelOption } from './genTypes';
 
@@ -43,6 +44,7 @@ function group(flat: ModelOption[]): ModelGroup[] {
 export function useGeneratorModels(mode: GenMode): GeneratorModels {
   const { data: rawProviders } = useProvidersQuery();
   const { providers: convProviders, getAvailableModels } = useModelProviderList();
+  const { profiles } = useModelProfiles();
 
   return useMemo<GeneratorModels>(() => {
     const hasProviders =
@@ -59,12 +61,12 @@ export function useGeneratorModels(mode: GenMode): GeneratorModels {
     }
 
     const cap = mode === 'video' ? 'video_generation' : 'image_generation';
-    const flat: ModelOption[] = getCreationModels(rawProviders, cap).map((e) => ({
+    const flat: ModelOption[] = getCreationModels(rawProviders, cap, profiles).map((e) => ({
       providerId: e.providerId,
       providerName: e.providerName,
       platform: e.platform,
       model: e.model,
     }));
     return { groups: group(flat), flat, hasProviders };
-  }, [mode, rawProviders, convProviders, getAvailableModels]);
+  }, [mode, rawProviders, convProviders, getAvailableModels, profiles]);
 }
