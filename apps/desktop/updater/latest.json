@@ -1,19 +1,11 @@
 {
-  "version": "0.2.10",
-  "notes": "Changes: hardened agent message rendering, improved expired web auth session handling, and published Windows installer/updater assets for v0.2.10.",
-  "pub_date": "2026-07-07T17:12:13.818Z",
+  "version": "0.2.11",
+  "notes": "Changes: stop dependent tool execution after failures; mark Creative Workshop as Beta; use user model profile tasks when resolving image/video generation models.",
+  "pub_date": "2026-07-08T03:55:14.426Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODhrZkdQdlh4Ykk4RGthbTFCQWdIQ2tNYWowbEIzL3FpbXJOL3ZWdUszaGMvNTZESlZyTDFqcGJnU0xJcmU0NytleEF3dDRUZy9RZEZ1dGdZUWljNXdnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNDM2Nzk3CWZpbGU6Tm9taUZ1bl8wLjIuMTBfeDY0LXNldHVwLmV4ZQpaY1BoMzEyeTBiY3lMNU5PSFplQ1dwa0VrZFNJNENNMXBPY3pjTzBibytvcXM5ME9zRktwckpyOUEwMEM5cStJWjZINE52V2ZWbDBNRzNsTWdvV1ZDZz09Cg==",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.10/NomiFun_0.2.10_x64-setup.exe"
-    },
-    "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODV3eXZHNkZ5NWJxNXJSRkgwS2RhUjBwVjZsN1BoeElHUlRoRnVqUnZQejBqWmlOS2FQWnRGTW1mbHZpK2M4NHkyKzJlbWVmQThkM1dFL2FpMGJNdmdVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNDM3MjgxCWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6ClRQQitNVjJjanRqZnJHbVVhVE9hM2pjcXhvdkI5SExGdThBaXpvQ0ZacUpiOFhEYTgzdGM4bWx6YTBMSEdmWERISS9LaURyemprTHpMaGcxSVd0RkNBPT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.10/NomiFun.app.tar.gz"
-    },
-    "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODV3eXZHNkZ5NWJxNXJSRkgwS2RhUjBwVjZsN1BoeElHUlRoRnVqUnZQejBqWmlOS2FQWnRGTW1mbHZpK2M4NHkyKzJlbWVmQThkM1dFL2FpMGJNdmdVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNDM3MjgxCWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6ClRQQitNVjJjanRqZnJHbVVhVE9hM2pjcXhvdkI5SExGdThBaXpvQ0ZacUpiOFhEYTgzdGM4bWx6YTBMSEdmWERISS9LaURyemprTHpMaGcxSVd0RkNBPT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.10/NomiFun.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxOHhuODFkc3RLajI0T2JaeGtuR2lMNHg2bzZDRlZLcnI1OXd0TmhvWUlKeG9vY2dKekxINHRVVUhCeFJZd2FrMWhkdGlrS1JkSFF4N1FweUtpS1dtWmdJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNDgyOTE0CWZpbGU6Tm9taUZ1bl8wLjIuMTFfeDY0LXNldHVwLmV4ZQpHZ2JET2JGYWxQaEdEY1Q2QjNVVS9pM0pHam8vK0gwN1o4c2JiSkU2c0JiM2NTdE5iSlpWSkJmY0ZCTUJvVzZpbG5pZnUvSWNDdEd0dTNkRHd0ZG9Ddz09Cg==",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.11/NomiFun_0.2.11_x64-setup.exe"
     }
   }
 }
