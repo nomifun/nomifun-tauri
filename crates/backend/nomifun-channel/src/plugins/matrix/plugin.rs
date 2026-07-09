@@ -233,6 +233,39 @@ impl ChannelPlugin for MatrixPlugin {
         api.send_text(chat_id, &text, html.as_deref()).await
     }
 
+    async fn send_media(
+        &self,
+        chat_id: &str,
+        media: crate::types::OutgoingMedia,
+        caption: Option<&str>,
+    ) -> Result<String, ChannelError> {
+        use crate::types::MediaKind;
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| ChannelError::PlatformApi("Plugin not initialized".into()))?;
+
+        // Two-step: upload bytes to the content repo, then send a media event
+        // referencing the resulting mxc:// URI.
+        let mxc_url = api
+            .upload_media(media.bytes, &media.filename, &media.mime)
+            .await?;
+
+        let msgtype = match media.kind {
+            MediaKind::Image => "m.image",
+            MediaKind::File => "m.file",
+        };
+        // Matrix has no dedicated caption field; the event `body` doubles as the
+        // media's human-readable description, so prefer the caption over the
+        // filename when one is provided.
+        let body = caption
+            .filter(|c| !c.is_empty())
+            .unwrap_or(media.filename.as_str());
+
+        api.send_media_event(chat_id, msgtype, body, &mxc_url, &media.mime)
+            .await
+    }
+
     async fn edit_message(
         &self,
         chat_id: &str,

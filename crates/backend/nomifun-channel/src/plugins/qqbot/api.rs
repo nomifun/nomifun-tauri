@@ -14,8 +14,9 @@ use tracing::{debug, warn};
 use crate::error::ChannelError;
 
 use super::types::{
-    AppAccessTokenRequest, AppAccessTokenResponse, CachedToken, GatewayUrlResponse,
-    InteractionCallbackBody, SendMessageRequest, SendMessageResponse,
+    AppAccessTokenRequest, AppAccessTokenResponse, CachedToken, FileUploadRequest,
+    FileUploadResponse, GatewayUrlResponse, InteractionCallbackBody, SendMediaMessageRequest,
+    SendMessageRequest, SendMessageResponse,
 };
 
 const TOKEN_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
@@ -178,6 +179,81 @@ impl QqbotApi {
         self.post_message(&url, req).await
     }
 
+    // -- Rich media ---------------------------------------------------------
+
+    /// Upload raw media bytes to a C2C user's file store; returns the
+    /// `file_info` handle to reference from a msg_type 7 message.
+    pub async fn upload_c2c_file(
+        &self,
+        user_openid: &str,
+        file_type: u32,
+        bytes: &[u8],
+    ) -> Result<String, ChannelError> {
+        let url = format!("{API_BASE}/v2/users/{user_openid}/files");
+        self.upload_file(&url, file_type, bytes).await
+    }
+
+    /// Upload raw media bytes to a group's file store; returns the
+    /// `file_info` handle to reference from a msg_type 7 message.
+    pub async fn upload_group_file(
+        &self,
+        group_openid: &str,
+        file_type: u32,
+        bytes: &[u8],
+    ) -> Result<String, ChannelError> {
+        let url = format!("{API_BASE}/v2/groups/{group_openid}/files");
+        self.upload_file(&url, file_type, bytes).await
+    }
+
+    /// Send a rich-media (msg_type 7) message to a C2C user.
+    pub async fn send_c2c_media(
+        &self,
+        user_openid: &str,
+        req: &SendMediaMessageRequest,
+    ) -> Result<SendMessageResponse, ChannelError> {
+        let url = format!("{API_BASE}/v2/users/{user_openid}/messages");
+        self.post_message(&url, req).await
+    }
+
+    /// Send a rich-media (msg_type 7) message to a group.
+    pub async fn send_group_media(
+        &self,
+        group_openid: &str,
+        req: &SendMediaMessageRequest,
+    ) -> Result<SendMessageResponse, ChannelError> {
+        let url = format!("{API_BASE}/v2/groups/{group_openid}/messages");
+        self.post_message(&url, req).await
+    }
+
+    /// Send an image to a guild channel via multipart (`file_image`).
+    /// The guild API uploads and sends in a single request.
+    pub async fn send_channel_media(
+        &self,
+        channel_id: &str,
+        bytes: Vec<u8>,
+        filename: &str,
+        mime: &str,
+        content: Option<&str>,
+        msg_id: Option<&str>,
+    ) -> Result<SendMessageResponse, ChannelError> {
+        let url = format!("{API_BASE}/channels/{channel_id}/messages");
+        self.post_multipart_image(&url, bytes, filename, mime, content, msg_id).await
+    }
+
+    /// Send an image in a guild direct message via multipart (`file_image`).
+    pub async fn send_dm_media(
+        &self,
+        guild_id: &str,
+        bytes: Vec<u8>,
+        filename: &str,
+        mime: &str,
+        content: Option<&str>,
+        msg_id: Option<&str>,
+    ) -> Result<SendMessageResponse, ChannelError> {
+        let url = format!("{API_BASE}/dms/{guild_id}/messages");
+        self.post_multipart_image(&url, bytes, filename, mime, content, msg_id).await
+    }
+
     /// ACK an interaction callback.
     pub async fn ack_interaction(&self, interaction_id: &str) -> Result<(), ChannelError> {
         let token = self.get_token().await?;
@@ -202,7 +278,116 @@ impl QqbotApi {
 
     // -- Internal -----------------------------------------------------------
 
-    async fn post_message(&self, url: &str, req: &SendMessageRequest) -> Result<SendMessageResponse, ChannelError> {
+    /// Upload rich-media bytes as base64 JSON, returning the `file_info` handle.
+    /// Shared by the C2C and group upload endpoints.
+    async fn upload_file(
+        &self,
+        url: &str,
+        file_type: u32,
+        bytes: &[u8],
+    ) -> Result<String, ChannelError> {
+        use base64::Engine;
+
+        let token = self.get_token().await?;
+        let file_data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let body = FileUploadRequest {
+            file_type,
+            file_data,
+            srv_send_msg: false,
+        };
+        debug!(url, bytes = bytes.len(), file_type, "QQBot uploading rich media");
+
+        let resp = self
+            .client
+            .post(url)
+            .header("Authorization", Self::auth_header(&token))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(format!("QQBot file upload request failed: {e}")))?;
+
+        let status = resp.status();
+        if status.as_u16() == 401 {
+            self.clear_token().await;
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ChannelError::MessageSendFailed(format!(
+                "QQBot file upload auth failed (token cleared): HTTP 401: {text}"
+            )));
+        }
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ChannelError::MessageSendFailed(format!(
+                "QQBot file upload failed: HTTP {status}: {text}"
+            )));
+        }
+
+        let parsed: FileUploadResponse = resp
+            .json()
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(format!("QQBot file upload parse failed: {e}")))?;
+        Ok(parsed.file_info)
+    }
+
+    /// POST a multipart `file_image` message to a guild channel / DM endpoint.
+    async fn post_multipart_image(
+        &self,
+        url: &str,
+        bytes: Vec<u8>,
+        filename: &str,
+        mime: &str,
+        content: Option<&str>,
+        msg_id: Option<&str>,
+    ) -> Result<SendMessageResponse, ChannelError> {
+        let token = self.get_token().await?;
+        debug!(url, bytes = bytes.len(), "QQBot sending guild media");
+
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename.to_owned())
+            .mime_str(mime)
+            .map_err(|e| ChannelError::MessageSendFailed(format!("QQBot invalid media mime {mime}: {e}")))?;
+
+        let mut form = reqwest::multipart::Form::new().part("file_image", part);
+        if let Some(c) = content.filter(|c| !c.is_empty()) {
+            form = form.text("content", c.to_owned());
+        }
+        if let Some(m) = msg_id {
+            form = form.text("msg_id", m.to_owned());
+        }
+
+        let resp = self
+            .client
+            .post(url)
+            .header("Authorization", Self::auth_header(&token))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(format!("QQBot media send request failed: {e}")))?;
+
+        let status = resp.status();
+        if status.as_u16() == 401 {
+            self.clear_token().await;
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ChannelError::MessageSendFailed(format!(
+                "QQBot media send auth failed (token cleared): HTTP 401: {text}"
+            )));
+        }
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ChannelError::MessageSendFailed(format!(
+                "QQBot media send failed: HTTP {status}: {text}"
+            )));
+        }
+
+        resp.json()
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(format!("QQBot media send parse failed: {e}")))
+    }
+
+    async fn post_message<T: serde::Serialize>(
+        &self,
+        url: &str,
+        req: &T,
+    ) -> Result<SendMessageResponse, ChannelError> {
         let token = self.get_token().await?;
         debug!(url, "QQBot sending message");
 

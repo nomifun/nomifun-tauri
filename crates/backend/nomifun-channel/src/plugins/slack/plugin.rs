@@ -206,6 +206,22 @@ impl ChannelPlugin for SlackPlugin {
         api.post_message(&req).await
     }
 
+    async fn send_media(
+        &self,
+        chat_id: &str,
+        media: crate::types::OutgoingMedia,
+        caption: Option<&str>,
+    ) -> Result<String, ChannelError> {
+        // Slack has no separate photo endpoint — images and documents alike go
+        // through the 3-step external file upload flow.
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| ChannelError::PlatformApi("Plugin not initialized".into()))?;
+        api.upload_file(chat_id, media.bytes, &media.filename, &media.mime, caption)
+            .await
+    }
+
     async fn edit_message(
         &self,
         chat_id: &str,

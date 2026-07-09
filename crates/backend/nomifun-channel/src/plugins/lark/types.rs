@@ -307,6 +307,38 @@ pub(crate) struct GenericResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Image / file upload (outbound media)
+// ---------------------------------------------------------------------------
+
+/// Response from the image upload endpoint (`/im/v1/images`).
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ImageUploadResponse {
+    pub code: i32,
+    pub msg: String,
+    pub data: Option<ImageUploadData>,
+}
+
+/// Data from a successful image upload: the reusable `image_key`.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ImageUploadData {
+    pub image_key: String,
+}
+
+/// Response from the file upload endpoint (`/im/v1/files`).
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct FileUploadResponse {
+    pub code: i32,
+    pub msg: String,
+    pub data: Option<FileUploadData>,
+}
+
+/// Data from a successful file upload: the reusable `file_key`.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct FileUploadData {
+    pub file_key: String,
+}
+
+// ---------------------------------------------------------------------------
 // Interactive card building helpers
 // ---------------------------------------------------------------------------
 

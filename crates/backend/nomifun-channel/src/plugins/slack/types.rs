@@ -86,6 +86,51 @@ pub(crate) struct UpdateMessageResult {
 }
 
 // ---------------------------------------------------------------------------
+// files.getUploadURLExternal (step 1 of the 3-step external upload flow)
+// ---------------------------------------------------------------------------
+
+/// Successful result from `files.getUploadURLExternal`.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct GetUploadUrlResult {
+    pub upload_url: Option<String>,
+    pub file_id: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// files.completeUploadExternal (step 3 of the 3-step external upload flow)
+// ---------------------------------------------------------------------------
+
+/// One entry in the `files` array of `files.completeUploadExternal`.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CompleteUploadFile {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// Request body for `files.completeUploadExternal`.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CompleteUploadRequest {
+    pub files: Vec<CompleteUploadFile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_comment: Option<String>,
+}
+
+/// Result from `files.completeUploadExternal`.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct CompleteUploadResult {
+    pub files: Option<Vec<CompletedFile>>,
+}
+
+/// A finalized file entry (we read its id as the returned handle).
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct CompletedFile {
+    pub id: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Socket Mode envelopes
 // ---------------------------------------------------------------------------
 

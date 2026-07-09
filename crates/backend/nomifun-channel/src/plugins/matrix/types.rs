@@ -131,6 +131,17 @@ pub struct SendEventResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Media upload response
+// ---------------------------------------------------------------------------
+
+/// Response from `POST /_matrix/media/v3/upload`.
+#[derive(Debug, Deserialize)]
+pub struct MediaUploadResponse {
+    /// The `mxc://` content URI of the uploaded bytes.
+    pub content_uri: String,
+}
+
+// ---------------------------------------------------------------------------
 // Display name response (for bot info)
 // ---------------------------------------------------------------------------
 

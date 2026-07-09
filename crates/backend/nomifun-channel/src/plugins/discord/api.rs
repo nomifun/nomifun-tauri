@@ -85,6 +85,58 @@ impl DiscordApi {
             .map_err(|e| ChannelError::MessageSendFailed(format!("Discord create_message parse failed: {e}")))
     }
 
+    /// `POST /channels/{channel_id}/messages` (multipart) — upload raw bytes as
+    /// a message attachment; returns the created message's id. Images and files
+    /// share this mechanism, so `caption` becomes the message content.
+    pub async fn create_message_with_attachment(
+        &self,
+        channel_id: &str,
+        bytes: Vec<u8>,
+        filename: &str,
+        mime: &str,
+        caption: Option<&str>,
+    ) -> Result<CreateMessageResponse, ChannelError> {
+        let url = format!("{DISCORD_API_BASE}/channels/{channel_id}/messages");
+        debug!(channel_id, bytes = bytes.len(), "Uploading Discord attachment");
+
+        // `payload_json` carries the message content plus attachment metadata
+        // that references the uploaded file part by index (files[0] → id 0).
+        let payload = serde_json::json!({
+            "content": caption.unwrap_or(""),
+            "attachments": [{ "id": 0, "filename": filename }],
+        });
+
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename.to_owned())
+            .mime_str(mime)
+            .map_err(|e| ChannelError::MessageSendFailed(format!("invalid attachment mime {mime}: {e}")))?;
+
+        let form = reqwest::multipart::Form::new()
+            .text("payload_json", payload.to_string())
+            .part("files[0]", part);
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("Authorization", self.auth_header())
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(format!("Discord attachment request failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ChannelError::MessageSendFailed(format!(
+                "Discord attachment upload failed: HTTP {status}: {body}"
+            )));
+        }
+
+        resp.json()
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(format!("Discord attachment parse failed: {e}")))
+    }
+
     /// `PATCH /channels/{channel_id}/messages/{message_id}` — edit a message.
     pub async fn edit_message(
         &self,

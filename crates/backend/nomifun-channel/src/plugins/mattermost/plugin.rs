@@ -228,6 +228,35 @@ impl ChannelPlugin for MattermostPlugin {
             channel_id: chat_id.to_owned(),
             message: text,
             root_id,
+            file_ids: Vec::new(),
+        };
+
+        let resp = api.create_post(&req).await?;
+        Ok(resp.id)
+    }
+
+    async fn send_media(
+        &self,
+        chat_id: &str,
+        media: crate::types::OutgoingMedia,
+        caption: Option<&str>,
+    ) -> Result<String, ChannelError> {
+        // Image and File both take the same two-step path: upload the bytes to
+        // /api/v4/files for a file id, then create a post attaching that id.
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| ChannelError::PlatformApi("Plugin not initialized".into()))?;
+
+        let file_id = api
+            .upload_file(chat_id, media.bytes, &media.filename, &media.mime)
+            .await?;
+
+        let req = CreatePostRequest {
+            channel_id: chat_id.to_owned(),
+            message: caption.unwrap_or("").to_owned(),
+            root_id: None,
+            file_ids: vec![file_id],
         };
 
         let resp = api.create_post(&req).await?;

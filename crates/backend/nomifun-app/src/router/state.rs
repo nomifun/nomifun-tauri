@@ -757,7 +757,12 @@ pub async fn build_channel_state(
         // Master-agent mode: per-channel companion binding (with legacy platform
         // fallback) + model resolution fall back to the bound companion when the
         // platform has no config of its own.
-        .with_master_profile(Arc::clone(&master_profile)),
+        .with_master_profile(Arc::clone(&master_profile))
+        // Outbound media: resolve `wsa_…` ids to bytes so channel replies can
+        // send AI-generated images/files.
+        .with_asset_resolver(Arc::new(crate::channel_asset_resolver::ChannelAssetResolver::new(
+            services.workshop_service.clone(),
+        ))),
     );
 
     let orchestrator = nomifun_channel::orchestrator::ChannelOrchestrator::new(

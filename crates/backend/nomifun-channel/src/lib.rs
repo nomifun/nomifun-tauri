@@ -5,6 +5,7 @@ pub mod constants;
 pub mod error;
 pub mod formatter;
 pub mod manager;
+pub mod media_refs;
 pub mod message_service;
 pub mod orchestrator;
 pub mod pairing;

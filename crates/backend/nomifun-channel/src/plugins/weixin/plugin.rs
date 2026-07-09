@@ -176,6 +176,26 @@ impl ChannelPlugin for WeixinPlugin {
         Ok(())
     }
 
+    async fn send_media(
+        &self,
+        chat_id: &str,
+        media: crate::types::OutgoingMedia,
+        _caption: Option<&str>,
+    ) -> Result<String, ChannelError> {
+        use crate::types::MediaKind;
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| ChannelError::PlatformApi("Plugin not initialized".into()))?;
+        // context_token (from the inbound turn) routes the reply to the right
+        // conversation — same requirement as text sends.
+        let context_token = self.context_tokens.get(chat_id).map(|v| v.clone());
+        let is_image = matches!(media.kind, MediaKind::Image);
+        api.send_media(chat_id, media.bytes, &media.filename, is_image, context_token.as_deref())
+            .await?;
+        Ok(String::new())
+    }
+
     fn active_user_count(&self) -> usize {
         0
     }

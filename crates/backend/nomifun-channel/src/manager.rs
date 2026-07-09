@@ -767,6 +767,21 @@ impl ChannelManager {
         plugin.edit_message(chat_id, message_id, message).await
     }
 
+    /// Sends a media item (image/file) through a specific plugin.
+    pub async fn send_media(
+        &self,
+        plugin_id: &str,
+        chat_id: &str,
+        media: crate::types::OutgoingMedia,
+        caption: Option<&str>,
+    ) -> Result<String, ChannelError> {
+        let plugin = self
+            .plugins
+            .get(plugin_id)
+            .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_owned()))?;
+        plugin.send_media(chat_id, media, caption).await
+    }
+
     // ── Watchdog ─────────────────────────────────────────────────────
 
     /// Spawns the periodic plugin health watchdog.
@@ -1187,6 +1202,16 @@ impl crate::stream_relay::ChannelSender for ChannelManager {
         message: crate::types::UnifiedOutgoingMessage,
     ) -> Result<(), crate::error::ChannelError> {
         self.edit_message(plugin_id, chat_id, message_id, message).await
+    }
+
+    async fn send_media(
+        &self,
+        plugin_id: &str,
+        chat_id: &str,
+        media: crate::types::OutgoingMedia,
+        caption: Option<&str>,
+    ) -> Result<String, crate::error::ChannelError> {
+        self.send_media(plugin_id, chat_id, media, caption).await
     }
 }
 

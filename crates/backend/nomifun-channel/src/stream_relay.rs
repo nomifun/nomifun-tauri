@@ -44,6 +44,14 @@ pub trait ChannelSender: Send + Sync {
         message_id: &str,
         message: UnifiedOutgoingMessage,
     ) -> Result<(), ChannelError>;
+
+    async fn send_media(
+        &self,
+        plugin_id: &str,
+        chat_id: &str,
+        media: crate::types::OutgoingMedia,
+        caption: Option<&str>,
+    ) -> Result<String, ChannelError>;
 }
 
 /// Relays agent stream events to an IM platform.
@@ -59,14 +67,48 @@ pub struct ChannelStreamRelay {
     /// Shared store: a relayed decision is recorded here so the inbound
     /// numeric reply can be mapped back to the right `call_id`/option.
     pending: Arc<PendingDecisionStore>,
+    /// Resolves `wsa_…` ids to bytes for outbound media. `None` disables sending.
+    asset_resolver: Option<Arc<dyn crate::message_service::AssetResolver>>,
 }
 
 impl ChannelStreamRelay {
-    pub fn new(config: RelayConfig, sender: Arc<dyn ChannelSender>, pending: Arc<PendingDecisionStore>) -> Self {
+    pub fn new(
+        config: RelayConfig,
+        sender: Arc<dyn ChannelSender>,
+        pending: Arc<PendingDecisionStore>,
+        asset_resolver: Option<Arc<dyn crate::message_service::AssetResolver>>,
+    ) -> Self {
         Self {
             config,
             sender,
             pending,
+            asset_resolver,
+        }
+    }
+
+    /// Resolve each not-yet-sent asset id to bytes and send it via the plugin's
+    /// media path. `seen` dedupes across a turn (get_task may be polled). No-ops
+    /// when no resolver is wired. Failures are logged, never fatal.
+    async fn flush_media(&self, ids: &[String], seen: &mut std::collections::HashSet<String>) {
+        let Some(resolver) = self.asset_resolver.as_ref() else {
+            return;
+        };
+        for id in ids {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            match resolver.resolve(id).await {
+                Some(media) => {
+                    if let Err(e) = self
+                        .sender
+                        .send_media(&self.config.plugin_id, &self.config.chat_id, media, None)
+                        .await
+                    {
+                        warn!(asset_id = %id, error = %e, "failed to send channel media");
+                    }
+                }
+                None => warn!(asset_id = %id, "asset could not be resolved for channel media"),
+            }
         }
     }
 
@@ -84,6 +126,8 @@ impl ChannelStreamRelay {
     async fn run_send_once(self, mut rx: broadcast::Receiver<AgentStreamEvent>) {
         let mut text_buffer = String::new();
         let mut has_content = false;
+        let mut media_ids: Vec<String> = Vec::new();
+        let mut media_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         loop {
             match rx.recv().await {
@@ -93,6 +137,11 @@ impl ChannelStreamRelay {
                         has_content = true;
                     }
                     Some(StreamAction::Thinking(_)) => {}
+                    // Produced workshop asset ids: accumulate; flushed as media
+                    // after the final text (deduped across the turn).
+                    Some(StreamAction::MediaProduced(ids)) => {
+                        media_ids.extend(ids);
+                    }
                     Some(StreamAction::ToolCall { .. }) if has_content && !text_buffer.trim().is_empty() => {
                         // Strip inline reasoning before flushing buffered text.
                         // If only <think> content has arrived so far, skip the
@@ -128,6 +177,10 @@ impl ChannelStreamRelay {
                                 .send_message(&self.config.plugin_id, &self.config.chat_id, final_msg)
                                 .await;
                         }
+                        // Also catch asset URLs written into the visible text
+                        // (the same link the desktop renders), then send images.
+                        media_ids.extend(crate::media_refs::asset_ids_from_text(&visible));
+                        self.flush_media(&media_ids, &mut media_seen).await;
                         info!(
                             plugin_id = %self.config.plugin_id,
                             chat_id = %self.config.chat_id,
@@ -168,6 +221,8 @@ impl ChannelStreamRelay {
                             .send_message(&self.config.plugin_id, &self.config.chat_id, final_msg)
                             .await;
                     }
+                    media_ids.extend(crate::media_refs::asset_ids_from_text(&visible));
+                    self.flush_media(&media_ids, &mut media_seen).await;
                     break;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -207,6 +262,8 @@ impl ChannelStreamRelay {
         // intact so the turn stays live (see `record_and_send_decision`); we
         // must not replace it with a terminal "(no text output)" card on Finish.
         let mut decision_forwarded = false;
+        let mut media_ids: Vec<String> = Vec::new();
+        let mut media_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         loop {
             match rx.recv().await {
@@ -234,6 +291,11 @@ impl ChannelStreamRelay {
                         }
                     }
                     Some(StreamAction::Thinking(_)) => {}
+                    // Produced workshop asset ids: accumulate; flushed as media
+                    // after the final text (deduped across the turn).
+                    Some(StreamAction::MediaProduced(ids)) => {
+                        media_ids.extend(ids);
+                    }
                     Some(StreamAction::ToolCall { name, .. }) => {
                         // Deliberately no parse mode: the tool name is raw
                         // agent output and is not HTML-escaped here.
@@ -253,6 +315,9 @@ impl ChannelStreamRelay {
                     Some(StreamAction::Finish) => {
                         self.send_final_edit(&text_buffer, decision_forwarded, &thinking_msg_id)
                             .await;
+                        let visible = strip_reasoning(&text_buffer, Stage::Final);
+                        media_ids.extend(crate::media_refs::asset_ids_from_text(&visible));
+                        self.flush_media(&media_ids, &mut media_seen).await;
                         info!(
                             plugin_id = %self.config.plugin_id,
                             chat_id = %self.config.chat_id,
@@ -294,6 +359,9 @@ impl ChannelStreamRelay {
                     warn!("channel stream relay: broadcast closed without terminal event");
                     self.send_final_edit(&text_buffer, decision_forwarded, &thinking_msg_id)
                         .await;
+                    let visible = strip_reasoning(&text_buffer, Stage::Final);
+                    media_ids.extend(crate::media_refs::asset_ids_from_text(&visible));
+                    self.flush_media(&media_ids, &mut media_seen).await;
                     break;
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -405,6 +473,7 @@ fn is_send_once_platform(platform: PluginType) -> bool {
 pub struct MessageRecorder {
     sends: std::sync::Mutex<Vec<UnifiedOutgoingMessage>>,
     edits: std::sync::Mutex<Vec<UnifiedOutgoingMessage>>,
+    media: std::sync::Mutex<Vec<crate::types::OutgoingMedia>>,
 }
 
 impl MessageRecorder {
@@ -412,6 +481,7 @@ impl MessageRecorder {
         Self {
             sends: std::sync::Mutex::new(Vec::new()),
             edits: std::sync::Mutex::new(Vec::new()),
+            media: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -421,6 +491,10 @@ impl MessageRecorder {
 
     pub fn take_edits(&self) -> Vec<UnifiedOutgoingMessage> {
         std::mem::take(&mut self.edits.lock().unwrap())
+    }
+
+    pub fn take_media(&self) -> Vec<crate::types::OutgoingMedia> {
+        std::mem::take(&mut self.media.lock().unwrap())
     }
 }
 
@@ -452,4 +526,114 @@ impl ChannelSender for MessageRecorder {
         self.edits.lock().unwrap().push(message);
         Ok(())
     }
+
+    async fn send_media(
+        &self,
+        _plugin_id: &str,
+        _chat_id: &str,
+        media: crate::types::OutgoingMedia,
+        _caption: Option<&str>,
+    ) -> Result<String, ChannelError> {
+        self.media.lock().unwrap().push(media);
+        Ok("media-1".into())
+    }
 }
+
+#[cfg(test)]
+mod media_tests {
+    use super::*;
+    use crate::types::{MediaKind, OutgoingMedia};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    struct StubResolver;
+    #[async_trait]
+    impl crate::message_service::AssetResolver for StubResolver {
+        async fn resolve(&self, asset_id: &str) -> Option<OutgoingMedia> {
+            Some(OutgoingMedia {
+                bytes: vec![1, 2, 3],
+                mime: "image/png".into(),
+                filename: format!("{asset_id}.png"),
+                kind: MediaKind::Image,
+            })
+        }
+    }
+
+    fn cfg(platform: PluginType) -> RelayConfig {
+        RelayConfig {
+            platform,
+            plugin_id: "p1".into(),
+            chat_id: "c1".into(),
+            throttle_ms: 0,
+            conversation_id: "conv1".into(),
+        }
+    }
+
+    // Drives the relay with two identical MediaProduced events then Finish, and
+    // asserts the resolved image is sent exactly once via send_media (deduped),
+    // and the final text is still delivered.
+    #[tokio::test]
+    async fn relay_flushes_media_on_finish() {
+        use nomifun_ai_agent::protocol::events::{FinishEventData, TextEventData, ToolCallEventData, ToolCallStatus};
+
+        let recorder = Arc::new(MessageRecorder::new());
+        let pending = crate::pending_decision::PendingDecisionStore::new();
+        let relay = ChannelStreamRelay::new(
+            cfg(PluginType::Telegram),
+            recorder.clone(),
+            pending,
+            Some(Arc::new(StubResolver)),
+        );
+
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        tx.send(AgentStreamEvent::Text(TextEventData { content: "图来咯～".into() })).unwrap();
+        // Two completed tool calls returning the SAME asset id → must dedupe to one send.
+        for _ in 0..2 {
+            tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+                call_id: "t".into(),
+                name: "nomi_workshop_get_task".into(),
+                args: serde_json::Value::Null,
+                status: ToolCallStatus::Completed,
+                description: None,
+                input: None,
+                output: Some(r#"{"result_asset_ids":["wsa_x"]}"#.into()),
+            })).unwrap();
+        }
+        tx.send(AgentStreamEvent::Finish(FinishEventData { session_id: None, stop_reason: None })).unwrap();
+        drop(tx);
+
+        relay.run(rx).await;
+
+        let media = recorder.take_media();
+        assert_eq!(media.len(), 1, "one deduped image sent");
+        assert_eq!(media[0].filename, "wsa_x.png");
+        assert!(!recorder.take_edits().is_empty(), "final text edit delivered too");
+    }
+
+    // Without a resolver wired, no media is sent (graceful text-only behaviour).
+    #[tokio::test]
+    async fn relay_without_resolver_sends_no_media() {
+        use nomifun_ai_agent::protocol::events::{FinishEventData, ToolCallEventData, ToolCallStatus};
+
+        let recorder = Arc::new(MessageRecorder::new());
+        let pending = crate::pending_decision::PendingDecisionStore::new();
+        let relay = ChannelStreamRelay::new(cfg(PluginType::Telegram), recorder.clone(), pending, None);
+
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "t".into(),
+            name: "nomi_workshop_get_task".into(),
+            args: serde_json::Value::Null,
+            status: ToolCallStatus::Completed,
+            description: None,
+            input: None,
+            output: Some(r#"{"result_asset_ids":["wsa_x"]}"#.into()),
+        })).unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData { session_id: None, stop_reason: None })).unwrap();
+        drop(tx);
+
+        relay.run(rx).await;
+        assert!(recorder.take_media().is_empty(), "no resolver → no media");
+    }
+}
+

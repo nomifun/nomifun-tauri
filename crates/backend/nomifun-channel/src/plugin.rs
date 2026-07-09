@@ -126,6 +126,23 @@ pub trait ChannelPlugin: Send + Sync {
         message: UnifiedOutgoingMessage,
     ) -> Result<(), ChannelError>;
 
+    /// Send a media item (image/file) to a chat, returning the platform message
+    /// id. Default: not supported — log at debug and no-op. The assistant's text
+    /// is delivered separately by the relay, so text-only / not-yet-wired
+    /// channels keep working; platforms with media support override this.
+    async fn send_media(
+        &self,
+        _chat_id: &str,
+        _media: crate::types::OutgoingMedia,
+        _caption: Option<&str>,
+    ) -> Result<String, ChannelError> {
+        tracing::debug!(
+            plugin = %self.plugin_type(),
+            "send_media not supported for this platform; skipping media"
+        );
+        Ok(String::new())
+    }
+
     /// Number of currently active (chatting) users on this plugin.
     fn active_user_count(&self) -> usize;
 

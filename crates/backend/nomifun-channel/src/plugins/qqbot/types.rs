@@ -338,6 +338,49 @@ pub struct SendMessageResponse {
     pub id: Option<String>,
 }
 
+/// Request body for uploading rich media to `/v2/users/{openid}/files` or
+/// `/v2/groups/{group_openid}/files` (C2C / group). Returns a `file_info`
+/// handle referenced by a subsequent msg_type 7 (rich media) message.
+#[derive(Debug, Serialize)]
+pub struct FileUploadRequest {
+    /// Media type: 1 = image, 2 = video, 3 = audio, 4 = file.
+    pub file_type: u32,
+    /// base64-encoded file bytes.
+    pub file_data: String,
+    /// Upload only (do not auto-send); we send the message separately.
+    pub srv_send_msg: bool,
+}
+
+/// Response from a rich-media file upload: the opaque handle to reference.
+#[derive(Debug, Deserialize)]
+pub struct FileUploadResponse {
+    #[serde(default)]
+    pub file_info: String,
+}
+
+/// Rich-media reference embedded in a msg_type 7 message body.
+#[derive(Debug, Serialize)]
+pub struct MediaRef {
+    pub file_info: String,
+}
+
+/// Request body for a rich-media (msg_type 7) message to a C2C user or group.
+#[derive(Debug, Serialize)]
+pub struct SendMediaMessageRequest {
+    /// Optional text caption (empty string is accepted by the API).
+    pub content: String,
+    /// Message type: 7 = rich media.
+    pub msg_type: u32,
+    /// Handle from a prior `FileUploadResponse`.
+    pub media: MediaRef,
+    /// Unique message sequence (per msg_id or proactive).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub msg_seq: Option<u32>,
+    /// Inbound message ID for passive reply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub msg_id: Option<String>,
+}
+
 /// Interaction callback body (ACK).
 #[derive(Debug, Serialize)]
 pub struct InteractionCallbackBody {
@@ -542,6 +585,38 @@ mod tests {
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("msg_seq").is_none());
         assert!(json.get("msg_id").is_none());
+    }
+
+    #[test]
+    fn file_upload_request_serializes() {
+        let req = FileUploadRequest {
+            file_type: 1,
+            file_data: "YWJj".into(),
+            srv_send_msg: false,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["file_type"], 1);
+        assert_eq!(json["file_data"], "YWJj");
+        assert_eq!(json["srv_send_msg"], false);
+    }
+
+    #[test]
+    fn send_media_message_request_serializes() {
+        let req = SendMediaMessageRequest {
+            content: String::new(),
+            msg_type: 7,
+            media: MediaRef {
+                file_info: "handle123".into(),
+            },
+            msg_seq: Some(2),
+            msg_id: Some("inbound".into()),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["content"], "");
+        assert_eq!(json["msg_type"], 7);
+        assert_eq!(json["media"]["file_info"], "handle123");
+        assert_eq!(json["msg_seq"], 2);
+        assert_eq!(json["msg_id"], "inbound");
     }
 
     #[test]

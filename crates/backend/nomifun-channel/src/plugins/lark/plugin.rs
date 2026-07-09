@@ -231,6 +231,26 @@ impl ChannelPlugin for LarkPlugin {
         api.update_card(message_id, &card_content).await
     }
 
+    async fn send_media(
+        &self,
+        chat_id: &str,
+        media: crate::types::OutgoingMedia,
+        _caption: Option<&str>,
+    ) -> Result<String, ChannelError> {
+        use crate::types::MediaKind;
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| ChannelError::PlatformApi("Plugin not initialized".into()))?;
+        // Lark image/file messages carry no caption field; the relay delivers
+        // the assistant's text separately, so `caption` is intentionally unused.
+        let data = match media.kind {
+            MediaKind::Image => api.send_image(chat_id, media.bytes, &media.filename, &media.mime).await?,
+            MediaKind::File => api.send_file(chat_id, media.bytes, &media.filename, &media.mime).await?,
+        };
+        Ok(data.message_id)
+    }
+
     fn active_user_count(&self) -> usize {
         0
     }

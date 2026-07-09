@@ -28,11 +28,30 @@ pub(crate) struct CreatePostRequest {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root_id: Option<String>,
+    /// Ids of previously uploaded files to attach (omitted when empty).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub file_ids: Vec<String>,
 }
 
 /// Response from `POST /api/v4/posts`.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct CreatePostResponse {
+    pub id: String,
+}
+
+// ---------------------------------------------------------------------------
+// REST: POST /api/v4/files  (upload)
+// ---------------------------------------------------------------------------
+
+/// Response from `POST /api/v4/files`. Only the uploaded file ids are needed.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct FileUploadResponse {
+    pub file_infos: Vec<FileInfo>,
+}
+
+/// A single uploaded file's metadata.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct FileInfo {
     pub id: String,
 }
 
@@ -157,6 +176,7 @@ mod tests {
             channel_id: "chan1".into(),
             message: "Hello".into(),
             root_id: Some("root1".into()),
+            file_ids: vec![],
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["channel_id"], "chan1");
@@ -170,9 +190,42 @@ mod tests {
             channel_id: "chan1".into(),
             message: "Hello".into(),
             root_id: None,
+            file_ids: vec![],
         };
         let json = serde_json::to_value(&req).unwrap();
         assert!(json.get("root_id").is_none());
+    }
+
+    #[test]
+    fn create_post_request_with_files_serializes() {
+        let req = CreatePostRequest {
+            channel_id: "chan1".into(),
+            message: String::new(),
+            root_id: None,
+            file_ids: vec!["file1".into(), "file2".into()],
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["file_ids"], serde_json::json!(["file1", "file2"]));
+    }
+
+    #[test]
+    fn create_post_request_empty_files_omits_field() {
+        let req = CreatePostRequest {
+            channel_id: "chan1".into(),
+            message: "Hi".into(),
+            root_id: None,
+            file_ids: vec![],
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("file_ids").is_none());
+    }
+
+    #[test]
+    fn file_upload_response_deserializes() {
+        let raw = json!({"file_infos": [{"id": "f1"}, {"id": "f2"}]});
+        let resp: FileUploadResponse = serde_json::from_value(raw).unwrap();
+        let ids: Vec<_> = resp.file_infos.into_iter().map(|f| f.id).collect();
+        assert_eq!(ids, vec!["f1", "f2"]);
     }
 
     #[test]

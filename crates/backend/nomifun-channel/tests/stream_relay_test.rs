@@ -13,7 +13,7 @@ use tokio::sync::broadcast;
 /// Builds a relay with a fresh (unshared) pending-decision store. Tests that
 /// need to inspect the store pass their own via [`relay_with_store`].
 fn relay(config: RelayConfig, sender: Arc<dyn ChannelSender>) -> ChannelStreamRelay {
-    ChannelStreamRelay::new(config, sender, PendingDecisionStore::new())
+    ChannelStreamRelay::new(config, sender, PendingDecisionStore::new(), None)
 }
 
 /// Builds a relay sharing the caller's pending-decision store.
@@ -22,7 +22,7 @@ fn relay_with_store(
     sender: Arc<dyn ChannelSender>,
     store: Arc<PendingDecisionStore>,
 ) -> ChannelStreamRelay {
-    ChannelStreamRelay::new(config, sender, store)
+    ChannelStreamRelay::new(config, sender, store, None)
 }
 
 // ── RelayConfig construction ─────────────────────────────────────

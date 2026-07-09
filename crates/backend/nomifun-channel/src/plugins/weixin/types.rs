@@ -11,6 +11,11 @@ pub(crate) const ITEM_TYPE_VOICE: i32 = 3;
 #[allow(dead_code)]
 pub(crate) const ITEM_TYPE_FILE: i32 = 4;
 
+// `getuploadurl` media_type (proto UploadMediaType) — DISTINCT from the
+// `item_list[].type` constants above: FILE is 3 here but 4 as an item type.
+pub(crate) const UPLOAD_MEDIA_TYPE_IMAGE: i32 = 1;
+pub(crate) const UPLOAD_MEDIA_TYPE_FILE: i32 = 3;
+
 // ---------------------------------------------------------------------------
 // ILinkResponse wrapper (kept for QR code endpoints that may use it)
 // ---------------------------------------------------------------------------
@@ -167,11 +172,78 @@ pub(crate) struct SendMessageItem {
     pub item_type: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_item: Option<SendTextItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_item: Option<SendImageItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_item: Option<SendFileItem>,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct SendTextItem {
     pub text: String,
+}
+
+// ---------------------------------------------------------------------------
+// Outbound media (image/file) — CDN-encrypted references. Mirrors the iLink
+// reference SDK (openclaw-weixin); see the media-upload findings spec doc.
+// ---------------------------------------------------------------------------
+
+/// `getuploadurl` request: reserve a pre-signed CDN upload URL for one media file.
+#[derive(Debug, Serialize)]
+pub(crate) struct GetUploadUrlRequest {
+    /// Random 16-byte key, hex-encoded (32 chars).
+    pub filekey: String,
+    /// [`UPLOAD_MEDIA_TYPE_IMAGE`] / [`UPLOAD_MEDIA_TYPE_FILE`].
+    pub media_type: i32,
+    pub to_user_id: String,
+    /// Plaintext size in bytes.
+    pub rawsize: u64,
+    /// Plaintext MD5, hex-encoded.
+    pub rawfilemd5: String,
+    /// Ciphertext size (AES-128-ECB + PKCS7 padded).
+    pub filesize: u64,
+    /// No thumbnail upload URL needed.
+    pub no_need_thumb: bool,
+    /// AES-128 key, hex-encoded (32 chars).
+    pub aeskey: String,
+}
+
+/// `getuploadurl` response.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct GetUploadUrlResponse {
+    /// Encrypted param for uploading the original file.
+    #[serde(default)]
+    pub upload_param: Option<String>,
+    /// Thumbnail upload param (absent when `no_need_thumb`).
+    #[serde(default)]
+    pub thumb_upload_param: Option<String>,
+}
+
+/// CDN media reference carried in an outbound image/file item.
+#[derive(Debug, Serialize)]
+pub(crate) struct SendCdnMedia {
+    /// Download param returned by the CDN upload (`x-encrypted-param`).
+    pub encrypt_query_param: String,
+    /// AES key — base64 of the hex-string's bytes, matching the reference SDK.
+    pub aes_key: String,
+    /// 1 = packed thumbnail/mid-size info.
+    pub encrypt_type: i32,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct SendImageItem {
+    pub media: SendCdnMedia,
+    /// Ciphertext size of the original image.
+    pub mid_size: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct SendFileItem {
+    pub media: SendCdnMedia,
+    pub file_name: String,
+    /// Plaintext size in bytes, as a string.
+    pub len: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +393,8 @@ mod tests {
                 item_list: vec![SendMessageItem {
                     item_type: ITEM_TYPE_TEXT,
                     text_item: Some(SendTextItem { text: "Hello".into() }),
+                    image_item: None,
+                    file_item: None,
                 }],
                 context_token: Some("ctx_abc".into()),
             },
@@ -348,6 +422,8 @@ mod tests {
                 item_list: vec![SendMessageItem {
                     item_type: ITEM_TYPE_TEXT,
                     text_item: Some(SendTextItem { text: "Hi".into() }),
+                    image_item: None,
+                    file_item: None,
                 }],
                 context_token: None,
             },

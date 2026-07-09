@@ -491,6 +491,27 @@ pub struct ChannelMediaAction {
     pub label: Option<String>,
 }
 
+/// Media resolved from a workshop asset, ready for a plugin to upload.
+///
+/// Runtime-only (NOT `Serialize`/`Deserialize`): it carries raw bytes and is
+/// passed in-process from the relay to a plugin's [`crate::plugin::ChannelPlugin::send_media`],
+/// never over the wire. Kept out of [`UnifiedOutgoingMessage`] so that type stays
+/// a serializable, literal-constructed wire struct.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutgoingMedia {
+    pub bytes: Vec<u8>,
+    pub mime: String,
+    pub filename: String,
+    pub kind: MediaKind,
+}
+
+/// Whether an [`OutgoingMedia`] should be sent as an inline image or a document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    Image,
+    File,
+}
+
 // ---------------------------------------------------------------------------
 // G2. Decision (blocking permission/confirmation relayed as numbered text)
 // ---------------------------------------------------------------------------

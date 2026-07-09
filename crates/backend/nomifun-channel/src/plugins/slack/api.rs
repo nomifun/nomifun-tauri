@@ -9,7 +9,8 @@ use tracing::debug;
 use crate::error::ChannelError;
 
 use super::types::{
-    AuthTestResult, ConnectionOpenResult, PostMessageRequest, PostMessageResult,
+    AuthTestResult, CompleteUploadFile, CompleteUploadRequest, CompleteUploadResult,
+    ConnectionOpenResult, GetUploadUrlResult, PostMessageRequest, PostMessageResult,
     SlackResponse, UpdateMessageRequest, UpdateMessageResult,
 };
 
@@ -142,6 +143,127 @@ impl SlackApi {
                     "chat.postMessage returned no ts".into(),
                 )
             })
+    }
+
+    /// Upload raw bytes as a file via Slack's modern 3-step external upload
+    /// flow and share it into `channel_id`. Used for both images and documents
+    /// (Slack has no separate photo endpoint). Returns the finalized file id.
+    ///
+    /// 1. `files.getUploadURLExternal` — reserve an `upload_url` + `file_id`.
+    /// 2. POST the raw bytes to `upload_url` (pre-signed; no bot auth).
+    /// 3. `files.completeUploadExternal` — finalize and post into the channel.
+    pub async fn upload_file(
+        &self,
+        channel_id: &str,
+        bytes: Vec<u8>,
+        filename: &str,
+        mime: &str,
+        caption: Option<&str>,
+    ) -> Result<String, ChannelError> {
+        // Step 1: reserve an upload URL + file id.
+        let length = bytes.len();
+        debug!(channel = %channel_id, bytes = length, "Reserving Slack upload URL");
+        let url = format!("{SLACK_API_BASE}/files.getUploadURLExternal");
+        let resp: SlackResponse<GetUploadUrlResult> = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.bot_token)
+            .form(&[("filename", filename.to_string()), ("length", length.to_string())])
+            .send()
+            .await
+            .map_err(|e| {
+                ChannelError::MessageSendFailed(format!(
+                    "files.getUploadURLExternal request failed: {e}"
+                ))
+            })?
+            .json()
+            .await
+            .map_err(|e| {
+                ChannelError::MessageSendFailed(format!(
+                    "files.getUploadURLExternal parse failed: {e}"
+                ))
+            })?;
+
+        if !resp.ok {
+            let desc = resp.error.unwrap_or_default();
+            return Err(ChannelError::MessageSendFailed(format!(
+                "files.getUploadURLExternal failed: {desc}"
+            )));
+        }
+        let reserved = resp.data.ok_or_else(|| {
+            ChannelError::MessageSendFailed("files.getUploadURLExternal returned no result".into())
+        })?;
+        let upload_url = reserved.upload_url.filter(|u| !u.is_empty()).ok_or_else(|| {
+            ChannelError::MessageSendFailed("files.getUploadURLExternal returned no upload_url".into())
+        })?;
+        let file_id = reserved.file_id.filter(|f| !f.is_empty()).ok_or_else(|| {
+            ChannelError::MessageSendFailed("files.getUploadURLExternal returned no file_id".into())
+        })?;
+
+        // Step 2: POST the raw bytes to the pre-signed URL. This host is not the
+        // Slack Web API, so no bot token — a non-200 status signals failure.
+        let upload_resp = self
+            .client
+            .post(&upload_url)
+            .header(reqwest::header::CONTENT_TYPE, mime.to_string())
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|e| {
+                ChannelError::MessageSendFailed(format!("Slack file upload request failed: {e}"))
+            })?;
+        if !upload_resp.status().is_success() {
+            let status = upload_resp.status();
+            return Err(ChannelError::MessageSendFailed(format!(
+                "Slack file upload failed with HTTP {status}"
+            )));
+        }
+
+        // Step 3: finalize the upload and share it into the channel.
+        let complete_url = format!("{SLACK_API_BASE}/files.completeUploadExternal");
+        let req = CompleteUploadRequest {
+            files: vec![CompleteUploadFile {
+                id: file_id.clone(),
+                title: Some(filename.to_string()),
+            }],
+            channel_id: Some(channel_id.to_string()),
+            initial_comment: caption.map(|c| c.to_string()),
+        };
+        let complete: SlackResponse<CompleteUploadResult> = self
+            .client
+            .post(&complete_url)
+            .bearer_auth(&self.bot_token)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| {
+                ChannelError::MessageSendFailed(format!(
+                    "files.completeUploadExternal request failed: {e}"
+                ))
+            })?
+            .json()
+            .await
+            .map_err(|e| {
+                ChannelError::MessageSendFailed(format!(
+                    "files.completeUploadExternal parse failed: {e}"
+                ))
+            })?;
+
+        if !complete.ok {
+            let desc = complete.error.unwrap_or_default();
+            return Err(ChannelError::MessageSendFailed(format!(
+                "files.completeUploadExternal failed: {desc}"
+            )));
+        }
+
+        // Prefer the finalized file id; fall back to the reserved id.
+        let handle = complete
+            .data
+            .and_then(|d| d.files)
+            .and_then(|mut f| f.pop())
+            .and_then(|f| f.id)
+            .unwrap_or(file_id);
+        Ok(handle)
     }
 
     /// `chat.update` -- edit an existing message.

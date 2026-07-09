@@ -8,7 +8,7 @@ default = []
 telegram = ["dep:reqwest", "dep:nomifun-runtime"]
 lark = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:prost", "dep:rustls", "dep:rustls-native-certs"]
 dingtalk = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls", "dep:rustls-native-certs"]
-weixin = ["dep:reqwest", "dep:futures-util", "dep:base64", "dep:uuid"]
+weixin = ["dep:reqwest", "dep:futures-util", "dep:base64", "dep:uuid", "dep:aes", "dep:md-5", "dep:hex"]
 wecom = ["dep:tokio-tungstenite", "dep:futures-util", "dep:rustls", "dep:rustls-native-certs"]
 discord = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls", "dep:rustls-native-certs", "dep:base64"]
 matrix = ["dep:reqwest"]
@@ -17,7 +17,7 @@ slack = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls
 twitch = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls", "dep:rustls-native-certs"]
 nostr = ["dep:nostr", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls", "dep:rustls-native-certs", "dep:hex"]
 # qqbot module + factory arm land when the parallel QQ Bot work is integrated.
-qqbot = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls", "dep:rustls-native-certs"]
+qqbot = ["dep:reqwest", "dep:tokio-tungstenite", "dep:futures-util", "dep:rustls", "dep:rustls-native-certs", "dep:base64"]
 
 [dependencies]
 nomifun-common.workspace = true
@@ -50,6 +50,9 @@ base64 = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 nostr = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
+# WeChat (iLink) CDN media: AES-128-ECB encryption + plaintext MD5.
+aes = { workspace = true, optional = true }
+md-5 = { workspace = true, optional = true }
 
 [dev-dependencies]
 nomifun-ai-agent = { workspace = true, features = ["test-support"] }

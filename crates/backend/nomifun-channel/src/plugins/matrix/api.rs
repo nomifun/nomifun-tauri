@@ -11,7 +11,9 @@ use tracing::debug;
 use crate::constants::{MATRIX_API_TIMEOUT, MATRIX_SYNC_TIMEOUT_MS};
 use crate::error::ChannelError;
 
-use super::types::{ProfileResponse, SendEventResponse, SyncResponse, WhoAmIResponse};
+use super::types::{
+    MediaUploadResponse, ProfileResponse, SendEventResponse, SyncResponse, WhoAmIResponse,
+};
 
 /// Monotonic transaction-ID counter for idempotent PUT requests.
 static TXN_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -255,6 +257,107 @@ impl MatrixApi {
             .json()
             .await
             .map_err(|e| ChannelError::PlatformApi(format!("edit_text parse error: {e}")))?;
+        Ok(result.event_id)
+    }
+
+    // -- media upload ----------------------------------------------------------
+
+    /// `POST /_matrix/media/v3/upload?filename={filename}`
+    ///
+    /// Uploads raw bytes to the homeserver content repository, returning the
+    /// resulting `mxc://` content URI referenced by media events.
+    pub async fn upload_media(
+        &self,
+        bytes: Vec<u8>,
+        filename: &str,
+        mime: &str,
+    ) -> Result<String, ChannelError> {
+        let url = format!(
+            "{}/_matrix/media/v3/upload?filename={}",
+            self.homeserver,
+            urlencoded(filename),
+        );
+
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.access_token)
+            .header(reqwest::header::CONTENT_TYPE, mime)
+            .body(bytes)
+            .timeout(MATRIX_API_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| {
+                ChannelError::MessageSendFailed(format!("upload_media request failed: {e}"))
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ChannelError::MessageSendFailed(format!(
+                "upload_media returned {status}: {body}"
+            )));
+        }
+
+        let result: MediaUploadResponse = resp
+            .json()
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(format!("upload_media parse error: {e}")))?;
+        Ok(result.content_uri)
+    }
+
+    // -- send media event ------------------------------------------------------
+
+    /// `PUT /_matrix/client/v3/rooms/{roomId}/send/m.room.message/{txnId}`
+    ///
+    /// Sends an `m.image` or `m.file` message referencing a previously-uploaded
+    /// `mxc://` URI. Returns the `event_id` of the sent message.
+    pub async fn send_media_event(
+        &self,
+        room_id: &str,
+        msgtype: &str,
+        body: &str,
+        mxc_url: &str,
+        mime: &str,
+    ) -> Result<String, ChannelError> {
+        let txn_id = next_txn_id();
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+            self.homeserver,
+            urlencoded(room_id),
+            urlencoded(&txn_id),
+        );
+
+        let event_body = serde_json::json!({
+            "msgtype": msgtype,
+            "body": body,
+            "url": mxc_url,
+            "info": { "mimetype": mime },
+        });
+
+        let resp = self
+            .client
+            .put(&url)
+            .bearer_auth(&self.access_token)
+            .json(&event_body)
+            .timeout(MATRIX_API_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| {
+                ChannelError::MessageSendFailed(format!("send_media_event request failed: {e}"))
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ChannelError::MessageSendFailed(format!(
+                "send_media_event returned {status}: {body}"
+            )));
+        }
+
+        let result: SendEventResponse = resp.json().await.map_err(|e| {
+            ChannelError::MessageSendFailed(format!("send_media_event parse error: {e}"))
+        })?;
         Ok(result.event_id)
     }
 }

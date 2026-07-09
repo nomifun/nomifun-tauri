@@ -331,7 +331,12 @@ async fn handle_dispatched(
             throttle_ms: 500,
             conversation_id: send_result.conversation_id.clone(),
         };
-        let relay = ChannelStreamRelay::new(relay_config, Arc::clone(sender), msg_svc.pending_decisions());
+        let relay = ChannelStreamRelay::new(
+            relay_config,
+            Arc::clone(sender),
+            msg_svc.pending_decisions(),
+            msg_svc.asset_resolver(),
+        );
         tokio::spawn(relay.run(rx));
     } else {
         warn!(

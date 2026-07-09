@@ -24,7 +24,7 @@ use super::gateway::{
     consume_passive_reply, next_msg_seq, parse_chat_id, run_gateway, run_token_refresh,
     ChatTarget, PassiveReplyMap,
 };
-use super::types::SendMessageRequest;
+use super::types::{MediaRef, SendMediaMessageRequest, SendMessageRequest};
 
 /// QQ Bot plugin: Gateway WS for inbound, REST for outbound, OAuth2 token.
 pub struct QqbotPlugin {
@@ -227,6 +227,86 @@ impl ChannelPlugin for QqbotPlugin {
             ChatTarget::Group => api.send_group_message(bare_id, &req).await?,
             ChatTarget::Channel => api.send_channel_message(bare_id, &req).await?,
             ChatTarget::Dm => api.send_dm_message(bare_id, &req).await?,
+        };
+
+        Ok(resp.id.unwrap_or_default())
+    }
+
+    async fn send_media(
+        &self,
+        chat_id: &str,
+        media: crate::types::OutgoingMedia,
+        caption: Option<&str>,
+    ) -> Result<String, ChannelError> {
+        use crate::types::MediaKind;
+
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| ChannelError::PlatformApi("Plugin not initialized".into()))?;
+
+        let (target, bare_id) = parse_chat_id(chat_id)
+            .ok_or_else(|| ChannelError::MessageSendFailed(format!("Unknown chat_id format: {chat_id}")))?;
+
+        // QQ media type: 1 = image, 4 = file.
+        let file_type = match media.kind {
+            MediaKind::Image => 1,
+            MediaKind::File => 4,
+        };
+
+        // Passive reply + sequence, mirroring send_message.
+        let now = tokio::time::Instant::now();
+        let passive_msg_id = consume_passive_reply(&self.reply_map, chat_id, now);
+        let content = caption.unwrap_or("").to_string();
+
+        let resp = match target {
+            // C2C / group: upload the bytes first, then send a msg_type 7
+            // (rich media) message referencing the returned file_info handle.
+            ChatTarget::C2c => {
+                let file_info = api.upload_c2c_file(bare_id, file_type, &media.bytes).await?;
+                let req = SendMediaMessageRequest {
+                    content,
+                    msg_type: 7,
+                    media: MediaRef { file_info },
+                    msg_seq: Some(next_msg_seq()),
+                    msg_id: passive_msg_id,
+                };
+                api.send_c2c_media(bare_id, &req).await?
+            }
+            ChatTarget::Group => {
+                let file_info = api.upload_group_file(bare_id, file_type, &media.bytes).await?;
+                let req = SendMediaMessageRequest {
+                    content,
+                    msg_type: 7,
+                    media: MediaRef { file_info },
+                    msg_seq: Some(next_msg_seq()),
+                    msg_id: passive_msg_id,
+                };
+                api.send_group_media(bare_id, &req).await?
+            }
+            // Guild channel / DM: single multipart request (file_image).
+            ChatTarget::Channel => {
+                api.send_channel_media(
+                    bare_id,
+                    media.bytes,
+                    &media.filename,
+                    &media.mime,
+                    caption,
+                    passive_msg_id.as_deref(),
+                )
+                .await?
+            }
+            ChatTarget::Dm => {
+                api.send_dm_media(
+                    bare_id,
+                    media.bytes,
+                    &media.filename,
+                    &media.mime,
+                    caption,
+                    passive_msg_id.as_deref(),
+                )
+                .await?
+            }
         };
 
         Ok(resp.id.unwrap_or_default())

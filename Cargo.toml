@@ -180,6 +180,9 @@ base64 = "0.22"
 http-body-util = "0.1"
 getrandom = "0.2"
 hex = "0.4"
+# AES-128-ECB + MD5 for the WeChat (iLink) CDN media upload/encryption.
+aes = "0.8"
+md-5 = "0.10"
 # Nostr protocol (keys, NIP-04 DMs, event signing) — pure crypto, no net/TLS deps.
 nostr = { version = "0.37", default-features = false, features = ["std", "nip04"] }
 # HTML → Markdown (URL knowledge-source snapshots)

@@ -178,6 +178,18 @@ impl ChannelPlugin for DiscordPlugin {
         Ok(sent.id)
     }
 
+    async fn send_media(&self, chat_id: &str, media: crate::types::OutgoingMedia, caption: Option<&str>) -> Result<String, ChannelError> {
+        // Discord: images and files both go through the message-attachment path.
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| ChannelError::PlatformApi("Plugin not initialized".into()))?;
+        let sent = api
+            .create_message_with_attachment(chat_id, media.bytes, &media.filename, &media.mime, caption)
+            .await?;
+        Ok(sent.id)
+    }
+
     async fn edit_message(
         &self,
         chat_id: &str,

@@ -243,6 +243,32 @@ impl ChannelPlugin for TelegramPlugin {
         api.edit_message_text(&req).await
     }
 
+    async fn send_media(
+        &self,
+        chat_id: &str,
+        media: crate::types::OutgoingMedia,
+        caption: Option<&str>,
+    ) -> Result<String, ChannelError> {
+        use crate::types::MediaKind;
+        let api = self
+            .api
+            .as_ref()
+            .ok_or_else(|| ChannelError::PlatformApi("Plugin not initialized".into()))?;
+        let chat_id_num = parse_chat_id(chat_id)?;
+
+        let sent = match media.kind {
+            MediaKind::Image => {
+                api.send_photo(chat_id_num, media.bytes, &media.filename, &media.mime, caption)
+                    .await?
+            }
+            MediaKind::File => {
+                api.send_document(chat_id_num, media.bytes, &media.filename, &media.mime, caption)
+                    .await?
+            }
+        };
+        Ok(sent.message_id.to_string())
+    }
+
     fn active_user_count(&self) -> usize {
         // Tracked externally by ChannelManager via SessionManager
         0

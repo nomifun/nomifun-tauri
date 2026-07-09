@@ -8,9 +8,9 @@ use tracing::{debug, warn};
 use crate::error::ChannelError;
 
 use super::types::{
-    BotInfoData, BotInfoResponse, GenericResponse, SendCardRequest, SendMessageData, SendMessageResponse,
-    TenantAccessTokenRequest, TenantAccessTokenResponse, UpdateCardRequest, WsEndpointData, WsEndpointRequest,
-    WsEndpointResponse,
+    BotInfoData, BotInfoResponse, FileUploadResponse, GenericResponse, ImageUploadResponse, SendCardRequest,
+    SendMessageData, SendMessageResponse, TenantAccessTokenRequest, TenantAccessTokenResponse, UpdateCardRequest,
+    WsEndpointData, WsEndpointRequest, WsEndpointResponse,
 };
 
 const LARK_OPEN_API_BASE: &str = "https://open.feishu.cn/open-apis";
@@ -221,6 +221,166 @@ impl LarkApi {
 
         resp.data
             .ok_or_else(|| ChannelError::MessageSendFailed("Lark send card returned no data".into()))
+    }
+
+    /// Upload raw image bytes and send them as an `image` message to a chat.
+    ///
+    /// Two-step flow: POST the bytes to `/im/v1/images` (`image_type=message`)
+    /// to obtain an `image_key`, then send an `image` message referencing it.
+    /// Returns the sent message data.
+    pub async fn send_image(
+        &self,
+        chat_id: &str,
+        bytes: Vec<u8>,
+        filename: &str,
+        mime: &str,
+    ) -> Result<SendMessageData, ChannelError> {
+        let image_key = self.upload_image(bytes, filename, mime).await?;
+        let content = serde_json::json!({ "image_key": image_key }).to_string();
+        self.send_content(chat_id, "image", &content).await
+    }
+
+    /// Upload raw file bytes and send them as a `file` message to a chat.
+    ///
+    /// Two-step flow: POST the bytes to `/im/v1/files` to obtain a `file_key`,
+    /// then send a `file` message referencing it. Returns the sent message data.
+    pub async fn send_file(
+        &self,
+        chat_id: &str,
+        bytes: Vec<u8>,
+        filename: &str,
+        mime: &str,
+    ) -> Result<SendMessageData, ChannelError> {
+        let file_key = self.upload_file(bytes, filename, mime).await?;
+        let content = serde_json::json!({ "file_key": file_key }).to_string();
+        self.send_content(chat_id, "file", &content).await
+    }
+
+    /// Upload raw image bytes, returning the reusable `image_key`.
+    ///
+    /// `image_type=message` marks the image for use in chat messages.
+    async fn upload_image(&self, bytes: Vec<u8>, filename: &str, mime: &str) -> Result<String, ChannelError> {
+        let token = self.get_token().await?;
+        let url = format!("{LARK_OPEN_API_BASE}/im/v1/images");
+
+        debug!(bytes = bytes.len(), "Uploading Lark image");
+
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename.to_owned())
+            .mime_str(mime)
+            .map_err(|e| ChannelError::MessageSendFailed(format!("invalid image mime {mime}: {e}")))?;
+        let form = reqwest::multipart::Form::new()
+            .text("image_type", "message")
+            .part("image", part);
+
+        let resp: ImageUploadResponse = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(format!("Lark image upload request failed: {e}")))?
+            .json()
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(format!("Lark image upload parse failed: {e}")))?;
+
+        if resp.code != 0 {
+            return Err(ChannelError::MessageSendFailed(format!(
+                "Lark image upload error (code={}): {}",
+                resp.code, resp.msg
+            )));
+        }
+
+        resp.data
+            .map(|d| d.image_key)
+            .ok_or_else(|| ChannelError::MessageSendFailed("Lark image upload returned no image_key".into()))
+    }
+
+    /// Upload raw file bytes, returning the reusable `file_key`.
+    ///
+    /// `file_type=stream` is Lark's generic binary type (non opus/mp4/pdf/doc/xls/ppt).
+    async fn upload_file(&self, bytes: Vec<u8>, filename: &str, mime: &str) -> Result<String, ChannelError> {
+        let token = self.get_token().await?;
+        let url = format!("{LARK_OPEN_API_BASE}/im/v1/files");
+
+        debug!(bytes = bytes.len(), file_name = filename, "Uploading Lark file");
+
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename.to_owned())
+            .mime_str(mime)
+            .map_err(|e| ChannelError::MessageSendFailed(format!("invalid file mime {mime}: {e}")))?;
+        let form = reqwest::multipart::Form::new()
+            .text("file_type", "stream")
+            .text("file_name", filename.to_owned())
+            .part("file", part);
+
+        let resp: FileUploadResponse = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(format!("Lark file upload request failed: {e}")))?
+            .json()
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(format!("Lark file upload parse failed: {e}")))?;
+
+        if resp.code != 0 {
+            return Err(ChannelError::MessageSendFailed(format!(
+                "Lark file upload error (code={}): {}",
+                resp.code, resp.msg
+            )));
+        }
+
+        resp.data
+            .map(|d| d.file_key)
+            .ok_or_else(|| ChannelError::MessageSendFailed("Lark file upload returned no file_key".into()))
+    }
+
+    /// Send a message with the given `msg_type` and JSON `content` string.
+    ///
+    /// Mirrors `send_card`'s POST but with a caller-provided message type;
+    /// shared by the image/file media sends.
+    async fn send_content(
+        &self,
+        chat_id: &str,
+        msg_type: &str,
+        content: &str,
+    ) -> Result<SendMessageData, ChannelError> {
+        let token = self.get_token().await?;
+        let url = format!("{LARK_OPEN_API_BASE}/im/v1/messages?receive_id_type=chat_id");
+
+        debug!(chat_id, msg_type, "Sending Lark media message");
+
+        let body = SendCardRequest {
+            receive_id: chat_id.to_string(),
+            msg_type: msg_type.to_string(),
+            content: content.to_string(),
+        };
+
+        let resp: SendMessageResponse = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(format!("Lark send {msg_type} request failed: {e}")))?
+            .json()
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(format!("Lark send {msg_type} parse failed: {e}")))?;
+
+        if resp.code != 0 {
+            return Err(ChannelError::MessageSendFailed(format!(
+                "Lark send {msg_type} error (code={}): {}",
+                resp.code, resp.msg
+            )));
+        }
+
+        resp.data
+            .ok_or_else(|| ChannelError::MessageSendFailed(format!("Lark send {msg_type} returned no data")))
     }
 
     /// Update (patch) an existing interactive card message.

@@ -94,6 +94,18 @@ pub trait MasterAgentProfile: Send + Sync {
     async fn record_public_agent_turn(&self, _id: &str, _platform: &str, _text: &str) {}
 }
 
+/// Resolves a workshop asset id (`wsa_…`) to raw bytes for outbound media.
+///
+/// Defined here (not in `nomifun-workshop`) so `nomifun-channel` stays free of
+/// a workshop dependency; the concrete impl lives in `nomifun-app`
+/// (`channel_asset_resolver.rs`), mirroring [`MasterAgentProfile`].
+#[async_trait::async_trait]
+pub trait AssetResolver: Send + Sync {
+    /// Load `asset_id` as bytes + mime + a suggested filename. `None` when the
+    /// asset can't be found or read (the relay then simply skips that image).
+    async fn resolve(&self, asset_id: &str) -> Option<crate::types::OutgoingMedia>;
+}
+
 /// Bridges channel messages to the conversation + AI agent layer.
 ///
 /// Responsibilities:
@@ -113,6 +125,9 @@ pub struct ChannelMessageService {
     /// reply. Shared with each `ChannelStreamRelay` (writer) so the inbound
     /// reply can be resolved against the right `call_id`/option.
     pending_decisions: Arc<crate::pending_decision::PendingDecisionStore>,
+    /// Optional resolver turning `wsa_…` ids into raw bytes for outbound media.
+    /// `None` (default / tests) disables channel image sending gracefully.
+    asset_resolver: Option<Arc<dyn AssetResolver>>,
 }
 
 impl ChannelMessageService {
@@ -131,6 +146,7 @@ impl ChannelMessageService {
             owner_user_id,
             master_profile: None,
             pending_decisions: crate::pending_decision::PendingDecisionStore::new(),
+            asset_resolver: None,
         }
     }
 
@@ -139,6 +155,19 @@ impl ChannelMessageService {
     pub fn with_master_profile(mut self, profile: Arc<dyn MasterAgentProfile>) -> Self {
         self.master_profile = Some(profile);
         self
+    }
+
+    /// Wire the asset resolver so channel replies can send AI-generated images.
+    /// Without it, image sending is disabled (text-only behaviour, unchanged).
+    pub fn with_asset_resolver(mut self, resolver: Arc<dyn AssetResolver>) -> Self {
+        self.asset_resolver = Some(resolver);
+        self
+    }
+
+    /// The wired asset resolver, if any. The orchestrator hands this to each
+    /// `ChannelStreamRelay` it spawns.
+    pub fn asset_resolver(&self) -> Option<Arc<dyn AssetResolver>> {
+        self.asset_resolver.clone()
     }
 
     /// The shared pending-decision store. The orchestrator hands this to each
@@ -605,10 +634,26 @@ impl ChannelMessageService {
             AgentStreamEvent::Finish(_) => Some(StreamAction::Finish),
             AgentStreamEvent::Error(data) => Some(StreamAction::Error(data.message.clone())),
             AgentStreamEvent::Thinking(data) => Some(StreamAction::Thinking(data.content.clone())),
-            AgentStreamEvent::ToolCall(data) => Some(StreamAction::ToolCall {
-                name: data.name.clone(),
-                status: format!("{:?}", data.status),
-            }),
+            AgentStreamEvent::ToolCall(data) => {
+                // A completed tool call may carry produced workshop asset ids in
+                // its output JSON (nomi_workshop_get_task/generate `result_asset_ids`).
+                // Surface those as MediaProduced so the relay can send the picture;
+                // otherwise keep the cosmetic {name,status} progress update.
+                if matches!(
+                    data.status,
+                    nomifun_ai_agent::protocol::events::ToolCallStatus::Completed
+                ) && let Some(output) = data.output.as_deref()
+                {
+                    let ids = crate::media_refs::asset_ids_from_tool_output(output);
+                    if !ids.is_empty() {
+                        return Some(StreamAction::MediaProduced(ids));
+                    }
+                }
+                Some(StreamAction::ToolCall {
+                    name: data.name.clone(),
+                    status: format!("{:?}", data.status),
+                })
+            }
             // Blocking decisions: forward as a numbered text choice. A decision
             // with no options is unanswerable, so it is dropped (None).
             AgentStreamEvent::AcpPermission(data) => match data {
@@ -820,6 +865,10 @@ pub enum StreamAction {
         prompt: String,
         options: Vec<crate::types::DecisionOption>,
     },
+    /// One or more workshop asset ids produced by a *completed* tool call
+    /// (e.g. `nomi_workshop_get_task` `result_asset_ids`). The relay resolves
+    /// each to bytes and sends it as media after the final text.
+    MediaProduced(Vec<String>),
 }
 
 /// Decorate a channel conversation's extra so the session is a companion master
@@ -1268,6 +1317,57 @@ mod tests {
     fn start_event_produces_none() {
         let event = AgentStreamEvent::Start(StartEventData { session_id: None });
         assert!(ChannelMessageService::process_stream_event(&event).is_none());
+    }
+
+    #[test]
+    fn completed_workshop_tool_call_produces_media() {
+        let event = AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "c1".into(),
+            name: "nomi_workshop_get_task".into(),
+            args: serde_json::Value::Null,
+            status: ToolCallStatus::Completed,
+            description: None,
+            input: None,
+            output: Some(r#"{"status":"succeeded","result_asset_ids":["wsa_1"]}"#.into()),
+        });
+        match ChannelMessageService::process_stream_event(&event) {
+            Some(StreamAction::MediaProduced(ids)) => assert_eq!(ids, vec!["wsa_1"]),
+            other => panic!("expected MediaProduced, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn running_tool_call_still_produces_tool_call_status() {
+        let event = AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "c1".into(),
+            name: "nomi_workshop_generate".into(),
+            args: serde_json::Value::Null,
+            status: ToolCallStatus::Running,
+            description: None,
+            input: None,
+            output: None,
+        });
+        assert!(matches!(
+            ChannelMessageService::process_stream_event(&event),
+            Some(StreamAction::ToolCall { .. })
+        ));
+    }
+
+    #[test]
+    fn completed_tool_call_without_asset_ids_stays_tool_call() {
+        let event = AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "c1".into(),
+            name: "Read".into(),
+            args: serde_json::Value::Null,
+            status: ToolCallStatus::Completed,
+            description: None,
+            input: None,
+            output: Some("just some text output".into()),
+        });
+        assert!(matches!(
+            ChannelMessageService::process_stream_event(&event),
+            Some(StreamAction::ToolCall { .. })
+        ));
     }
 
     // ── process_stream_event → Decision ────────────────────────────────
