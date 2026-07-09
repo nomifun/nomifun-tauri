@@ -7,7 +7,7 @@
 /**
  * Tauri-native in-app updater adapter. Backs the ipcBridge `update` /
  * `autoUpdate` channels with `@tauri-apps/plugin-updater` (+ `plugin-process`
- * for relaunch). Mirrors tauriShell.ts: every call is GUARDED by `isTauri()`
+ * for relaunch). Mirrors tauriShell.ts: every call is GUARDED by `isTauriRuntime()`
  * and the Tauri modules load via dynamic `import()` so the WebUI browser bundle
  * never evaluates Tauri IPC code.
  *
@@ -25,12 +25,7 @@
  */
 
 import type { AutoUpdateStatus } from '@/common/update/updateTypes';
-
-// Tauri-runtime detection — identical contract to tauriShell.ts (check BOTH
-// signals so a single missing one does not silently disable the updater).
-const isTauri = (): boolean =>
-  typeof window !== 'undefined' &&
-  (Boolean((window as { isTauri?: boolean }).isTauri) || '__TAURI_INTERNALS__' in window);
+import { isTauriRuntime } from './tauriRuntime';
 
 // Structural mirror of @tauri-apps/plugin-updater's public surface, so this
 // module type-checks without a static import (the plugin loads lazily).
@@ -99,7 +94,7 @@ async function runCheck(): Promise<TauriUpdateInfo | null> {
  * still serializes behind any in-flight check.
  */
 export async function tauriUpdateCheck(force = false): Promise<TauriUpdateInfo | null> {
-  if (!isTauri()) return null;
+  if (!isTauriRuntime()) return null;
   // Preserve a completed in-session download: re-checking would close the handle
   // and throw away the downloaded bytes, forcing a full re-download.
   if (downloadComplete && pendingUpdate) return infoFromHandle(pendingUpdate);
@@ -132,7 +127,7 @@ let currentVersionCache: string | null = null;
  * `null` (no Update handle in that case). Empty string outside the desktop shell.
  */
 export async function tauriUpdateCurrentVersion(): Promise<string> {
-  if (!isTauri()) return '';
+  if (!isTauriRuntime()) return '';
   if (currentVersionCache != null) return currentVersionCache;
   const { getVersion } = await import('@tauri-apps/api/app');
   currentVersionCache = await getVersion();
@@ -146,7 +141,7 @@ export async function tauriUpdateCurrentVersion(): Promise<string> {
  * handle was lost (e.g. modal reopened after a stale check).
  */
 export async function tauriUpdateDownload(emit: (s: AutoUpdateStatus) => void): Promise<void> {
-  if (!isTauri()) throw new Error('Updater is unavailable outside the desktop shell');
+  if (!isTauriRuntime()) throw new Error('Updater is unavailable outside the desktop shell');
   if (!pendingUpdate) await tauriUpdateCheck(true);
   if (!pendingUpdate) throw new Error('No update available to download');
   downloadComplete = false;
@@ -202,7 +197,7 @@ export async function tauriUpdateDownload(emit: (s: AutoUpdateStatus) => void): 
  * and relaunch into the new version. No-op outside the desktop shell.
  */
 export async function tauriUpdateInstallAndRelaunch(): Promise<void> {
-  if (!isTauri()) return;
+  if (!isTauriRuntime()) return;
   if (pendingUpdate) await pendingUpdate.install();
   const { relaunch } = await import('@tauri-apps/plugin-process');
   await relaunch();

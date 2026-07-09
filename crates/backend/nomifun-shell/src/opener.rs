@@ -52,6 +52,11 @@ impl ISystemOpener for DefaultSystemOpener {
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);
             tracing::warn!(program, ?args, %stderr, "command exited with non-zero status");
+            return Err(ShellError::CommandFailed(format!(
+                "{program} exited with status {}: {}",
+                result.status,
+                stderr.trim()
+            )));
         }
         Ok(())
     }

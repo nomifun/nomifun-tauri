@@ -5,6 +5,7 @@
  */
 
 import type { Theme } from '@renderer/hooks/system/useTheme';
+import { isTauriRuntime } from '@/common/adapter/tauriRuntime';
 
 /**
  * Cross-window light/dark theme sync.
@@ -27,12 +28,9 @@ export interface ThemeSyncPayload {
   customCss?: string;
 }
 
-const isTauri = (): boolean =>
-  typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
-
 /** Broadcast a light/dark theme change to every window (incl. the companion). */
 export function broadcastThemeSync(theme: Theme): void {
-  if (!isTauri()) return;
+  if (!isTauriRuntime()) return;
   void import('@tauri-apps/api/event')
     .then(({ emit }) => emit(THEME_SYNC_EVENT, { theme } satisfies ThemeSyncPayload))
     .catch(() => {
@@ -47,7 +45,7 @@ export function broadcastThemeSync(theme: Theme): void {
  * Rides the same THEME_SYNC_EVENT channel with a distinct payload field.
  */
 export function broadcastCustomCssSync(customCss: string): void {
-  if (!isTauri()) return;
+  if (!isTauriRuntime()) return;
   void import('@tauri-apps/api/event')
     .then(({ emit }) => emit(THEME_SYNC_EVENT, { customCss } satisfies ThemeSyncPayload))
     .catch(() => {

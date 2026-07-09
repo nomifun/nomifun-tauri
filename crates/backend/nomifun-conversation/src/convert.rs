@@ -3,13 +3,14 @@ use std::path::Path;
 use nomifun_api_types::{ConversationArtifactResponse, ConversationResponse, MessageResponse, MessageSearchItem};
 use nomifun_common::{
     AgentType, AppError, ConversationSource, ConversationStatus, MessagePosition, MessageStatus, MessageType,
-    ProviderWithModel,
+    ProviderWithModel, now_ms,
 };
 use nomifun_db::MessageSearchRow;
 use nomifun_db::models::{ConversationArtifactRow, ConversationRow, MessageRow};
 
 pub(crate) const TOOL_CONTENT_COMPACT_THRESHOLD_BYTES: usize = 64 * 1024;
 const TOOL_CONTENT_PREVIEW_CHARS: usize = 4096;
+const WRITEBACK_RUNNING_STALE_MS: i64 = 5 * 60 * 1000;
 
 /// Convert a database row into an API response DTO.
 ///
@@ -144,8 +145,9 @@ pub fn row_to_message_response(row: MessageRow) -> Result<MessageResponse, AppEr
 
     let status: Option<MessageStatus> = row.status.as_deref().map(string_to_enum).transpose()?;
 
-    let content: serde_json::Value = serde_json::from_str(&row.content)
+    let mut content: serde_json::Value = serde_json::from_str(&row.content)
         .map_err(|e| AppError::Internal(format!("Invalid message content JSON: {e}")))?;
+    project_interrupted_writeback_state(&mut content);
 
     Ok(MessageResponse {
         id: row.id,
@@ -158,6 +160,34 @@ pub fn row_to_message_response(row: MessageRow) -> Result<MessageResponse, AppEr
         hidden: row.hidden,
         created_at: row.created_at,
     })
+}
+
+fn project_interrupted_writeback_state(content: &mut serde_json::Value) {
+    let Some(writeback) = content
+        .as_object_mut()
+        .and_then(|obj| obj.get_mut("knowledge_writeback"))
+    else {
+        return;
+    };
+    let Some(status) = writeback.get("status").and_then(|v| v.as_str()) else {
+        return;
+    };
+    if !matches!(status, "started" | "extracting" | "writing") {
+        return;
+    }
+    let updated_at = writeback
+        .get("updated_at")
+        .and_then(|v| v.as_i64())
+        .or_else(|| writeback.get("started_at").and_then(|v| v.as_i64()))
+        .unwrap_or_default();
+    if now_ms().saturating_sub(updated_at) < WRITEBACK_RUNNING_STALE_MS {
+        return;
+    }
+    if let Some(obj) = writeback.as_object_mut() {
+        obj.insert("status".to_owned(), serde_json::json!("interrupted"));
+        obj.insert("retryable".to_owned(), serde_json::json!(true));
+        obj.insert("interrupted_at".to_owned(), serde_json::json!(now_ms()));
+    }
 }
 
 /// Convert a message row for history-list use, compacting oversized tool payloads.
@@ -336,6 +366,20 @@ mod tests {
             cron_job_id: None,
             created_at: 1000,
             updated_at: 2000,
+        }
+    }
+
+    fn make_message_row(content: serde_json::Value) -> MessageRow {
+        MessageRow {
+            id: "msg_1".into(),
+            conversation_id: 1,
+            msg_id: Some("msg_1".into()),
+            r#type: "text".into(),
+            content: content.to_string(),
+            position: Some("left".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: 1000,
         }
     }
 
@@ -554,6 +598,27 @@ mod tests {
         let content = r#"{"content":"  hello   world  "}"#;
         let result = extract_preview_text(content);
         assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn row_to_message_response_projects_stale_writeback_as_interrupted() {
+        let stale_at = now_ms() - WRITEBACK_RUNNING_STALE_MS - 1;
+        let row = make_message_row(json!({
+            "content": "answer",
+            "knowledge_writeback": {
+                "status": "writing",
+                "attempt_id": "msg_1:1",
+                "started_at": stale_at,
+                "updated_at": stale_at,
+                "retryable": false
+            }
+        }));
+
+        let resp = row_to_message_response(row).unwrap();
+
+        assert_eq!(resp.content["knowledge_writeback"]["status"], "interrupted");
+        assert_eq!(resp.content["knowledge_writeback"]["retryable"], true);
+        assert!(resp.content["knowledge_writeback"]["interrupted_at"].is_i64());
     }
 
     // ── search_row_to_item ─────────────────────────────────────────────

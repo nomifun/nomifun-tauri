@@ -6,10 +6,7 @@
 
 import { useEffect } from 'react';
 import { ipcBridge } from '@/common';
-
-const isTauri = (): boolean =>
-  typeof window !== 'undefined' &&
-  (Boolean((window as { isTauri?: boolean }).isTauri) || '__TAURI_INTERNALS__' in window);
+import { isTauriRuntime } from '@/common/adapter/tauriRuntime';
 
 /** Collapse event bursts (e.g. drag-save config-updated echoes) into one sync. */
 const SYNC_DEBOUNCE_MS = 500;
@@ -34,7 +31,7 @@ export function requestCompanionWindowSync(): void {
  */
 export function useCompanionWindowsSync(): void {
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!isTauriRuntime()) return;
     let disposed = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
 

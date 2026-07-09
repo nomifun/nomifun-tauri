@@ -6,26 +6,16 @@ import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 import { Button, Checkbox, Select, Tag } from '@arco-design/web-react';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { mutate as mutateSWR } from 'swr';
 import useModeModeList from '@renderer/hooks/agent/useModeModeList';
-import { deriveDefaultTasks } from '@renderer/hooks/agent/useModelProfiles';
+import { MODEL_PROFILES_SWR_KEY } from '@renderer/hooks/agent/useModelProfiles';
+import { buildModelProfileUpsertRequest, MODEL_TASK_ORDER } from '@renderer/hooks/agent/modelProfileEditing';
 import {
   isNewApiPlatform,
   NEW_API_PROTOCOL_OPTIONS,
   detectNewApiProtocol,
 } from '@/renderer/utils/model/modelPlatforms';
 import { ContextLimitSelect } from './ContextLimitSelect';
-
-/** Display order of modality/task options in the selector. */
-const TASK_ORDER: ModelTask[] = [
-  'chat',
-  'image_generation',
-  'image_edit',
-  'video_generation',
-  'speech_synthesis',
-  'speech_recognition',
-  'embedding',
-  'rerank',
-];
 
 const AddModelModal = ModalHOC<{ data?: IProvider; onSubmit: (model: IProvider) => void }>(
   ({ modalProps, data, onSubmit, modalCtrl }) => {
@@ -34,11 +24,11 @@ const AddModelModal = ModalHOC<{ data?: IProvider; onSubmit: (model: IProvider) 
     const [model, setModel] = useState('');
     const [modelProtocol, setModelProtocol] = useState<string>('openai');
     const [contextLimit, setContextLimit] = useState<number | undefined>();
-    const [tasks, setTasks] = useState<ModelTask[]>(['chat']);
+    const [tasks, setTasks] = useState<ModelTask[]>([]);
     const [visionInput, setVisionInput] = useState(false);
     const isNewApi = isNewApiPlatform(data?.platform ?? '');
     const taskOptions = useMemo(
-      () => TASK_ORDER.map((v) => ({ label: t(`settings.modelTask.${v}`), value: v })),
+      () => MODEL_TASK_ORDER.map((v) => ({ label: t(`settings.modelTask.${v}`), value: v })),
       [t]
     );
     const { data: modelList, isLoading } = useModeModeList(data?.platform ?? '', data?.base_url, data?.api_key);
@@ -60,7 +50,7 @@ const AddModelModal = ModalHOC<{ data?: IProvider; onSubmit: (model: IProvider) 
         setModel('');
         setModelProtocol('openai');
         setContextLimit(undefined);
-        setTasks(['chat']);
+        setTasks([]);
         setVisionInput(false);
       }
     }, [modalProps.visible]);
@@ -90,13 +80,11 @@ const AddModelModal = ModalHOC<{ data?: IProvider; onSubmit: (model: IProvider) 
       // Persist the authoritative capability profile for the new model so probing
       // and dispatch pick the correct endpoint (source=user = authoritative).
       try {
+        const selectedTraits = tasks.includes('chat') && visionInput ? (['vision_input'] as const) : [];
         await ipcBridge.modelProfile.upsert.invoke({
-          provider_id: data.id,
-          model,
-          tasks: tasks.length > 0 ? tasks : ['chat'],
-          traits: visionInput ? ['vision_input'] : [],
-          source: 'user',
+          ...buildModelProfileUpsertRequest(data.id, model, tasks, [...selectedTraits]),
         });
+        void mutateSWR(MODEL_PROFILES_SWR_KEY);
       } catch (e) {
         console.error('model profile upsert failed', e);
         message.warning(t('settings.saveModelConfigFailed', { defaultValue: '模型能力保存失败' }));
@@ -132,7 +120,8 @@ const AddModelModal = ModalHOC<{ data?: IProvider; onSubmit: (model: IProvider) 
               loading={isLoading}
               onChange={(value: string) => {
                 setModel(value);
-                setTasks(deriveDefaultTasks(data?.platform ?? '', value));
+                setTasks([]);
+                setVisionInput(false);
                 if (isNewApi) setModelProtocol(detectNewApiProtocol(value));
               }}
               value={model}

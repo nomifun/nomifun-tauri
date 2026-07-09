@@ -5,11 +5,11 @@
  */
 
 import { ipcBridge } from '@/common';
-import type { IProvider } from '@/common/config/storage';
+import type { IProvider, ModelProfile, ModelTask, ModelTrait } from '@/common/config/storage';
 import { prefixedId } from '@/common/utils';
-import { Button, Divider, Message, Modal, Popconfirm, Popover, Input, Collapse, Tag, Switch, Tooltip } from '@arco-design/web-react';
+import { Button, Checkbox, Collapse, Divider, Input, Message, Modal, Popconfirm, Popover, Select, Switch, Tag, Tooltip } from '@arco-design/web-react';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
-import { Copy, DeleteFour, Info, Minus, Plus, Write, Heartbeat, Drag } from '@icon-park/react';
+import { Copy, DeleteFour, Info, Minus, Plus, Write, Heartbeat, Drag, TagOne } from '@icon-park/react';
 import {
   closestCenter,
   DndContext,
@@ -49,6 +49,13 @@ import { consumePendingDeepLink } from '@/renderer/hooks/system/useDeepLink';
 import { ContextLimitSelect, formatContextLimit } from '@/renderer/pages/settings/components/ContextLimitSelect';
 import { cloneProviderConfig } from '@/renderer/utils/model/providerClone';
 import { reorderById, reorderStrings, withDenseSortOrder } from './modelProviderOrdering';
+import {
+  buildModelProfileUpsertRequest,
+  editableModelTasks,
+  editableModelTraits,
+  MODEL_TASK_ORDER,
+  visibleModelTaskBadges,
+} from '@/renderer/hooks/agent/modelProfileEditing';
 import '../model-provider.css';
 
 /**
@@ -268,6 +275,105 @@ const ModelContextLimitEditor: React.FC<{
   );
 };
 
+const ModelModalityEditor: React.FC<{
+  profile?: ModelProfile;
+  onSave: (tasks: ModelTask[], traits: ModelTrait[]) => Promise<void>;
+}> = ({ profile, onSave }) => {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [draftTasks, setDraftTasks] = useState<ModelTask[]>(() => editableModelTasks(profile));
+  const [draftVisionInput, setDraftVisionInput] = useState(() =>
+    editableModelTraits(profile).includes('vision_input')
+  );
+  const taskOptions = useMemo(
+    () => MODEL_TASK_ORDER.map((v) => ({ label: t(`settings.modelTask.${v}`), value: v })),
+    [t]
+  );
+  const hasUserSelection =
+    profile?.source === 'user' && ((profile.tasks?.length ?? 0) > 0 || (profile.traits?.length ?? 0) > 0);
+
+  const handleVisibleChange = (visible: boolean) => {
+    if (visible) {
+      const nextTasks = editableModelTasks(profile);
+      setDraftTasks(nextTasks);
+      setDraftVisionInput(nextTasks.includes('chat') && editableModelTraits(profile).includes('vision_input'));
+    }
+    setOpen(visible);
+  };
+
+  const handleTasksChange = (value: ModelTask[]) => {
+    const next = value ?? [];
+    setDraftTasks(next);
+    if (!next.includes('chat')) setDraftVisionInput(false);
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      await onSave(draftTasks, draftTasks.includes('chat') && draftVisionInput ? ['vision_input'] : []);
+      setOpen(false);
+    } catch {
+      // Parent save handler owns the toast; keep the editor open so the user can retry.
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Popover
+      trigger='click'
+      position='bl'
+      popupVisible={open}
+      onVisibleChange={handleVisibleChange}
+      content={
+        <div className='flex flex-col gap-8px w-280px' onClick={(e) => e.stopPropagation()}>
+          <div className='text-12px text-t-secondary'>
+            {t('settings.modelModality', { defaultValue: '模态能力' })}
+          </div>
+          <Select
+            mode='multiple'
+            value={draftTasks}
+            onChange={handleTasksChange}
+            options={taskOptions}
+            placeholder={t('settings.modelModality', { defaultValue: '模态能力' })}
+            triggerProps={{ getPopupContainer: () => document.body }}
+          />
+          {draftTasks.includes('chat') && (
+            <Checkbox checked={draftVisionInput} onChange={setDraftVisionInput} className='!pl-0'>
+              <span className='text-12px text-t-secondary'>
+                {t('settings.modelVisionInput', { defaultValue: '支持图片输入（视觉）' })}
+              </span>
+            </Checkbox>
+          )}
+          <div className='text-11px text-t-tertiary leading-4'>
+            {t('settings.modelModalityTip', {
+              defaultValue: '声明该模型能做什么——探测与调用据此选择正确的端点',
+            })}
+          </div>
+          <div className='flex items-center justify-end gap-8px'>
+            <Button size='mini' onClick={() => setOpen(false)} disabled={saving}>
+              {t('common.cancel', { defaultValue: '取消' })}
+            </Button>
+            <Button size='mini' type='primary' loading={saving} onClick={handleSave}>
+              {t('common.save', { defaultValue: '保存' })}
+            </Button>
+          </div>
+        </div>
+      }
+    >
+      <Tooltip content={t('settings.editModelModality', { defaultValue: '编辑模型类别' })}>
+        <Button
+          size='mini'
+          className={`model-provider-action-btn !w-24px !h-24px !min-w-24px shrink-0 ${hasUserSelection ? 'text-[rgb(var(--primary-6))] hover:text-[rgb(var(--primary-5))]' : 'text-t-secondary hover:text-t-primary'}`}
+          icon={<TagOne theme='outline' size='14' />}
+          onClick={(e) => e.stopPropagation()}
+        />
+      </Tooltip>
+    </Popover>
+  );
+};
+
 const providerSortableId = (providerId: string) => `provider:${providerId}`;
 const modelSortableId = (providerId: string, model: string) => `model:${providerId}:${model}`;
 
@@ -370,7 +476,7 @@ const ModelModalContent: React.FC = () => {
   const [collapseKey, setCollapseKey] = useState<Record<string, boolean>>({});
   const [healthCheckLoading, setHealthCheckLoading] = useState<Record<string, boolean>>({});
   const { data, mutate } = useProvidersQuery();
-  const { profileFor } = useModelProfiles();
+  const { profileFor, mutate: mutateProfiles } = useModelProfiles();
   const [message, messageContext] = useArcoMessage();
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
@@ -392,7 +498,7 @@ const ModelModalContent: React.FC = () => {
     }
   };
 
-  const updatePlatform = (platform: IProvider, success: () => void) => {
+  const updatePlatform = (platform: IProvider, success: () => void, throwOnError = false): Promise<void> => {
     const existing = (data || []).find((item) => item.id === platform.id);
     const nextArray = existing
       ? (data || []).map((item) => (item.id === platform.id ? { ...item, ...platform } : item))
@@ -401,7 +507,7 @@ const ModelModalContent: React.FC = () => {
     // Optimistic update
     void mutate(nextArray, false);
 
-    persistPlatform(platform)
+    return persistPlatform(platform)
       .then(() => {
         void mutate();
         success();
@@ -416,6 +522,7 @@ const ModelModalContent: React.FC = () => {
         } else {
           message.error(t('settings.saveModelConfigFailed'));
         }
+        if (throwOnError) throw error;
       });
   };
 
@@ -680,11 +787,10 @@ const ModelModalContent: React.FC = () => {
   };
 
   const [addPlatformModalCtrl, addPlatformModalContext] = AddPlatformModal.useModal({
-    onSubmit(platform) {
-      updatePlatform(platform, () => {
+    async onSubmit(platform) {
+      await updatePlatform(platform, () => {
         setCollapseKey((prev) => ({ ...prev, [platform.id]: true }));
-        addPlatformModalCtrl.close();
-      });
+      }, true);
     },
   });
 
@@ -901,6 +1007,7 @@ const ModelModalContent: React.FC = () => {
                       const modelDescription = platform.model_descriptions?.[model] ?? '';
                       const modelContextLimit = platform.model_context_limits?.[model];
                       const inheritedContextLimit = modelContextLimit == null ? platform.context_limit : undefined;
+                      const modelProfile = profileFor(platform.id, model);
 
                       return (
                         <SortableModelRow key={model} providerId={platform.id} model={model}>
@@ -960,9 +1067,7 @@ const ModelModalContent: React.FC = () => {
                                 </span>
 
                                 {/* 模态徽章 / Modality badges — non-chat tasks (image/tts/asr/...) surfaced. */}
-                                {(profileFor(platform.id, model)?.tasks ?? [])
-                                  .filter((tk) => tk !== 'chat')
-                                  .map((tk) => (
+                                {visibleModelTaskBadges(modelProfile).map((tk) => (
                                     <Tag
                                       key={tk}
                                       size='small'
@@ -1009,6 +1114,23 @@ const ModelModalContent: React.FC = () => {
                                       },
                                       () => {}
                                     );
+                                  }}
+                                />
+
+                                {/* 每模型类别编辑 / Per-model modality editor */}
+                                <ModelModalityEditor
+                                  profile={modelProfile}
+                                  onSave={async (tasks, traits) => {
+                                    try {
+                                      await ipcBridge.modelProfile.upsert.invoke(
+                                        buildModelProfileUpsertRequest(platform.id, model, tasks, traits)
+                                      );
+                                      await mutateProfiles();
+                                    } catch (error) {
+                                      console.error('model profile upsert failed', error);
+                                      message.error(t('settings.saveModelConfigFailed'));
+                                      throw error;
+                                    }
                                   }}
                                 />
 

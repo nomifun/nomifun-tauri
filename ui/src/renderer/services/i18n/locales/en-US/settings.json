@@ -306,6 +306,7 @@
   "addModel": "Add Model",
   "modelModality": "Modality",
   "modelModalityTip": "Declare what this model does — probing and calls pick the correct endpoint from this.",
+  "editModelModality": "Edit model category",
   "modelVisionInput": "Accepts image input (vision)",
   "modelTask": {
     "chat": "Chat",

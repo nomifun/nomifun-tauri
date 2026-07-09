@@ -56,6 +56,18 @@
     "expandAllThinkingProcess": "Expand all thinking process",
     "collapseAllThinkingProcess": "Collapse all thinking process"
   },
+  "knowledgeWriteback": {
+    "started": "Preparing knowledge write-back",
+    "extracting": "Extracting reusable knowledge",
+    "writing": "Writing to knowledge base",
+    "written": "Knowledge write-back complete: {{count}}",
+    "partial": "Knowledge write-back partially complete, {{failures}} failed",
+    "failed": "Knowledge write-back failed",
+    "noCandidate": "No knowledge needed write-back",
+    "noCompleter": "Knowledge write-back is unavailable",
+    "disabled": "Knowledge write-back is disabled",
+    "interrupted": "Knowledge write-back was interrupted"
+  },
   "planTodoList": "To do list",
   "planProgress": "{{done}}/{{total}} done",
   "fileChanges": "File Changes",

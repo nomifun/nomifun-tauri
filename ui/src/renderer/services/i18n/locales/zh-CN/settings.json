@@ -306,6 +306,7 @@
   "addModel": "添加模型",
   "modelModality": "模态能力",
   "modelModalityTip": "声明该模型能做什么——探测与调用据此选择正确的端点",
+  "editModelModality": "编辑模型类别",
   "modelVisionInput": "支持图片输入（视觉）",
   "modelTask": {
     "chat": "对话",
@@ -1226,11 +1227,11 @@
     "sectionWebhook": "Webhook"
   },
   "assistantSkillsHub": {
-    "title": "助手 & Skill",
+    "title": "助手与技能",
     "subtitle": "在一处管理助手与可复用技能包。",
-    "railTitle": "助手&Skill",
+    "railTitle": "助手与技能",
     "assistantsTab": "助手",
-    "skillsTab": "Skills"
+    "skillsTab": "技能"
   },
   "mcpHub": {
     "title": "MCP",

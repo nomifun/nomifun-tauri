@@ -25,7 +25,7 @@ import HOC from '@renderer/utils/ui/HOC';
 import type { FileChangeInfo } from './MessageFileChanges';
 import { parseDiff } from './MessageFileChanges';
 import { useConversationArtifacts } from './artifacts';
-import { useMessageList, useMessageListLoading } from './hooks';
+import { useKnowledgeWritebackEvents, useMessageList, useMessageListLoading } from './hooks';
 import MessageAgentStatus from './components/MessageAgentStatus';
 import MessageTips from './components/MessageTips';
 import MessageToolCall from './components/MessageToolCall';
@@ -650,6 +650,7 @@ const MessageList: React.FC<{
   const isMessageListLoading = useMessageListLoading();
   const artifacts = useConversationArtifacts();
   const conversationContext = useConversationContextSafe();
+  useKnowledgeWritebackEvents(conversationContext?.conversation_id);
   useAutoPreviewOfficeFiles(conversationContext);
   const workspaceRoots = useMemo(
     () => (conversationContext?.workspace ? [conversationContext.workspace] : []),

@@ -7,8 +7,10 @@
 #   bun run build:linux x64           # 显式 x86_64
 #   bun run build:linux arm64         # 显式 aarch64(见下方交叉编译警告)
 #   bun run build:linux x64 arm64     # 两个都打
+#   bun run build:linux --config apps/desktop/tauri.updater.conf.json
+#                                     # 未知 --xxx 选项会原样透传给 tauri build
 #   bun run build:linux -- --bundles deb
-#                                     # `--` 之后的参数原样透传给 tauri build
+#                                     # `--` 之后的参数也会原样透传给 tauri build
 #
 # 架构别名:
 #   x64   / x86_64        -> x86_64-unknown-linux-gnu
@@ -36,6 +38,40 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONF="apps/desktop/tauri.conf.json"
 DIST="$ROOT/dist/desktop"
 
+require_linux_build_deps() {
+  local missing=()
+
+  if ! command -v pkg-config >/dev/null 2>&1; then
+    missing+=("pkg-config")
+  else
+    pkg-config --exists gbm || missing+=("libgbm-dev (pkg-config: gbm)")
+    pkg-config --exists librsvg-2.0 || missing+=("librsvg2-dev (pkg-config: librsvg-2.0)")
+    if ! pkg-config --exists ayatana-appindicator3-0.1 && ! pkg-config --exists appindicator3-0.1; then
+      missing+=("libayatana-appindicator3-dev 或 libappindicator3-dev (pkg-config: *appindicator3-0.1)")
+    fi
+  fi
+
+  if [[ "${#missing[@]}" -gt 0 ]]; then
+    echo "❌ Linux 打包依赖不完整:" >&2
+    local item
+    for item in "${missing[@]}"; do
+      echo "   - $item" >&2
+    done
+    cat >&2 <<'EOF'
+
+Debian/Ubuntu 可先安装:
+  sudo apt-get install -y pkg-config libgbm-dev libayatana-appindicator3-dev librsvg2-dev
+
+说明:
+  - libgbm-dev 提供 -lgbm 链接名与 gbm.pc。
+  - libayatana-appindicator3-dev 提供 Tauri 托盘/AppIndicator 打包探测。
+  - librsvg2-dev 提供 linuxdeploy GTK 插件需要的 librsvg-2.0.pc。
+  - 本脚本会设置 APPIMAGE_EXTRACT_AND_RUN=1，让 linuxdeploy AppImage 在无 FUSE2 的构建机上也能运行。
+EOF
+    exit 1
+  fi
+}
+
 # 当前机器架构对应的 triple(用于判断哪个是「原生」)
 HOST_ARCH="$(uname -m)"
 case "$HOST_ARCH" in
@@ -52,6 +88,9 @@ for arg in "$@"; do
   if [[ "$seen_dashdash" -eq 1 ]]; then
     PASSTHRU+=("$arg")
   elif [[ "$arg" == "--" ]]; then
+    seen_dashdash=1
+  elif [[ "$arg" == --* ]]; then
+    PASSTHRU+=("$arg")
     seen_dashdash=1
   else
     SELECT+=("$arg")
@@ -78,6 +117,9 @@ else
     TRIPLES+=("$(resolve_triple "$s")")
   done
 fi
+
+require_linux_build_deps
+export APPIMAGE_EXTRACT_AND_RUN="${APPIMAGE_EXTRACT_AND_RUN:-1}"
 
 ensure_target() {
   local t="$1"
@@ -112,6 +154,10 @@ for t in "${TRIPLES[@]}"; do
     COLLECTED+=("$DIST/$(basename "$pkg")")
   done < <(find "$bundle_dir" -type f \( -name '*.deb' -o -name '*.AppImage' -o -name '*.rpm' \) -print0 2>/dev/null)
 done
+
+echo ""
+echo "▶ 清理 Linux 构建后 debug/flycheck 中间产物(保留 release 安装包与 updater 签名)..."
+bun scripts/prune-build.mjs --post
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

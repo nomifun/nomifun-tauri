@@ -2,8 +2,11 @@
 //!
 //! Enigo handles are not `Send`, so each operation constructs a fresh Enigo
 //! inside `tokio::task::spawn_blocking` and the whole blocking task is
-//! wrapped in a 10s timeout. Coordinates passed in here are already absolute
-//! screen coordinates (mapped from screenshot space by the caller).
+//! wrapped in a 10s timeout. On macOS, Enigo's keyboard path queries Carbon
+//! TIS/TSM input-source APIs, so the actual Enigo construction and operation
+//! are synchronously dispatched to the main queue. Coordinates passed in here
+//! are already absolute screen coordinates (mapped from screenshot space by
+//! the caller).
 
 use std::time::Duration;
 
@@ -174,6 +177,25 @@ fn new_enigo() -> Result<Enigo, String> {
     })
 }
 
+fn run_input_task_blocking<T, F>(task: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    crate::macos_main::run_blocking(task)
+}
+
+fn run_enigo_operation_blocking<T, F>(op: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Enigo) -> Result<T, String> + Send + 'static,
+{
+    run_input_task_blocking(move || {
+        let mut enigo = new_enigo()?;
+        op(&mut enigo)
+    })
+}
+
 /// Run an input operation on a fresh Enigo instance inside spawn_blocking,
 /// bounded by a 10s timeout.
 async fn with_enigo<T, F>(op: F) -> Result<T, String>
@@ -181,10 +203,7 @@ where
     T: Send + 'static,
     F: FnOnce(&mut Enigo) -> Result<T, String> + Send + 'static,
 {
-    let handle = tokio::task::spawn_blocking(move || {
-        let mut enigo = new_enigo()?;
-        op(&mut enigo)
-    });
+    let handle = tokio::task::spawn_blocking(move || run_enigo_operation_blocking(op));
     match tokio::time::timeout(INPUT_TIMEOUT, handle).await {
         Ok(Ok(result)) => result,
         Ok(Err(join_err)) => Err(format!("Input task failed: {join_err}")),
@@ -310,8 +329,7 @@ pub async fn cursor_position() -> Result<(i32, i32), String> {
 /// Size (width, height) of the main display in enigo's coordinate system.
 /// Blocking variant for use inside other spawn_blocking sections.
 pub fn main_display_size_blocking() -> Result<(i32, i32), String> {
-    let enigo = new_enigo()?;
-    enigo.main_display().map_err(input_err)
+    run_enigo_operation_blocking(|enigo| enigo.main_display().map_err(input_err))
 }
 
 #[cfg(test)]
@@ -406,5 +424,38 @@ mod tests {
     #[ignore]
     async fn mouse_move_real() {
         mouse_move(10, 10).await.expect("should move cursor");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_input_task_runs_inside_dispatcher() {
+        use std::sync::{Arc, Mutex};
+
+        let caller_thread = std::thread::current().id();
+        let dispatcher_thread = Arc::new(Mutex::new(None));
+        let work_thread = Arc::new(Mutex::new(None));
+        let dispatcher_thread_seen = dispatcher_thread.clone();
+        let work_thread_seen = work_thread.clone();
+
+        let result = crate::macos_main::run_task_with(
+            move |task| {
+                *dispatcher_thread_seen.lock().unwrap() = Some(std::thread::current().id());
+                let handle = std::thread::spawn(task);
+                handle.join().expect("dispatched task should not panic")
+            },
+            move || {
+                *work_thread_seen.lock().unwrap() = Some(std::thread::current().id());
+                Ok("ok")
+            },
+        )
+        .expect("task should complete");
+
+        assert_eq!(result, "ok");
+        assert_eq!(dispatcher_thread.lock().unwrap().unwrap(), caller_thread);
+        assert_ne!(
+            work_thread.lock().unwrap().unwrap(),
+            caller_thread,
+            "work must run inside the dispatcher task, not on the caller thread"
+        );
     }
 }

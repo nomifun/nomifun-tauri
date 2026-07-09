@@ -148,8 +148,7 @@ NomiFun 交付的是**一个**统一的 Rust 后端（`nomifun-app`，二进制
 
 修改密码流会顺带轮换 JWT 密钥，使所有现有会话失效。
 
-同一密钥还会用于派生加密钥（`derive_encryption_key`），用于对存储在
-数据库中的机密（提供商密钥、MCP OAuth token 等）做静态加密。
+静态加密使用独立的持久密钥，存放在 `<data-dir>/encryption_key`。旧安装若还没有该文件，启动时会用当前解析到的 JWT 密钥派生并写入一次，以保证既有加密字段仍可读取；之后修改密码或轮换 JWT 密钥不会再改变数据加密密钥。
 
 ## TLS / HTTPS Cookie 处理
 

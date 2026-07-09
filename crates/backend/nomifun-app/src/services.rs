@@ -26,7 +26,7 @@ use nomifun_db::{
 use nomifun_realtime::{BroadcastEventBus, WebSocketManager};
 use nomifun_terminal::{TerminalEventEmitter, TerminalLifecycleServer, TerminalService};
 
-use crate::config::{AppConfig, derive_encryption_key};
+use crate::config::{AppConfig, load_or_create_data_encryption_key};
 
 pub struct AppServices {
     pub database: Database,
@@ -62,8 +62,10 @@ pub struct AppServices {
     /// created (a fresh instance would have an empty live map).
     pub terminal_service: Arc<TerminalService>,
     pub acp_session_sync: Arc<AcpSessionSyncService>,
-    /// Raw JWT secret string, used to derive encryption keys.
+    /// Raw JWT secret string, used only for authentication/session signing.
     pub jwt_secret_raw: String,
+    /// Persistent AES-256-GCM key for encrypted app data.
+    pub encryption_key: [u8; 32],
     pub data_dir: PathBuf,
     pub work_dir: PathBuf,
     /// Authentication policy (single source of truth, replaces `local: bool`).
@@ -192,7 +194,8 @@ impl AppServices {
             tracing::info!("Generated and persisted new JWT secret");
         }
 
-        let encryption_key = derive_encryption_key(&secret);
+        let encryption_key = load_or_create_data_encryption_key(&data_dir, &secret)
+            .map_err(|e| anyhow::anyhow!("Failed to load data encryption key: {e}"))?;
 
         let remote_agent_repo = Arc::new(SqliteRemoteAgentRepository::new(database.pool().clone()));
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
@@ -758,6 +761,7 @@ impl AppServices {
             terminal_service,
             acp_session_sync: acp_agent_service,
             jwt_secret_raw: secret,
+            encryption_key,
             data_dir,
             work_dir,
             auth_policy,
@@ -838,13 +842,22 @@ async fn reconcile_model_profiles(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    fn test_config(data_dir: &Path) -> AppConfig {
+        AppConfig {
+            data_dir: data_dir.to_path_buf(),
+            work_dir: data_dir.to_path_buf(),
+            ..Default::default()
+        }
+    }
 
     #[tokio::test]
     async fn test_app_services_from_memory_db() {
         let db = nomifun_db::init_database_memory().await.unwrap();
-        let services = AppServices::from_config(db, &AppConfig::default())
-            .await
-            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let services = AppServices::from_config(db, &config).await.unwrap();
 
         // JWT service should be functional
         let token = services.jwt_service.sign("test_user", "testuser").unwrap();
@@ -861,9 +874,9 @@ mod tests {
     #[tokio::test]
     async fn test_jwt_secret_persisted_to_db() {
         let db = nomifun_db::init_database_memory().await.unwrap();
-        let services = AppServices::from_config(db, &AppConfig::default())
-            .await
-            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let services = AppServices::from_config(db, &config).await.unwrap();
 
         // System user should now have a jwt_secret persisted
         let system_user = services.user_repo.get_system_user().await.unwrap();
@@ -877,9 +890,10 @@ mod tests {
     #[tokio::test]
     async fn test_app_services_uses_supplied_app_version() {
         let db = nomifun_db::init_database_memory().await.unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
         let config = AppConfig {
             app_version: "9.9.9".to_string(),
-            ..Default::default()
+            ..test_config(tmp.path())
         };
         let services = AppServices::from_config(db, &config).await.unwrap();
 

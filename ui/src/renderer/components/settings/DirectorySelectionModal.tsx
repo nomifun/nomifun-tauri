@@ -129,7 +129,7 @@ const DirectorySelectionModal: React.FC<DirectorySelectionModalProps> = ({
       onCancel={onCancel}
       onOk={handleConfirm}
       okButtonProps={{ disabled: !selectedPath }}
-      className='w-[90vw] md:w-[600px]'
+      className='nomifun-file-picker-modal w-[90vw] md:w-[600px]'
       style={{ width: 'min(600px, 90vw)' }}
       wrapStyle={{ zIndex: 3000 }}
       maskStyle={{ zIndex: 2990 }}
@@ -145,7 +145,12 @@ const DirectorySelectionModal: React.FC<DirectorySelectionModalProps> = ({
           </div>
           <div className='flex gap-10px'>
             <Button onClick={onCancel}>{t('common.cancel')}</Button>
-            <Button type='primary' onClick={handleConfirm} disabled={!selectedPath}>
+            <Button
+              type='primary'
+              className='nomifun-file-picker-confirm'
+              onClick={handleConfirm}
+              disabled={!selectedPath}
+            >
               {t('common.confirm')}
             </Button>
           </div>

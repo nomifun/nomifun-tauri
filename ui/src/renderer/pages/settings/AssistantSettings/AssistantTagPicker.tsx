@@ -13,7 +13,7 @@ import type {
 } from '@/common/types/agent/assistantTypes';
 import { Input } from '@arco-design/web-react';
 import { Close, Plus } from '@icon-park/react';
-import React, { useState } from 'react';
+import React, { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 type AssistantTagPickerProps = {
@@ -25,42 +25,92 @@ type AssistantTagPickerProps = {
   onCreateTag: (req: CreateAssistantTagRequest) => Promise<AssistantTag>;
   localeKey: string;
   readOnly: boolean;
+  commitOnBlur?: boolean;
 };
 
-const AssistantTagPicker: React.FC<AssistantTagPickerProps> = ({
-  dimension,
-  label,
-  tags,
-  value,
-  onChange,
-  onCreateTag,
-  localeKey,
-  readOnly,
-}) => {
+export type AssistantTagPickerHandle = {
+  flushPendingTag: () => Promise<string[]>;
+  resetPendingTag: () => void;
+};
+
+const AssistantTagPicker = forwardRef<AssistantTagPickerHandle, AssistantTagPickerProps>(function AssistantTagPicker(
+  { dimension, label, tags, value, onChange, onCreateTag, localeKey, readOnly, commitOnBlur = false },
+  ref
+) {
   const { t } = useTranslation();
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState('');
   const [creating, setCreating] = useState(false);
+  const latestValueRef = useRef(value);
+  const draftRef = useRef('');
+  const creatingPromiseRef = useRef<Promise<string[]> | null>(null);
+
+  useEffect(() => {
+    latestValueRef.current = value;
+  }, [value]);
+
+  const resetPendingTag = useCallback(() => {
+    draftRef.current = '';
+    setAdding(false);
+    setDraft('');
+  }, []);
+
+  const setDraftValue = useCallback((next: string) => {
+    draftRef.current = next;
+    setDraft(next);
+  }, []);
 
   const toggle = (key: string) => {
     if (readOnly) return;
-    onChange(value.includes(key) ? value.filter((k) => k !== key) : [...value, key]);
+    const next = value.includes(key) ? value.filter((k) => k !== key) : [...value, key];
+    latestValueRef.current = next;
+    onChange(next);
   };
 
-  const submitNew = async () => {
-    const newLabel = draft.trim();
-    if (!newLabel || creating) return;
-    setCreating(true);
-    try {
-      const created = await onCreateTag({ dimension, label: newLabel });
-      onChange([...value, created.key]);
-      setDraft('');
-      setAdding(false);
-    } catch (error) {
-      console.error('Failed to create tag from picker:', error);
-    } finally {
-      setCreating(false);
+  const submitNew = useCallback(async (): Promise<string[]> => {
+    if (creatingPromiseRef.current) return creatingPromiseRef.current;
+
+    const newLabel = draftRef.current.trim();
+    if (!newLabel) {
+      resetPendingTag();
+      return latestValueRef.current;
     }
+
+    const promise = (async () => {
+      setCreating(true);
+      try {
+        const created = await onCreateTag({ dimension, label: newLabel });
+        const current = latestValueRef.current;
+        const next = current.includes(created.key) ? current : [...current, created.key];
+        latestValueRef.current = next;
+        onChange(next);
+        resetPendingTag();
+        return next;
+      } finally {
+        setCreating(false);
+        creatingPromiseRef.current = null;
+      }
+    })();
+    creatingPromiseRef.current = promise;
+    return promise;
+  }, [dimension, onChange, onCreateTag, resetPendingTag]);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      flushPendingTag: submitNew,
+      resetPendingTag,
+    }),
+    [resetPendingTag, submitNew]
+  );
+
+  const handleAddBlur = (event: React.FocusEvent<HTMLDivElement>) => {
+    if (!commitOnBlur) return;
+    const nextFocus = event.relatedTarget;
+    if (nextFocus && event.currentTarget.contains(nextFocus as Node)) return;
+    void submitNew().catch((error) => {
+      console.error('Failed to create tag from picker:', error);
+    });
   };
 
   return (
@@ -100,13 +150,17 @@ const AssistantTagPicker: React.FC<AssistantTagPickerProps> = ({
 
         {!readOnly &&
           (adding ? (
-            <div className='inline-flex items-center gap-6px'>
+            <div className='inline-flex items-center gap-6px' onBlur={handleAddBlur}>
               <Input
                 size='small'
                 autoFocus
                 value={draft}
-                onChange={setDraft}
-                onPressEnter={() => void submitNew()}
+                onChange={setDraftValue}
+                onPressEnter={() => {
+                  void submitNew().catch((error) => {
+                    console.error('Failed to create tag from picker:', error);
+                  });
+                }}
                 disabled={creating}
                 placeholder={t('settings.assistantTagAddPlaceholder', { defaultValue: 'New tag…' })}
                 className='!w-128px !rounded-[16px]'
@@ -114,14 +168,13 @@ const AssistantTagPicker: React.FC<AssistantTagPickerProps> = ({
               <div
                 role='button'
                 tabIndex={0}
+                onMouseDown={(e) => e.preventDefault()}
                 onClick={() => {
-                  setAdding(false);
-                  setDraft('');
+                  resetPendingTag();
                 }}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') {
-                    setAdding(false);
-                    setDraft('');
+                    resetPendingTag();
                   }
                 }}
                 className='flex items-center justify-center w-20px h-20px rounded-full cursor-pointer text-[var(--color-text-3)] hover:bg-[var(--color-fill-2)] transition-colors'
@@ -160,6 +213,8 @@ const AssistantTagPicker: React.FC<AssistantTagPickerProps> = ({
       </div>
     </div>
   );
-};
+});
+
+AssistantTagPicker.displayName = 'AssistantTagPicker';
 
 export default AssistantTagPicker;

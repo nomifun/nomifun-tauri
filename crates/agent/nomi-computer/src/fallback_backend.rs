@@ -35,8 +35,13 @@ pub struct WindowInfo {
 }
 
 /// Enumerate windows (front-to-back z order). Blocking: call from
-/// spawn_blocking.
+/// spawn_blocking. On macOS, xcap window metadata checks can touch AppKit
+/// (`NSWorkspace`), so enumeration is dispatched to the main queue.
 pub fn list_windows() -> Result<Vec<WindowInfo>, String> {
+    crate::macos_main::run_blocking(list_windows_inner)
+}
+
+fn list_windows_inner() -> Result<Vec<WindowInfo>, String> {
     let windows = Window::all().map_err(|e| format!("Failed to enumerate windows: {e}"))?;
     let mut infos = Vec::with_capacity(windows.len());
     for w in &windows {
@@ -226,5 +231,38 @@ mod tests {
         let windows = list_windows().expect("should enumerate windows");
         // There is at least a desktop-level window in a real session.
         assert!(!windows.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_window_task_runs_inside_dispatcher() {
+        use std::sync::{Arc, Mutex};
+
+        let caller_thread = std::thread::current().id();
+        let dispatcher_thread = Arc::new(Mutex::new(None));
+        let work_thread = Arc::new(Mutex::new(None));
+        let dispatcher_thread_seen = dispatcher_thread.clone();
+        let work_thread_seen = work_thread.clone();
+
+        let result = crate::macos_main::run_task_with(
+            move |task| {
+                *dispatcher_thread_seen.lock().unwrap() = Some(std::thread::current().id());
+                let handle = std::thread::spawn(task);
+                handle.join().expect("dispatched task should not panic")
+            },
+            move || {
+                *work_thread_seen.lock().unwrap() = Some(std::thread::current().id());
+                Ok("ok")
+            },
+        )
+        .expect("task should complete");
+
+        assert_eq!(result, "ok");
+        assert_eq!(dispatcher_thread.lock().unwrap().unwrap(), caller_thread);
+        assert_ne!(
+            work_thread.lock().unwrap().unwrap(),
+            caller_thread,
+            "work must run inside the dispatcher task, not on the caller thread"
+        );
     }
 }

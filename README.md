@@ -423,6 +423,7 @@ fails on the webkit2gtk link — build on the target architecture's machine/cont
 | `bun run make:latest` | 扫描本机更新产物，生成/合并自动更新清单 latest.json |
 | `bun run release:mac` | 一键 macOS 发版：自动判定追加/首发；首发用 -Version 打版本号 + -NotesFile/-Notes 建 Release；-DryRun 只预检 |
 | `bun run release:win` | 一键 Windows 发版：自动判定追加/首发；首发用 -Version 打版本号 + -NotesFile/-Notes 建 Release；-DryRun 只预检 |
+| `bun run release:linux` | 一键 Linux 发版：自动判定追加/首发；首发用 -Version 打版本号 + -NotesFile/-Notes 建 Release；-DryRun 只预检 |
 | `bun run build:ui` | 前端生产构建 → ui/dist |
 | **运行（组装好的应用）** | |
 | `bun run serve:web` | 启动 Web 服务器，托管已构建的前端 |
@@ -430,10 +431,11 @@ fails on the webkit2gtk link — build on the target architecture's machine/cont
 | `bun run test` | 运行全部 Rust 测试（含 doctest） |
 | `bun run test:fast` | 用 nextest 快速跑 Rust 测试（日常） |
 | **静态检查 / 门禁** | |
-| `bun run check` | 聚合静态门禁：typecheck + i18n + 主题契约 + 脚本登记 |
+| `bun run check` | 聚合静态门禁：typecheck + i18n + 主题契约 + 图标导入 + 脚本登记 |
 | `bun run typecheck` | 前端 TypeScript 类型检查（tsc --noEmit） |
 | `bun run check:i18n` | 校验 i18n 类型与 locale 键是否一致 |
 | `bun run check:theme` | 校验预设 CSS 主题契约 |
+| `bun run check:icons` | 校验 @icon-park/react 导入禁别名/禁命名空间（别名会被图标包装插件改写成非法代码，tsc 抓不到） |
 | **格式化** | |
 | `bun run fmt` | 格式化 Rust 代码（cargo fmt） |
 | `bun run fmt:check` | 校验 Rust 代码格式（cargo fmt --check） |

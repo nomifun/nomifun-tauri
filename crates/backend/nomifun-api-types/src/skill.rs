@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // A. Skill list & info
@@ -28,6 +29,10 @@ pub enum SkillSourceResponse {
 pub struct SkillListItemResponse {
     pub name: String,
     pub description: String,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub name_i18n: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub description_i18n: HashMap<String, String>,
     pub location: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relative_location: Option<String>,
@@ -56,6 +61,10 @@ pub struct SetSkillTagsRequest {
 pub struct BuiltinAutoSkillResponse {
     pub name: String,
     pub description: String,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub name_i18n: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub description_i18n: HashMap<String, String>,
     pub location: String,
 }
 

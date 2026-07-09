@@ -38,7 +38,7 @@ use crate::convert::{
 };
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
-use crate::stream_relay::{RelayTerminal, StreamRelay, spawn_turn_writeback_report};
+use crate::stream_relay::{RelayTerminal, StreamRelay, run_turn_writeback_report};
 use std::sync::RwLock;
 
 const MAX_CRON_CONTINUATIONS_PER_TURN: usize = 4;
@@ -2043,6 +2043,7 @@ impl ConversationService {
                 if outcome.system_responses.is_empty() {
                     if matches!(outcome.terminal, RelayTerminal::Finish)
                         && let Some(final_text) = outcome.final_text.clone()
+                        && let Some(final_text_msg_id) = outcome.final_text_msg_id.clone()
                         && let Some((knowledge_service, request)) = service.build_turn_writeback_request(
                             &knowledge_extra,
                             &conv_id,
@@ -2054,7 +2055,7 @@ impl ConversationService {
                             channel_platform.as_deref(),
                         )
                     {
-                        final_turn_writeback = Some((knowledge_service, request, turn_msg_id, final_text));
+                        final_turn_writeback = Some((knowledge_service, request, final_text_msg_id, final_text));
                     }
                     break;
                 }
@@ -2080,14 +2081,16 @@ impl ConversationService {
                 .complete_turn_with_companion_context(&conv_id, companion, companion_id, origin, channel_platform)
                 .await;
             if let Some((knowledge_service, request, msg_id, final_text)) = final_turn_writeback {
-                spawn_turn_writeback_report(
+                run_turn_writeback_report(
                     knowledge_service,
                     request,
+                    Arc::clone(&repo),
                     Arc::clone(&broadcaster),
                     conv_id.clone(),
                     msg_id,
                     final_text,
-                );
+                )
+                .await;
             }
         });
 

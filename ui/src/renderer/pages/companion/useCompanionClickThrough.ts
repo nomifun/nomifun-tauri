@@ -5,6 +5,7 @@
  */
 
 import { useEffect, useRef } from 'react';
+import { isTauriRuntime } from '@/common/adapter/tauriRuntime';
 import { isPointOverCompanionHitTarget } from './companionHitTarget';
 
 /**
@@ -52,9 +53,6 @@ export interface CompanionClickThroughOptions {
   dragging?: boolean;
 }
 
-const isTauriWindow = (): boolean =>
-  typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
-
 export function useCompanionClickThrough(opts: CompanionClickThroughOptions): void {
   const { enabled, hitSelector = '[data-companion-hit]', tolerancePx = 8, intervalMs = 40, onHoverChange, captureAll, dragging } = opts;
 
@@ -65,7 +63,7 @@ export function useCompanionClickThrough(opts: CompanionClickThroughOptions): vo
   draggingRef.current = dragging;
 
   useEffect(() => {
-    if (!enabled || !isTauriWindow()) return;
+    if (!enabled || !isTauriRuntime()) return;
 
     let disposed = false;
     let timer: ReturnType<typeof setInterval> | null = null;

@@ -6,7 +6,10 @@ export type SkillSource = 'builtin' | 'custom' | 'extension';
 export type SkillInfo = {
   name: string;
   description: string;
+  name_i18n?: Record<string, string>;
+  description_i18n?: Record<string, string>;
   location: string;
+  relative_location?: string;
   is_custom: boolean;
   source: SkillSource;
   // Tag keys referencing the shared assistant tag vocabulary. Resolved at the

@@ -4,14 +4,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { IMessageText } from '@/common/chat/chatLib';
+import type { IMessageText, KnowledgeWritebackState, KnowledgeWritebackStatus } from '@/common/chat/chatLib';
 import { toDisplayText } from '@/common/chat/displayText';
 import { NOMIFUN_FILES_MARKER } from '@/common/config/constants';
 import { useConversationContextSafe } from '@/renderer/hooks/context/ConversationContext';
 import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
 import { iconColors } from '@/renderer/styles/colors';
 import { Alert, Message, Tooltip } from '@arco-design/web-react';
-import { Copy, Edit } from '@icon-park/react';
+import { CheckOne, CloseOne, Copy, Edit, Info, Loading } from '@icon-park/react';
 import classNames from 'classnames';
 import React, { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -53,6 +53,90 @@ import { getAgentLogo } from '@/renderer/utils/model/agentLogo';
 import TeammateMessageAvatar from './TeammateMessageAvatar';
 
 const CODE_STYLE = { marginTop: 4, marginBlock: 4 };
+
+const RUNNING_WRITEBACK_STATUSES = new Set<KnowledgeWritebackStatus>(['started', 'extracting', 'writing']);
+const SUCCESS_WRITEBACK_STATUSES = new Set<KnowledgeWritebackStatus>(['written']);
+const WARNING_WRITEBACK_STATUSES = new Set<KnowledgeWritebackStatus>(['partial', 'interrupted']);
+const FAILURE_WRITEBACK_STATUSES = new Set<KnowledgeWritebackStatus>(['failed']);
+
+const compactWritebackFiles = (state: KnowledgeWritebackState): string | undefined => {
+  const paths = (state.written ?? [])
+    .map((file) => file.rel_path)
+    .filter((path): path is string => Boolean(path));
+  if (!paths.length) return undefined;
+  const visible = paths.slice(0, 2).join(', ');
+  return paths.length > 2 ? `${visible} +${paths.length - 2}` : visible;
+};
+
+const getWritebackTextKey = (status: KnowledgeWritebackStatus): string => {
+  switch (status) {
+    case 'started':
+      return 'messages.knowledgeWriteback.started';
+    case 'extracting':
+      return 'messages.knowledgeWriteback.extracting';
+    case 'writing':
+      return 'messages.knowledgeWriteback.writing';
+    case 'written':
+      return 'messages.knowledgeWriteback.written';
+    case 'partial':
+      return 'messages.knowledgeWriteback.partial';
+    case 'failed':
+      return 'messages.knowledgeWriteback.failed';
+    case 'no_candidate':
+      return 'messages.knowledgeWriteback.noCandidate';
+    case 'no_completer':
+      return 'messages.knowledgeWriteback.noCompleter';
+    case 'disabled':
+      return 'messages.knowledgeWriteback.disabled';
+    case 'interrupted':
+      return 'messages.knowledgeWriteback.interrupted';
+  }
+};
+
+const MessageKnowledgeWriteback: React.FC<{ state: KnowledgeWritebackState }> = ({ state }) => {
+  const { t } = useTranslation();
+  const failureCount = state.failures?.length ?? 0;
+  const writtenCount = state.written?.length ?? 0;
+  const firstFailure = state.failures?.find((failure) => failure.error)?.error;
+  const fileSummary = compactWritebackFiles(state);
+  const detail = firstFailure ?? fileSummary;
+
+  const toneClass = RUNNING_WRITEBACK_STATUSES.has(state.status)
+    ? 'border-line bg-fill-1 text-t-secondary'
+    : SUCCESS_WRITEBACK_STATUSES.has(state.status)
+      ? 'border-success-4 bg-success-light-1 text-success-6'
+      : WARNING_WRITEBACK_STATUSES.has(state.status)
+        ? 'border-warning-3 bg-warning-1 text-warning-7'
+        : FAILURE_WRITEBACK_STATUSES.has(state.status)
+          ? 'border-danger-4 bg-danger-light-1 text-danger-6'
+          : 'border-line bg-fill-1 text-t-secondary';
+
+  const icon = RUNNING_WRITEBACK_STATUSES.has(state.status) ? (
+    <Loading theme='outline' size='13' className='block shrink-0 animate-spin' />
+  ) : SUCCESS_WRITEBACK_STATUSES.has(state.status) ? (
+    <CheckOne theme='filled' size='13' className='block shrink-0' />
+  ) : FAILURE_WRITEBACK_STATUSES.has(state.status) ? (
+    <CloseOne theme='filled' size='13' className='block shrink-0' />
+  ) : (
+    <Info theme='outline' size='13' className='block shrink-0' />
+  );
+
+  return (
+    <div
+      className={classNames(
+        'mt-6px inline-flex max-w-full items-center gap-6px rd-6px border px-8px py-4px text-12px leading-18px',
+        toneClass
+      )}
+      title={detail}
+    >
+      <span className='flex h-14px w-14px shrink-0 items-center justify-center self-center leading-none'>{icon}</span>
+      <span className='min-w-0 truncate'>
+        {t(getWritebackTextKey(state.status), { count: writtenCount, failures: failureCount })}
+      </span>
+      {detail && <span className='min-w-0 truncate opacity-75'>{detail}</span>}
+    </div>
+  );
+};
 
 const parseFileMarker = (content: string) => {
   const markerIndex = content.indexOf(NOMIFUN_FILES_MARKER);
@@ -119,6 +203,7 @@ const MessageText: React.FC<{ message: IMessageText; hideActions?: boolean }> = 
   const [showCopyAlert, setShowCopyAlert] = useState(false);
   const isUserMessage = message.position === 'right';
   const isTeammateMessage = message.position === 'left' && message.content.teammateMessage === true;
+  const writebackState = !isUserMessage ? message.content.knowledge_writeback : undefined;
   const shouldRenderPlainText = isUserMessage;
   const conversationContext = useConversationContextSafe();
   const layout = useLayoutContext();
@@ -138,7 +223,9 @@ const MessageText: React.FC<{ message: IMessageText; hideActions?: boolean }> = 
   }, [isUserMessage, messageList, message.msg_id]);
 
   // 过滤空内容，避免渲染空DOM
-  if (!contentToRender.trim()) {
+  const hasRenderableContent = contentToRender.trim().length > 0;
+
+  if (!hasRenderableContent && !writebackState) {
     return null;
   }
 
@@ -225,43 +312,46 @@ const MessageText: React.FC<{ message: IMessageText; hideActions?: boolean }> = 
             )}
           </div>
         )}
-        <div
-          className={classNames('min-w-0 [&>p:first-child]:mt-0px [&>p:last-child]:mb-0px md:max-w-780px', {
-            'bg-aou-2 p-6px md:p-8px': isUserMessage || cronMeta,
-            'bg-3 p-6px md:p-8px': isTeammateMessage,
-            'w-full': !(isUserMessage || cronMeta || isTeammateMessage),
-          })}
-          style={{
-            ...(isUserMessage || cronMeta
-              ? { borderRadius: '8px 0 8px 8px', color: 'var(--text-primary)' }
-              : isTeammateMessage
-                ? { borderRadius: '0 8px 8px 8px' }
-                : undefined),
-          }}
-        >
-          {/* JSON 内容使用折叠组件 Use CollapsibleContent for JSON content */}
-          {shouldRenderPlainText ? (
-            <div className={MESSAGE_BODY_CLASS_NAME} data-testid='message-text-content'>
-              {text}
-            </div>
-          ) : json ? (
-            <CollapsibleContent maxHeight={200} defaultCollapsed={true}>
-              <div data-testid='message-text-content'>
-                <MarkdownView
-                  codeStyle={CODE_STYLE}
-                  fontSize={MESSAGE_BODY_FONT_SIZE}
-                  lineHeight={MESSAGE_BODY_LINE_HEIGHT}
-                >{`\`\`\`json\n${JSON.stringify(data, null, 2)}\n\`\`\``}</MarkdownView>
+        {hasRenderableContent && (
+          <div
+            className={classNames('min-w-0 [&>p:first-child]:mt-0px [&>p:last-child]:mb-0px md:max-w-780px', {
+              'bg-aou-2 p-6px md:p-8px': isUserMessage || cronMeta,
+              'bg-3 p-6px md:p-8px': isTeammateMessage,
+              'w-full': !(isUserMessage || cronMeta || isTeammateMessage),
+            })}
+            style={{
+              ...(isUserMessage || cronMeta
+                ? { borderRadius: '8px 0 8px 8px', color: 'var(--text-primary)' }
+                : isTeammateMessage
+                  ? { borderRadius: '0 8px 8px 8px' }
+                  : undefined),
+            }}
+          >
+            {/* JSON 内容使用折叠组件 Use CollapsibleContent for JSON content */}
+            {shouldRenderPlainText ? (
+              <div className={MESSAGE_BODY_CLASS_NAME} data-testid='message-text-content'>
+                {text}
               </div>
-            </CollapsibleContent>
-          ) : (
-            <div data-testid='message-text-content'>
-              <MarkdownView codeStyle={CODE_STYLE} fontSize={MESSAGE_BODY_FONT_SIZE} lineHeight={MESSAGE_BODY_LINE_HEIGHT}>
-                {data}
-              </MarkdownView>
-            </div>
-          )}
-        </div>
+            ) : json ? (
+              <CollapsibleContent maxHeight={200} defaultCollapsed={true}>
+                <div data-testid='message-text-content'>
+                  <MarkdownView
+                    codeStyle={CODE_STYLE}
+                    fontSize={MESSAGE_BODY_FONT_SIZE}
+                    lineHeight={MESSAGE_BODY_LINE_HEIGHT}
+                  >{`\`\`\`json\n${JSON.stringify(data, null, 2)}\n\`\`\``}</MarkdownView>
+                </div>
+              </CollapsibleContent>
+            ) : (
+              <div data-testid='message-text-content'>
+                <MarkdownView codeStyle={CODE_STYLE} fontSize={MESSAGE_BODY_FONT_SIZE} lineHeight={MESSAGE_BODY_LINE_HEIGHT}>
+                  {data}
+                </MarkdownView>
+              </div>
+            )}
+          </div>
+        )}
+        {writebackState && <MessageKnowledgeWriteback state={writebackState} />}
         {/* Hover-revealed copy + timestamp row. Mobile has no hover affordance,
             so we drop the row entirely — system-level long-press still copies. */}
         {shouldShowActions && (

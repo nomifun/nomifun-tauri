@@ -8,11 +8,9 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { DragEvent } from 'react';
 import type { TFunction } from 'i18next';
 import { ipcBridge } from '@/common';
+import { isTauriRuntime } from '@/common/adapter/tauriRuntime';
 import { FileService } from '@/renderer/services/FileService';
 import type { MessageApi } from '../types';
-
-const isTauriRuntime = (): boolean =>
-  typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
 interface UseWorkspaceDragImportOptions {
   onFilesDropped: (files: Array<{ path: string; name: string }>) => Promise<void> | void;

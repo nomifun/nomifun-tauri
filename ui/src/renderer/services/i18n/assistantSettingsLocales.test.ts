@@ -31,4 +31,10 @@ describe('assistant settings locale coverage', () => {
   test('zh-CN keeps editor skill label separate from the assistant/skill hub strings', () => {
     assertAssistantSettingsLocale(zhSettings);
   });
+
+  test('zh-CN localizes the assistant/skill hub title and tabs', () => {
+    expect(zhSettings.assistantSkillsHub.title).toBe('助手与技能');
+    expect(zhSettings.assistantSkillsHub.railTitle).toBe('助手与技能');
+    expect(zhSettings.assistantSkillsHub.skillsTab).toBe('技能');
+  });
 });

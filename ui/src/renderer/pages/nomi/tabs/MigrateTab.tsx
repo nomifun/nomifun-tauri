@@ -9,17 +9,13 @@ import { useTranslation } from 'react-i18next';
 import { Alert, Button, Checkbox, Empty, Message, Select } from '@arco-design/web-react';
 import { ipcBridge } from '@/common';
 import { httpRequest, isBackendHttpError } from '@/common/adapter/httpBridge';
+import { isTauriRuntime } from '@/common/adapter/tauriRuntime';
 import type { ICompanionExportResult, ICompanionWithStatus } from '@/common/adapter/ipcBridge';
 
 /** Tagged import result of POST /api/companion/import (backend `ImportOutcome`). */
 type ImportOutcome =
   | { kind: 'memory'; imported: number; skipped_duplicates: number }
   | { kind: 'companion'; companion_id: string; name: string; knowledge_names: string[] };
-
-/** Same dual-signal runtime check as tauriShell.ts (not exported there). */
-const isTauriRuntime = (): boolean =>
-  typeof window !== 'undefined' &&
-  (Boolean((window as { isTauri?: boolean }).isTauri) || '__TAURI_INTERNALS__' in window);
 
 const ZIP_FILTERS = [{ name: 'Zip', extensions: ['zip'] }];
 

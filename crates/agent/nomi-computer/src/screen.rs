@@ -83,8 +83,14 @@ fn select_monitor(monitors: &[Monitor], display: Option<usize>) -> Result<usize,
 }
 
 /// Capture a monitor, downscale to `max_edge`, and encode as base64 PNG.
-/// Blocking: call from `spawn_blocking`.
+/// Blocking: call from `spawn_blocking`. On macOS, xcap enumerates displays
+/// through AppKit (`NSScreen`), so the native capture work is dispatched to the
+/// main queue before it touches xcap.
 pub fn capture_screen(display: Option<usize>, max_edge: u32) -> Result<CapturedScreen, String> {
+    crate::macos_main::run_blocking(move || capture_screen_inner(display, max_edge))
+}
+
+fn capture_screen_inner(display: Option<usize>, max_edge: u32) -> Result<CapturedScreen, String> {
     // Proactive + authoritative on macOS: a denied Screen Recording grant lets
     // capture "succeed" with a black frame, so fail fast with a clear message
     // instead of relying solely on the downstream black-frame heuristic.
@@ -169,5 +175,38 @@ mod tests {
     fn capture_invalid_display_errors_real() {
         let err = capture_screen(Some(99), 1568).unwrap_err();
         assert!(err.contains("99"), "error should name the display: {err}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_capture_task_runs_inside_dispatcher() {
+        use std::sync::{Arc, Mutex};
+
+        let caller_thread = std::thread::current().id();
+        let dispatcher_thread = Arc::new(Mutex::new(None));
+        let work_thread = Arc::new(Mutex::new(None));
+        let dispatcher_thread_seen = dispatcher_thread.clone();
+        let work_thread_seen = work_thread.clone();
+
+        let result = crate::macos_main::run_task_with(
+            move |task| {
+                *dispatcher_thread_seen.lock().unwrap() = Some(std::thread::current().id());
+                let handle = std::thread::spawn(task);
+                handle.join().expect("dispatched task should not panic")
+            },
+            move || {
+                *work_thread_seen.lock().unwrap() = Some(std::thread::current().id());
+                Ok("ok")
+            },
+        )
+        .expect("task should complete");
+
+        assert_eq!(result, "ok");
+        assert_eq!(dispatcher_thread.lock().unwrap().unwrap(), caller_thread);
+        assert_ne!(
+            work_thread.lock().unwrap().unwrap(),
+            caller_thread,
+            "work must run inside the dispatcher task, not on the caller thread"
+        );
     }
 }

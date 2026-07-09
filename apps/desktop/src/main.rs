@@ -165,6 +165,21 @@ struct CompanionWindowSpec {
     enabled: bool,
 }
 
+type MainThreadTask = Box<dyn FnOnce() + Send + 'static>;
+
+async fn run_on_main_thread_task<D, F>(dispatch: D, work: F) -> Result<(), String>
+where
+    D: FnOnce(MainThreadTask) -> Result<(), String>,
+    F: FnOnce() -> Result<(), String> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    dispatch(Box::new(move || {
+        let _ = tx.send(work());
+    }))?;
+    rx.await
+        .map_err(|_| "main-thread task did not return a result".to_string())?
+}
+
 // ---- WebUI / LAN remote-access lifecycle commands -------------------------
 // The embedded backend always serves the app's own webview on loopback. These
 // commands toggle the SEPARATE on-demand LAN listener (`0.0.0.0`) so remote
@@ -374,6 +389,20 @@ async fn sync_companion_windows(
     server: tauri::State<'_, Arc<DesktopServer>>,
     specs: Vec<CompanionWindowSpec>,
 ) -> Result<(), String> {
+    let init_script = webui_init_script(server.loopback_port(), server.local_trust_secret());
+    let app_for_task = app.clone();
+    run_on_main_thread_task(
+        move |task| app.run_on_main_thread(task).map_err(|e| e.to_string()),
+        move || reconcile_companion_windows(app_for_task, init_script, specs),
+    )
+    .await
+}
+
+fn reconcile_companion_windows(
+    app: tauri::AppHandle,
+    init_script: String,
+    specs: Vec<CompanionWindowSpec>,
+) -> Result<(), String> {
     use std::collections::HashSet;
 
     let known: HashSet<String> = specs
@@ -409,7 +438,6 @@ async fn sync_companion_windows(
     // Ensure every enabled companion has a VISIBLE window: show the existing one
     // (it may be hidden from a previous disable / right-click hide), or create it
     // (hidden; the companion page shows itself once its config loads).
-    let init_script = webui_init_script(server.loopback_port(), server.local_trust_secret());
     for spec in specs.iter().filter(|s| s.enabled) {
         let label = format!("companion-{}", spec.companion_id);
         if let Some(window) = app.get_webview_window(&label) {
@@ -801,6 +829,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn macos_reopen_surfaces_main_window_when_no_windows_are_visible() {
@@ -810,5 +839,35 @@ mod tests {
     #[test]
     fn macos_reopen_surfaces_main_window_even_when_companion_window_is_visible() {
         assert!(should_show_main_window_for_macos_reopen(true));
+    }
+
+    #[tokio::test]
+    async fn main_thread_task_runner_executes_work_inside_dispatcher() {
+        let dispatcher_thread = Arc::new(Mutex::new(None));
+        let work_thread = Arc::new(Mutex::new(None));
+        let dispatcher_thread_seen = dispatcher_thread.clone();
+        let work_thread_seen = work_thread.clone();
+
+        run_on_main_thread_task(
+            move |task| {
+                *dispatcher_thread_seen.lock().unwrap() = Some(std::thread::current().id());
+                let handle = std::thread::spawn(move || task());
+                handle.join().expect("dispatched task should not panic");
+                Ok(())
+            },
+            move || {
+                *work_thread_seen.lock().unwrap() = Some(std::thread::current().id());
+                Ok(())
+            },
+        )
+        .await
+        .expect("task should complete");
+
+        let dispatcher_thread = dispatcher_thread.lock().unwrap().unwrap();
+        let work_thread = work_thread.lock().unwrap().unwrap();
+        assert_ne!(
+            dispatcher_thread, work_thread,
+            "work must run inside the dispatcher task, not on the caller thread"
+        );
     }
 }

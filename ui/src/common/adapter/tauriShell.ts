@@ -10,7 +10,7 @@
  * used for OS-shell operations.
  *
  * Every operation is implemented with a Tauri v2 JS API (a plugin or
- * `@tauri-apps/api`) and is GUARDED by `isTauri()`:
+ * `@tauri-apps/api`) and is GUARDED by `isTauriRuntime()`:
  *   - In the Tauri desktop shell → the real Tauri call runs.
  *   - In the WebUI browser       → providers return a web-safe fallback and
  *                                  emitters are inert (no transport, no throw).
@@ -24,14 +24,7 @@
  * Tauri modules are loaded via dynamic `import()` inside the guarded branch so
  * the WebUI browser bundle never evaluates Tauri IPC code.
  */
-
-// Tauri-runtime detection. Tauri v2 injects `window.isTauri`; the IPC layer also
-// always sets `window.__TAURI_INTERNALS__`. Check BOTH so detection is robust
-// regardless of `withGlobalTauri` config — a single missing signal must not make
-// every shell op silently no-op (which is what broke the window controls).
-const isTauri = (): boolean =>
-  typeof window !== 'undefined' &&
-  (Boolean((window as { isTauri?: boolean }).isTauri) || '__TAURI_INTERNALS__' in window);
+import { isTauriRuntime } from './tauriRuntime';
 
 // ---------------------------------------------------------------------------
 // Channel shapes — mirror the bridge.buildProvider / bridge.buildEmitter API
@@ -52,13 +45,15 @@ export interface ShellEmitter<Params> {
 /** A provider backed by a Tauri call, with a web-safe fallback for the browser. */
 export function shellProvider<Data, Params = void>(
   handler: (params: Params) => Promise<Data>,
-  webFallback: Data | (() => Data | Promise<Data>)
+  webFallback: Data | ((params: Params) => Data | Promise<Data>)
 ): ShellProvider<Data, Params> {
   return {
     provider: () => {},
     invoke: async (params: Params): Promise<Data> => {
-      if (isTauri()) return handler(params);
-      return typeof webFallback === 'function' ? (webFallback as () => Data | Promise<Data>)() : webFallback;
+      if (isTauriRuntime()) return handler(params);
+      return typeof webFallback === 'function'
+        ? (webFallback as (p: Params) => Data | Promise<Data>)(params)
+        : webFallback;
     },
   };
 }
@@ -77,7 +72,7 @@ export function shellEmitter<Params = void>(
 ): ShellEmitter<Params> {
   return {
     on: (callback: (params: Params) => void): (() => void) => {
-      if (!isTauri()) return () => {};
+      if (!isTauriRuntime()) return () => {};
       let unlisten: (() => void) | null = null;
       let disposed = false;
       void subscribe(callback)

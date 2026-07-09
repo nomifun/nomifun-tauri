@@ -75,7 +75,7 @@ bun run build:win --config apps/desktop/tauri.updater.conf.json
 # macOS (Universal .app.tar.gz + .sig — one artifact serves both darwin chips):
 bun run build:mac --config apps/desktop/tauri.updater.conf.json
 
-# Linux (AppImage + .sig):
+# Linux (AppImage + .sig for updater; deb/rpm remain manual installers):
 bun run build:linux --config apps/desktop/tauri.updater.conf.json
 ```
 
@@ -116,6 +116,11 @@ Run it once per build machine; carry `latest.json` between them (or commit it) s
 the merged manifest ends up complete. The report prints which platform keys are
 filled and which are still missing — **a missing `<os>-<arch>` entry means those
 users silently get no update**, so make sure every platform you ship has one.
+
+If one platform produces several signed bundle types, `make:latest` uses the
+updater package for the manifest and still leaves the other installers available
+for upload. On Linux, the updater entry prefers `.AppImage`; `.deb` and `.rpm`
+are manual download assets.
 
 ## Releasing
 

@@ -109,6 +109,7 @@ async fn list_skills(
     State(state): State<SkillRouterState>,
 ) -> Result<Json<ApiResponse<Vec<SkillListItemResponse>>>, AppError> {
     let items = skill_service::list_available_skills(&state.skill_paths).await?;
+    let builtin_display = skill_service::load_builtin_skill_display_metadata();
     // user sidecar assignments (decode JSON arrays), keyed by skill name
     let user_rows = state.skill_tag_repo.get_all().await.map_err(AppError::from)?;
     let mut user_map: HashMap<String, (Vec<String>, Vec<String>)> = HashMap::new();
@@ -120,6 +121,11 @@ async fn list_skills(
     let resp: Vec<SkillListItemResponse> = items
         .into_iter()
         .map(|s| {
+            let display = if s.source == skill_service::SkillSource::Builtin {
+                builtin_display.get(&s.name).cloned().unwrap_or_default()
+            } else {
+                Default::default()
+            };
             let (audience_tags, scenario_tags) = user_map
                 .get(&s.name)
                 .cloned()
@@ -128,6 +134,8 @@ async fn list_skills(
             SkillListItemResponse {
                 name: s.name,
                 description: s.description,
+                name_i18n: display.name_i18n,
+                description_i18n: display.description_i18n,
                 location: s.location,
                 relative_location: s.relative_location,
                 is_custom: s.is_custom,
@@ -177,12 +185,18 @@ async fn list_builtin_auto_skills(
     State(state): State<SkillRouterState>,
 ) -> Result<Json<ApiResponse<Vec<BuiltinAutoSkillResponse>>>, AppError> {
     let items = skill_service::list_builtin_auto_skills(&state.skill_paths).await?;
+    let builtin_display = skill_service::load_builtin_skill_display_metadata();
     let resp: Vec<BuiltinAutoSkillResponse> = items
         .into_iter()
-        .map(|s| BuiltinAutoSkillResponse {
-            name: s.name,
-            description: s.description,
-            location: s.location,
+        .map(|s| {
+            let display = builtin_display.get(&s.name).cloned().unwrap_or_default();
+            BuiltinAutoSkillResponse {
+                name: s.name,
+                description: s.description,
+                name_i18n: display.name_i18n,
+                description_i18n: display.description_i18n,
+                location: s.location,
+            }
         })
         .collect();
     Ok(Json(ApiResponse::ok(resp)))

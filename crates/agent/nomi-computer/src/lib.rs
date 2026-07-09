@@ -2,6 +2,7 @@ pub mod fallback_backend;
 pub mod input;
 pub mod keys;
 pub mod launch;
+mod macos_main;
 pub mod permissions;
 pub mod scale;
 pub mod screen;

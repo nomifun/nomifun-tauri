@@ -8,6 +8,7 @@ import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from
 import { useTranslation } from 'react-i18next';
 import { ipcBridge } from '@/common';
 import { isBackendHttpError } from '@/common/adapter/httpBridge';
+import { isTauriRuntime } from '@/common/adapter/tauriRuntime';
 import type { ICompanionProfile, ICompanionSuggestion, IResponseMessage } from '@/common/adapter/ipcBridge';
 import { extractResponseTextChunk } from '@/common/chat/displayText';
 import MarkdownView from '@/renderer/components/Markdown';
@@ -39,10 +40,6 @@ import { useCompanionClickThrough } from './useCompanionClickThrough';
 import { createCompanionBarRevealController, type CompanionBarRevealController } from './companionBarReveal';
 import { shouldCaptureWholeCompanionWindow } from './companionCapturePolicy';
 import './companion.css';
-
-const isTauri = (): boolean =>
-  typeof window !== 'undefined' &&
-  (Boolean((window as { isTauri?: boolean }).isTauri) || '__TAURI_INTERNALS__' in window);
 
 const BUBBLE_MS = 12_000;
 /** Safety net: a streaming bubble auto-dismisses even if chat-done is lost. */
@@ -248,7 +245,7 @@ const CompanionPage: React.FC = () => {
 
   // Apply native window visibility/position from the companion's profile (desktop shell only).
   const applyWindowState = useCallback(async (cfg: ICompanionProfile, opts?: { skipPosition?: boolean }) => {
-    if (!isTauri()) return;
+    if (!isTauriRuntime()) return;
     try {
       const { getCurrentWindow, PhysicalPosition, availableMonitors, primaryMonitor } = await import('@tauri-apps/api/window');
       const win = getCurrentWindow();
@@ -321,7 +318,7 @@ const CompanionPage: React.FC = () => {
   // first orderFront macOS reports scaleFactor 1.0 and every physical-px
   // computation here would be wrong.
   const applyDeskSize = useCallback(async (cfg: ICompanionProfile, opts?: { anchor?: 'bottom' | 'top-left' }) => {
-    if (!isTauri() || !cfg.appearance.companion_enabled) return;
+    if (!isTauriRuntime() || !cfg.appearance.companion_enabled) return;
     // 聊天模式下窗口被 enterChatSize 故意放大；此时 config-updated 回声里的
     // applyDeskSize 不能把它缩回桌面伙伴尺寸（会和 enterChatSize 打架、把气泡挤没）。
     // exitChatSize 会先清掉该标记再调本函数还原，故不影响正常收尾还原。
@@ -379,7 +376,7 @@ const CompanionPage: React.FC = () => {
   // 宽 ~ min(480, 工作区宽 42%)，高 ~ min(560, 工作区高 56%)；底边锚定、显示器钳制，
   // 与 applyDeskSize 同一套读回+锚定逻辑。chatSizedRef 防抖：流式分片不重复 setSize。
   const enterChatSize = useCallback(async () => {
-    if (!isTauri() || chatSizedRef.current) return;
+    if (!isTauriRuntime() || chatSizedRef.current) return;
     const cfg = profileRef.current;
     if (!cfg || !cfg.appearance.companion_enabled) return;
     chatSizedRef.current = true; // 先占位防抖，失败再回退
@@ -491,7 +488,7 @@ const CompanionPage: React.FC = () => {
         document.documentElement.style.background = prevHtmlBg;
       };
     }
-    if (!isTauri()) {
+    if (!isTauriRuntime()) {
       // Web fallback still loads the profile (+ embedded status) so the
       // preview shows the configured character with its real mood.
       void ipcBridge.companion.getCompanion
@@ -854,7 +851,7 @@ const CompanionPage: React.FC = () => {
 
   // Persist the window position after drags (debounced onMoved).
   useEffect(() => {
-    if (!isTauri() || !companionId) return;
+    if (!isTauriRuntime() || !companionId) return;
     let unlisten: (() => void) | undefined;
     let timer: ReturnType<typeof setTimeout> | null = null;
     void (async () => {
@@ -887,7 +884,7 @@ const CompanionPage: React.FC = () => {
   // 不会每个分片都 setSize。气泡出现→放大；气泡清空→还原桌面伙伴尺寸。
   const hasBubble = bubble.length > 0;
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!isTauriRuntime()) return;
     // 气泡或展开态 composer 都需要放大原生窗口才能撑得开。
     if (hasBubble || composerOpen) void enterChatSize();
     else void exitChatSize();
@@ -910,7 +907,7 @@ const CompanionPage: React.FC = () => {
   // 还在拉取时窗口已可见，此刻就该穿透——否则启动数秒内整窗仍挡点击。停用→窗口 hide()→
   // companion_enabled=false→停轮询。
   useCompanionClickThrough({
-    enabled: isTauri() && profile?.appearance.companion_enabled !== false,
+    enabled: isTauriRuntime() && profile?.appearance.companion_enabled !== false,
     onHoverChange: handleCompanionHoverChange,
     // 明确交互态整窗捕获：建议/展开 composer，以及迷你输入条已显露或有草稿时，
     // 优先保证控件可点可聚焦；离开后由 bar reveal 延迟和状态清空恢复按区域穿透。
@@ -925,7 +922,7 @@ const CompanionPage: React.FC = () => {
   // 使桌宠气泡/输入框（及功能按键）chrome 完整跟随主窗氛围。初始值在挂载时主动读取
   // 一次（应对桌宠晚于主窗打开的情况）；注入带透明保护，见 applyCustomCss。
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!isTauriRuntime()) return;
     let unlisten: (() => void) | undefined;
     let disposed = false;
     void configService
@@ -962,7 +959,7 @@ const CompanionPage: React.FC = () => {
   // 伙伴专属称呼而非千篇一律的 "nomi"。初次加载与重命名（config-updated → setProfile）
   // 都会触发本 effect。
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!isTauriRuntime()) return;
     const name = profile?.name?.trim();
     if (!name) return;
     void import('@tauri-apps/api/window')
@@ -1013,7 +1010,7 @@ const CompanionPage: React.FC = () => {
   }, [hasBubble]);
 
   const startDrag = useCallback(async (e: React.MouseEvent) => {
-    if (e.button !== 0 || !isTauri()) return;
+    if (e.button !== 0 || !isTauriRuntime()) return;
     setDragging(true); // 冻结点击穿透轮询，根除拖动闪动
     let ended = false;
     let unlistenMoved: (() => void) | undefined;
@@ -1052,7 +1049,7 @@ const CompanionPage: React.FC = () => {
   }, []);
 
   const openMainAt = useCallback(async (path: string) => {
-    if (!isTauri()) return;
+    if (!isTauriRuntime()) return;
     try {
       const { emitTo } = await import('@tauri-apps/api/event');
       const { Window } = await import('@tauri-apps/api/window');
@@ -1119,7 +1116,7 @@ const CompanionPage: React.FC = () => {
   // 拖拽图片进桌宠窗：桌面端 OS 文件拖放经 Tauri 原生 onDragDropEvent 投递（webview 的
   // DOM ondrop 拿不到真实主机路径），这里取图片绝对路径追加为附件；enter/over 高亮、drop 落盘。
   useEffect(() => {
-    if (!isTauri()) return;
+    if (!isTauriRuntime()) return;
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     void import('@tauri-apps/api/webview')
@@ -1421,7 +1418,7 @@ const CompanionPage: React.FC = () => {
     </>
   );
 
-  if (!isTauri()) {
+  if (!isTauriRuntime()) {
     return (
       <div className='nomi-companion-web-hint'>
         <CompanionAvatar
@@ -1445,7 +1442,7 @@ const CompanionPage: React.FC = () => {
       onContextMenu={(e) => {
         e.preventDefault();
         // 同步捕获：不等下个轮询 tick，先确保这次右键不会被透明穿透状态影响。
-        if (isTauri()) {
+        if (isTauriRuntime()) {
           void import('@tauri-apps/api/window')
             .then(({ getCurrentWindow }) => getCurrentWindow().setIgnoreCursorEvents(false))
             .catch(() => {});

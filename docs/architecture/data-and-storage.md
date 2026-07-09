@@ -128,14 +128,13 @@ the user memory entry "AutoWork backend-authoritative".)
 Sensitive strings (provider API keys, OAuth tokens, channel-bot tokens, ...)
 are encrypted before insertion using AES-256-GCM via
 `nomifun_common::crypto::{encrypt_string, decrypt_string}` and the
-encryption key derived in `nomifun_app::derive_encryption_key`.
+data-encryption key loaded by `nomifun_app::load_or_create_data_encryption_key`.
 
-The master key is not a file: `derive_encryption_key` is the SHA-256 of the
-JWT secret, which is resolved at boot as env `JWT_SECRET` → the system
-user's `jwt_secret` column → freshly generated and persisted to the
-database. The key is per-installation and never crosses the wire; losing
-the JWT secret renders all encrypted columns unreadable (this is by design
-— it is the kill switch).
+The master key is a per-installation file at `<data_dir>/encryption_key`.
+Older installs did not have that file, so the first boot on the newer code
+seeds it from the currently resolved JWT secret to keep existing ciphertext
+readable. After that, password changes and JWT rotation do not alter the data
+key. Losing `encryption_key` renders encrypted columns unreadable.
 
 The `aes-gcm` crate version pinned in the workspace is `0.10`.
 
@@ -288,10 +287,9 @@ non-loopback bind address.
 ## Backups and reinstall
 
 - **Database** — copy `<data_dir>/nomifun-backend.db` (sqlx single-file SQLite).
-- **Encryption key** — nothing separate to copy: the key is derived from the
-  JWT secret, which lives in the database (unless supplied via env
-  `JWT_SECRET`), so a database copy carries the encrypted columns *and* the
-  means to read them.
+- **Encryption key** — copy `<data_dir>/encryption_key` together with the
+  database. Without this file, provider API keys, OAuth tokens, channel bot
+  tokens, and other encrypted columns cannot be decrypted.
 - **Workspaces** — copy `<work_dir>/conversations/` if you want to keep the
   files agents wrote.
 - **Companion data** — copy `<data_dir>/companion/` (shared memory hub + per-companion

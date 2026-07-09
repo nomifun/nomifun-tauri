@@ -1,29 +1,221 @@
 {
   "version": "1.0.0",
   "skills": [
-    { "name": "officecli-docx", "audience_tags": ["office"], "scenario_tags": ["document"] },
-    { "name": "officecli-pptx", "audience_tags": ["office"], "scenario_tags": ["presentation"] },
-    { "name": "officecli-xlsx", "audience_tags": ["office", "finance"], "scenario_tags": ["spreadsheet"] },
-    { "name": "officecli-word-form", "audience_tags": ["office"], "scenario_tags": ["document", "spreadsheet"] },
-    { "name": "officecli-academic-paper", "audience_tags": ["student"], "scenario_tags": ["document", "research"] },
-    { "name": "officecli-data-dashboard", "audience_tags": ["office", "marketing"], "scenario_tags": ["dataviz"] },
-    { "name": "officecli-financial-model", "audience_tags": ["finance"], "scenario_tags": ["spreadsheet", "dataviz"] },
-    { "name": "officecli-pitch-deck", "audience_tags": ["finance", "office"], "scenario_tags": ["presentation"] },
-    { "name": "morph-ppt", "audience_tags": ["office", "designer"], "scenario_tags": ["presentation"] },
-    { "name": "morph-ppt-3d", "audience_tags": ["designer", "office"], "scenario_tags": ["presentation", "design"] },
-    { "name": "star-office-helper", "audience_tags": ["office", "general"], "scenario_tags": ["document"] },
-    { "name": "mermaid", "audience_tags": ["developer", "office"], "scenario_tags": ["dataviz"] },
-    { "name": "ui-ux-pro-max", "audience_tags": ["designer", "developer"], "scenario_tags": ["design", "coding"] },
-    { "name": "moltbook", "audience_tags": ["student", "general"], "scenario_tags": ["document"] },
-    { "name": "story-roleplay", "audience_tags": ["general", "designer"], "scenario_tags": ["writing"] },
-    { "name": "xiaohongshu-recruiter", "audience_tags": ["marketing"], "scenario_tags": ["social"] },
-    { "name": "x-recruiter", "audience_tags": ["marketing"], "scenario_tags": ["social"] },
-    { "name": "weixin-file-send", "audience_tags": ["general"], "scenario_tags": ["setup"] },
-    { "name": "openclaw-setup", "audience_tags": ["developer", "general"], "scenario_tags": ["setup"] },
-    { "name": "nomifun-webui-setup", "audience_tags": ["developer", "general"], "scenario_tags": ["setup"] },
-    { "name": "cron", "audience_tags": ["general", "developer"], "scenario_tags": ["setup"] },
-    { "name": "nomifun-skills", "audience_tags": ["developer", "general"], "scenario_tags": ["setup"] },
-    { "name": "officecli", "audience_tags": ["office"], "scenario_tags": ["document"] },
-    { "name": "skill-creator", "audience_tags": ["developer"], "scenario_tags": ["setup"] }
+    {
+      "name": "officecli-docx",
+      "name_i18n": { "zh-CN": "officecli-docx" },
+      "description_i18n": {
+        "zh-CN": "处理 Word 文档的通用技能，适用于创建、读取、编辑 .docx，以及模板、修订、批注、页眉页脚和目录等场景。"
+      },
+      "audience_tags": ["office"],
+      "scenario_tags": ["document"]
+    },
+    {
+      "name": "officecli-pptx",
+      "name_i18n": { "zh-CN": "officecli-pptx" },
+      "description_i18n": {
+        "zh-CN": "处理 PowerPoint 演示文稿的通用技能，适用于创建、读取、编辑、合并或拆分 .pptx，以及模板、版式、演讲者备注和批注等场景。"
+      },
+      "audience_tags": ["office"],
+      "scenario_tags": ["presentation"]
+    },
+    {
+      "name": "officecli-xlsx",
+      "name_i18n": { "zh-CN": "officecli-xlsx" },
+      "description_i18n": {
+        "zh-CN": "处理 Excel 工作簿的通用技能，适用于创建、读取、编辑 .xlsx，导入 CSV/TSV，以及公式、图表、透视表、模板和数据追踪表等场景。"
+      },
+      "audience_tags": ["office", "finance"],
+      "scenario_tags": ["spreadsheet"]
+    },
+    {
+      "name": "officecli-word-form",
+      "name_i18n": { "zh-CN": "officecli-word-form" },
+      "description_i18n": {
+        "zh-CN": "创建可填写 Word 表单的技能，支持内容控件、传统复选框、邮件合并字段和文档保护，适合入职表、问卷、合同模板和合规清单。"
+      },
+      "audience_tags": ["office"],
+      "scenario_tags": ["document", "spreadsheet"]
+    },
+    {
+      "name": "officecli-academic-paper",
+      "name_i18n": { "zh-CN": "officecli-academic-paper" },
+      "description_i18n": {
+        "zh-CN": "生成学术风格 .docx 的技能，适用于论文、会议稿、学位论文、正式引用格式、编号公式、图表交叉引用、脚注尾注和参考文献。"
+      },
+      "audience_tags": ["student"],
+      "scenario_tags": ["document", "research"]
+    },
+    {
+      "name": "officecli-data-dashboard",
+      "name_i18n": { "zh-CN": "officecli-data-dashboard" },
+      "description_i18n": {
+        "zh-CN": "从 CSV 或表格数据生成 Excel 仪表盘的技能，支持 KPI 卡片、多图表、迷你图和条件格式，适合经营、指标和数据可视化报表。"
+      },
+      "audience_tags": ["office", "marketing"],
+      "scenario_tags": ["dataviz"]
+    },
+    {
+      "name": "officecli-financial-model",
+      "name_i18n": { "zh-CN": "officecli-financial-model" },
+      "description_i18n": {
+        "zh-CN": "构建 Excel 财务模型的技能，适用于三表模型、DCF、LBO、SaaS 单位经济模型、敏感性分析、情景分析、债务计划和融资预测。"
+      },
+      "audience_tags": ["finance"],
+      "scenario_tags": ["spreadsheet", "dataviz"]
+    },
+    {
+      "name": "officecli-pitch-deck",
+      "name_i18n": { "zh-CN": "officecli-pitch-deck" },
+      "description_i18n": {
+        "zh-CN": "创建融资或投资人路演 PPT 的技能，适用于种子轮、A/B/C 轮、可转债、SAFE、VC deck、募资演示和 term sheet 展示。"
+      },
+      "audience_tags": ["finance", "office"],
+      "scenario_tags": ["presentation"]
+    },
+    {
+      "name": "morph-ppt",
+      "name_i18n": { "zh-CN": "morph-ppt" },
+      "description_i18n": {
+        "zh-CN": "创建带平滑跨页动画的 .pptx，使用 PowerPoint Morph 转场实现形状放大、移动、旋转和连续动画，适合需要动态衔接的演示。"
+      },
+      "audience_tags": ["office", "designer"],
+      "scenario_tags": ["presentation"]
+    },
+    {
+      "name": "morph-ppt-3d",
+      "name_i18n": { "zh-CN": "morph-ppt-3d" },
+      "description_i18n": {
+        "zh-CN": "在 morph-ppt 基础上加入 GLB 3D 模型、电影感镜头、模型与内容排版以及更完整视觉设计系统的 3D Morph PPT 技能。"
+      },
+      "audience_tags": ["designer", "office"],
+      "scenario_tags": ["presentation", "design"]
+    },
+    {
+      "name": "star-office-helper",
+      "name_i18n": { "zh-CN": "star-office-helper" },
+      "description_i18n": {
+        "zh-CN": "安装、启动、连接和排查 Nomi/OpenClaw 可视化伴侣项目的技能，默认推荐 Star-Office-UI，适合端口、鉴权、预览面板和 Python 环境问题。"
+      },
+      "audience_tags": ["office", "general"],
+      "scenario_tags": ["document"]
+    },
+    {
+      "name": "mermaid",
+      "name_i18n": { "zh-CN": "mermaid" },
+      "description_i18n": {
+        "zh-CN": "使用 Mermaid 渲染流程图、时序图、状态图、类图或 ER 图，可输出 SVG 或终端友好的 ASCII/Unicode 图。"
+      },
+      "audience_tags": ["developer", "office"],
+      "scenario_tags": ["dataviz"]
+    },
+    {
+      "name": "ui-ux-pro-max",
+      "name_i18n": { "zh-CN": "ui-ux-pro-max" },
+      "description_i18n": {
+        "zh-CN": "专业 UI/UX 设计研究技能，内置可检索资料库，覆盖产品模式、视觉风格、配色、字体、落地页结构、仪表盘图表、UX 实践和技术选型。"
+      },
+      "audience_tags": ["designer", "developer"],
+      "scenario_tags": ["design", "coding"]
+    },
+    {
+      "name": "moltbook",
+      "name_i18n": { "zh-CN": "moltbook" },
+      "description_i18n": {
+        "zh-CN": "面向 AI agent 的社交网络技能，可发帖、评论、点赞和创建社区，用于参与 Moltbook 社区互动。"
+      },
+      "audience_tags": ["student", "general"],
+      "scenario_tags": ["document"]
+    },
+    {
+      "name": "story-roleplay",
+      "name_i18n": { "zh-CN": "story-roleplay" },
+      "description_i18n": {
+        "zh-CN": "解析并应用角色卡和世界信息文件的技能，支持 PNG、WebP、JSON 等格式，兼容 SillyTavern，并支持关键词触发和动态更新。"
+      },
+      "audience_tags": ["general", "designer"],
+      "scenario_tags": ["writing"]
+    },
+    {
+      "name": "xiaohongshu-recruiter",
+      "name_i18n": { "zh-CN": "xiaohongshu-recruiter" },
+      "description_i18n": {
+        "zh-CN": "准备并发布小红书 AI 相关岗位招聘内容的技能，包含封面图、详情图生成和确认门控的发布脚本。"
+      },
+      "audience_tags": ["marketing"],
+      "scenario_tags": ["social"]
+    },
+    {
+      "name": "x-recruiter",
+      "name_i18n": { "zh-CN": "x-recruiter" },
+      "description_i18n": {
+        "zh-CN": "用于在 X 发布招聘帖的技能，包含招聘文案规范、图片生成提示和自动化发布脚本，适合 AI 或设计类岗位。"
+      },
+      "audience_tags": ["marketing"],
+      "scenario_tags": ["social"]
+    },
+    {
+      "name": "weixin-file-send",
+      "name_i18n": { "zh-CN": "weixin-file-send" },
+      "description_i18n": {
+        "zh-CN": "当用户希望把本地文件或图片发回给自己时使用，例如“发给我”或“send me the file”。"
+      },
+      "audience_tags": ["general"],
+      "scenario_tags": ["setup"]
+    },
+    {
+      "name": "openclaw-setup",
+      "name_i18n": { "zh-CN": "openclaw-setup" },
+      "description_i18n": {
+        "zh-CN": "OpenClaw 使用专家技能，帮助安装、部署、配置和排查个人 AI 助手，包括 Gateway、Channels、Agents、Bot 创建和自动化任务等。"
+      },
+      "audience_tags": ["developer", "general"],
+      "scenario_tags": ["setup"]
+    },
+    {
+      "name": "nomifun-webui-setup",
+      "name_i18n": { "zh-CN": "nomifun-webui-setup" },
+      "description_i18n": {
+        "zh-CN": "NomiFun WebUI 配置专家技能，帮助通过开放能力面板配置远程访问，支持局域网、Tailscale VPN、服务器部署和故障排查。"
+      },
+      "audience_tags": ["developer", "general"],
+      "scenario_tags": ["setup"]
+    },
+    {
+      "name": "cron",
+      "name_i18n": { "zh-CN": "cron" },
+      "description_i18n": {
+        "zh-CN": "定时任务管理技能，用于创建、查询和更新计划任务，让操作按指定时间自动执行。"
+      },
+      "audience_tags": ["general", "developer"],
+      "scenario_tags": ["setup"]
+    },
+    {
+      "name": "nomifun-skills",
+      "name_i18n": { "zh-CN": "nomifun-skills" },
+      "description_i18n": {
+        "zh-CN": "访问 Nomi Skills 注册表的技能，可发现和下载 AI agent 技能，并管理 Nomi Skills 平台上的 agent 凭据。"
+      },
+      "audience_tags": ["developer", "general"],
+      "scenario_tags": ["setup"]
+    },
+    {
+      "name": "officecli",
+      "name_i18n": { "zh-CN": "officecli" },
+      "description_i18n": {
+        "zh-CN": "使用 officecli 命令行创建、分析、校对和修改 Office 文档，适用于 .docx、.xlsx、.pptx 的格式检查、图表添加和内容编辑。"
+      },
+      "audience_tags": ["office"],
+      "scenario_tags": ["document"]
+    },
+    {
+      "name": "skill-creator",
+      "name_i18n": { "zh-CN": "skill-creator" },
+      "description_i18n": {
+        "zh-CN": "创建或更新技能的指南，用于把专门知识、工作流或工具集成封装成可复用的 agent 技能。"
+      },
+      "audience_tags": ["developer"],
+      "scenario_tags": ["setup"]
+    }
   ]
 }

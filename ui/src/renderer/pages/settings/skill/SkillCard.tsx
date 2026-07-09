@@ -15,6 +15,7 @@
  */
 import type { AssistantTag } from '@/common/types/agent/assistantTypes';
 import type { SkillInfo } from '@/renderer/pages/settings/AssistantSettings/types';
+import { resolveSkillDisplay } from './skillDisplay';
 import { getAvatarColorClass, normalizeTestId } from './skillPresentation';
 import { Tag } from '@arco-design/web-react';
 import { Delete, Lightning, SettingOne } from '@icon-park/react';
@@ -96,6 +97,7 @@ const SkillCard: React.FC<SkillCardProps> = ({
 }) => {
   const { t } = useTranslation();
   const testId = normalizeTestId(skill.name);
+  const display = resolveSkillDisplay(skill, localeKey);
 
   // Resolve tag keys → labels via the shared vocabulary; drop unknown keys.
   const resolvedTags = [...(skill.audience_tags ?? []), ...(skill.scenario_tags ?? [])]
@@ -144,9 +146,9 @@ const SkillCard: React.FC<SkillCardProps> = ({
           <div className='flex items-center gap-6px min-w-0 flex-wrap'>
             <span
               className='truncate max-w-full text-14px font-medium leading-20px text-[var(--color-text-1)]'
-              title={skill.name}
+              title={display.name}
             >
-              {skill.name}
+              {display.name}
             </span>
             <SourceBadge skill={skill} isAutoInjected={isAutoInjected} />
           </div>
@@ -156,7 +158,7 @@ const SkillCard: React.FC<SkillCardProps> = ({
       {/* Description — fixed 2-line clamp so cards stay even-height */}
       <div
         className='mt-10px text-12px leading-18px text-[var(--color-text-3)] min-h-[36px]'
-        title={skill.description || undefined}
+        title={display.description || undefined}
         style={{
           display: '-webkit-box',
           WebkitLineClamp: 2,
@@ -164,7 +166,7 @@ const SkillCard: React.FC<SkillCardProps> = ({
           overflow: 'hidden',
         }}
       >
-        {skill.description || t('settings.skillsHub.noDescription', { defaultValue: 'No description provided.' })}
+        {display.description || t('settings.skillsHub.noDescription', { defaultValue: 'No description provided.' })}
       </div>
 
       {/* Tag chips — static pills resolved from the shared vocabulary */}

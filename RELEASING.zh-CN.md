@@ -221,6 +221,14 @@ bun run make:latest
 如果发布 Linux，必须在 Linux 机器上执行：
 
 ```bash
+sudo apt-get install -y pkg-config libgbm-dev libayatana-appindicator3-dev librsvg2-dev
+```
+
+`build:linux` 会在构建前检查 `gbm`、AppIndicator 与 `librsvg-2.0` 的 `pkg-config`
+条目，并设置 `APPIMAGE_EXTRACT_AND_RUN=1`，避免构建机缺 FUSE2 时无法运行
+`linuxdeploy` AppImage。
+
+```bash
 export TAURI_SIGNING_PRIVATE_KEY="$(cat apps/desktop/signing/nomifun-updater.key)"
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
 
@@ -229,6 +237,8 @@ bun run make:latest
 ```
 
 Linux 不走 macOS 公证或 Windows Authenticode，但仍需要 Tauri updater `.sig`。
+Linux 发布会上传 `.AppImage`、`.deb`、`.rpm`；其中 `latest.json` 的 updater
+条目应指向 `.AppImage`，`bun run make:latest` 会在多个签名 Linux 包里显式选择它。
 
 ## 合并 latest.json
 

@@ -1,10 +1,13 @@
 //! Application configuration parsed from CLI arguments + key derivation.
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nomifun_auth::AuthPolicy;
 use sha2::{Digest, Sha256};
+
+const DATA_ENCRYPTION_KEY_FILE: &str = "encryption_key";
 
 /// Application configuration parsed from CLI arguments.
 #[derive(Debug, Clone)]
@@ -57,6 +60,94 @@ pub fn derive_encryption_key(jwt_secret: &str) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+/// Load the app's persistent data-encryption key, creating it on first boot.
+///
+/// Existing installs historically derived this key from the JWT secret. When no
+/// key file exists, we persist that current derived key so old ciphertext remains
+/// readable while future JWT rotation no longer changes the data key.
+pub fn load_or_create_data_encryption_key(data_dir: &Path, jwt_secret: &str) -> anyhow::Result<[u8; 32]> {
+    let key_path = data_dir.join(DATA_ENCRYPTION_KEY_FILE);
+
+    if key_path.exists() {
+        let raw = fs::read_to_string(&key_path)?;
+        return parse_hex_key(raw.trim(), &key_path);
+    }
+
+    fs::create_dir_all(data_dir)?;
+    let key = derive_encryption_key(jwt_secret);
+    let tmp_path = key_path.with_extension("tmp");
+    #[cfg(unix)]
+    {
+        use std::io::{ErrorKind, Write};
+        use std::os::unix::fs::OpenOptionsExt;
+
+        match fs::remove_file(&tmp_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        file.write_all(hex_encode_key(&key).as_bytes())?;
+        file.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(&tmp_path, hex_encode_key(&key))?;
+    }
+    fs::rename(&tmp_path, &key_path)?;
+    Ok(key)
+}
+
+fn hex_encode_key(key: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in key {
+        out.push(nibble_to_hex(byte >> 4));
+        out.push(nibble_to_hex(byte & 0x0f));
+    }
+    out
+}
+
+fn nibble_to_hex(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        10..=15 => (b'a' + (nibble - 10)) as char,
+        _ => unreachable!("nibble is masked to four bits"),
+    }
+}
+
+fn parse_hex_key(raw: &str, path: &Path) -> anyhow::Result<[u8; 32]> {
+    if raw.len() != 64 {
+        anyhow::bail!(
+            "Invalid data encryption key at {}: expected 64 hex characters, got {}",
+            path.display(),
+            raw.len()
+        );
+    }
+
+    let mut key = [0u8; 32];
+    for (index, byte) in key.iter_mut().enumerate() {
+        let offset = index * 2;
+        let hi = hex_value(raw.as_bytes()[offset], path)?;
+        let lo = hex_value(raw.as_bytes()[offset + 1], path)?;
+        *byte = (hi << 4) | lo;
+    }
+    Ok(key)
+}
+
+fn hex_value(byte: u8, path: &Path) -> anyhow::Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => anyhow::bail!("Invalid data encryption key at {}: non-hex character", path.display()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,5 +178,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.database_path(), PathBuf::from("/tmp/nomifun/nomifun-backend.db"));
+    }
+
+    #[test]
+    fn data_encryption_key_is_persisted_independently_of_jwt_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = load_or_create_data_encryption_key(tmp.path(), "jwt-secret-before").unwrap();
+        let second = load_or_create_data_encryption_key(tmp.path(), "jwt-secret-after").unwrap();
+
+        assert_eq!(first, derive_encryption_key("jwt-secret-before"));
+        assert_eq!(second, first);
+        assert_ne!(second, derive_encryption_key("jwt-secret-after"));
     }
 }

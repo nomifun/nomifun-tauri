@@ -285,6 +285,38 @@ async fn list_skills_builtin_entries_carry_relative_location() {
     assert!(saw_custom, "expected the seeded custom entry");
 }
 
+#[tokio::test]
+async fn list_skills_builtin_entries_include_display_i18n_metadata() {
+    let fx = fixture_embedded().await;
+
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token("/api/skills", &fx.token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let arr = json["data"].as_array().unwrap();
+    let mermaid = arr
+        .iter()
+        .find(|item| item["name"] == "mermaid")
+        .expect("mermaid builtin skill listed");
+
+    assert_eq!(mermaid["source"], "builtin");
+    let zh_desc = mermaid["description_i18n"]["zh-CN"]
+        .as_str()
+        .expect("mermaid should expose zh-CN display description");
+    assert!(
+        zh_desc.contains("Mermaid") && zh_desc.contains("流程图"),
+        "unexpected zh-CN display description: {zh_desc}"
+    );
+    assert!(
+        mermaid.get("name_i18n").is_some(),
+        "builtin skills should expose display name metadata, even when it preserves the canonical name"
+    );
+}
+
 // ===========================================================================
 // POST /api/skills/materialize-for-agent
 // ===========================================================================

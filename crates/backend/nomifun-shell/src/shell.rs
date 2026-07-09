@@ -31,7 +31,7 @@ impl ShellService {
             self.opener.run_command("explorer", &[&parent.to_string_lossy()]).await
         } else {
             let parent = path.parent().unwrap_or(&path);
-            self.opener.run_command("xdg-open", &[&parent.to_string_lossy()]).await
+            self.open_linux_path(parent).await
         }
     }
 
@@ -115,30 +115,123 @@ impl ShellService {
         } else if cfg!(target_os = "windows") {
             self.opener.run_command("explorer", &[&path_str]).await
         } else {
-            self.opener.run_command("xdg-open", &[&path_str]).await
+            self.open_linux_path(path).await
         }
     }
 
     async fn try_linux_terminal(&self, path: &str) -> Result<(), ShellError> {
-        let terminals = [
-            "gnome-terminal",
-            "konsole",
-            "xfce4-terminal",
-            "x-terminal-emulator",
-            "terminator",
-        ];
-        for term in &terminals {
+        let candidates = linux_terminal_candidates(path);
+        let mut last_error: Option<ShellError> = None;
+
+        for (term, args) in candidates {
             if self.opener.is_tool_available(term) {
-                let args: Vec<&str> = match *term {
-                    "gnome-terminal" => vec!["--working-directory", path],
-                    "konsole" => vec!["--workdir", path],
-                    _ => vec!["--working-directory", path],
-                };
-                return self.opener.run_command(term, &args).await;
+                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                match self.opener.run_command(term, &arg_refs).await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => last_error = Some(error),
+                }
             }
         }
-        Err(ShellError::ToolNotInstalled("terminal emulator".to_owned()))
+
+        Err(last_error.unwrap_or_else(|| ShellError::ToolNotInstalled("terminal emulator".to_owned())))
     }
+
+    async fn open_linux_path(&self, path: &Path) -> Result<(), ShellError> {
+        let path_str = path.to_string_lossy();
+
+        if self.opener.open_detached(&path_str).is_ok() {
+            return Ok(());
+        }
+
+        let mut last_error: Option<ShellError> = None;
+        for (program, args) in linux_file_manager_candidates(&path_str) {
+            if !self.opener.is_tool_available(program) {
+                continue;
+            }
+
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            match self.opener.run_command(program, &arg_refs).await {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+        }
+
+        Err(last_error
+            .unwrap_or_else(|| ShellError::ToolNotInstalled("Linux file manager opener".to_owned())))
+    }
+}
+
+fn linux_file_manager_candidates(path: &str) -> Vec<(&'static str, Vec<String>)> {
+    vec![
+        ("xdg-open", vec![path.to_owned()]),
+        ("gio", vec!["open".to_owned(), path.to_owned()]),
+        ("kde-open", vec![path.to_owned()]),
+        ("kde-open5", vec![path.to_owned()]),
+        ("exo-open", vec![path.to_owned()]),
+    ]
+}
+
+fn linux_terminal_candidates(path: &str) -> Vec<(&'static str, Vec<String>)> {
+    let shell_cd = "cd \"$1\" && exec \"${SHELL:-sh}\" -l";
+
+    vec![
+        (
+            "gnome-terminal",
+            vec!["--working-directory".to_owned(), path.to_owned()],
+        ),
+        (
+            "kgx",
+            vec!["--working-directory".to_owned(), path.to_owned()],
+        ),
+        ("konsole", vec!["--workdir".to_owned(), path.to_owned()]),
+        (
+            "xfce4-terminal",
+            vec!["--working-directory".to_owned(), path.to_owned()],
+        ),
+        (
+            "mate-terminal",
+            vec!["--working-directory".to_owned(), path.to_owned()],
+        ),
+        (
+            "terminator",
+            vec!["--working-directory".to_owned(), path.to_owned()],
+        ),
+        (
+            "tilix",
+            vec!["--working-directory".to_owned(), path.to_owned()],
+        ),
+        ("kitty", vec!["--directory".to_owned(), path.to_owned()]),
+        (
+            "wezterm",
+            vec!["start".to_owned(), "--cwd".to_owned(), path.to_owned()],
+        ),
+        (
+            "alacritty",
+            vec!["--working-directory".to_owned(), path.to_owned()],
+        ),
+        (
+            "x-terminal-emulator",
+            vec![
+                "-e".to_owned(),
+                "sh".to_owned(),
+                "-lc".to_owned(),
+                shell_cd.to_owned(),
+                "sh".to_owned(),
+                path.to_owned(),
+            ],
+        ),
+        (
+            "xterm",
+            vec![
+                "-e".to_owned(),
+                "sh".to_owned(),
+                "-lc".to_owned(),
+                shell_cd.to_owned(),
+                "sh".to_owned(),
+                path.to_owned(),
+            ],
+        ),
+    ]
 }
 
 fn validate_file_exists(file_path: &str) -> Result<std::path::PathBuf, ShellError> {
@@ -431,5 +524,53 @@ mod tests {
             .open_folder_with(file_path.to_str().unwrap(), ToolType::Explorer)
             .await;
         assert!(matches!(result, Err(ShellError::DirectoryNotFound(_))));
+    }
+
+    #[test]
+    fn linux_file_manager_candidates_include_common_fallbacks() {
+        let candidates = linux_file_manager_candidates("/tmp/project");
+        let programs: Vec<&str> = candidates.iter().map(|(program, _)| *program).collect();
+
+        for expected in ["xdg-open", "gio", "kde-open", "exo-open"] {
+            assert!(
+                programs.contains(&expected),
+                "missing file manager candidate {expected}"
+            );
+        }
+
+        assert!(
+            candidates
+                .iter()
+                .any(|(program, args)| *program == "gio" && args == &vec!["open".to_owned(), "/tmp/project".to_owned()]),
+            "gio fallback must use the open subcommand"
+        );
+    }
+
+    #[test]
+    fn linux_terminal_candidates_cover_common_desktops_and_generic_fallbacks() {
+        let candidates = linux_terminal_candidates("/tmp/project");
+        let programs: Vec<&str> = candidates.iter().map(|(program, _)| *program).collect();
+
+        for expected in [
+            "gnome-terminal",
+            "kgx",
+            "konsole",
+            "xfce4-terminal",
+            "kitty",
+            "wezterm",
+            "x-terminal-emulator",
+            "xterm",
+        ] {
+            assert!(
+                programs.contains(&expected),
+                "missing terminal candidate {expected}"
+            );
+        }
+
+        assert!(
+            candidates.iter().any(|(program, args)| *program == "x-terminal-emulator"
+                && args.iter().any(|arg| arg == "/tmp/project")),
+            "generic terminal fallback should carry the working directory as a discrete argv"
+        );
     }
 }

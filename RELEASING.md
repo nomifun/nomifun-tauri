@@ -107,12 +107,26 @@ Use this order for every desktop release.
 
 4. **Build Linux on Linux** if that platform is part of the release.
 
+   Prepare the native Linux packaging dependencies first:
+
+   ```bash
+   sudo apt-get install -y pkg-config libgbm-dev libayatana-appindicator3-dev librsvg2-dev
+   ```
+
+   `build:linux` preflights the `gbm`, AppIndicator, and `librsvg-2.0`
+   `pkg-config` entries and sets `APPIMAGE_EXTRACT_AND_RUN=1` so linuxdeploy can
+   run on builders without FUSE2.
+
    ```bash
    export TAURI_SIGNING_PRIVATE_KEY="$(cat apps/desktop/signing/nomifun-updater.key)"
    export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
    bun run build:linux --config apps/desktop/tauri.updater.conf.json
    bun run make:latest
    ```
+
+   Linux uploads include `.AppImage`, `.deb`, and `.rpm`, but the updater
+   manifest should point at the `.AppImage`. `make:latest` applies that
+   preference explicitly when several signed Linux bundles exist.
 
 5. **Merge `latest.json` before publishing.** `bun run make:latest` preserves
    existing real platform entries and fills the entries for the current build

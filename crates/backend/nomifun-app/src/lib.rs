@@ -18,7 +18,7 @@ pub mod commands;
 pub mod desktop;
 pub mod mcp_endpoints;
 
-pub use config::{AppConfig, derive_encryption_key};
+pub use config::{AppConfig, derive_encryption_key, load_or_create_data_encryption_key};
 pub use desktop::{DesktopKeepAlive, DesktopServer, WebUiStatus};
 pub use nomifun_auth::AuthPolicy;
 // Re-export the build channel so in-process hosts (the Tauri desktop shell)

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -577,7 +578,7 @@ pub async fn list_builtin_auto_skills(
 
 /// Built-in skill → (audience_tags, scenario_tags) seed map, loaded from the
 /// embedded `skill-tags.json`. Graceful: missing/malformed → empty map.
-pub fn load_builtin_skill_tags() -> std::collections::HashMap<String, (Vec<String>, Vec<String>)> {
+pub fn load_builtin_skill_tags() -> HashMap<String, (Vec<String>, Vec<String>)> {
     #[derive(serde::Deserialize)]
     struct Entry {
         name: String,
@@ -593,13 +594,59 @@ pub fn load_builtin_skill_tags() -> std::collections::HashMap<String, (Vec<Strin
     }
     let bytes = match BUILTIN_SKILLS.get_file("skill-tags.json") {
         Some(f) => f.contents(),
-        None => return std::collections::HashMap::new(),
+        None => return HashMap::new(),
     };
     let manifest: Manifest = serde_json::from_slice(bytes).unwrap_or_default();
     manifest
         .skills
         .into_iter()
         .map(|e| (e.name, (e.audience_tags, e.scenario_tags)))
+        .collect()
+}
+
+/// Built-in skill display metadata for localized UI surfaces. This lives beside
+/// the tag seed so the Skills Hub can localize descriptions without changing the
+/// executable `SKILL.md` files that agents read.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BuiltinSkillDisplayMetadata {
+    pub name_i18n: HashMap<String, String>,
+    pub description_i18n: HashMap<String, String>,
+}
+
+pub fn load_builtin_skill_display_metadata() -> HashMap<String, BuiltinSkillDisplayMetadata> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        name: String,
+        #[serde(default)]
+        name_i18n: HashMap<String, String>,
+        #[serde(default)]
+        description_i18n: HashMap<String, String>,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct Manifest {
+        #[serde(default)]
+        skills: Vec<Entry>,
+    }
+    let bytes = match BUILTIN_SKILLS.get_file("skill-tags.json") {
+        Some(f) => f.contents(),
+        None => return HashMap::new(),
+    };
+    let manifest: Manifest = serde_json::from_slice(bytes).unwrap_or_default();
+    manifest
+        .skills
+        .into_iter()
+        .filter_map(|e| {
+            if e.name_i18n.is_empty() && e.description_i18n.is_empty() {
+                return None;
+            }
+            Some((
+                e.name,
+                BuiltinSkillDisplayMetadata {
+                    name_i18n: e.name_i18n,
+                    description_i18n: e.description_i18n,
+                },
+            ))
+        })
         .collect()
 }
 
@@ -1848,6 +1895,22 @@ mod tests {
         assert!(!m.is_empty());
         let mermaid = m.get("mermaid").expect("mermaid seeded");
         assert!(mermaid.1.iter().any(|s| s == "dataviz"));
+    }
+
+    #[tokio::test]
+    async fn load_builtin_skill_display_metadata_has_known_entries() {
+        let m = super::load_builtin_skill_display_metadata();
+        let mermaid = m.get("mermaid").expect("mermaid display metadata seeded");
+        assert_eq!(
+            mermaid.name_i18n.get("zh-CN").map(String::as_str),
+            Some("mermaid")
+        );
+        assert!(
+            mermaid
+                .description_i18n
+                .get("zh-CN")
+                .is_some_and(|desc| desc.contains("流程图"))
+        );
     }
 
     // -----------------------------------------------------------------------

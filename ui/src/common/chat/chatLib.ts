@@ -10,7 +10,7 @@ import type {
   ToolCallContentItem,
   ToolCallUpdate,
 } from '@/common/types/platform/acpTypes';
-import type { IResponseMessage } from '../adapter/ipcBridge';
+import type { IKnowledgeWritebackEvent, IResponseMessage } from '../adapter/ipcBridge';
 import { uuid } from '../utils';
 import { optionalDisplayText, toDisplayText } from './displayText';
 
@@ -116,6 +116,43 @@ export type CronMessageMeta = {
   triggered_at: number;
 };
 
+export type KnowledgeWritebackStatus =
+  | 'started'
+  | 'extracting'
+  | 'writing'
+  | 'written'
+  | 'partial'
+  | 'failed'
+  | 'no_candidate'
+  | 'no_completer'
+  | 'disabled'
+  | 'interrupted';
+
+export type KnowledgeWritebackFile = {
+  kb_id?: string | null;
+  rel_path?: string | null;
+  staged?: boolean;
+};
+
+export type KnowledgeWritebackFailure = {
+  kb_id?: string | null;
+  rel_path?: string | null;
+  error?: string;
+};
+
+export type KnowledgeWritebackState = {
+  status: KnowledgeWritebackStatus;
+  attempt_id?: string;
+  started_at?: number;
+  updated_at?: number;
+  finished_at?: number | null;
+  retryable?: boolean;
+  candidates?: number;
+  written?: KnowledgeWritebackFile[];
+  failures?: KnowledgeWritebackFailure[];
+  interrupted_at?: number;
+};
+
 export type IMessageText = IMessage<
   'text',
   {
@@ -128,6 +165,8 @@ export type IMessageText = IMessage<
     senderAgentType?: string;
     /** Sender teammate's conversation id — lets the renderer resolve preset avatars via their conversation extras. */
     senderConversationId?: number;
+    /** Turn-final knowledge write-back state, rendered under the assistant message. */
+    knowledge_writeback?: KnowledgeWritebackState;
   }
 >;
 
@@ -292,6 +331,7 @@ type ResponseTextData = {
   content: unknown;
   replace?: boolean;
   cronMeta?: CronMessageMeta;
+  knowledge_writeback?: unknown;
   teammate_message?: unknown;
   sender_name?: unknown;
   sender_backend?: unknown;
@@ -300,6 +340,79 @@ type ResponseTextData = {
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const KNOWLEDGE_WRITEBACK_STATUSES = new Set<KnowledgeWritebackStatus>([
+  'started',
+  'extracting',
+  'writing',
+  'written',
+  'partial',
+  'failed',
+  'no_candidate',
+  'no_completer',
+  'disabled',
+  'interrupted',
+]);
+
+const normalizeKnowledgeWritebackFiles = (value: unknown): KnowledgeWritebackFile[] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+  return value
+    .filter(isObject)
+    .map((file) => ({
+      ...(typeof file.kb_id === 'string' || file.kb_id === null ? { kb_id: file.kb_id } : {}),
+      ...(typeof file.rel_path === 'string' || file.rel_path === null ? { rel_path: file.rel_path } : {}),
+      ...(typeof file.staged === 'boolean' ? { staged: file.staged } : {}),
+    }));
+};
+
+const normalizeKnowledgeWritebackFailures = (value: unknown): KnowledgeWritebackFailure[] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+  return value
+    .filter(isObject)
+    .map((failure) => ({
+      ...(typeof failure.kb_id === 'string' || failure.kb_id === null ? { kb_id: failure.kb_id } : {}),
+      ...(typeof failure.rel_path === 'string' || failure.rel_path === null ? { rel_path: failure.rel_path } : {}),
+      ...(typeof failure.error === 'string' ? { error: failure.error } : {}),
+    }));
+};
+
+export const normalizeKnowledgeWritebackState = (value: unknown): KnowledgeWritebackState | undefined => {
+  if (!isObject(value) || typeof value.status !== 'string') return undefined;
+  if (!KNOWLEDGE_WRITEBACK_STATUSES.has(value.status as KnowledgeWritebackStatus)) return undefined;
+  const written = normalizeKnowledgeWritebackFiles(value.written);
+  const failures = normalizeKnowledgeWritebackFailures(value.failures);
+  return {
+    status: value.status as KnowledgeWritebackStatus,
+    ...(typeof value.attempt_id === 'string' ? { attempt_id: value.attempt_id } : {}),
+    ...(typeof value.started_at === 'number' ? { started_at: value.started_at } : {}),
+    ...(typeof value.updated_at === 'number' ? { updated_at: value.updated_at } : {}),
+    ...(typeof value.finished_at === 'number' || value.finished_at === null ? { finished_at: value.finished_at } : {}),
+    ...(typeof value.retryable === 'boolean' ? { retryable: value.retryable } : {}),
+    ...(typeof value.candidates === 'number' ? { candidates: value.candidates } : {}),
+    ...(written ? { written } : {}),
+    ...(failures ? { failures } : {}),
+    ...(typeof value.interrupted_at === 'number' ? { interrupted_at: value.interrupted_at } : {}),
+  };
+};
+
+const knowledgeWritebackTime = (state: KnowledgeWritebackState | undefined): number | undefined => {
+  if (!state) return undefined;
+  return state.updated_at ?? state.finished_at ?? state.interrupted_at ?? state.started_at;
+};
+
+const preferKnowledgeWritebackState = (
+  existing: KnowledgeWritebackState | undefined,
+  incoming: KnowledgeWritebackState | undefined
+): KnowledgeWritebackState | undefined => {
+  if (!existing) return incoming;
+  if (!incoming) return existing;
+  const existingTime = knowledgeWritebackTime(existing);
+  const incomingTime = knowledgeWritebackTime(incoming);
+  if (existingTime === undefined && incomingTime === undefined) return incoming;
+  if (existingTime === undefined) return incoming;
+  if (incomingTime === undefined) return existing;
+  return incomingTime >= existingTime ? incoming : existing;
+};
 
 const isResponseTextData = (data: unknown): data is ResponseTextData =>
   typeof data === 'object' &&
@@ -314,26 +427,44 @@ export const mergeTextMessageContent = (
   existing: IMessageText['content'],
   incoming: IMessageText['content']
 ): IMessageText['content'] => {
-  const { replace: _existingReplace, ...existingRest } = existing;
-  const { replace: incomingReplace, ...incomingRest } = incoming;
+  const { replace: _existingReplace, knowledge_writeback: existingWriteback, ...existingRest } = existing;
+  const { replace: incomingReplace, knowledge_writeback: incomingWriteback, ...incomingRest } = incoming;
+  const knowledgeWriteback = preferKnowledgeWritebackState(existingWriteback, incomingWriteback);
 
   return {
     ...existingRest,
     ...incomingRest,
     content: incomingReplace ? incoming.content : existing.content + incoming.content,
     ...(incomingReplace ? { replace: true } : {}),
+    ...(knowledgeWriteback ? { knowledge_writeback: knowledgeWriteback } : {}),
   };
 };
 
 export const preferTextMessageVersion = (primary: IMessageText, secondary: IMessageText): IMessageText => {
   const primaryIsReplace = isTextContentReplacement(primary.content);
   const secondaryIsReplace = isTextContentReplacement(secondary.content);
+  const mergePreferredWriteback = (preferred: IMessageText, fallback: IMessageText): IMessageText => {
+    const knowledgeWriteback = preferKnowledgeWritebackState(
+      fallback.content.knowledge_writeback,
+      preferred.content.knowledge_writeback
+    );
+    if (!knowledgeWriteback) return preferred;
+    return {
+      ...preferred,
+      content: {
+        ...preferred.content,
+        knowledge_writeback: knowledgeWriteback,
+      },
+    };
+  };
 
   if (primaryIsReplace !== secondaryIsReplace) {
-    return primaryIsReplace ? primary : secondary;
+    return primaryIsReplace ? mergePreferredWriteback(primary, secondary) : mergePreferredWriteback(secondary, primary);
   }
 
-  return secondary.content.content.length > primary.content.content.length ? secondary : primary;
+  return secondary.content.content.length > primary.content.content.length
+    ? mergePreferredWriteback(secondary, primary)
+    : mergePreferredWriteback(primary, secondary);
 };
 
 export type IMessagePlan = IMessage<
@@ -793,6 +924,7 @@ export const transformMessage = (message: IResponseMessage): TMessage | undefine
       const data = message.data;
       const isRichData = isResponseTextData(data);
       const shouldReplace = message.replace === true || (isRichData && data.replace === true);
+      const persistedWriteback = isRichData ? normalizeKnowledgeWritebackState(data.knowledge_writeback) : undefined;
       return {
         id: uuid(),
         type: 'text',
@@ -805,6 +937,7 @@ export const transformMessage = (message: IResponseMessage): TMessage | undefine
               content: toDisplayText(data.content),
               cronMeta: data.cronMeta,
               ...(shouldReplace ? { replace: true } : {}),
+              ...(persistedWriteback ? { knowledge_writeback: persistedWriteback } : {}),
               ...(data.teammate_message ? { teammateMessage: true } : {}),
               ...(typeof data.sender_name === 'string' ? { senderName: data.sender_name } : {}),
               ...(typeof data.sender_backend === 'string' ? { senderAgentType: data.sender_backend } : {}),
@@ -935,6 +1068,33 @@ export const transformMessage = (message: IResponseMessage): TMessage | undefine
       return undefined;
     }
   }
+};
+
+export const transformKnowledgeWritebackEvent = (event: IKnowledgeWritebackEvent): IMessageText | undefined => {
+  if (!event.msg_id) return undefined;
+  const conversationId = Number(event.conversation_id);
+  if (!Number.isFinite(conversationId)) return undefined;
+  return {
+    id: uuid(),
+    type: 'text',
+    msg_id: event.msg_id,
+    position: 'left',
+    conversation_id: conversationId,
+    content: {
+      content: '',
+      knowledge_writeback: {
+        status: event.status,
+        attempt_id: event.attempt_id,
+        started_at: event.started_at,
+        updated_at: event.updated_at,
+        finished_at: event.finished_at,
+        retryable: event.retryable,
+        candidates: event.candidates,
+        written: event.written,
+        failures: event.failures,
+      },
+    },
+  };
 };
 
 /**

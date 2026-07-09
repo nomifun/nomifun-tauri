@@ -105,8 +105,8 @@ const SkillsHubSettings: React.FC<SkillsHubSettingsProps> = ({ withWrapper = tru
   }, [fetchData]);
 
   const filteredSkills = useMemo(() => {
-    return filterSkillsByTags(availableSkills, search_query, tagFilter);
-  }, [availableSkills, search_query, tagFilter]);
+    return filterSkillsByTags(availableSkills, search_query, tagFilter, localeKey);
+  }, [availableSkills, search_query, tagFilter, localeKey]);
 
   // Self-heal the tag filter against the current vocabulary: dropping a tag in
   // the management modal must not leave a stale key invisibly constraining a

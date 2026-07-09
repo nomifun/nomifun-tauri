@@ -60,7 +60,6 @@ use nomifun_webhook::WebhookRouterState;
 
 use nomifun_secret::SecretRouterState;
 
-use crate::config::derive_encryption_key;
 use crate::services::AppServices;
 
 /// All module-level router states bundled into a single struct.
@@ -182,7 +181,7 @@ pub async fn build_module_states(services: &AppServices) -> (ModuleStates, Chann
 
     let pool = services.database.pool().clone();
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool));
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = services.encryption_key;
     let agent_service = AgentService::new(
         services.agent_registry.clone(),
         provider_repo,
@@ -298,7 +297,7 @@ pub fn build_assistant_state(services: &AppServices, extension_registry: Extensi
 
 /// Build the default `SystemRouterState` from application services.
 pub fn build_system_state(services: &AppServices) -> SystemRouterState {
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = services.encryption_key;
     let pool = services.database.pool().clone();
     let provider_repo = Arc::new(SqliteProviderRepository::new(pool.clone()));
 
@@ -404,7 +403,7 @@ pub fn build_conversation_state(
 
 /// Build the default `RemoteAgentRouterState` from application services.
 pub fn build_remote_agent_state(services: &AppServices) -> RemoteAgentRouterState {
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = services.encryption_key;
     let pool = services.database.pool().clone();
     let repo = Arc::new(SqliteRemoteAgentRepository::new(pool));
     RemoteAgentRouterState {
@@ -628,7 +627,7 @@ pub async fn build_channel_state(
 ) -> (ChannelRouterState, ChannelOrchestratorComponents) {
     let pool = services.database.pool().clone();
     let repo: Arc<dyn nomifun_db::IChannelRepository> = Arc::new(nomifun_db::SqliteChannelRepository::new(pool));
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = services.encryption_key;
 
     let (message_tx, message_rx) = tokio::sync::mpsc::channel(256);
     let (confirm_tx, confirm_rx) = tokio::sync::mpsc::channel(256);
@@ -1382,7 +1381,7 @@ pub fn build_orchestrator_state(
     // `tests/orchestrator_run_e2e.rs`. Selecting a real lead from the run's fleet
     // snapshot (members already carry provider+model) is a natural follow-up.
     let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(pool));
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = services.encryption_key;
     let lead = nomifun_common::ProviderWithModel {
         provider_id: String::new(),
         model: String::new(),
@@ -1446,19 +1445,19 @@ pub fn build_orchestrator_state(
 /// **P3-X2**: build the `SecretRouterState` (browser-use credential CRUD).
 /// The service holds the app data dir (去 per-pet 键化: browser identity globally
 /// shared — one vault under `{data_dir}/browser-secrets/shared`) + the machine-bound
-/// `encryption_key` (`derive_encryption_key`, the same `[u8; 32]` the session/factory
+/// `encryption_key` (the same persistent `[u8; 32]` the session/factory
 /// side uses to build the `SecretStore`), so a secret registered here decrypts in a session.
 pub fn build_secret_state(services: &AppServices) -> SecretRouterState {
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = services.encryption_key;
     let service = nomifun_secret::SecretService::new(services.data_dir.clone(), encryption_key);
     SecretRouterState::new(service)
 }
 
 /// Build the `IdmmRouterState` (the IDMM supervisor manager + service). Shares
 /// the caller's `ConversationService` / conversation repo / terminal driver so
-/// IDMM supervises the same live sessions AutoWork + the UI drive. Constructs a
-/// fresh provider repo + client-preferences repo + encryption key from the pool
-/// (matching the per-builder pattern used elsewhere in this module).
+/// IDMM supervises the same live sessions AutoWork + the UI drive. Constructs
+/// fresh provider/client-preference repos from the pool, while reusing the
+/// process-wide persistent data-encryption key from [`AppServices`].
 pub fn build_idmm_state(
     services: &AppServices,
     conv_service: ConversationService,
@@ -1470,7 +1469,7 @@ pub fn build_idmm_state(
     let client_prefs: Arc<dyn nomifun_db::IClientPreferenceRepository> =
         Arc::new(SqliteClientPreferenceRepository::new(pool.clone()));
     let records: Arc<dyn IIdmmInterventionRepository> = Arc::new(SqliteIdmmInterventionRepository::new(pool));
-    let encryption_key = derive_encryption_key(&services.jwt_secret_raw);
+    let encryption_key = services.encryption_key;
 
     // The sidecar's one-shot completions run against a backup provider; use the
     // data dir as the (unused-for-supervision) workspace root.

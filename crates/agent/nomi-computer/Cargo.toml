@@ -32,6 +32,7 @@ open.workspace   = true
 # status + prompt via AXIsProcessTrusted(WithOptions) and CG*ScreenCaptureAccess.
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
+dispatch2 = "0.3"
 
 # Windows: correct absolute mouse actuation across the whole virtual desktop
 # (enigo 0.6's Coordinate::Abs normalizes against the PRIMARY monitor only and

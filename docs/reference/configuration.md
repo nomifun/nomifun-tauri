@@ -111,7 +111,8 @@ Source: [`crates/backend/nomifun-common/src/constants.rs`](../../crates/backend/
 
 The change-password flow rotates the JWT secret as a side effect, invalidating every existing session.
 
-The same secret is also used to derive an encryption key (`derive_encryption_key`) for at-rest encryption of secrets stored in the database (provider keys, MCP OAuth tokens, etc.).
+At-rest encryption uses a separate persistent key stored at `<data-dir>/encryption_key`.
+On older installs where that file does not exist yet, startup seeds it from the currently resolved JWT secret so existing encrypted fields remain readable. After that first seed, changing the password or rotating the JWT secret does not change the data-encryption key.
 
 ## TLS / HTTPS cookie handling
 

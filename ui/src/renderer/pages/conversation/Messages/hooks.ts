@@ -11,8 +11,10 @@ import {
   composeMessage,
   mergeAcpToolCallContent,
   mergeTextMessageContent,
+  normalizeKnowledgeWritebackState,
   normalizeAgentStreamError,
   preferTextMessageVersion,
+  transformKnowledgeWritebackEvent,
 } from '@/common/chat/chatLib';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { createContext } from '@renderer/utils/ui/createContext';
@@ -123,6 +125,28 @@ function composeMessageWithIndex(message: TMessage | undefined, list: TMessage[]
     return list || [];
   }
 
+  if (message.type === 'text' && message.content.knowledge_writeback && message.msg_id) {
+    const existingIdx = index.msgIdIndex.get(message.msg_id);
+    if (existingIdx !== undefined && existingIdx < list.length) {
+      const existingMsg = list[existingIdx];
+      if (existingMsg.type === 'text') {
+        const newList = list.slice();
+        newList[existingIdx] = {
+          ...existingMsg,
+          content: {
+            ...mergeTextMessageContent(existingMsg.content, message.content),
+            content: existingMsg.content.content,
+          },
+        };
+        return newList;
+      }
+    }
+
+    const newIdx = list.length;
+    index.msgIdIndex.set(message.msg_id, newIdx);
+    return list.concat(message);
+  }
+
   if (!list?.length) {
     // Update index when adding first message
     const msgIndexKey = getMessageIndexKey(message);
@@ -217,6 +241,20 @@ function composeMessageWithIndex(message: TMessage | undefined, list: TMessage[]
     if (existingIdx !== undefined && existingIdx < list.length) {
       const existingMsg = list[existingIdx];
       if (existingMsg.type === 'text') {
+        const existingIsWritebackOnly =
+          existingMsg.position === 'left' &&
+          existingMsg.content.content.length === 0 &&
+          Boolean(existingMsg.content.knowledge_writeback);
+        if (existingIsWritebackOnly && message.position === 'left') {
+          const newList = list.slice();
+          newList[existingIdx] = {
+            ...existingMsg,
+            ...message,
+            id: existingMsg.id,
+            content: mergeTextMessageContent(existingMsg.content, message.content),
+          };
+          return newList;
+        }
         // User messages (right position) are complete — skip if already exists to prevent duplicates
         if (message.position === 'right') {
           return list;
@@ -427,6 +465,20 @@ export const useAddOrUpdateMessage = () => {
   );
 };
 
+export const useKnowledgeWritebackEvents = (conversationId: number | undefined) => {
+  const addOrUpdateMessage = useAddOrUpdateMessage();
+
+  useEffect(() => {
+    if (!conversationId) return;
+    return ipcBridge.conversation.knowledgeWriteback.on((event) => {
+      if (conversationId !== Number(event.conversation_id)) {
+        return;
+      }
+      addOrUpdateMessage(transformKnowledgeWritebackEvent(event));
+    });
+  }, [conversationId, addOrUpdateMessage]);
+};
+
 export const useRemoveMessageByMsgId = () => {
   const update = useUpdateMessageList();
 
@@ -607,10 +659,12 @@ export function normalizeDbMessage(msg: TMessage): TMessage {
   try {
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     if (typeof parsed.content !== 'string') return msg;
+    const knowledgeWriteback = normalizeKnowledgeWritebackState(parsed.knowledge_writeback);
     return {
       ...msg,
       content: {
         content: parsed.content as string,
+        ...(knowledgeWriteback ? { knowledge_writeback: knowledgeWriteback } : {}),
         ...(parsed.teammate_message ? { teammateMessage: true } : {}),
         ...(parsed.sender_name ? { senderName: parsed.sender_name as string } : {}),
         ...(parsed.sender_backend ? { senderAgentType: parsed.sender_backend as string } : {}),
@@ -812,4 +866,10 @@ export const useMessageLstCache = (key: number, opts?: { windowed?: boolean }) =
   return { loadOlder, hasMore, loadingOlder };
 };
 
-export { MessageListLoadingProvider, MessageListProvider, useMessageList, useMessageListLoading, useUpdateMessageList };
+export {
+  MessageListLoadingProvider,
+  MessageListProvider,
+  useMessageList,
+  useMessageListLoading,
+  useUpdateMessageList,
+};

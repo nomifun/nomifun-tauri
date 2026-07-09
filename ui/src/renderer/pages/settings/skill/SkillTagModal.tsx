@@ -16,9 +16,11 @@ import type { SkillInfo } from '@/renderer/pages/settings/AssistantSettings/type
 import type { ArcoMessageInstance } from '@/renderer/utils/ui/useArcoMessage';
 // Shared tag UI — reused verbatim from the assistant page so both surfaces
 // share one chip language and one vocabulary.
-import AssistantTagPicker from '@/renderer/pages/settings/AssistantSettings/AssistantTagPicker';
+import AssistantTagPicker, {
+  type AssistantTagPickerHandle,
+} from '@/renderer/pages/settings/AssistantSettings/AssistantTagPicker';
 import { Button, Modal } from '@arco-design/web-react';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 type SkillTagModalProps = {
@@ -49,27 +51,43 @@ const SkillTagModal: React.FC<SkillTagModalProps> = ({
   const [audience, setAudience] = useState<string[]>([]);
   const [scenario, setScenario] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
+  const audiencePickerRef = useRef<AssistantTagPickerHandle>(null);
+  const scenarioPickerRef = useRef<AssistantTagPickerHandle>(null);
 
   // Re-seed local selection whenever a new skill opens.
   useEffect(() => {
     if (visible && skill) {
       setAudience(skill.audience_tags ?? []);
       setScenario(skill.scenario_tags ?? []);
+      audiencePickerRef.current?.resetPendingTag();
+      scenarioPickerRef.current?.resetPendingTag();
     }
   }, [visible, skill]);
+
+  const handleClose = () => {
+    audiencePickerRef.current?.resetPendingTag();
+    scenarioPickerRef.current?.resetPendingTag();
+    onClose();
+  };
 
   const handleSave = async () => {
     if (!skill || saving) return;
     setSaving(true);
     try {
+      const [nextAudience, nextScenario] = await Promise.all([
+        audiencePickerRef.current?.flushPendingTag() ?? Promise.resolve(audience),
+        scenarioPickerRef.current?.flushPendingTag() ?? Promise.resolve(scenario),
+      ]);
+      setAudience(nextAudience);
+      setScenario(nextScenario);
       await ipcBridge.fs.setSkillTags.invoke({
         skill_name: skill.name,
-        audience_tags: audience,
-        scenario_tags: scenario,
+        audience_tags: nextAudience,
+        scenario_tags: nextScenario,
       });
       message.success(t('settings.skillsHub.tagsSaved', { defaultValue: 'Tags saved' }));
       onSaved();
-      onClose();
+      handleClose();
     } catch (error) {
       console.error('Failed to save skill tags:', error);
       message.error(t('settings.skillsHub.tagsSaveFailed', { defaultValue: 'Failed to save tags' }));
@@ -81,7 +99,7 @@ const SkillTagModal: React.FC<SkillTagModalProps> = ({
   return (
     <Modal
       visible={visible}
-      onCancel={onClose}
+      onCancel={handleClose}
       title={
         <div className='flex items-center gap-8px min-w-0'>
           <span className='text-12px font-normal text-[var(--color-text-3)] flex-shrink-0'>
@@ -96,7 +114,7 @@ const SkillTagModal: React.FC<SkillTagModalProps> = ({
       maskClosable={!saving}
       footer={
         <div className='flex items-center justify-end gap-10px'>
-          <Button onClick={onClose} disabled={saving}>
+          <Button onClick={handleClose} disabled={saving}>
             {t('common.cancel', { defaultValue: 'Cancel' })}
           </Button>
           <Button type='primary' loading={saving} onClick={() => void handleSave()} data-testid='btn-save-skill-tags'>
@@ -113,6 +131,7 @@ const SkillTagModal: React.FC<SkillTagModalProps> = ({
       </p>
       <div className='flex flex-col gap-18px'>
         <AssistantTagPicker
+          ref={audiencePickerRef}
           dimension='audience'
           label={t('settings.assistantTagAudience', { defaultValue: 'Audience' })}
           tags={audienceTags}
@@ -121,8 +140,10 @@ const SkillTagModal: React.FC<SkillTagModalProps> = ({
           onCreateTag={onCreateTag}
           localeKey={localeKey}
           readOnly={false}
+          commitOnBlur
         />
         <AssistantTagPicker
+          ref={scenarioPickerRef}
           dimension='scenario'
           label={t('settings.assistantTagScenario', { defaultValue: 'Skill Scenario' })}
           tags={scenarioTags}
@@ -131,6 +152,7 @@ const SkillTagModal: React.FC<SkillTagModalProps> = ({
           onCreateTag={onCreateTag}
           localeKey={localeKey}
           readOnly={false}
+          commitOnBlur
         />
       </div>
     </Modal>

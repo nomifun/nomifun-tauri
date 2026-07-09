@@ -163,9 +163,7 @@ pub async fn create_router(services: &AppServices) -> Router {
             // resolves, firewall allowlist derived from registered allowed_origins, 裁决⑤).
             // PKG-1: pass the bundled Chrome dir so packaged builds prefer it over download.
             nomifun_gateway::browser_registry::BrowserRegistry::default_for_browser_use()
-                .with_secret_key(crate::config::derive_encryption_key(
-                    &services.jwt_secret_raw,
-                ))
+                .with_secret_key(services.encryption_key)
                 .with_bundled_dir(crate::commands::bundled_chrome_dir()),
         ),
         // Computer-use: one shared desktop ComputerTool (no per-companion
@@ -553,7 +551,7 @@ pub fn create_router_with_all_state(
         let login_state = crate::router::browser_login::BrowserLoginState::new(
             browser_data_dir,
             crate::commands::bundled_chrome_dir(),
-            crate::config::derive_encryption_key(&services.jwt_secret_raw),
+            services.encryption_key,
         );
         Router::new()
             .route(

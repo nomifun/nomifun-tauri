@@ -15,10 +15,10 @@ use nomifun_api_types::{AgentErrorCode, ConversationRuntimeSummary, WebSocketMes
 use nomifun_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
 
 use crate::service::ConversationService;
-use nomifun_db::IConversationRepository;
+use nomifun_db::{IConversationRepository, MessageRowUpdate};
 use nomifun_db::models::MessageRow;
 use nomifun_realtime::EventBroadcaster;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::{broadcast, oneshot};
 use tracing::{debug, error, info, warn};
 
@@ -69,6 +69,10 @@ pub struct RelayOutcome {
     /// turn-final knowledge write-back after the relay has persisted the text and
     /// completed the turn.
     pub final_text: Option<String>,
+    /// Message id of the visible text row that should own turn-final
+    /// post-processing UI state. This may differ from the turn's primary msg_id
+    /// when the turn starts with thinking/tool output before final text.
+    pub final_text_msg_id: Option<String>,
 }
 
 fn turn_writeback_status_label(status: nomifun_knowledge::TurnWritebackStatus) -> &'static str {
@@ -82,9 +86,142 @@ fn turn_writeback_status_label(status: nomifun_knowledge::TurnWritebackStatus) -
     }
 }
 
-pub(crate) fn spawn_turn_writeback_report(
+fn turn_writeback_phase_label(phase: nomifun_knowledge::TurnWritebackPhase) -> &'static str {
+    match phase {
+        nomifun_knowledge::TurnWritebackPhase::Extracting => "extracting",
+        nomifun_knowledge::TurnWritebackPhase::Writing => "writing",
+    }
+}
+
+fn turn_writeback_retryable(status: nomifun_knowledge::TurnWritebackStatus) -> bool {
+    matches!(
+        status,
+        nomifun_knowledge::TurnWritebackStatus::NoCompleter
+            | nomifun_knowledge::TurnWritebackStatus::Partial
+            | nomifun_knowledge::TurnWritebackStatus::Failed
+    )
+}
+
+fn turn_writeback_running_state(status: &str, attempt_id: &str, started_at: i64, updated_at: i64) -> Value {
+    json!({
+        "status": status,
+        "attempt_id": attempt_id,
+        "started_at": started_at,
+        "updated_at": updated_at,
+        "finished_at": Value::Null,
+        "retryable": false,
+        "candidates": 0,
+        "written": [],
+        "failures": [],
+    })
+}
+
+fn turn_writeback_final_state(
+    report: &nomifun_knowledge::TurnWritebackReport,
+    status: &str,
+    attempt_id: &str,
+    started_at: i64,
+    finished_at: i64,
+) -> Value {
+    json!({
+        "status": status,
+        "attempt_id": attempt_id,
+        "started_at": started_at,
+        "updated_at": finished_at,
+        "finished_at": finished_at,
+        "retryable": turn_writeback_retryable(report.status),
+        "candidates": report.candidates,
+        "written": report.written.iter().map(|w| json!({
+            "kb_id": w.kb_id.clone(),
+            "rel_path": w.final_rel_path.clone(),
+            "staged": w.staged,
+        })).collect::<Vec<_>>(),
+        "failures": report.failures.iter().map(|f| json!({
+            "kb_id": f.kb_id.clone(),
+            "rel_path": f.rel_path.clone(),
+            "error": f.error.clone(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn turn_writeback_event_payload(conversation_id: &str, msg_id: &str, state: &Value) -> Value {
+    let mut payload = state.clone();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("conversation_id".to_owned(), json!(conversation_id));
+        obj.insert("msg_id".to_owned(), json!(msg_id));
+    }
+    payload
+}
+
+async fn persist_turn_writeback_state(
+    repo: &Arc<dyn IConversationRepository>,
+    conversation_id: &str,
+    msg_id: &str,
+    state: &Value,
+) {
+    let Ok(conv_id) = conversation_id.parse::<i64>() else {
+        debug!(conversation_id, msg_id, "skip writeback state persist for non-numeric conversation id");
+        return;
+    };
+    let row = match repo.get_message(conv_id, msg_id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            debug!(conversation_id, msg_id, "skip writeback state persist; assistant message row not found");
+            return;
+        }
+        Err(e) => {
+            warn!(
+                conversation_id,
+                msg_id,
+                error = %ErrorChain(&e),
+                "failed to load assistant message for writeback state"
+            );
+            return;
+        }
+    };
+
+    let mut content: Value =
+        serde_json::from_str(&row.content).unwrap_or_else(|_| json!({ "content": row.content }));
+    if !content.is_object() {
+        content = json!({ "content": content });
+    }
+    if let Some(obj) = content.as_object_mut() {
+        obj.insert("knowledge_writeback".to_owned(), state.clone());
+    }
+
+    let update = MessageRowUpdate {
+        content: Some(content.to_string()),
+        status: None,
+        hidden: None,
+    };
+    if let Err(e) = repo.update_message(&row.id, &update).await {
+        warn!(
+            conversation_id,
+            msg_id,
+            error = %ErrorChain(&e),
+            "failed to persist assistant message writeback state"
+        );
+    }
+}
+
+async fn emit_turn_writeback_state(
+    repo: &Arc<dyn IConversationRepository>,
+    broadcaster: &Arc<dyn EventBroadcaster>,
+    conversation_id: &str,
+    msg_id: &str,
+    state: Value,
+) {
+    persist_turn_writeback_state(repo, conversation_id, msg_id, &state).await;
+    broadcaster.broadcast(WebSocketMessage::new(
+        "knowledge.writeback",
+        turn_writeback_event_payload(conversation_id, msg_id, &state),
+    ));
+}
+
+pub(crate) async fn run_turn_writeback_report(
     service: Arc<nomifun_knowledge::KnowledgeService>,
     mut request: nomifun_knowledge::TurnWritebackRequest,
+    repo: Arc<dyn IConversationRepository>,
     broadcaster: Arc<dyn EventBroadcaster>,
     conversation_id: String,
     msg_id: String,
@@ -93,58 +230,84 @@ pub(crate) fn spawn_turn_writeback_report(
     if final_text.trim().is_empty() {
         return;
     }
-    tokio::spawn(async move {
-        request.assistant_text = final_text;
-        let report = service.finalize_turn_writeback(request).await;
-        let status = turn_writeback_status_label(report.status);
-        let payload = json!({
-            "conversation_id": conversation_id,
-            "msg_id": msg_id,
-            "status": status,
-            "candidates": report.candidates,
-            "written": report.written.iter().map(|w| json!({
-                "kb_id": w.kb_id,
-                "rel_path": w.final_rel_path,
-                "staged": w.staged,
-            })).collect::<Vec<_>>(),
-            "failures": report.failures.iter().map(|f| json!({
-                "kb_id": f.kb_id,
-                "rel_path": f.rel_path,
-                "error": f.error,
-            })).collect::<Vec<_>>(),
-        });
-        match report.status {
-            nomifun_knowledge::TurnWritebackStatus::Written
-            | nomifun_knowledge::TurnWritebackStatus::Partial => {
-                info!(
-                    conversation_id = %conversation_id,
-                    msg_id = %msg_id,
-                    candidates = report.candidates,
-                    written = report.written.len(),
-                    failures = report.failures.len(),
-                    "turn-final knowledge write-back completed"
-                );
+    request.assistant_text = final_text;
+    let started_at = now_ms();
+    let attempt_id = format!("{msg_id}:{started_at}");
+    emit_turn_writeback_state(
+        &repo,
+        &broadcaster,
+        &conversation_id,
+        &msg_id,
+        turn_writeback_running_state("started", &attempt_id, started_at, started_at),
+    )
+    .await;
+
+    let progress_repo = Arc::clone(&repo);
+    let progress_broadcaster = Arc::clone(&broadcaster);
+    let progress_conversation_id = conversation_id.clone();
+    let progress_msg_id = msg_id.clone();
+    let progress_attempt_id = attempt_id.clone();
+    let report = service
+        .finalize_turn_writeback_with_progress(request, move |phase| {
+            let repo = Arc::clone(&progress_repo);
+            let broadcaster = Arc::clone(&progress_broadcaster);
+            let conversation_id = progress_conversation_id.clone();
+            let msg_id = progress_msg_id.clone();
+            let attempt_id = progress_attempt_id.clone();
+            let status = turn_writeback_phase_label(phase);
+            async move {
+                let updated_at = now_ms();
+                emit_turn_writeback_state(
+                    &repo,
+                    &broadcaster,
+                    &conversation_id,
+                    &msg_id,
+                    turn_writeback_running_state(status, &attempt_id, started_at, updated_at),
+                )
+                .await;
             }
-            nomifun_knowledge::TurnWritebackStatus::Failed => {
-                warn!(
-                    conversation_id = %conversation_id,
-                    msg_id = %msg_id,
-                    candidates = report.candidates,
-                    failures = report.failures.len(),
-                    "turn-final knowledge write-back failed"
-                );
-            }
-            other => {
-                debug!(
-                    conversation_id = %conversation_id,
-                    msg_id = %msg_id,
-                    status = ?other,
-                    "turn-final knowledge write-back skipped"
-                );
-            }
+        })
+        .await;
+    let status = turn_writeback_status_label(report.status);
+    match report.status {
+        nomifun_knowledge::TurnWritebackStatus::Written
+        | nomifun_knowledge::TurnWritebackStatus::Partial => {
+            info!(
+                conversation_id = %conversation_id,
+                msg_id = %msg_id,
+                candidates = report.candidates,
+                written = report.written.len(),
+                failures = report.failures.len(),
+                "turn-final knowledge write-back completed"
+            );
         }
-        broadcaster.broadcast(WebSocketMessage::new("knowledge.writeback", payload));
-    });
+        nomifun_knowledge::TurnWritebackStatus::Failed => {
+            warn!(
+                conversation_id = %conversation_id,
+                msg_id = %msg_id,
+                candidates = report.candidates,
+                failures = report.failures.len(),
+                "turn-final knowledge write-back failed"
+            );
+        }
+        other => {
+            debug!(
+                conversation_id = %conversation_id,
+                msg_id = %msg_id,
+                status = ?other,
+                "turn-final knowledge write-back skipped"
+            );
+        }
+    }
+    let finished_at = now_ms();
+    emit_turn_writeback_state(
+        &repo,
+        &broadcaster,
+        &conversation_id,
+        &msg_id,
+        turn_writeback_final_state(&report, status, &attempt_id, started_at, finished_at),
+    )
+    .await;
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -872,6 +1035,7 @@ impl StreamRelay {
             emitted_response,
             suppressed_error: None,
             final_text: None,
+            final_text_msg_id: None,
         };
         let status = match event {
             AgentStreamEvent::Error(_) => "error",
@@ -888,6 +1052,9 @@ impl StreamRelay {
 
             if let Some(primary_segment) = text_segments.first() {
                 if processed.message != text || hidden {
+                    if !hidden {
+                        outcome.final_text_msg_id = Some(primary_segment.id.clone());
+                    }
                     let content = json!({ "content": final_text }).to_string();
                     let update = nomifun_db::MessageRowUpdate {
                         content: Some(content),
@@ -911,6 +1078,7 @@ impl StreamRelay {
                         self.send_final_text_override(&segment.id, "", true);
                     }
                 } else {
+                    outcome.final_text_msg_id = text_segments.last().map(|segment| segment.id.clone());
                     for segment in text_segments {
                         let status_update = nomifun_db::MessageRowUpdate {
                             content: None,
@@ -934,6 +1102,7 @@ impl StreamRelay {
                     hidden: false,
                     created_at: now_ms(),
                 };
+                outcome.final_text_msg_id = Some(row.id.clone());
                 if let Err(e) = self.repo.insert_message(&row).await {
                     error!(error = %ErrorChain(&e), "Failed to create final fallback message");
                 }
@@ -2235,7 +2404,7 @@ mod tests {
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
 
-        relay.consume(rx).await;
+        let outcome = relay.consume(rx).await;
 
         let inserts = repo.take_inserts();
         let thinking_msgs: Vec<_> = inserts.iter().filter(|msg| msg.r#type == "thinking").collect();
@@ -2263,6 +2432,11 @@ mod tests {
         assert_eq!(thinking_done_ids, vec!["asst-1".to_string()]);
         assert_eq!(text_msg_ids.len(), 1);
         assert_ne!(text_msg_ids[0], "asst-1");
+        assert_eq!(
+            outcome.final_text_msg_id.as_deref(),
+            Some(text_msg_ids[0].as_str()),
+            "turn-final post-processing should target the final assistant text segment, not the thinking segment"
+        );
     }
 
     #[tokio::test]

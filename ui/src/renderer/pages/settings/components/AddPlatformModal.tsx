@@ -1,4 +1,4 @@
-import type { IProvider } from '@/common/config/storage';
+import type { IProvider, ModelTask } from '@/common/config/storage';
 import type { ProtocolDetectionResponse, ProtocolType } from '@/common/utils/protocolDetector';
 import { ipcBridge } from '@/common';
 import { prefixedId } from '@/common/utils';
@@ -7,11 +7,12 @@ import { platformHasNoModelsEndpoint } from '@/common/utils/platformConstants';
 import { isGoogleApisHost } from '@/common/utils/urlValidation';
 import ModalHOC from '@/renderer/utils/ui/ModalHOC';
 import { copyText } from '@/renderer/utils/ui/clipboard';
-import { Button, Form, Input, Popover, Select, Switch } from '@arco-design/web-react';
+import { Button, Checkbox, Form, Input, Popover, Select, Switch } from '@arco-design/web-react';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 import { LinkCloud, Edit, Search, Loading, Info, Copy } from '@icon-park/react';
 import React, { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { mutate as mutateSWR } from 'swr';
 import useModeModeList from '@renderer/hooks/agent/useModeModeList';
 import useProtocolDetection from '@renderer/hooks/system/useProtocolDetection';
 import NomiModal from '@/renderer/components/base/NomiModal';
@@ -28,6 +29,8 @@ import {
 } from '@/renderer/utils/model/modelPlatforms';
 import type { DeepLinkAddProviderDetail } from '@/renderer/hooks/system/useDeepLink';
 import { ContextLimitSelect } from './ContextLimitSelect';
+import { MODEL_PROFILES_SWR_KEY } from '@renderer/hooks/agent/useModelProfiles';
+import { buildModelProfileUpsertRequest, MODEL_TASK_ORDER } from '@renderer/hooks/agent/modelProfileEditing';
 
 /**
  * 预设供应商的 API 地址示例（用于 base_url 旁的 tips 弹层）
@@ -236,7 +239,7 @@ const renderPlatformOption = (platform: PlatformConfig, t?: (key: string) => str
 };
 
 const AddPlatformModal = ModalHOC<{
-  onSubmit: (platform: IProvider) => void;
+  onSubmit: (platform: IProvider) => void | Promise<void>;
   deepLinkData?: DeepLinkAddProviderDetail;
 }>(({ modalProps, onSubmit, modalCtrl, deepLinkData }) => {
   const [message, messageContext] = useArcoMessage();
@@ -267,6 +270,8 @@ const AddPlatformModal = ModalHOC<{
 
   // new-api 每模型协议选择状态 / new-api per-model protocol selection state
   const [modelProtocol, setModelProtocol] = useState<string>('openai');
+  const [tasks, setTasks] = useState<ModelTask[]>([]);
+  const [visionInput, setVisionInput] = useState(false);
   const [isFullUrl, setIsFullUrl] = useState(false);
   // 用户已忽略的 base_url 自动修复建议 / base_url auto-fix suggestion the user dismissed
   const [dismissedFixUrl, setDismissedFixUrl] = useState<string | null>(null);
@@ -290,6 +295,11 @@ const AddPlatformModal = ModalHOC<{
       setModelProtocol(detectNewApiProtocol(modelValue));
     }
   }, [modelValue, isNewApi]);
+
+  const taskOptions = useMemo(
+    () => MODEL_TASK_ORDER.map((v) => ({ label: t(`settings.modelTask.${v}`), value: v })),
+    [t]
+  );
 
   // 计算实际使用的 base_url（优先使用用户输入，否则使用平台预设）
   // Calculate actual base_url (prefer user input, fallback to platform preset)
@@ -353,6 +363,8 @@ const AddPlatformModal = ModalHOC<{
       protocolDetection.reset();
       setLastDetectionInput(null); // 重置检测记录 / Reset detection record
       setModelProtocol('openai'); // 重置协议选择 / Reset protocol selection
+      setTasks([]);
+      setVisionInput(false);
       setIsFullUrl(false);
       setDismissedFixUrl(null); // 重置 base_url 修复建议 / Reset base_url fix suggestion
 
@@ -469,7 +481,21 @@ const AddPlatformModal = ModalHOC<{
           provider.model_protocols = { [values.model]: modelProtocol };
         }
 
-        onSubmit(provider);
+        setIsSaving(true);
+        await onSubmit(provider);
+        if (values.model) {
+          const selectedTraits = tasks.includes('chat') && visionInput ? (['vision_input'] as const) : [];
+          try {
+            await ipcBridge.modelProfile.upsert.invoke({
+              ...buildModelProfileUpsertRequest(provider.id, values.model, tasks, [...selectedTraits]),
+            });
+            void mutateSWR(MODEL_PROFILES_SWR_KEY);
+          } catch (error) {
+            console.error('model profile upsert failed', error);
+            message.warning(t('settings.saveModelConfigFailed', { defaultValue: '模型能力保存失败' }));
+            return;
+          }
+        }
         modalCtrl.close();
       })
       .catch(() => {
@@ -519,6 +545,8 @@ const AddPlatformModal = ModalHOC<{
                 const plat = MODEL_PLATFORMS.find((p) => p.value === value);
                 if (plat) {
                   form.setFieldValue('model', '');
+                  setTasks([]);
+                  setVisionInput(false);
                   // 预填模型供应商名称：预设平台用其展示名，自定义裸选项留空待用户填写。
                   // 这样用户在新增时即可命名供应商，便于在 Nomi 中归类（尤其聚合平台）。
                   // Prefill provider name: preset platforms use their display name,
@@ -815,6 +843,10 @@ const AddPlatformModal = ModalHOC<{
               loading={!isFullUrl && modelListState.isLoading}
               showSearch
               allowCreate
+              onChange={() => {
+                setTasks([]);
+                setVisionInput(false);
+              }}
               suffixIcon={
                 isFullUrl ? undefined : (
                   <Search
@@ -892,6 +924,34 @@ const AddPlatformModal = ModalHOC<{
               options={isFullUrl ? [] : modelListState.data?.models || []}
             />
           </Form.Item>
+
+          {/* 模态能力 / Model modality */}
+          <Form.Item
+            label={t('settings.modelModality')}
+            field={'model_modality'}
+            extra={<span className='text-11px text-t-secondary'>{t('settings.modelModalityTip')}</span>}
+          >
+            <Select
+              mode='multiple'
+              value={tasks}
+              onChange={(value: ModelTask[]) => {
+                const next = value ?? [];
+                setTasks(next);
+                if (!next.includes('chat')) setVisionInput(false);
+              }}
+              options={taskOptions}
+              placeholder={t('settings.modelModality')}
+              triggerProps={{ getPopupContainer: () => document.body }}
+            />
+          </Form.Item>
+
+          {tasks.includes('chat') && (
+            <div className='-mt-6px mb-12px'>
+              <Checkbox checked={visionInput} onChange={setVisionInput} className='!pl-0'>
+                <span className='text-12px text-t-secondary'>{t('settings.modelVisionInput')}</span>
+              </Checkbox>
+            </div>
+          )}
 
           {/* 上下文窗口 / Context window */}
           <Form.Item
