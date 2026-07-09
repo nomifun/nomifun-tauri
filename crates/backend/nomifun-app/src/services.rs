@@ -692,7 +692,7 @@ impl AppServices {
             ))
                 as Arc<dyn nomifun_db::IClientPreferenceRepository>),
             // System settings repo: lets the nomi factory read the app UI language
-            // live per build so companion-owned sessions reply in the app's
+            // live per build so every nomi session thinks and replies in the app's
             // language instead of the old hardcoded Chinese (mirrors client_prefs).
             settings_repo: Some(Arc::new(nomifun_db::SqliteSettingsRepository::new(
                 database.pool().clone(),

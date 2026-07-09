@@ -193,17 +193,18 @@ pub(super) async fn build(
         overrides.agent_cluster_mode,
     );
 
-    // Companion-owned sessions (local 桌面伙伴 chat + IM channel master) — AND
-    // 对外伙伴 (public agent) sessions — must reply in the app's UI language, not a
-    // hardcoded one. The persona prompt no longer forces a language, so it is
-    // decided HERE from the live system setting and appended LAST (first turn
-    // follows the system language). Regular chat / ACP sessions are untouched.
-    if overrides.companion
-        || overrides.channel_platform.is_some()
-        || public_agent_id.is_some()
+    // Every nomi (local-model) session — regular desktop chat, companion, IM
+    // channel master, and 对外伙伴 (public agent) — must think AND reply in the
+    // app's UI language, not a hardcoded one. The persona prompt no longer forces
+    // a language, so it is decided HERE from the live system setting and appended
+    // LAST (so it wins over the English base prompt / any earlier persisted
+    // language line, and the first turn follows the system language). Read live
+    // per build → switching the language takes effect on the next new session.
+    // External ACP/openclaw agents own their own prompts (built elsewhere) and
+    // are intentionally unaffected.
     {
         let lang = read_app_language(deps.settings_repo.as_ref()).await;
-        let directive = reply_language_directive(&lang);
+        let directive = output_language_directive(&lang);
         overrides.system_prompt = Some(match overrides.system_prompt.take() {
             Some(existing) => format!("{existing}\n\n{directive}"),
             None => directive.to_owned(),
@@ -651,8 +652,8 @@ async fn read_string_pref(deps: &AgentFactoryDeps, key: &str, host_default: &str
 /// `SystemSettingsResponse::default().language` in `nomifun-api-types`.
 const DEFAULT_APP_LANGUAGE: &str = "en-US";
 
-/// Normalize an arbitrary locale tag to the reply-language directive's supported
-/// axis. [`reply_language_directive`] only distinguishes `zh-CN` from everything
+/// Normalize an arbitrary locale tag to the output-language directive's supported
+/// axis. [`output_language_directive`] only distinguishes `zh-CN` from everything
 /// else, so any Chinese locale (`zh`, `zh_CN`, `zh-Hans`, `zh-Hans-CN`, …) folds
 /// to `zh-CN`; any other tag is returned normalized (→ English directive).
 fn normalize_lang(code: &str) -> String {
@@ -695,22 +696,25 @@ async fn read_app_language(settings_repo: Option<&Arc<dyn ISettingsRepository>>)
     resolve_language(persisted.as_deref(), sys_locale::get_locale().as_deref())
 }
 
-/// Map a stored app-language code to the reply-language directive appended LAST
-/// to a companion-owned system prompt. Phrased as an explicit override so it wins
-/// over any earlier (possibly persisted) language line, while still letting the
-/// owner pull the companion into another language by writing in it. Unknown /
-/// empty / en-US all resolve to English (the app default); only the supported
-/// `zh-CN` selects Chinese (supported set lives in `nomifun-system`).
-fn reply_language_directive(lang: &str) -> &'static str {
+/// Map a stored app-language code to the output-language directive appended LAST
+/// to every nomi session's system prompt. Covers BOTH the final reply and the
+/// model's reasoning / thinking, phrased as an explicit override so it wins over
+/// the English base prompt and any earlier (possibly persisted) language line,
+/// while still letting the owner pull the session into another language by
+/// writing in it. Unknown / empty / en-US all resolve to English (the app
+/// default); only the supported `zh-CN` selects Chinese (supported set lives in
+/// `nomifun-system`).
+fn output_language_directive(lang: &str) -> &'static str {
     match lang {
         "zh-CN" => {
-            "【回复语言】无论上文的指令或记忆使用何种语言，都请始终用简体中文回复主人——\
-                    除非主人主动用其他语言和你说话，或明确要求你换一种语言。"
+            "【输出语言】无论上文的指令或记忆使用何种语言，请始终用简体中文进行思考与回复\
+                    （包括你的推理/思考过程）——除非主人主动用其他语言和你说话，或明确要求你换一种语言。"
         }
         _ => {
-            "[Reply language] Regardless of the language used in the instructions or memories \
-              above, always reply to the owner in English — unless the owner writes to you in \
-              another language or explicitly asks you to switch."
+            "[Output language] Regardless of the language used in the instructions or memories \
+              above, always think and reply in English (including your reasoning / thinking \
+              process) — unless the owner writes to you in another language or explicitly asks \
+              you to switch."
         }
     }
 }
@@ -1368,7 +1372,7 @@ mod tests {
     use super::*;
     use nomifun_api_types::GuideMcpConfig;
 
-    // ----- companion reply-language directive (the 用中文 bug fix) -----
+    // ----- output-language directive (thinking + reply follow system language) -----
 
     /// Minimal mock settings repo for `read_app_language`: yields a fixed result
     /// (`Err(())` simulates a DB read failure). Mirrors the McpServerRepo mock in
@@ -1415,14 +1419,21 @@ mod tests {
     }
 
     #[test]
-    fn reply_language_directive_maps_supported_and_defaults_to_english() {
-        assert!(reply_language_directive("zh-CN").contains("简体中文"));
+    fn output_language_directive_maps_supported_and_defaults_to_english() {
+        // zh-CN steers BOTH reply and thinking to Simplified Chinese.
+        let zh = output_language_directive("zh-CN");
+        assert!(zh.contains("简体中文"));
+        assert!(zh.contains("思考"), "zh directive must cover the thinking process: {zh}");
         // en-US, unknown codes, and the empty string all resolve to English.
         for lang in ["en-US", "fr-FR", "zh-TW", ""] {
-            let d = reply_language_directive(lang);
+            let d = output_language_directive(lang);
             assert!(
                 d.contains("in English"),
                 "{lang} should map to English: {d}"
+            );
+            assert!(
+                d.contains("think"),
+                "{lang} directive must cover the thinking process: {d}"
             );
             assert!(!d.contains("简体中文"), "{lang} must not select Chinese");
         }
