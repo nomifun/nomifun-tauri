@@ -44,6 +44,14 @@ pub trait ChannelSender: Send + Sync {
         message_id: &str,
         message: UnifiedOutgoingMessage,
     ) -> Result<(), ChannelError>;
+
+    async fn send_media(
+        &self,
+        plugin_id: &str,
+        chat_id: &str,
+        media: crate::types::OutgoingMedia,
+        caption: Option<&str>,
+    ) -> Result<String, ChannelError>;
 }
 
 /// Relays agent stream events to an IM platform.
@@ -411,6 +419,7 @@ fn is_send_once_platform(platform: PluginType) -> bool {
 pub struct MessageRecorder {
     sends: std::sync::Mutex<Vec<UnifiedOutgoingMessage>>,
     edits: std::sync::Mutex<Vec<UnifiedOutgoingMessage>>,
+    media: std::sync::Mutex<Vec<crate::types::OutgoingMedia>>,
 }
 
 impl MessageRecorder {
@@ -418,6 +427,7 @@ impl MessageRecorder {
         Self {
             sends: std::sync::Mutex::new(Vec::new()),
             edits: std::sync::Mutex::new(Vec::new()),
+            media: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -427,6 +437,10 @@ impl MessageRecorder {
 
     pub fn take_edits(&self) -> Vec<UnifiedOutgoingMessage> {
         std::mem::take(&mut self.edits.lock().unwrap())
+    }
+
+    pub fn take_media(&self) -> Vec<crate::types::OutgoingMedia> {
+        std::mem::take(&mut self.media.lock().unwrap())
     }
 }
 
@@ -457,5 +471,16 @@ impl ChannelSender for MessageRecorder {
     ) -> Result<(), ChannelError> {
         self.edits.lock().unwrap().push(message);
         Ok(())
+    }
+
+    async fn send_media(
+        &self,
+        _plugin_id: &str,
+        _chat_id: &str,
+        media: crate::types::OutgoingMedia,
+        _caption: Option<&str>,
+    ) -> Result<String, ChannelError> {
+        self.media.lock().unwrap().push(media);
+        Ok("media-1".into())
     }
 }
