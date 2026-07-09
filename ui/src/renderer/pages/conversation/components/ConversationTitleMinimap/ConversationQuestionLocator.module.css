@@ -1,25 +1,28 @@
 .root {
   position: absolute;
-  left: 16px;
+  left: -18px;
   top: 50%;
   z-index: 35;
   display: flex;
-  min-width: 44px;
   align-items: center;
+  justify-content: center;
   transform: translateY(-50%);
   pointer-events: none;
 }
 
 .track {
+  --locator-dot-muted: color-mix(in srgb, var(--color-text-4) 70%, transparent);
+  --locator-dot-near: color-mix(in srgb, var(--color-text-2) 76%, rgb(var(--primary-6)) 14%);
+  --locator-dot-active: color-mix(in srgb, var(--color-text-1) 72%, rgb(var(--primary-6)) 28%);
+
   display: flex;
-  width: 32px;
   max-height: min(44vh, 220px);
   flex-direction: column;
-  align-items: flex-start;
+  align-items: center;
   justify-content: center;
-  gap: 7px;
+  gap: 5px;
   overflow-y: auto;
-  padding: 10px 0;
+  padding: 10px 4px;
   pointer-events: auto;
   scrollbar-width: none;
 }
@@ -28,12 +31,17 @@
   display: none;
 }
 
-.bar {
+.dotButton {
+  --locator-dot-size: 5px;
+  --locator-dot-color: var(--locator-dot-muted);
+  --locator-dot-opacity: 0.5;
+  --locator-dot-shadow: transparent;
+
   display: flex;
-  width: 32px;
-  height: 8px;
+  width: 22px;
+  height: 18px;
   align-items: center;
-  justify-content: flex-start;
+  justify-content: center;
   cursor: pointer;
   border: 0;
   background: transparent;
@@ -41,95 +49,128 @@
   padding: 0;
 }
 
-.barLine {
+.dot {
   display: block;
-  width: 14px;
-  height: 2px;
+  width: var(--locator-dot-size);
+  height: var(--locator-dot-size);
   border-radius: 999px;
-  background: var(--color-text-4);
-  opacity: 0.72;
+  background: var(--locator-dot-color);
+  box-shadow: 0 0 0 3px var(--locator-dot-shadow);
+  opacity: var(--locator-dot-opacity);
   transition:
-    width 0.14s cubic-bezier(0.2, 0.8, 0.2, 1),
-    background-color 0.14s ease,
-    opacity 0.14s ease;
+    width 0.16s cubic-bezier(0.2, 0.8, 0.2, 1),
+    height 0.16s cubic-bezier(0.2, 0.8, 0.2, 1),
+    background-color 0.16s ease,
+    box-shadow 0.16s ease,
+    opacity 0.16s ease,
+    transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
-.bar:hover .barLine,
-.bar:focus-visible .barLine,
-.barActive .barLine {
-  width: 28px;
-  background: var(--color-text-1);
-  opacity: 0.96;
+.dotButton[data-distance-level="2"] {
+  --locator-dot-size: 6px;
+  --locator-dot-color: color-mix(in srgb, var(--locator-dot-muted) 78%, var(--locator-dot-near) 22%);
+  --locator-dot-opacity: 0.58;
 }
 
-.bar:focus-visible .barLine {
-  box-shadow: 0 0 0 2px color-mix(in srgb, rgb(var(--primary-6)) 26%, transparent);
+.dotButton[data-distance-level="1"] {
+  --locator-dot-size: 8px;
+  --locator-dot-color: color-mix(in srgb, var(--locator-dot-muted) 46%, var(--locator-dot-near) 54%);
+  --locator-dot-opacity: 0.76;
 }
 
-.previewCard {
+.dotButton[data-distance-level="0"] {
+  --locator-dot-size: 10px;
+  --locator-dot-color: var(--locator-dot-active);
+  --locator-dot-opacity: 0.96;
+  --locator-dot-shadow: color-mix(in srgb, rgb(var(--primary-6)) 14%, transparent);
+}
+
+.dotButton:hover,
+.dotButton:focus-visible,
+.dotButton[data-hovered="true"] {
+  --locator-dot-color: var(--locator-dot-active);
+  --locator-dot-opacity: 1;
+}
+
+.dotButton:hover .dot,
+.dotButton:focus-visible .dot,
+.dotButton[data-hovered="true"] .dot {
+  transform: scale(1.12);
+}
+
+.dotButton:focus-visible .dot {
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, rgb(var(--primary-6)) 18%, transparent),
+    0 0 0 5px color-mix(in srgb, var(--color-bg-1) 88%, transparent);
+}
+
+.tooltipBubble {
   position: absolute;
-  left: 46px;
+  left: 34px;
   top: 50%;
   box-sizing: border-box;
   display: flex;
   width: max-content;
-  min-width: 260px;
-  max-width: min(520px, calc(100vw - 128px));
+  min-width: 220px;
+  max-width: min(420px, calc(100vw - 112px));
   max-height: min(180px, 46vh);
   flex-direction: column;
   gap: 6px;
   overflow: hidden;
   border: 1px solid color-mix(in srgb, var(--color-border-2) 82%, transparent);
-  border-radius: 18px;
-  background: var(--color-bg-2);
-  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.14), 0 1px 7px rgba(15, 23, 42, 0.06);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--color-bg-2) 94%, rgb(var(--primary-6)) 6%);
+  box-shadow:
+    0 14px 32px rgba(15, 23, 42, 0.14),
+    0 1px 8px rgba(15, 23, 42, 0.07);
   color: inherit;
   cursor: pointer;
   opacity: 0;
-  padding: 12px 16px;
+  padding: 10px 12px;
   pointer-events: none;
-  text-align: left;
-  transform: translate(-10px, -50%) scale(0.985);
+  text-align: start;
+  transform: translate(8px, -50%) scale(0.98);
   transform-origin: left center;
   transition:
     opacity 0.14s ease,
     transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1),
     box-shadow 0.16s ease;
-  will-change: opacity, transform;
 }
 
-.root:hover .previewCard,
-.root:focus-within .previewCard {
+.root[data-tooltip-visible="true"] .tooltipBubble,
+.tooltipBubble:focus-visible {
   opacity: 1;
   pointer-events: auto;
   transform: translate(0, -50%) scale(1);
 }
 
-.previewCard:hover,
-.previewCard:focus-visible {
-  box-shadow: 0 14px 34px rgba(15, 23, 42, 0.16), 0 2px 9px rgba(15, 23, 42, 0.07);
+.tooltipBubble:hover,
+.tooltipBubble:focus-visible {
+  box-shadow:
+    0 16px 36px rgba(15, 23, 42, 0.16),
+    0 2px 10px rgba(15, 23, 42, 0.08);
   outline: none;
 }
 
-.previewTitle {
+.tooltipTitle {
   display: -webkit-box;
   overflow: hidden;
   color: var(--color-text-1);
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 700;
-  line-height: 20px;
+  line-height: 19px;
   overflow-wrap: anywhere;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
 }
 
-.previewExcerpt {
+.tooltipExcerpt {
   display: -webkit-box;
   overflow: hidden;
   color: var(--color-text-3);
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 500;
-  line-height: 20px;
+  line-height: 18px;
   overflow-wrap: anywhere;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
@@ -146,19 +187,30 @@
     top: 46%;
   }
 
-  .previewCard {
-    padding: 10px 14px;
+  .track {
+    gap: 3px;
+    padding: 8px 4px;
+  }
+
+  .tooltipBubble {
+    padding: 9px 11px;
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .barLine,
-  .previewCard {
+  .dot,
+  .tooltipBubble {
     transition: none;
   }
 
-  .root:hover .previewCard,
-  .root:focus-within .previewCard {
+  .dotButton:hover .dot,
+  .dotButton:focus-visible .dot,
+  .dotButton[data-hovered="true"] .dot {
+    transform: none;
+  }
+
+  .root[data-tooltip-visible="true"] .tooltipBubble,
+  .tooltipBubble:focus-visible {
     transform: translate(0, -50%) scale(1);
   }
 }

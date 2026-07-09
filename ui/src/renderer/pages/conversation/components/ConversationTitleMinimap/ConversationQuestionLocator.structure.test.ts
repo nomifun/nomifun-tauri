@@ -16,12 +16,12 @@ describe('conversation question locator structure', () => {
 
     expect(locatorSource.includes("data-testid='conversation-question-locator'")).toBe(true);
     expect(locatorSource.includes('conversation_id?: number')).toBe(true);
-    expect(locatorSource.includes('if (!conversation_id || !activeItem || !previewItem) return null')).toBe(true);
+    expect(locatorSource.includes('if (!conversation_id || !activeItem) return null')).toBe(true);
     expect(messageListSource.includes('ConversationQuestionLocator')).toBe(true);
     expect(messageListSource.includes('conversationContext?.conversation_id')).toBe(true);
   });
 
-  test('uses Codex-style hover bars instead of the title search minimap panel', () => {
+  test('uses a dot rail instead of the title search minimap panel', () => {
     const locatorSource = readSource(new URL('./ConversationQuestionLocator.tsx', import.meta.url));
 
     expect(locatorSource.includes("from '@renderer/pages/conversation/Messages/hooks'")).toBe(true);
@@ -29,10 +29,13 @@ describe('conversation question locator structure', () => {
     expect(locatorSource.includes('dispatchChatMessageJump')).toBe(true);
     expect(locatorSource.includes('ConversationTitleMinimap')).toBe(false);
     expect(locatorSource.includes("data-testid='conversation-question-locator-track'")).toBe(true);
-    expect(locatorSource.includes("data-testid='conversation-question-locator-bar'")).toBe(true);
-    expect(locatorSource.includes("data-testid='conversation-question-locator-card'")).toBe(true);
+    expect(locatorSource.includes("data-testid='conversation-question-locator-dot'")).toBe(true);
+    expect(locatorSource.includes("data-distance-level={getDotDistanceLevel(index, activeIndex)}")).toBe(true);
+    expect(locatorSource.includes("data-testid='conversation-question-locator-tooltip'")).toBe(true);
     expect(locatorSource.includes('hoverIndex')).toBe(true);
     expect(locatorSource.includes('previewIndex')).toBe(true);
+    expect(locatorSource.includes('previewItem.answer')).toBe(true);
+    expect(locatorSource.includes('onBlur={() => setHoverIndex((current) => (current === index ? null : current))}')).toBe(true);
     expect(locatorSource.includes('locatorItemAria')).toBe(true);
     expect(locatorSource.includes('locatorMeta')).toBe(false);
     expect(locatorSource.includes('openSearchPanel')).toBe(false);
@@ -60,27 +63,33 @@ describe('conversation question locator structure', () => {
     expect(messageListSource.includes('var(--color-aou-')).toBe(false);
   });
 
-  test('hover bars are hidden at rest and reveal a content card by hover or keyboard focus', () => {
+  test('dot rail stays on the left edge and scales nearby active dots with theme tokens', () => {
     const cssSource = readSource(new URL('./ConversationQuestionLocator.module.css', import.meta.url));
 
     expect(cssSource.includes('.track')).toBe(true);
-    expect(cssSource.includes('.bar')).toBe(true);
-    expect(cssSource.includes('.barActive')).toBe(true);
-    expect(cssSource.includes('min-width: 44px')).toBe(true);
-    expect(cssSource.includes('width: 32px')).toBe(true);
-    expect(cssSource.includes('width: 14px')).toBe(true);
-    expect(cssSource.includes('width: 28px')).toBe(true);
-    expect(cssSource.includes('height: 2px')).toBe(true);
-    expect(cssSource.includes('left: 46px')).toBe(true);
-    expect(cssSource.includes('width: max-content')).toBe(true);
-    expect(cssSource.includes('max-width: min(520px')).toBe(true);
-    expect(cssSource.includes('padding: 12px 16px')).toBe(true);
-    expect(cssSource.includes('.previewMeta')).toBe(false);
-    expect(cssSource.includes('.root:hover .previewCard')).toBe(true);
-    expect(cssSource.includes('.root:focus-within .previewCard')).toBe(true);
-    expect(cssSource.includes('pointer-events: none')).toBe(true);
-    expect(cssSource.includes('pointer-events: auto')).toBe(true);
-    expect(cssSource.includes('opacity: 0')).toBe(true);
-    expect(cssSource.includes('box-shadow: 0 12px 30px')).toBe(true);
+    expect(cssSource.includes('.dotButton')).toBe(true);
+    expect(cssSource.includes('.dot')).toBe(true);
+    expect(cssSource.includes('left: -18px')).toBe(true);
+    expect(cssSource.includes('right:')).toBe(false);
+    expect(cssSource.includes('--locator-dot-size')).toBe(true);
+    expect(cssSource.includes('--locator-dot-size: 5px')).toBe(true);
+    expect(cssSource.includes('--locator-dot-size: 6px')).toBe(true);
+    expect(cssSource.includes('--locator-dot-size: 8px')).toBe(true);
+    expect(cssSource.includes('--locator-dot-size: 10px')).toBe(true);
+    expect(cssSource.includes('--locator-dot-color')).toBe(true);
+    expect(cssSource.includes('--locator-dot-opacity')).toBe(true);
+    expect(cssSource.includes('[data-distance-level="0"]')).toBe(true);
+    expect(cssSource.includes('[data-distance-level="1"]')).toBe(true);
+    expect(cssSource.includes('[data-distance-level="2"]')).toBe(true);
+    expect(cssSource.includes('rgb(var(--primary-6))')).toBe(true);
+    expect(cssSource.includes('color-mix(in srgb')).toBe(true);
+    expect(cssSource.includes('.tooltipBubble')).toBe(true);
+    expect(cssSource.includes('left: 34px')).toBe(true);
+    expect(cssSource.includes('transform-origin: left center')).toBe(true);
+    expect(cssSource.includes('max-width: min(420px')).toBe(true);
+    expect(cssSource.includes('.root[data-tooltip-visible="true"] .tooltipBubble')).toBe(true);
+    expect(cssSource.includes('.tooltipTitle')).toBe(true);
+    expect(cssSource.includes('.tooltipExcerpt')).toBe(true);
+    expect(cssSource.includes('.barLine')).toBe(false);
   });
 });

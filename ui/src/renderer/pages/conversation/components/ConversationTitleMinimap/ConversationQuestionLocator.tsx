@@ -31,6 +31,14 @@ export const pickActiveQuestionIndex = (questionTopOffsets: number[], anchorY: n
   return activeIndex;
 };
 
+export const getDotDistanceLevel = (index: number, activeIndex: number): 0 | 1 | 2 | 3 => {
+  const distance = Math.abs(index - activeIndex);
+  if (distance <= 0) return 0;
+  if (distance === 1) return 1;
+  if (distance === 2) return 2;
+  return 3;
+};
+
 const ConversationQuestionLocator: React.FC<ConversationQuestionLocatorProps> = ({ conversation_id }) => {
   const { t } = useTranslation();
   const list = useMessageList();
@@ -107,13 +115,14 @@ const ConversationQuestionLocator: React.FC<ConversationQuestionLocatorProps> = 
     });
   }, [conversation_id, turns]);
 
-  if (!conversation_id || !activeItem || !previewItem) return null;
+  if (!conversation_id || !activeItem) return null;
 
   return (
     <div
       ref={rootRef}
       className={styles.root}
       data-testid='conversation-question-locator'
+      data-tooltip-visible={hoverIndex !== null ? 'true' : undefined}
       onMouseLeave={() => setHoverIndex(null)}
     >
       <div
@@ -123,38 +132,42 @@ const ConversationQuestionLocator: React.FC<ConversationQuestionLocatorProps> = 
         aria-label={t('conversation.minimap.locatorAria', { defaultValue: 'Open question history' })}
       >
         {turns.map((item, index) => {
-          const isSelected = (hoverIndex ?? activeIndex) === index;
+          const isActive = activeIndex === index;
+          const isHovered = hoverIndex === index;
           return (
             <button
               key={item.messageId || item.msgId || item.index}
               type='button'
-              className={`${styles.bar} ${isSelected ? styles.barActive : ''}`}
-              data-testid='conversation-question-locator-bar'
-              data-active={isSelected ? 'true' : undefined}
-              aria-current={isSelected ? 'true' : undefined}
+              className={styles.dotButton}
+              data-testid='conversation-question-locator-dot'
+              data-active={isActive ? 'true' : undefined}
+              data-hovered={isHovered ? 'true' : undefined}
+              data-distance-level={getDotDistanceLevel(index, activeIndex)}
+              aria-current={isActive ? 'true' : undefined}
               aria-label={t('conversation.minimap.locatorItemAria', {
                 defaultValue: 'Jump to question {{index}}',
                 index: item.index,
               })}
               title={truncate(item.questionRaw || item.question, 72)}
               onClick={() => jumpToQuestion(index)}
+              onBlur={() => setHoverIndex((current) => (current === index ? null : current))}
               onFocus={() => setHoverIndex(index)}
               onMouseEnter={() => setHoverIndex(index)}
             >
-              <span className={styles.barLine} aria-hidden='true' />
+              <span className={styles.dot} aria-hidden='true' />
             </button>
           );
         })}
       </div>
       <button
         type='button'
-        className={styles.previewCard}
-        data-testid='conversation-question-locator-card'
+        className={styles.tooltipBubble}
+        data-testid='conversation-question-locator-tooltip'
         onClick={() => jumpToQuestion(previewIndex)}
       >
-        <span className={styles.previewTitle}>{truncate(previewItem.questionRaw || previewItem.question, 72)}</span>
+        <span className={styles.tooltipTitle}>{truncate(previewItem.questionRaw || previewItem.question, 72)}</span>
         {previewItem.answer ? (
-          <span className={styles.previewExcerpt}>{truncate(previewItem.answerRaw || previewItem.answer, 156)}</span>
+          <span className={styles.tooltipExcerpt}>{truncate(previewItem.answerRaw || previewItem.answer, 156)}</span>
         ) : null}
       </button>
     </div>
