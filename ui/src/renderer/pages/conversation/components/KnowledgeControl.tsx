@@ -50,6 +50,7 @@ import {
   filterKnowledgeBasesByQuery,
   shouldShowKnowledgeBaseSearch,
 } from './KnowledgeControl.utils';
+import { capabilityHeaderButtonClass, capabilityHeaderButtonStyle } from './CapabilityHeaderButton';
 
 export type KnowledgeTarget =
   | { kind: 'conversation'; id: number }
@@ -629,7 +630,8 @@ const KnowledgeControl: React.FC<KnowledgeControlProps> = ({ target, draft, disa
       shape='round'
       type='secondary'
       disabled={!!disabledReason}
-      className='shrink-0'
+      className={capabilityHeaderButtonClass(binding.enabled, 'shrink-0')}
+      style={capabilityHeaderButtonStyle(dotColor)}
     >
       <span className='inline-flex items-center gap-6px leading-none'>
         {/* Icon tinted by enabled-state (primary when mounted, gray off) — the

@@ -15,6 +15,7 @@ import { CAPABILITY_COLORS } from '@/renderer/components/capability/CapabilityIc
 import { AUTOWORK_STATUS_COLOR } from '@/renderer/components/capability/capabilityStatusColors';
 import { isLiveEventForTarget } from './liveEventMatch';
 import { useRequirementTags } from '@renderer/pages/requirements/useRequirements';
+import { capabilityHeaderButtonClass, capabilityHeaderButtonStyle } from './CapabilityHeaderButton';
 
 export interface AutoWorkTarget {
   kind: AutoWorkTargetKind;
@@ -169,7 +170,8 @@ const AutoWorkControl: React.FC<AutoWorkControlProps> = ({ target, draft, disabl
       shape='round'
       type='secondary'
       disabled={!!disabledReason}
-      className='shrink-0'
+      className={capabilityHeaderButtonClass(enabled, 'shrink-0')}
+      style={capabilityHeaderButtonStyle(dotColor)}
     >
       <span className='inline-flex items-center gap-6px leading-none'>
         <Robot

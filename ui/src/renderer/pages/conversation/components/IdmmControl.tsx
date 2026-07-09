@@ -33,6 +33,7 @@ import { applyIdmmStateToSessionCapabilities } from '@/renderer/pages/conversati
 import { useProvidersQuery } from '@renderer/hooks/agent/useModelProviderList';
 import IdmmInterventionRow from './IdmmInterventionRow';
 import { isLiveEventForTarget } from './liveEventMatch';
+import { capabilityHeaderButtonClass, capabilityHeaderButtonStyle } from './CapabilityHeaderButton';
 import {
   getWatchBackupValidationErrorKey,
   type IdmmBackupValidationKey,
@@ -1026,7 +1027,8 @@ const IdmmControl: React.FC<IdmmControlProps> = ({ target, draft, disabledReason
       shape='round'
       type='secondary'
       disabled={!!disabledReason}
-      className='shrink-0'
+      className={capabilityHeaderButtonClass(enabled, 'shrink-0')}
+      style={capabilityHeaderButtonStyle(dotColor)}
     >
       <span className='inline-flex items-center gap-6px leading-none'>
         {/* Icon tinted by run-state (same hue as the session-list IDMM icon); the

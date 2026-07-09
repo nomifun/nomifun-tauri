@@ -62,6 +62,83 @@
   }
 }
 
+/* Desktop session capability pills. Active state must read clearly across all
+   preset/custom themes, so it derives the surface and border from the current
+   capability accent instead of hard-coded light-theme colors. */
+.capability-header-btn {
+  --capability-accent: rgb(var(--primary-6));
+  position: relative !important;
+  overflow: hidden;
+  height: 30px !important;
+  border: 1px solid var(--color-border-2) !important;
+  background: color-mix(in srgb, var(--color-fill-2) 72%, var(--color-bg-1)) !important;
+  color: var(--color-text-2) !important;
+  font-weight: 500;
+  transition:
+    background-color 0.16s ease,
+    border-color 0.16s ease,
+    color 0.16s ease;
+}
+
+.capability-header-btn .arco-btn-content {
+  position: relative;
+  z-index: 1;
+}
+
+.capability-header-btn--inactive:not(.arco-btn-disabled):hover {
+  background: color-mix(in srgb, var(--capability-accent) 7%, var(--color-bg-2)) !important;
+  border-color: color-mix(in srgb, var(--capability-accent) 24%, var(--color-border-2)) !important;
+  color: var(--color-text-1) !important;
+}
+
+.capability-header-btn--active {
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--capability-accent) 24%, var(--color-bg-1)) 0%,
+      color-mix(in srgb, var(--capability-accent) 15%, var(--color-bg-2)) 100%
+    ) !important;
+  border-color: color-mix(in srgb, var(--capability-accent) 64%, var(--color-border-2)) !important;
+  color: color-mix(in srgb, var(--capability-accent) 76%, var(--color-text-1)) !important;
+  font-weight: 600;
+}
+
+.capability-header-btn--active:not(.arco-btn-disabled):hover {
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--capability-accent) 24%, var(--color-bg-1)) 0%,
+      color-mix(in srgb, var(--capability-accent) 16%, var(--color-bg-2)) 100%
+    ) !important;
+  border-color: color-mix(in srgb, var(--capability-accent) 62%, var(--color-border-2)) !important;
+}
+
+[data-theme='dark'] .capability-header-btn {
+  background: color-mix(in srgb, var(--color-bg-2) 82%, var(--color-bg-1)) !important;
+}
+
+[data-theme='dark'] .capability-header-btn--active {
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--capability-accent) 34%, var(--color-bg-2)) 0%,
+      color-mix(in srgb, var(--capability-accent) 23%, var(--color-bg-1)) 100%
+    ) !important;
+  border-color: color-mix(in srgb, var(--capability-accent) 68%, var(--color-border-2)) !important;
+}
+
+@supports not (background: color-mix(in srgb, red 10%, white)) {
+  .capability-header-btn {
+    background: var(--color-fill-2) !important;
+  }
+
+  .capability-header-btn--active {
+    background: var(--color-primary-light-1) !important;
+    border-color: rgb(var(--primary-6)) !important;
+    color: rgb(var(--primary-6)) !important;
+  }
+}
+
 /* Mobile: conversation header pills */
 @media (max-width: 767px) {
   .agent-mode-compact-pill {
