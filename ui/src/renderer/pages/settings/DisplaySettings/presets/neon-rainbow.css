@@ -126,6 +126,10 @@ body {
   --color-secondary-hover: #e6e6ee;
   --color-secondary-active: #d8d8e2;
   --color-secondary-disabled: #f6f6fa;
+  --button-primary-text: #ffffff;
+  --button-primary-disabled-bg: var(--color-fill-2);
+  --button-primary-disabled-border: var(--color-border-2);
+  --button-primary-disabled-text: var(--color-text-3);
 
   /* Semantic Colors - 语义色（成功翠、警告橙、危险红、信息青，标准语义槽） */
   --success: #16a34a;
@@ -254,6 +258,10 @@ body {
   --color-secondary-hover: rgba(255, 255, 255, 0.12);
   --color-secondary-active: rgba(255, 255, 255, 0.16);
   --color-secondary-disabled: rgba(255, 255, 255, 0.04);
+  --button-primary-text: #ffffff;
+  --button-primary-disabled-bg: var(--color-fill-3);
+  --button-primary-disabled-border: var(--color-border-3);
+  --button-primary-disabled-text: var(--color-text-2);
 
   /* Semantic Colors - 语义色（暗底上提亮，标准语义槽） */
   --success: #3ddc84;
@@ -376,18 +384,25 @@ body {
 
 /* 3. 主按钮：霓虹紫罗兰渐变 + hover 辉光（亮色压深保白字 ≥4.5:1，暗色提亮发光）；
       :not() 排除语义状态按钮，避免 danger/warning/success 被染紫 */
-.arco-btn-primary:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(.arco-btn-status-success) {
+.arco-btn-primary:not(.arco-btn-disabled):not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(
+    .arco-btn-status-success
+  ) {
   background-image: linear-gradient(135deg, #9d3ce0 0%, #7c29be 100%);
   border-color: transparent;
-  color: #ffffff;
+  color: var(--button-primary-text);
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
   transition: box-shadow 0.25s ease;
 }
-.arco-btn-primary:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(.arco-btn-status-success):hover {
+.arco-btn-primary:not(.arco-btn-disabled):not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(
+    .arco-btn-status-success
+  ):hover {
   box-shadow: 0 0 14px rgba(177, 75, 255, 0.45), 0 0 28px rgba(177, 75, 255, 0.2);
 }
 
-[data-theme='dark'] .arco-btn-primary:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(.arco-btn-status-success) {
+[data-theme='dark']
+  .arco-btn-primary:not(.arco-btn-disabled):not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(
+    .arco-btn-status-success
+  ) {
   background-image: linear-gradient(135deg, #c36dff 0%, #9a2ff0 100%);
 }
 

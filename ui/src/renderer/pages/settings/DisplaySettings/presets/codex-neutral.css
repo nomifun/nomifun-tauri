@@ -127,6 +127,10 @@ body {
   --color-secondary-hover: #e8e8e6;
   --color-secondary-active: #ddddda;
   --color-secondary-disabled: #f7f7f6;
+  --button-primary-text: #ffffff;
+  --button-primary-disabled-bg: var(--color-fill-2);
+  --button-primary-disabled-border: var(--color-border-2);
+  --button-primary-disabled-text: var(--color-text-3);
 
   /* Arco misc */
   --color-tooltip-bg: #272725;
@@ -255,6 +259,10 @@ body {
   --color-secondary-hover: rgba(255, 255, 255, 0.12);
   --color-secondary-active: rgba(255, 255, 255, 0.16);
   --color-secondary-disabled: rgba(255, 255, 255, 0.04);
+  --button-primary-text: #171717;
+  --button-primary-disabled-bg: var(--color-fill-3);
+  --button-primary-disabled-border: var(--color-border-3);
+  --button-primary-disabled-text: var(--color-text-2);
 
   /* Arco misc */
   --color-tooltip-bg: #363636;
@@ -266,17 +274,25 @@ body {
 
 /* ===== Signature touches ===== */
 
-.arco-btn-primary:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(.arco-btn-status-success) {
+.arco-btn-primary:not(.arco-btn-disabled):not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(
+    .arco-btn-status-success
+  ) {
   box-shadow: none;
+  color: var(--button-primary-text);
   transition: background-color 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
 }
 
-.arco-btn-primary:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(.arco-btn-status-success):hover {
+.arco-btn-primary:not(.arco-btn-disabled):not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(
+    .arco-btn-status-success
+  ):hover {
   box-shadow: 0 0 0 3px rgba(var(--primary-6), 0.12);
 }
 
-[data-theme='dark'] .arco-btn-primary:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(.arco-btn-status-success) {
-  color: #171717;
+[data-theme='dark']
+  .arco-btn-primary:not(.arco-btn-disabled):not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(
+    .arco-btn-status-success
+  ) {
+  color: var(--button-primary-text);
 }
 
 [data-theme='light'] .layout-sider {

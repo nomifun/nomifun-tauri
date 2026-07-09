@@ -40,9 +40,38 @@ body {
   }
 }
 
-.arco-btn-primary.arco-btn-disabled {
-  background-color: var(--aou-2) !important;
-  border-color: var(--aou-2) !important;
+.arco-btn-primary:not(.arco-btn-disabled):not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(
+    .arco-btn-status-success
+  ) {
+  color: var(--button-primary-text, #ffffff) !important;
+}
+
+.arco-btn-primary.arco-btn-disabled:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(
+    .arco-btn-status-success
+  ),
+.arco-btn-primary[disabled]:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(.arco-btn-status-success),
+.arco-btn-primary:disabled:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(.arco-btn-status-success) {
+  background-color: var(--button-primary-disabled-bg, var(--color-fill-2)) !important;
+  background-image: none !important;
+  border-color: var(--button-primary-disabled-border, var(--color-border-2)) !important;
+  color: var(--button-primary-disabled-text, var(--color-text-3)) !important;
+  opacity: 1 !important;
+  text-shadow: none !important;
+}
+
+body[arco-theme='dark']
+  .arco-btn-primary.arco-btn-disabled:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(
+    .arco-btn-status-success
+  ),
+body[arco-theme='dark']
+  .arco-btn-primary[disabled]:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(
+    .arco-btn-status-success
+  ),
+body[arco-theme='dark']
+  .arco-btn-primary:disabled:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(
+    .arco-btn-status-success
+  ) {
+  background-color: var(--button-primary-disabled-bg, var(--color-fill-3)) !important;
 }
 
 .arco-collapse {

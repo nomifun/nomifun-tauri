@@ -153,6 +153,10 @@ body {
   --color-secondary-hover: #f6e1c4;
   --color-secondary-active: #efd2ac;
   --color-secondary-disabled: #fdf5e9;
+  --button-primary-text: #ffffff;
+  --button-primary-disabled-bg: var(--color-fill-2);
+  --button-primary-disabled-border: var(--color-border-2);
+  --button-primary-disabled-text: var(--color-text-3);
 
   /* ---- B. Arco 杂项 Misc ---- */
   --color-tooltip-bg: #3a2410;
@@ -282,6 +286,10 @@ body {
   --color-secondary-hover: rgba(255, 255, 255, 0.12);
   --color-secondary-active: rgba(255, 255, 255, 0.16);
   --color-secondary-disabled: rgba(255, 255, 255, 0.04);
+  --button-primary-text: #ffffff;
+  --button-primary-disabled-bg: var(--color-fill-3);
+  --button-primary-disabled-border: var(--color-border-3);
+  --button-primary-disabled-text: var(--color-text-2);
 
   /* ---- B. Arco 杂项 Misc ---- */
   --color-tooltip-bg: #3a2410;
@@ -351,22 +359,32 @@ body {
 /* 点缀 3：主按钮 —— 金→朱一档线性渐变（金灿灿在上、红火火在下＝金朱交替；base 压得
  * 够深保白字 ≥ AA，不靠渐变浅端虚标）+ hover 双层柔辉（熔金主辉 + 一丝朱红余烬）；
  * :not() 排除语义状态按钮，避免 danger/warning/success 被染朱橙 */
-.arco-btn-primary:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(.arco-btn-status-success) {
+.arco-btn-primary:not(.arco-btn-disabled):not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(
+    .arco-btn-status-success
+  ) {
   background-image: linear-gradient(135deg, #c64518 0%, #bb3614 100%);
   border-color: transparent;
-  color: #ffffff;
+  color: var(--button-primary-text);
   transition: box-shadow 0.25s ease, background-color 0.2s ease;
 }
 
-.arco-btn-primary:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(.arco-btn-status-success):hover {
+.arco-btn-primary:not(.arco-btn-disabled):not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(
+    .arco-btn-status-success
+  ):hover {
   box-shadow: 0 6px 20px rgba(245, 178, 64, 0.4), 0 0 24px rgba(226, 82, 30, 0.22);
 }
 
-[data-theme='dark'] .arco-btn-primary:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(.arco-btn-status-success) {
+[data-theme='dark']
+  .arco-btn-primary:not(.arco-btn-disabled):not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(
+    .arco-btn-status-success
+  ) {
   background-image: linear-gradient(135deg, #c94818 0%, #bf3417 100%);
 }
 
-[data-theme='dark'] .arco-btn-primary:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(.arco-btn-status-success):hover {
+[data-theme='dark']
+  .arco-btn-primary:not(.arco-btn-disabled):not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(
+    .arco-btn-status-success
+  ):hover {
   box-shadow: 0 6px 20px rgba(245, 178, 64, 0.45), 0 0 26px rgba(255, 106, 77, 0.22);
 }
 

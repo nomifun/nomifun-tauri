@@ -130,6 +130,10 @@ body {
   --color-secondary-hover: #e6e6e8;
   --color-secondary-active: #d9d9dc;
   --color-secondary-disabled: #f7f7f8;
+  --button-primary-text: #ffffff;
+  --button-primary-disabled-bg: var(--color-fill-2);
+  --button-primary-disabled-border: var(--color-border-2);
+  --button-primary-disabled-text: var(--color-text-3);
 
   /* Semantic Colors - 语义色（info 走深青保对比度；danger 走橙红
      与主玫红拉开色相，#d4380d 白底 4.8:1） */
@@ -259,6 +263,10 @@ body {
   --color-secondary-hover: rgba(255, 255, 255, 0.12);
   --color-secondary-active: rgba(255, 255, 255, 0.16);
   --color-secondary-disabled: rgba(255, 255, 255, 0.04);
+  --button-primary-text: #ffffff;
+  --button-primary-disabled-bg: var(--color-fill-3);
+  --button-primary-disabled-border: var(--color-border-3);
+  --button-primary-disabled-text: var(--color-text-2);
 
   /* Semantic Colors - 语义色（info = 电光青） */
   --success: #2ed573;
@@ -290,10 +298,15 @@ body {
 /* 1. 主按钮：纯玫红（由 --primary-6 驱动）+ hover 微辉光，亮暗通用，
       辉光取 --primary-6 跟随各模式主色；
       :not() 排除语义状态按钮，避免 danger/warning/success 被染玫红 */
-.arco-btn-primary:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(.arco-btn-status-success) {
+.arco-btn-primary:not(.arco-btn-disabled):not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(
+    .arco-btn-status-success
+  ) {
+  color: var(--button-primary-text);
   transition: box-shadow 0.25s ease, background-color 0.2s ease;
 }
-.arco-btn-primary:not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(.arco-btn-status-success):hover {
+.arco-btn-primary:not(.arco-btn-disabled):not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(
+    .arco-btn-status-success
+  ):hover {
   box-shadow: 0 0 12px rgba(var(--primary-6), 0.45);
 }
 

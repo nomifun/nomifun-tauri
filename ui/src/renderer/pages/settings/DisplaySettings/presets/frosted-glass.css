@@ -140,6 +140,10 @@ body {
   --color-secondary-hover: rgba(108, 92, 231, 0.18);
   --color-secondary-active: rgba(108, 92, 231, 0.25);
   --color-secondary-disabled: rgba(108, 92, 231, 0.04);
+  --button-primary-text: #ffffff;
+  --button-primary-disabled-bg: var(--color-fill-2);
+  --button-primary-disabled-border: var(--color-border-2);
+  --button-primary-disabled-text: var(--color-text-3);
 
   /* ---- B. Arco 杂项 Misc ---- */
   --color-tooltip-bg: rgba(38, 35, 60, 0.92);
@@ -268,6 +272,10 @@ body {
   --color-secondary-hover: rgba(157, 140, 255, 0.2);
   --color-secondary-active: rgba(157, 140, 255, 0.28);
   --color-secondary-disabled: rgba(157, 140, 255, 0.05);
+  --button-primary-text: #ffffff;
+  --button-primary-disabled-bg: var(--color-fill-3);
+  --button-primary-disabled-border: var(--color-border-3);
+  --button-primary-disabled-text: var(--color-text-2);
 
   /* ---- B. Arco 杂项 Misc ---- */
   --color-tooltip-bg: rgba(51, 48, 78, 0.95);
