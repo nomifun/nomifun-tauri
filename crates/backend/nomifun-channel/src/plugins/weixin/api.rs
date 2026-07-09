@@ -20,11 +20,6 @@ use super::types::{
     SendMessageItem, SendMessageMsg, SendMessageRequest, SendTextItem, UPLOAD_MEDIA_TYPE_FILE, UPLOAD_MEDIA_TYPE_IMAGE,
 };
 
-/// WeChat media CDN base (AES-128-ECB encrypted blobs). Distinct host from the
-/// iLink gateway `base_url`; the `upload_param` is the pre-signed credential, so
-/// CDN requests carry NO gateway auth headers.
-const WEIXIN_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
-
 /// AES-128-ECB ciphertext size for `n` plaintext bytes (PKCS7 always pads, so a
 /// full-block plaintext still grows by one block).
 fn aes_ecb_padded_size(n: usize) -> usize {
@@ -303,14 +298,19 @@ impl WeixinApi {
             .authenticated_post("ilink/bot/getuploadurl", &upload_req, WEIXIN_API_TIMEOUT)
             .await
             .map_err(|e| ChannelError::MessageSendFailed(format!("getuploadurl failed: {e}")))?;
-        let upload_param = upload_resp
-            .upload_param
+        // The live iLink API returns a ready-to-use CDN URL (`upload_full_url`,
+        // with encrypted_query_param + filekey + taskid embedded), NOT a bare
+        // `upload_param` to reconstruct a URL from. Verified against the live
+        // gateway. `upload_param` kept only as a legacy fallback.
+        let upload_url = upload_resp
+            .upload_full_url
+            .or(upload_resp.upload_param)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| ChannelError::MessageSendFailed("getuploadurl returned no upload_param".into()))?;
+            .ok_or_else(|| ChannelError::MessageSendFailed("getuploadurl returned no upload_full_url".into()))?;
 
-        // 4. AES-128-ECB encrypt and PUT the ciphertext to the CDN.
+        // 4. AES-128-ECB encrypt and POST the ciphertext to the returned CDN URL.
         let ciphertext = aes128_ecb_pkcs7_encrypt(&bytes, &aeskey_bytes);
-        let download_param = self.upload_to_cdn(&upload_param, &filekey, ciphertext).await?;
+        let download_param = self.upload_to_cdn(&upload_url, ciphertext).await?;
 
         // 5. Build the media item and send. NOTE: `media.aes_key` is the base64 of
         //    the AES key's HEX STRING bytes (not the raw 16 bytes) — replicated
@@ -364,20 +364,15 @@ impl WeixinApi {
         Ok(())
     }
 
-    /// POST AES-encrypted `ciphertext` to the WeChat CDN and return the download
-    /// `x-encrypted-param` used to reference the file in a message. No gateway
-    /// auth — `upload_param` is itself the pre-signed credential.
-    async fn upload_to_cdn(
-        &self,
-        upload_param: &str,
-        filekey: &str,
-        ciphertext: Vec<u8>,
-    ) -> Result<String, ChannelError> {
-        let url = format!("{WEIXIN_CDN_BASE_URL}/upload");
+    /// POST AES-encrypted `ciphertext` to the CDN `upload_url` returned by
+    /// `getuploadurl` (it already carries encrypted_query_param + filekey +
+    /// taskid) and return the download `x-encrypted-param` used to reference the
+    /// file in a message. No gateway auth — the URL is itself the pre-signed
+    /// credential. Verified live: POST + octet-stream body → 200 + the header.
+    async fn upload_to_cdn(&self, upload_url: &str, ciphertext: Vec<u8>) -> Result<String, ChannelError> {
         let resp = self
             .client
-            .post(&url)
-            .query(&[("encrypted_query_param", upload_param), ("filekey", filekey)])
+            .post(upload_url)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .timeout(WEIXIN_API_TIMEOUT)
             .body(ciphertext)

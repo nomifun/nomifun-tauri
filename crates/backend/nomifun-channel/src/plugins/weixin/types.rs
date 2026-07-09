@@ -212,7 +212,12 @@ pub(crate) struct GetUploadUrlRequest {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[allow(dead_code)]
 pub(crate) struct GetUploadUrlResponse {
-    /// Encrypted param for uploading the original file.
+    /// Ready-to-use CDN upload URL (encrypted_query_param + filekey + taskid
+    /// embedded). What the live iLink gateway returns — POST the AES-encrypted
+    /// bytes straight to it.
+    #[serde(default)]
+    pub upload_full_url: Option<String>,
+    /// Legacy/fallback: a bare encrypted param (older protocol shape).
     #[serde(default)]
     pub upload_param: Option<String>,
     /// Thumbnail upload param (absent when `no_need_thumb`).
