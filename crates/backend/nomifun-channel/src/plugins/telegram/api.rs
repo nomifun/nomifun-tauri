@@ -107,6 +107,78 @@ impl TelegramApi {
             .ok_or_else(|| ChannelError::MessageSendFailed("sendMessage returned no result".into()))
     }
 
+    /// `sendPhoto` — upload raw image bytes as a photo. Returns the sent message.
+    pub async fn send_photo(
+        &self,
+        chat_id: i64,
+        bytes: Vec<u8>,
+        filename: &str,
+        mime: &str,
+        caption: Option<&str>,
+    ) -> Result<TgMessage, ChannelError> {
+        self.send_media_multipart("sendPhoto", "photo", chat_id, bytes, filename, mime, caption)
+            .await
+    }
+
+    /// `sendDocument` — upload raw bytes as a file attachment.
+    pub async fn send_document(
+        &self,
+        chat_id: i64,
+        bytes: Vec<u8>,
+        filename: &str,
+        mime: &str,
+        caption: Option<&str>,
+    ) -> Result<TgMessage, ChannelError> {
+        self.send_media_multipart("sendDocument", "document", chat_id, bytes, filename, mime, caption)
+            .await
+    }
+
+    /// Shared multipart POST for photo/document uploads.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_media_multipart(
+        &self,
+        method: &str,
+        field: &str,
+        chat_id: i64,
+        bytes: Vec<u8>,
+        filename: &str,
+        mime: &str,
+        caption: Option<&str>,
+    ) -> Result<TgMessage, ChannelError> {
+        let url = format!("{}/{method}", self.base_url);
+        debug!(chat_id, bytes = bytes.len(), method, "Uploading Telegram media");
+
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename.to_owned())
+            .mime_str(mime)
+            .map_err(|e| ChannelError::MessageSendFailed(format!("invalid media mime {mime}: {e}")))?;
+
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part(field.to_owned(), part);
+        if let Some(c) = caption {
+            form = form.text("caption", c.to_owned());
+        }
+
+        let resp: TgResponse<TgMessage> = self
+            .client
+            .post(&url)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(format!("{method} request failed: {e}")))?
+            .json()
+            .await
+            .map_err(|e| ChannelError::MessageSendFailed(format!("{method} parse failed: {e}")))?;
+
+        if !resp.ok {
+            let desc = resp.description.unwrap_or_default();
+            return Err(ChannelError::MessageSendFailed(format!("{method} failed: {desc}")));
+        }
+        resp.result
+            .ok_or_else(|| ChannelError::MessageSendFailed(format!("{method} returned no result")))
+    }
+
     /// `editMessageText` — edit an existing text message.
     pub async fn edit_message_text(&self, req: &EditMessageTextRequest) -> Result<(), ChannelError> {
         let url = format!("{}/editMessageText", self.base_url);

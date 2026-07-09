@@ -8,6 +8,7 @@ mod provider_deletion;
 mod router;
 mod services;
 mod workshop_bridge;
+mod channel_asset_resolver;
 
 // Promoted from the `nomicore` bin so in-process hosts (Tauri desktop, web)
 // can boot the backend as a library — no spawned binary.
