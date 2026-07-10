@@ -5149,6 +5149,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "nomi-execution"
+version = "0.2.14"
+dependencies = [
+ "async-trait",
+ "encoding_rs",
+ "libc",
+ "portable-pty",
+ "serde",
+ "serial_test",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "nomi-mcp"
 version = "0.2.14"
 dependencies = [

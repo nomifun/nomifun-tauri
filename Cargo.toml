@@ -46,6 +46,7 @@ nomifun-app = { path = "crates/backend/nomifun-app" }
 # --- Internal crates: shared ---
 nomifun-net = { path = "crates/shared/nomifun-net" }
 nomi-redact = { path = "crates/shared/nomi-redact" }
+nomi-execution = { path = "crates/shared/nomi-execution" }
 
 # --- Internal crates: agent (from nomifun-agent-rs, now local) ---
 nomi-types = { path = "crates/agent/nomi-types" }
@@ -80,6 +81,7 @@ futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+encoding_rs = "0.8"
 
 # --- Async / error / log ---
 async-trait = "0.1"
