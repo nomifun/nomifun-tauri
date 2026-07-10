@@ -241,7 +241,7 @@ Accepted
 
 共同不变量：任何非 hand-off spawn 在用户代码开始运行前必须成功建立 owner；建立失败则 spawn 失败，不能静默降级为无监管进程。
 
-主动取消的总 SLA 为 5 秒：最多 1 秒 graceful interrupt、最多 1 秒 terminate grace，随后 force kill 并在剩余 3 秒内 wait/reap。平台不支持某一级信号时跳过该级但不扩大总 SLA；5 秒后仍不能证明进程树消失则 operation 进入 `Lost`。
+主动取消的总 SLA 为 5 秒：最多 1 秒 graceful interrupt、最多 1 秒 terminate grace，随后 force kill 并在剩余 3 秒内 wait/reap。平台不支持某一级信号时跳过该级但不扩大总 SLA；5 秒后仍不能证明平台 owner 的 containment boundary 已清空则 operation 进入 `Lost`。
 
 ### 5.1 Windows
 
@@ -252,21 +252,34 @@ Accepted
 - ConPTY close 在可能阻塞的平台版本上由专用 cleanup worker 隔离，并受 deadline 约束；不能让 async runtime 或 UI 线程无限阻塞。
 - 所有 handle 使用 RAII，最终状态必须包含 Job/leader/descendant 的回收结果。
 
-### 5.2 Linux
+### 5.2 Unix containment boundary
+
+Unix process group 不是 Windows Job 或 Linux cgroup：后代可以主动调用 `setsid`/`setpgid` 逃离。因此 Linux/macOS 的基础 owner 只对初始 owned process group 作强保证，不能把“PGID 已清空”描述成“任意 daemonized descendant 已消失”。发现 escaped descendant（例如仍持有输出管道）或无法证明边界清空时必须返回 `Lost`；真正 hand-off 只能走未来独立 API。Linux 可在具备可信 cgroup v2 delegation 时增加更强 containment，但 macOS 普通 PGID 没有等价的不可逃逸保证。
+
+两平台共用以下协议：
+
+- 每次执行先创建一个由宿主直接拥有、正常路径可显式 reap 的 watchdog；不使用 detached/double-fork orphan。
+- watchdog 先建立宿主进程级监控并发出 `BOOT_READY`，user child 才能 fork。child 在 `pre_exec` 中建立独立 group、用 nonce 注册精确 PID/PGID，并等待 watchdog ACK；ACK 之前用户代码不得执行。
+- Rust `Command::spawn` 返回 `Ok` 后宿主必须发送 `COMMIT` 并收到 `COMMITTED` 才能交付 owner；exec 失败发送 `ABORT`，避免 watchdog 对已经由 Rust 回收的失败 child 使用旧 PGID。
+- watchdog 与 owner 之间保留 health/control channel。ACK 后 watchdog 异常退出时 owner 立即停止 group，并把终态标记为 `Lost`。
+- watchdog 观察 leader exit 后，在 leader 尚未 reap、身份仍锚定时完成最后一次 group `SIGKILL` 并退出；唯一 waiter 先 reap watchdog、关闭 signal gate，再 reap leader。leader reap 后只允许无副作用的 group existence probe，禁止再次向裸 PGID 发信号；任何不确定性都保守为 `Lost`。
+- child `pre_exec` 只调用 async-signal-safe 原语并只关闭协议明确拥有的 FD，绝不能全量关闭未知 FD（Rust 自己的 exec-error pipe 也在其中）。watchdog fork branch 则使用经过审计的 raw-syscall loop，重定向标准流并关闭全部非协议 FD。
+- `SpawnFailed` 只表示已证明用户代码没有执行且 command/watchdog/FD 均已清理；越过 ACK/exec 边界后所有权交付或清理未证明时返回 `StartLost`，禁止自动重试。
+
+### 5.3 Linux
 
 - child 成为独立 process group leader。
-- pre-exec 安装 `PR_SET_PDEATHSIG` 并关闭父进程死亡竞态。
-- `PDEATHSIG` 只覆盖直接 child，不能单独证明孙进程退出。因此 Linux adapter 同时使用独立 pidfd watchdog 监视父进程与 child group；父进程先退出时 watchdog 对整个 process group 发 `SIGKILL`。不支持 pidfd 的内核使用双重 fork 的 `kill(parent, 0)` watchdog，语义不变。
-- 停止顺序为 `SIGINT -> SIGTERM -> SIGKILL`，每步有短 grace period，最终 wait/reap。
-- 可用时用 pidfd 改善 PID reuse 与等待可靠性；不可用时以 process group + cached pid 退化，但不改变上层语义。
+- 不使用 `PR_SET_PDEATHSIG` 作为正确性条件：该原语监视创建 child 的 OS 线程，任意 Tokio worker 退出会在宿主仍健康时误杀命令。进程级 direct-child watchdog 与 ownership health channel 取代它。
+- watchdog 优先用 pidfd 监视宿主与 child identity；只有明确不支持 pidfd 时才使用包含 `/proc/<pid>/stat` start time/state 的身份校验。`/proc` 不可用或身份不可信则 fail closed，绝不退化为裸 `kill(pid, 0)`。
+- 停止顺序为 `SIGINT -> SIGTERM -> SIGKILL`，每步有短 grace period，最终按共同两阶段协议 wait/reap。
 
-### 5.3 macOS
+### 5.4 macOS
 
 - child 成为独立 process group leader。
-- 复用并下沉现有独立 kqueue watchdog；父进程先退出时由 watchdog kill 整个 child group。
+- direct-child watchdog 自行创建 kqueue，严格注册宿主与 child 的 `EVFILT_PROC | NOTE_EXIT` 后才发 READY/ACK；正常路径由 owner 显式 reap。
 - Seatbelt profile 在执行内核边界应用，所有 pipe、PTY、兼容 alias 与子 Agent 使用同一个 policy。
 - sandbox 请求若无法建立必须 fail closed；只有明确的 unrestricted local-owner policy 可以无 sandbox 执行。
-- 停止顺序与 Linux 一致，最终以 group wait/reap 证明终止。
+- 停止顺序与 Linux 一致，最终按共同两阶段协议证明 owned group 已终止。
 
 ## 6. 结构化结果与工具编排
 

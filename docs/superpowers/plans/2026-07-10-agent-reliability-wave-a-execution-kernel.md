@@ -13,8 +13,9 @@
 - `nomi-execution` lives under `crates/shared` and must not depend on `nomifun-*`, `nomi-types`, database, conversation, UI, Bun embedding, or Agent business logic.
 - Every non-hand-off process must obtain an execution owner before user code runs. Ownership setup failure is a spawn failure; there is no silent fallback.
 - Windows pipe and PTY creation must use `CREATE_SUSPENDED`, assign an execution-scoped `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` Job, then resume. Do not use the current portable-pty Windows spawn, global Job, or `taskkill` in the new kernel.
-- Linux uses an independent process group, `PR_SET_PDEATHSIG`, and a parent-death watchdog that kills the whole group; PDEATHSIG alone is not descendant proof.
-- macOS uses an independent process group and the existing double-fork + kqueue parent-death watchdog moved into the shared crate.
+- Linux uses an independent process group plus a process-level, direct-child pidfd watchdog. Do not use thread-scoped `PR_SET_PDEATHSIG` as a host-liveness condition.
+- macOS uses an independent process group plus a process-level, direct-child kqueue watchdog; do not migrate the existing detached/double-fork best-effort watcher.
+- Unix process groups contain the owned group, not arbitrary descendants that deliberately escape with `setsid`/`setpgid`. Observed escape or unproven containment is `Lost`; never claim PGID cleanup proves an arbitrary process tree is gone.
 - Cancellation SLA is fixed at 5 seconds: interrupt up to 1s, terminate up to 1s, force-kill and wait/reap in the remaining 3s. Unproven cleanup becomes `Lost`, never `Cancelled`.
 - `yield` never kills. Child exit must be surfaced within 250ms after the waiter observes it, independent of remaining yield.
 - Default output cap is 4 MiB per execution. Memory is bounded while reading, `dropped_bytes` is exact, and decoding errors are explicit.
@@ -635,6 +636,8 @@ git commit -m "feat(execution): add supervised process lifecycle"
 ### Task 4: Implement Unix pipe ownership and parent-death cleanup
 
 **Files:**
+- Modify: `docs/superpowers/specs/2026-07-10-nomifun-agent-command-reliability-design.md`
+- Modify: `docs/superpowers/plans/2026-07-10-agent-reliability-wave-a-execution-kernel.md`
 - Create: `crates/shared/nomi-execution/src/platform/unix.rs`
 - Create: `crates/shared/nomi-execution/src/platform/linux_watchdog.rs`
 - Create: `crates/shared/nomi-execution/src/platform/macos_watchdog.rs`
@@ -656,7 +659,11 @@ Tests must assert:
 - invalid executable is `SpawnFailed`;
 - `spawn-grandchild` child PID and grandchild PID are both gone after cancel;
 - parent-death harness exits without cleanup code and both descendants disappear;
-- natural exit returns within 250ms after exit observation.
+- natural exit returns within 250ms after exit observation;
+- invalid exec, withheld ACK, short registration, wrong nonce and watchdog failure terminate within one shared setup deadline without running a marker;
+- leader-first exit cleans a same-group descendant before reap, while a detectable `setsid` escape becomes `Lost` rather than a false whole-tree success;
+- rapid spawn/exit and subreaper cases leave no normal-path watchdog zombies;
+- after leader reap no negative-PGID signal can occur, including forced PGID-reuse tests.
 
 Use `libc::kill(pid, 0)` only in test helpers and always wait with a bounded condition loop.
 
@@ -670,10 +677,14 @@ Expected on Unix: failures because Unix platform spawn/watchdogs are missing.
 
 - [ ] **Step 3: Move and harden existing Unix primitives**
 
-- Move process-group setup, fd shuffle, Linux PDEATHSIG race check, macOS double-fork/kqueue watchdog, group kill, and wait logic from `nomifun-runtime/src/spawn.rs`.
-- Linux watchdog monitors both parent and child identity. Use pidfd when available; fallback double-fork watchdog repeatedly verifies the original parent PID and cached child group before group kill.
-- Every watchdog closes inherited file descriptors above stderr and exits when the child exits first.
-- `interrupt` sends SIGINT to negative pgid; `terminate` sends SIGTERM; `force_kill` sends SIGKILL. ESRCH is success only when `wait_reaped` also confirms terminal state.
+- Reuse only hardened ideas from the old runtime. Implement a direct-child watchdog with a bounded `BOOT_READY -> child registration/ACK -> COMMIT/ABORT -> COMMITTED` protocol; the watchdog is the only ACK writer, so `Command::spawn` cannot deadlock waiting on its private exec-error pipe.
+- Keep a watchdog health/control channel. ACK-before-health failure is spawn failure; ACK/exec-after-health failure is `StartLost` and triggers immediate cleanup.
+- Linux watchdog monitors the host and child identity with pidfd. Fallback is allowed only for explicit pidfd unavailability and must verify `/proc` start time/state; identity uncertainty fails closed. macOS watchdog creates and registers its own kqueue before READY/ACK.
+- Watchdog fork code is a raw async-signal-safe loop. It moves retained protocol FDs to fixed slots, redirects stdio, and closes all other inherited descriptors. User-child `pre_exec` closes only known protocol FDs and must never `close_range` unknown FDs.
+- `interrupt` sends SIGINT to negative pgid; `terminate` sends SIGTERM; `force_kill` sends SIGKILL. A single signal gate makes the state check and syscall atomic with respect to reap.
+- On leader exit, watchdog performs the final group kill while leader identity is still anchored, then exits. The sole waiter reaps watchdog, permanently closes the signal gate, reaps leader exactly once, and only probes group absence afterward. It never signals a PGID after leader reap; any remaining/ambiguous group is `Lost`.
+- `ProcessSupervisor::start` keeps its existing shape. Add stable `ExecutionError::SpawnFailed { failure }` (`spawn_failed`) and `ExecutionError::StartLost { failure, last_known, cleanup }` (`start_lost`). Invalid executable is `SpawnFailed` only after all pre-exec resources are proven clean.
+- All pipe executions are owned regardless of `allow_hand_off`. `DenyExecution` and unsupported/uninstalled sandbox requests fail before spawn; no unrestricted fallback.
 
 - [ ] **Step 4: Run Unix contracts**
 
