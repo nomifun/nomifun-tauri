@@ -6,8 +6,9 @@
 
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Button, Message, Popover, Select, Switch, Tooltip } from '@arco-design/web-react';
-import { Robot } from '@icon-park/react';
+import { useNavigate } from 'react-router-dom';
+import { Button, Message, Popover, Select, Spin, Switch, Tooltip } from '@arco-design/web-react';
+import { ListAdd, Robot } from '@icon-park/react';
 import classNames from 'classnames';
 import { ipcBridge } from '@/common';
 import type { AutoWorkRunState, AutoWorkTargetKind, IAutoWorkState } from '@/common/adapter/ipcBridge';
@@ -16,6 +17,7 @@ import { AUTOWORK_STATUS_COLOR } from '@/renderer/components/capability/capabili
 import { isLiveEventForTarget } from './liveEventMatch';
 import { useRequirementTags } from '@renderer/pages/requirements/useRequirements';
 import { capabilityHeaderButtonClass, capabilityHeaderButtonStyle } from './CapabilityHeaderButton';
+import { getAutoWorkTagPickerMode, isAutoWorkEnableBlocked } from './AutoWorkControl.model';
 
 export interface AutoWorkTarget {
   kind: AutoWorkTargetKind;
@@ -56,7 +58,9 @@ interface AutoWorkControlProps {
  */
 const AutoWorkControl: React.FC<AutoWorkControlProps> = ({ target, draft, disabledReason, safetyHint, applyNote }) => {
   const { t } = useTranslation();
-  const { tags } = useRequirementTags();
+  const navigate = useNavigate();
+  const { tags, loading: tagsLoading, error: tagsError, refresh: refreshTags } = useRequirementTags();
+  const tagPickerMode = getAutoWorkTagPickerMode(tags.length, tagsLoading, tagsError);
   const [state, setState] = useState<IAutoWorkState | null>(null);
   const [persistedTag, setPersistedTag] = useState<string | undefined>();
   const kind = target?.kind;
@@ -105,6 +109,42 @@ const AutoWorkControl: React.FC<AutoWorkControlProps> = ({ target, draft, disabl
       : t('guid.advanced.draftOff')
     : t(`requirements.autowork.state.${runState}`);
 
+  const openNewRequirement = () => navigate('/requirements?new=1');
+
+  const tagPickerFeedback =
+    tagPickerMode === 'loading' ? (
+      <div className='flex items-center justify-center gap-8px px-16px py-18px text-12px text-t-tertiary'>
+        <Spin size={16} />
+        <span>{t('requirements.autowork.loadingTags')}</span>
+      </div>
+    ) : tagPickerMode === 'error' ? (
+      <div className='flex flex-col items-center gap-6px px-16px py-16px text-center'>
+        <span className='text-13px font-500 text-t-primary'>{t('requirements.autowork.loadErrorTitle')}</span>
+        <span className='text-12px leading-16px text-t-tertiary'>
+          {t('requirements.autowork.loadErrorDescription')}
+        </span>
+        <Button size='mini' type='text' onClick={() => void refreshTags()}>
+          {t('requirements.autowork.retry')}
+        </Button>
+      </div>
+    ) : tagPickerMode === 'empty' ? (
+      <div className='flex flex-col items-center gap-8px px-14px py-16px text-center'>
+        <span
+          className='grid h-34px w-34px place-items-center rounded-full bg-fill-2 text-primary-6'
+          aria-hidden='true'
+        >
+          <ListAdd theme='outline' size='18' strokeWidth={3} />
+        </span>
+        <span className='text-13px font-500 text-t-primary'>{t('requirements.autowork.emptyTitle')}</span>
+        <span className='text-12px leading-16px text-t-tertiary'>
+          {t('requirements.autowork.emptyDescription')}
+        </span>
+        <Button size='mini' type='primary' shape='round' onClick={openNewRequirement}>
+          {t('requirements.autowork.emptyCta')}
+        </Button>
+      </div>
+    ) : null;
+
   const toggle = async (next: boolean) => {
     if (next && !tag) {
       Message.warning(t('requirements.autowork.tagRequired'));
@@ -139,6 +179,7 @@ const AutoWorkControl: React.FC<AutoWorkControlProps> = ({ target, draft, disabl
             value={tag}
             onChange={setTag}
             disabled={enabled}
+            notFoundContent={tagPickerFeedback}
             options={tags.map((tg) => ({ label: `${tg.tag} (${tg.done}/${tg.total})`, value: tg.tag }))}
             allowClear
           />
@@ -149,7 +190,11 @@ const AutoWorkControl: React.FC<AutoWorkControlProps> = ({ target, draft, disabl
           <span className='inline-block w-6px h-6px rounded-full' style={{ backgroundColor: dotColor }} />
           {statusText}
         </span>
-        <Switch checked={enabled} onChange={toggle} />
+        <Switch
+          checked={enabled}
+          disabled={isAutoWorkEnableBlocked(enabled, tagPickerMode)}
+          onChange={toggle}
+        />
       </div>
       {running && state?.completed_count != null ? (
         <div className='text-t-tertiary text-11px'>

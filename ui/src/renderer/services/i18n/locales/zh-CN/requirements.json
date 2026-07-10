@@ -101,6 +101,13 @@
     "enabledOk": "自动工作已开启",
     "disabledOk": "自动工作已关闭",
     "completedCount": "已完成：{{count}}",
+    "emptyTitle": "还没有可用标签",
+    "emptyDescription": "标签会在创建需求后自动生成。先去需求平台添加一条带标签的需求。",
+    "emptyCta": "新建需求",
+    "loadingTags": "正在加载标签",
+    "loadErrorTitle": "标签加载失败",
+    "loadErrorDescription": "请检查连接后重试。",
+    "retry": "重新加载",
     "state": {
       "off": "未开启",
       "idle": "空闲",

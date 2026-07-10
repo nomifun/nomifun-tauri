@@ -1,0 +1,16 @@
+export type AutoWorkTagPickerMode = 'loading' | 'error' | 'empty' | 'ready';
+
+export function getAutoWorkTagPickerMode(
+  tagCount: number,
+  loading: boolean,
+  error: string | null
+): AutoWorkTagPickerMode {
+  if (loading) return 'loading';
+  if (tagCount > 0) return 'ready';
+  if (error) return 'error';
+  return 'empty';
+}
+
+export function isAutoWorkEnableBlocked(enabled: boolean, mode: AutoWorkTagPickerMode): boolean {
+  return !enabled && mode !== 'ready';
+}
