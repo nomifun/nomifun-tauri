@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { getAutoWorkTagPickerMode, isAutoWorkEnableBlocked } from './AutoWorkControl.model';
+import {
+  getAutoWorkTagPickerMode,
+  isAutoWorkEnableBlocked,
+  shouldFocusAutoWorkTagPickerAction,
+} from './AutoWorkControl.model';
 
 describe('AutoWork tag picker state', () => {
   test('distinguishes loading, ready, failure, and empty results', () => {
@@ -20,5 +24,26 @@ describe('AutoWork tag picker state', () => {
     expect(isAutoWorkEnableBlocked(false, 'error')).toBe(true);
     expect(isAutoWorkEnableBlocked(false, 'empty')).toBe(true);
     expect(isAutoWorkEnableBlocked(false, 'ready')).toBe(false);
+  });
+
+  test('focuses the actionable feedback on forward Tab', () => {
+    expect(shouldFocusAutoWorkTagPickerAction('empty', 'Tab', false)).toBe(true);
+    expect(shouldFocusAutoWorkTagPickerAction('error', 'Tab', false)).toBe(true);
+  });
+
+  test('leaves forward Tab unchanged when no action is available', () => {
+    expect(shouldFocusAutoWorkTagPickerAction('loading', 'Tab', false)).toBe(false);
+    expect(shouldFocusAutoWorkTagPickerAction('ready', 'Tab', false)).toBe(false);
+  });
+
+  test('leaves non-Tab keys unchanged', () => {
+    expect(shouldFocusAutoWorkTagPickerAction('empty', 'Enter', false)).toBe(false);
+    expect(shouldFocusAutoWorkTagPickerAction('error', 'Escape', false)).toBe(false);
+  });
+
+  test('leaves Shift+Tab unchanged in every mode', () => {
+    for (const mode of ['loading', 'error', 'empty', 'ready'] as const) {
+      expect(shouldFocusAutoWorkTagPickerAction(mode, 'Tab', true)).toBe(false);
+    }
   });
 });

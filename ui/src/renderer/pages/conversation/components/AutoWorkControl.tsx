@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import { Button, Message, Popover, Select, Spin, Switch, Tooltip } from '@arco-design/web-react';
@@ -17,7 +17,11 @@ import { AUTOWORK_STATUS_COLOR } from '@/renderer/components/capability/capabili
 import { isLiveEventForTarget } from './liveEventMatch';
 import { useRequirementTags } from '@renderer/pages/requirements/useRequirements';
 import { capabilityHeaderButtonClass, capabilityHeaderButtonStyle } from './CapabilityHeaderButton';
-import { getAutoWorkTagPickerMode, isAutoWorkEnableBlocked } from './AutoWorkControl.model';
+import {
+  getAutoWorkTagPickerMode,
+  isAutoWorkEnableBlocked,
+  shouldFocusAutoWorkTagPickerAction,
+} from './AutoWorkControl.model';
 
 export interface AutoWorkTarget {
   kind: AutoWorkTargetKind;
@@ -61,6 +65,7 @@ const AutoWorkControl: React.FC<AutoWorkControlProps> = ({ target, draft, disabl
   const navigate = useNavigate();
   const { tags, loading: tagsLoading, error: tagsError, refresh: refreshTags } = useRequirementTags();
   const tagPickerMode = getAutoWorkTagPickerMode(tags.length, tagsLoading, tagsError);
+  const tagPickerActionRef = useRef<HTMLButtonElement | null>(null);
   const [state, setState] = useState<IAutoWorkState | null>(null);
   const [persistedTag, setPersistedTag] = useState<string | undefined>();
   const kind = target?.kind;
@@ -111,6 +116,23 @@ const AutoWorkControl: React.FC<AutoWorkControlProps> = ({ target, draft, disabl
 
   const openNewRequirement = () => navigate('/requirements?new=1');
 
+  const setTagPickerActionRef = (node: unknown) => {
+    tagPickerActionRef.current = node as HTMLButtonElement | null;
+  };
+
+  const handleTagPickerKeyDownCapture = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (
+      !shouldFocusAutoWorkTagPickerAction(tagPickerMode, event.key, event.shiftKey) ||
+      !tagPickerActionRef.current ||
+      tagPickerActionRef.current.contains(event.target as Node)
+    ) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    tagPickerActionRef.current?.focus();
+  };
+
   const tagPickerFeedback =
     tagPickerMode === 'loading' ? (
       <div className='flex items-center justify-center gap-8px px-16px py-18px text-12px text-t-tertiary'>
@@ -123,7 +145,7 @@ const AutoWorkControl: React.FC<AutoWorkControlProps> = ({ target, draft, disabl
         <span className='text-12px leading-16px text-t-tertiary'>
           {t('requirements.autowork.loadErrorDescription')}
         </span>
-        <Button size='mini' type='text' onClick={() => void refreshTags()}>
+        <Button ref={setTagPickerActionRef} size='mini' type='text' onClick={() => void refreshTags()}>
           {t('requirements.autowork.retry')}
         </Button>
       </div>
@@ -139,7 +161,7 @@ const AutoWorkControl: React.FC<AutoWorkControlProps> = ({ target, draft, disabl
         <span className='text-12px leading-16px text-t-tertiary'>
           {t('requirements.autowork.emptyDescription')}
         </span>
-        <Button size='mini' type='primary' shape='round' onClick={openNewRequirement}>
+        <Button ref={setTagPickerActionRef} size='mini' type='primary' shape='round' onClick={openNewRequirement}>
           {t('requirements.autowork.emptyCta')}
         </Button>
       </div>
@@ -170,7 +192,7 @@ const AutoWorkControl: React.FC<AutoWorkControlProps> = ({ target, draft, disabl
       <div className='text-t-primary text-13px font-600'>{t('requirements.autowork.label')}</div>
       <div className='text-t-tertiary text-12px leading-16px'>{t('requirements.autowork.hint')}</div>
       {safetyHint ? <div className='text-12px leading-16px text-[rgb(var(--warning-6))]'>{safetyHint}</div> : null}
-      <div className='flex flex-col gap-4px'>
+      <div className='flex flex-col gap-4px' onKeyDownCapture={handleTagPickerKeyDownCapture}>
         <span className='text-t-secondary text-12px'>{t('requirements.autowork.tagLabel')}</span>
         <Tooltip disabled={!enabled} content={t('requirements.autowork.disableToChangeTag')}>
           <Select

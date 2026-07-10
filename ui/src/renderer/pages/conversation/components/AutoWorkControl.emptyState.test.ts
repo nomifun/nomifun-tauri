@@ -34,4 +34,16 @@ describe('AutoWork tag picker empty state', () => {
     expect(keys.map((key) => zh.autowork[key] && key)).toEqual(keys);
     expect(keys.map((key) => en.autowork[key] && key)).toEqual(keys);
   });
+
+  test('captures forward Tab and focuses either actionable feedback button', () => {
+    const source = readSource(new URL('./AutoWorkControl.tsx', import.meta.url));
+
+    expect(source.includes('onKeyDownCapture={handleTagPickerKeyDownCapture}')).toBe(true);
+    expect(source.includes('event.preventDefault()')).toBe(true);
+    expect(source.includes('event.stopPropagation()')).toBe(true);
+    expect(source.includes('tagPickerActionRef.current?.focus()')).toBe(true);
+    expect(source.includes('!tagPickerActionRef.current')).toBe(true);
+    expect(source.includes('tagPickerActionRef.current.contains(event.target as Node)')).toBe(true);
+    expect(source.split('ref={setTagPickerActionRef}').length - 1).toBe(2);
+  });
 });

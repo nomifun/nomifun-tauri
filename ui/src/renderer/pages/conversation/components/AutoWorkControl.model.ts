@@ -14,3 +14,11 @@ export function getAutoWorkTagPickerMode(
 export function isAutoWorkEnableBlocked(enabled: boolean, mode: AutoWorkTagPickerMode): boolean {
   return !enabled && mode !== 'ready';
 }
+
+export function shouldFocusAutoWorkTagPickerAction(
+  mode: AutoWorkTagPickerMode,
+  key: string,
+  shiftKey: boolean
+): boolean {
+  return key === 'Tab' && !shiftKey && (mode === 'empty' || mode === 'error');
+}
