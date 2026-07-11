@@ -55,13 +55,13 @@ describe('RequirementFilters trigger', () => {
     expect(listViewSource.includes('requirements.selection.selectAllPage')).toBe(false);
   });
 
-  test('moves only the filter region upward and separates it compactly from content', () => {
+  test('moves only the filter region upward without an outer divider', () => {
     expect(workspaceSource.includes("<div className='mt-8px'>")).toBe(true);
     expect(workspaceSource.includes("<div className='mt-10px'>")).toBe(true);
     expect(
       filtersSource.includes(
         "border-b border-solid border-[var(--color-border-2)] pb-6px"
       )
-    ).toBe(true);
+    ).toBe(false);
   });
 });

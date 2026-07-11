@@ -218,7 +218,7 @@ const RequirementFilters: React.FC<RequirementFiltersProps> = ({
 
   return (
     <div className='flex flex-col gap-10px'>
-      <div className='flex flex-wrap items-center gap-8px border-b border-solid border-[var(--color-border-2)] pb-6px'>
+      <div className='flex flex-wrap items-center gap-8px'>
         <Dropdown
           droplist={tagMenu}
           trigger='click'
