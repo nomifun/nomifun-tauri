@@ -4,21 +4,17 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { describe, expect, test } from 'bun:test';
+import { expect, test } from 'bun:test';
 import cronEn from '@renderer/services/i18n/locales/en-US/cron.json';
 import cronZh from '@renderer/services/i18n/locales/zh-CN/cron.json';
 import * as scheduledTaskLayout from './scheduledTaskLayout';
 
-const { getScheduledTaskLayout } = scheduledTaskLayout;
+test('keeps responsive utility classes in JSX instead of runtime exports', () => {
+  const layout = scheduledTaskLayout as Record<string, unknown>;
 
-describe('getScheduledTaskLayout', () => {
-  test('keeps cards on mobile', () => {
-    expect(getScheduledTaskLayout(true)).toBe('card');
-  });
-
-  test('uses horizontal rows on desktop', () => {
-    expect(getScheduledTaskLayout(false)).toBe('row');
-  });
+  expect(layout.getScheduledTaskLayout).toBeUndefined();
+  expect(layout.SCHEDULED_TASK_LIST_CLASS_NAMES).toBeUndefined();
+  expect(layout.SCHEDULED_TASK_ROW_CLASS_NAMES).toBeUndefined();
 });
 
 test('defines five readable desktop columns', () => {

@@ -21,12 +21,11 @@ import { getJobAgentMeta } from './jobAgentMeta';
 import { shortSessionId } from '@renderer/utils/ui/shortId';
 import { filterCronJobsByQuery } from './cronJobSearch';
 import { parseScheduledCreateTarget } from './scheduledCreateTarget';
-import { DESKTOP_SCHEDULED_TASK_COLUMNS, getScheduledTaskLayout } from './scheduledTaskLayout';
+import { DESKTOP_SCHEDULED_TASK_COLUMNS } from './scheduledTaskLayout';
 
 const ScheduledTasksPage: React.FC = () => {
   const layout = useLayoutContext();
   const isMobile = layout?.isMobile ?? false;
-  const taskLayout = getScheduledTaskLayout(isMobile);
   const { t } = useTranslation();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -177,10 +176,10 @@ const ScheduledTasksPage: React.FC = () => {
               })}
             />
           </div>
-        ) : taskLayout === 'row' ? (
-          <div className='w-full overflow-hidden rounded-12px border border-solid border-[var(--color-border-2)] bg-fill-1'>
+        ) : (
+          <div className='w-full'>
             <div
-              className='grid items-center gap-16px border-b border-b-solid border-b-[var(--color-border-2)] bg-fill-2 px-18px py-10px text-12px font-medium leading-18px text-t-tertiary'
+              className='hidden items-center gap-16px rounded-t-12px border border-solid border-[var(--color-border-2)] bg-fill-2 px-18px py-10px text-12px font-medium leading-18px text-t-tertiary md:grid'
               style={{ gridTemplateColumns: DESKTOP_SCHEDULED_TASK_COLUMNS }}
             >
               <span>{t('cron.page.list.task')}</span>
@@ -190,7 +189,7 @@ const ScheduledTasksPage: React.FC = () => {
               <span className='text-center'>{t('cron.page.list.action')}</span>
             </div>
 
-            <div className='divide-y divide-solid divide-[var(--color-border-2)]'>
+            <div className='grid w-full grid-cols-1 items-start gap-12px md:block md:overflow-hidden md:rounded-b-12px md:border md:border-t-0 md:border-solid md:border-[var(--color-border-2)] md:bg-fill-1 md:divide-y md:divide-solid md:divide-[var(--color-border-2)]'>
               {filteredJobs.map((job) => {
                 const agentMeta = getJobAgentMeta(job, cliAgents);
                 const isManualOnly = job.schedule.kind === 'cron' && !job.schedule.expr;
@@ -198,155 +197,91 @@ const ScheduledTasksPage: React.FC = () => {
                   job.target.execution_mode === 'new_conversation'
                     ? t('cron.page.form.newConversation')
                     : t('cron.page.form.existingConversation');
-                const nextRunLabel = job.state.next_run_at_ms ? formatNextRun(job.state.next_run_at_ms) : '-';
 
                 return (
                   <div
                     key={job.id}
-                    className='group grid min-h-68px cursor-pointer items-center gap-16px px-18px py-14px transition-colors hover:bg-fill-2'
+                    className='group flex cursor-pointer flex-col rounded-12px border border-solid border-[var(--color-border-2)] bg-fill-1 px-16px py-16px transition-colors duration-200 hover:border-[var(--color-border-3)] hover:shadow-sm md:grid md:min-h-68px md:items-center md:gap-16px md:rounded-0 md:border-0 md:px-18px md:py-14px md:hover:bg-fill-2 md:hover:shadow-none'
                     style={{ gridTemplateColumns: DESKTOP_SCHEDULED_TASK_COLUMNS }}
                     onClick={() => handleGoToDetail(job)}
                   >
-                    <div className='flex min-w-0 items-center gap-8px' title={job.name}>
-                      <span className='min-w-0 truncate text-14px font-medium leading-20px text-t-primary'>
-                        {job.name}
+                    <div className='mb-12px flex items-center justify-between gap-8px md:mb-0 md:contents'>
+                      {/* Name truncates on its own; #N sits outside the truncating span so it never gets clipped. */}
+                      <span className='mr-8px flex min-w-0 flex-1 items-center gap-6px md:mr-0' title={job.name}>
+                        <span className='min-w-0 truncate text-14px font-medium leading-20px text-t-primary'>
+                          {job.name}
+                        </span>
+                        <span className='shrink-0 text-12px font-normal text-t-tertiary'>
+                          {shortSessionId(job.id)}
+                        </span>
                       </span>
-                      <span className='shrink-0 text-12px font-normal text-t-tertiary'>{shortSessionId(job.id)}</span>
+                      <div className='shrink-0 md:[grid-column:3] md:[grid-row:1] md:justify-self-start'>
+                        <CronStatusTag job={job} />
+                      </div>
                     </div>
 
-                    <span className='min-w-0 truncate text-13px leading-20px text-t-secondary' title={nextRunLabel}>
-                      {nextRunLabel}
-                    </span>
-
-                    <div className='min-w-0 justify-self-start'>
-                      <CronStatusTag job={job} />
+                    <div
+                      className='min-w-0 break-words text-13px leading-20px text-t-secondary md:hidden'
+                      title={formatSchedule(job, t)}
+                    >
+                      {formatSchedule(job, t)}
                     </div>
 
-                    <div className='flex min-w-0 items-center gap-7px text-13px leading-20px text-t-secondary'>
-                      {agentMeta.name ? (
-                        <Tooltip content={agentMeta.name}>
-                          <div className='flex h-18px w-18px shrink-0 items-center justify-center text-t-secondary'>
-                            {agentMeta.logo ? (
-                              <img
-                                src={agentMeta.logo}
-                                alt={agentMeta.name}
-                                className='h-18px w-18px shrink-0 rounded-50%'
-                              />
-                            ) : (
-                              <span className='flex h-18px w-18px items-center justify-center rounded-50% text-10px font-medium text-t-secondary'>
-                                {agentMeta.name.slice(0, 1)}
-                              </span>
-                            )}
-                          </div>
-                        </Tooltip>
-                      ) : null}
-                      <span className='min-w-0 truncate' title={executionModeLabel}>
-                        {executionModeLabel}
-                      </span>
-                    </div>
-
-                    <div className='justify-self-center' onClick={(e) => e.stopPropagation()}>
-                      {!isManualOnly && (
-                        <Switch size='small' checked={job.enabled} onChange={() => handleToggleEnabled(job)} />
+                    <div
+                      className='mt-16px min-w-0 break-words text-13px leading-20px text-t-secondary md:mt-0 md:truncate md:[grid-column:2] md:[grid-row:1]'
+                      title={
+                        job.state.next_run_at_ms
+                          ? `${t('cron.nextRun')} ${formatNextRun(job.state.next_run_at_ms)}`
+                          : '-'
+                      }
+                    >
+                      {job.state.next_run_at_ms ? (
+                        <>
+                          <span className='md:hidden'>{t('cron.nextRun')} </span>
+                          {formatNextRun(job.state.next_run_at_ms)}
+                        </>
+                      ) : (
+                        '-'
                       )}
+                    </div>
+
+                    <div className='mt-14px flex items-center justify-between gap-10px md:mt-0 md:contents'>
+                      <div className='flex min-w-0 items-center gap-6px text-12px leading-18px text-t-secondary md:[grid-column:4] md:[grid-row:1] md:text-13px md:leading-20px'>
+                        {agentMeta.name ? (
+                          <Tooltip content={agentMeta.name}>
+                            <div className='flex h-16px w-16px shrink-0 items-center justify-center text-t-secondary md:h-18px md:w-18px'>
+                              {agentMeta.logo ? (
+                                <img
+                                  src={agentMeta.logo}
+                                  alt={agentMeta.name}
+                                  className='h-16px w-16px shrink-0 rounded-50% md:h-18px md:w-18px'
+                                />
+                              ) : (
+                                <span className='flex h-16px w-16px items-center justify-center rounded-50% text-10px font-medium text-t-secondary md:h-18px md:w-18px'>
+                                  {agentMeta.name.slice(0, 1)}
+                                </span>
+                              )}
+                            </div>
+                          </Tooltip>
+                        ) : null}
+                        <span className='min-w-0 truncate' title={executionModeLabel}>
+                          {executionModeLabel}
+                        </span>
+                      </div>
+
+                      <div
+                        className='shrink-0 md:[grid-column:5] md:[grid-row:1] md:justify-self-center'
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        {!isManualOnly && (
+                          <Switch size='small' checked={job.enabled} onChange={() => handleToggleEnabled(job)} />
+                        )}
+                      </div>
                     </div>
                   </div>
                 );
               })}
             </div>
-          </div>
-        ) : (
-          <div
-            className={classNames(
-              'grid w-full items-start grid-cols-1 gap-12px',
-              isMobile ? '' : 'sm:grid-cols-2 lg:grid-cols-3'
-            )}
-          >
-            {filteredJobs.map((job) => {
-              const agentMeta = getJobAgentMeta(job, cliAgents);
-              const isManualOnly = job.schedule.kind === 'cron' && !job.schedule.expr;
-              const executionModeLabel =
-                job.target.execution_mode === 'new_conversation'
-                  ? t('cron.page.form.newConversation')
-                  : t('cron.page.form.existingConversation');
-
-              return (
-                <div
-                  key={job.id}
-                  className={classNames(
-                    'group flex cursor-pointer flex-col border border-solid border-[var(--color-border-2)] bg-fill-1 transition-colors duration-200 hover:border-[var(--color-border-3)] hover:shadow-sm',
-                    isMobile ? 'rounded-12px px-16px py-16px' : 'rounded-12px px-20px py-18px'
-                  )}
-                  onClick={() => handleGoToDetail(job)}
-                >
-                  <div className='mb-12px flex items-center justify-between gap-8px'>
-                    {/* Name truncates on its own; #N sits outside the truncating span so it never gets clipped. */}
-                    <span className='mr-8px min-w-0 flex-1 flex items-center gap-6px'>
-                      <span
-                        className={classNames(
-                          'min-w-0 truncate font-medium text-t-primary',
-                          isMobile ? 'text-14px leading-20px' : 'text-15px leading-22px'
-                        )}
-                      >
-                        {job.name}
-                      </span>
-                      <span className='shrink-0 text-12px font-normal text-t-tertiary'>
-                        {shortSessionId(job.id)}
-                      </span>
-                    </span>
-                    <CronStatusTag job={job} />
-                  </div>
-
-                  <div
-                    className={classNames(
-                      'min-w-0 break-words text-t-secondary',
-                      isMobile ? 'text-13px leading-20px' : 'text-14px leading-22px'
-                    )}
-                    title={formatSchedule(job, t)}
-                  >
-                    {formatSchedule(job, t)}
-                  </div>
-
-                  <div
-                    className='mt-16px min-w-0 break-words text-t-secondary text-13px leading-20px'
-                    title={
-                      job.state.next_run_at_ms ? `${t('cron.nextRun')} ${formatNextRun(job.state.next_run_at_ms)}` : '-'
-                    }
-                  >
-                    {job.state.next_run_at_ms ? `${t('cron.nextRun')} ${formatNextRun(job.state.next_run_at_ms)}` : '-'}
-                  </div>
-
-                  <div className='mt-14px flex items-center justify-between gap-10px'>
-                    <div className='min-w-0 flex items-center gap-6px text-12px leading-18px text-t-secondary'>
-                      {agentMeta.name ? (
-                        <Tooltip content={agentMeta.name}>
-                          <div className='flex h-16px w-16px shrink-0 items-center justify-center text-t-secondary'>
-                            {agentMeta.logo ? (
-                              <img
-                                src={agentMeta.logo}
-                                alt={agentMeta.name}
-                                className='h-16px w-16px shrink-0 rounded-50%'
-                              />
-                            ) : (
-                              <span className='flex h-16px w-16px items-center justify-center rounded-50% text-10px font-medium text-t-secondary'>
-                                {agentMeta.name.slice(0, 1)}
-                              </span>
-                            )}
-                          </div>
-                        </Tooltip>
-                      ) : null}
-                      <span className='min-w-0 truncate'>{executionModeLabel}</span>
-                    </div>
-
-                    <div className='shrink-0' onClick={(e) => e.stopPropagation()}>
-                      {!isManualOnly && (
-                        <Switch size='small' checked={job.enabled} onChange={() => handleToggleEnabled(job)} />
-                      )}
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
           </div>
         )}
 
