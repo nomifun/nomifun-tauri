@@ -217,7 +217,7 @@ const RequirementFilters: React.FC<RequirementFiltersProps> = ({
   );
 
   return (
-    <div className='flex flex-col gap-10px'>
+    <div className='flex flex-col'>
       <div className='flex flex-wrap items-center gap-8px'>
         <Dropdown
           droplist={tagMenu}
@@ -319,11 +319,13 @@ const RequirementFilters: React.FC<RequirementFiltersProps> = ({
         )}
       </div>
 
+      <div role='separator' className='mt-6px h-px bg-[var(--color-border-2)]' />
+
       {/* Stable batch-action bar — its own surface, only mounted when there is
           a selection. Kept out of the filter row so the filters never reflow. */}
       {selectedCount > 0 && (
         <div
-          className='flex items-center justify-between gap-12px rounded-10px border border-solid border-[var(--color-border-2)] bg-[var(--color-bg-2)] px-12px py-8px'
+          className='mt-10px flex items-center justify-between gap-12px rounded-10px border border-solid border-[var(--color-border-2)] bg-[var(--color-bg-2)] px-12px py-8px'
           style={SOFT_BATCH_BAR_STYLE}
         >
           <span className='text-13px text-[var(--color-text-2)]'>

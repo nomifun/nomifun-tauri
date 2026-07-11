@@ -55,9 +55,14 @@ describe('RequirementFilters trigger', () => {
     expect(listViewSource.includes('requirements.selection.selectAllPage')).toBe(false);
   });
 
-  test('moves only the filter region upward without an outer divider', () => {
+  test('separates the filter row from content without adding an outer border', () => {
     expect(workspaceSource.includes("<div className='mt-8px'>")).toBe(true);
     expect(workspaceSource.includes("<div className='mt-10px'>")).toBe(true);
+    expect(
+      filtersSource.includes(
+        "role='separator' className='mt-6px h-px bg-[var(--color-border-2)]'"
+      )
+    ).toBe(true);
     expect(
       filtersSource.includes(
         "border-b border-solid border-[var(--color-border-2)] pb-6px"
