@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default capability for the NomiFun desktop window.",
-  "windows": ["main", "companion-*"],
+  "windows": ["main", "companion-*", "nomi-memory-panel"],
   "permissions": [
     "core:default",
     "core:window:default",
