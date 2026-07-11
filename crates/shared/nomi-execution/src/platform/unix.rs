@@ -20,6 +20,8 @@ use tokio::{
     task::JoinHandle,
 };
 
+use super::unix_pty::{PtyMaster, PtyPair};
+
 use super::{
     ExitFact, ProcessOwner, SpawnedPlatformProcess,
     unix_protocol::{
@@ -333,10 +335,40 @@ pub(super) async fn spawn_pipe(
     spawn_pipe_inner(request, output, SpawnOptions::default()).await
 }
 
+pub(super) async fn spawn_pty(
+    request: NormalizedExecutionRequest,
+    output: Arc<OutputBuffer>,
+    cols: u16,
+    rows: u16,
+) -> Result<SpawnedPlatformProcess, ExecutionError> {
+    spawn_inner(
+        request,
+        output,
+        SpawnOptions::default(),
+        SpawnTransport::Pty { cols, rows },
+    )
+    .await
+}
+
 async fn spawn_pipe_inner(
     request: NormalizedExecutionRequest,
     output: Arc<OutputBuffer>,
     options: SpawnOptions,
+) -> Result<SpawnedPlatformProcess, ExecutionError> {
+    spawn_inner(request, output, options, SpawnTransport::Pipe).await
+}
+
+#[derive(Clone, Copy)]
+enum SpawnTransport {
+    Pipe,
+    Pty { cols: u16, rows: u16 },
+}
+
+async fn spawn_inner(
+    request: NormalizedExecutionRequest,
+    output: Arc<OutputBuffer>,
+    options: SpawnOptions,
+    transport: SpawnTransport,
 ) -> Result<SpawnedPlatformProcess, ExecutionError> {
     enforce_sandbox(&request)?;
 
@@ -366,7 +398,8 @@ async fn spawn_pipe_inner(
             pause.block();
         }
         ensure_setup_active(deadline, &worker_cancelled)?;
-        let mut transaction = spawn_transaction(request, options, deadline, &worker_cancelled)?;
+        let mut transaction =
+            spawn_transaction(request, options, deadline, &worker_cancelled, transport)?;
         #[cfg(test)]
         if let Some(pause) = blocking_transaction_pause {
             pause.block();
@@ -397,13 +430,7 @@ async fn spawn_pipe_inner(
         pause.entered.notify_one();
         pause.release.notified().await;
     }
-    let CommittedSpawn {
-        pid,
-        stdin,
-        stdout,
-        stderr,
-        lifecycle,
-    } = committed;
+    let CommittedSpawn { pid, io, lifecycle } = committed;
     #[cfg(test)]
     if async_wrap_failure {
         lifecycle.shutdown();
@@ -411,37 +438,65 @@ async fn spawn_pipe_inner(
             "injected async stdio wrap failure",
         )));
     }
-    let stdin = match ChildStdin::from_std(stdin) {
-        Ok(value) => value,
-        Err(error) => {
-            lifecycle.shutdown();
-            return Err(async_wrap_start_lost(error));
+    let (io, readers) = match io {
+        CommittedIo::Pipe {
+            stdin,
+            stdout,
+            stderr,
+        } => {
+            let stdin = match ChildStdin::from_std(stdin) {
+                Ok(value) => value,
+                Err(error) => {
+                    lifecycle.shutdown();
+                    return Err(async_wrap_start_lost(error));
+                }
+            };
+            let stdout = match ChildStdout::from_std(stdout) {
+                Ok(value) => value,
+                Err(error) => {
+                    lifecycle.shutdown();
+                    return Err(async_wrap_start_lost(error));
+                }
+            };
+            let stderr = match ChildStderr::from_std(stderr) {
+                Ok(value) => value,
+                Err(error) => {
+                    lifecycle.shutdown();
+                    return Err(async_wrap_start_lost(error));
+                }
+            };
+            (
+                UnixIo::Pipe(tokio::sync::Mutex::new(Some(stdin))),
+                vec![
+                    tokio::spawn(read_stream(stdout, OutputStream::Stdout, output.clone())),
+                    tokio::spawn(read_stream(stderr, OutputStream::Stderr, output)),
+                ],
+            )
+        }
+        CommittedIo::Pty(master) => {
+            let master = match master.into_async() {
+                Ok(master) => Arc::new(master),
+                Err(error) => {
+                    lifecycle.shutdown();
+                    return Err(async_wrap_start_lost(error));
+                }
+            };
+            let reader = tokio::spawn(super::unix_pty::read_output(
+                Arc::clone(&master),
+                output,
+            ));
+            (
+                UnixIo::Pty(master),
+                vec![reader],
+            )
         }
     };
-    let stdout = match ChildStdout::from_std(stdout) {
-        Ok(value) => value,
-        Err(error) => {
-            lifecycle.shutdown();
-            return Err(async_wrap_start_lost(error));
-        }
-    };
-    let stderr = match ChildStderr::from_std(stderr) {
-        Ok(value) => value,
-        Err(error) => {
-            lifecycle.shutdown();
-            return Err(async_wrap_start_lost(error));
-        }
-    };
-    let readers = vec![
-        tokio::spawn(read_stream(stdout, OutputStream::Stdout, output.clone())),
-        tokio::spawn(read_stream(stderr, OutputStream::Stderr, output)),
-    ];
 
     Ok(SpawnedPlatformProcess {
         owner: Arc::new(UnixOwner {
             pid,
             lifecycle,
-            stdin: tokio::sync::Mutex::new(Some(stdin)),
+            io,
             readers: Mutex::new(readers),
         }),
     })
@@ -465,10 +520,17 @@ fn async_wrap_start_lost(error: io::Error) -> ExecutionError {
 
 struct CommittedSpawn {
     pid: u32,
-    stdin: StdChildStdin,
-    stdout: StdChildStdout,
-    stderr: StdChildStderr,
+    io: CommittedIo,
     lifecycle: LifecycleHandle,
+}
+
+enum CommittedIo {
+    Pipe {
+        stdin: StdChildStdin,
+        stdout: StdChildStdout,
+        stderr: StdChildStderr,
+    },
+    Pty(PtyMaster),
 }
 
 #[derive(Clone)]
@@ -528,6 +590,7 @@ impl Drop for LifecycleHandle {
 
 struct SpawnTransaction {
     child: Option<StdChild>,
+    io: Option<TransactionIo>,
     watchdog_pid: Option<libc::pid_t>,
     control: Option<OwnedFd>,
     pgid: Option<libc::pid_t>,
@@ -546,6 +609,11 @@ struct SpawnTransaction {
     disarmed: bool,
     #[cfg(test)]
     audit: TestSpawnAudit,
+}
+
+enum TransactionIo {
+    Pipe,
+    Pty(PtyMaster),
 }
 
 impl SpawnTransaction {
@@ -656,25 +724,46 @@ impl SpawnTransaction {
             .take()
             .expect("committed ownership bundle was validated");
         let pid = child.id();
-        let stdin = child.stdin.take().ok_or_else(|| {
-            io::Error::other("committed Unix command is missing piped stdin")
-        });
-        let stdout = child.stdout.take().ok_or_else(|| {
-            io::Error::other("committed Unix command is missing piped stdout")
-        });
-        let stderr = child.stderr.take().ok_or_else(|| {
-            io::Error::other("committed Unix command is missing piped stderr")
-        });
-        let (stdin, stdout, stderr) = match (stdin, stdout, stderr) {
-            (Ok(stdin), Ok(stdout), Ok(stderr)) => (stdin, stdout, stderr),
-            (stdin, stdout, stderr) => {
+        let io = match self.io.take() {
+            Some(TransactionIo::Pipe) => {
+                let stdin = child.stdin.take().ok_or_else(|| {
+                    io::Error::other("committed Unix command is missing piped stdin")
+                });
+                let stdout = child.stdout.take().ok_or_else(|| {
+                    io::Error::other("committed Unix command is missing piped stdout")
+                });
+                let stderr = child.stderr.take().ok_or_else(|| {
+                    io::Error::other("committed Unix command is missing piped stderr")
+                });
+                match (stdin, stdout, stderr) {
+                    (Ok(stdin), Ok(stdout), Ok(stderr)) => CommittedIo::Pipe {
+                        stdin,
+                        stdout,
+                        stderr,
+                    },
+                    (stdin, stdout, stderr) => {
+                        self.child = Some(child);
+                        let error = stdin
+                            .err()
+                            .or_else(|| stdout.err())
+                            .or_else(|| stderr.err())
+                            .expect("one committed stdio handle is missing");
+                        return Err(self.post_exec_failure("owner_transfer_failed", error));
+                    }
+                }
+            }
+            Some(TransactionIo::Pty(master)) => {
+                child.stdin.take();
+                child.stdout.take();
+                child.stderr.take();
+                CommittedIo::Pty(master)
+            }
+            None => {
                 self.child = Some(child);
-                let error = stdin
-                    .err()
-                    .or_else(|| stdout.err())
-                    .or_else(|| stderr.err())
-                    .expect("one committed stdio handle is missing");
-                return Err(self.post_exec_failure("owner_transfer_failed", error));
+                return Err(self.post_exec_failure(
+                    "owner_transfer_failed",
+                    io::Error::other("committed Unix command transport is missing"),
+                ));
             }
         };
         let watchdog_pid = self
@@ -747,9 +836,7 @@ impl SpawnTransaction {
         self.disarmed = true;
         Ok(CommittedSpawn {
             pid,
-            stdin,
-            stdout,
-            stderr,
+            io,
             lifecycle: LifecycleHandle {
                 pgid,
                 signal_gate,
@@ -1292,6 +1379,7 @@ fn spawn_transaction(
     options: SpawnOptions,
     deadline: Deadline,
     cancelled: &std::sync::atomic::AtomicBool,
+    transport: SpawnTransport,
 ) -> Result<SpawnTransaction, ExecutionError> {
     let _gate = lock_spawn_gate(deadline, cancelled)?;
     let cleanup_relay = cleanup_relay_sender().map_err(spawn_failed)?;
@@ -1312,6 +1400,19 @@ fn spawn_transaction(
         .into_fds();
     #[cfg(target_os = "linux")]
     let close_upper_exclusive = capture_close_upper_exclusive().map_err(spawn_failed)?;
+    let pty = match transport {
+        SpawnTransport::Pipe => None,
+        SpawnTransport::Pty { cols, rows } => {
+            Some(PtyPair::open(cols, rows).map_err(spawn_failed)?)
+        }
+    };
+    // Prepare every fallible slave duplication before the watchdog fork, so a
+    // descriptor-allocation failure cannot leave an unproven direct child.
+    let pty_child_stdio = pty
+        .as_ref()
+        .map(PtyPair::child_stdio)
+        .transpose()
+        .map_err(spawn_failed)?;
     ensure_setup_active(deadline, cancelled)?;
 
     // SAFETY: the child branch immediately enters the raw watchdog and never unwinds.
@@ -1328,6 +1429,7 @@ fn spawn_transaction(
             null_fd: watchdog_null.null_fd(),
             #[cfg(target_os = "linux")]
             close_upper_exclusive,
+            external_session: matches!(transport, SpawnTransport::Pty { .. }),
             nonce,
             deadline,
             fault: watchdog_fault(&options),
@@ -1346,6 +1448,7 @@ fn spawn_transaction(
 
     let mut transaction = SpawnTransaction {
         child: None,
+        io: None,
         watchdog_pid: Some(watchdog_pid),
         control: Some(control_host),
         pgid: None,
@@ -1389,11 +1492,24 @@ fn spawn_transaction(
     command
         .args(command_args(&request.command))
         .current_dir(&request.cwd)
-        .envs(&request.env)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // SAFETY: child_bootstrap uses only raw protocol syscalls and setpgid pre-exec.
+        .envs(&request.env);
+    let pty_slave_fd = pty.as_ref().map(PtyPair::slave_fd);
+    let pty_master_fd = pty.as_ref().map(PtyPair::master_fd);
+    match pty_child_stdio {
+        None => {
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        }
+        Some(stdio) => {
+            command
+                .stdin(stdio.stdin)
+                .stdout(stdio.stdout)
+                .stderr(stdio.stderr);
+        }
+    }
+    // SAFETY: child_bootstrap uses only raw protocol and process/session syscalls.
     unsafe {
         command.pre_exec(move || {
             child_bootstrap(
@@ -1401,6 +1517,8 @@ fn spawn_transaction(
                 registration_fd,
                 nonce,
                 deadline,
+                pty_slave_fd,
+                pty_master_fd,
                 #[cfg(test)]
                 registration_fault,
             )
@@ -1416,6 +1534,10 @@ fn spawn_transaction(
             return Err(transaction.pre_exec_failure(error, deadline));
         }
     };
+    let transaction_io = match pty {
+        Some(pty) => TransactionIo::Pty(pty.into_master()),
+        None => TransactionIo::Pipe,
+    };
     let pid = child.id() as libc::pid_t;
     #[cfg(test)]
     options
@@ -1424,6 +1546,7 @@ fn spawn_transaction(
         .store(pid, std::sync::atomic::Ordering::SeqCst);
     transaction.pgid = Some(pid);
     transaction.child = Some(child);
+    transaction.io = Some(transaction_io);
     let commit = Frame::new(FrameKind::Commit, nonce, pid, pid);
     if let Err(error) = send_frame(control_fd, &commit, deadline)
         .and_then(|_| recv_expected(control_fd, nonce, FrameKind::Committed, deadline))
@@ -1454,13 +1577,32 @@ fn child_bootstrap(
     registration_fd: libc::c_int,
     nonce: Nonce,
     deadline: Deadline,
+    pty_slave_fd: Option<RawFd>,
+    pty_master_fd: Option<RawFd>,
     #[cfg(test)] registration_fault: TestRegistrationFault,
 ) -> io::Result<()> {
     // SAFETY: these descriptors are valid inherited protocol endpoints.
     unsafe { libc::close(control_fd) };
-    // SAFETY: make the user child its own process-group leader before registration.
-    if unsafe { libc::setpgid(0, 0) } == -1 {
-        return Err(io::Error::last_os_error());
+    if let Some(master_fd) = pty_master_fd {
+        // The user child uses only the slave. Close the inherited master copy
+        // before ACK so it cannot keep the PTY alive after the host closes it.
+        unsafe { libc::close(master_fd) };
+    }
+    match pty_slave_fd {
+        Some(slave_fd) => {
+            // SAFETY: the helper performs only async-signal-safe syscalls and
+            // returns a raw errno without allocating or consulting TLS.
+            let errno = unsafe { bootstrap_controlling_terminal(slave_fd) };
+            if errno != 0 {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+        }
+        None => {
+            // Pipe children remain process-group leaders in the host session.
+            if unsafe { libc::setpgid(0, 0) } == -1 {
+                return Err(io::Error::last_os_error());
+            }
+        }
     }
     let pid = unsafe { libc::getpid() };
     #[cfg(test)]
@@ -1506,6 +1648,42 @@ fn child_bootstrap(
     }
     unsafe { libc::close(registration_fd) };
     Ok(())
+}
+
+/// Establishes a truthful controlling terminal in the post-fork child.
+///
+/// Returns zero on success or a raw errno on failure. This intentionally avoids
+/// `io::Error::last_os_error`, formatting, allocation and unwinding between
+/// `fork` and `exec`.
+unsafe fn bootstrap_controlling_terminal(slave_fd: RawFd) -> libc::c_int {
+    // A controlling terminal requires a fresh session. `setsid` also makes the
+    // child the leader of a new process group with pgid=pid.
+    if unsafe { libc::setsid() } == -1 {
+        return unsafe { raw_errno() };
+    }
+    if unsafe { libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) } == -1 {
+        return unsafe { raw_errno() };
+    }
+    let pid = unsafe { libc::getpid() };
+    if unsafe { libc::getsid(0) } != pid
+        || unsafe { libc::getpgrp() } != pid
+        || unsafe { libc::tcgetpgrp(slave_fd) } != pid
+    {
+        return libc::EPROTO;
+    }
+    0
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn raw_errno() -> libc::c_int {
+    // SAFETY: libc exposes the current thread's errno slot.
+    unsafe { *libc::__errno_location() }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn raw_errno() -> libc::c_int {
+    // SAFETY: libc exposes the current thread's errno slot.
+    unsafe { *libc::__error() }
 }
 
 fn waitpid_exact_setup(pid: libc::pid_t, deadline: Deadline) -> io::Result<libc::c_int> {
@@ -1667,8 +1845,13 @@ fn spawn_failed(error: io::Error) -> ExecutionError {
 struct UnixOwner {
     pid: u32,
     lifecycle: LifecycleHandle,
-    stdin: tokio::sync::Mutex<Option<ChildStdin>>,
+    io: UnixIo,
     readers: Mutex<Vec<JoinHandle<io::Result<()>>>>,
+}
+
+enum UnixIo {
+    Pipe(tokio::sync::Mutex<Option<ChildStdin>>),
+    Pty(Arc<super::unix_pty::AsyncPtyMaster>),
 }
 
 struct SignalGate {
@@ -2132,7 +2315,12 @@ impl Drop for LifecycleJob {
 
 impl Drop for UnixOwner {
     fn drop(&mut self) {
-        self.stdin.get_mut().take();
+        match &mut self.io {
+            UnixIo::Pipe(stdin) => {
+                stdin.get_mut().take();
+            }
+            UnixIo::Pty(_) => {}
+        }
         self.lifecycle.shutdown();
         let readers = match self.readers.get_mut() {
             Ok(readers) => std::mem::take(readers),
@@ -2151,17 +2339,51 @@ impl ProcessOwner for UnixOwner {
     }
 
     async fn write(&self, bytes: &[u8]) -> io::Result<()> {
-        let mut stdin = self.stdin.lock().await;
-        let stdin = stdin
-            .as_mut()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "stdin is closed"))?;
-        stdin.write_all(bytes).await?;
-        stdin.flush().await
+        match &self.io {
+            UnixIo::Pipe(stdin) => {
+                let mut stdin = stdin.lock().await;
+                let stdin = stdin
+                    .as_mut()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "stdin is closed"))?;
+                stdin.write_all(bytes).await?;
+                stdin.flush().await
+            }
+            UnixIo::Pty(master) => master.write_all(bytes).await,
+        }
     }
 
     async fn close_stdin(&self) -> io::Result<()> {
-        self.stdin.lock().await.take();
-        Ok(())
+        match &self.io {
+            UnixIo::Pipe(stdin) => {
+                stdin.lock().await.take();
+                Ok(())
+            }
+            UnixIo::Pty(master) => master.close_input().await,
+        }
+    }
+
+    async fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        let gate = self
+            .lifecycle
+            .signal_gate
+            .lock()
+            .map_err(|_| io::Error::other("signal gate is poisoned"))?;
+        if gate.phase != SignalPhase::Open {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "process group is already quiescing",
+            ));
+        }
+        match &self.io {
+            UnixIo::Pipe(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "pipe transport does not support terminal resize",
+            )),
+            // Keep the lifecycle gate locked across the terminal ioctl. This
+            // makes the state validation and resize atomic with respect to
+            // quiescing/retirement.
+            UnixIo::Pty(master) => master.resize(cols, rows),
+        }
     }
 
     async fn interrupt(&self) -> io::Result<()> {
@@ -2332,6 +2554,7 @@ fn exit_fact(status: ExitStatus) -> io::Result<ExitFact> {
     Ok(ExitFact {
         code: status.code(),
         signal: status.signal(),
+        cleanup_errors: Vec::new(),
     })
 }
 
@@ -2438,7 +2661,10 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{SpawnOptions, TestSpawnAudit, TestSpawnFault, spawn_pipe_inner};
+    use super::{
+        SpawnOptions, SpawnTransport, TestSpawnAudit, TestSpawnFault, spawn_inner,
+        spawn_pipe_inner,
+    };
     use crate::{
         CapabilityPolicy, CommandSpec, ExecutionError, ExecutionOwner, ExecutionPolicy,
         NormalizedExecutionRequest, OutputBuffer, Transport,
@@ -2458,6 +2684,25 @@ mod tests {
                 setup_timeout: None,
                 ..SpawnOptions::default()
             },
+        )
+        .await
+    }
+
+    async fn spawn_pty_with_fault(
+        request: NormalizedExecutionRequest,
+        fault: TestSpawnFault,
+        audit: &TestSpawnAudit,
+    ) -> Result<super::SpawnedPlatformProcess, ExecutionError> {
+        spawn_inner(
+            request,
+            Arc::new(OutputBuffer::new(1024)),
+            SpawnOptions {
+                fault,
+                audit: audit.clone(),
+                setup_timeout: None,
+                ..SpawnOptions::default()
+            },
+            SpawnTransport::Pty { cols: 80, rows: 24 },
         )
         .await
     }
@@ -2727,6 +2972,34 @@ mod tests {
                 && libc::WTERMSIG(watchdog_status) == libc::SIGKILL,
             "the injected watchdog must be observed as exact SIGKILL: {watchdog_status:#x}"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(unix_spawn)]
+    async fn external_pty_watchdog_failure_after_committed_fails_closed() {
+        let audit = TestSpawnAudit::default();
+        let spawned = spawn_pty_with_fault(
+            request("/bin/sleep".into(), vec!["60".into()]),
+            TestSpawnFault::WatchdogDiesAfterCommitted,
+            &audit,
+        )
+        .await
+        .expect("PTY child should commit before the injected watchdog death");
+        let leader = spawned.owner.pid() as libc::pid_t;
+
+        let result = spawned
+            .owner
+            .wait_reaped(Instant::now() + Duration::from_secs(3))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "external watchdog loss after COMMITTED must remain a lifecycle failure"
+        );
+        assert_eq!(audit.watchdog_reaps.load(Ordering::SeqCst), 1);
+        assert_eq!(audit.leader_reaps.load(Ordering::SeqCst), 1);
+        assert!(audit.group_signals.load(Ordering::SeqCst) >= 1);
+        assert!(!process_exists(leader));
     }
 
     #[tokio::test]

@@ -95,6 +95,12 @@ pub(super) struct WatchdogConfig {
     pub(super) registration_fd: RawFd,
     pub(super) null_fd: RawFd,
     pub(super) close_upper_exclusive: RawFd,
+    /// A true PTY child is a session leader, so the watchdog cannot join the
+    /// child's process group. In that mode it monitors the exact leader from
+    /// outside the session, seals the group with `kill(-pgid, SIGKILL)`, then
+    /// terminates itself with SIGKILL so the host observes the same lifecycle
+    /// fact as the process-group-anchored pipe mode.
+    pub(super) external_session: bool,
     pub(super) nonce: Nonce,
     pub(super) deadline: Deadline,
     pub(super) fault: u8,
@@ -380,7 +386,16 @@ pub(super) unsafe fn run_watchdog(config: WatchdogConfig) -> ! {
     if leader <= 1
         || registration.pgid() != leader
         || unsafe { libc::getpgid(leader) } != leader
-        || ignore_graceful_and_anchor(leader).is_err()
+    {
+        unsafe { exit_watchdog(config, 76) };
+    }
+    if config.external_session {
+        if unsafe { libc::getsid(leader) } != leader
+            || unsafe { libc::getpgrp() } == leader
+        {
+            unsafe { exit_watchdog(config, 76) };
+        }
+    } else if ignore_graceful_and_anchor(leader).is_err()
         || unsafe { libc::getpgrp() } != leader
     {
         unsafe { exit_watchdog(config, 76) };
@@ -495,7 +510,7 @@ unsafe fn quiesce_and_kill(
     let mut kill_attempt = 0_u32;
     let kill_result = unsafe { try_final_group_kill(config, leader, kill_attempt) };
     let Some(retry_delay_ms) = final_kill_retry_delay_ms(kill_result) else {
-        unsafe { hold_for_group_sigkill() };
+        unsafe { finish_after_group_seal(config) };
     };
     if let Ok(deadline) = Deadline::after(std::time::Duration::from_millis(50)) {
         let failure = Frame::new(FrameKind::Failure, config.nonce, leader, leader);
@@ -507,7 +522,7 @@ unsafe fn quiesce_and_kill(
         if !group_kill_needs_failure(unsafe {
             try_final_group_kill(config, leader, kill_attempt)
         }) {
-            unsafe { hold_for_group_sigkill() };
+            unsafe { finish_after_group_seal(config) };
         }
     }
 }
@@ -534,6 +549,17 @@ unsafe fn try_final_group_kill(
         return -1;
     }
     unsafe { libc::kill(-leader, libc::SIGKILL) }
+}
+
+unsafe fn finish_after_group_seal(config: WatchdogConfig) -> ! {
+    if config.external_session {
+        // The PTY watchdog intentionally lives outside the child's session,
+        // so the group SIGKILL cannot reap it as a side effect. Preserve the
+        // lifecycle contract by terminating this exact watchdog with SIGKILL.
+        unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+        unsafe { libc::_exit(127) };
+    }
+    unsafe { hold_for_group_sigkill() }
 }
 
 unsafe fn raw_poll_delay(milliseconds: libc::c_int) {
@@ -1095,6 +1121,7 @@ mod tests {
                     registration_fd: -1,
                     null_fd: -1,
                     close_upper_exclusive: 3,
+                    external_session: false,
                     nonce,
                     deadline,
                     fault: FAULT_SKIP_FINAL_GROUP_KILL,

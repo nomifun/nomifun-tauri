@@ -43,15 +43,25 @@ async fn main() {
 #[cfg(unix)]
 async fn run() -> io::Result<()> {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
-    if args.len() != 3 {
+    if !(args.len() == 3 || args.len() == 4) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "expected helper, leader marker, and grandchild marker paths",
+            "expected helper, leader marker, grandchild marker, and optional 'pty'",
         ));
     }
     let helper = args[0].clone();
     let leader_marker = PathBuf::from(&args[1]);
     let grandchild_marker = PathBuf::from(&args[2]);
+    let transport = match args.get(3).and_then(|value| value.to_str()) {
+        None => Transport::Pipe,
+        Some("pty") => Transport::Pty { cols: 80, rows: 24 },
+        Some(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "optional Unix transport must be 'pty'",
+            ));
+        }
+    };
     let cwd = env::current_dir()?;
     let request = NormalizedExecutionRequest {
         owner: ExecutionOwner::new(uuid::Uuid::now_v7(), uuid::Uuid::now_v7()),
@@ -64,7 +74,7 @@ async fn run() -> io::Result<()> {
         },
         cwd: cwd.clone(),
         env: BTreeMap::new(),
-        transport: Transport::Pipe,
+        transport,
         policy: ExecutionPolicy::default(),
         capability: CapabilityPolicy::local_owner(cwd),
     };

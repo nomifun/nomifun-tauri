@@ -276,6 +276,28 @@ impl ProcessSupervisor {
         Ok(())
     }
 
+    pub async fn resize(
+        &self,
+        owner: &ExecutionOwner,
+        session_id: &SessionId,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), ExecutionError> {
+        if cols == 0 || rows == 0 {
+            return Err(ExecutionError::InvalidTransport {
+                reason: "PTY dimensions must be non-zero".to_owned(),
+            });
+        }
+        let session = self.session(owner, session_id)?;
+        session
+            .process
+            .resize(cols, rows)
+            .await
+            .map_err(|error| owner_io_error("resize terminal", error))?;
+        session.touch();
+        Ok(())
+    }
+
     pub async fn interrupt(
         &self,
         owner: &ExecutionOwner,
@@ -467,7 +489,7 @@ impl Session {
         }
         if let Some(ExitObservation::Reaped { fact, observed_at }) = &state.exit_observation {
             return LostResolution::Reaped {
-                fact: *fact,
+                fact: fact.clone(),
                 observed_at: *observed_at,
                 cleanup,
             };
@@ -630,11 +652,12 @@ fn start_waiter(session: Arc<Session>) {
                 tokio::time::sleep_until(observed_at + FINAL_OUTPUT_DRAIN).await;
                 TerminalRecord {
                     kind: TerminalKind::Exited {
-                        fact,
+                        fact: fact.clone(),
                         output: session.output.freeze(),
                     },
                     cleanup: CleanupReport {
                         reaped: true,
+                        errors: fact.cleanup_errors,
                         ..CleanupReport::default()
                     },
                 }
@@ -661,11 +684,12 @@ async fn finish_observed_exit(
             tokio::time::sleep_until(observed_at + FINAL_OUTPUT_DRAIN).await;
             let natural = TerminalRecord {
                 kind: TerminalKind::Exited {
-                    fact,
+                    fact: fact.clone(),
                     output: session.output.freeze(),
                 },
                 cleanup: CleanupReport {
                     reaped: true,
+                    errors: fact.cleanup_errors,
                     ..CleanupReport::default()
                 },
             };
@@ -818,11 +842,12 @@ async fn run_stop_escalation(session: &Session, budget: &StopBudget) -> Executio
 
 async fn finish_reaped(
     session: &Session,
-    _fact: ExitFact,
+    fact: ExitFact,
     observed_at: tokio::time::Instant,
     mut cleanup: CleanupReport,
     budget: &StopBudget,
 ) -> ExecutionOutcome {
+    cleanup.errors.extend(fact.cleanup_errors);
     if observed_at > budget.cleanup_deadline {
         cleanup.reaped = true;
         let terminal = session.commit_known_lost(
@@ -975,7 +1000,7 @@ mod tests {
         platform::{ExitFact, ProcessOwner},
     };
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone)]
     enum ReapPlan {
         Pending,
         Natural {
@@ -1004,8 +1029,10 @@ mod tests {
         wait_calls: Arc<AtomicUsize>,
         writes: Arc<Mutex<Vec<Vec<u8>>>>,
         close_calls: Arc<AtomicUsize>,
+        resizes: Arc<Mutex<Vec<(u16, u16)>>>,
         signal_calls: Arc<Mutex<Vec<&'static str>>>,
         signal_times: Arc<Mutex<Vec<(&'static str, tokio::time::Instant)>>>,
+        resize_error: Arc<AtomicBool>,
         block_write: Arc<AtomicBool>,
         write_entered: Arc<AtomicBool>,
         write_release: Arc<tokio::sync::Notify>,
@@ -1022,8 +1049,10 @@ mod tests {
                 wait_calls: Arc::new(AtomicUsize::new(0)),
                 writes: Arc::new(Mutex::new(Vec::new())),
                 close_calls: Arc::new(AtomicUsize::new(0)),
+                resizes: Arc::new(Mutex::new(Vec::new())),
                 signal_calls: Arc::new(Mutex::new(Vec::new())),
                 signal_times: Arc::new(Mutex::new(Vec::new())),
+                resize_error: Arc::new(AtomicBool::new(false)),
                 block_write: Arc::new(AtomicBool::new(false)),
                 write_entered: Arc::new(AtomicBool::new(false)),
                 write_release: Arc::new(tokio::sync::Notify::new()),
@@ -1041,6 +1070,20 @@ mod tests {
                 fact: ExitFact {
                     code: Some(code),
                     signal: None,
+                    cleanup_errors: Vec::new(),
+                },
+            };
+            fake
+        }
+
+        fn exits_with_cleanup_error(message: &str) -> Self {
+            let mut fake = Self::pending();
+            fake.reap_plan = ReapPlan::Natural {
+                after: Duration::ZERO,
+                fact: ExitFact {
+                    code: Some(0),
+                    signal: None,
+                    cleanup_errors: vec![message.to_owned()],
                 },
             };
             fake
@@ -1053,6 +1096,7 @@ mod tests {
                 fact: ExitFact {
                     code: Some(code),
                     signal: None,
+                    cleanup_errors: Vec::new(),
                 },
                 after: Duration::ZERO,
             };
@@ -1065,6 +1109,7 @@ mod tests {
                 fact: ExitFact {
                     code: Some(code),
                     signal: None,
+                    cleanup_errors: Vec::new(),
                 },
             };
             fake
@@ -1094,6 +1139,11 @@ mod tests {
             self
         }
 
+        fn with_resize_error(self) -> Self {
+            self.resize_error.store(true, Ordering::SeqCst);
+            self
+        }
+
         fn blocking_write() -> Self {
             let fake = Self::pending();
             fake.block_write.store(true, Ordering::SeqCst);
@@ -1113,6 +1163,13 @@ mod tests {
 
         fn close_call_count(&self) -> usize {
             self.close_calls.load(Ordering::SeqCst)
+        }
+
+        fn resizes(&self) -> Vec<(u16, u16)> {
+            self.resizes
+                .lock()
+                .expect("fake resize log lock should not be poisoned")
+                .clone()
         }
 
         fn signal_calls(&self) -> Vec<&'static str> {
@@ -1142,11 +1199,11 @@ mod tests {
                 signal: trigger,
                 fact,
                 after,
-            } = self.reap_plan
+            } = &self.reap_plan
             {
-                if trigger == signal {
+                if *trigger == signal {
                     let _ = after;
-                    self.exit_tx.send_replace(Some(fact));
+                    self.exit_tx.send_replace(Some(fact.clone()));
                 }
             }
             if self
@@ -1185,6 +1242,18 @@ mod tests {
             Ok(())
         }
 
+        async fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+            self.resizes
+                .lock()
+                .expect("fake resize log lock should not be poisoned")
+                .push((cols, rows));
+            if self.resize_error.load(Ordering::SeqCst) {
+                Err(io::Error::other("resize failed"))
+            } else {
+                Ok(())
+            }
+        }
+
         async fn interrupt(&self) -> io::Result<()> {
             self.signal(FakeSignal::Interrupt, "interrupt")
         }
@@ -1199,19 +1268,19 @@ mod tests {
 
         async fn wait_reaped(&self, _deadline: Instant) -> io::Result<ExitFact> {
             self.wait_calls.fetch_add(1, Ordering::SeqCst);
-            match self.reap_plan {
+            match &self.reap_plan {
                 ReapPlan::Pending => future::pending().await,
                 ReapPlan::Natural { after, fact } => {
-                    tokio::time::sleep(after).await;
-                    Ok(fact)
+                    tokio::time::sleep(*after).await;
+                    Ok(fact.clone())
                 }
                 ReapPlan::OnSignal { after, .. } => {
                     let mut exit = self.exit_tx.subscribe();
                     loop {
-                        let fact = *exit.borrow();
+                        let fact = exit.borrow().clone();
                         if let Some(fact) = fact {
                             if !after.is_zero() {
-                                tokio::time::sleep(after).await;
+                                tokio::time::sleep(*after).await;
                             }
                             return Ok(fact);
                         }
@@ -1222,7 +1291,7 @@ mod tests {
                 }
                 ReapPlan::Controlled { fact } => {
                     self.reap_release.notified().await;
-                    Ok(fact)
+                    Ok(fact.clone())
                 }
             }
         }
@@ -1254,7 +1323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_close_and_interrupt_delegate_to_the_registered_owner() {
+    async fn write_close_resize_and_interrupt_delegate_to_the_registered_owner() {
         let (supervisor, handle, fake, _output) = register_fake(FakeOwner::pending()).await;
 
         supervisor
@@ -1266,14 +1335,49 @@ mod tests {
             .await
             .expect("close should delegate");
         supervisor
+            .resize(&handle.owner, &handle.session_id, 120, 40)
+            .await
+            .expect("resize should delegate");
+        supervisor
             .interrupt(&handle.owner, &handle.session_id)
             .await
             .expect("interrupt should delegate");
 
         assert_eq!(fake.writes(), vec![b"typed input".to_vec()]);
         assert_eq!(fake.close_call_count(), 1);
+        assert_eq!(fake.resizes(), vec![(120, 40)]);
         assert_eq!(fake.signal_calls(), vec!["interrupt"]);
         assert_eq!(fake.wait_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn resize_rejects_zero_dimensions_before_calling_the_owner() {
+        let (supervisor, handle, fake, _output) = register_fake(FakeOwner::pending()).await;
+
+        for (cols, rows) in [(0, 24), (80, 0)] {
+            let error = supervisor
+                .resize(&handle.owner, &handle.session_id, cols, rows)
+                .await
+                .expect_err("zero PTY dimensions should be rejected");
+            assert_eq!(error.code(), "invalid_transport");
+        }
+
+        assert!(fake.resizes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resize_owner_failures_use_the_stable_io_error_code() {
+        let (supervisor, handle, fake, _output) =
+            register_fake(FakeOwner::pending().with_resize_error()).await;
+
+        let error = supervisor
+            .resize(&handle.owner, &handle.session_id, 100, 30)
+            .await
+            .expect_err("owner resize failure should propagate");
+
+        assert_eq!(error.code(), "io");
+        assert!(error.to_string().contains("resize failed"));
+        assert_eq!(fake.resizes(), vec![(100, 30)]);
     }
 
     #[tokio::test]
@@ -1475,6 +1579,61 @@ mod tests {
 
         assert_eq!(outcome_output(&outcome).raw_bytes(), b"drained");
         assert!(tokio::time::Instant::now() <= observed_start + Duration::from_millis(150));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn natural_exit_preserves_nonfatal_platform_cleanup_diagnostics() {
+        let (supervisor, handle, _fake, _output) = register_fake(
+            FakeOwner::exits_with_cleanup_error("ConPTY close exceeded its deadline"),
+        )
+        .await;
+
+        let outcome = finished(
+            supervisor
+                .poll(
+                    &handle.owner,
+                    &handle.session_id,
+                    OutputCursor::START,
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .await
+                .expect("terminal poll should succeed"),
+        );
+
+        let ExecutionOutcome::Exited { code, cleanup, .. } = outcome else {
+            panic!("exact platform exit should remain Exited");
+        };
+        assert_eq!(code, Some(0));
+        assert!(cleanup.reaped);
+        assert_eq!(
+            cleanup.errors,
+            vec!["ConPTY close exceeded its deadline".to_owned()]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_exit_preserves_nonfatal_platform_cleanup_diagnostics() {
+        let mut fake = FakeOwner::reaps_on(FakeSignal::Interrupt, 130);
+        let ReapPlan::OnSignal { fact, .. } = &mut fake.reap_plan else {
+            unreachable!("reaps_on must create an on-signal plan");
+        };
+        fact.cleanup_errors
+            .push("ConPTY close exceeded its deadline".to_owned());
+        let (supervisor, handle, _fake, _output) = register_fake(fake).await;
+
+        let outcome = supervisor
+            .cancel(&handle.owner, &handle.session_id)
+            .await
+            .expect("cancellation should resolve");
+
+        let ExecutionOutcome::Cancelled { cleanup, .. } = outcome else {
+            panic!("signalled exact exit should become Cancelled");
+        };
+        assert!(cleanup.reaped);
+        assert_eq!(
+            cleanup.errors,
+            vec!["ConPTY close exceeded its deadline".to_owned()]
+        );
     }
 
     #[tokio::test(start_paused = true)]

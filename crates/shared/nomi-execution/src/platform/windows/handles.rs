@@ -9,7 +9,8 @@ use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
     System::Threading::{
         DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
-        LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, UpdateProcThreadAttribute,
+        LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, UpdateProcThreadAttribute,
     },
 };
 
@@ -62,17 +63,34 @@ pub(super) struct ProcThreadAttributeList {
     // UpdateProcThreadAttribute retains this pointer until CreateProcessW uses
     // the list, so the backing array must live as long as the attribute list.
     _handle_list: Option<Box<[HANDLE]>>,
+    // Records that the single pseudoconsole attribute has been installed.
+    _pseudoconsole: Option<isize>,
 }
 
 impl ProcThreadAttributeList {
     /// Allocates and initializes space for exactly one attribute.
     pub(super) fn new_one() -> io::Result<Self> {
+        Self::new(1)
+    }
+
+    pub(super) fn new(attribute_count: u32) -> io::Result<Self> {
+        if attribute_count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "process attribute list must reserve at least one attribute",
+            ));
+        }
         let mut bytes_required = 0usize;
 
         // The sizing call normally fails with ERROR_INSUFFICIENT_BUFFER while
         // reporting the required allocation size.
         let probe_result = unsafe {
-            InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut bytes_required)
+            InitializeProcThreadAttributeList(
+                ptr::null_mut(),
+                attribute_count,
+                0,
+                &mut bytes_required,
+            )
         };
         if bytes_required == 0 {
             return if probe_result == 0 {
@@ -101,7 +119,7 @@ impl ProcThreadAttributeList {
 
         let list = storage.as_mut_ptr().cast::<c_void>();
         let initialized = unsafe {
-            InitializeProcThreadAttributeList(list, 1, 0, &mut bytes_required)
+            InitializeProcThreadAttributeList(list, attribute_count, 0, &mut bytes_required)
         };
         if initialized == 0 {
             // The list was not initialized, so DeleteProcThreadAttributeList
@@ -113,6 +131,7 @@ impl ProcThreadAttributeList {
         Ok(Self {
             storage,
             _handle_list: None,
+            _pseudoconsole: None,
         })
     }
 
@@ -162,6 +181,39 @@ impl ProcThreadAttributeList {
         }
 
         self._handle_list = Some(owned_handles);
+        Ok(())
+    }
+
+    pub(super) fn set_pseudoconsole(&mut self, pseudoconsole: isize) -> io::Result<()> {
+        if pseudoconsole == 0 || pseudoconsole == -1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the pseudoconsole handle is invalid",
+            ));
+        }
+        if self._pseudoconsole.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the pseudoconsole attribute is already set",
+            ));
+        }
+
+        let updated = unsafe {
+            UpdateProcThreadAttribute(
+                self.as_mut_ptr(),
+                0,
+                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+                pseudoconsole as *const c_void,
+                mem::size_of::<isize>(),
+                ptr::null_mut(),
+                ptr::null(),
+            )
+        };
+        if updated == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        self._pseudoconsole = Some(pseudoconsole);
         Ok(())
     }
 

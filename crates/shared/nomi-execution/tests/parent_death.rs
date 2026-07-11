@@ -23,16 +23,33 @@ fn harness_binary() -> &'static str {
 #[tokio::test]
 #[serial_test::serial]
 async fn abrupt_harness_exit_kills_and_reaps_the_owned_process_group() {
+    assert_abrupt_harness_exit_kills_owned_group(false).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[serial_test::serial]
+async fn abrupt_harness_exit_kills_and_reaps_the_owned_pty_session() {
+    assert_abrupt_harness_exit_kills_owned_group(true).await;
+}
+
+#[cfg(target_os = "linux")]
+async fn assert_abrupt_harness_exit_kills_owned_group(pty: bool) {
     let _subreaper = SubreaperGuard::install().expect("test process should become a subreaper");
+    let baseline_children =
+        direct_children().expect("baseline direct-child identities should be readable");
     let directory = tempfile::tempdir().expect("temporary directory should be created");
     let leader_marker = directory.path().join("leader.pid");
     let grandchild_marker = directory.path().join("grandchild.pid");
-    let child = Command::new(harness_binary())
+    let mut command = Command::new(harness_binary());
+    command
         .arg(helper_binary())
         .arg(&leader_marker)
-        .arg(&grandchild_marker)
-        .spawn()
-        .expect("parent-death harness should spawn");
+        .arg(&grandchild_marker);
+    if pty {
+        command.arg("pty");
+    }
+    let child = command.spawn().expect("parent-death harness should spawn");
     let mut harness = HarnessCleanup(Some(child));
 
     let status = tokio::time::timeout(Duration::from_secs(5), async {
@@ -48,7 +65,10 @@ async fn abrupt_harness_exit_kills_and_reaps_the_owned_process_group() {
     .expect("parent-death harness should exit within its bounded setup window")
     .expect("harness should be reaped");
     harness.0.take();
-    assert!(status.success(), "harness failed before deliberate _exit: {status:?}");
+    assert!(
+        status.success(),
+        "harness failed before deliberate _exit (pty={pty}): {status:?}"
+    );
     let leader = read_pid(&leader_marker).expect("leader PID should be published");
     let grandchild = read_pid(&grandchild_marker).expect("grandchild PID should be published");
     let mut group_cleanup = GroupCleanup {
@@ -57,17 +77,26 @@ async fn abrupt_harness_exit_kills_and_reaps_the_owned_process_group() {
         armed: true,
     };
 
-    let statuses = reap_owned_group(leader, grandchild)
+    let statuses = reap_owned_group(leader, grandchild, &baseline_children, pty)
         .await
         .expect("watchdog-owned descendants should become exactly reapable");
 
-    assert_sigkill(statuses.get(&leader), "leader");
+    if pty {
+        assert_pty_leader_termination(statuses.get(&leader));
+    } else {
+        assert_sigkill(statuses.get(&leader), "leader");
+    }
     assert_sigkill(statuses.get(&grandchild), "grandchild");
     assert!(
         statuses
             .iter()
             .any(|(pid, status)| *pid != leader && *pid != grandchild && was_sigkill(*status)),
-        "the direct-child watchdog was not discovered and reaped: {statuses:?}"
+        "the {} watchdog was not discovered and reaped: {statuses:?}",
+        if pty {
+            "external-session"
+        } else {
+            "process-group"
+        }
     );
     assert!(!process_exists(leader));
     assert!(!process_exists(grandchild));
@@ -78,14 +107,21 @@ async fn abrupt_harness_exit_kills_and_reaps_the_owned_process_group() {
 async fn reap_owned_group(
     leader: libc::pid_t,
     grandchild: libc::pid_t,
+    baseline_children: &BTreeSet<libc::pid_t>,
+    include_external_watchdog: bool,
 ) -> io::Result<BTreeMap<libc::pid_t, ExitStatus>> {
     let mut statuses = BTreeMap::new();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let mut candidates = BTreeSet::from([leader, grandchild]);
-            for pid in direct_children()? {
-                if pid == leader || pid == grandchild || process_group(pid) == Some(leader) {
-                    candidates.insert(pid);
+            let direct = direct_children()?;
+            for pid in &direct {
+                if *pid == leader
+                    || *pid == grandchild
+                    || process_group(*pid) == Some(leader)
+                    || (include_external_watchdog && !baseline_children.contains(pid))
+                {
+                    candidates.insert(*pid);
                 }
             }
             for pid in candidates {
@@ -96,12 +132,20 @@ async fn reap_owned_group(
                     statuses.insert(pid, status);
                 }
             }
-            let remaining_group_child = direct_children()?.into_iter().any(|pid| {
-                pid == leader || pid == grandchild || process_group(pid) == Some(leader)
+            let remaining_owned_child = direct.into_iter().any(|pid| {
+                pid == leader
+                    || pid == grandchild
+                    || process_group(pid) == Some(leader)
+                    || (include_external_watchdog && !baseline_children.contains(&pid))
             });
+            let watchdog_reaped = !include_external_watchdog
+                || statuses.iter().any(|(pid, status)| {
+                    *pid != leader && *pid != grandchild && was_sigkill(*status)
+                });
             if !process_exists(leader)
                 && !process_exists(grandchild)
-                && !remaining_group_child
+                && !remaining_owned_child
+                && watchdog_reaped
             {
                 return Ok(statuses);
             }
@@ -161,6 +205,19 @@ fn assert_sigkill(status: Option<&ExitStatus>, label: &str) {
     assert!(
         status.is_some_and(|status| was_sigkill(*status)),
         "{label} was not reaped from SIGKILL: {status:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn assert_pty_leader_termination(status: Option<&ExitStatus>) {
+    use std::os::unix::process::ExitStatusExt;
+
+    assert!(
+        status.is_some_and(|status| matches!(
+            status.signal(),
+            Some(libc::SIGHUP | libc::SIGKILL)
+        )),
+        "PTY leader was not reaped from terminal hangup or watchdog SIGKILL: {status:?}"
     );
 }
 

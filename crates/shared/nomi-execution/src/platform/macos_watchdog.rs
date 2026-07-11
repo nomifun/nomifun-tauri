@@ -83,6 +83,10 @@ pub(super) struct WatchdogConfig {
     pub(super) control_fd: RawFd,
     pub(super) registration_fd: RawFd,
     pub(super) null_fd: RawFd,
+    /// True for a controlling-PTY child that owns a separate session. Such a
+    /// watchdog must remain outside the child's process group, seal that group
+    /// explicitly, and then terminate itself with SIGKILL.
+    pub(super) external_session: bool,
     pub(super) nonce: Nonce,
     pub(super) deadline: Deadline,
     pub(super) fault: u8,
@@ -311,7 +315,21 @@ pub(super) unsafe fn run_watchdog(config: WatchdogConfig) -> ! {
         };
     }
 
-    if unsafe { libc::setpgid(0, leader) } == -1 || unsafe { libc::getpgrp() } != leader {
+    if watchdog.config.external_session {
+        if unsafe { libc::getsid(leader) } != leader
+            || unsafe { libc::getpgrp() } == leader
+        {
+            unsafe {
+                exit_without_group(
+                    watchdog.config,
+                    watchdog.kqueue_fd,
+                    EXIT_ANCHOR_FAILED,
+                )
+            };
+        }
+    } else if unsafe { libc::setpgid(0, leader) } == -1
+        || unsafe { libc::getpgrp() } != leader
+    {
         unsafe {
             exit_without_group(
                 watchdog.config,
@@ -982,7 +1000,7 @@ unsafe fn quiesce_and_kill(
     let mut kill_attempt = 0_u32;
     let kill_result = unsafe { try_final_group_kill(watchdog.config, leader, kill_attempt) };
     let Some(retry_delay_ms) = final_kill_retry_delay_ms(kill_result) else {
-        unsafe { hold_for_group_sigkill() };
+        unsafe { finish_after_group_seal(watchdog.config) };
     };
     if let Ok(deadline) = Deadline::after(std::time::Duration::from_millis(EXIT_PREPARE_MS)) {
         let failure = Frame::new(FrameKind::Failure, watchdog.config.nonce, leader, leader);
@@ -994,7 +1012,7 @@ unsafe fn quiesce_and_kill(
         if !group_kill_needs_failure(unsafe {
             try_final_group_kill(watchdog.config, leader, kill_attempt)
         }) {
-            unsafe { hold_for_group_sigkill() };
+            unsafe { finish_after_group_seal(watchdog.config) };
         }
     }
 }
@@ -1009,6 +1027,14 @@ unsafe fn try_final_group_kill(
         return -1;
     }
     unsafe { libc::kill(-leader, libc::SIGKILL) }
+}
+
+unsafe fn finish_after_group_seal(config: WatchdogConfig) -> ! {
+    if config.external_session {
+        unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+        unsafe { libc::_exit(127) };
+    }
+    unsafe { hold_for_group_sigkill() }
 }
 
 fn group_kill_needs_failure(kill_result: libc::c_int) -> bool {

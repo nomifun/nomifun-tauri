@@ -1,3 +1,4 @@
+mod conpty;
 mod handles;
 
 use std::{
@@ -43,6 +44,7 @@ use windows_sys::Win32::{
 };
 
 use self::handles::{OwnedHandle, ProcThreadAttributeList};
+use self::conpty::{PreparedConPty, PseudoConsoleControl};
 use super::{ExitFact, ProcessOwner, SpawnedPlatformProcess};
 use crate::{
     CleanupReport, CommandSpec, ExecutionError, NormalizedExecutionRequest, OutputBuffer,
@@ -52,7 +54,9 @@ use crate::{
 const READ_BUFFER_BYTES: usize = 8 * 1024;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
-const POST_EXIT_READER_DRAIN: Duration = Duration::from_millis(100);
+const POST_EXIT_READER_DRAIN: Duration = Duration::from_millis(120);
+const CONPTY_NATURAL_CLOSE_WAIT: Duration = Duration::from_millis(250);
+const CONPTY_INPUT_CLOSE_GRACE: Duration = Duration::from_millis(250);
 const JOB_EMPTY_POLL: Duration = Duration::from_millis(2);
 const WRITE_CHUNK_BYTES: usize = 64 * 1024;
 const LIFECYCLE_WAIT_HORIZON: Duration = Duration::from_secs(60 * 60 * 24 * 365);
@@ -66,10 +70,51 @@ pub(super) async fn spawn_pipe(
     spawn_pipe_inner(request, output, Arc::new(SystemWin32)).await
 }
 
-async fn spawn_pipe_inner(
+pub(super) async fn spawn_pty(
+    request: NormalizedExecutionRequest,
+    output: Arc<OutputBuffer>,
+    cols: u16,
+    rows: u16,
+) -> Result<SpawnedPlatformProcess, ExecutionError> {
+    spawn_inner(
+        request,
+        output,
+        Arc::new(SystemWin32),
+        SpawnTransport::Pty { cols, rows },
+    )
+    .await
+}
+
+    async fn spawn_pipe_inner(
+        request: NormalizedExecutionRequest,
+        output: Arc<OutputBuffer>,
+        api: Arc<dyn Win32Facade>,
+) -> Result<SpawnedPlatformProcess, ExecutionError> {
+    spawn_inner(request, output, api, SpawnTransport::Pipe).await
+}
+
+#[cfg(test)]
+async fn spawn_pty_inner(
     request: NormalizedExecutionRequest,
     output: Arc<OutputBuffer>,
     api: Arc<dyn Win32Facade>,
+    cols: u16,
+    rows: u16,
+) -> Result<SpawnedPlatformProcess, ExecutionError> {
+    spawn_inner(
+        request,
+        output,
+        api,
+        SpawnTransport::Pty { cols, rows },
+    )
+    .await
+}
+
+async fn spawn_inner(
+    request: NormalizedExecutionRequest,
+    output: Arc<OutputBuffer>,
+    api: Arc<dyn Win32Facade>,
+    transport: SpawnTransport,
 ) -> Result<SpawnedPlatformProcess, ExecutionError> {
     enforce_sandbox(&request)?;
     let prepared = PreparedCommand::new(&request)?;
@@ -87,6 +132,7 @@ async fn spawn_pipe_inner(
             runtime,
             deadline,
             cancelled,
+            transport,
         )
     });
 
@@ -171,6 +217,12 @@ async fn spawn_pipe_inner(
     })
 }
 
+#[derive(Clone, Copy)]
+enum SpawnTransport {
+    Pipe,
+    Pty { cols: u16, rows: u16 },
+}
+
 fn spawn_transaction(
     mut prepared: PreparedCommand,
     output: Arc<OutputBuffer>,
@@ -178,46 +230,29 @@ fn spawn_transaction(
     runtime: tokio::runtime::Handle,
     deadline: Instant,
     cancellation: Arc<StartCancellation>,
+    transport: SpawnTransport,
 ) -> Result<WindowsOwner, ExecutionError> {
     ensure_setup_active(deadline, &cancellation).map_err(spawn_failed)?;
 
-    let stdin_pipe = create_inheritable_pipe().map_err(spawn_failed)?;
-    let stdout_pipe = create_inheritable_pipe().map_err(spawn_failed)?;
-    let stderr_pipe = create_inheritable_pipe().map_err(spawn_failed)?;
-    clear_inheritance(stdin_pipe.write.as_raw()).map_err(spawn_failed)?;
-    clear_inheritance(stdout_pipe.read.as_raw()).map_err(spawn_failed)?;
-    clear_inheritance(stderr_pipe.read.as_raw()).map_err(spawn_failed)?;
+    let io = PreparedIo::new(transport).map_err(spawn_failed)?;
 
     ensure_setup_active(deadline, &cancellation).map_err(spawn_failed)?;
     let job = create_execution_job().map_err(spawn_failed)?;
     let job = Arc::new(JobControl::new(job));
-    let mut transaction = SpawnTransaction::new(
-        Arc::clone(&job),
-        stdin_pipe,
-        stdout_pipe,
-        stderr_pipe,
-    );
+    let mut transaction = SpawnTransaction::new(Arc::clone(&job), io);
 
     let mut attributes = match ProcThreadAttributeList::new_one() {
         Ok(attributes) => attributes,
         Err(error) => return Err(transaction.into_failure(error, deadline)),
     };
-    let inherited = [
-        transaction.child_stdin().as_raw(),
-        transaction.child_stdout().as_raw(),
-        transaction.child_stderr().as_raw(),
-    ];
-    if let Err(error) = attributes.set_handle_list(&inherited) {
+    if let Err(error) = transaction.configure_attributes(&mut attributes) {
         return Err(transaction.into_failure(error, deadline));
     }
 
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb =
         u32::try_from(mem::size_of::<STARTUPINFOEXW>()).expect("STARTUPINFOEXW fits in u32");
-    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startup.StartupInfo.hStdInput = transaction.child_stdin().as_raw();
-    startup.StartupInfo.hStdOutput = transaction.child_stdout().as_raw();
-    startup.StartupInfo.hStdError = transaction.child_stderr().as_raw();
+    transaction.configure_startup(&mut startup);
     startup.lpAttributeList = attributes.as_mut_ptr();
 
     if let Err(error) = ensure_setup_active(deadline, &cancellation) {
@@ -227,8 +262,8 @@ fn spawn_transaction(
     let mut process_information = PROCESS_INFORMATION::default();
     let flags = CREATE_SUSPENDED
         | CREATE_UNICODE_ENVIRONMENT
-        | CREATE_NO_WINDOW
-        | EXTENDED_STARTUPINFO_PRESENT;
+        | EXTENDED_STARTUPINFO_PRESENT
+        | transaction.extra_creation_flags();
     // SAFETY: every pointer refers to live, NUL-terminated backing storage for
     // the duration of the call. The mutable command-line buffer is exclusively
     // owned by this transaction. The handle list contains exactly the three
@@ -239,7 +274,7 @@ fn spawn_transaction(
             prepared.command_line.as_mut_ptr(),
             ptr::null(),
             ptr::null(),
-            1,
+            transaction.inherit_handles(),
             flags,
             prepared.environment.as_ptr().cast::<c_void>(),
             prepared.cwd.as_ptr(),
@@ -352,32 +387,20 @@ fn spawn_transaction(
         }
     }
 
-    transaction.child_stdin.take();
-    transaction.child_stdout.take();
-    transaction.child_stderr.take();
+    transaction.close_child_only_handles();
     transaction.thread.take();
 
     if let Err(error) = ensure_setup_active(deadline, &cancellation) {
         return Err(transaction.into_failure(error, deadline));
     }
 
-    let stdout = transaction
-        .parent_stdout
-        .take()
-        .expect("parent stdout is owned until reader start");
-    let stderr = transaction
-        .parent_stderr
-        .take()
-        .expect("parent stderr is owned until reader start");
-    let readers = vec![
-        start_reader(
-            &runtime,
-            stdout,
-            OutputStream::Stdout,
-            Arc::clone(&output),
-        ),
-        start_reader(&runtime, stderr, OutputStream::Stderr, output),
-    ];
+    let (stdin, readers, pseudoconsole) = transaction.take_runtime_io(&runtime, output);
+    let owner_pseudoconsole = transaction.pseudoconsole_control();
+    let pty_input_close_not_before = owner_pseudoconsole.as_ref().map(|_| {
+        Instant::now()
+            .checked_add(CONPTY_INPUT_CLOSE_GRACE)
+            .unwrap_or_else(Instant::now)
+    });
     let (completion_sender, completion_receiver) = watch::channel(LifecycleCompletion::Running);
     let lifecycle_process = Arc::clone(
         transaction
@@ -387,6 +410,7 @@ fn spawn_transaction(
     );
     let lifecycle_job = Arc::clone(&job);
     runtime.spawn_blocking(move || {
+        let failure_pseudoconsole = pseudoconsole.clone();
         let lifecycle_deadline = Instant::now()
             .checked_add(LIFECYCLE_WAIT_HORIZON)
             .unwrap_or_else(Instant::now);
@@ -394,18 +418,33 @@ fn spawn_transaction(
             Arc::clone(&lifecycle_process),
             Arc::clone(&lifecycle_job),
             readers,
+            pseudoconsole,
             lifecycle_deadline,
         );
         let completion = match result {
             Ok(fact) => LifecycleCompletion::Reaped(fact),
-            Err(error) => LifecycleCompletion::Failed {
-                kind: error.kind(),
-                message: Arc::from(lifecycle_failure_message(
+            Err(error) => {
+                let kind = error.kind();
+                let mut message = lifecycle_failure_message(
                     error,
                     &lifecycle_process,
                     &lifecycle_job,
-                )),
-            },
+                );
+                if let Some(pseudoconsole) = failure_pseudoconsole {
+                    let close_deadline = Instant::now()
+                        .checked_add(conpty::CLOSE_TIMEOUT)
+                        .unwrap_or_else(Instant::now);
+                    if let Err(error) = pseudoconsole.close_until(close_deadline) {
+                        message.push_str(&format!(
+                            "; close pseudoconsole after lifecycle failure: {error}"
+                        ));
+                    }
+                }
+                LifecycleCompletion::Failed {
+                    kind,
+                    message: Arc::from(message),
+                }
+            }
         };
         completion_sender.send_replace(completion);
     });
@@ -415,17 +454,14 @@ fn spawn_transaction(
         .process
         .take()
         .expect("created process is transferred to the owner");
-    let stdin = transaction
-        .parent_stdin
-        .take()
-        .expect("parent stdin is transferred to the owner");
     transaction.disarmed = true;
-
     Ok(WindowsOwner {
         pid,
         process,
         job,
         stdin: Arc::new(tokio::sync::Mutex::new(Some(stdin))),
+        pseudoconsole: owner_pseudoconsole,
+        pty_input_close_not_before,
         completion: completion_receiver,
     })
 }
@@ -542,49 +578,81 @@ struct SpawnTransaction {
     process: Option<Arc<OwnedHandle>>,
     thread: Option<OwnedHandle>,
     job: Arc<JobControl>,
-    parent_stdin: Option<OwnedHandle>,
-    child_stdin: Option<OwnedHandle>,
-    parent_stdout: Option<OwnedHandle>,
-    child_stdout: Option<OwnedHandle>,
-    parent_stderr: Option<OwnedHandle>,
-    child_stderr: Option<OwnedHandle>,
+    io: Option<PreparedIo>,
     phase: SpawnPhase,
     disarmed: bool,
 }
 
 impl SpawnTransaction {
-    fn new(
-        job: Arc<JobControl>,
-        stdin: PipePair,
-        stdout: PipePair,
-        stderr: PipePair,
-    ) -> Self {
+    fn new(job: Arc<JobControl>, io: PreparedIo) -> Self {
         Self {
             pid: None,
             process: None,
             thread: None,
             job,
-            parent_stdin: Some(stdin.write),
-            child_stdin: Some(stdin.read),
-            parent_stdout: Some(stdout.read),
-            child_stdout: Some(stdout.write),
-            parent_stderr: Some(stderr.read),
-            child_stderr: Some(stderr.write),
+            io: Some(io),
             phase: SpawnPhase::Preparing,
             disarmed: false,
         }
     }
 
-    fn child_stdin(&self) -> &OwnedHandle {
-        self.child_stdin.as_ref().expect("child stdin is owned")
+    fn configure_attributes(
+        &mut self,
+        attributes: &mut ProcThreadAttributeList,
+    ) -> io::Result<()> {
+        self.io
+            .as_ref()
+            .expect("transport I/O is owned")
+            .configure_attributes(attributes)
     }
 
-    fn child_stdout(&self) -> &OwnedHandle {
-        self.child_stdout.as_ref().expect("child stdout is owned")
+    fn configure_startup(&self, startup: &mut STARTUPINFOEXW) {
+        self.io
+            .as_ref()
+            .expect("transport I/O is owned")
+            .configure_startup(startup);
     }
 
-    fn child_stderr(&self) -> &OwnedHandle {
-        self.child_stderr.as_ref().expect("child stderr is owned")
+    fn inherit_handles(&self) -> i32 {
+        self.io
+            .as_ref()
+            .expect("transport I/O is owned")
+            .inherit_handles()
+    }
+
+    fn extra_creation_flags(&self) -> u32 {
+        self.io
+            .as_ref()
+            .expect("transport I/O is owned")
+            .extra_creation_flags()
+    }
+
+    fn close_child_only_handles(&mut self) {
+        self.io
+            .as_mut()
+            .expect("transport I/O is owned")
+            .close_child_only_handles();
+    }
+
+    fn take_runtime_io(
+        &mut self,
+        runtime: &tokio::runtime::Handle,
+        output: Arc<OutputBuffer>,
+    ) -> (
+        OwnedHandle,
+        Vec<ReaderCompletion>,
+        Option<Arc<PseudoConsoleControl>>,
+    ) {
+        self.io
+            .as_mut()
+            .expect("transport I/O is owned")
+            .take_runtime_io(runtime, output)
+    }
+
+    fn pseudoconsole_control(&self) -> Option<Arc<PseudoConsoleControl>> {
+        self.io
+            .as_ref()
+            .and_then(PreparedIo::pseudoconsole_control)
     }
 
     fn into_failure(mut self, error: io::Error, setup_deadline: Instant) -> ExecutionError {
@@ -625,12 +693,9 @@ impl SpawnTransaction {
             ..CleanupReport::default()
         };
         let started = Instant::now();
-        self.parent_stdin.take();
-        self.child_stdin.take();
-        self.parent_stdout.take();
-        self.child_stdout.take();
-        self.parent_stderr.take();
-        self.child_stderr.take();
+        self.io
+            .as_mut()
+            .map(PreparedIo::close_input_and_child_handles);
         self.thread.take();
 
         if let Some(process) = &self.process {
@@ -686,6 +751,14 @@ impl SpawnTransaction {
         if !cleanup.errors.is_empty() {
             let _ = self.job.close_for_kill();
         }
+        if let Some(io) = self.io.as_mut()
+            && let Err(error) = io.finish_cleanup(deadline)
+        {
+            cleanup
+                .errors
+                .push(format!("close Windows transport: {error}"));
+        }
+        self.io.take();
         self.process.take();
         cleanup.elapsed = started.elapsed();
         cleanup
@@ -707,6 +780,237 @@ impl Drop for SpawnTransaction {
 struct PipePair {
     read: OwnedHandle,
     write: OwnedHandle,
+}
+
+enum PreparedIo {
+    Pipe {
+        parent_stdin: Option<OwnedHandle>,
+        child_stdin: Option<OwnedHandle>,
+        parent_stdout: Option<OwnedHandle>,
+        child_stdout: Option<OwnedHandle>,
+        parent_stderr: Option<OwnedHandle>,
+        child_stderr: Option<OwnedHandle>,
+    },
+    Pty {
+        input: Option<OwnedHandle>,
+        output: Option<OwnedHandle>,
+        control: Arc<PseudoConsoleControl>,
+    },
+}
+
+impl PreparedIo {
+    fn new(transport: SpawnTransport) -> io::Result<Self> {
+        match transport {
+            SpawnTransport::Pipe => {
+                let stdin = create_inheritable_pipe()?;
+                let stdout = create_inheritable_pipe()?;
+                let stderr = create_inheritable_pipe()?;
+                clear_inheritance(stdin.write.as_raw())?;
+                clear_inheritance(stdout.read.as_raw())?;
+                clear_inheritance(stderr.read.as_raw())?;
+                Ok(Self::Pipe {
+                    parent_stdin: Some(stdin.write),
+                    child_stdin: Some(stdin.read),
+                    parent_stdout: Some(stdout.read),
+                    child_stdout: Some(stdout.write),
+                    parent_stderr: Some(stderr.read),
+                    child_stderr: Some(stderr.write),
+                })
+            }
+            SpawnTransport::Pty { cols, rows } => {
+                let prepared = PreparedConPty::create(cols, rows, || {
+                    let pair = create_inheritable_pipe()?;
+                    Ok((pair.read, pair.write))
+                })?;
+                clear_inheritance(prepared.input.as_raw())?;
+                clear_inheritance(prepared.output.as_raw())?;
+                let (control, input, output) = prepared.into_parts();
+                Ok(Self::Pty {
+                    input: Some(input),
+                    output: Some(output),
+                    control,
+                })
+            }
+        }
+    }
+
+    fn configure_attributes(
+        &self,
+        attributes: &mut ProcThreadAttributeList,
+    ) -> io::Result<()> {
+        match self {
+            Self::Pipe {
+                child_stdin,
+                child_stdout,
+                child_stderr,
+                ..
+            } => attributes.set_handle_list(&[
+                child_stdin.as_ref().expect("child stdin is owned").as_raw(),
+                child_stdout
+                    .as_ref()
+                    .expect("child stdout is owned")
+                    .as_raw(),
+                child_stderr
+                    .as_ref()
+                    .expect("child stderr is owned")
+                    .as_raw(),
+            ]),
+            Self::Pty { control, .. } => attributes.set_pseudoconsole(control.raw()?),
+        }
+    }
+
+    fn configure_startup(&self, startup: &mut STARTUPINFOEXW) {
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        match self {
+            Self::Pipe {
+                child_stdin,
+                child_stdout,
+                child_stderr,
+                ..
+            } => {
+                startup.StartupInfo.hStdInput =
+                    child_stdin.as_ref().expect("child stdin is owned").as_raw();
+                startup.StartupInfo.hStdOutput = child_stdout
+                    .as_ref()
+                    .expect("child stdout is owned")
+                    .as_raw();
+                startup.StartupInfo.hStdError = child_stderr
+                    .as_ref()
+                    .expect("child stderr is owned")
+                    .as_raw();
+            }
+            Self::Pty { .. } => {
+                startup.StartupInfo.hStdInput = -1isize as HANDLE;
+                startup.StartupInfo.hStdOutput = -1isize as HANDLE;
+                startup.StartupInfo.hStdError = -1isize as HANDLE;
+            }
+        }
+    }
+
+    const fn inherit_handles(&self) -> i32 {
+        match self {
+            Self::Pipe { .. } => 1,
+            Self::Pty { .. } => 0,
+        }
+    }
+
+    const fn extra_creation_flags(&self) -> u32 {
+        match self {
+            Self::Pipe { .. } => CREATE_NO_WINDOW,
+            Self::Pty { .. } => 0,
+        }
+    }
+
+    fn close_child_only_handles(&mut self) {
+        if let Self::Pipe {
+            child_stdin,
+            child_stdout,
+            child_stderr,
+            ..
+        } = self
+        {
+            child_stdin.take();
+            child_stdout.take();
+            child_stderr.take();
+        }
+    }
+
+    fn take_runtime_io(
+        &mut self,
+        runtime: &tokio::runtime::Handle,
+        output: Arc<OutputBuffer>,
+    ) -> (
+        OwnedHandle,
+        Vec<ReaderCompletion>,
+        Option<Arc<PseudoConsoleControl>>,
+    ) {
+        match self {
+            Self::Pipe {
+                parent_stdin,
+                parent_stdout,
+                parent_stderr,
+                ..
+            } => {
+                let stdin = parent_stdin.take().expect("parent stdin is owned");
+                let stdout = parent_stdout.take().expect("parent stdout is owned");
+                let stderr = parent_stderr.take().expect("parent stderr is owned");
+                (
+                    stdin,
+                    vec![
+                        start_reader(
+                            runtime,
+                            stdout,
+                            OutputStream::Stdout,
+                            Arc::clone(&output),
+                        ),
+                        start_reader(runtime, stderr, OutputStream::Stderr, output),
+                    ],
+                    None,
+                )
+            }
+            Self::Pty {
+                input,
+                output: pty_output,
+                control,
+            } => {
+                let input = input.take().expect("ConPTY input is owned");
+                let output_handle = pty_output.take().expect("ConPTY output is owned");
+                (
+                    input,
+                    vec![start_reader(runtime, output_handle, OutputStream::Pty, output)],
+                    Some(Arc::clone(control)),
+                )
+            }
+        }
+    }
+
+    fn pseudoconsole_control(&self) -> Option<Arc<PseudoConsoleControl>> {
+        match self {
+            Self::Pipe { .. } => None,
+            Self::Pty { control, .. } => Some(Arc::clone(control)),
+        }
+    }
+
+    fn close_input_and_child_handles(&mut self) {
+        match self {
+            Self::Pipe {
+                parent_stdin,
+                child_stdin,
+                child_stdout,
+                child_stderr,
+                ..
+            } => {
+                parent_stdin.take();
+                child_stdin.take();
+                child_stdout.take();
+                child_stderr.take();
+            }
+            Self::Pty { input, .. } => {
+                input.take();
+            }
+        }
+    }
+
+    fn finish_cleanup(&mut self, deadline: Instant) -> io::Result<()> {
+        match self {
+            Self::Pipe { .. } => Ok(()),
+            Self::Pty {
+                input,
+                output,
+                control,
+            } => {
+                input.take();
+                let close_deadline = deadline.min(
+                    Instant::now()
+                        .checked_add(conpty::CLOSE_TIMEOUT)
+                        .unwrap_or(deadline),
+                );
+                let result = control.close_until(close_deadline);
+                output.take();
+                result
+            }
+        }
+    }
 }
 
 fn create_inheritable_pipe() -> io::Result<PipePair> {
@@ -970,6 +1274,7 @@ fn run_lifecycle(
     process: Arc<OwnedHandle>,
     job: Arc<JobControl>,
     readers: Vec<ReaderCompletion>,
+    pseudoconsole: Option<Arc<PseudoConsoleControl>>,
     deadline: Instant,
 ) -> io::Result<ExitFact> {
     wait_handle_until(process.as_raw(), deadline)?;
@@ -984,11 +1289,25 @@ fn run_lifecycle(
         job.wait_empty_until(deadline)?;
     }
     job.close_proven_empty()?;
-    finish_readers(readers, deadline)?;
+    let mut cleanup_errors = Vec::new();
+    if let Some(pseudoconsole) = pseudoconsole {
+        let close_deadline = deadline.min(
+            Instant::now()
+                .checked_add(CONPTY_NATURAL_CLOSE_WAIT)
+                .unwrap_or(deadline),
+        );
+        if let Err(error) = pseudoconsole.close_until(close_deadline) {
+            cleanup_errors.push(format!("close pseudoconsole: {error}"));
+        }
+        drain_pty_readers_after_close(readers, deadline);
+    } else {
+        finish_readers(readers, deadline)?;
+    }
 
     Ok(ExitFact {
         code: Some(exit_code as i32),
         signal: None,
+        cleanup_errors,
     })
 }
 
@@ -1061,17 +1380,43 @@ fn finish_readers(readers: Vec<ReaderCompletion>, caller_deadline: Instant) -> i
     }
 }
 
+fn drain_pty_readers_after_close(
+    readers: Vec<ReaderCompletion>,
+    caller_deadline: Instant,
+) {
+    let deadline = caller_deadline.min(
+        Instant::now()
+            .checked_add(POST_EXIT_READER_DRAIN)
+            .unwrap_or(caller_deadline),
+    );
+    for reader in readers {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match reader.receiver.recv_timeout(remaining) {
+            Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => return,
+        }
+    }
+}
+
 struct WindowsOwner {
     pid: u32,
     process: Arc<OwnedHandle>,
     job: Arc<JobControl>,
     stdin: Arc<tokio::sync::Mutex<Option<OwnedHandle>>>,
+    pseudoconsole: Option<Arc<PseudoConsoleControl>>,
+    pty_input_close_not_before: Option<Instant>,
     completion: watch::Receiver<LifecycleCompletion>,
 }
 
 impl Drop for WindowsOwner {
     fn drop(&mut self) {
         let _ = self.job.close_for_kill();
+        if let Some(pseudoconsole) = &self.pseudoconsole {
+            let _ = pseudoconsole.begin_close();
+        }
     }
 }
 
@@ -1099,15 +1444,65 @@ impl ProcessOwner for WindowsOwner {
     }
 
     async fn close_stdin(&self) -> io::Result<()> {
-        self.stdin.lock().await.take();
+        let mut stdin = self.stdin.lock().await;
+        if stdin.is_none() {
+            return Ok(());
+        }
+        if let Some(not_before) = self.pty_input_close_not_before {
+            let remaining = not_before.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                tokio::time::sleep(remaining).await;
+            }
+            let stdin = stdin
+                .take()
+                .expect("ConPTY stdin was validated before the EOF write");
+            tokio::task::spawn_blocking(move || {
+                // In the default ConPTY cooked-input contract, CR submits any
+                // pending line and SUB is the Windows console/CRT EOF
+                // character. Closing the input pipe alone is observed by
+                // console clients as CTRL_CLOSE/CONTROL_C_EXIT rather than a
+                // successful stdin EOF. Arbitrary raw-mode clients cannot
+                // expose a truthful generic EOF operation through ConPTY.
+                write_all(stdin.as_raw(), b"\r\n\x1a")?;
+                std::thread::sleep(Duration::from_millis(25));
+                Ok::<(), io::Error>(())
+            })
+            .await
+            .map_err(|error| io::Error::other(format!("PTY EOF writer task failed: {error}")))??;
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "ConPTY cannot prove generic stdin EOF; a default cooked-console EOF \
+                 sequence was delivered before closing input",
+            ));
+        }
+        stdin.take();
         Ok(())
     }
 
+    async fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        self.pseudoconsole
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "pipe transport does not support terminal resize",
+                )
+            })?
+            .resize(cols, rows)
+    }
+
     async fn interrupt(&self) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "CREATE_NO_WINDOW pipe processes have no truthful console interrupt contract",
-        ))
+        if self.pseudoconsole.is_some() {
+            // In ConPTY's VT input contract, ETX is the terminal Ctrl+C
+            // keystroke. Tree-wide escalation remains owned by the execution
+            // Job if the foreground application ignores it.
+            self.write(b"\x03").await
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "CREATE_NO_WINDOW pipe processes have no truthful console interrupt contract",
+            ))
+        }
     }
 
     async fn terminate(&self) -> io::Result<()> {
@@ -1144,6 +1539,9 @@ impl ProcessOwner for WindowsOwner {
                 }
                 Err(_) => {
                     let _ = self.job.close_for_kill();
+                    if let Some(pseudoconsole) = &self.pseudoconsole {
+                        let _ = pseudoconsole.begin_close();
+                    }
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "exact Windows process wait timed out",
@@ -1738,6 +2136,47 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
+    async fn conpty_assignment_failure_never_resumes_or_executes_user_code() {
+        let temporary = TempDir::new().expect("temporary marker directory should be created");
+        let marker = temporary.path().join("conpty-must-not-exist.marker");
+        let facade = Arc::new(AuditFacade::assignment_failure());
+        let request = program_request(
+            command_shell(),
+            &[
+                OsString::from("/D"),
+                OsString::from("/C"),
+                OsString::from(format!(">\"{}\" echo resumed", marker.display())),
+            ],
+        );
+
+        let result = spawn_pty_inner(
+            request,
+            Arc::new(OutputBuffer::new(4096)),
+            facade.clone(),
+            80,
+            24,
+        )
+        .await;
+
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("injected ConPTY Job assignment failure must reject start"),
+        };
+        assert!(matches!(error, ExecutionError::SpawnFailed { .. }));
+        assert_eq!(
+            facade.events(),
+            vec![SpawnAuditEvent::Created, SpawnAuditEvent::Assigned]
+        );
+        assert!(!marker.exists(), "suspended ConPTY child executed user code");
+        assert!(
+            facade
+                .created_process_is_signaled()
+                .expect("exact ConPTY process liveness probe should succeed")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
     async fn spawn_order_is_create_then_assign_then_resume() {
         let facade = Arc::new(AuditFacade::successful());
         let request = program_request(
@@ -1815,6 +2254,55 @@ mod tests {
         facade
             .wait_created_process_terminated()
             .expect("cancelled start must leave no exact process behind");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn dropping_conpty_start_after_create_cannot_resume_later() {
+        let temporary = TempDir::new().expect("temporary marker directory should be created");
+        let marker = temporary.path().join("drop-conpty-must-not-resume.marker");
+        let facade = Arc::new(PausedAssignFacade::new());
+        let request = program_request(
+            command_shell(),
+            &[
+                OsString::from("/D"),
+                OsString::from("/C"),
+                OsString::from(format!(">\"{}\" echo resumed", marker.display())),
+            ],
+        );
+        let start = tokio::spawn(spawn_pty_inner(
+            request,
+            Arc::new(OutputBuffer::new(4096)),
+            facade.clone(),
+            80,
+            24,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), facade.wait_until_assign_entered())
+            .await
+            .expect("ConPTY transaction should reach the assignment pause");
+        start.abort();
+        let _ = start.await;
+        facade.release_assignment();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if facade.events().contains(&SpawnAuditEvent::Assigned) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("cancelled ConPTY transaction should finish cleanup");
+
+        assert_eq!(
+            facade.events(),
+            vec![SpawnAuditEvent::Created, SpawnAuditEvent::Assigned]
+        );
+        assert!(!marker.exists(), "dropped ConPTY start executed user code");
+        facade
+            .wait_created_process_terminated()
+            .expect("cancelled ConPTY start must leave no exact process behind");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
