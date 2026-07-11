@@ -157,29 +157,9 @@ const TerminalRightRegion: React.FC<{ session: ITerminalSession }> = ({ session 
         </div>
       )}
 
-      {/* Workspace rail — mirrors the conversation right sider: collapses to
+      {/* Workspace panel — mirrors the conversation right sider: collapses to
           width 0, WorkspacePanelHeader on top (in-panel toggle gated to
           non-mac/Windows), left-edge resize handle when expanded. */}
-      {!isMobile && (
-        <WorkspaceToolRail
-          t={t}
-          activeTab={activeWorkspaceTab}
-          expanded={!rightSiderCollapsed}
-          onSelect={selectWorkspaceTool}
-          changeCount={workspaceChangeCount}
-          footer={
-            <button
-              type='button'
-              className='workspace-tool-rail__item workspace-tool-rail__item--collapse'
-              onClick={() => persistRightSiderCollapsed(!rightSiderCollapsed)}
-              aria-label={rightSiderCollapsed ? 'Expand workspace' : 'Collapse workspace'}
-            >
-              {rightSiderCollapsed ? <span>‹</span> : <span>›</span>}
-            </button>
-          }
-        />
-      )}
-
       {!isMobile && (
         <div
           className='!bg-1 relative layout-sider'
@@ -214,6 +194,26 @@ const TerminalRightRegion: React.FC<{ session: ITerminalSession }> = ({ session 
             <TerminalWorkspaceRail session={session} />
           </div>
         </div>
+      )}
+
+      {!isMobile && (
+        <WorkspaceToolRail
+          t={t}
+          activeTab={activeWorkspaceTab}
+          expanded={!rightSiderCollapsed}
+          onSelect={selectWorkspaceTool}
+          changeCount={workspaceChangeCount}
+          footer={
+            <button
+              type='button'
+              className='workspace-tool-rail__item workspace-tool-rail__item--collapse'
+              onClick={() => persistRightSiderCollapsed(!rightSiderCollapsed)}
+              aria-label={rightSiderCollapsed ? 'Expand workspace' : 'Collapse workspace'}
+            >
+              {rightSiderCollapsed ? <span>‹</span> : <span>›</span>}
+            </button>
+          }
+        />
       )}
     </>
   );

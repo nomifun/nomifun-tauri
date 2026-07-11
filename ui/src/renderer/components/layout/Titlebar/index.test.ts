@@ -20,4 +20,10 @@ describe('Titlebar instant icon tooltips', () => {
     expect(titlebarSource.includes('title={sessionToggleTooltip}')).toBe(false);
     expect(languageMenuSource.includes('title={label}')).toBe(false);
   });
+
+  test('shows the workspace titlebar toggle on mobile only', () => {
+    expect(titlebarSource.includes('const showWorkspaceButton = workspaceAvailable && Boolean(layout?.isMobile);')).toBe(
+      true
+    );
+  });
 });

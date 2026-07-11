@@ -410,36 +410,6 @@ const ChatLayoutInner: React.FC<ChatLayoutProps> = (props) => {
             )}
           </div>
         </div>
-        {workspaceEnabled && !layout?.isMobile && (
-          <WorkspaceToolRail
-            t={t}
-            activeTab={activeWorkspaceTab}
-            expanded={!rightSiderCollapsed}
-            onSelect={selectWorkspaceTool}
-            changeCount={workspaceChangeCount}
-            extraTabs={props.workspaceExtraTabs}
-            orchestration={workspaceOrchestration}
-            footer={
-              <button
-                type='button'
-                className='workspace-tool-rail__item workspace-tool-rail__item--collapse'
-                onClick={() => {
-                  if (rightSiderCollapsed && props.workspaceOrchestration?.active) {
-                    props.workspaceOrchestration.onClick();
-                  }
-                  persistRightSiderCollapsed(!rightSiderCollapsed);
-                }}
-                aria-label={
-                  rightSiderCollapsed
-                    ? t('conversation.workspace.expand', { defaultValue: '展开侧栏' })
-                    : t('conversation.workspace.collapse', { defaultValue: '收起侧栏' })
-                }
-              >
-                {rightSiderCollapsed ? <span>‹</span> : <span>›</span>}
-              </button>
-            }
-          />
-        )}
         {workspaceEnabled && layout?.isMobile && rightSiderCollapsed && (
           <button
             type='button'
@@ -488,6 +458,36 @@ const ChatLayoutInner: React.FC<ChatLayoutProps> = (props) => {
               {props.sider}
             </ArcoLayout.Content>
           </div>
+        )}
+        {workspaceEnabled && !layout?.isMobile && (
+          <WorkspaceToolRail
+            t={t}
+            activeTab={activeWorkspaceTab}
+            expanded={!rightSiderCollapsed}
+            onSelect={selectWorkspaceTool}
+            changeCount={workspaceChangeCount}
+            extraTabs={props.workspaceExtraTabs}
+            orchestration={workspaceOrchestration}
+            footer={
+              <button
+                type='button'
+                className='workspace-tool-rail__item workspace-tool-rail__item--collapse'
+                onClick={() => {
+                  if (rightSiderCollapsed && props.workspaceOrchestration?.active) {
+                    props.workspaceOrchestration.onClick();
+                  }
+                  persistRightSiderCollapsed(!rightSiderCollapsed);
+                }}
+                aria-label={
+                  rightSiderCollapsed
+                    ? t('conversation.workspace.expand', { defaultValue: '展开侧栏' })
+                    : t('conversation.workspace.collapse', { defaultValue: '收起侧栏' })
+                }
+              >
+                {rightSiderCollapsed ? <span>‹</span> : <span>›</span>}
+              </button>
+            }
+          />
         )}
 
         {/* Mobile workspace overlay: backdrop + fixed panel + floating collapse handle */}

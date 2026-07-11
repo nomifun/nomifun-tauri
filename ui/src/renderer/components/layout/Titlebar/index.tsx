@@ -18,7 +18,7 @@ import {
 import type { SessionSiderStateDetail } from '@renderer/utils/workspace/sessionSiderEvents';
 import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
 import { useNavigationHistory } from '@/renderer/hooks/context/NavigationHistoryContext';
-import { isDesktopShell, isMacOS, isWindows } from '@/renderer/utils/platform';
+import { isDesktopShell, isMacOS } from '@/renderer/utils/platform';
 import './titlebar.css';
 
 interface TitlebarProps {
@@ -115,14 +115,11 @@ const Titlebar: React.FC<TitlebarProps> = ({ workspaceAvailable }) => {
 
   const isDesktopRuntime = isDesktopShell();
   const isMacRuntime = isDesktopRuntime && isMacOS();
-  const isWinRuntime = isDesktopRuntime && isWindows();
-  // Windows/Linux 显示自定义窗口按钮；macOS 在标题栏给工作区一个切换入口
+  // Windows/Linux 显示自定义窗口按钮。
   const showWindowControls = isDesktopRuntime && !isMacRuntime;
-  // WebUI、macOS、Windows 桌面都在标题栏放工作区开关。
-  // Windows 上它落在系统窗口按钮（最小化/最大化/关闭）左侧；macOS 没有系统按钮占位。
-  // Linux 桌面不在此列：它改用工作区面板内的折叠/展开按钮
-  //（ChatLayout 中按 `!isMac && !isWindows` 渲染），避免与标题栏开关重复。
-  const showWorkspaceButton = workspaceAvailable && (!isDesktopRuntime || isMacRuntime || isWinRuntime);
+  // Desktop workspace surfaces use the persistent far-right tool rail as their
+  // single toggle. Mobile keeps the titlebar entry because the rail is hidden.
+  const showWorkspaceButton = workspaceAvailable && Boolean(layout?.isMobile);
 
   const workspaceTooltip = workspaceCollapsed
     ? t('common.expandMore', { defaultValue: 'Expand workspace' })

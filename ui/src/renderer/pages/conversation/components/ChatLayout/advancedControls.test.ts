@@ -24,4 +24,14 @@ describe('ChatLayout advanced controls', () => {
 
     expect(source.includes('autoExpandOnFiles: false')).toBe(true);
   });
+
+  test('keeps the workspace tool rail at the far right of the expanded panel', () => {
+    const source = readSource(new URL('./index.tsx', import.meta.url));
+    const panelIndex = source.indexOf("className={classNames('!bg-1 relative chat-layout-right-sider layout-sider')}");
+    const railIndex = source.indexOf('<WorkspaceToolRail');
+
+    expect(panelIndex >= 0).toBe(true);
+    expect(railIndex >= 0).toBe(true);
+    expect(panelIndex < railIndex).toBe(true);
+  });
 });
