@@ -86,13 +86,20 @@ where
     env.insert("LANG".to_owned(), UTF8_LANG.to_owned());
     env.insert("LC_CTYPE".to_owned(), UTF8_CTYPE.to_owned());
 
-    // Inherited LC_ALL has higher POSIX precedence than LC_CTYPE. Repair only
-    // a non-empty, non-UTF-8 value; a valid UTF-8 LC_ALL is already safe.
-    if inherited("LC_ALL")
-        .filter(|value| !value.is_empty())
-        .is_some_and(|value| !is_utf8_lc_all(value.as_os_str()))
-    {
-        env.insert("LC_ALL".to_owned(), UTF8_LANG.to_owned());
+    // Inherited LC_ALL has higher POSIX precedence than LC_CTYPE. Materialize
+    // any non-empty value into the overrides: preserve a valid UTF-8 locale
+    // exactly, or replace malformed/non-Unicode/legacy values with the safe
+    // platform fallback. This also tells the PTY layer not to remove a valid
+    // inherited LC_ALL while resolving explicit-locale precedence.
+    if let Some(value) = inherited("LC_ALL").filter(|value| !value.is_empty()) {
+        let value = if is_utf8_lc_all(value.as_os_str()) {
+            value
+                .into_string()
+                .expect("a validated UTF-8 locale is Unicode")
+        } else {
+            UTF8_LANG.to_owned()
+        };
+        env.insert("LC_ALL".to_owned(), value);
     }
 }
 
@@ -1666,12 +1673,12 @@ mod tests {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn emulator_env_defaults_keeps_inherited_utf8_lc_all() {
+    fn emulator_env_defaults_preserves_inherited_utf8_lc_all_as_override() {
         let mut env = HashMap::new();
         apply_emulator_env_defaults_with(&mut env, |key| {
             (key == "LC_ALL").then(|| "C.UTF-8".into())
         });
-        assert!(!env.contains_key("LC_ALL"));
+        assert_eq!(env.get("LC_ALL").map(String::as_str), Some("C.UTF-8"));
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1774,6 +1781,55 @@ mod tests {
         assert!(
             out.contains("CT=[truecolor]"),
             "child must receive the injected COLORTERM, got: {out:?}"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn pty_child_preserves_valid_inherited_utf8_lc_all() {
+        use crate::pty::{PtyHandle, SpawnParams};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut env = HashMap::new();
+        apply_emulator_env_defaults_with(&mut env, |key| {
+            (key == "LC_ALL").then(|| "C.UTF-8".into())
+        });
+
+        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let cap = captured.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let done_cb = done.clone();
+        let _handle = PtyHandle::spawn(
+            SpawnParams {
+                program: "sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "printf 'LC_ALL=[%s] LC_CTYPE=[%s] LANG=[%s]\n' \"$LC_ALL\" \"$LC_CTYPE\" \"$LANG\""
+                        .to_owned(),
+                ],
+                cwd: String::new(),
+                env,
+                cols: 80,
+                rows: 24,
+            },
+            0,
+            move |chunk| cap.lock().unwrap().extend_from_slice(&chunk),
+            move |_code, _sb| done_cb.store(true, Ordering::SeqCst),
+        )
+        .expect("spawn sh");
+
+        for _ in 0..250 {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        let output = String::from_utf8(captured.lock().unwrap().clone()).expect("UTF-8 output");
+        assert!(
+            output.contains("LC_ALL=[C.UTF-8]"),
+            "valid inherited LC_ALL must survive normalization and PTY spawn: {output:?}"
         );
     }
 

@@ -63,12 +63,12 @@ fn emulator_env_defaults_repairs_inherited_non_utf8_lc_all() {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
-fn emulator_env_defaults_keeps_inherited_utf8_lc_all() {
+fn emulator_env_defaults_preserves_inherited_utf8_lc_all_as_override() {
     let mut env = HashMap::new();
     apply_emulator_env_defaults_with(&mut env, |key| {
         (key == "LC_ALL").then(|| "C.UTF-8".into())
     });
-    assert!(!env.contains_key("LC_ALL"));
+    assert_eq!(env.get("LC_ALL").map(String::as_str), Some("C.UTF-8"));
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -159,11 +159,13 @@ where
     env.insert("LANG".to_owned(), UTF8_LANG.to_owned());
     env.insert("LC_CTYPE".to_owned(), UTF8_CTYPE.to_owned());
 
-    if inherited("LC_ALL")
-        .filter(|value| !value.is_empty())
-        .is_some_and(|value| !is_utf8_lc_all(value.as_os_str()))
-    {
-        env.insert("LC_ALL".to_owned(), UTF8_LANG.to_owned());
+    if let Some(value) = inherited("LC_ALL").filter(|value| !value.is_empty()) {
+        let value = if is_utf8_lc_all(value.as_os_str()) {
+            value.into_string().expect("a validated UTF-8 locale is Unicode")
+        } else {
+            UTF8_LANG.to_owned()
+        };
+        env.insert("LC_ALL".to_owned(), value);
     }
 }
 
