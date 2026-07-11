@@ -1,5 +1,6 @@
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", windows))]
 
+#[cfg(target_os = "linux")]
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs, io,
@@ -18,6 +19,7 @@ fn harness_binary() -> &'static str {
         .expect("Cargo did not build the parent_death_harness binary")
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 #[serial_test::serial]
 async fn abrupt_harness_exit_kills_and_reaps_the_owned_process_group() {
@@ -72,6 +74,7 @@ async fn abrupt_harness_exit_kills_and_reaps_the_owned_process_group() {
     group_cleanup.armed = false;
 }
 
+#[cfg(target_os = "linux")]
 async fn reap_owned_group(
     leader: libc::pid_t,
     grandchild: libc::pid_t,
@@ -109,6 +112,7 @@ async fn reap_owned_group(
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "adopted process-group reap timed out"))?
 }
 
+#[cfg(target_os = "linux")]
 fn direct_children() -> io::Result<BTreeSet<libc::pid_t>> {
     let mut children = BTreeSet::new();
     for task in fs::read_dir("/proc/self/task")? {
@@ -125,12 +129,14 @@ fn direct_children() -> io::Result<BTreeSet<libc::pid_t>> {
     Ok(children)
 }
 
+#[cfg(target_os = "linux")]
 fn process_group(pid: libc::pid_t) -> Option<libc::pid_t> {
     // SAFETY: getpgid only inspects the identity named by pid.
     let pgid = unsafe { libc::getpgid(pid) };
     (pgid >= 0).then_some(pgid)
 }
 
+#[cfg(target_os = "linux")]
 fn reap_exact_if_ready(pid: libc::pid_t) -> io::Result<Option<ExitStatus>> {
     let mut status = 0;
     // SAFETY: pid is an exact child identity discovered from /proc or a published marker.
@@ -150,6 +156,7 @@ fn reap_exact_if_ready(pid: libc::pid_t) -> io::Result<Option<ExitStatus>> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn assert_sigkill(status: Option<&ExitStatus>, label: &str) {
     assert!(
         status.is_some_and(|status| was_sigkill(*status)),
@@ -157,11 +164,13 @@ fn assert_sigkill(status: Option<&ExitStatus>, label: &str) {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn was_sigkill(status: ExitStatus) -> bool {
     use std::os::unix::process::ExitStatusExt;
     status.signal() == Some(libc::SIGKILL)
 }
 
+#[cfg(target_os = "linux")]
 fn read_pid(path: &Path) -> io::Result<libc::pid_t> {
     fs::read_to_string(path)?
         .trim()
@@ -169,6 +178,7 @@ fn read_pid(path: &Path) -> io::Result<libc::pid_t> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
+#[cfg(target_os = "linux")]
 fn process_exists(pid: libc::pid_t) -> bool {
     // SAFETY: signal zero probes liveness without delivering a signal.
     if unsafe { libc::kill(pid, 0) } == 0 {
@@ -177,10 +187,12 @@ fn process_exists(pid: libc::pid_t) -> bool {
     io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
+#[cfg(target_os = "linux")]
 struct SubreaperGuard {
     previous: libc::c_int,
 }
 
+#[cfg(target_os = "linux")]
 impl SubreaperGuard {
     fn install() -> io::Result<Self> {
         let mut previous = 0;
@@ -196,6 +208,7 @@ impl SubreaperGuard {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for SubreaperGuard {
     fn drop(&mut self) {
         // SAFETY: restores the process-wide flag captured by install.
@@ -203,8 +216,10 @@ impl Drop for SubreaperGuard {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct HarnessCleanup(Option<Child>);
 
+#[cfg(target_os = "linux")]
 impl Drop for HarnessCleanup {
     fn drop(&mut self) {
         if let Some(child) = self.0.as_mut() {
@@ -214,12 +229,14 @@ impl Drop for HarnessCleanup {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct GroupCleanup {
     pgid: libc::pid_t,
     members: Vec<libc::pid_t>,
     armed: bool,
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for GroupCleanup {
     fn drop(&mut self) {
         if !self.armed {
@@ -230,6 +247,331 @@ impl Drop for GroupCleanup {
         for pid in &self.members {
             // SAFETY: these exact PIDs were published by the harness and helper.
             let _ = unsafe { libc::kill(*pid, libc::SIGKILL) };
+        }
+    }
+}
+
+#[cfg(windows)]
+mod windows_parent_death {
+    use std::{
+        fs,
+        io,
+        os::windows::io::AsRawHandle,
+        path::Path,
+        process::{Child, Command},
+        time::{Duration, Instant},
+    };
+
+    use windows_sys::Win32::{
+        Foundation::{
+            CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        },
+        System::{
+            JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+                QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+            },
+            Threading::{
+                OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+                PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+            },
+        },
+    };
+
+    use super::{harness_binary, helper_binary};
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn abrupt_harness_exit_closes_the_execution_job_and_kills_the_tree() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let leader_marker = directory.path().join("leader.pid");
+        let grandchild_marker = directory.path().join("grandchild.pid");
+        let start_gate = directory.path().join("start.gate");
+        let exit_gate = directory.path().join("exit.gate");
+        let fallback_job = TestJob::new().expect("fallback test Job should be created");
+
+        let child = Command::new(harness_binary())
+            .arg(helper_binary())
+            .arg(&leader_marker)
+            .arg(&grandchild_marker)
+            .arg(&start_gate)
+            .arg(&exit_gate)
+            .spawn()
+            .expect("parent-death harness should spawn");
+        let harness_handle = duplicate_child_process_handle(&child)
+            .expect("harness exact process handle should duplicate");
+        fallback_job
+            .assign(harness_handle.raw())
+            .expect("harness should join the fallback test Job");
+        let mut harness = HarnessGuard {
+            child: Some(child),
+            process: harness_handle,
+        };
+
+        publish_gate(&start_gate);
+        let leader_pid = wait_for_pid_marker(&leader_marker).await;
+        let grandchild_pid = wait_for_pid_marker(&grandchild_marker).await;
+        let leader =
+            ExactProcess::open(leader_pid).expect("leader exact process handle should open");
+        let grandchild = ExactProcess::open(grandchild_pid)
+            .expect("grandchild exact process handle should open");
+
+        publish_gate(&exit_gate);
+        harness
+            .process
+            .wait_terminated(Duration::from_secs(5), "harness")
+            .await;
+        let status = harness
+            .child
+            .as_mut()
+            .expect("harness child should be owned")
+            .wait()
+            .expect("harness should be reaped");
+        harness.child.take();
+        assert!(
+            status.success(),
+            "harness failed before deliberate ExitProcess: {status:?}"
+        );
+
+        leader
+            .wait_terminated(Duration::from_secs(5), "leader")
+            .await;
+        grandchild
+            .wait_terminated(Duration::from_secs(5), "grandchild")
+            .await;
+        fallback_job
+            .wait_empty(Duration::from_secs(5))
+            .await
+            .expect("fallback Job should become empty without being closed");
+    }
+
+    fn publish_gate(path: &Path) {
+        fs::write(path, b"go").unwrap_or_else(|error| {
+            panic!("gate should be published at {}: {error}", path.display())
+        });
+    }
+
+    async fn wait_for_pid_marker(path: &Path) -> u32 {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(contents) = fs::read_to_string(path)
+                    && let Ok(pid) = contents.trim().parse::<u32>()
+                {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("PID marker was not published: {}", path.display()))
+    }
+
+    struct OwnedHandle(HANDLE);
+
+    impl OwnedHandle {
+        fn new(handle: HANDLE, operation: &'static str) -> io::Result<Self> {
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                Err(io::Error::new(
+                    io::Error::last_os_error().kind(),
+                    format!("{operation}: {}", io::Error::last_os_error()),
+                ))
+            } else {
+                Ok(Self(handle))
+            }
+        }
+
+        fn raw(&self) -> HANDLE {
+            self.0
+        }
+    }
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            // SAFETY: the wrapper owns one valid kernel handle and closes it exactly once.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    struct ExactProcess {
+        pid: u32,
+        handle: OwnedHandle,
+    }
+
+    impl ExactProcess {
+        fn open(pid: u32) -> io::Result<Self> {
+            // SAFETY: OpenProcess returns one new non-inheritable exact process handle.
+            let handle = OwnedHandle::new(
+                unsafe {
+                    OpenProcess(
+                        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+                        0,
+                        pid,
+                    )
+                },
+                "OpenProcess",
+            )?;
+            Ok(Self { pid, handle })
+        }
+
+        fn raw(&self) -> HANDLE {
+            self.handle.raw()
+        }
+
+        async fn wait_terminated(&self, timeout: Duration, label: &str) {
+            let deadline = Instant::now() + timeout;
+            loop {
+                // SAFETY: the exact process handle remains live while it is inspected.
+                match unsafe { WaitForSingleObject(self.raw(), 0) } {
+                    WAIT_OBJECT_0 => return,
+                    WAIT_TIMEOUT if Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    WAIT_TIMEOUT => {
+                        panic!("{label} pid={} remained alive after {timeout:?}", self.pid)
+                    }
+                    WAIT_FAILED => panic!(
+                        "waiting for {label} pid={} failed: {}",
+                        self.pid,
+                        io::Error::last_os_error()
+                    ),
+                    result => panic!(
+                        "waiting for {label} pid={} returned unexpected status {result:#x}",
+                        self.pid
+                    ),
+                }
+            }
+        }
+
+        fn terminate_best_effort(&self) {
+            // SAFETY: the exact process handle remains live. Termination is panic cleanup only.
+            let _ = unsafe { TerminateProcess(self.raw(), 1) };
+            // SAFETY: bounded best-effort wait on the same exact handle.
+            let _ = unsafe { WaitForSingleObject(self.raw(), 2_000) };
+        }
+    }
+
+    fn duplicate_child_process_handle(child: &Child) -> io::Result<ExactProcess> {
+        use windows_sys::Win32::{
+            Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle},
+            System::Threading::GetCurrentProcess,
+        };
+
+        let mut duplicated = std::ptr::null_mut();
+        // SAFETY: the child and pseudo-current-process handles are valid for the call. The
+        // duplicate is explicitly non-inheritable and owned by the returned wrapper.
+        if unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                child.as_raw_handle().cast(),
+                GetCurrentProcess(),
+                &mut duplicated,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(ExactProcess {
+            pid: child.id(),
+            handle: OwnedHandle::new(duplicated, "DuplicateHandle")?,
+        })
+    }
+
+    struct TestJob {
+        handle: OwnedHandle,
+    }
+
+    impl TestJob {
+        fn new() -> io::Result<Self> {
+            // SAFETY: null security/name pointers request an anonymous, non-inheritable Job.
+            let handle = OwnedHandle::new(
+                unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) },
+                "CreateJobObjectW",
+            )?;
+            let mut information = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: `information` is initialized for the requested information class.
+            if unsafe {
+                SetInformationJobObject(
+                    handle.raw(),
+                    JobObjectExtendedLimitInformation,
+                    (&information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self { handle })
+        }
+
+        fn assign(&self, process: HANDLE) -> io::Result<()> {
+            // SAFETY: both handles remain live for the duration of the call.
+            if unsafe { AssignProcessToJobObject(self.handle.raw(), process) } == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn wait_empty(&self, timeout: Duration) -> io::Result<()> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                let mut information = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+                // SAFETY: `information` is writable for the requested information class.
+                if unsafe {
+                    QueryInformationJobObject(
+                        self.handle.raw(),
+                        JobObjectBasicAccountingInformation,
+                        (&mut information as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                        std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                        std::ptr::null_mut(),
+                    )
+                } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                if information.ActiveProcesses == 0 {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "test Job still contained {} active processes",
+                            information.ActiveProcesses
+                        ),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    impl Drop for TestJob {
+        fn drop(&mut self) {
+            // SAFETY: this anonymous Job contains only processes created by this test.
+            let _ = unsafe { TerminateJobObject(self.handle.raw(), 1) };
+        }
+    }
+
+    struct HarnessGuard {
+        child: Option<Child>,
+        process: ExactProcess,
+    }
+
+    impl Drop for HarnessGuard {
+        fn drop(&mut self) {
+            if self.child.is_some() {
+                self.process.terminate_best_effort();
+                if let Some(child) = self.child.as_mut() {
+                    let _ = child.wait();
+                }
+            }
         }
     }
 }

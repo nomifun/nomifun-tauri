@@ -6,6 +6,8 @@ use crate::{ExecutionError, NormalizedExecutionRequest, OutputBuffer, Transport}
 
 #[cfg(unix)]
 mod unix;
+#[cfg(windows)]
+mod windows;
 #[cfg(target_os = "linux")]
 mod linux_watchdog;
 #[cfg(target_os = "macos")]
@@ -55,7 +57,12 @@ pub(crate) async fn spawn_pipe(
         unix::spawn_pipe(request, output).await
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows::spawn_pipe(request, output).await
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (request, output);
         Err(ExecutionError::Transport {

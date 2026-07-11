@@ -1,0 +1,2135 @@
+mod handles;
+
+use std::{
+    cmp::Ordering,
+    ffi::{OsStr, OsString, c_void},
+    io,
+    mem,
+    os::windows::ffi::OsStrExt,
+    ptr,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        mpsc,
+    },
+    time::{Duration, Instant},
+};
+
+use async_trait::async_trait;
+use tokio::sync::watch;
+use windows_sys::Win32::{
+    Foundation::{
+        ERROR_BROKEN_PIPE, ERROR_NO_DATA, HANDLE, HANDLE_FLAG_INHERIT, WAIT_FAILED,
+        WAIT_OBJECT_0, WAIT_TIMEOUT, SetHandleInformation,
+    },
+    Globalization::{CSTR_GREATER_THAN, CSTR_LESS_THAN, CompareStringOrdinal},
+    Security::SECURITY_ATTRIBUTES,
+    Storage::FileSystem::{ReadFile, WriteFile},
+    System::{
+        JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+            QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+        },
+        Pipes::CreatePipe,
+        Threading::{
+            CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+            CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
+            PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+            TerminateProcess, WaitForSingleObject,
+        },
+    },
+};
+
+use self::handles::{OwnedHandle, ProcThreadAttributeList};
+use super::{ExitFact, ProcessOwner, SpawnedPlatformProcess};
+use crate::{
+    CleanupReport, CommandSpec, ExecutionError, NormalizedExecutionRequest, OutputBuffer,
+    OutputStream, ProcessSnapshot, ProcessState, SandboxPolicy, ShellKind, SpawnFailure,
+};
+
+const READ_BUFFER_BYTES: usize = 8 * 1024;
+const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const POST_EXIT_READER_DRAIN: Duration = Duration::from_millis(100);
+const JOB_EMPTY_POLL: Duration = Duration::from_millis(2);
+const WRITE_CHUNK_BYTES: usize = 64 * 1024;
+const LIFECYCLE_WAIT_HORIZON: Duration = Duration::from_secs(60 * 60 * 24 * 365);
+const MAX_COMMAND_LINE_UNITS: usize = 32_767;
+const TERMINATED_BY_HOST_EXIT_CODE: u32 = 0xC000_013A;
+
+pub(super) async fn spawn_pipe(
+    request: NormalizedExecutionRequest,
+    output: Arc<OutputBuffer>,
+) -> Result<SpawnedPlatformProcess, ExecutionError> {
+    spawn_pipe_inner(request, output, Arc::new(SystemWin32)).await
+}
+
+async fn spawn_pipe_inner(
+    request: NormalizedExecutionRequest,
+    output: Arc<OutputBuffer>,
+    api: Arc<dyn Win32Facade>,
+) -> Result<SpawnedPlatformProcess, ExecutionError> {
+    enforce_sandbox(&request)?;
+    let prepared = PreparedCommand::new(&request)?;
+    let deadline = Instant::now()
+        .checked_add(SETUP_TIMEOUT)
+        .ok_or_else(|| invalid_command("Windows setup deadline overflowed"))?;
+    let runtime = tokio::runtime::Handle::current();
+    let mut cancellation = StartCancellationGuard::new();
+    let cancelled = cancellation.worker_flag();
+    let mut transaction = tokio::task::spawn_blocking(move || {
+        spawn_transaction(
+            prepared,
+            output,
+            api,
+            runtime,
+            deadline,
+            cancelled,
+        )
+    });
+
+    let owner = match tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        &mut transaction,
+    )
+    .await
+    {
+        Ok(joined) => joined
+            .map_err(|error| {
+                start_lost(
+                    "windows_spawn_worker_failed",
+                    format!("Windows spawn transaction failed to join: {error}"),
+                    None,
+                    CleanupReport::default(),
+                )
+            })??,
+        Err(_) => {
+            cancellation.cancel();
+            match transaction.await {
+                Ok(Ok(owner)) => {
+                    let now = Instant::now();
+                    let last_known = Some(ProcessSnapshot {
+                        pid: owner.pid,
+                        state: ProcessState::Lost,
+                        started_at: now,
+                        last_activity_at: now,
+                    });
+                    let cleanup_started = Instant::now();
+                    let mut cleanup = CleanupReport {
+                        force_kill_attempted: true,
+                        ..CleanupReport::default()
+                    };
+                    if let Err(error) = owner.force_kill().await {
+                        cleanup
+                            .errors
+                            .push(format!("terminate execution Job after start timeout: {error}"));
+                    }
+                    let cleanup_deadline = Instant::now()
+                        .checked_add(CLEANUP_TIMEOUT)
+                        .unwrap_or_else(Instant::now);
+                    match owner.wait_reaped(cleanup_deadline).await {
+                        Ok(_) => cleanup.reaped = true,
+                        Err(error) => cleanup.errors.push(format!(
+                            "wait exact process and empty Job after start timeout: {error}"
+                        )),
+                    }
+                    cleanup.elapsed = cleanup_started.elapsed();
+                    return Err(start_lost(
+                        "windows_spawn_deadline_after_resume",
+                        "Windows spawn crossed its setup deadline after user code may have resumed"
+                            .to_owned(),
+                        last_known,
+                        cleanup,
+                    ));
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(error) => {
+                    return Err(start_lost(
+                        "windows_spawn_worker_failed",
+                        format!(
+                            "Windows spawn transaction failed to join after deadline cancellation: {error}"
+                        ),
+                        None,
+                        CleanupReport {
+                            errors: vec![
+                                "the blocking transaction unwound before it could return a cleanup report"
+                                    .to_owned(),
+                            ],
+                            ..CleanupReport::default()
+                        },
+                    ));
+                }
+            }
+        }
+    };
+    cancellation.disarm();
+
+    Ok(SpawnedPlatformProcess {
+        owner: Arc::new(owner),
+    })
+}
+
+fn spawn_transaction(
+    mut prepared: PreparedCommand,
+    output: Arc<OutputBuffer>,
+    api: Arc<dyn Win32Facade>,
+    runtime: tokio::runtime::Handle,
+    deadline: Instant,
+    cancellation: Arc<StartCancellation>,
+) -> Result<WindowsOwner, ExecutionError> {
+    ensure_setup_active(deadline, &cancellation).map_err(spawn_failed)?;
+
+    let stdin_pipe = create_inheritable_pipe().map_err(spawn_failed)?;
+    let stdout_pipe = create_inheritable_pipe().map_err(spawn_failed)?;
+    let stderr_pipe = create_inheritable_pipe().map_err(spawn_failed)?;
+    clear_inheritance(stdin_pipe.write.as_raw()).map_err(spawn_failed)?;
+    clear_inheritance(stdout_pipe.read.as_raw()).map_err(spawn_failed)?;
+    clear_inheritance(stderr_pipe.read.as_raw()).map_err(spawn_failed)?;
+
+    ensure_setup_active(deadline, &cancellation).map_err(spawn_failed)?;
+    let job = create_execution_job().map_err(spawn_failed)?;
+    let job = Arc::new(JobControl::new(job));
+    let mut transaction = SpawnTransaction::new(
+        Arc::clone(&job),
+        stdin_pipe,
+        stdout_pipe,
+        stderr_pipe,
+    );
+
+    let mut attributes = match ProcThreadAttributeList::new_one() {
+        Ok(attributes) => attributes,
+        Err(error) => return Err(transaction.into_failure(error, deadline)),
+    };
+    let inherited = [
+        transaction.child_stdin().as_raw(),
+        transaction.child_stdout().as_raw(),
+        transaction.child_stderr().as_raw(),
+    ];
+    if let Err(error) = attributes.set_handle_list(&inherited) {
+        return Err(transaction.into_failure(error, deadline));
+    }
+
+    let mut startup = STARTUPINFOEXW::default();
+    startup.StartupInfo.cb =
+        u32::try_from(mem::size_of::<STARTUPINFOEXW>()).expect("STARTUPINFOEXW fits in u32");
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = transaction.child_stdin().as_raw();
+    startup.StartupInfo.hStdOutput = transaction.child_stdout().as_raw();
+    startup.StartupInfo.hStdError = transaction.child_stderr().as_raw();
+    startup.lpAttributeList = attributes.as_mut_ptr();
+
+    if let Err(error) = ensure_setup_active(deadline, &cancellation) {
+        return Err(transaction.into_failure(error, deadline));
+    }
+
+    let mut process_information = PROCESS_INFORMATION::default();
+    let flags = CREATE_SUSPENDED
+        | CREATE_UNICODE_ENVIRONMENT
+        | CREATE_NO_WINDOW
+        | EXTENDED_STARTUPINFO_PRESENT;
+    // SAFETY: every pointer refers to live, NUL-terminated backing storage for
+    // the duration of the call. The mutable command-line buffer is exclusively
+    // owned by this transaction. The handle list contains exactly the three
+    // inheritable child stdio handles.
+    let created = unsafe {
+        CreateProcessW(
+            prepared.application.as_ptr(),
+            prepared.command_line.as_mut_ptr(),
+            ptr::null(),
+            ptr::null(),
+            1,
+            flags,
+            prepared.environment.as_ptr().cast::<c_void>(),
+            prepared.cwd.as_ptr(),
+            &startup.StartupInfo,
+            &mut process_information,
+        )
+    };
+    if created == 0 {
+        return Err(transaction.into_failure(io::Error::last_os_error(), deadline));
+    }
+
+    let process = match unsafe { OwnedHandle::from_raw(process_information.hProcess) } {
+        Ok(process) => Arc::new(process),
+        Err(error) => {
+            if !process_information.hThread.is_null() {
+                // SAFETY: CreateProcessW returned this fresh thread handle, but
+                // the process handle was invalid so there is no safe transaction
+                // object to adopt it into.
+                let _ = unsafe {
+                    windows_sys::Win32::Foundation::CloseHandle(process_information.hThread)
+                };
+            }
+            return Err(transaction.into_failure(error, deadline));
+        }
+    };
+    let thread = match unsafe { OwnedHandle::from_raw(process_information.hThread) } {
+        Ok(thread) => thread,
+        Err(error) => {
+            transaction.process = Some(process);
+            transaction.phase = SpawnPhase::Suspended;
+            return Err(transaction.into_failure(error, deadline));
+        }
+    };
+    transaction.pid = Some(process_information.dwProcessId);
+    transaction.process = Some(process);
+    transaction.thread = Some(thread);
+    transaction.phase = SpawnPhase::Suspended;
+    #[cfg(test)]
+    if let Err(error) = api.process_created(
+        process_information.dwProcessId,
+        transaction
+            .process
+            .as_ref()
+            .expect("created process is owned")
+            .as_raw(),
+        transaction
+            .thread
+            .as_ref()
+            .expect("created primary thread is owned")
+            .as_raw(),
+    ) {
+        return Err(transaction.into_failure(error, deadline));
+    }
+
+    if let Err(error) = ensure_setup_active(deadline, &cancellation) {
+        return Err(transaction.into_failure(error, deadline));
+    }
+    let job_handle = match job.raw_handle() {
+        Some(handle) => handle,
+        None => {
+            return Err(transaction.into_failure(
+                io::Error::other("execution Job closed before assignment"),
+                deadline,
+            ));
+        }
+    };
+    if let Err(error) = api.assign_process_to_job(
+        job_handle,
+        transaction
+            .process
+            .as_ref()
+            .expect("created process is owned")
+            .as_raw(),
+    ) {
+        return Err(transaction.into_failure(error, deadline));
+    }
+    if let Err(error) = ensure_setup_active(deadline, &cancellation) {
+        return Err(transaction.into_failure(error, deadline));
+    }
+    let previous_suspend_count = match cancellation.resume_thread_if_active(
+        deadline,
+        api.as_ref(),
+        transaction
+            .thread
+            .as_ref()
+            .expect("created primary thread is owned")
+            .as_raw(),
+    ) {
+        Ok(count) => count,
+        Err(error) => return Err(transaction.into_failure(error, deadline)),
+    };
+    match previous_suspend_count {
+        1 => transaction.phase = SpawnPhase::Resumed,
+        0 => {
+            transaction.phase = SpawnPhase::Resumed;
+            return Err(transaction.into_failure(
+                io::Error::other(
+                    "ResumeThread reported an already-running primary thread",
+                ),
+                deadline,
+            ));
+        }
+        count => {
+            return Err(transaction.into_failure(
+                io::Error::other(format!(
+                    "ResumeThread left an unexpected suspend count: {count}"
+                )),
+                deadline,
+            ));
+        }
+    }
+
+    transaction.child_stdin.take();
+    transaction.child_stdout.take();
+    transaction.child_stderr.take();
+    transaction.thread.take();
+
+    if let Err(error) = ensure_setup_active(deadline, &cancellation) {
+        return Err(transaction.into_failure(error, deadline));
+    }
+
+    let stdout = transaction
+        .parent_stdout
+        .take()
+        .expect("parent stdout is owned until reader start");
+    let stderr = transaction
+        .parent_stderr
+        .take()
+        .expect("parent stderr is owned until reader start");
+    let readers = vec![
+        start_reader(
+            &runtime,
+            stdout,
+            OutputStream::Stdout,
+            Arc::clone(&output),
+        ),
+        start_reader(&runtime, stderr, OutputStream::Stderr, output),
+    ];
+    let (completion_sender, completion_receiver) = watch::channel(LifecycleCompletion::Running);
+    let lifecycle_process = Arc::clone(
+        transaction
+            .process
+            .as_ref()
+            .expect("created process remains owned"),
+    );
+    let lifecycle_job = Arc::clone(&job);
+    runtime.spawn_blocking(move || {
+        let lifecycle_deadline = Instant::now()
+            .checked_add(LIFECYCLE_WAIT_HORIZON)
+            .unwrap_or_else(Instant::now);
+        let result = run_lifecycle(
+            Arc::clone(&lifecycle_process),
+            Arc::clone(&lifecycle_job),
+            readers,
+            lifecycle_deadline,
+        );
+        let completion = match result {
+            Ok(fact) => LifecycleCompletion::Reaped(fact),
+            Err(error) => LifecycleCompletion::Failed {
+                kind: error.kind(),
+                message: Arc::from(lifecycle_failure_message(
+                    error,
+                    &lifecycle_process,
+                    &lifecycle_job,
+                )),
+            },
+        };
+        completion_sender.send_replace(completion);
+    });
+
+    let pid = transaction.pid.expect("created process has a PID");
+    let process = transaction
+        .process
+        .take()
+        .expect("created process is transferred to the owner");
+    let stdin = transaction
+        .parent_stdin
+        .take()
+        .expect("parent stdin is transferred to the owner");
+    transaction.disarmed = true;
+
+    Ok(WindowsOwner {
+        pid,
+        process,
+        job,
+        stdin: Arc::new(tokio::sync::Mutex::new(Some(stdin))),
+        completion: completion_receiver,
+    })
+}
+
+trait Win32Facade: Send + Sync {
+    #[cfg(test)]
+    fn process_created(&self, _pid: u32, _process: HANDLE, _thread: HANDLE) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn assign_process_to_job(&self, job: HANDLE, process: HANDLE) -> io::Result<()>;
+    fn resume_thread(&self, thread: HANDLE) -> io::Result<u32>;
+}
+
+struct SystemWin32;
+
+impl Win32Facade for SystemWin32 {
+    fn assign_process_to_job(&self, job: HANDLE, process: HANDLE) -> io::Result<()> {
+        // SAFETY: both handles are live kernel handles owned by the spawn
+        // transaction, and the process is still suspended.
+        if unsafe { AssignProcessToJobObject(job, process) } == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn resume_thread(&self, thread: HANDLE) -> io::Result<u32> {
+        // SAFETY: thread is the live primary thread returned by CreateProcessW.
+        let previous = unsafe { ResumeThread(thread) };
+        if previous == u32::MAX {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(previous)
+        }
+    }
+}
+
+struct StartCancellationGuard {
+    state: Arc<StartCancellation>,
+    armed: bool,
+}
+
+impl StartCancellationGuard {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(StartCancellation {
+                cancelled: AtomicBool::new(false),
+                resume_gate: Mutex::new(()),
+            }),
+            armed: true,
+        }
+    }
+
+    fn worker_flag(&self) -> Arc<StartCancellation> {
+        Arc::clone(&self.state)
+    }
+
+    fn cancel(&self) {
+        self.state.cancel();
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+struct StartCancellation {
+    cancelled: AtomicBool,
+    resume_gate: Mutex<()>,
+}
+
+impl StartCancellation {
+    fn cancel(&self) {
+        let _gate = match self.resume_gate.lock() {
+            Ok(gate) => gate,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.cancelled.store(true, AtomicOrdering::Release);
+    }
+
+    fn resume_thread_if_active(
+        &self,
+        deadline: Instant,
+        api: &dyn Win32Facade,
+        thread: HANDLE,
+    ) -> io::Result<u32> {
+        let _gate = self
+            .resume_gate
+            .lock()
+            .map_err(|_| io::Error::other("Windows resume cancellation gate is poisoned"))?;
+        ensure_setup_active(deadline, self)?;
+        api.resume_thread(thread)
+    }
+}
+
+impl Drop for StartCancellationGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancel();
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpawnPhase {
+    Preparing,
+    Suspended,
+    Resumed,
+}
+
+struct SpawnTransaction {
+    pid: Option<u32>,
+    process: Option<Arc<OwnedHandle>>,
+    thread: Option<OwnedHandle>,
+    job: Arc<JobControl>,
+    parent_stdin: Option<OwnedHandle>,
+    child_stdin: Option<OwnedHandle>,
+    parent_stdout: Option<OwnedHandle>,
+    child_stdout: Option<OwnedHandle>,
+    parent_stderr: Option<OwnedHandle>,
+    child_stderr: Option<OwnedHandle>,
+    phase: SpawnPhase,
+    disarmed: bool,
+}
+
+impl SpawnTransaction {
+    fn new(
+        job: Arc<JobControl>,
+        stdin: PipePair,
+        stdout: PipePair,
+        stderr: PipePair,
+    ) -> Self {
+        Self {
+            pid: None,
+            process: None,
+            thread: None,
+            job,
+            parent_stdin: Some(stdin.write),
+            child_stdin: Some(stdin.read),
+            parent_stdout: Some(stdout.read),
+            child_stdout: Some(stdout.write),
+            parent_stderr: Some(stderr.read),
+            child_stderr: Some(stderr.write),
+            phase: SpawnPhase::Preparing,
+            disarmed: false,
+        }
+    }
+
+    fn child_stdin(&self) -> &OwnedHandle {
+        self.child_stdin.as_ref().expect("child stdin is owned")
+    }
+
+    fn child_stdout(&self) -> &OwnedHandle {
+        self.child_stdout.as_ref().expect("child stdout is owned")
+    }
+
+    fn child_stderr(&self) -> &OwnedHandle {
+        self.child_stderr.as_ref().expect("child stderr is owned")
+    }
+
+    fn into_failure(mut self, error: io::Error, setup_deadline: Instant) -> ExecutionError {
+        let phase = self.phase;
+        let last_known = self.pid.map(|pid| ProcessSnapshot {
+            pid,
+            state: ProcessState::Lost,
+            started_at: Instant::now(),
+            last_activity_at: Instant::now(),
+        });
+        let cleanup_deadline = setup_deadline.max(
+            Instant::now()
+                .checked_add(CLEANUP_TIMEOUT)
+                .unwrap_or(setup_deadline),
+        );
+        let cleanup = self.cleanup(cleanup_deadline);
+        self.disarmed = true;
+
+        if phase != SpawnPhase::Resumed && cleanup.reaped && cleanup.errors.is_empty() {
+            spawn_failed(error)
+        } else {
+            start_lost(
+                if phase == SpawnPhase::Resumed {
+                    "windows_post_resume_failure"
+                } else {
+                    "windows_pre_resume_cleanup_unproven"
+                },
+                error.to_string(),
+                last_known,
+                cleanup,
+            )
+        }
+    }
+
+    fn cleanup(&mut self, deadline: Instant) -> CleanupReport {
+        let mut cleanup = CleanupReport {
+            force_kill_attempted: self.process.is_some(),
+            ..CleanupReport::default()
+        };
+        let started = Instant::now();
+        self.parent_stdin.take();
+        self.child_stdin.take();
+        self.parent_stdout.take();
+        self.child_stdout.take();
+        self.parent_stderr.take();
+        self.child_stderr.take();
+        self.thread.take();
+
+        if let Some(process) = &self.process {
+            if self.phase == SpawnPhase::Resumed {
+                if let Err(error) = self.job.terminate() {
+                    cleanup
+                        .errors
+                        .push(format!("terminate execution Job: {error}"));
+                }
+            } else {
+                // SAFETY: process is the exact suspended process created by
+                // this transaction. No user instruction has run.
+                if unsafe { TerminateProcess(process.as_raw(), TERMINATED_BY_HOST_EXIT_CODE) } == 0 {
+                    let error = io::Error::last_os_error();
+                    if !handle_is_signaled(process.as_raw()).unwrap_or(false) {
+                        cleanup
+                            .errors
+                            .push(format!("terminate suspended process: {error}"));
+                    }
+                }
+            }
+
+            match wait_handle_until(process.as_raw(), deadline) {
+                Ok(()) => {
+                    cleanup.reaped = true;
+                    if let Err(error) = self.job.wait_empty_until(deadline) {
+                        cleanup
+                            .errors
+                            .push(format!("prove execution Job empty: {error}"));
+                    } else if let Err(error) = self.job.close_proven_empty() {
+                        cleanup
+                            .errors
+                            .push(format!("close empty execution Job: {error}"));
+                    }
+                }
+                Err(error) => cleanup
+                    .errors
+                    .push(format!("wait exact process handle: {error}")),
+            }
+        } else {
+            if let Err(error) = self.job.wait_empty_until(deadline) {
+                cleanup
+                    .errors
+                    .push(format!("prove uncommitted execution Job empty: {error}"));
+            } else if let Err(error) = self.job.close_proven_empty() {
+                cleanup
+                    .errors
+                    .push(format!("close uncommitted execution Job: {error}"));
+            } else {
+                cleanup.reaped = true;
+            }
+        }
+        if !cleanup.errors.is_empty() {
+            let _ = self.job.close_for_kill();
+        }
+        self.process.take();
+        cleanup.elapsed = started.elapsed();
+        cleanup
+    }
+}
+
+impl Drop for SpawnTransaction {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        let deadline = Instant::now()
+            .checked_add(CLEANUP_TIMEOUT)
+            .unwrap_or_else(Instant::now);
+        let _ = self.cleanup(deadline);
+    }
+}
+
+struct PipePair {
+    read: OwnedHandle,
+    write: OwnedHandle,
+}
+
+fn create_inheritable_pipe() -> io::Result<PipePair> {
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(mem::size_of::<SECURITY_ATTRIBUTES>())
+            .expect("SECURITY_ATTRIBUTES fits in u32"),
+        lpSecurityDescriptor: ptr::null_mut(),
+        bInheritHandle: 1,
+    };
+    let mut read = ptr::null_mut();
+    let mut write = ptr::null_mut();
+    // SAFETY: output pointers and SECURITY_ATTRIBUTES are valid for the call.
+    if unsafe { CreatePipe(&mut read, &mut write, &mut attributes, 0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: CreatePipe succeeded and returned two fresh owned handles.
+    let read = unsafe { OwnedHandle::from_raw(read)? };
+    // SAFETY: CreatePipe succeeded and returned a second fresh owned handle.
+    let write = unsafe { OwnedHandle::from_raw(write)? };
+    Ok(PipePair { read, write })
+}
+
+fn clear_inheritance(handle: HANDLE) -> io::Result<()> {
+    // SAFETY: handle is a live pipe handle owned by the transaction.
+    if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn create_execution_job() -> io::Result<OwnedHandle> {
+    // SAFETY: null security/name pointers request a non-inheritable anonymous Job.
+    let raw = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+    // SAFETY: a non-null result is a fresh Job handle.
+    let job = unsafe { OwnedHandle::from_raw(raw)? };
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: job and limits remain valid for the duration of the call.
+    if unsafe {
+        SetInformationJobObject(
+            job.as_raw(),
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast::<c_void>(),
+            u32::try_from(mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                .expect("JOBOBJECT_EXTENDED_LIMIT_INFORMATION fits in u32"),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(job)
+}
+
+struct JobControl {
+    state: Mutex<JobState>,
+}
+
+struct JobState {
+    handle: Option<OwnedHandle>,
+    termination_requested: bool,
+    empty_proven: bool,
+}
+
+impl JobControl {
+    fn new(handle: OwnedHandle) -> Self {
+        Self {
+            state: Mutex::new(JobState {
+                handle: Some(handle),
+                termination_requested: false,
+                empty_proven: false,
+            }),
+        }
+    }
+
+    fn raw_handle(&self) -> Option<HANDLE> {
+        let state = self.state.lock().ok()?;
+        state.handle.as_ref().map(OwnedHandle::as_raw)
+    }
+
+    fn terminate(&self) -> io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("execution Job state is poisoned"))?;
+        if state.empty_proven {
+            return Ok(());
+        }
+        if state.termination_requested {
+            return Ok(());
+        }
+        let handle = state
+            .handle
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "execution Job is closed"))?
+            .as_raw();
+        // SAFETY: handle is kept live by the locked Job state.
+        if unsafe { TerminateJobObject(handle, TERMINATED_BY_HOST_EXIT_CODE) } == 0 {
+            let error = io::Error::last_os_error();
+            if query_active_processes(handle)? != 0 {
+                return Err(error);
+            }
+            state.empty_proven = true;
+        }
+        state.termination_requested = true;
+        Ok(())
+    }
+
+    fn active_processes(&self) -> io::Result<u32> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("execution Job state is poisoned"))?;
+        if state.empty_proven {
+            return Ok(0);
+        }
+        let handle = state
+            .handle
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "execution Job is closed"))?
+            .as_raw();
+        let active = query_active_processes(handle)?;
+        if active == 0 {
+            state.empty_proven = true;
+        }
+        Ok(active)
+    }
+
+    fn close_proven_empty(&self) -> io::Result<()> {
+        let handle = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("execution Job state is poisoned"))?;
+            if !state.empty_proven {
+                return Err(io::Error::other(
+                    "execution Job cannot close before empty membership is proven",
+                ));
+            }
+            state.handle.take()
+        };
+        drop(handle);
+        Ok(())
+    }
+
+    fn wait_empty_until(&self, deadline: Instant) -> io::Result<()> {
+        loop {
+            if self.active_processes()? == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "execution Job did not become empty before the cleanup deadline",
+                ));
+            }
+            std::thread::sleep(
+                JOB_EMPTY_POLL.min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+
+    fn close_for_kill(&self) -> io::Result<()> {
+        let handle = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("execution Job state is poisoned"))?;
+            state.termination_requested = true;
+            state.handle.take()
+        };
+        drop(handle);
+        Ok(())
+    }
+}
+
+fn query_active_processes(job: HANDLE) -> io::Result<u32> {
+    let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    // SAFETY: job is live and accounting is valid writable storage.
+    if unsafe {
+        QueryInformationJobObject(
+            job,
+            JobObjectBasicAccountingInformation,
+            (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast::<c_void>(),
+            u32::try_from(mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>())
+                .expect("JOBOBJECT_BASIC_ACCOUNTING_INFORMATION fits in u32"),
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(accounting.ActiveProcesses)
+    }
+}
+
+#[derive(Clone)]
+enum LifecycleCompletion {
+    Running,
+    Reaped(ExitFact),
+    Failed {
+        kind: io::ErrorKind,
+        message: Arc<str>,
+    },
+}
+
+struct ReaderCompletion {
+    receiver: mpsc::Receiver<io::Result<()>>,
+}
+
+fn start_reader(
+    runtime: &tokio::runtime::Handle,
+    handle: OwnedHandle,
+    stream: OutputStream,
+    output: Arc<OutputBuffer>,
+) -> ReaderCompletion {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    runtime.spawn_blocking(move || {
+        let _ = sender.send(read_stream(handle, stream, output));
+    });
+    ReaderCompletion { receiver }
+}
+
+fn read_stream(
+    handle: OwnedHandle,
+    stream: OutputStream,
+    output: Arc<OutputBuffer>,
+) -> io::Result<()> {
+    let mut buffer = [0_u8; READ_BUFFER_BYTES];
+    loop {
+        let mut read = 0_u32;
+        // SAFETY: buffer is writable for its full length and handle is a live
+        // synchronous pipe read handle owned by this worker.
+        let result = unsafe {
+            ReadFile(
+                handle.as_raw(),
+                buffer.as_mut_ptr(),
+                u32::try_from(buffer.len()).expect("reader buffer fits in u32"),
+                &mut read,
+                ptr::null_mut(),
+            )
+        };
+        if result == 0 {
+            let error = io::Error::last_os_error();
+            if matches!(
+                error.raw_os_error().map(|code| code as u32),
+                Some(ERROR_BROKEN_PIPE | ERROR_NO_DATA)
+            ) {
+                return Ok(());
+            }
+            return Err(error);
+        }
+        if read == 0 {
+            return Ok(());
+        }
+        output.push(stream, &buffer[..read as usize]);
+    }
+}
+
+fn run_lifecycle(
+    process: Arc<OwnedHandle>,
+    job: Arc<JobControl>,
+    readers: Vec<ReaderCompletion>,
+    deadline: Instant,
+) -> io::Result<ExitFact> {
+    wait_handle_until(process.as_raw(), deadline)?;
+    let mut exit_code = 0_u32;
+    // SAFETY: process is signaled and its exact handle remains live.
+    if unsafe { GetExitCodeProcess(process.as_raw(), &mut exit_code) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    if job.active_processes()? != 0 {
+        job.terminate()?;
+        job.wait_empty_until(deadline)?;
+    }
+    job.close_proven_empty()?;
+    finish_readers(readers, deadline)?;
+
+    Ok(ExitFact {
+        code: Some(exit_code as i32),
+        signal: None,
+    })
+}
+
+fn lifecycle_failure_message(
+    error: io::Error,
+    process: &OwnedHandle,
+    job: &JobControl,
+) -> String {
+    let deadline = Instant::now()
+        .checked_add(CLEANUP_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+    let mut cleanup_errors = Vec::new();
+    if let Err(cleanup_error) = job.terminate() {
+        cleanup_errors.push(format!("terminate execution Job: {cleanup_error}"));
+    }
+    if let Err(cleanup_error) = wait_handle_until(process.as_raw(), deadline) {
+        cleanup_errors.push(format!("wait exact process handle: {cleanup_error}"));
+    }
+    if let Err(cleanup_error) = job.wait_empty_until(deadline) {
+        cleanup_errors.push(format!("prove execution Job empty: {cleanup_error}"));
+    } else if let Err(cleanup_error) = job.close_proven_empty() {
+        cleanup_errors.push(format!("close proven-empty execution Job: {cleanup_error}"));
+    }
+    if !cleanup_errors.is_empty() {
+        let _ = job.close_for_kill();
+        format!(
+            "{error}; fail-closed lifecycle cleanup: {}",
+            cleanup_errors.join("; ")
+        )
+    } else {
+        error.to_string()
+    }
+}
+
+fn finish_readers(readers: Vec<ReaderCompletion>, caller_deadline: Instant) -> io::Result<()> {
+    let deadline = caller_deadline.min(
+        Instant::now()
+            .checked_add(POST_EXIT_READER_DRAIN)
+            .unwrap_or(caller_deadline),
+    );
+    let mut first_error = None;
+    for reader in readers {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let result = if remaining.is_zero() {
+            Err(mpsc::RecvTimeoutError::Timeout)
+        } else {
+            reader.receiver.recv_timeout(remaining)
+        };
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if first_error.is_none() => first_error = Some(error),
+            Ok(Err(_)) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) if first_error.is_none() => {
+                first_error = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "output reader timed out",
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) if first_error.is_none() => {
+                first_error = Some(io::Error::other(
+                    "output reader ended without publishing a result",
+                ));
+            }
+            Err(_) => {}
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+struct WindowsOwner {
+    pid: u32,
+    process: Arc<OwnedHandle>,
+    job: Arc<JobControl>,
+    stdin: Arc<tokio::sync::Mutex<Option<OwnedHandle>>>,
+    completion: watch::Receiver<LifecycleCompletion>,
+}
+
+impl Drop for WindowsOwner {
+    fn drop(&mut self) {
+        let _ = self.job.close_for_kill();
+    }
+}
+
+#[async_trait]
+impl ProcessOwner for WindowsOwner {
+    fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    async fn write(&self, bytes: &[u8]) -> io::Result<()> {
+        let stdin = Arc::clone(&self.stdin).lock_owned().await;
+        if stdin.is_none() {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdin is closed"));
+        }
+        let bytes = bytes.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let handle = stdin
+                .as_ref()
+                .expect("stdin was validated before entering the blocking writer")
+                .as_raw();
+            write_all(handle, &bytes)
+        })
+            .await
+            .map_err(|error| io::Error::other(format!("stdin writer task failed: {error}")))?
+    }
+
+    async fn close_stdin(&self) -> io::Result<()> {
+        self.stdin.lock().await.take();
+        Ok(())
+    }
+
+    async fn interrupt(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "CREATE_NO_WINDOW pipe processes have no truthful console interrupt contract",
+        ))
+    }
+
+    async fn terminate(&self) -> io::Result<()> {
+        self.job.terminate()
+    }
+
+    async fn force_kill(&self) -> io::Result<()> {
+        self.job.terminate()
+    }
+
+    async fn wait_reaped(&self, deadline: Instant) -> io::Result<ExitFact> {
+        let _keep_exact_process_handle_alive = &self.process;
+        let mut completion = self.completion.clone();
+        loop {
+            match completion.borrow().clone() {
+                LifecycleCompletion::Running => {}
+                LifecycleCompletion::Reaped(fact) => return Ok(fact),
+                LifecycleCompletion::Failed { kind, message } => {
+                    return Err(io::Error::new(kind, message.to_string()));
+                }
+            }
+            match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                completion.changed(),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    let _ = self.job.close_for_kill();
+                    return Err(io::Error::other(
+                        "Windows lifecycle worker ended without a result",
+                    ));
+                }
+                Err(_) => {
+                    let _ = self.job.close_for_kill();
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "exact Windows process wait timed out",
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn write_all(handle: HANDLE, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let chunk_len = bytes.len().min(WRITE_CHUNK_BYTES);
+        let mut written = 0_u32;
+        // SAFETY: bytes points to chunk_len readable bytes and handle is kept
+        // live by the Arc owned by the blocking writer.
+        if unsafe {
+            WriteFile(
+                handle,
+                bytes.as_ptr(),
+                u32::try_from(chunk_len).expect("chunk length is bounded to u32"),
+                &mut written,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "Windows stdin pipe accepted zero bytes",
+            ));
+        }
+        bytes = &bytes[written as usize..];
+    }
+    Ok(())
+}
+
+fn wait_handle_until(handle: HANDLE, deadline: Instant) -> io::Result<()> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let milliseconds = if remaining.is_zero() {
+            0
+        } else {
+            remaining
+                .as_millis()
+                .saturating_add(1)
+                .min((u32::MAX - 1) as u128) as u32
+        };
+        // SAFETY: handle is a live process handle for the duration of the wait.
+        match unsafe { WaitForSingleObject(handle, milliseconds) } {
+            WAIT_OBJECT_0 => return Ok(()),
+            WAIT_TIMEOUT if Instant::now() < deadline => {}
+            WAIT_TIMEOUT => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "exact process termination timed out",
+                ));
+            }
+            WAIT_FAILED => return Err(io::Error::last_os_error()),
+            result => {
+                return Err(io::Error::other(format!(
+                    "unexpected exact process wait result: {result}"
+                )));
+            }
+        }
+    }
+}
+
+fn handle_is_signaled(handle: HANDLE) -> io::Result<bool> {
+    // SAFETY: handle is live for this nonblocking probe.
+    match unsafe { WaitForSingleObject(handle, 0) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        WAIT_FAILED => Err(io::Error::last_os_error()),
+        result => Err(io::Error::other(format!(
+            "unexpected process liveness probe result: {result}"
+        ))),
+    }
+}
+
+fn ensure_setup_active(deadline: Instant, cancellation: &StartCancellation) -> io::Result<()> {
+    if cancellation.cancelled.load(AtomicOrdering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "Windows start future was cancelled",
+        ));
+    }
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Windows spawn transaction exceeded its setup deadline",
+        ));
+    }
+    Ok(())
+}
+
+struct PreparedCommand {
+    application: Vec<u16>,
+    command_line: Vec<u16>,
+    cwd: Vec<u16>,
+    environment: Vec<u16>,
+}
+
+impl PreparedCommand {
+    fn new(request: &NormalizedExecutionRequest) -> Result<Self, ExecutionError> {
+        let (program, args) = command_argv(&request.command)?;
+        let application = encode_nul_terminated(&program, "program")?;
+        let command_line = encode_command_line(&program, &args)?;
+        let cwd = encode_nul_terminated(request.cwd.as_os_str(), "working directory").map_err(
+            |error| ExecutionError::InvalidWorkingDirectory {
+                path: request.cwd.clone(),
+                reason: error.to_string(),
+            },
+        )?;
+        let environment = encode_environment(&request.env)?;
+        Ok(Self {
+            application,
+            command_line,
+            cwd,
+            environment,
+        })
+    }
+}
+
+fn command_argv(spec: &CommandSpec) -> Result<(OsString, Vec<OsString>), ExecutionError> {
+    match spec {
+        CommandSpec::Program { program, args } => Ok((program.clone(), args.clone())),
+        CommandSpec::Shell {
+            shell: ShellKind::PowerShell,
+            script,
+        } => Ok((
+            OsString::from("powershell.exe"),
+            vec![
+                OsString::from("-NoLogo"),
+                OsString::from("-NoProfile"),
+                OsString::from("-NonInteractive"),
+                OsString::from("-Command"),
+                OsString::from(script),
+            ],
+        )),
+        CommandSpec::Shell {
+            shell: ShellKind::Posix,
+            ..
+        } => Err(invalid_command(
+            "POSIX shell text cannot be reinterpreted as PowerShell on Windows",
+        )),
+    }
+}
+
+fn encode_command_line(program: &OsStr, args: &[OsString]) -> Result<Vec<u16>, ExecutionError> {
+    let mut command_line = Vec::new();
+    append_quoted(program, &mut command_line)?;
+    for arg in args {
+        command_line.push(b' ' as u16);
+        append_quoted(arg, &mut command_line)?;
+    }
+    command_line.push(0);
+    if command_line.len() > MAX_COMMAND_LINE_UNITS {
+        return Err(invalid_command(
+            "Windows command line exceeds 32,767 UTF-16 code units",
+        ));
+    }
+    Ok(command_line)
+}
+
+fn append_quoted(arg: &OsStr, command_line: &mut Vec<u16>) -> Result<(), ExecutionError> {
+    let encoded = arg.encode_wide().collect::<Vec<_>>();
+    if encoded.contains(&0) {
+        return Err(invalid_command(
+            "Windows command-line arguments cannot contain NUL",
+        ));
+    }
+    let requires_quotes = encoded.is_empty()
+        || encoded.iter().any(|unit| {
+            matches!(
+                *unit,
+                value if value == b' ' as u16
+                    || value == b'\t' as u16
+                    || value == b'\n' as u16
+                    || value == 0x0B
+                    || value == b'"' as u16
+            )
+        });
+    if !requires_quotes {
+        command_line.extend_from_slice(&encoded);
+        return Ok(());
+    }
+
+    command_line.push(b'"' as u16);
+    let mut index = 0;
+    while index < encoded.len() {
+        let mut backslashes = 0_usize;
+        while index < encoded.len() && encoded[index] == b'\\' as u16 {
+            backslashes += 1;
+            index += 1;
+        }
+        if index == encoded.len() {
+            command_line.extend(std::iter::repeat_n(
+                b'\\' as u16,
+                backslashes.saturating_mul(2),
+            ));
+            break;
+        }
+        if encoded[index] == b'"' as u16 {
+            command_line.extend(std::iter::repeat_n(
+                b'\\' as u16,
+                backslashes.saturating_mul(2).saturating_add(1),
+            ));
+        } else {
+            command_line.extend(std::iter::repeat_n(b'\\' as u16, backslashes));
+        }
+        command_line.push(encoded[index]);
+        index += 1;
+    }
+    command_line.push(b'"' as u16);
+    Ok(())
+}
+
+struct EnvironmentEntry {
+    key: OsString,
+    value: OsString,
+}
+
+fn encode_environment(
+    overrides: &std::collections::BTreeMap<OsString, OsString>,
+) -> Result<Vec<u16>, ExecutionError> {
+    encode_environment_from(std::env::vars_os(), overrides)
+}
+
+fn encode_environment_from(
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+    overrides: &std::collections::BTreeMap<OsString, OsString>,
+) -> Result<Vec<u16>, ExecutionError> {
+    let mut entries = Vec::<EnvironmentEntry>::new();
+    for (key, value) in inherited {
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| compare_os_case_insensitive(&entry.key, &key) == Ordering::Equal)
+        {
+            entry.key = key;
+            entry.value = value;
+        } else {
+            entries.push(EnvironmentEntry { key, value });
+        }
+    }
+
+    for (key, value) in overrides {
+        validate_environment_override(key, value)?;
+        if let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| compare_os_case_insensitive(&entry.key, key) == Ordering::Equal)
+        {
+            entry.key = key.clone();
+            entry.value = value.clone();
+        } else {
+            entries.push(EnvironmentEntry {
+                key: key.clone(),
+                value: value.clone(),
+            });
+        }
+    }
+
+    entries.sort_by(|left, right| {
+        compare_os_case_insensitive(&left.key, &right.key)
+            .then_with(|| compare_os_raw(&left.key, &right.key))
+    });
+    let mut block = Vec::new();
+    for entry in entries {
+        append_environment_component(&entry.key, "environment key", &mut block)?;
+        block.push(b'=' as u16);
+        append_environment_component(&entry.value, "environment value", &mut block)?;
+        block.push(0);
+    }
+    block.push(0);
+    if block.len() == 1 {
+        block.push(0);
+    }
+    Ok(block)
+}
+
+fn validate_environment_override(key: &OsStr, value: &OsStr) -> Result<(), ExecutionError> {
+    let encoded_key = key.encode_wide().collect::<Vec<_>>();
+    if encoded_key.is_empty() {
+        return Err(invalid_command("environment keys cannot be empty"));
+    }
+    if encoded_key
+        .iter()
+        .any(|unit| *unit == 0 || *unit == b'=' as u16)
+    {
+        return Err(invalid_command(
+            "environment keys cannot contain NUL or '='",
+        ));
+    }
+    if value.encode_wide().any(|unit| unit == 0) {
+        return Err(invalid_command(
+            "environment values cannot contain NUL",
+        ));
+    }
+    Ok(())
+}
+
+fn append_environment_component(
+    value: &OsStr,
+    label: &'static str,
+    destination: &mut Vec<u16>,
+) -> Result<(), ExecutionError> {
+    for unit in value.encode_wide() {
+        if unit == 0 {
+            return Err(invalid_command(format!("{label} cannot contain NUL")));
+        }
+        destination.push(unit);
+    }
+    Ok(())
+}
+
+fn compare_os_case_insensitive(left: &OsStr, right: &OsStr) -> Ordering {
+    let left = left.encode_wide().collect::<Vec<_>>();
+    let right = right.encode_wide().collect::<Vec<_>>();
+    let Some(left_len) = i32::try_from(left.len()).ok() else {
+        return left.cmp(&right);
+    };
+    let Some(right_len) = i32::try_from(right.len()).ok() else {
+        return left.cmp(&right);
+    };
+    // SAFETY: the explicit lengths bound both readable UTF-16 buffers.
+    match unsafe {
+        CompareStringOrdinal(
+            left.as_ptr(),
+            left_len,
+            right.as_ptr(),
+            right_len,
+            1,
+        )
+    } {
+        CSTR_LESS_THAN => Ordering::Less,
+        CSTR_GREATER_THAN => Ordering::Greater,
+        _ => Ordering::Equal,
+    }
+}
+
+fn compare_os_raw(left: &OsStr, right: &OsStr) -> Ordering {
+    left.encode_wide()
+        .collect::<Vec<_>>()
+        .cmp(&right.encode_wide().collect::<Vec<_>>())
+}
+
+fn encode_nul_terminated(value: &OsStr, label: &'static str) -> Result<Vec<u16>, ExecutionError> {
+    let mut encoded = value.encode_wide().collect::<Vec<_>>();
+    if encoded.contains(&0) {
+        return Err(invalid_command(format!("{label} cannot contain NUL")));
+    }
+    encoded.push(0);
+    Ok(encoded)
+}
+
+fn enforce_sandbox(request: &NormalizedExecutionRequest) -> Result<(), ExecutionError> {
+    match &request.capability.sandbox {
+        SandboxPolicy::UnrestrictedLocalOwner => Ok(()),
+        SandboxPolicy::DenyExecution => Err(ExecutionError::CapabilityDenied {
+            path: request.cwd.clone(),
+            reason: "execution is denied by the sandbox policy".to_owned(),
+        }),
+        SandboxPolicy::MacSeatbelt { .. } => Err(ExecutionError::CapabilityDenied {
+            path: request.cwd.clone(),
+            reason: "macOS Seatbelt cannot authorize Windows execution".to_owned(),
+        }),
+    }
+}
+
+fn invalid_command(reason: impl Into<String>) -> ExecutionError {
+    ExecutionError::InvalidCommand {
+        reason: reason.into(),
+    }
+}
+
+fn spawn_failed(error: io::Error) -> ExecutionError {
+    ExecutionError::SpawnFailed {
+        failure: SpawnFailure {
+            code: "spawn_failed".to_owned(),
+            message: error.to_string(),
+        },
+    }
+}
+
+fn start_lost(
+    code: &'static str,
+    message: String,
+    last_known: Option<ProcessSnapshot>,
+    cleanup: CleanupReport,
+) -> ExecutionError {
+    ExecutionError::StartLost {
+        failure: SpawnFailure {
+            code: code.to_owned(),
+            message,
+        },
+        last_known,
+        cleanup,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        ffi::{OsStr, OsString},
+        os::windows::ffi::OsStringExt,
+        sync::Mutex,
+        time::Duration,
+    };
+
+    use serial_test::serial;
+    use tempfile::TempDir;
+    use windows_sys::Win32::{
+        Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE},
+        System::Threading::GetCurrentProcess,
+    };
+
+    use super::*;
+    use crate::{CapabilityPolicy, ExecutionOwner, ExecutionPolicy, Transport};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SpawnAuditEvent {
+        Created,
+        Assigned,
+        Resumed,
+    }
+
+    struct AuditFacade {
+        events: Mutex<Vec<SpawnAuditEvent>>,
+        fail_assignment: bool,
+        created: Mutex<Option<CreatedProcess>>,
+    }
+
+    struct CreatedProcess {
+        pid: u32,
+        process: OwnedHandle,
+    }
+
+    impl AuditFacade {
+        fn assignment_failure() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+                fail_assignment: true,
+                created: Mutex::new(None),
+            }
+        }
+
+        fn successful() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+                fail_assignment: false,
+                created: Mutex::new(None),
+            }
+        }
+
+        fn events(&self) -> Vec<SpawnAuditEvent> {
+            self.events
+                .lock()
+                .expect("spawn audit event mutex should not be poisoned")
+                .clone()
+        }
+
+        fn created_pid(&self) -> Option<u32> {
+            self.created
+                .lock()
+                .expect("created process mutex should not be poisoned")
+                .as_ref()
+                .map(|created| created.pid)
+        }
+
+    fn created_process_is_signaled(&self) -> io::Result<bool> {
+            let created = self
+                .created
+                .lock()
+                .map_err(|_| io::Error::other("created process mutex is poisoned"))?;
+            let created = created
+                .as_ref()
+                .ok_or_else(|| io::Error::other("CreateProcessW was not observed"))?;
+            handle_is_signaled(created.process.as_raw())
+        }
+
+        fn wait_created_process_terminated(&self) -> io::Result<()> {
+            let created = self
+                .created
+                .lock()
+                .map_err(|_| io::Error::other("created process mutex is poisoned"))?;
+            let created = created
+                .as_ref()
+                .ok_or_else(|| io::Error::other("CreateProcessW was not observed"))?;
+            wait_handle_until(
+                created.process.as_raw(),
+                Instant::now() + Duration::from_secs(5),
+            )
+        }
+    }
+
+    impl Win32Facade for AuditFacade {
+        fn process_created(
+            &self,
+            pid: u32,
+            process: HANDLE,
+            _thread: HANDLE,
+        ) -> io::Result<()> {
+            let process = duplicate_non_inheritable(process)?;
+            self.events
+                .lock()
+                .map_err(|_| io::Error::other("spawn audit event mutex is poisoned"))?
+                .push(SpawnAuditEvent::Created);
+            *self
+                .created
+                .lock()
+                .map_err(|_| io::Error::other("created process mutex is poisoned"))? =
+                Some(CreatedProcess { pid, process });
+            Ok(())
+        }
+
+        fn assign_process_to_job(&self, job: HANDLE, process: HANDLE) -> io::Result<()> {
+            self.events
+                .lock()
+                .map_err(|_| io::Error::other("spawn audit event mutex is poisoned"))?
+                .push(SpawnAuditEvent::Assigned);
+            if self.fail_assignment {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected AssignProcessToJobObject failure",
+                ))
+            } else {
+                SystemWin32.assign_process_to_job(job, process)
+            }
+        }
+
+        fn resume_thread(&self, thread: HANDLE) -> io::Result<u32> {
+            self.events
+                .lock()
+                .map_err(|_| io::Error::other("spawn audit event mutex is poisoned"))?
+                .push(SpawnAuditEvent::Resumed);
+            SystemWin32.resume_thread(thread)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn assignment_failure_never_resumes_or_executes_user_code() {
+        let temporary = TempDir::new().expect("temporary marker directory should be created");
+        let marker = temporary.path().join("must-not-exist.marker");
+        let facade = Arc::new(AuditFacade::assignment_failure());
+        let request = program_request(
+            command_shell(),
+            &[
+                OsString::from("/D"),
+                OsString::from("/C"),
+                OsString::from(format!(">\"{}\" echo resumed", marker.display())),
+            ],
+        );
+        let output = Arc::new(OutputBuffer::new(4096));
+
+        let result = spawn_pipe_inner(request, output, facade.clone()).await;
+
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("injected Job assignment failure must reject start"),
+        };
+        let ExecutionError::SpawnFailed { failure } = error else {
+            panic!("pre-resume assignment failure must be stable SpawnFailed, got {error:?}");
+        };
+        assert_eq!(failure.code, "spawn_failed");
+        assert!(
+            failure
+                .message
+                .contains("injected AssignProcessToJobObject failure"),
+            "unexpected spawn failure message: {}",
+            failure.message
+        );
+        assert_eq!(
+            facade.events(),
+            vec![SpawnAuditEvent::Created, SpawnAuditEvent::Assigned],
+            "ResumeThread must never be attempted after assignment failure"
+        );
+        assert!(
+            !marker.exists(),
+            "the suspended child executed user code despite assignment failure"
+        );
+        assert!(
+            facade
+                .created_process_is_signaled()
+                .expect("exact process handle liveness probe should succeed"),
+            "the suspended child was not reaped before SpawnFailed returned"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn spawn_order_is_create_then_assign_then_resume() {
+        let facade = Arc::new(AuditFacade::successful());
+        let request = program_request(
+            command_shell(),
+            &[
+                OsString::from("/D"),
+                OsString::from("/C"),
+                OsString::from("exit 0"),
+            ],
+        );
+        let output = Arc::new(OutputBuffer::new(4096));
+
+        let spawned = spawn_pipe_inner(request, output, facade.clone())
+            .await
+            .expect("audited helper should start");
+        let fact = spawned
+            .owner
+            .wait_reaped(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("audited helper should be reaped");
+
+        assert_eq!(fact.code, Some(0));
+        assert_eq!(fact.signal, None);
+        assert_eq!(
+            facade.events(),
+            vec![
+                SpawnAuditEvent::Created,
+                SpawnAuditEvent::Assigned,
+                SpawnAuditEvent::Resumed,
+            ]
+        );
+        assert!(facade.created_pid().is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn dropping_start_future_after_create_cannot_resume_later() {
+        let temporary = TempDir::new().expect("temporary marker directory should be created");
+        let marker = temporary.path().join("drop-must-not-resume.marker");
+        let facade = Arc::new(PausedAssignFacade::new());
+        let request = program_request(
+            command_shell(),
+            &[
+                OsString::from("/D"),
+                OsString::from("/C"),
+                OsString::from(format!(">\"{}\" echo resumed", marker.display())),
+            ],
+        );
+        let output = Arc::new(OutputBuffer::new(4096));
+        let start = tokio::spawn(spawn_pipe_inner(request, output, facade.clone()));
+
+        tokio::time::timeout(Duration::from_secs(5), facade.wait_until_assign_entered())
+            .await
+            .expect("spawn transaction should reach the injected assignment pause");
+        start.abort();
+        let _ = start.await;
+        facade.release_assignment();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if facade.events().contains(&SpawnAuditEvent::Assigned) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("cancelled blocking transaction should finish assignment cleanup");
+
+        assert_eq!(
+            facade.events(),
+            vec![SpawnAuditEvent::Created, SpawnAuditEvent::Assigned],
+            "a dropped start future permitted a late ResumeThread"
+        );
+        assert!(!marker.exists(), "dropped start executed user code");
+        facade
+            .wait_created_process_terminated()
+            .expect("cancelled start must leave no exact process behind");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn dropped_write_keeps_stdin_open_until_the_blocking_write_finishes() {
+        let spawned = spawn_pipe_inner(
+            program_request(
+                command_shell(),
+                &[
+                    OsString::from("/D"),
+                    OsString::from("/C"),
+                    OsString::from("ping -n 10 127.0.0.1 >NUL"),
+                ],
+            ),
+            Arc::new(OutputBuffer::new(4096)),
+            Arc::new(SystemWin32),
+        )
+        .await
+        .expect("stdin sink should start");
+        let owner = spawned.owner.clone();
+        let write_owner = owner.clone();
+        let write = tokio::spawn(async move {
+            write_owner
+                .write(&vec![b'x'; 32 * 1024 * 1024])
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        write.abort();
+        let _ = write.await;
+        let close_owner = owner.clone();
+        let close = tokio::spawn(async move { close_owner.close_stdin().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), close)
+                .await
+                .is_err(),
+            "close_stdin returned while the cancelled blocking write still owned stdin"
+        );
+        owner
+            .force_kill()
+            .await
+            .expect("stdin sink Job should terminate");
+        owner
+            .wait_reaped(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("stdin sink should be reaped after dropped write");
+        owner
+            .close_stdin()
+            .await
+            .expect("stdin should close after the detached writer has finished");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn child_inherits_only_the_three_whitelisted_stdio_handles() {
+        let sentinel = create_inheritable_pipe().expect("sentinel pipe should be created");
+        clear_inheritance(sentinel.read.as_raw())
+            .expect("sentinel parent read handle should not be inheritable");
+        let spawned = spawn_pipe_inner(
+            program_request(
+                command_shell(),
+                &[
+                    OsString::from("/D"),
+                    OsString::from("/C"),
+                    OsString::from("ping -n 10 127.0.0.1 >NUL"),
+                ],
+            ),
+            Arc::new(OutputBuffer::new(4096)),
+            Arc::new(SystemWin32),
+        )
+        .await
+        .expect("sentinel probe child should start");
+        drop(sentinel.write);
+
+        let eof = tokio::task::spawn_blocking(move || {
+            let mut byte = 0_u8;
+            let mut read = 0_u32;
+            // SAFETY: byte is writable and the sentinel read handle remains
+            // owned by this blocking task.
+            let result = unsafe {
+                ReadFile(
+                    sentinel.read.as_raw(),
+                    &mut byte,
+                    1,
+                    &mut read,
+                    ptr::null_mut(),
+                )
+            };
+            if result != 0 {
+                return Ok(read == 0);
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error().map(|code| code as u32) == Some(ERROR_BROKEN_PIPE) {
+                Ok(true)
+            } else {
+                Err(error)
+            }
+        });
+
+        let inherited = tokio::time::timeout(Duration::from_millis(250), eof)
+            .await
+            .map(|result| {
+                result
+                    .expect("sentinel reader task should not panic")
+                    .expect("sentinel reader should observe EOF")
+            })
+            .unwrap_or(false);
+        spawned
+            .owner
+            .force_kill()
+            .await
+            .expect("sentinel probe Job should terminate");
+        spawned
+            .owner
+            .wait_reaped(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("sentinel probe child should be reaped");
+
+        assert!(
+            inherited,
+            "an unrelated inheritable host handle reached the child despite HANDLE_LIST"
+        );
+    }
+
+    #[test]
+    fn crt_quoting_handles_empty_spaces_quotes_and_trailing_backslashes() {
+        assert_eq!(quoted("plain"), "plain");
+        assert_eq!(quoted(""), r#""""#);
+        assert_eq!(quoted("two words"), r#""two words""#);
+        assert_eq!(quoted(r#"a\"b"#), r#""a\\\"b""#);
+        assert_eq!(quoted(r#"ends with \"#), r#""ends with \\""#);
+        assert_eq!(
+            decode_wide(&encode_command_line(
+                OsStr::new(r"C:\Program Files\helper.exe"),
+                &[OsString::from(r#"a\"b"#), OsString::from("")],
+            )
+            .expect("valid command line should encode")),
+            r#""C:\Program Files\helper.exe" "a\\\"b" """#
+        );
+    }
+
+    #[test]
+    fn environment_overlay_is_case_insensitive_sorted_and_double_nul_terminated() {
+        let inherited = vec![
+            (OsString::from("Path"), OsString::from("old")),
+            (OsString::from("path"), OsString::from("newer inherited")),
+            (OsString::from("ZETA"), OsString::from("last")),
+            (OsString::from("alpha"), OsString::from("first")),
+        ];
+        let overrides = BTreeMap::from([
+            (OsString::from("PATH"), OsString::from("new")),
+            (OsString::from("Beta"), OsString::from("middle")),
+        ]);
+
+        let block = encode_environment_from(inherited, &overrides)
+            .expect("valid environment should encode");
+
+        assert!(block.ends_with(&[0, 0]));
+        assert_eq!(
+            environment_entries(&block),
+            vec!["alpha=first", "Beta=middle", "PATH=new", "ZETA=last"]
+        );
+    }
+
+    #[test]
+    fn environment_rejects_nul_in_override_key_or_value() {
+        let nul = OsString::from_wide(&[b'A' as u16, 0, b'B' as u16]);
+        let invalid_key = BTreeMap::from([(nul.clone(), OsString::from("value"))]);
+        let invalid_value = BTreeMap::from([(OsString::from("KEY"), nul)]);
+
+        assert!(matches!(
+            encode_environment_from(Vec::new(), &invalid_key),
+            Err(ExecutionError::InvalidCommand { reason })
+                if reason.contains("environment keys cannot contain NUL")
+        ));
+        assert!(matches!(
+            encode_environment_from(Vec::new(), &invalid_value),
+            Err(ExecutionError::InvalidCommand { reason })
+                if reason.contains("environment values cannot contain NUL")
+        ));
+    }
+
+    fn program_request(program: OsString, args: &[OsString]) -> NormalizedExecutionRequest {
+        let cwd = std::env::current_dir().expect("current directory should exist");
+        NormalizedExecutionRequest {
+            owner: ExecutionOwner::new(uuid::Uuid::now_v7(), uuid::Uuid::now_v7()),
+            command: CommandSpec::Program {
+                program,
+                args: args.to_vec(),
+            },
+            cwd: cwd.clone(),
+            env: BTreeMap::new(),
+            transport: Transport::Pipe,
+            policy: ExecutionPolicy::default(),
+            capability: CapabilityPolicy::local_owner(cwd),
+        }
+    }
+
+    fn command_shell() -> OsString {
+        let system_root =
+            std::env::var_os("SystemRoot").unwrap_or_else(|| OsString::from(r"C:\Windows"));
+        std::path::PathBuf::from(system_root)
+            .join("System32")
+            .join("cmd.exe")
+            .into_os_string()
+    }
+
+    fn quoted(value: &str) -> String {
+        let mut encoded = Vec::new();
+        append_quoted(OsStr::new(value), &mut encoded).expect("valid argument should quote");
+        String::from_utf16(&encoded).expect("ASCII fixture should remain valid UTF-16")
+    }
+
+    fn decode_wide(encoded: &[u16]) -> String {
+        let encoded = encoded.strip_suffix(&[0]).unwrap_or(encoded);
+        String::from_utf16(encoded).expect("ASCII fixture should remain valid UTF-16")
+    }
+
+    fn environment_entries(block: &[u16]) -> Vec<String> {
+        block
+            .split(|unit| *unit == 0)
+            .take_while(|entry| !entry.is_empty())
+            .map(|entry| String::from_utf16(entry).expect("ASCII fixture should remain UTF-16"))
+            .collect()
+    }
+
+    fn duplicate_non_inheritable(handle: HANDLE) -> io::Result<OwnedHandle> {
+        let current_process = unsafe { GetCurrentProcess() };
+        let mut duplicate = ptr::null_mut();
+        let duplicated = unsafe {
+            DuplicateHandle(
+                current_process,
+                handle,
+                current_process,
+                &mut duplicate,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if duplicated == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        unsafe { OwnedHandle::from_raw(duplicate) }
+    }
+
+    struct PausedAssignFacade {
+        audit: AuditFacade,
+        entered: tokio::sync::Notify,
+        release: (Mutex<bool>, std::sync::Condvar),
+    }
+
+    impl PausedAssignFacade {
+        fn new() -> Self {
+            Self {
+                audit: AuditFacade::successful(),
+                entered: tokio::sync::Notify::new(),
+                release: (Mutex::new(false), std::sync::Condvar::new()),
+            }
+        }
+
+        async fn wait_until_assign_entered(&self) {
+            self.entered.notified().await;
+        }
+
+        fn release_assignment(&self) {
+            let (released, condition) = &self.release;
+            let mut released = match released.lock() {
+                Ok(released) => released,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *released = true;
+            condition.notify_all();
+        }
+
+        fn events(&self) -> Vec<SpawnAuditEvent> {
+            self.audit.events()
+        }
+
+        fn wait_created_process_terminated(&self) -> io::Result<()> {
+            self.audit.wait_created_process_terminated()
+        }
+    }
+
+    impl Win32Facade for PausedAssignFacade {
+        fn process_created(
+            &self,
+            pid: u32,
+            process: HANDLE,
+            thread: HANDLE,
+        ) -> io::Result<()> {
+            self.audit.process_created(pid, process, thread)
+        }
+
+        fn assign_process_to_job(&self, _job: HANDLE, _process: HANDLE) -> io::Result<()> {
+            self.entered.notify_one();
+            let (released, condition) = &self.release;
+            let mut released = released
+                .lock()
+                .map_err(|_| io::Error::other("assignment pause mutex is poisoned"))?;
+            while !*released {
+                released = condition
+                    .wait(released)
+                    .map_err(|_| io::Error::other("assignment pause mutex is poisoned"))?;
+            }
+            self.audit
+                .events
+                .lock()
+                .map_err(|_| io::Error::other("spawn audit event mutex is poisoned"))?
+                .push(SpawnAuditEvent::Assigned);
+            Ok(())
+        }
+
+        fn resume_thread(&self, thread: HANDLE) -> io::Result<u32> {
+            self.audit.resume_thread(thread)
+        }
+    }
+}

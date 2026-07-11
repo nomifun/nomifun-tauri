@@ -7,15 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(windows)]
-use std::collections::BTreeMap;
-
 use nomi_execution::SupervisorConfig;
-#[cfg(windows)]
-use nomi_execution::{
-    CapabilityPolicy, CommandSpec, ExecutionOwner, ExecutionPolicy, NormalizedExecutionRequest,
-    ProcessSupervisor, Transport,
-};
 use tempfile::tempdir;
 
 fn helper_binary() -> &'static str {
@@ -39,19 +31,6 @@ fn supervisor_defaults_are_stable() {
 
     assert_eq!(config.max_sessions, 64);
     assert_eq!(config.reaper_interval, Duration::from_secs(30));
-}
-
-#[cfg(windows)]
-#[tokio::test]
-async fn public_start_reports_the_pending_platform_adapter_as_transport_failure() {
-    let supervisor = ProcessSupervisor::new(SupervisorConfig::default());
-    let result = supervisor.start(normalized_request()).await;
-    let Err(error) = result else {
-        panic!("Task 3 must not fabricate an unsupervised process");
-    };
-
-    assert_eq!(error.code(), "transport");
-    assert!(error.to_string().contains("platform"));
 }
 
 #[test]
@@ -140,6 +119,7 @@ fn helper_write_pid_publishes_its_pid_atomically() {
 }
 
 #[test]
+#[cfg(unix)]
 fn helper_spawn_grandchild_publishes_the_child_pid() {
     let directory = tempdir().expect("temporary directory should be created");
     let marker = directory.path().join("grandchild.marker");
@@ -154,6 +134,7 @@ fn helper_spawn_grandchild_publishes_the_child_pid() {
     let parent_pid = child.id();
     let mut tree = HelperTree {
         parent: child,
+        #[cfg(unix)]
         grandchild_pid: None,
     };
 
@@ -182,6 +163,7 @@ fn helper_ignore_interrupt_remains_alive() {
         .expect("execution_test_helper should start");
     let mut tree = HelperTree {
         parent: child,
+        #[cfg(unix)]
         grandchild_pid: None,
     };
     let stdout = tree
@@ -211,6 +193,7 @@ fn helper_ignore_interrupt_remains_alive() {
         .is_none());
 }
 
+#[cfg(unix)]
 fn wait_for_pid(path: &std::path::Path, timeout: Duration) -> u32 {
     let deadline = Instant::now() + timeout;
     loop {
@@ -230,33 +213,19 @@ fn read_pid(path: &std::path::Path) -> u32 {
         .expect("PID marker should contain a decimal PID")
 }
 
-#[cfg(windows)]
-fn normalized_request() -> NormalizedExecutionRequest {
-    let cwd = std::env::current_dir().expect("current directory should exist");
-    NormalizedExecutionRequest {
-        owner: ExecutionOwner::new(uuid::Uuid::now_v7(), uuid::Uuid::now_v7()),
-        command: CommandSpec::Program {
-            program: "not-started-in-task-3".into(),
-            args: Vec::new(),
-        },
-        cwd: cwd.clone(),
-        env: BTreeMap::new(),
-        transport: Transport::Pipe,
-        policy: ExecutionPolicy::default(),
-        capability: CapabilityPolicy::local_owner(cwd),
-    }
-}
-
 struct HelperTree {
     parent: Child,
+    #[cfg(unix)]
     grandchild_pid: Option<u32>,
 }
 
 impl Drop for HelperTree {
     fn drop(&mut self) {
+        #[cfg(unix)]
         kill_process_tree(self.parent.id());
         let _ = self.parent.kill();
         let _ = self.parent.wait();
+        #[cfg(unix)]
         if let Some(pid) = self.grandchild_pid {
             kill_process(pid);
         }
@@ -296,27 +265,9 @@ fn send_interrupt(pid: u32) -> std::io::Result<()> {
     }
 }
 
-#[cfg(windows)]
-fn kill_process_tree(pid: u32) {
-    let _ = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-}
-
 #[cfg(unix)]
 fn kill_process_tree(pid: u32) {
     kill_process(pid);
-}
-
-#[cfg(windows)]
-fn kill_process(pid: u32) {
-    let _ = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
 }
 
 #[cfg(unix)]

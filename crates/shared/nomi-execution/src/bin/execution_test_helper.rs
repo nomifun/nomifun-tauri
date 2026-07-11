@@ -64,11 +64,16 @@ fn main() {
                 .unwrap_or_else(|error| fail_io("write ready PID marker", error));
             thread::sleep(LONG_SLEEP);
         }
-        #[cfg(unix)]
         "leader-first" => {
             require_len(&args, 2);
-            spawn_surviving_descendant(Path::new(&args[1]), false)
+            spawn_leader_first(Path::new(&args[1]))
                 .unwrap_or_else(|error| fail_io("spawn leader-first descendant", error));
+        }
+        #[cfg(windows)]
+        "leader-first-gated" => {
+            require_len(&args, 3);
+            spawn_leader_first_gated(Path::new(&args[1]), Path::new(&args[2]))
+                .unwrap_or_else(|error| fail_io("spawn gated leader-first descendant", error));
         }
         #[cfg(unix)]
         "setsid-escape" => {
@@ -86,6 +91,11 @@ fn main() {
             require_len(&args, 2);
             write_pid_atomically(Path::new(&args[1]), process::id())
                 .unwrap_or_else(|error| fail_io("write PID marker", error));
+        }
+        "print-args-env-cwd" => {
+            require_len(&args, 5);
+            print_args_env_cwd(&args[1], &args[2], &args[3], &args[4])
+                .unwrap_or_else(|error| fail_io("print argv/env/cwd", error));
         }
         _ => fail("unknown helper subcommand"),
     }
@@ -124,6 +134,32 @@ fn emit_ready() -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     stdout.write_all(b"ready\n")?;
     stdout.flush()
+}
+
+fn print_args_env_cwd(
+    first: &OsStr,
+    second: &OsStr,
+    env_key: &OsStr,
+    expected_cwd: &OsStr,
+) -> io::Result<()> {
+    let cwd = env::current_dir()?;
+    if cwd.as_os_str() != expected_cwd {
+        return Err(io::Error::other(format!(
+            "cwd mismatch: actual={cwd:?} expected={expected_cwd:?}"
+        )));
+    }
+    let value = env::var_os(env_key).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("environment key was not inherited: {env_key:?}"),
+        )
+    })?;
+    let mut output = io::stdout().lock();
+    for field in [first, second, value.as_os_str(), cwd.as_os_str()] {
+        let encoded = field.to_string_lossy();
+        writeln!(output, "{}:{encoded}", encoded.as_bytes().len())?;
+    }
+    output.flush()
 }
 
 fn flood(mut remaining: u64) -> io::Result<()> {
@@ -187,6 +223,51 @@ fn spawn_surviving_descendant(marker: &Path, escape_session: bool) -> io::Result
     }
     let mut descendant = command.spawn()?;
     if let Err(error) = write_pid_atomically(marker, descendant.id()) {
+        let _ = descendant.kill();
+        let _ = descendant.wait();
+        return Err(error);
+    }
+    drop(descendant);
+    Ok(())
+}
+
+fn spawn_leader_first(marker: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        spawn_surviving_descendant(marker, false)
+    }
+
+    #[cfg(windows)]
+    {
+        let executable = env::current_exe()?;
+        let mut descendant = Command::new(executable)
+            .args(["sleep", "60000"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        if let Err(error) = write_pid_atomically(marker, descendant.id()) {
+            let _ = descendant.kill();
+            let _ = descendant.wait();
+            return Err(error);
+        }
+        drop(descendant);
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn spawn_leader_first_gated(marker: &Path, exit_gate: &Path) -> io::Result<()> {
+    let executable = env::current_exe()?;
+    let mut descendant = Command::new(executable)
+        .args(["sleep", "60000"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    if let Err(error) = write_pid_atomically(marker, descendant.id())
+        .and_then(|_| wait_for_marker(exit_gate, Duration::from_secs(5)))
+    {
         let _ = descendant.kill();
         let _ = descendant.wait();
         return Err(error);
