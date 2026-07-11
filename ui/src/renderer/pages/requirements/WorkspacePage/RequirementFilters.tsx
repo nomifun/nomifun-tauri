@@ -12,7 +12,7 @@
  *
  * Presentational: all state lives in the parent; this only emits callbacks.
  */
-import { Button, Checkbox, Dropdown, Input, Menu, Popconfirm } from '@arco-design/web-react';
+import { Button, Checkbox, Dropdown, Input, Menu, Popconfirm, Radio } from '@arco-design/web-react';
 import type { RefInputType } from '@arco-design/web-react/es/Input/interface';
 import { Check, Filter, Search, SortTwo, Tag } from '@icon-park/react';
 import React, { useEffect, useRef, useState } from 'react';
@@ -36,8 +36,6 @@ const STATUS_OPTIONS: RequirementStatus[] = [
 const DEFAULT_SORT = '__default__';
 const ALL_TAGS = '__all_tags__';
 const ALL_STATUSES = '__all_statuses__';
-const SORT_ASC = '__sort_asc__';
-const SORT_DESC = '__sort_desc__';
 
 type FilterTriggerProps = Omit<React.ButtonHTMLAttributes<HTMLButtonElement>, 'value'> & {
   icon: React.ReactNode;
@@ -189,31 +187,33 @@ const RequirementFilters: React.FC<RequirementFiltersProps> = ({
   );
 
   const sortMenu = (
-    <Menu
-      onClickMenuItem={(key) => {
-        if (key === SORT_ASC || key === SORT_DESC) {
-          onOrderChange(key === SORT_ASC ? 'asc' : 'desc');
-          return;
-        }
-        onOrderByChange(key === DEFAULT_SORT ? undefined : (String(key) as RequirementOrderBy));
-      }}
-    >
-      <Menu.ItemGroup title={sortLabel}>
-        {sortOptions.map((option) => (
-          <Menu.Item key={option.value}>
-            {optionContent(option.label, (orderBy ?? DEFAULT_SORT) === option.value)}
-          </Menu.Item>
-        ))}
-      </Menu.ItemGroup>
-      <Menu.ItemGroup title={t('requirements.sort.direction')}>
-        <Menu.Item key={SORT_ASC} disabled={!orderBy}>
-          {optionContent(`↑ ${t('requirements.sort.asc')}`, Boolean(orderBy) && order === 'asc')}
-        </Menu.Item>
-        <Menu.Item key={SORT_DESC} disabled={!orderBy}>
-          {optionContent(`↓ ${t('requirements.sort.desc')}`, Boolean(orderBy) && order === 'desc')}
-        </Menu.Item>
-      </Menu.ItemGroup>
-    </Menu>
+    <div className='rounded-8px border border-solid border-[var(--color-border-2)] bg-[var(--color-bg-2)] p-8px shadow-[0_8px_24px_rgba(0,0,0,0.18)]'>
+      <div className='flex items-start gap-12px'>
+        <Menu
+          className='min-w-180px !bg-transparent !shadow-none'
+          onClickMenuItem={(key) =>
+            onOrderByChange(key === DEFAULT_SORT ? undefined : (String(key) as RequirementOrderBy))
+          }
+        >
+          <Menu.ItemGroup title={sortLabel}>
+            {sortOptions.map((option) => (
+              <Menu.Item key={option.value}>
+                {optionContent(option.label, (orderBy ?? DEFAULT_SORT) === option.value)}
+              </Menu.Item>
+            ))}
+          </Menu.ItemGroup>
+        </Menu>
+        <div className='min-w-178px border-l border-solid border-[var(--color-border-2)] px-12px pb-8px pt-6px'>
+          <div className='mb-10px text-12px text-[var(--color-text-3)]'>
+            {t('requirements.sort.direction')}
+          </div>
+          <Radio.Group type='button' size='small' value={order} disabled={!orderBy} onChange={onOrderChange}>
+            <Radio value='asc'>↑ {t('requirements.sort.asc')}</Radio>
+            <Radio value='desc'>↓ {t('requirements.sort.desc')}</Radio>
+          </Radio.Group>
+        </div>
+      </div>
+    </div>
   );
 
   return (

@@ -55,6 +55,12 @@ describe('RequirementFilters trigger', () => {
     expect(listViewSource.includes('requirements.selection.selectAllPage')).toBe(false);
   });
 
+  test('places sort direction beside the sort field options', () => {
+    expect(filtersSource.includes("className='flex items-start gap-12px'")).toBe(true);
+    expect(filtersSource.includes("<Radio.Group type='button' size='small'")).toBe(true);
+    expect(filtersSource.includes("<Menu.ItemGroup title={t('requirements.sort.direction')}>")).toBe(false);
+  });
+
   test('separates the filter row from content without adding an outer border', () => {
     expect(workspaceSource.includes("<div className='mt-8px'>")).toBe(true);
     expect(workspaceSource.includes("<div className='mt-10px'>")).toBe(true);
