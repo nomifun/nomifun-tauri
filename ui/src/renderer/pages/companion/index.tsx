@@ -35,15 +35,11 @@ import { getDeskSpecFor } from './characters';
 import { customFigureMetaOf } from './characters/customMeta';
 import type { CompanionActivity as RabbitActivity, CompanionMood as RabbitMood } from './characters';
 import {
-  chooseMemoryPanelLayout,
-  fitMemoryPanelInAchievedWindow,
-  memoryPanelStageShiftX,
   pickHostMonitor,
   resolveDeskRestoreLayout,
-  type MemoryPanelPlacement,
-  type MemoryPanelLayout,
   type MonitorLayout,
 } from './memoryPanelGeometry';
+import { useDetachedMemoryPanel } from './useDetachedMemoryPanel';
 import { placeResizedWindow, type GeomRect } from './windowGeometry';
 import { buildCompanionMenuEntries, type CompanionMenuAction } from './companionNativeMenu';
 import { useCompanionClickThrough } from './useCompanionClickThrough';
@@ -59,7 +55,7 @@ const INIT_MAX_RETRIES = 6;
 const BAR_REVEAL_HIDE_DELAY_MS = 280;
 const MAX_WINDOW_RESTORE_RETRIES = 2;
 
-type ExpandedWindowMode = 'memory' | 'chat';
+type ExpandedWindowMode = 'chat';
 
 interface ExpandedWindowSession {
   anchor: GeomRect;
@@ -124,7 +120,6 @@ const CompanionPage: React.FC = () => {
   const [bubbleLoading, setBubbleLoading] = useState(false);
   const [unread, setUnread] = useState(0);
   const [suggestions, setSuggestions] = useState<ICompanionSuggestion[]>([]);
-  const [showSuggestions, setShowSuggestions] = useState(false);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   /** 光标是否停在伙伴交互区（由 useCompanionClickThrough 上报）：驱动「悬停才出现」的
@@ -177,10 +172,6 @@ const CompanionPage: React.FC = () => {
   const expandedWindowRequestedModeRef = useRef<ExpandedWindowMode | null>(null);
   const expandedWindowRestoreTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const internalWindowLayoutRef = useRef(false);
-  const [memoryPanelPlacement, setMemoryPanelPlacement] = useState<MemoryPanelPlacement>('above');
-  const [memoryPanelMaxWidth, setMemoryPanelMaxWidth] = useState(340);
-  const [memoryPanelMaxHeight, setMemoryPanelMaxHeight] = useState(320);
-  const [memoryStageShiftX, setMemoryStageShiftX] = useState(0);
   /** 气泡正文滚动视口 + 内容包裹，用于「粘底自动追尾」（持续对话感）。 */
   const bubbleScrollRef = useRef<HTMLDivElement | null>(null);
   const bubbleContentRef = useRef<HTMLDivElement | null>(null);
@@ -471,8 +462,6 @@ const CompanionPage: React.FC = () => {
           await win.setPosition(new PhysicalPosition(restored.rect.x, restored.rect.y));
           expandedWindowSessionRef.current = null;
           expandedWindowRestoreRetriesRef.current = 0;
-          setMemoryPanelPlacement('above');
-          setMemoryStageShiftX(0);
           return;
         }
 
@@ -519,73 +508,26 @@ const CompanionPage: React.FC = () => {
           height: Math.max(window.screen.availHeight * scale, session.anchor.y + session.anchor.height),
         };
         const host = hostMonitor?.workArea ?? fallbackHost;
-        let targetRect: GeomRect;
-        let requestedMemoryLayout: MemoryPanelLayout | null = null;
-
-        if (mode === 'memory') {
-          const screenWidth = host.width / scale;
-          const screenHeight = host.height / scale;
-          const desiredPanel = {
-            width: Math.max(300, Math.min(360, screenWidth * 0.32)),
-            height: Math.max(160, Math.min(320, screenHeight * 0.42)),
-          };
-          const layout = chooseMemoryPanelLayout({
-            anchor: session.anchor,
-            monitor: host,
-            scaleFactor: scale,
-            desiredPanel,
-          });
-          requestedMemoryLayout = layout;
-          targetRect = layout.windowRect;
-          setMemoryPanelPlacement(layout.placement);
-          setMemoryPanelMaxWidth(Math.max(1, Math.floor(layout.panelMaxWidth / scale)));
-          setMemoryPanelMaxHeight(Math.max(1, Math.floor(layout.panelMaxHeight / scale)));
-          setMemoryStageShiftX(memoryPanelStageShiftX(layout, session.anchor.width) / scale);
-        } else {
-          const deskNow = getDeskSpecFor(cfg.character, customFigureMetaOf(cfg));
-          const reservePx = deskNow.figureHeight + 84;
-          const screenWidth = host.width / scale;
-          const screenHeight = host.height / scale;
-          const clampPx = (min: number, value: number, max: number) => Math.round(Math.max(min, Math.min(max, value)));
-          const targetSize = {
-            width: Math.max(session.anchor.width, Math.round(clampPx(360, screenWidth * 0.3, 560) * scale)),
-            height: Math.max(
-              session.anchor.height,
-              Math.round(clampPx(440, Math.max(screenHeight * 0.6, reservePx + 220), 720) * scale)
-            ),
-          };
-          const workAreas = monitors.map((monitor) => monitor.workArea);
-          const position = placeResizedWindow(session.anchor, targetSize, workAreas.length > 0 ? workAreas : [host]);
-          targetRect = { ...position, ...targetSize };
-        }
+        const deskNow = getDeskSpecFor(cfg.character, customFigureMetaOf(cfg));
+        const reservePx = deskNow.figureHeight + 84;
+        const screenWidth = host.width / scale;
+        const screenHeight = host.height / scale;
+        const clampPx = (min: number, value: number, max: number) => Math.round(Math.max(min, Math.min(max, value)));
+        const targetSize = {
+          width: Math.max(session.anchor.width, Math.round(clampPx(360, screenWidth * 0.3, 560) * scale)),
+          height: Math.max(
+            session.anchor.height,
+            Math.round(clampPx(440, Math.max(screenHeight * 0.6, reservePx + 220), 720) * scale)
+          ),
+        };
+        const workAreas = monitors.map((monitor) => monitor.workArea);
+        const position = placeResizedWindow(session.anchor, targetSize, workAreas.length > 0 ? workAreas : [host]);
+        const targetRect: GeomRect = { ...position, ...targetSize };
 
         await win.setSize(new PhysicalSize(targetRect.width, targetRect.height));
         const achieved = await win.outerSize();
         if (achieved.width !== targetRect.width || achieved.height !== targetRect.height) {
           console.warn('[companion] native window refused expanded surface size');
-          if (mode === 'memory' && requestedMemoryLayout) {
-            const reducedPanel = fitMemoryPanelInAchievedWindow({
-              achieved,
-              anchor: session.anchor,
-              monitor: host,
-              gap: requestedMemoryLayout.gap,
-              desiredWidth: requestedMemoryLayout.panelMaxWidth,
-              desiredHeight: requestedMemoryLayout.panelMaxHeight,
-              bottomChrome: Math.round(64 * scale),
-              preferredPlacement: requestedMemoryLayout.placement,
-              minWidth: Math.round(220 * scale),
-              minHeight: Math.round(96 * scale),
-            });
-            if (reducedPanel) {
-              setMemoryPanelPlacement(reducedPanel.placement);
-              setMemoryPanelMaxWidth(Math.max(1, Math.floor(reducedPanel.panelMaxWidth / scale)));
-              setMemoryPanelMaxHeight(Math.max(1, Math.floor(reducedPanel.panelMaxHeight / scale)));
-              setMemoryStageShiftX(memoryPanelStageShiftX(reducedPanel, session.anchor.width) / scale);
-              await win.setPosition(new PhysicalPosition(reducedPanel.windowRect.x, reducedPanel.windowRect.y));
-              lastLocalMoveAt.current = Date.now();
-              return;
-            }
-          }
           await win.setSize(new PhysicalSize(session.anchor.width, session.anchor.height));
           const restored = await win.outerSize();
           if (restored.width === session.anchor.width && restored.height === session.anchor.height) {
@@ -593,9 +535,6 @@ const CompanionPage: React.FC = () => {
             expandedWindowSessionRef.current = null;
             expandedWindowRestoreRetriesRef.current = 0;
           }
-          setMemoryPanelPlacement('above');
-          setMemoryStageShiftX(0);
-          if (mode === 'memory') setShowSuggestions(false);
           return;
         }
         await win.setPosition(new PhysicalPosition(targetRect.x, targetRect.y));
@@ -1058,36 +997,20 @@ const CompanionPage: React.FC = () => {
     };
   }, [companionId]);
 
-  // One expanded native rectangle serves the memory panel, reply bubble, and
-  // composer. Memory is explicit user intent and therefore wins while open.
+  // Reply and composer continue to share one expanded companion rectangle.
+  // Memory uses its own native window and never participates here.
   const hasBubble = bubble.length > 0;
-  const expandedMode: ExpandedWindowMode | null = showSuggestions ? 'memory' : hasBubble || composerOpen ? 'chat' : null;
+  const expandedMode: ExpandedWindowMode | null = hasBubble || composerOpen ? 'chat' : null;
   useEffect(() => {
     if (!isTauriRuntime()) return;
     void syncExpandedWindow(expandedMode);
   }, [expandedMode, syncExpandedWindow]);
-
-  useEffect(() => {
-    if (showSuggestions && suggestions.length === 0) setShowSuggestions(false);
-  }, [showSuggestions, suggestions.length]);
-
-  useEffect(() => {
-    if (!showSuggestions) return;
-    const closeMemoryPanel = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
-      setShowSuggestions(false);
-      requestAnimationFrame(() => unreadBadgeRef.current?.focus());
-    };
-    window.addEventListener('keydown', closeMemoryPanel);
-    return () => window.removeEventListener('keydown', closeMemoryPanel);
-  }, [showSuggestions]);
 
   const forceCompanionCapture = shouldCaptureWholeCompanionWindow({
     composerOpen,
     barRevealed,
     hasInput: Boolean(input),
     sending,
-    showSuggestions,
     dragOver,
   });
 
@@ -1252,6 +1175,14 @@ const CompanionPage: React.FC = () => {
       console.error('companion→main navigate failed:', e);
     }
   }, []);
+
+  const memoryPanel = useDetachedMemoryPanel({
+    companionId,
+    suggestions,
+    onActivate: async (suggestion) => openMainAt(suggestion.action?.to || '/nomi?tab=suggestions'),
+    onFallback: async () => openMainAt('/nomi?tab=suggestions'),
+    badgeRef: unreadBadgeRef,
+  });
 
   /** 解析（或幂等创建）该伙伴的唯一专属会话 id。单会话契约（FE2）：
    *  先读 getCompanionSession，有 id 直接用；否则 ensureCompanionSession 幂等创建。
@@ -1476,6 +1407,7 @@ const CompanionPage: React.FC = () => {
 
   const hideCompanion = useCallback(async () => {
     if (!companionId) return;
+    memoryPanel.close('owner-invalid');
     const next = await ipcBridge.companion.patchCompanion
       .invoke({ companion_id: companionId, patch: { appearance: { companion_enabled: false } } })
       .catch(() => null);
@@ -1486,11 +1418,11 @@ const CompanionPage: React.FC = () => {
       // through the config-updated path; kept for call-site symmetry.
       await applyDeskSize(next);
     }
-  }, [applyDeskSize, applyWindowState, companionId]);
+  }, [applyDeskSize, applyWindowState, companionId, memoryPanel]);
 
   const clearUnreadSuggestions = useCallback(() => {
     setUnread(0);
-    setShowSuggestions(false);
+    memoryPanel.close('empty');
     // Dismiss server-side too — otherwise the badge resurrects on the next
     // window load.
     const pending = suggestionsRef.current;
@@ -1498,7 +1430,7 @@ const CompanionPage: React.FC = () => {
     void Promise.allSettled(
       pending.map((s) => ipcBridge.companion.decideSuggestion.invoke({ id: s.id, accept: false }))
     );
-  }, []);
+  }, [memoryPanel]);
 
   const runMenuAction = useCallback(
     (action: CompanionMenuAction) => {
@@ -1559,18 +1491,6 @@ const CompanionPage: React.FC = () => {
     }
   }, [runMenuAction, t]);
 
-  const clickSuggestion = useCallback(
-    async (s: ICompanionSuggestion) => {
-      // Click = "take me to handle it", NOT accept. We don't decide here (no
-      // silent accept, no xp): the suggestion stays pending until the owner
-      // explicitly accepts/dismisses it in the panel, and the resulting
-      // companion.suggestion-decided event then syncs this bubble.
-      setShowSuggestions(false);
-      await openMainAt(s.action?.to || '/nomi?tab=suggestions');
-    },
-    [openMainAt]
-  );
-
   const desk = getDeskSpecFor(profile?.character, customFigureMetaOf(profile));
 
   // 反应控件：□ 打断（本地或远程 IM 回合生成中）+ × 忽略（有气泡时）。从气泡上移到输入条
@@ -1628,7 +1548,7 @@ const CompanionPage: React.FC = () => {
 
   return (
     <div
-      className={`nomi-companion-window ${showSuggestions ? 'is-memory-panel-open' : ''}`}
+      className='nomi-companion-window'
       // 气泡可用高度 = 100vh − 预留（立绘高 + 输入条/边距）。让正文吃满窗口剩余空间又不压到立绘。
       style={{ '--companion-reserve': `${desk.figureHeight + 84}px` } as React.CSSProperties}
       onContextMenu={(e) => {
@@ -1685,36 +1605,7 @@ const CompanionPage: React.FC = () => {
           </div>
         </div>
       )}
-      <div
-        className={`nomi-companion-stage-shell nomi-companion-stage-shell--${memoryPanelPlacement}`}
-        style={
-          {
-            '--memory-panel-max-width': `${memoryPanelMaxWidth}px`,
-            '--memory-panel-max-height': `${memoryPanelMaxHeight}px`,
-            '--memory-stage-shift-x': `${memoryStageShiftX}px`,
-          } as React.CSSProperties
-        }
-      >
-        {showSuggestions && suggestions.length > 0 && (
-          <div
-            id='nomi-companion-memory-panel'
-            className='nomi-companion-suggestions'
-            data-companion-hit
-            onClick={(event) => event.stopPropagation()}
-          >
-            {suggestions.map((s) => (
-              <button
-                key={s.id}
-                type='button'
-                className='nomi-companion-suggestions__item'
-                onClick={() => void clickSuggestion(s)}
-              >
-                <span className='nomi-companion-suggestions__title'>{s.title}</span>
-                <span className='nomi-companion-suggestions__body'>{s.body}</span>
-              </button>
-            ))}
-          </div>
-        )}
+      <div className='nomi-companion-stage-shell'>
         <div className='nomi-companion-stage'>
           {unread > 0 && (
             <button
@@ -1723,11 +1614,10 @@ const CompanionPage: React.FC = () => {
               className='nomi-companion-badge'
               data-companion-hit
               aria-label={t('nomi.tabs.suggestions')}
-              aria-expanded={showSuggestions}
-              aria-controls='nomi-companion-memory-panel'
+              aria-expanded={memoryPanel.isExpanded}
               onClick={(e) => {
                 e.stopPropagation();
-                setShowSuggestions((v) => !v);
+                memoryPanel.toggle();
               }}
             >
               {unread > 99 ? '99+' : unread}

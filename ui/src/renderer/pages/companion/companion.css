@@ -27,32 +27,6 @@
     -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
 }
 
-/* The memory panel is an explicit reading mode. Keep in-flight reply/composer
-   state alive, but give the panel the visible surface so transient chrome never
-   competes for the same native-window height. The hidden input row still keeps
-   its desk chrome footprint, so the figure does not jump vertically. */
-.nomi-companion-window.is-memory-panel-open > .nomi-companion-bubble {
-  display: none;
-}
-
-.nomi-companion-window.is-memory-panel-open > .nomi-companion-chatbar {
-  visibility: hidden;
-  pointer-events: none;
-}
-
-.nomi-companion-window.is-memory-panel-open > .nomi-companion-composer {
-  height: 30px;
-  min-height: 30px;
-  max-height: 30px;
-  margin-top: 6px;
-  margin-bottom: 10px;
-  padding: 0;
-  border: 0;
-  overflow: hidden;
-  visibility: hidden;
-  pointer-events: none;
-}
-
 /* ---- character shell ---- */
 
 .nomi-ch {
@@ -77,19 +51,6 @@
   min-height: 0;
 }
 
-.nomi-companion-stage-shell--above {
-  flex-direction: column;
-  align-items: center;
-}
-
-.nomi-companion-stage-shell--left {
-  flex-direction: row;
-}
-
-.nomi-companion-stage-shell--right {
-  flex-direction: row-reverse;
-}
-
 .nomi-companion-stage {
   position: relative;
   flex: none;
@@ -98,10 +59,6 @@
   justify-content: center;
   max-width: 100%;
   line-height: 0;
-}
-
-.nomi-companion-window.is-memory-panel-open .nomi-companion-stage {
-  transform: translateX(var(--memory-stage-shift-x, 0));
 }
 
 .nomi-companion-figure-hit {
@@ -589,101 +546,6 @@
   to {
     transform: rotate(360deg);
   }
-}
-
-/* ---- memory / suggestions panel ---- */
-
-.nomi-companion-suggestions {
-  flex: 0 1 auto;
-  min-width: 0;
-  min-height: 0;
-  width: min(100vw, var(--memory-panel-max-width, 340px));
-  max-height: var(--memory-panel-max-height, min(320px, 42vh));
-  overflow-y: auto;
-  overflow-x: hidden;
-  overscroll-behavior: contain;
-  scrollbar-width: thin;
-  scrollbar-color: var(--bg-4) transparent;
-  scrollbar-gutter: stable;
-  background: var(--bg-base);
-  border: 1px solid var(--border-base);
-  border-radius: 14px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
-  padding: 6px;
-  color: var(--text-primary);
-  line-height: 1.55;
-  user-select: text;
-  animation: nomi-bubble-in 0.18s ease-out;
-}
-
-.nomi-companion-stage-shell--above .nomi-companion-suggestions {
-  margin-bottom: 12px;
-}
-
-.nomi-companion-stage-shell--left .nomi-companion-suggestions {
-  margin-right: 12px;
-}
-
-.nomi-companion-stage-shell--right .nomi-companion-suggestions {
-  margin-left: 12px;
-}
-
-.nomi-companion-suggestions::-webkit-scrollbar {
-  width: 6px;
-}
-
-.nomi-companion-suggestions::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-.nomi-companion-suggestions::-webkit-scrollbar-thumb {
-  background: var(--bg-4);
-  border-radius: 3px;
-}
-
-.nomi-companion-suggestions::-webkit-scrollbar-thumb:hover {
-  background: var(--bg-5);
-}
-
-.nomi-companion-suggestions__item {
-  display: block;
-  width: 100%;
-  padding: 9px 10px;
-  border: 0;
-  border-radius: 8px;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
-}
-
-.nomi-companion-suggestions__item:hover {
-  background: var(--bg-hover);
-}
-
-.nomi-companion-suggestions__item:focus-visible {
-  outline: 2px solid var(--primary);
-  outline-offset: -2px;
-}
-
-.nomi-companion-suggestions__title {
-  display: block;
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--text-primary);
-  line-height: 1.45;
-  margin-bottom: 3px;
-  overflow-wrap: anywhere;
-}
-
-.nomi-companion-suggestions__body {
-  display: block;
-  font-size: 12px;
-  color: var(--text-secondary);
-  line-height: 1.55;
-  white-space: normal;
-  overflow-wrap: anywhere;
 }
 
 /* ---- web fallback hint ---- */
