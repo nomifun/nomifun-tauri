@@ -65,6 +65,11 @@
     "description": "Run tasks on a schedule, or start from a conversation with that target already selected.",
     "searchPlaceholder": "Search by task, conversation, instruction, or schedule",
     "noSearchResults": "No matching scheduled tasks",
+    "list": {
+      "task": "Task",
+      "status": "Status",
+      "action": "On / off"
+    },
     "awakeBanner": "Scheduled tasks only run while your computer is awake.",
     "keepAwake": "Keep awake",
     "keepAwakeTooltip": "When on, Nomi keeps your Mac awake while the lid is open; the display can still turn off normally without affecting scheduled tasks. Closing the lid still sleeps it — unless it's plugged in with an external display and an external keyboard/mouse (clamshell mode).",
