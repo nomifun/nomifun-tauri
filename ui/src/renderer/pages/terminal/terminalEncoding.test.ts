@@ -28,7 +28,7 @@ describe('terminal UTF-8 encoding', () => {
       const output =
         decode(bytesToBase64(bytes.slice(0, split))) + decode(bytesToBase64(bytes.slice(split)));
       expect(output).toBe(text);
-      expect(output).not.toContain('\uFFFD');
+      expect(output.includes('\uFFFD')).toBe(false);
     }
   });
 
