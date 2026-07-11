@@ -1,7 +1,7 @@
 {
   "version": "0.2.15",
   "notes": "- 新增托管免费模型服务与免费模型页，降低首次配置模型的门槛。\n- 增强 Companion 体验：支持独立记忆面板窗口、记忆/技能/建议分页，并优化记忆气泡布局。\n- 新增会话工作区常驻工具栏，改进能力入口、知识入口与编排面板的可达性。\n- 优化自动工作标签空状态、键盘可访问性和标签刷新顺序。\n- 修复助手标签草稿关闭后的残留、主题按钮对比度、能力激活状态和若干布局细节。",
-  "pub_date": "2026-07-11T04:44:43.945Z",
+  "pub_date": "2026-07-11T04:51:25.169Z",
   "platforms": {
     "darwin-x86_64": {
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODdyRVh1TFh2RnR3Q2lFa0NrQ1BYbzFHejc4U0FHRnZmMFRIRXZsZlBBdWNWejF4cXpXdG1DSEJ1bm96M1JLcmYvUW5VcncrbUFMeGNFY1AyMmNidXdnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNzQ0OTg1CWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6Ci83UjUzVGtmRDl1eGlQZG5BVnRmWHpMdU04c0NZaVVhLzNtaVpaUkZWbjY5czZrT3d0ajhpcll5VUlscjhrVENOdEJzWmtETTlqbUdqcHFtQTIrM0N3PT0K",
@@ -10,6 +10,10 @@
     "darwin-aarch64": {
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODdyRVh1TFh2RnR3Q2lFa0NrQ1BYbzFHejc4U0FHRnZmMFRIRXZsZlBBdWNWejF4cXpXdG1DSEJ1bm96M1JLcmYvUW5VcncrbUFMeGNFY1AyMmNidXdnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNzQ0OTg1CWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6Ci83UjUzVGtmRDl1eGlQZG5BVnRmWHpMdU04c0NZaVVhLzNtaVpaUkZWbjY5czZrT3d0ajhpcll5VUlscjhrVENOdEJzWmtETTlqbUdqcHFtQTIrM0N3PT0K",
       "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.15/NomiFun.app.tar.gz"
+    },
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODJLbDd5cjBVcWtCZGJiUkZTRW1obmJJSC9rNjllYTl1dFd2QndyN2RvRkxDWW9YZlcxUDYxVm5abmlJRWw3SXdGbFM0NUg2Umc1OW1lYWhWUXBnNFFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNzQ1Mjg0CWZpbGU6Tm9taUZ1bl8wLjIuMTVfeDY0LXNldHVwLmV4ZQoxV0Y2dzRtaldYSFJZYUI0U0lraXd2Y01RU0UxVHlEYWZCaGpLcUxUZHYrQnRrZTlrMVBtNGFlUlV3WkxMNXcvT09oNjNXaDJxcjlFdjZSOTZIZW9EQT09Cg==",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.15/NomiFun_0.2.15_x64-setup.exe"
     }
   }
 }
