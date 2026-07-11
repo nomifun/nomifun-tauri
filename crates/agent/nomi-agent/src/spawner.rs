@@ -488,10 +488,8 @@ where
     }
 
     let mut results: Vec<Result<T, tokio::task::JoinError>> = Vec::with_capacity(n);
-    for slot in slots {
-        if let Some(v) = slot {
-            results.push(Ok(v));
-        }
+    for value in slots.into_iter().flatten() {
+        results.push(Ok(value));
     }
     results.extend(panics.into_iter().map(Err));
     results

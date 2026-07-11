@@ -8,8 +8,10 @@ pub mod grep;
 pub mod lsp;
 pub mod output_truncation;
 pub mod path_guard;
+#[cfg(test)]
 pub mod persistent_shell;
 pub mod process_store;
+#[cfg(test)]
 pub mod pty;
 pub mod read;
 pub mod registry;
@@ -84,7 +86,7 @@ pub fn coerce_input_to_schema(schema: &JsonSchema, input: Value) -> Value {
 
     for (key, prop_schema) in props {
         let expected = schema_type_names(prop_schema);
-        if expected.iter().any(|t| *t == "string") {
+        if expected.contains(&"string") {
             continue;
         }
         // Copy the string out (releasing the borrow) so the insert below can mutate `obj`.
@@ -126,24 +128,22 @@ fn collect_schema_type_names<'a>(schema: &'a Value, out: &mut Vec<&'a str>) {
 }
 
 fn coerce_string_to_types(s: &str, expected: &[&str]) -> Option<Value> {
-    if expected.iter().any(|t| *t == "array" || *t == "object") {
-        if let Ok(parsed) = serde_json::from_str::<Value>(s) {
-            if (expected.contains(&"array") && parsed.is_array())
-                || (expected.contains(&"object") && parsed.is_object())
-            {
-                return Some(parsed);
-            }
-        }
+    if expected.iter().any(|t| *t == "array" || *t == "object")
+        && let Ok(parsed) = serde_json::from_str::<Value>(s)
+        && ((expected.contains(&"array") && parsed.is_array())
+            || (expected.contains(&"object") && parsed.is_object()))
+    {
+        return Some(parsed);
     }
 
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return None;
     }
-    if expected.contains(&"integer") {
-        if let Ok(n) = trimmed.parse::<i64>() {
-            return Some(Value::Number(n.into()));
-        }
+    if expected.contains(&"integer")
+        && let Ok(n) = trimmed.parse::<i64>()
+    {
+        return Some(Value::Number(n.into()));
     }
     if expected.contains(&"number") {
         if let Ok(n) = trimmed.parse::<i64>() {

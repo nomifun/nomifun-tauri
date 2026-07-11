@@ -37,24 +37,16 @@ fn resolve_existing_prefix(path: &Path) -> Option<PathBuf> {
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut cur = path;
     loop {
-        match cur.parent() {
-            Some(parent) => {
-                if let Some(name) = cur.file_name() {
-                    tail.push(name.to_os_string());
-                } else {
-                    return None;
-                }
-                if let Ok(c) = parent.canonicalize() {
-                    let mut resolved = c;
-                    for component in tail.iter().rev() {
-                        resolved.push(component);
-                    }
-                    return Some(resolved);
-                }
-                cur = parent;
+        let parent = cur.parent()?;
+        tail.push(cur.file_name()?.to_os_string());
+        if let Ok(c) = parent.canonicalize() {
+            let mut resolved = c;
+            for component in tail.iter().rev() {
+                resolved.push(component);
             }
-            None => return None,
+            return Some(resolved);
         }
+        cur = parent;
     }
 }
 

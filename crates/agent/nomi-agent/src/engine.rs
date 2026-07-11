@@ -749,7 +749,7 @@ impl AgentEngine {
             // thresholds + circuit breaker, so it cannot over-compact a small
             // context or loop.
             let pre_send_estimate =
-                estimate::estimate_tokens_from_messages(&self.messages) as u64;
+                estimate::estimate_tokens_from_messages(&self.messages);
             self.compact_state.last_input_tokens =
                 self.compact_state.last_input_tokens.max(pre_send_estimate);
 
@@ -866,7 +866,7 @@ impl AgentEngine {
                     let ttft_ms = stream_start.elapsed().as_millis();
                     tracing::debug!(
                         target: "nomi_agent",
-                        ttft_ms = ttft_ms as u64,
+                        ttft_ms,
                         turn = turn + 1,
                         "first token received"
                     );

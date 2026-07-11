@@ -33,10 +33,10 @@ pub(crate) fn pty_test_helper_bin() -> PathBuf {
     candidates.push(profile_dir.join(bin_name));
     // 2) Split build-dir: the runner is under build.noindex/<profile> but the bin
     //    artifact lands in the sibling target/<profile>. Map the path across.
-    if let Some(s) = profile_dir.to_str() {
-        if s.contains("build.noindex") {
-            candidates.push(PathBuf::from(s.replacen("build.noindex", "target", 1)).join(bin_name));
-        }
+    if let Some(s) = profile_dir.to_str()
+        && s.contains("build.noindex")
+    {
+        candidates.push(PathBuf::from(s.replacen("build.noindex", "target", 1)).join(bin_name));
     }
     // 3) Backstop: derive from the workspace root via CARGO_MANIFEST_DIR
     //    (crates/agent/nomi-tools → agent → crates → <root>).

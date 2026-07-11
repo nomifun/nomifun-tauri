@@ -431,7 +431,8 @@ fails on the webkit2gtk link — build on the target architecture's machine/cont
 | `bun run test` | 运行全部 Rust 测试（含 doctest） |
 | `bun run test:fast` | 用 nextest 快速跑 Rust 测试（日常） |
 | **静态检查 / 门禁** | |
-| `bun run check` | 聚合静态门禁：typecheck + i18n + 主题契约 + 图标导入 + 脚本登记 |
+| `bun run check:process-runtime-boundary` | Enforce the supervised process runtime boundary and exact hand-off allowlist. |
+| `bun run check` | 聚合静态门禁：typecheck + i18n + 主题契约 + 图标导入 + 进程运行时边界 + 脚本登记 |
 | `bun run typecheck` | 前端 TypeScript 类型检查（tsc --noEmit） |
 | `bun run check:i18n` | 校验 i18n 类型与 locale 键是否一致 |
 | `bun run check:theme` | 校验预设 CSS 主题契约 |

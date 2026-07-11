@@ -238,10 +238,10 @@ fn canonicalize_compatible(path: &Path) -> std::io::Result<PathBuf> {
     let canonical = fs::canonicalize(path)?;
 
     #[cfg(windows)]
-    if let Some(simplified) = strip_verbatim_disk_prefix(&canonical) {
-        if matches!(fs::canonicalize(&simplified), Ok(round_trip) if round_trip == canonical) {
-            return Ok(simplified);
-        }
+    if let Some(simplified) = strip_verbatim_disk_prefix(&canonical)
+        && matches!(fs::canonicalize(&simplified), Ok(round_trip) if round_trip == canonical)
+    {
+        return Ok(simplified);
     }
 
     Ok(canonical)

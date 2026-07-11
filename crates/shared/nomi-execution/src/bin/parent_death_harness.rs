@@ -43,16 +43,20 @@ async fn main() {
 #[cfg(unix)]
 async fn run() -> io::Result<()> {
     let args = env::args_os().skip(1).collect::<Vec<_>>();
-    if !(args.len() == 3 || args.len() == 4) {
+    if !(args.len() == 3 || args.len() == 4 || args.len() == 6 || args.len() == 7) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "expected helper, leader marker, grandchild marker, and optional 'pty'",
+            "expected helper, leader marker, grandchild marker, optional 'pty', and optional start/ready/exit gates",
         ));
     }
     let helper = args[0].clone();
     let leader_marker = PathBuf::from(&args[1]);
     let grandchild_marker = PathBuf::from(&args[2]);
-    let transport = match args.get(3).and_then(|value| value.to_str()) {
+    let transport_arg = match args.len() {
+        4 | 7 => args.get(3).and_then(|value| value.to_str()),
+        _ => None,
+    };
+    let transport = match transport_arg {
         None => Transport::Pipe,
         Some("pty") => Transport::Pty { cols: 80, rows: 24 },
         Some(_) => {
@@ -62,6 +66,17 @@ async fn run() -> io::Result<()> {
             ));
         }
     };
+    let gate_offset = usize::from(matches!(args.len(), 4 | 7));
+    let gates = (args.len() >= 6).then(|| {
+        (
+            PathBuf::from(&args[3 + gate_offset]),
+            PathBuf::from(&args[4 + gate_offset]),
+            PathBuf::from(&args[5 + gate_offset]),
+        )
+    });
+    if let Some((start_gate, _, _)) = gates.as_ref() {
+        wait_for_gate(start_gate, "start").await?;
+    }
     let cwd = env::current_dir()?;
     let request = NormalizedExecutionRequest {
         owner: ExecutionOwner::new(uuid::Uuid::now_v7(), uuid::Uuid::now_v7()),
@@ -89,7 +104,12 @@ async fn run() -> io::Result<()> {
         .map_err(|error| io::Error::other(error.to_string()))?
         .pid;
     wait_for_pid_marker(&grandchild_marker).await?;
-    write_pid_atomically(&leader_marker, leader)
+    write_pid_atomically(&leader_marker, leader)?;
+    if let Some((_, ready_gate, exit_gate)) = gates.as_ref() {
+        write_gate_atomically(ready_gate)?;
+        wait_for_gate(exit_gate, "exit").await?;
+    }
+    Ok(())
 }
 
 #[cfg(any(unix, windows))]
@@ -110,10 +130,21 @@ async fn wait_for_pid_marker(path: &Path) -> io::Result<u32> {
 
 #[cfg(any(unix, windows))]
 fn write_pid_atomically(path: &Path, pid: u32) -> io::Result<()> {
+    write_atomically(path, pid.to_string().as_bytes())
+}
+
+#[cfg(unix)]
+fn write_gate_atomically(path: &Path) -> io::Result<()> {
+    write_atomically(path, b"ready")
+}
+
+#[cfg(any(unix, windows))]
+fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "marker has no file name"))?;
+    let pid = process::id();
     for attempt in 0..100_u32 {
         let mut temporary_name = OsString::from(".");
         temporary_name.push(file_name);
@@ -126,7 +157,8 @@ fn write_pid_atomically(path: &Path, pid: u32) -> io::Result<()> {
         {
             Ok(mut file) => {
                 let result = (|| {
-                    writeln!(file, "{pid}")?;
+                    file.write_all(contents)?;
+                    file.write_all(b"\n")?;
                     file.flush()?;
                     file.sync_all()?;
                     drop(file);
@@ -143,8 +175,27 @@ fn write_pid_atomically(path: &Path, pid: u32) -> io::Result<()> {
     }
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
-        "could not allocate a temporary PID marker",
+        "could not allocate a temporary marker",
     ))
+}
+
+#[cfg(unix)]
+async fn wait_for_gate(path: &Path, label: &str) -> io::Result<()> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if path.is_file() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("{label} gate timed out: {}", path.display()),
+        )
+    })
 }
 
 #[cfg(windows)]

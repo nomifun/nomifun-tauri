@@ -132,8 +132,8 @@ impl Tool for WriteTool {
         if existed
             && let Some(cache_arc) = &self.file_cache
             && let Ok(mut cache) = cache_arc.write()
+            && cache.get(path).is_none()
         {
-            if cache.get(path).is_none() {
                 return ToolResult {
                     content: format!(
                         "You must Read {} before overwriting it — it already exists. \
@@ -143,7 +143,6 @@ impl Tool for WriteTool {
                     is_error: true,
                     images: Vec::new(),
                 };
-            }
         }
 
         // Create parent directories

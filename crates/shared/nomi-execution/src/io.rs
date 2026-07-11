@@ -44,7 +44,7 @@ struct OutputState {
 }
 
 enum OutputBufferState {
-    Live(OutputState),
+    Live(Box<OutputState>),
     Frozen(Arc<OutputState>),
     Transition,
 }
@@ -61,7 +61,7 @@ impl OutputBuffer {
         let (changed, _receiver) = tokio::sync::watch::channel(0);
         Self {
             limit: limit_bytes,
-            inner: Mutex::new(OutputBufferState::Live(OutputState {
+            inner: Mutex::new(OutputBufferState::Live(Box::new(OutputState {
                 next_seq: 0,
                 next_offset: 0,
                 base_offset: 0,
@@ -71,7 +71,7 @@ impl OutputBuffer {
                 decoders,
                 base_decoders,
                 finalized: false,
-            })),
+            }))),
             activity: None,
             changed,
         }
@@ -177,7 +177,7 @@ impl OutputBuffer {
             unreachable!("output state transition is only visible while its lock is held")
         };
         state.finalize();
-        let state = Arc::new(state);
+        let state = Arc::from(state);
         *storage = OutputBufferState::Frozen(Arc::clone(&state));
         drop(storage);
         self.changed.send_modify(|generation| {
@@ -811,8 +811,8 @@ mod tests {
     fn retained_allocation(output: &OutputBuffer) -> Option<(*const u8, usize)> {
         let storage = output.inner.lock().expect("fresh mutex must lock");
         let state = match &*storage {
-            OutputBufferState::Live(state) => state,
-            OutputBufferState::Frozen(state) => state,
+            OutputBufferState::Live(state) => state.as_ref(),
+            OutputBufferState::Frozen(state) => state.as_ref(),
             OutputBufferState::Transition => panic!("freeze cannot expose its transition state"),
         };
         state

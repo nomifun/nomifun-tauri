@@ -263,6 +263,8 @@ mod tests {
         let item = SkillListItemResponse {
             name: "my-skill".into(),
             description: "Does things".into(),
+            name_i18n: HashMap::new(),
+            description_i18n: HashMap::new(),
             location: "/home/user/.nomifun/skills/my-skill".into(),
             relative_location: None,
             is_custom: true,
@@ -286,6 +288,8 @@ mod tests {
         let item = SkillListItemResponse {
             name: "cron".into(),
             description: "Schedule recurring tasks".into(),
+            name_i18n: HashMap::new(),
+            description_i18n: HashMap::new(),
             location: "/home/user/.nomifun/builtin-skills-view/cron/SKILL.md".into(),
             relative_location: Some("auto-inject/cron/SKILL.md".into()),
             is_custom: false,
@@ -322,6 +326,8 @@ mod tests {
         let item = SkillListItemResponse {
             name: "x".into(),
             description: "d".into(),
+            name_i18n: HashMap::new(),
+            description_i18n: HashMap::new(),
             location: "/l".into(),
             relative_location: None,
             is_custom: true,

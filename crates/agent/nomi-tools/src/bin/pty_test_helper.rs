@@ -7,29 +7,24 @@
 //! behaviour on Windows and unix, no external dependencies, pure `std`.
 //!
 //! Subcommands (`pty_test_helper <subcommand> [args...]`):
-//!   - `echo-stdin`                 read stdin line-by-line, echo each line to
-//!                                  stdout (flushed), exit on EOF. Replaces `cat`.
-//!   - `sleep <ms>`                 sleep `ms` milliseconds, then exit 0.
-//!                                  Replaces `sleep N`.
-//!   - `exit <code>`                exit immediately with `code`.
-//!                                  Replaces `sh -c 'exit N'`.
-//!   - `emit-after <ms> <text> <keepalive_ms>`
-//!                                  sleep `ms`, print `text` + newline (flushed),
-//!                                  then sleep `keepalive_ms` and exit. Models a
-//!                                  process that emits delayed output then lingers.
-//!   - `emit-twice <first_ms> <first> <second_ms> <second> <keepalive_ms>`
-//!                                  emit two flushed lines at independent delays,
-//!                                  then remain alive. Models output arriving
-//!                                  around an adapter settle boundary.
-//!   - `ignore-interrupt`           install an interrupt handler that ignores
-//!                                  Ctrl-C, print `ready`, then remain alive.
-//!   - `write-marker-after <ms> <path>`
-//!                                  sleep `ms`, then atomically publish a marker.
-//!   - `spawn-marker-child <ms> <path> <ready_path> <keepalive_ms>`
-//!                                  spawn `write-marker-after`, print the child's
-//!                                  PID, atomically publish both PIDs, then remain
-//!                                  alive for `keepalive_ms`.
-//!   - `print-unicode`              print the Task 9 encoding sample.
+//! - `echo-stdin`: read stdin line-by-line, echo each line to stdout (flushed),
+//!   and exit on EOF. Replaces `cat`.
+//! - `sleep <ms>`: sleep `ms` milliseconds, then exit 0. Replaces `sleep N`.
+//! - `exit <code>`: exit immediately with `code`. Replaces `sh -c 'exit N'`.
+//! - `emit-after <ms> <text> <keepalive_ms>`: sleep `ms`, print `text` plus a
+//!   newline (flushed), then sleep `keepalive_ms` and exit. Models a process
+//!   that emits delayed output and then lingers.
+//! - `emit-twice <first_ms> <first> <second_ms> <second> <keepalive_ms>`: emit
+//!   two flushed lines at independent delays, then remain alive. Models output
+//!   arriving around an adapter settle boundary.
+//! - `ignore-interrupt`: install an interrupt handler that ignores Ctrl-C,
+//!   print `ready`, then remain alive.
+//! - `write-marker-after <ms> <path>`: sleep `ms`, then atomically publish a
+//!   marker.
+//! - `spawn-marker-child <ms> <path> <ready_path> <keepalive_ms>`: spawn
+//!   `write-marker-after`, print the child's PID, atomically publish both PIDs,
+//!   then remain alive for `keepalive_ms`.
+//! - `print-unicode`: print the Task 9 encoding sample.
 //!
 //! Kept dependency-free on purpose: it is compiled as part of the crate's normal
 //! build (a `[[bin]]`) so the unit tests can locate it next to the test runner.
@@ -39,6 +34,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+// This fixture deliberately leaves the spawned grandchild running so the
+// supervisor tests can prove process-tree cleanup. Waiting here would erase
+// the lifecycle being tested.
+#[allow(clippy::zombie_processes)]
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let sub = args.first().map(String::as_str).unwrap_or("");

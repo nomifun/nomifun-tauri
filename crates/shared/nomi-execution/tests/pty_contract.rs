@@ -21,8 +21,7 @@ const PTY_COLS: u16 = 80;
 const PTY_ROWS: u16 = 24;
 
 fn helper_binary() -> &'static str {
-    option_env!("CARGO_BIN_EXE_execution_test_helper")
-        .expect("Cargo did not build the execution_test_helper binary")
+    env!("CARGO_BIN_EXE_execution_test_helper")
 }
 
 fn helper_request(args: &[&str]) -> NormalizedExecutionRequest {

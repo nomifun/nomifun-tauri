@@ -764,7 +764,7 @@ unsafe fn close_unknown_fds(
         }
         let returned = returned as usize;
         let entry_bytes = std::mem::size_of::<libc::proc_fdinfo>();
-        if returned > buffer_bytes || returned % entry_bytes != 0 {
+        if returned > buffer_bytes || !returned.is_multiple_of(entry_bytes) {
             return Err(libc::EPROTO);
         }
         let count = returned / entry_bytes;

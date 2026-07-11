@@ -542,13 +542,10 @@ impl LegacySpawnTransaction {
                         None,
                         false,
                     );
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!(
+                    return Err(io::Error::other(format!(
                             "{}; watchdog cleanup transferred to durable relay: {cleanup_error}",
                             protocol_io_error(error)
-                        ),
-                    ));
+                        )));
                 }
             }
             return Err(protocol_io_error(error));
@@ -652,24 +649,15 @@ impl LegacySpawnTransaction {
         }
         self.registration.take();
         self.control.take();
-        if let Some(watchdog_pid) = self.watchdog_pid.take() {
-            if let Err(cleanup_error) = waitpid_exact_setup(watchdog_pid, self.deadline) {
-                defer_legacy_cleanup(
-                    None,
-                    None,
-                    Some(watchdog_pid),
-                    None,
-                    None,
-                    false,
-                );
-                self.spawn_gate.take();
-                return io::Error::new(
-                    error.kind(),
-                    format!(
-                        "{error}; watchdog cleanup transferred to durable relay: {cleanup_error}"
-                    ),
-                );
-            }
+        if let Some(watchdog_pid) = self.watchdog_pid.take()
+            && let Err(cleanup_error) = waitpid_exact_setup(watchdog_pid, self.deadline)
+        {
+            defer_legacy_cleanup(None, None, Some(watchdog_pid), None, None, false);
+            self.spawn_gate.take();
+            return io::Error::new(
+                error.kind(),
+                format!("{error}; watchdog cleanup transferred to durable relay: {cleanup_error}"),
+            );
         }
         self.spawn_gate.take();
         io::Error::new(error.kind(), error.to_string())
@@ -736,18 +724,18 @@ impl LegacySpawnTransaction {
                 }
             }
         }
-        if let Some(watchdog_pid) = self.watchdog_pid.take() {
-            if let Err(cleanup_error) = waitpid_exact_setup(watchdog_pid, self.deadline) {
-                cleanup_errors.push(format!("reap legacy watchdog: {cleanup_error}"));
-                defer_legacy_cleanup(
-                    None,
-                    None,
-                    Some(watchdog_pid),
-                    None,
-                    Some(pid),
-                    group_sealed,
-                );
-            }
+        if let Some(watchdog_pid) = self.watchdog_pid.take()
+            && let Err(cleanup_error) = waitpid_exact_setup(watchdog_pid, self.deadline)
+        {
+            cleanup_errors.push(format!("reap legacy watchdog: {cleanup_error}"));
+            defer_legacy_cleanup(
+                None,
+                None,
+                Some(watchdog_pid),
+                None,
+                Some(pid),
+                group_sealed,
+            );
         }
         self.spawn_gate.take();
         let message = if cleanup_errors.is_empty() {
@@ -1617,8 +1605,10 @@ impl SpawnTransaction {
     }
 
     fn relay_owned(&mut self, signal_group: bool) -> CleanupReport {
-        let mut cleanup = CleanupReport::default();
-        cleanup.force_kill_attempted = signal_group && self.pgid.is_some();
+        let mut cleanup = CleanupReport {
+            force_kill_attempted: signal_group && self.pgid.is_some(),
+            ..CleanupReport::default()
+        };
         let job = CleanupJob {
             child: self.child.take(),
             raw_leader_pid: None,
@@ -1874,7 +1864,7 @@ enum CleanupGroupState {
 }
 
 enum CleanupStep {
-    Retry(CleanupJob),
+    Retry(Box<CleanupJob>),
     Finished { exact: bool },
 }
 
@@ -1897,7 +1887,7 @@ impl CleanupJob {
             }
             match self.run_once() {
                 CleanupStep::Retry(job) => {
-                    self = job;
+                    self = *job;
                 }
                 CleanupStep::Finished { exact } => return exact,
             }
@@ -1979,7 +1969,7 @@ impl CleanupJob {
         if self.hold.as_ref().is_some_and(TestCleanupHold::should_defer) {
             self.last_error = Some("injected cleanup attempt remained unproven".to_owned());
             self.schedule_retry(false, false);
-            return CleanupStep::Retry(self);
+            return CleanupStep::Retry(Box::new(self));
         }
 
         let mut errors = Vec::new();
@@ -2239,7 +2229,7 @@ impl CleanupJob {
                 || self.leader_ownership_lost
                 || !errors.is_empty();
             self.schedule_retry(before != after, persistent_error);
-            CleanupStep::Retry(self)
+            CleanupStep::Retry(Box::new(self))
         }
     }
 }
@@ -2282,7 +2272,7 @@ fn run_cleanup_relay(receiver: mpsc::Receiver<CleanupJob>) {
                 pending.push_back(job);
             } else {
                 match job.run_once() {
-                    CleanupStep::Retry(job) => pending.push_back(job),
+                    CleanupStep::Retry(job) => pending.push_back(*job),
                     CleanupStep::Finished { .. } => {}
                 }
             }
@@ -2813,7 +2803,7 @@ fn start_lost_message(code: &'static str, message: String) -> ExecutionError {
 fn watchdog_fault(options: &SpawnOptions) -> u8 {
     #[cfg(test)]
     {
-        return match options.fault {
+        match options.fault {
             TestSpawnFault::WatchdogDiesBeforeBootReady => FAULT_EXIT_BEFORE_BOOT_READY,
             TestSpawnFault::WatchdogDiesBeforeRegistration => FAULT_EXIT_BEFORE_REGISTRATION,
             TestSpawnFault::WatchdogDiesBeforeAck => FAULT_EXIT_BEFORE_ACK,
@@ -2827,7 +2817,7 @@ fn watchdog_fault(options: &SpawnOptions) -> u8 {
             TestSpawnFault::SkipFinalGroupKill => FAULT_SKIP_FINAL_GROUP_KILL,
             TestSpawnFault::FailFinalGroupKillOnce => FAULT_FAIL_FINAL_GROUP_KILL_ONCE,
             TestSpawnFault::None => FAULT_NONE,
-        };
+        }
     }
     #[cfg(not(test))]
     {
@@ -3262,9 +3252,7 @@ impl LifecycleJob {
             {
                 let final_kill_sent = self.close_signal_gate(false)?.0;
                 if !final_kill_sent && !quiescing_seen {
-                    if let Err(error) = self.host_fallback_kill(&mut host_kill_attempted) {
-                        return Err(error);
-                    }
+                    self.host_fallback_kill(&mut host_kill_attempted)?;
                     lifecycle_error.get_or_insert_with(|| {
                         io::Error::other("watchdog control was lost while leader was running")
                     });
@@ -3283,9 +3271,7 @@ impl LifecycleJob {
 
         let final_kill_sent = self.close_signal_gate(false)?.0;
         if lifecycle_error.is_some() && !final_kill_sent {
-            if let Err(error) = self.host_fallback_kill(&mut host_kill_attempted) {
-                return Err(error);
-            }
+            self.host_fallback_kill(&mut host_kill_attempted)?;
         }
 
         let watchdog_deadline = Instant::now()
@@ -3310,9 +3296,7 @@ impl LifecycleJob {
                         lifecycle_error.get_or_insert_with(|| {
                             io::Error::other("watchdog final group kill failed")
                         });
-                        if let Err(error) = self.host_fallback_kill(&mut host_kill_attempted) {
-                            return Err(error);
-                        }
+                        self.host_fallback_kill(&mut host_kill_attempted)?;
                     }
                     Ok(kind) => {
                         lifecycle_error.get_or_insert_with(|| {
@@ -3376,9 +3360,7 @@ impl LifecycleJob {
         // Even a valid QUIESCING + SIGKILL pair cannot prove that no concurrent
         // actor killed only the watchdog. Make one final idempotent group-kill
         // attempt while the exact leader remains WNOWAIT-anchored.
-        if let Err(error) = self.host_fallback_kill(&mut host_kill_attempted) {
-            return Err(error);
-        }
+        self.host_fallback_kill(&mut host_kill_attempted)?;
         while !leader_observed {
             leader_observed = leader_exit_observed(leader_pid)?;
             if !leader_observed {

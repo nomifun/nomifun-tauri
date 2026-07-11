@@ -22,20 +22,17 @@ use nomi_execution::SandboxPolicy;
 use nomi_execution::ShellKind;
 
 fn helper_binary() -> &'static str {
-    option_env!("CARGO_BIN_EXE_execution_test_helper")
-        .expect("Cargo did not build the execution_test_helper binary")
+    env!("CARGO_BIN_EXE_execution_test_helper")
 }
 
 #[cfg(unix)]
 fn low_fd_harness_binary() -> &'static str {
-    option_env!("CARGO_BIN_EXE_low_fd_harness")
-        .expect("Cargo did not build the low_fd_harness binary")
+    env!("CARGO_BIN_EXE_low_fd_harness")
 }
 
 #[cfg(unix)]
 fn fd_sentinel_harness_binary() -> &'static str {
-    option_env!("CARGO_BIN_EXE_fd_sentinel_harness")
-        .expect("Cargo did not build the fd_sentinel_harness binary")
+    env!("CARGO_BIN_EXE_fd_sentinel_harness")
 }
 
 fn request(program: impl Into<OsString>, args: impl IntoIterator<Item = OsString>) -> NormalizedExecutionRequest {
@@ -354,7 +351,7 @@ async fn invalid_executable_is_a_stable_spawn_failure_without_a_session() {
     };
 
     assert_eq!(error.code(), "spawn_failed");
-    assert!(matches!(error, ExecutionError::Transport { .. }) == false);
+    assert!(!matches!(error, ExecutionError::Transport { .. }));
 }
 
 #[tokio::test]
@@ -831,7 +828,7 @@ async fn windows_preserves_complex_unicode_argv_environment_and_cwd() {
         .into_iter()
         .map(|field| {
             let field = field.to_string_lossy();
-            format!("{}:{field}\n", field.as_bytes().len())
+            format!("{}:{field}\n", field.len())
         })
         .collect::<String>();
     assert_eq!(output.text(), expected);

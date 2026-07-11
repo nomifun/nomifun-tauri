@@ -28,13 +28,13 @@ async-trait.workspace = true
 base64.workspace      = true
 glob.workspace        = true
 lru.workspace         = true
-portable-pty.workspace = true
 libc.workspace        = true
 uuid.workspace        = true
 
 
 [dev-dependencies]
 tempfile.workspace = true
+portable-pty.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

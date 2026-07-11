@@ -1,3 +1,9 @@
+// `ExecutionError::StartLost` intentionally carries the complete last-known
+// process and cleanup evidence. Keeping that evidence inline makes loss
+// reporting truthful and pattern matching stable across the public API; the
+// error path is cold and the extra stack space is bounded.
+#![allow(clippy::result_large_err)]
+
 mod capability;
 mod command_builder;
 mod io;

@@ -10,6 +10,10 @@
     { "id": "maint", "title": "维护 / 工具" }
   ],
   "scripts": {
+    "check:process-runtime-boundary": {
+      "group": "check",
+      "desc": "Enforce the supervised process runtime boundary and exact hand-off allowlist."
+    },
     "dev":           { "group": "dev",   "desc": "启动桌面应用开发（tauri dev，热重载）" },
     "dev:web":       { "group": "dev",   "desc": "启动 Web 全栈开发（后端 API + 前端 vite）" },
     "dev:ui":        { "group": "dev",   "desc": "仅启动前端开发服务器（纯 vite，无后端）" },
@@ -27,7 +31,7 @@
     "serve:web":     { "group": "serve", "desc": "启动 Web 服务器，托管已构建的前端" },
     "test":          { "group": "test",  "desc": "运行全部 Rust 测试（含 doctest）" },
     "test:fast":     { "group": "test",  "desc": "用 nextest 快速跑 Rust 测试（日常）" },
-    "check":         { "group": "check", "desc": "聚合静态门禁：typecheck + i18n + 主题契约 + 图标导入 + 脚本登记" },
+    "check":         { "group": "check", "desc": "聚合静态门禁：typecheck + i18n + 主题契约 + 图标导入 + 进程运行时边界 + 脚本登记" },
     "typecheck":     { "group": "check", "desc": "前端 TypeScript 类型检查（tsc --noEmit）" },
     "check:i18n":    { "group": "check", "desc": "校验 i18n 类型与 locale 键是否一致" },
     "check:theme":   { "group": "check", "desc": "校验预设 CSS 主题契约" },

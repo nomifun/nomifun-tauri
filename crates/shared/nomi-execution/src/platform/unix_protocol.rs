@@ -787,7 +787,6 @@ mod tests {
         #[cfg(target_os = "macos")]
         {
             send_stream_raw(fd, bytes.len() as u16, bytes);
-            return;
         }
         #[cfg(target_os = "linux")]
         let sent = unsafe {

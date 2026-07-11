@@ -17,8 +17,7 @@ use uuid::Uuid;
 const SHORT_GRACE: Duration = Duration::from_millis(25);
 
 fn helper_binary() -> &'static str {
-    option_env!("CARGO_BIN_EXE_execution_test_helper")
-        .expect("Cargo did not build the execution_test_helper binary")
+    env!("CARGO_BIN_EXE_execution_test_helper")
 }
 
 fn owner(run_id: Uuid, call_id: Uuid) -> ExecutionOwner {

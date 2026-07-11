@@ -193,11 +193,11 @@ fn register_legacy_job(pid: u32, execution: Arc<LegacyExecution>) -> io::Result<
                 ));
             }
         };
-        if jobs.contains_key(&pid) {
-            false
-        } else {
-            jobs.insert(pid, Arc::clone(&execution));
+        if let std::collections::hash_map::Entry::Vacant(entry) = jobs.entry(pid) {
+            entry.insert(Arc::clone(&execution));
             true
+        } else {
+            false
         }
     };
     start_gate.wait();
@@ -313,12 +313,12 @@ fn resume_legacy_primary_thread(pid: u32) -> io::Result<()> {
     }
     let mut only_thread = None;
     loop {
-        if entry.th32OwnerProcessID == pid {
-            if only_thread.replace(entry.th32ThreadID).is_some() {
-                return Err(io::Error::other(format!(
-                    "suspended legacy PID {pid} exposed more than one thread before resume"
-                )));
-            }
+        if entry.th32OwnerProcessID == pid
+            && only_thread.replace(entry.th32ThreadID).is_some()
+        {
+            return Err(io::Error::other(format!(
+                "suspended legacy PID {pid} exposed more than one thread before resume"
+            )));
         }
         // SAFETY: snapshot remains live and entry remains writable.
         if unsafe { Thread32Next(snapshot.as_raw(), &mut entry) } == 0 {
@@ -1304,7 +1304,7 @@ impl PreparedIo {
 }
 
 fn create_inheritable_pipe() -> io::Result<PipePair> {
-    let mut attributes = SECURITY_ATTRIBUTES {
+    let attributes = SECURITY_ATTRIBUTES {
         nLength: u32::try_from(mem::size_of::<SECURITY_ATTRIBUTES>())
             .expect("SECURITY_ATTRIBUTES fits in u32"),
         lpSecurityDescriptor: ptr::null_mut(),
@@ -1313,7 +1313,7 @@ fn create_inheritable_pipe() -> io::Result<PipePair> {
     let mut read = ptr::null_mut();
     let mut write = ptr::null_mut();
     // SAFETY: output pointers and SECURITY_ATTRIBUTES are valid for the call.
-    if unsafe { CreatePipe(&mut read, &mut write, &mut attributes, 0) } == 0 {
+    if unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) } == 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: CreatePipe succeeded and returned two fresh owned handles.

@@ -11,8 +11,7 @@ use nomi_execution::SupervisorConfig;
 use tempfile::tempdir;
 
 fn helper_binary() -> &'static str {
-    option_env!("CARGO_BIN_EXE_execution_test_helper")
-        .expect("Cargo did not build the execution_test_helper binary")
+    env!("CARGO_BIN_EXE_execution_test_helper")
 }
 
 #[test]

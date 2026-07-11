@@ -1,4 +1,4 @@
-#![cfg(any(target_os = "linux", windows))]
+#![cfg(any(target_os = "linux", target_os = "macos", windows))]
 
 #[cfg(target_os = "linux")]
 use std::{
@@ -10,13 +10,11 @@ use std::{
 };
 
 fn helper_binary() -> &'static str {
-    option_env!("CARGO_BIN_EXE_execution_test_helper")
-        .expect("Cargo did not build the execution_test_helper binary")
+    env!("CARGO_BIN_EXE_execution_test_helper")
 }
 
 fn harness_binary() -> &'static str {
-    option_env!("CARGO_BIN_EXE_parent_death_harness")
-        .expect("Cargo did not build the parent_death_harness binary")
+    env!("CARGO_BIN_EXE_parent_death_harness")
 }
 
 #[cfg(target_os = "linux")]
@@ -304,6 +302,285 @@ impl Drop for GroupCleanup {
         for pid in &self.members {
             // SAFETY: these exact PIDs were published by the harness and helper.
             let _ = unsafe { libc::kill(*pid, libc::SIGKILL) };
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod macos_parent_death {
+    use std::{
+        fs, io,
+        os::fd::RawFd,
+        path::Path,
+        process::{Child, Command},
+        time::{Duration, Instant},
+    };
+
+    use super::{harness_binary, helper_binary};
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn abrupt_harness_exit_kills_the_owned_process_group() {
+        assert_abrupt_harness_exit_kills_owned_group(false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn abrupt_harness_exit_kills_the_owned_pty_session() {
+        assert_abrupt_harness_exit_kills_owned_group(true).await;
+    }
+
+    async fn assert_abrupt_harness_exit_kills_owned_group(pty: bool) {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let leader_marker = directory.path().join("leader.pid");
+        let grandchild_marker = directory.path().join("grandchild.pid");
+        let start_gate = directory.path().join("start.gate");
+        let ready_gate = directory.path().join("ready.gate");
+        let exit_gate = directory.path().join("exit.gate");
+        let mut command = Command::new(harness_binary());
+        command
+            .arg(helper_binary())
+            .arg(&leader_marker)
+            .arg(&grandchild_marker);
+        if pty {
+            command.arg("pty");
+        }
+        let child = command
+            .arg(&start_gate)
+            .arg(&ready_gate)
+            .arg(&exit_gate)
+            .spawn()
+            .expect("parent-death harness should spawn");
+        let harness_pid = child.id();
+        let mut harness = HarnessGuard(Some(child));
+        let mut harness_watch =
+            ProcessExitWatch::register(harness_pid).expect("harness kqueue watch should register");
+
+        publish_gate(&start_gate);
+        wait_for_gate(&ready_gate).await;
+        let leader_pid = read_pid_marker(&leader_marker);
+        let grandchild_pid = read_pid_marker(&grandchild_marker);
+        let mut group_cleanup = GroupCleanup {
+            pgid: leader_pid as libc::pid_t,
+            members: [leader_pid as libc::pid_t, grandchild_pid as libc::pid_t],
+            armed: true,
+        };
+        let mut leader_watch =
+            ProcessExitWatch::register(leader_pid).expect("leader kqueue watch should register");
+        let mut grandchild_watch = ProcessExitWatch::register(grandchild_pid)
+            .expect("grandchild kqueue watch should register");
+
+        publish_gate(&exit_gate);
+        harness_watch
+            .wait_terminated(Duration::from_secs(5), "harness")
+            .await;
+        let status = harness
+            .0
+            .as_mut()
+            .expect("harness child should be owned")
+            .wait()
+            .expect("harness should be reaped");
+        harness.0.take();
+        assert!(
+            status.success(),
+            "harness failed before deliberate _exit (pty={pty}): {status:?}"
+        );
+
+        leader_watch
+            .wait_terminated(Duration::from_secs(5), "leader")
+            .await;
+        grandchild_watch
+            .wait_terminated(Duration::from_secs(5), "grandchild")
+            .await;
+        group_cleanup.armed = false;
+    }
+
+    fn publish_gate(path: &Path) {
+        fs::write(path, b"go").unwrap_or_else(|error| {
+            panic!("gate should be published at {}: {error}", path.display())
+        });
+    }
+
+    async fn wait_for_gate(path: &Path) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if path.is_file() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("gate was not published: {}", path.display()));
+    }
+
+    fn read_pid_marker(path: &Path) -> u32 {
+        fs::read_to_string(path)
+            .unwrap_or_else(|error| {
+                panic!("PID marker should be readable at {}: {error}", path.display())
+            })
+            .trim()
+            .parse()
+            .unwrap_or_else(|error| {
+                panic!("PID marker should contain a PID at {}: {error}", path.display())
+            })
+    }
+
+    struct ProcessExitWatch {
+        pid: u32,
+        kqueue: RawFd,
+    }
+
+    impl ProcessExitWatch {
+        fn register(pid: u32) -> io::Result<Self> {
+            let native_pid = libc::pid_t::try_from(pid)
+                .ok()
+                .filter(|pid| *pid > 1)
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+            let kqueue = loop {
+                // SAFETY: kqueue returns a fresh descriptor or -1 with errno.
+                let descriptor = unsafe { libc::kqueue() };
+                if descriptor >= 0 {
+                    break descriptor;
+                }
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EINTR) {
+                    return Err(error);
+                }
+            };
+            let change = libc::kevent {
+                ident: native_pid as libc::uintptr_t,
+                filter: libc::EVFILT_PROC,
+                flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_RECEIPT,
+                fflags: libc::NOTE_EXIT,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            // SAFETY: the change and receipt buffers are valid for one event.
+            let mut receipt: libc::kevent = unsafe { std::mem::zeroed() };
+            let returned = loop {
+                // SAFETY: the change and receipt buffers are valid for one event.
+                let result = unsafe {
+                    libc::kevent(
+                        kqueue,
+                        &change,
+                        1,
+                        &mut receipt,
+                        1,
+                        std::ptr::null(),
+                    )
+                };
+                if result >= 0 {
+                    break result;
+                }
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EINTR) {
+                    // SAFETY: this descriptor was created above and is still owned here.
+                    let _ = unsafe { libc::close(kqueue) };
+                    return Err(error);
+                }
+            };
+            if returned != 1
+                || receipt.ident != native_pid as libc::uintptr_t
+                || receipt.filter != libc::EVFILT_PROC
+                || receipt.flags & libc::EV_ERROR == 0
+                || receipt.data != 0
+            {
+                let error = if returned == 1 && receipt.data > 0 {
+                    io::Error::from_raw_os_error(
+                        i32::try_from(receipt.data).unwrap_or(libc::EPROTO),
+                    )
+                } else {
+                    io::Error::from_raw_os_error(libc::EPROTO)
+                };
+                // SAFETY: this descriptor was created above and is still owned here.
+                let _ = unsafe { libc::close(kqueue) };
+                return Err(error);
+            }
+            Ok(Self { pid, kqueue })
+        }
+
+        async fn wait_terminated(&mut self, timeout: Duration, label: &str) {
+            let deadline = Instant::now() + timeout;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let wait = remaining.min(Duration::from_millis(50));
+                let timespec = libc::timespec {
+                    tv_sec: wait.as_secs() as libc::time_t,
+                    tv_nsec: wait.subsec_nanos() as libc::c_long,
+                };
+                // SAFETY: the event buffer and timeout are valid for one kevent wait.
+                let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+                let returned = unsafe {
+                    libc::kevent(
+                        self.kqueue,
+                        std::ptr::null(),
+                        0,
+                        &mut event,
+                        1,
+                        &timespec,
+                    )
+                };
+                if returned == 1 {
+                    let ident = event.ident;
+                    let filter = event.filter;
+                    let fflags = event.fflags;
+                    let flags = event.flags;
+                    assert_eq!(ident, self.pid as libc::uintptr_t);
+                    assert_eq!(filter, libc::EVFILT_PROC);
+                    assert_ne!(fflags & libc::NOTE_EXIT, 0);
+                    assert_eq!(flags & libc::EV_ERROR, 0);
+                    return;
+                }
+                if returned < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                {
+                    panic!(
+                        "waiting for {label} pid={} failed: {}",
+                        self.pid,
+                        io::Error::last_os_error()
+                    );
+                }
+                if Instant::now() >= deadline {
+                    panic!("{label} pid={} remained alive after {timeout:?}", self.pid);
+                }
+            }
+        }
+    }
+
+    impl Drop for ProcessExitWatch {
+        fn drop(&mut self) {
+            // SAFETY: this wrapper owns exactly one kqueue descriptor.
+            let _ = unsafe { libc::close(self.kqueue) };
+        }
+    }
+
+    struct HarnessGuard(Option<Child>);
+
+    impl Drop for HarnessGuard {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    struct GroupCleanup {
+        pgid: libc::pid_t,
+        members: [libc::pid_t; 2],
+        armed: bool,
+    }
+
+    impl Drop for GroupCleanup {
+        fn drop(&mut self) {
+            if self.armed {
+                // SAFETY: this panic guard owns the helper-created process group.
+                let _ = unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
+                for pid in self.members {
+                    // SAFETY: these exact PIDs were published for this test's process tree.
+                    let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
         }
     }
 }

@@ -174,7 +174,7 @@ struct LostCommitHook {
 
 impl ProcessSupervisor {
     pub fn new(config: SupervisorConfig) -> Arc<Self> {
-        let supervisor = Arc::new(Self {
+        Arc::new(Self {
             registry: Arc::new(Registry::new(config.max_sessions)),
             reaper_started: AtomicBool::new(false),
             reaper_stop: tokio_util::sync::CancellationToken::new(),
@@ -183,8 +183,7 @@ impl ProcessSupervisor {
                 report: tokio::sync::watch::channel(None).0,
             }),
             reaper_interval: config.reaper_interval,
-        });
-        supervisor
+        })
     }
 
     pub async fn start(
@@ -1669,11 +1668,10 @@ mod tests {
                 fact,
                 after,
             } = &self.reap_plan
+                && *trigger == signal
             {
-                if *trigger == signal {
-                    let _ = after;
-                    self.exit_tx.send_replace(Some(fact.clone()));
-                }
+                let _ = after;
+                self.exit_tx.send_replace(Some(fact.clone()));
             }
             if self
                 .signal_errors
@@ -1786,7 +1784,7 @@ mod tests {
             .expect("fake process should register");
         let session_id = handle.session_id;
 
-        drop(handle);
+        let _ = handle;
         tokio::task::yield_now().await;
 
         let snapshot = supervisor

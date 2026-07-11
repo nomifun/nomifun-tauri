@@ -180,7 +180,7 @@ fn print_args_env_cwd(
     let mut output = io::stdout().lock();
     for field in [first, second, value.as_os_str(), cwd.as_os_str()] {
         let encoded = field.to_string_lossy();
-        writeln!(output, "{}:{encoded}", encoded.as_bytes().len())?;
+        writeln!(output, "{}:{encoded}", encoded.len())?;
     }
     output.flush()
 }
