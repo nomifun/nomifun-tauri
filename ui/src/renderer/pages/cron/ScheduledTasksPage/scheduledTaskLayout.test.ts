@@ -52,3 +52,15 @@ test('removes only the desktop perimeter and keeps internal dividers', () => {
   expect(pageSource.includes('md:divide-y')).toBe(true);
   expect(pageSource.includes('border-b-[var(--color-border-2)]')).toBe(true);
 });
+
+test('keeps desktop table surfaces transparent', () => {
+  const desktopHeaderClass =
+    pageSource.match(/className='hidden items-center gap-16px[^']*md:grid'/)?.[0] ?? '';
+  const desktopListClass =
+    pageSource.match(/className='grid w-full grid-cols-1 items-start gap-12px[^']*md:divide-\[var\(--color-border-2\)\]'/)?.[0] ?? '';
+
+  expect(desktopHeaderClass.includes('bg-fill-2')).toBe(false);
+  expect(desktopListClass.includes('md:bg-fill-1')).toBe(false);
+  expect(desktopHeaderClass.includes('border-b-[var(--color-border-2)]')).toBe(true);
+  expect(desktopListClass.includes('md:divide-y')).toBe(true);
+});

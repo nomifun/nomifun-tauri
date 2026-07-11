@@ -12,6 +12,7 @@
 
 - Desktop task rows use `md:min-h-48px` and `md:py-8px`, producing an approximately 64px total row height.
 - Desktop header and list have no four-sided perimeter or rounded outer corners.
+- Desktop header and list container have transparent backgrounds.
 - The header bottom rule and task-to-task horizontal dividers remain visible.
 - Mobile cards retain their existing border, padding, layout, and behavior.
 - Detail navigation and start/pause callbacks remain unchanged.
@@ -28,7 +29,7 @@
 - Consumes: the existing single responsive task DOM and `md:` breakpoint.
 - Produces: compact desktop rows without a perimeter; mobile behavior is unchanged.
 
-- [ ] **Step 1: Write the failing styling contract test**
+- [x] **Step 1: Write the failing styling contract test**
 
 Add `readFileSync` and the page source fixture to `scheduledTaskLayout.test.ts`:
 
@@ -56,13 +57,13 @@ test('removes only the desktop perimeter and keeps internal dividers', () => {
 });
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run: `bun test ui/src/renderer/pages/cron/ScheduledTasksPage/scheduledTaskLayout.test.ts`
 
 Expected: FAIL because the current JSX still contains `md:min-h-68px`, `md:py-14px`, and rounded bordered perimeter classes.
 
-- [ ] **Step 3: Apply the minimal JSX class changes**
+- [x] **Step 3: Apply the minimal JSX class changes**
 
 Change the desktop header class to use only a bottom border:
 
@@ -78,21 +79,78 @@ className='grid w-full grid-cols-1 items-start gap-12px md:block md:bg-fill-1 md
 
 In the task-row class, replace `md:min-h-68px md:py-14px` with `md:min-h-48px md:py-8px`. Do not change the non-`md:` mobile classes.
 
+- [x] **Step 4: Run focused and adjacent tests**
+
+Run: `bun test ui/src/renderer/pages/cron/ScheduledTasksPage/scheduledTaskLayout.test.ts ui/src/renderer/pages/cron/ScheduledTasksPage/cronJobSearch.test.ts ui/src/renderer/pages/cron/ScheduledTasksPage/scheduledCreateTarget.test.ts`
+
+Expected: all tests pass.
+
+- [x] **Step 5: Run static and production verification**
+
+Run: `bun run typecheck && bun run build:ui`
+
+Expected: both commands exit with code 0.
+
+- [x] **Step 6: Commit the style adjustment**
+
+```bash
+git add ui/src/renderer/pages/cron/ScheduledTasksPage/index.tsx ui/src/renderer/pages/cron/ScheduledTasksPage/scheduledTaskLayout.test.ts docs/superpowers/specs/2026-07-11-scheduled-task-horizontal-list-design.md docs/superpowers/plans/2026-07-11-scheduled-task-list-density.md
+git commit -m "style(ui): compact scheduled task rows"
+```
+
+### Task 2: Transparent desktop table surfaces
+
+**Files:**
+- Modify: `ui/src/renderer/pages/cron/ScheduledTasksPage/index.tsx`
+- Test: `ui/src/renderer/pages/cron/ScheduledTasksPage/scheduledTaskLayout.test.ts`
+
+**Interfaces:**
+- Consumes: the compact borderless desktop markup from Task 1.
+- Produces: transparent desktop header and list surfaces while preserving mobile cards, internal dividers, and hover feedback.
+
+- [ ] **Step 1: Write the failing transparency test**
+
+Add to `scheduledTaskLayout.test.ts`:
+
+```ts
+test('keeps desktop table surfaces transparent', () => {
+  const desktopHeaderClass =
+    pageSource.match(/className='hidden items-center gap-16px[^']*md:grid'/)?.[0] ?? '';
+  const desktopListClass =
+    pageSource.match(/className='grid w-full grid-cols-1 items-start gap-12px[^']*md:divide-\[var\(--color-border-2\)\]'/)?.[0] ?? '';
+
+  expect(desktopHeaderClass.includes('bg-fill-2')).toBe(false);
+  expect(desktopListClass.includes('md:bg-fill-1')).toBe(false);
+  expect(desktopHeaderClass.includes('border-b-[var(--color-border-2)]')).toBe(true);
+  expect(desktopListClass.includes('md:divide-y')).toBe(true);
+});
+```
+
+- [ ] **Step 2: Run the focused test and verify RED**
+
+Run: `bun test ui/src/renderer/pages/cron/ScheduledTasksPage/scheduledTaskLayout.test.ts`
+
+Expected: FAIL because the desktop header contains `bg-fill-2` and the desktop list contains `md:bg-fill-1`.
+
+- [ ] **Step 3: Remove only the desktop surface backgrounds**
+
+In `index.tsx`, remove `bg-fill-2` from the desktop-only header class and remove `md:bg-fill-1` from the desktop list class. Keep `border-b-[var(--color-border-2)]`, `md:divide-y`, the row's mobile `bg-fill-1`, and `md:hover:bg-fill-2` unchanged.
+
 - [ ] **Step 4: Run focused and adjacent tests**
 
 Run: `bun test ui/src/renderer/pages/cron/ScheduledTasksPage/scheduledTaskLayout.test.ts ui/src/renderer/pages/cron/ScheduledTasksPage/cronJobSearch.test.ts ui/src/renderer/pages/cron/ScheduledTasksPage/scheduledCreateTarget.test.ts`
 
 Expected: all tests pass.
 
-- [ ] **Step 5: Run static and production verification**
+- [ ] **Step 5: Run type and production verification**
 
 Run: `bun run typecheck && bun run build:ui`
 
 Expected: both commands exit with code 0.
 
-- [ ] **Step 6: Commit the style adjustment**
+- [ ] **Step 6: Commit the transparency adjustment**
 
 ```bash
 git add ui/src/renderer/pages/cron/ScheduledTasksPage/index.tsx ui/src/renderer/pages/cron/ScheduledTasksPage/scheduledTaskLayout.test.ts docs/superpowers/specs/2026-07-11-scheduled-task-horizontal-list-design.md docs/superpowers/plans/2026-07-11-scheduled-task-list-density.md
-git commit -m "style(ui): compact scheduled task rows"
+git commit -m "style(ui): make scheduled task list transparent"
 ```
