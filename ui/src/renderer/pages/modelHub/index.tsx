@@ -8,7 +8,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useSearchParams } from 'react-router-dom';
 import classNames from 'classnames';
-import { LinkCloud, Robot, SettingTwo, Platte } from '@icon-park/react';
+import { LinkCloud, Robot, SettingTwo, Platte, Lightning } from '@icon-park/react';
 import ContentSider from '@/renderer/components/layout/ContentSider';
 import SegmentedTabs, { type SegmentedTabItem } from '@/renderer/components/base/SegmentedTabs';
 import { SettingsViewModeProvider } from '@/renderer/components/settings/SettingsModal/settingsViewContext';
@@ -19,11 +19,12 @@ import AgentModalContent from '@/renderer/components/settings/SettingsModal/cont
 import ModelModalContent from '@/renderer/components/settings/SettingsModal/contents/ModelModalContent';
 import GlobalModelConfig from './GlobalModelConfig';
 import CreationModelsContent from './CreationModelsContent';
+import FreeModelsContent from './FreeModelsContent';
 
-type Section = 'agents' | 'models' | 'creation' | 'global';
+type Section = 'agents' | 'models' | 'free' | 'creation' | 'global';
 
 const isSection = (value: string | null): value is Section =>
-  value === 'agents' || value === 'models' || value === 'creation' || value === 'global';
+  value === 'agents' || value === 'models' || value === 'free' || value === 'creation' || value === 'global';
 
 const MODELHUB_SIDER_STORAGE_KEY = 'nomifun:modelhub-sider-width';
 
@@ -74,6 +75,12 @@ const ModelHubPage: React.FC = () => {
     [searchParams, setSearchParams]
   );
 
+  const focusSectionTab = useCallback((key: Section) => {
+    requestAnimationFrame(() => {
+      document.getElementById(`model-hub-tab-${key}`)?.focus();
+    });
+  }, []);
+
   const resize = useResizableSplit({
     unit: 'px',
     defaultWidth: 248,
@@ -91,6 +98,7 @@ const ModelHubPage: React.FC = () => {
     () => [
       { key: 'agents', label: t('settings.modelHub.sectionAgents'), icon: <Robot theme='outline' size='16' strokeWidth={3} /> },
       { key: 'models', label: t('settings.modelHub.sectionModels'), icon: <LinkCloud theme='outline' size='16' strokeWidth={3} /> },
+      { key: 'free', label: t('settings.modelHub.sectionFree'), icon: <Lightning theme='outline' size='16' strokeWidth={3} /> },
       { key: 'creation', label: t('settings.modelHub.sectionCreation'), icon: <Platte theme='outline' size='16' strokeWidth={3} /> },
       { key: 'global', label: t('settings.modelHub.sectionGlobal'), icon: <SettingTwo theme='outline' size='16' strokeWidth={3} /> },
     ],
@@ -101,6 +109,7 @@ const ModelHubPage: React.FC = () => {
     <>
       {section === 'agents' && <AgentModalContent />}
       {section === 'models' && <ModelModalContent />}
+      {section === 'free' && <FreeModelsContent />}
       {section === 'creation' && <CreationModelsContent />}
       {section === 'global' && <GlobalModelConfig />}
     </>
@@ -139,19 +148,34 @@ const ModelHubPage: React.FC = () => {
         resizeHandle={resize.createDragHandle({ className: 'right-0' })}
       >
         <div className='flex flex-col gap-2px px-8px pb-8px' role='tablist' aria-orientation='vertical'>
-          {sections.map((s) => {
+          {sections.map((s, index) => {
             const selected = section === s.key;
             return (
               <div
                 key={s.key}
+                id={`model-hub-tab-${s.key}`}
                 role='tab'
                 aria-selected={selected}
-                tabIndex={0}
+                aria-controls='model-hub-panel'
+                tabIndex={selected ? 0 : -1}
                 onClick={() => handleSectionChange(s.key)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' || e.key === ' ') {
                     e.preventDefault();
                     handleSectionChange(s.key);
+                    return;
+                  }
+                  if (e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'Home' || e.key === 'End') {
+                    e.preventDefault();
+                    const nextIndex =
+                      e.key === 'Home'
+                        ? 0
+                        : e.key === 'End'
+                          ? sections.length - 1
+                          : (index + (e.key === 'ArrowDown' ? 1 : -1) + sections.length) % sections.length;
+                    const next = sections[nextIndex].key;
+                    handleSectionChange(next);
+                    focusSectionTab(next);
                   }
                 }}
                 className={classNames(
@@ -173,7 +197,13 @@ const ModelHubPage: React.FC = () => {
           })}
         </div>
       </ContentSider>
-      <div className='flex-1 min-w-0 min-h-0 overflow-y-auto' role='tabpanel' aria-label={t('settings.modelHub.title')} ref={paneRef}>
+      <div
+        id='model-hub-panel'
+        className='flex-1 min-w-0 min-h-0 overflow-y-auto'
+        role='tabpanel'
+        aria-labelledby={`model-hub-tab-${section}`}
+        ref={paneRef}
+      >
         <SettingsViewModeProvider value='page'>
           <div className={classNames('mx-auto w-full max-w-1100px box-border py-32px', panePadX)}>{content}</div>
         </SettingsViewModeProvider>

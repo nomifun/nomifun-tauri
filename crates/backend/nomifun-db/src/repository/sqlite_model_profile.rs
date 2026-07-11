@@ -79,6 +79,24 @@ impl IModelProfileRepository for SqliteModelProfileRepository {
         })
     }
 
+    async fn insert_if_absent(&self, params: &UpsertModelProfileParams<'_>) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "INSERT INTO model_profiles (provider_id, model, tasks, traits, params, source, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(provider_id, model) DO NOTHING",
+        )
+        .bind(params.provider_id)
+        .bind(params.model)
+        .bind(params.tasks)
+        .bind(params.traits)
+        .bind(params.params)
+        .bind(params.source)
+        .bind(now_ms())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn delete(&self, provider_id: &str, model: &str) -> Result<bool, DbError> {
         let result = sqlx::query("DELETE FROM model_profiles WHERE provider_id = ? AND model = ?")
             .bind(provider_id)
@@ -200,5 +218,46 @@ mod tests {
             .await
             .unwrap();
         assert!(r.list().await.unwrap().is_empty(), "profiles should cascade-delete with provider");
+    }
+
+    #[tokio::test]
+    async fn insert_if_absent_never_overwrites_existing_profile() {
+        let db = init_database_memory().await.unwrap();
+        seed_provider(db.pool(), "p1").await;
+        let r = SqliteModelProfileRepository::new(db.pool().clone());
+
+        assert!(
+            r.insert_if_absent(&UpsertModelProfileParams {
+                provider_id: "p1",
+                model: "deepseek-v4-flash-free",
+                tasks: r#"["chat"]"#,
+                traits: r#"["vision_input"]"#,
+                params: r#"{"owner":"user"}"#,
+                source: "user",
+            })
+            .await
+            .unwrap()
+        );
+        assert!(
+            !r.insert_if_absent(&UpsertModelProfileParams {
+                provider_id: "p1",
+                model: "deepseek-v4-flash-free",
+                tasks: r#"["chat"]"#,
+                traits: "[]",
+                params: "{}",
+                source: "inferred",
+            })
+            .await
+            .unwrap()
+        );
+
+        let stored = r
+            .get("p1", "deepseek-v4-flash-free")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.source, "user");
+        assert_eq!(stored.traits, r#"["vision_input"]"#);
+        assert_eq!(stored.params, r#"{"owner":"user"}"#);
     }
 }

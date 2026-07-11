@@ -579,6 +579,9 @@ async fn build_probe_engine(config_extra: NomiResolvedConfig) -> Result<AgentEng
     if let Some(path) = config_extra.compat_overrides.api_path {
         config.compat.api_path = Some(path);
     }
+    if let Some(required) = config_extra.compat_overrides.require_reasoning_content {
+        config.compat.require_reasoning_content = Some(required);
+    }
 
     AgentBootstrap::new(config, workspace, sink)
         .build()

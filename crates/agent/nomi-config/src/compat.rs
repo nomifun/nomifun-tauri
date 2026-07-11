@@ -66,6 +66,10 @@ pub struct ProviderCompat {
     /// 为 Some(false) 时 OpenAI provider 的 build_messages 会剔除图片、改文字占位。
     /// 由 VisionUnsupportedRegistry 在工厂构建时按 provider+model 注入,不持久化。
     pub supports_image: Option<bool>,
+
+    /// Require a non-empty `reasoning_content` field on assistant history
+    /// messages. Used only by gateways that explicitly enforce this extension.
+    pub require_reasoning_content: Option<bool>,
 }
 
 impl ProviderCompat {
@@ -130,6 +134,9 @@ impl ProviderCompat {
             supports_effort: user.supports_effort.or(defaults.supports_effort),
             effort_levels: user.effort_levels.or(defaults.effort_levels),
             supports_image: user.supports_image.or(defaults.supports_image),
+            require_reasoning_content: user
+                .require_reasoning_content
+                .or(defaults.require_reasoning_content),
         }
     }
 
@@ -183,6 +190,10 @@ impl ProviderCompat {
     /// 是否支持图片输入。**默认 true**——只有被显式标记不支持时才 false。
     pub fn supports_image(&self) -> bool {
         self.supports_image.unwrap_or(true)
+    }
+
+    pub fn require_reasoning_content(&self) -> bool {
+        self.require_reasoning_content.unwrap_or(false)
     }
 }
 

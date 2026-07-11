@@ -2,20 +2,23 @@ use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use std::path::PathBuf;
 
 use nomifun_api_types::{
-    ApiResponse, ClientPreferencesResponse, CreateProviderRequest, DetectProtocolRequest, FetchModelsAnonymousRequest,
-    FetchModelsRequest, FetchModelsResponse, ModelProfile, ModelProfileKeyRequest,
-    ModelProfileUpsertRequest, ProtocolDetectionResponse, ProviderResponse, ResolveModelsRequest,
-    ResolveModelsResponse, SystemInfoResponse, SystemSettingsResponse, UpdateCheckRequest,
-    UpdateCheckResult, UpdateClientPreferencesRequest, UpdateProviderRequest, UpdateSettingsRequest,
-    UpdateWorkDirRequest,
+    ApiResponse, ClientPreferencesResponse, CreateProviderRequest, DetectProtocolRequest,
+    FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse, ManagedModel,
+    ManagedModelHealthBatchResult, ManagedModelHealthResult, ManagedModelServiceStatus,
+    ModelProfile, ModelProfileKeyRequest, ModelProfileUpsertRequest, ProtocolDetectionResponse,
+    ProviderResponse, ResolveModelsRequest, ResolveModelsResponse, SetManagedModelEnabledRequest,
+    SetManagedModelServiceEnabledRequest, SystemInfoResponse, SystemSettingsResponse,
+    UpdateCheckRequest, UpdateCheckResult, UpdateClientPreferencesRequest,
+    UpdateProviderRequest, UpdateSettingsRequest, UpdateWorkDirRequest,
 };
 use nomifun_common::AppError;
 
 use crate::client_pref::ClientPrefService;
+use crate::managed_model::ManagedModelService;
 use crate::model_fetcher::ModelFetchService;
 use crate::model_profile::ModelProfileService;
 use crate::protocol::ProtocolDetectionService;
@@ -31,6 +34,7 @@ pub struct SystemRouterState {
     pub provider_service: ProviderService,
     pub model_fetch_service: ModelFetchService,
     pub model_profile_service: ModelProfileService,
+    pub managed_model_service: Option<std::sync::Arc<ManagedModelService>>,
     pub protocol_detection_service: ProtocolDetectionService,
     pub version_check_service: VersionCheckService,
     /// Data directory root — used to arm a factory reset (write the marker that
@@ -71,6 +75,23 @@ pub fn system_routes(state: SystemRouterState) -> Router {
         // "fetch-models" as a provider id.
         .route("/api/providers/detect-protocol", post(detect_protocol))
         .route("/api/providers/fetch-models", post(fetch_models_anonymous))
+        .route("/api/model-services/free/status", get(get_free_model_status))
+        .route("/api/model-services/free/models", get(get_free_models))
+        .route("/api/model-services/free/refresh", post(refresh_free_models))
+        .route(
+            "/api/model-services/free/health",
+            get(get_free_model_health).post(check_all_free_model_health),
+        )
+        .route("/api/model-services/free/activate", post(activate_free_models))
+        .route(
+            "/api/model-services/free/models/{id}/health",
+            post(check_free_model_health),
+        )
+        .route(
+            "/api/model-services/free/models/{id}",
+            patch(set_free_model_enabled),
+        )
+        .route("/api/model-services/local/status", get(get_local_model_status))
         .route("/api/providers/{id}", delete(delete_provider).put(update_provider))
         .route("/api/providers/{id}/models", post(fetch_models))
         // Multimodal model hub: authoritative per-model capability profiles.
@@ -208,6 +229,124 @@ async fn detect_protocol(
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     let result = state.protocol_detection_service.detect_protocol(&req).await?;
     Ok(Json(ApiResponse::ok(result)))
+}
+
+// ===========================================================================
+// Managed model services
+// ===========================================================================
+
+fn managed_service(
+    state: &SystemRouterState,
+) -> Result<std::sync::Arc<ManagedModelService>, AppError> {
+    state.managed_model_service.clone().ok_or_else(|| {
+        AppError::ProviderUnavailable("managed model service is not available in this process".into())
+    })
+}
+
+async fn get_free_model_status(
+    State(state): State<SystemRouterState>,
+) -> Result<Json<ApiResponse<ManagedModelServiceStatus>>, AppError> {
+    Ok(Json(ApiResponse::ok(
+        managed_service(&state)?.free_status().await,
+    )))
+}
+
+async fn get_free_models(
+    State(state): State<SystemRouterState>,
+) -> Result<Json<ApiResponse<Vec<ManagedModel>>>, AppError> {
+    Ok(Json(ApiResponse::ok(
+        managed_service(&state)?.free_models().await,
+    )))
+}
+
+async fn refresh_free_models(
+    State(state): State<SystemRouterState>,
+) -> Result<Json<ApiResponse<ManagedModelServiceStatus>>, AppError> {
+    let status = managed_service(&state)?.refresh_free_models().await?;
+    if status.last_error.is_none() {
+        let models = status
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+        match state
+            .model_profile_service
+            .seed_missing_inferred(
+                crate::managed_model::FREE_MODEL_PROVIDER_ID,
+                crate::managed_model::FREE_MODEL_PROVIDER_ID,
+                &models,
+            )
+            .await
+        {
+            Ok(seeded) if seeded > 0 => tracing::info!(
+                seeded,
+                "Manual managed free-model refresh seeded inferred profiles"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                error = %error,
+                "Manual managed free-model profile reconciliation failed"
+            ),
+        }
+    }
+    Ok(Json(ApiResponse::ok(status)))
+}
+
+async fn get_free_model_health(
+    State(state): State<SystemRouterState>,
+) -> Result<Json<ApiResponse<Vec<ManagedModelHealthResult>>>, AppError> {
+    Ok(Json(ApiResponse::ok(
+        managed_service(&state)?.free_health_snapshot().await,
+    )))
+}
+
+async fn check_free_model_health(
+    State(state): State<SystemRouterState>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<ManagedModelHealthResult>>, AppError> {
+    let service = managed_service(&state)?;
+    let result = service.check_free_model_health(&id).await?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+async fn check_all_free_model_health(
+    State(state): State<SystemRouterState>,
+) -> Result<Json<ApiResponse<ManagedModelHealthBatchResult>>, AppError> {
+    let service = managed_service(&state)?;
+    Ok(Json(ApiResponse::ok(
+        service.check_all_free_model_health().await,
+    )))
+}
+
+async fn activate_free_models(
+    State(state): State<SystemRouterState>,
+    body: Result<Json<SetManagedModelServiceEnabledRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ManagedModelServiceStatus>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let status = managed_service(&state)?
+        .set_free_enabled(req.enabled)
+        .await?;
+    Ok(Json(ApiResponse::ok(status)))
+}
+
+async fn set_free_model_enabled(
+    State(state): State<SystemRouterState>,
+    Path(id): Path<String>,
+    body: Result<Json<SetManagedModelEnabledRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ManagedModelServiceStatus>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let status = managed_service(&state)?
+        .set_free_model_enabled(&id, req.enabled)
+        .await?;
+    Ok(Json(ApiResponse::ok(status)))
+}
+
+async fn get_local_model_status(
+    State(state): State<SystemRouterState>,
+) -> Result<Json<ApiResponse<ManagedModelServiceStatus>>, AppError> {
+    Ok(Json(ApiResponse::ok(
+        managed_service(&state)?.local_status(),
+    )))
 }
 
 // ===========================================================================

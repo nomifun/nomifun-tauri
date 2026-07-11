@@ -84,6 +84,15 @@ import type {
   ResolveModelsResponse,
   UpdateProviderRequest,
 } from '../types/provider/providerApi';
+import type {
+  CheckManagedModelHealthRequest,
+  ManagedModel,
+  ManagedModelHealthBatchResult,
+  ManagedModelHealthResult,
+  ManagedModelServiceStatus,
+  SetManagedModelEnabledRequest,
+  SetManagedModelServiceEnabledRequest,
+} from '../types/provider/managedModelService';
 import type { SpeechToTextRequest, SpeechToTextResult } from '../types/provider/speech';
 import type {
   TAdjustRunRequest,
@@ -919,6 +928,34 @@ export const mode = {
    */
   fetchModelList: httpPost<FetchModelsResponse, FetchModelsAnonymousRequest>('/api/providers/fetch-models'),
   detectProtocol: httpPost<ProtocolDetectionResponse, ProtocolDetectionRequest>('/api/providers/detect-protocol'),
+};
+
+// ---------------------------------------------------------------------------
+// NomiFun-managed model services — stable provider layer for free/local models
+// ---------------------------------------------------------------------------
+
+export const managedModelService = {
+  free: {
+    status: httpGet<ManagedModelServiceStatus, void>('/api/model-services/free/status'),
+    models: httpGet<ManagedModel[], void>('/api/model-services/free/models'),
+    refresh: httpPost<ManagedModelServiceStatus, void>('/api/model-services/free/refresh'),
+    setEnabled: httpPost<ManagedModelServiceStatus, SetManagedModelServiceEnabledRequest>(
+      '/api/model-services/free/activate'
+    ),
+    setModelEnabled: httpPatch<ManagedModelServiceStatus, SetManagedModelEnabledRequest>(
+      (p) => `/api/model-services/free/models/${encodeURIComponent(p.id)}`,
+      (p) => ({ enabled: p.enabled })
+    ),
+    healthSnapshot: httpGet<ManagedModelHealthResult[], void>('/api/model-services/free/health'),
+    checkHealth: httpPost<ManagedModelHealthBatchResult, void>('/api/model-services/free/health'),
+    checkModelHealth: httpPost<ManagedModelHealthResult, CheckManagedModelHealthRequest>(
+      (p) => `/api/model-services/free/models/${encodeURIComponent(p.id)}/health`,
+      () => undefined
+    ),
+  },
+  local: {
+    status: httpGet<ManagedModelServiceStatus, void>('/api/model-services/local/status'),
+  },
 };
 
 // ---------------------------------------------------------------------------

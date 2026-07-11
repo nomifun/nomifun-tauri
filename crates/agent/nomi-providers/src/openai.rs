@@ -37,7 +37,12 @@ impl OpenAIProvider {
         Ok(headers)
     }
 
-    fn build_messages(messages: &[Message], system: &str, compat: &ProviderCompat) -> Vec<Value> {
+    fn build_messages(
+        messages: &[Message],
+        system: &str,
+        compat: &ProviderCompat,
+        require_reasoning_content: bool,
+    ) -> Vec<Value> {
         let mut result: Vec<Value> = Vec::new();
 
         // Check if any assistant message in the conversation has thinking content.
@@ -188,8 +193,19 @@ impl OpenAIProvider {
                         .collect::<Vec<_>>()
                         .join("");
 
-                    if has_any_thinking {
-                        msg_json["reasoning_content"] = json!(thinking);
+                    if has_any_thinking || require_reasoning_content {
+                        // OpenCode's DeepSeek free endpoint rejects some
+                        // multi-turn tool histories when an assistant turn has
+                        // no reasoning_content. A single space is intentional:
+                        // unlike "", it is accepted as a non-empty placeholder
+                        // when persisted/compacted history lost the original
+                        // thinking block.
+                        let reasoning_content = if require_reasoning_content && thinking.is_empty() {
+                            " ".to_owned()
+                        } else {
+                            thinking
+                        };
+                        msg_json["reasoning_content"] = json!(reasoning_content);
                     }
 
                     let text: String = msg
@@ -342,7 +358,12 @@ impl OpenAIProvider {
 
         let mut body = json!({
             "model": request.model,
-            "messages": Self::build_messages(&request.messages, &request.system, &self.compat),
+            "messages": Self::build_messages(
+                &request.messages,
+                &request.system,
+                &self.compat,
+                self.compat.require_reasoning_content(),
+            ),
             "stream": true,
             "stream_options": { "include_usage": true }
         });
@@ -1466,6 +1487,34 @@ fn text_tool_progress_events(state: &mut StreamState) -> Vec<LlmEvent> {
     events
 }
 
+/// Extract one reasoning delta from the OpenAI-compatible variants used by
+/// different gateways. Prefer the scalar fields to avoid duplicating output
+/// when a provider includes both a normalized field and `reasoning_details`.
+fn extract_reasoning_delta(delta: &Value) -> Option<String> {
+    for field in ["reasoning_content", "reasoning"] {
+        if let Some(text) = delta[field].as_str().filter(|text| !text.is_empty()) {
+            return Some(text.to_string());
+        }
+    }
+
+    let mut reasoning = String::new();
+    for detail in delta["reasoning_details"].as_array()? {
+        let text = detail["text"]
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .or_else(|| {
+                detail["content"]
+                    .as_str()
+                    .filter(|content| !content.is_empty())
+            });
+        if let Some(text) = text {
+            reasoning.push_str(text);
+        }
+    }
+
+    (!reasoning.is_empty()).then_some(reasoning)
+}
+
 fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id: bool) -> Vec<LlmEvent> {
     let mut events = Vec::new();
 
@@ -1515,13 +1564,11 @@ fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id: bool) -> V
     let delta = &choice["delta"];
 
     // Reasoning content (OpenAI reasoning models)
-    if let Some(reasoning) = delta["reasoning_content"].as_str()
-        && !reasoning.is_empty()
-    {
+    if let Some(reasoning) = extract_reasoning_delta(delta) {
         let visible_delta = append_raw_text_and_visible_delta(
             &mut state.reasoning_buf,
             &mut state.visible_reasoning_buf,
-            reasoning,
+            &reasoning,
         );
         if !visible_delta.is_empty() {
             events.push(LlmEvent::ThinkingDelta(visible_delta));
@@ -1652,10 +1699,67 @@ fn parse_sse_chunk(data: &str, state: &mut StreamState, auto_tool_id: bool) -> V
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_sse_chunk, parse_text_tool_calls, StreamState};
+    use super::{
+        extract_reasoning_delta, parse_sse_chunk, parse_text_tool_calls, StreamState,
+    };
     use nomi_types::llm::LlmEvent;
     use nomi_types::message::StopReason;
     use serde_json::json;
+
+    #[test]
+    fn extracts_reasoning_content_delta() {
+        let delta = json!({"reasoning_content": "thinking"});
+        assert_eq!(extract_reasoning_delta(&delta).as_deref(), Some("thinking"));
+    }
+
+    #[test]
+    fn extracts_reasoning_delta() {
+        let delta = json!({"reasoning": "thinking"});
+        assert_eq!(extract_reasoning_delta(&delta).as_deref(), Some("thinking"));
+    }
+
+    #[test]
+    fn extracts_reasoning_details_text_and_content() {
+        let delta = json!({
+            "reasoning_details": [
+                {"type": "reasoning.text", "text": "first "},
+                {"type": "reasoning.text", "content": "second"},
+                {"text": "", "content": " third"}
+            ]
+        });
+        assert_eq!(
+            extract_reasoning_delta(&delta).as_deref(),
+            Some("first second third")
+        );
+    }
+
+    #[test]
+    fn scalar_reasoning_field_takes_precedence_over_details() {
+        let delta = json!({
+            "reasoning_content": "once",
+            "reasoning": "duplicate",
+            "reasoning_details": [{"text": "duplicate"}]
+        });
+        assert_eq!(extract_reasoning_delta(&delta).as_deref(), Some("once"));
+    }
+
+    #[test]
+    fn reasoning_variants_emit_thinking_deltas() {
+        for chunk in [
+            r#"{"choices":[{"delta":{"reasoning_content":"from content"},"finish_reason":null,"index":0}]}"#,
+            r#"{"choices":[{"delta":{"reasoning":"from reasoning"},"finish_reason":null,"index":0}]}"#,
+            r#"{"choices":[{"delta":{"reasoning_details":[{"text":"from "},{"content":"details"}]},"finish_reason":null,"index":0}]}"#,
+        ] {
+            let mut state = StreamState::new();
+            let events = parse_sse_chunk(chunk, &mut state, false);
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, LlmEvent::ThinkingDelta(text) if !text.is_empty())),
+                "expected ThinkingDelta for chunk: {chunk}"
+            );
+        }
+    }
 
     /// Qwen XML form (the exact shape step-3.7-flash emitted in session 18 that
     /// dead-ended): a `<tool_call><function=NAME><parameter=KEY>JSON</parameter>`
@@ -1886,7 +1990,7 @@ mod tests {
             }],
         )];
         let compat = nomi_config::compat::ProviderCompat::openai_defaults();
-        let result = OpenAIProvider::build_messages(&messages, "", &compat);
+        let result = OpenAIProvider::build_messages(&messages, "", &compat, false);
         // tool message first, then a user message carrying the image
         assert_eq!(result[0]["role"], "tool");
         assert_eq!(result[0]["content"], "screenshot taken");
@@ -1918,7 +2022,7 @@ mod tests {
             ],
         )];
         let compat = nomi_config::compat::ProviderCompat::openai_defaults();
-        let result = OpenAIProvider::build_messages(&messages, "", &compat);
+        let result = OpenAIProvider::build_messages(&messages, "", &compat, false);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["role"], "user");
         let content = result[0]["content"].as_array().unwrap();
@@ -1957,7 +2061,7 @@ mod tests {
                 },
             ],
         )];
-        let out = OpenAIProvider::build_messages(&messages, "", &compat);
+        let out = OpenAIProvider::build_messages(&messages, "", &compat, false);
         let s = serde_json::to_string(&out).unwrap();
         assert!(!s.contains("image_url"), "不应出现 image_url: {s}");
         assert!(s.contains("图片已省略"), "应出现占位: {s}");
@@ -1974,7 +2078,7 @@ mod tests {
                 data: "AAAA".into(),
             }],
         )];
-        let out = OpenAIProvider::build_messages(&messages, "", &compat);
+        let out = OpenAIProvider::build_messages(&messages, "", &compat, false);
         let s = serde_json::to_string(&out).unwrap();
         assert!(s.contains("image_url"), "应保留 image_url: {s}");
     }
@@ -2008,6 +2112,64 @@ mod tests {
 
     async fn drain_stream(mut rx: tokio::sync::mpsc::Receiver<LlmEvent>) {
         while rx.recv().await.is_some() {}
+    }
+
+    #[test]
+    fn deepseek_free_multiturn_tool_history_gets_reasoning_placeholder() {
+        let mut compat = openai_compat();
+        compat.require_reasoning_content = Some(true);
+        let provider = OpenAIProvider::new("key", "http://localhost", compat);
+        let mut request = simple_request();
+        request.model = "deepseek-v4-flash-free".into();
+        request.messages = vec![
+            Message::new(
+                Role::Assistant,
+                vec![ContentBlock::ToolUse {
+                    id: "call_1".into(),
+                    name: "read".into(),
+                    input: json!({"path": "README.md"}),
+                    extra: None,
+                }],
+            ),
+            Message::new(
+                Role::Tool,
+                vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: "contents".into(),
+                    is_error: false,
+                    images: Vec::new(),
+                }],
+            ),
+        ];
+
+        let body = provider.build_request_body(&request);
+        let assistant = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .unwrap();
+        assert_eq!(assistant["reasoning_content"], " ");
+        assert!(assistant["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn reasoning_placeholder_requires_explicit_provider_compat() {
+        let provider = OpenAIProvider::new("key", "http://localhost", openai_compat());
+        let mut request = simple_request();
+        request.model = "other-free".into();
+        request.messages = vec![Message::new(
+            Role::Assistant,
+            vec![ContentBlock::Text {
+                text: "answer".into(),
+            }],
+        )];
+
+        let body = provider.build_request_body(&request);
+        assert!(
+            body["messages"][0].get("reasoning_content").is_none(),
+            "unrelated models must retain normal OpenAI message semantics"
+        );
     }
 
     #[tokio::test]
@@ -2110,7 +2272,7 @@ mod tests {
                 }],
             ),
         ];
-        let result = OpenAIProvider::build_messages(&messages, "", &openai_compat());
+        let result = OpenAIProvider::build_messages(&messages, "", &openai_compat(), false);
         let assistant_msgs: Vec<_> = result.iter().filter(|m| m["role"] == "assistant").collect();
         assert_eq!(assistant_msgs.len(), 1);
         assert_eq!(assistant_msgs[0]["content"], "hello world");
@@ -2132,7 +2294,7 @@ mod tests {
                 }],
             ),
         ];
-        let result = OpenAIProvider::build_messages(&messages, "", &no_compat());
+        let result = OpenAIProvider::build_messages(&messages, "", &no_compat(), false);
         let assistant_msgs: Vec<_> = result.iter().filter(|m| m["role"] == "assistant").collect();
         assert_eq!(assistant_msgs.len(), 2);
     }
@@ -2170,7 +2332,7 @@ mod tests {
             ),
             // tc2 has no result -> orphan
         ];
-        let result = OpenAIProvider::build_messages(&messages, "", &openai_compat());
+        let result = OpenAIProvider::build_messages(&messages, "", &openai_compat(), false);
         let assistant = result.iter().find(|m| m["role"] == "assistant").unwrap();
         let tcs = assistant["tool_calls"].as_array().unwrap();
         assert_eq!(tcs.len(), 1);
@@ -2207,7 +2369,7 @@ mod tests {
                 }],
             ),
         ];
-        let result = OpenAIProvider::build_messages(&messages, "", &no_compat());
+        let result = OpenAIProvider::build_messages(&messages, "", &no_compat(), false);
         let assistant = result.iter().find(|m| m["role"] == "assistant").unwrap();
         let tcs = assistant["tool_calls"].as_array().unwrap();
         assert_eq!(tcs.len(), 2);
@@ -2246,7 +2408,7 @@ mod tests {
                 }],
             ),
         ];
-        let result = OpenAIProvider::build_messages(&messages, "", &openai_compat());
+        let result = OpenAIProvider::build_messages(&messages, "", &openai_compat(), false);
         let tool_msgs: Vec<_> = result.iter().filter(|m| m["role"] == "tool").collect();
         assert_eq!(tool_msgs.len(), 1);
         assert_eq!(tool_msgs[0]["content"], "second");

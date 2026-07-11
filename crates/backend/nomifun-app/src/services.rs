@@ -21,7 +21,7 @@ use nomifun_db::{
     IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
     SqliteCompanionTokenRepository, SqliteConversationRepository, SqliteMcpServerRepository,
     SqliteModelProfileRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
-    SqliteTerminalRepository, SqliteUserRepository, UpsertModelProfileParams,
+    SqliteTerminalRepository, SqliteUserRepository,
 };
 use nomifun_realtime::{BroadcastEventBus, WebSocketManager};
 use nomifun_terminal::{TerminalEventEmitter, TerminalLifecycleServer, TerminalService};
@@ -38,6 +38,13 @@ pub struct AppServices {
     pub companion_token_validator: Arc<CompanionTokenValidator>,
     /// Provider repository (exposed for the mint-time model-availability guard).
     pub provider_repo: Arc<dyn IProviderRepository>,
+    /// Unified loopback model supply (`nomifun-free-model` today, with the
+    /// `nomifun-local-model` contract reserved for a future local runtime).
+    pub managed_model_service: Arc<nomifun_system::ManagedModelService>,
+    /// Keeps the authenticated loopback OpenAI-compatible listener alive.
+    pub(crate) _managed_model_server: nomifun_system::ManagedModelServer,
+    /// Keeps the immediate + periodic managed catalog refresh loop alive.
+    pub(crate) _managed_model_refresh_task: nomifun_system::ManagedModelRefreshTask,
     /// Authoritative per-model capability profiles (multimodal model hub).
     pub model_profile_repo: Arc<dyn IModelProfileRepository>,
     pub cookie_config: Arc<CookieConfig>,
@@ -199,8 +206,60 @@ impl AppServices {
 
         let remote_agent_repo = Arc::new(SqliteRemoteAgentRepository::new(database.pool().clone()));
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
+        // Start the stable managed-model loopback supply and provision its
+        // provider projection before any model-profile reconciliation or agent
+        // factory construction. A seed catalog makes a fresh install usable
+        // without blocking boot on third-party discovery.
+        let (managed_model_service, managed_model_server) =
+            nomifun_system::start_and_provision_free_model_with_preferences(
+                provider_repo.clone(),
+                Some(Arc::new(nomifun_db::SqliteClientPreferenceRepository::new(
+                    database.pool().clone(),
+                ))),
+                encryption_key,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to provision NomiFun free model service: {e}"))?;
         let model_profile_repo: Arc<dyn IModelProfileRepository> =
             Arc::new(SqliteModelProfileRepository::new(database.pool().clone()));
+        // Refresh immediately, then about every six hours with jitter. Failed
+        // attempts retain the current catalog and use capped exponential
+        // backoff. Successful refreshes atomically seed profiles for any newly
+        // discovered models without overwriting concurrent user edits.
+        let managed_model_refresh_task = {
+            let profile_repo = model_profile_repo.clone();
+            nomifun_system::ManagedModelRefreshTask::start_with_success_hook(
+                managed_model_service.clone(),
+                move |status| {
+                    let profile_repo = profile_repo.clone();
+                    async move {
+                        let models = status
+                            .models
+                            .iter()
+                            .map(|model| model.id.as_str())
+                            .collect::<Vec<_>>();
+                        match nomifun_system::seed_missing_inferred_profiles(
+                            profile_repo.as_ref(),
+                            nomifun_system::FREE_MODEL_PROVIDER_ID,
+                            nomifun_system::FREE_MODEL_PROVIDER_ID,
+                            &models,
+                        )
+                        .await
+                        {
+                            Ok(seeded) if seeded > 0 => tracing::info!(
+                                seeded,
+                                "Managed free-model refresh seeded inferred model profiles"
+                            ),
+                            Ok(_) => {}
+                            Err(error) => tracing::warn!(
+                                error = %error,
+                                "Managed free-model profile reconciliation failed"
+                            ),
+                        }
+                    }
+                },
+            )
+        };
         // User-configured MCP servers — injected into ACP `session/new`
         // so the agent gets the operator's tools (ELECTRON-1JG fix).
         let mcp_server_repo: Arc<dyn IMcpServerRepository> =
@@ -747,6 +806,9 @@ impl AppServices {
             companion_token_repo,
             companion_token_validator,
             provider_repo: provider_repo_for_services,
+            managed_model_service,
+            _managed_model_server: managed_model_server,
+            _managed_model_refresh_task: managed_model_refresh_task,
             model_profile_repo: model_profile_repo.clone(),
             cookie_config: Arc::new(CookieConfig::from_env()),
             qr_token_store: Arc::new(QrTokenStore::new()),
@@ -799,39 +861,23 @@ async fn reconcile_model_profiles(
             return;
         }
     };
-    let existing = model_profile_repo.list().await.unwrap_or_default();
-    let has_profile = |provider_id: &str, model: &str| {
-        existing
-            .iter()
-            .any(|r| r.provider_id == provider_id && r.model == model)
-    };
-
     let mut seeded = 0usize;
     for provider in &providers {
         let models: Vec<String> = serde_json::from_str(&provider.models).unwrap_or_default();
-        for model in models {
-            if has_profile(&provider.id, &model) {
-                continue;
-            }
-            let (tasks, traits) =
-                nomifun_api_types::derive_tasks_and_traits(&provider.platform, &model);
-            let tasks_json = serde_json::to_string(&tasks).unwrap_or_else(|_| "[]".to_string());
-            let traits_json = serde_json::to_string(&traits).unwrap_or_else(|_| "[]".to_string());
-            if let Err(e) = model_profile_repo
-                .upsert(&UpsertModelProfileParams {
-                    provider_id: &provider.id,
-                    model: &model,
-                    tasks: &tasks_json,
-                    traits: &traits_json,
-                    params: "{}",
-                    source: "inferred",
-                })
-                .await
-            {
-                tracing::warn!("model-profile reconcile: upsert {}/{} failed: {e}", provider.id, model);
-            } else {
-                seeded += 1;
-            }
+        match nomifun_system::seed_missing_inferred_profiles(
+            model_profile_repo.as_ref(),
+            &provider.id,
+            &provider.platform,
+            &models,
+        )
+        .await
+        {
+            Ok(count) => seeded += count,
+            Err(error) => tracing::warn!(
+                provider_id = %provider.id,
+                error = %error,
+                "model-profile reconcile failed"
+            ),
         }
     }
     if seeded > 0 {

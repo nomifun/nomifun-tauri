@@ -54,6 +54,8 @@ pub struct NomiCompatOverrides {
     pub api_path: Option<String>,
     /// None = 默认支持图片;Some(false) = registry 已标记不支持,发送时剔图。
     pub supports_image: Option<bool>,
+    /// Some(true) = gateway requires assistant reasoning_content placeholders.
+    pub require_reasoning_content: Option<bool>,
 }
 
 /// Fully resolved Nomi configuration passed to the agent manager.

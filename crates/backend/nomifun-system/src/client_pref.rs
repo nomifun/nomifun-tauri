@@ -6,6 +6,7 @@ use nomifun_db::IClientPreferenceRepository;
 
 /// Maximum allowed key length for client preferences.
 const MAX_KEY_LENGTH: usize = 255;
+const SYSTEM_RESERVED_PREFIXES: &[&str] = &["managedModel."];
 
 /// Business logic for client preferences (generic key-value store).
 #[derive(Clone)]
@@ -42,6 +43,14 @@ impl ClientPrefService {
 
         for (key, value) in req {
             validate_key(&key)?;
+            if SYSTEM_RESERVED_PREFIXES
+                .iter()
+                .any(|prefix| key.starts_with(prefix))
+            {
+                return Err(AppError::Forbidden(format!(
+                    "Preference key '{key}' is managed by the system"
+                )));
+            }
 
             if value.is_null() {
                 deletes.push(key);
@@ -115,6 +124,15 @@ mod tests {
     fn validate_key_rejects_too_long() {
         let long_key = "x".repeat(MAX_KEY_LENGTH + 1);
         assert!(validate_key(&long_key).is_err());
+    }
+
+    #[tokio::test]
+    async fn update_rejects_system_managed_namespace() {
+        let svc = setup().await;
+        let mut req = UpdateClientPreferencesRequest::new();
+        req.insert("managedModel.free.lastRefresh".into(), json!(1));
+        let err = svc.update_preferences(req).await.unwrap_err();
+        assert_eq!(err.status_code(), axum::http::StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
