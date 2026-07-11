@@ -93,6 +93,12 @@ import type {
   SetManagedModelEnabledRequest,
   SetManagedModelServiceEnabledRequest,
 } from '../types/provider/managedModelService';
+import type {
+  LocalModelCatalogEntry,
+  LocalModelIdRequest,
+  LocalModelServiceStatus,
+  SetLocalModelActiveRequest,
+} from '../types/provider/localModelService';
 import type { SpeechToTextRequest, SpeechToTextResult } from '../types/provider/speech';
 import type {
   TAdjustRunRequest,
@@ -954,7 +960,23 @@ export const managedModelService = {
     ),
   },
   local: {
-    status: httpGet<ManagedModelServiceStatus, void>('/api/model-services/local/status'),
+    catalog: httpGet<LocalModelCatalogEntry[], void>('/api/model-services/local/catalog'),
+    status: httpGet<LocalModelServiceStatus, void>('/api/model-services/local/status'),
+    install: httpPost<LocalModelServiceStatus, LocalModelIdRequest>(
+      (p) => `/api/model-services/local/models/${encodeURIComponent(p.id)}/install`,
+      () => undefined
+    ),
+    cancel: httpPost<LocalModelServiceStatus, LocalModelIdRequest>(
+      (p) => `/api/model-services/local/models/${encodeURIComponent(p.id)}/cancel`,
+      () => undefined
+    ),
+    remove: httpDelete<LocalModelServiceStatus, LocalModelIdRequest>((p) =>
+      `/api/model-services/local/models/${encodeURIComponent(p.id)}`
+    ),
+    setActive: httpPost<LocalModelServiceStatus, SetLocalModelActiveRequest>(
+      (p) => `/api/model-services/local/models/${encodeURIComponent(p.id)}/activate`,
+      (p) => ({ enabled: p.enabled })
+    ),
   },
 };
 

@@ -328,6 +328,7 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
             services.model_profile_repo.clone(),
         ),
         managed_model_service: Some(services.managed_model_service.clone()),
+        local_model_service: services.local_model_service.clone(),
         protocol_detection_service: ProtocolDetectionService::new_dynamic(),
         version_check_service: VersionCheckService::new_dynamic(env!("CARGO_PKG_VERSION").to_owned()),
         data_dir: services.data_dir.clone(),

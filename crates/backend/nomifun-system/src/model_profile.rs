@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use nomifun_api_types::{
-    ModelProfile, ModelProfileUpsertRequest, ModelTask, ModelTrait, ProfileSource,
+    LocalModelCatalogEntry, ModelProfile, ModelProfileUpsertRequest, ModelTask, ModelTrait,
+    ProfileSource,
 };
 use nomifun_common::AppError;
 use nomifun_db::{IModelProfileRepository, ModelProfileRow, UpsertModelProfileParams};
@@ -131,6 +132,49 @@ where
     Ok(inserted)
 }
 
+/// Reconcile NomiFun's curated local catalog into authoritative profiles.
+///
+/// The repository implements the source-precedence check in one SQL statement:
+/// catalog data may replace inferred/older catalog rows, but never a concurrent
+/// or existing `source = user` edit.
+pub async fn reconcile_local_catalog_profiles(
+    repo: &dyn IModelProfileRepository,
+    provider_id: &str,
+    catalog: &[LocalModelCatalogEntry],
+) -> Result<usize, AppError> {
+    let provider_id = provider_id.trim();
+    if provider_id.is_empty() {
+        return Err(AppError::BadRequest("provider_id is required".into()));
+    }
+    let mut changed = 0;
+    for entry in catalog {
+        let tasks = serde_json::to_string(&entry.tasks)
+            .map_err(|error| AppError::Internal(format!("serialize catalog tasks: {error}")))?;
+        let traits = serde_json::to_string(&entry.traits)
+            .map_err(|error| AppError::Internal(format!("serialize catalog traits: {error}")))?;
+        let params = serde_json::to_string(&serde_json::json!({
+            "contextWindow": entry.context_window,
+            "parameterSize": entry.parameter_size,
+            "quantization": entry.quantization,
+        }))
+        .map_err(|error| AppError::Internal(format!("serialize catalog params: {error}")))?;
+        if repo
+            .upsert_unless_user(&UpsertModelProfileParams {
+                provider_id,
+                model: &entry.id,
+                tasks: &tasks,
+                traits: &traits,
+                params: &params,
+                source: "catalog",
+            })
+            .await?
+        {
+            changed += 1;
+        }
+    }
+    Ok(changed)
+}
+
 fn source_to_str(source: ProfileSource) -> &'static str {
     match source {
         ProfileSource::Inferred => "inferred",
@@ -255,5 +299,77 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(inferred.source, "inferred");
+    }
+
+    #[tokio::test]
+    async fn local_catalog_profile_does_not_overwrite_user_authority() {
+        let db = init_database_memory().await.unwrap();
+        let provider_repo = SqliteProviderRepository::new(db.pool().clone());
+        provider_repo
+            .create(CreateProviderParams {
+                id: Some("nomifun-local-model"),
+                platform: "nomifun-local-model",
+                name: "Local",
+                base_url: "http://127.0.0.1:1/v1",
+                api_key_encrypted: "encrypted",
+                models: "[]",
+                enabled: false,
+                capabilities: "[]",
+                context_limit: None,
+                model_context_limits: None,
+                model_protocols: None,
+                model_descriptions: None,
+                model_enabled: None,
+                model_health: None,
+                bedrock_config: None,
+                is_full_url: false,
+                sort_order: None,
+            })
+            .await
+            .unwrap();
+        let profile_repo = SqliteModelProfileRepository::new(db.pool().clone());
+        profile_repo
+            .upsert(&UpsertModelProfileParams {
+                provider_id: "nomifun-local-model",
+                model: "local-test",
+                tasks: r#"["chat"]"#,
+                traits: r#"["function_calling"]"#,
+                params: r#"{"owner":"user"}"#,
+                source: "user",
+            })
+            .await
+            .unwrap();
+        let catalog = vec![LocalModelCatalogEntry {
+            id: "local-test".into(),
+            name: "Local".into(),
+            description: "Local".into(),
+            parameter_size: "1B".into(),
+            quantization: "Q4_K_M".into(),
+            download_size_bytes: 1,
+            required_memory_bytes: 2,
+            context_window: 4096,
+            license: "Apache-2.0".into(),
+            source: "test".into(),
+            recommended: true,
+            tasks: vec![ModelTask::Chat],
+            traits: vec![],
+        }];
+        assert_eq!(
+            reconcile_local_catalog_profiles(
+                &profile_repo,
+                "nomifun-local-model",
+                &catalog,
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        let row = profile_repo
+            .get("nomifun-local-model", "local-test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.source, "user");
+        assert_eq!(row.traits, r#"["function_calling"]"#);
     }
 }

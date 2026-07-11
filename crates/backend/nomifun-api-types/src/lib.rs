@@ -18,6 +18,7 @@ mod file;
 mod idmm;
 mod knowledge;
 mod lifecycle;
+mod local_model;
 mod managed_model;
 mod mcp;
 pub mod dispatch_target;
@@ -133,6 +134,12 @@ pub use knowledge::{
 pub use lifecycle::{
     GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult,
     UpdateReleaseInfo, UpdateWorkDirRequest,
+};
+pub use local_model::{
+    LocalModelCatalogEntry, LocalModelErrorKind, LocalModelInstallPhase,
+    LocalModelProgressComponent, LocalModelRuntimeBackend, LocalModelRuntimePhase,
+    LocalModelServiceStatus, LocalModelState, LocalModelTransferProgress, LocalRuntimeStatus,
+    SetLocalModelActiveRequest,
 };
 pub use managed_model::{
     ManagedModel, ManagedModelHealthBatchResult, ManagedModelHealthErrorKind,

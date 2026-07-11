@@ -9,6 +9,7 @@ nomifun-common.workspace = true
 nomifun-db.workspace = true
 nomifun-net.workspace = true
 nomifun-api-types.workspace = true
+nomifun-runtime.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 serde.workspace = true
@@ -16,7 +17,15 @@ serde_json.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 getrandom.workspace = true
+futures-util.workspace = true
+sha2.workspace = true
+hex.workspace = true
+zip.workspace = true
+flate2.workspace = true
+tar.workspace = true
+fs2.workspace = true
 aws-config.workspace = true
 aws-sdk-bedrock.workspace = true
 semver.workspace = true
@@ -27,3 +36,7 @@ tower = { workspace = true }
 http-body-util.workspace = true
 reqwest.workspace = true
 wiremock = "0.6"
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

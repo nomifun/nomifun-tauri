@@ -43,6 +43,12 @@ pub struct AppServices {
     pub managed_model_service: Arc<nomifun_system::ManagedModelService>,
     /// Keeps the authenticated loopback OpenAI-compatible listener alive.
     pub(crate) _managed_model_server: nomifun_system::ManagedModelServer,
+    /// One-click local-model control plane. `None` only when its isolated
+    /// startup failed; the rest of NomiFun remains usable in that case.
+    pub local_model_service: Option<Arc<nomifun_system::LocalModelService>>,
+    /// Keeps the stable local OpenAI facade alive while llama-server itself is
+    /// loaded, sleeping, or restarted on demand.
+    pub(crate) _local_model_server: Option<nomifun_system::LocalModelServer>,
     /// Keeps the immediate + periodic managed catalog refresh loop alive.
     pub(crate) _managed_model_refresh_task: nomifun_system::ManagedModelRefreshTask,
     /// Authoritative per-model capability profiles (multimodal model hub).
@@ -222,6 +228,53 @@ impl AppServices {
             .map_err(|e| anyhow::anyhow!("Failed to provision NomiFun free model service: {e}"))?;
         let model_profile_repo: Arc<dyn IModelProfileRepository> =
             Arc::new(SqliteModelProfileRepository::new(database.pool().clone()));
+        let (local_model_service, local_model_server) =
+            match nomifun_system::start_and_provision_local_model(
+                &data_dir,
+                provider_repo.clone(),
+                encryption_key,
+            )
+            .await
+            {
+                Ok((service, server)) => (Some(service), Some(server)),
+                Err(error) => {
+                    // Local AI is optional. A damaged local state file or an
+                    // unsupported host must not prevent cloud/free providers
+                    // and the rest of the desktop application from starting.
+                    tracing::warn!(error = %error, "Local model service is unavailable");
+                    if let Err(disable_error) = nomifun_system::disable_local_model_provider(
+                        provider_repo.clone(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            error = %disable_error,
+                            "Could not disable stale local-model provider projection"
+                        );
+                    }
+                    (None, None)
+                }
+            };
+        if let Some(local) = &local_model_service {
+            let catalog = local.catalog().await;
+            match nomifun_system::reconcile_local_catalog_profiles(
+                model_profile_repo.as_ref(),
+                nomifun_system::LOCAL_MODEL_PROVIDER_ID,
+                &catalog,
+            )
+            .await
+            {
+                Ok(changed) if changed > 0 => tracing::info!(
+                    changed,
+                    "Reconciled curated local-model capability profiles"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "Local-model profile reconciliation failed"
+                ),
+            }
+        }
         // Refresh immediately, then about every six hours with jitter. Failed
         // attempts retain the current catalog and use capped exponential
         // backoff. Successful refreshes atomically seed profiles for any newly
@@ -808,6 +861,8 @@ impl AppServices {
             provider_repo: provider_repo_for_services,
             managed_model_service,
             _managed_model_server: managed_model_server,
+            local_model_service,
+            _local_model_server: local_model_server,
             _managed_model_refresh_task: managed_model_refresh_task,
             model_profile_repo: model_profile_repo.clone(),
             cookie_config: Arc::new(CookieConfig::from_env()),
@@ -913,6 +968,25 @@ mod tests {
         // User repo should have system user
         let has_users = services.user_repo.has_users().await.unwrap();
         assert!(!has_users); // system user has empty password → not counted
+
+        // Local AI is provisioned without downloading runtime/model bytes, and
+        // its curated profiles are catalog-authoritative from first boot.
+        assert!(services.local_model_service.is_some());
+        let local_provider = services
+            .provider_repo
+            .find_by_id(nomifun_system::LOCAL_MODEL_PROVIDER_ID)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!local_provider.enabled);
+        assert_eq!(local_provider.models, "[]");
+        let local_profiles = services
+            .model_profile_repo
+            .list_for_provider(nomifun_system::LOCAL_MODEL_PROVIDER_ID)
+            .await
+            .unwrap();
+        assert_eq!(local_profiles.len(), 3);
+        assert!(local_profiles.iter().all(|profile| profile.source == "catalog"));
 
         services.database.close().await;
     }

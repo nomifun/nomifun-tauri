@@ -1,7 +1,11 @@
 # 「本地模型」领域架构设计(Local AI)
 
+> [!CAUTION]
+> **本文档已被取代（Superseded，2026-07-11），仅保留作历史设计参考。**
+> 文中依赖 `llama-server` router mode、多模型 LRU、多运行时家族、远程目录和自定义导入的方案不是当前实现。生产方向已经收敛为 **Local AI Lite**：仅使用一个按需下载、固定版本的 `llama-server` sidecar；采用内置的少量文本 GGUF 目录；同一时间只启用一个模型；通过受管 provider `nomifun-local-model` 复用 OpenAI 兼容数据面。当前制品与升级流程以 [`docs/maintenance/local-ai-lite-artifacts.md`](../../maintenance/local-ai-lite-artifacts.md) 和实现代码为准。
+
 - 日期:2026-07-06
-- 状态:设计定稿待评审(评审通过后按模块并行实施)
+- 状态:已废弃，由 Local AI Lite 实现取代
 - 领域代号:`local-ai`(crate `nomifun-local-ai`,数据目录 `{data_dir}/local-ai/`,路由 `/api/local-ai/*`)
 - 用户可见名:「本地模型」
 

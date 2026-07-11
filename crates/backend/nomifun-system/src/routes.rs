@@ -8,16 +8,18 @@ use std::path::PathBuf;
 use nomifun_api_types::{
     ApiResponse, ClientPreferencesResponse, CreateProviderRequest, DetectProtocolRequest,
     FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse, ManagedModel,
-    ManagedModelHealthBatchResult, ManagedModelHealthResult, ManagedModelServiceStatus,
-    ModelProfile, ModelProfileKeyRequest, ModelProfileUpsertRequest, ProtocolDetectionResponse,
-    ProviderResponse, ResolveModelsRequest, ResolveModelsResponse, SetManagedModelEnabledRequest,
-    SetManagedModelServiceEnabledRequest, SystemInfoResponse, SystemSettingsResponse,
-    UpdateCheckRequest, UpdateCheckResult, UpdateClientPreferencesRequest,
-    UpdateProviderRequest, UpdateSettingsRequest, UpdateWorkDirRequest,
+    LocalModelCatalogEntry, LocalModelServiceStatus, ManagedModelHealthBatchResult,
+    ManagedModelHealthResult, ManagedModelServiceStatus, ModelProfile, ModelProfileKeyRequest,
+    ModelProfileUpsertRequest, ProtocolDetectionResponse, ProviderResponse, ResolveModelsRequest,
+    ResolveModelsResponse, SetLocalModelActiveRequest, SetManagedModelEnabledRequest,
+    SetManagedModelServiceEnabledRequest, SystemInfoResponse, SystemSettingsResponse, UpdateCheckRequest,
+    UpdateCheckResult, UpdateClientPreferencesRequest, UpdateProviderRequest, UpdateSettingsRequest,
+    UpdateWorkDirRequest,
 };
 use nomifun_common::AppError;
 
 use crate::client_pref::ClientPrefService;
+use crate::local_model::LocalModelService;
 use crate::managed_model::ManagedModelService;
 use crate::model_fetcher::ModelFetchService;
 use crate::model_profile::ModelProfileService;
@@ -35,6 +37,7 @@ pub struct SystemRouterState {
     pub model_fetch_service: ModelFetchService,
     pub model_profile_service: ModelProfileService,
     pub managed_model_service: Option<std::sync::Arc<ManagedModelService>>,
+    pub local_model_service: Option<std::sync::Arc<LocalModelService>>,
     pub protocol_detection_service: ProtocolDetectionService,
     pub version_check_service: VersionCheckService,
     /// Data directory root — used to arm a factory reset (write the marker that
@@ -91,7 +94,24 @@ pub fn system_routes(state: SystemRouterState) -> Router {
             "/api/model-services/free/models/{id}",
             patch(set_free_model_enabled),
         )
+        .route("/api/model-services/local/catalog", get(get_local_model_catalog))
         .route("/api/model-services/local/status", get(get_local_model_status))
+        .route(
+            "/api/model-services/local/models/{id}/install",
+            post(install_local_model),
+        )
+        .route(
+            "/api/model-services/local/models/{id}/cancel",
+            post(cancel_local_model_install),
+        )
+        .route(
+            "/api/model-services/local/models/{id}/activate",
+            post(set_local_model_active),
+        )
+        .route(
+            "/api/model-services/local/models/{id}",
+            delete(delete_local_model),
+        )
         .route("/api/providers/{id}", delete(delete_provider).put(update_provider))
         .route("/api/providers/{id}/models", post(fetch_models))
         // Multimodal model hub: authoritative per-model capability profiles.
@@ -243,6 +263,12 @@ fn managed_service(
     })
 }
 
+fn local_service(state: &SystemRouterState) -> Result<std::sync::Arc<LocalModelService>, AppError> {
+    state.local_model_service.clone().ok_or_else(|| {
+        AppError::ProviderUnavailable("local model service is not available in this process".into())
+    })
+}
+
 async fn get_free_model_status(
     State(state): State<SystemRouterState>,
 ) -> Result<Json<ApiResponse<ManagedModelServiceStatus>>, AppError> {
@@ -343,10 +369,54 @@ async fn set_free_model_enabled(
 
 async fn get_local_model_status(
     State(state): State<SystemRouterState>,
-) -> Result<Json<ApiResponse<ManagedModelServiceStatus>>, AppError> {
+) -> Result<Json<ApiResponse<LocalModelServiceStatus>>, AppError> {
     Ok(Json(ApiResponse::ok(
-        managed_service(&state)?.local_status(),
+        local_service(&state)?.status().await,
     )))
+}
+
+async fn get_local_model_catalog(
+    State(state): State<SystemRouterState>,
+) -> Result<Json<ApiResponse<Vec<LocalModelCatalogEntry>>>, AppError> {
+    Ok(Json(ApiResponse::ok(local_service(&state)?.catalog().await)))
+}
+
+async fn install_local_model(
+    State(state): State<SystemRouterState>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<LocalModelServiceStatus>>, AppError> {
+    let service = local_service(&state)?;
+    let status = service.install(&id).await?;
+    Ok(Json(ApiResponse::ok(status)))
+}
+
+async fn cancel_local_model_install(
+    State(state): State<SystemRouterState>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<LocalModelServiceStatus>>, AppError> {
+    let service = local_service(&state)?;
+    let status = service.cancel(&id).await?;
+    Ok(Json(ApiResponse::ok(status)))
+}
+
+async fn delete_local_model(
+    State(state): State<SystemRouterState>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<LocalModelServiceStatus>>, AppError> {
+    let service = local_service(&state)?;
+    let status = service.delete(&id).await?;
+    Ok(Json(ApiResponse::ok(status)))
+}
+
+async fn set_local_model_active(
+    State(state): State<SystemRouterState>,
+    Path(id): Path<String>,
+    body: Result<Json<SetLocalModelActiveRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<LocalModelServiceStatus>>, AppError> {
+    let Json(req) = body.map_err(|error| AppError::BadRequest(error.to_string()))?;
+    let service = local_service(&state)?;
+    let status = service.set_active(&id, req.enabled).await?;
+    Ok(Json(ApiResponse::ok(status)))
 }
 
 // ===========================================================================

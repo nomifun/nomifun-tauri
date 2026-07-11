@@ -1200,6 +1200,7 @@
     "sectionAgents": "Agents",
     "sectionModels": "模型",
     "sectionFree": "免费模型",
+    "sectionLocal": "本地模型",
     "sectionCreation": "创作模型",
     "sectionGlobal": "全局模型配置",
     "globalConfigTip": "IDMM、旁路模型、记忆总结、伙伴对话等全局默认模型对话配置入口。",
@@ -1260,13 +1261,6 @@
       "degradedHint": "在线模型列表暂时不可用，但仍可继续使用已缓存或内置的免费模型。",
       "empty": "暂未发现免费模型",
       "emptyHint": "请检查网络后刷新模型列表。服务会保留内置模型，避免首次启动时无模型可用。",
-      "local": {
-        "title": "本地模型",
-        "planned": "规划中",
-        "loading": "检查中",
-        "unavailable": "尚未提供",
-        "description": "未来将复用同一统一协议，支持一键下载开源模型、按设备算力选择运行方案，并以 nomifun-local-model 提供给平台。"
-      },
     "upstreamWarningHint": "模型列表更新遇到问题，已继续保留当前可用模型。您可以稍后重试。",
     "health": {
       "checkAll": "检测可用性",
@@ -1287,6 +1281,88 @@
       "batchWarning": "检测完成：{{healthy}} / {{total}} 个可用，{{unhealthy}} 个不可用，{{unknown}} 个未检测",
       "failed": "模型可用性检测失败，请稍后重试"
     }
+    },
+    "local": {
+      "title": "本地模型",
+      "providerId": "统一接口：nomifun-local-model",
+      "privacyNotice": "模型文件、提示词和回复均保留在此设备；仅下载模型与运行时需要联网。NomiFun 一次只运行一个本地模型，并会在空闲时自动释放资源。",
+      "refresh": "刷新状态",
+      "refreshHint": "重新读取本地模型目录与运行状态",
+      "loading": "正在读取本地模型服务",
+      "loadFailed": "无法读取本地模型服务",
+      "loadFailedHint": "服务可能仍在启动，或当前平台暂不受支持。请稍后重试。",
+      "empty": "暂时没有可安装的模型",
+      "emptyHint": "当前内置目录为空，请更新 NomiFun 后重试。",
+      "catalogTitle": "轻量本地模型",
+      "singleModelHint": "模型和运行时按需下载；同一时间只运行一个模型。",
+      "modelCount": "{{count}} 个模型",
+      "recommended": "推荐",
+      "active": "当前使用",
+      "activeModel": "当前：{{model}}",
+      "actionFailed": "操作失败，请稍后重试",
+      "installSuccess": "下载任务已开始，完成后即可在模型选择器中使用",
+      "resumeSuccess": "已继续下载",
+      "cancelSuccess": "下载已暂停，断点将被保留",
+      "activateSuccess": "本地模型已启用",
+      "deactivateSuccess": "本地模型已停止",
+      "deleteSuccess": "本地模型文件已删除",
+      "deleteConfirmTitle": "删除本地模型？",
+      "deleteConfirmContent": "将删除 {{model}} 的本地文件；以后仍可重新下载。",
+      "deleteModelLabel": "删除 {{model}}",
+      "phase": {
+        "notInstalled": "未安装",
+        "downloading": "下载中",
+        "verifying": "校验中",
+        "installed": "已安装",
+        "paused": "已暂停",
+        "failed": "安装失败"
+      },
+      "runtime": {
+        "title": "本地推理运行时",
+        "auto": "自动选择",
+        "onDemand": "按需下载",
+        "checking": "检查中",
+        "stopped": "未运行",
+        "starting": "启动中",
+        "ready": "运行中",
+        "stopping": "停止中",
+        "failed": "运行异常"
+      },
+      "action": {
+        "install": "下载并启用",
+        "cancel": "暂停下载",
+        "resume": "继续下载",
+        "retry": "重试",
+        "activate": "启用",
+        "deactivate": "停止",
+        "delete": "删除"
+      },
+      "metadata": {
+        "download": "下载 {{size}}",
+        "memory": "建议内存 {{size}}",
+        "context": "上下文 {{tokens}}",
+        "source": "来源：{{source}}"
+      },
+      "capability": {
+        "chat": "文本对话",
+        "functionCalling": "工具调用"
+      },
+      "progress": {
+        "runtime": "正在准备推理运行时",
+        "model": "正在下载模型",
+        "preparing": "准备中",
+        "verifyingHint": "正在校验文件完整性，请勿退出 NomiFun。"
+      },
+      "error": {
+        "network": "网络连接失败，可保留断点后重试",
+        "insufficientSpace": "磁盘可用空间不足",
+        "checksumMismatch": "文件校验失败，请重新下载",
+        "unsupportedPlatform": "当前系统或处理器暂不受支持",
+        "runtimeUnavailable": "本地推理运行时不可用",
+        "busy": "另一个本地模型操作正在进行",
+        "notFound": "模型或本地文件不存在",
+        "unknown": "本地模型操作失败"
+      }
     },
     "creation": {
       "title": "创作模型",

@@ -11,7 +11,6 @@ import { Button, Switch, Tag, Tooltip } from '@arco-design/web-react';
 import {
   ApiApp,
   CloudStorage,
-  DataServer,
   Heartbeat,
   Info,
   Lightning,
@@ -26,7 +25,6 @@ import type {
   ManagedModelServiceAvailability,
   ManagedModelServiceStatus,
 } from '@/common/types/provider/managedModelService';
-import { NOMIFUN_LOCAL_MODEL_PROVIDER_ID } from '@/common/types/provider/managedModelService';
 import { useFreeModels } from './useFreeModels';
 
 const availabilityColor = (availability: ManagedModelServiceAvailability): string => {
@@ -82,9 +80,6 @@ const FreeModelsContent: React.FC = () => {
     error,
     isLoading,
     mutate,
-    localStatus,
-    localError,
-    isLocalLoading,
     pendingAction,
     healthResults,
     healthCheckPending,
@@ -560,37 +555,6 @@ const FreeModelsContent: React.FC = () => {
               )}
             </section>
 
-            <div className='rd-12px border border-dashed border-[var(--color-border-3)] bg-[var(--fill-0)] px-14px py-12px'>
-              <div className='flex items-start justify-between gap-12px flex-wrap'>
-                <div className='flex items-start gap-10px min-w-0 flex-1'>
-                  <span className='size-30px flex items-center justify-center rd-8px bg-[var(--color-bg-2)] text-t-secondary shrink-0'>
-                    <DataServer theme='outline' size='18' />
-                  </span>
-                  <div className='min-w-0'>
-                    <div className='flex items-center gap-8px flex-wrap'>
-                      <span className='text-14px font-600 text-t-primary'>
-                        {t('settings.modelHub.free.local.title')}
-                      </span>
-                      <Tag size='small' color={availabilityColor(localStatus?.availability ?? 'planned')}>
-                        {isLocalLoading
-                          ? t('settings.modelHub.free.local.loading')
-                          : localError
-                            ? t('settings.modelHub.free.local.unavailable')
-                            : t('settings.modelHub.free.local.planned')}
-                      </Tag>
-                    </div>
-                    <div className='mt-3px text-12px leading-18px text-t-secondary'>
-                      {t('settings.modelHub.free.local.description')}
-                    </div>
-                    <div className='mt-5px text-11px text-t-tertiary'>
-                      {t('settings.modelHub.free.providerId', {
-                        id: localStatus?.providerId ?? NOMIFUN_LOCAL_MODEL_PROVIDER_ID,
-                      })}
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
           </div>
         )}
       </NomiScrollArea>

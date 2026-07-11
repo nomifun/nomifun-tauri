@@ -1199,6 +1199,7 @@
     "sectionAgents": "Agents",
     "sectionModels": "Models",
     "sectionFree": "Free Models",
+    "sectionLocal": "Local Models",
     "sectionCreation": "Creation Models",
     "sectionGlobal": "Global Model Config",
     "globalConfigTip": "Global default model settings for IDMM, the bypass model, memory summarization, and companion chat.",
@@ -1259,13 +1260,6 @@
       "degradedHint": "The online model list is temporarily unavailable, but cached or built-in free models remain usable.",
       "empty": "No free models found",
       "emptyHint": "Check your connection and refresh the model list. Built-in models are retained so first launch is never left without a model.",
-      "local": {
-        "title": "Local Models",
-        "planned": "Planned",
-        "loading": "Checking",
-        "unavailable": "Not available yet",
-        "description": "A future service will reuse the same unified protocol to download open-source models in one click, select a runtime for this device, and expose them to the platform as nomifun-local-model."
-      },
       "upstreamWarningHint": "The model-list update encountered a problem. Current models remain available; try again later.",
       "health": {
         "checkAll": "Check availability",
@@ -1285,6 +1279,88 @@
         "batchSuccess": "Check complete: {{healthy}} / {{total}} models available",
         "batchWarning": "Check complete: {{healthy}} / {{total}} available, {{unhealthy}} unavailable, {{unknown}} not checked",
         "failed": "Model availability check failed. Please try again later."
+      }
+    },
+    "local": {
+      "title": "Local Models",
+      "providerId": "Unified endpoint: nomifun-local-model",
+      "privacyNotice": "Model files, prompts, and responses stay on this device; only model and runtime downloads require a network connection. NomiFun runs one local model at a time and releases resources while idle.",
+      "refresh": "Refresh status",
+      "refreshHint": "Reload the local catalog and runtime status",
+      "loading": "Loading the local-model service",
+      "loadFailed": "Unable to load the local-model service",
+      "loadFailedHint": "The service may still be starting, or this platform may not be supported yet. Try again shortly.",
+      "empty": "No installable models are available",
+      "emptyHint": "The built-in catalog is empty. Update NomiFun and try again.",
+      "catalogTitle": "Lightweight local models",
+      "singleModelHint": "Models and the runtime download on demand; only one model runs at a time.",
+      "modelCount": "{{count}} models",
+      "recommended": "Recommended",
+      "active": "Active",
+      "activeModel": "Active: {{model}}",
+      "actionFailed": "Action failed. Please try again.",
+      "installSuccess": "Download started. The model will appear in model selectors when ready.",
+      "resumeSuccess": "Download resumed",
+      "cancelSuccess": "Download paused; the partial file was retained",
+      "activateSuccess": "Local model enabled",
+      "deactivateSuccess": "Local model stopped",
+      "deleteSuccess": "Local model files deleted",
+      "deleteConfirmTitle": "Delete local model?",
+      "deleteConfirmContent": "This deletes the local files for {{model}}. You can download it again later.",
+      "deleteModelLabel": "Delete {{model}}",
+      "phase": {
+        "notInstalled": "Not installed",
+        "downloading": "Downloading",
+        "verifying": "Verifying",
+        "installed": "Installed",
+        "paused": "Paused",
+        "failed": "Install failed"
+      },
+      "runtime": {
+        "title": "Local inference runtime",
+        "auto": "Auto",
+        "onDemand": "On demand",
+        "checking": "Checking",
+        "stopped": "Stopped",
+        "starting": "Starting",
+        "ready": "Running",
+        "stopping": "Stopping",
+        "failed": "Runtime error"
+      },
+      "action": {
+        "install": "Download & enable",
+        "cancel": "Pause download",
+        "resume": "Resume download",
+        "retry": "Retry",
+        "activate": "Enable",
+        "deactivate": "Stop",
+        "delete": "Delete"
+      },
+      "metadata": {
+        "download": "Download {{size}}",
+        "memory": "Recommended memory {{size}}",
+        "context": "Context {{tokens}}",
+        "source": "Source: {{source}}"
+      },
+      "capability": {
+        "chat": "Text chat",
+        "functionCalling": "Tool calling"
+      },
+      "progress": {
+        "runtime": "Preparing inference runtime",
+        "model": "Downloading model",
+        "preparing": "Preparing",
+        "verifyingHint": "Verifying file integrity. Keep NomiFun open."
+      },
+      "error": {
+        "network": "Network connection failed; retry from the saved checkpoint",
+        "insufficientSpace": "Not enough free disk space",
+        "checksumMismatch": "File verification failed; download it again",
+        "unsupportedPlatform": "This operating system or processor is not supported yet",
+        "runtimeUnavailable": "The local inference runtime is unavailable",
+        "busy": "Another local-model operation is in progress",
+        "notFound": "The model or local file was not found",
+        "unknown": "The local-model operation failed"
       }
     },
     "creation": {

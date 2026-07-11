@@ -15,5 +15,45 @@ applicable:
   Copyright iOfficeAI
   Licensed under the Apache License, Version 2.0.
 
+----------------------------------------------------------------------
+Optional Local AI Lite downloads
+----------------------------------------------------------------------
+
+NomiFun does not bundle the following runtime or model artifacts in its
+installer. When a user explicitly installs a local model, NomiFun downloads
+the pinned artifacts directly from the upstream locations identified below.
+
+llama.cpp / llama-server runtime
+  https://github.com/ggml-org/llama.cpp
+  Pinned release: b9957
+  Copyright (c) 2023-2026 The ggml authors
+  Licensed under the MIT License.
+  License text: https://github.com/ggml-org/llama.cpp/blob/b9957/LICENSE
+
+Qwen3 models (0.6B, 1.7B, and 4B)
+  https://huggingface.co/Qwen
+  Developed by the Qwen Team at Alibaba Cloud.
+  The corresponding upstream model repositories declare the Apache License,
+  Version 2.0 (SPDX: Apache-2.0).
+
+  https://huggingface.co/Qwen/Qwen3-0.6B
+  https://huggingface.co/Qwen/Qwen3-1.7B
+  https://huggingface.co/Qwen/Qwen3-4B
+
+Qwen3 GGUF Q4_K_M quantizations
+  Produced and published by the Hugging Face account "bartowski" as
+  quantized derivatives of the corresponding Qwen3 models:
+
+  https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/tree/60b85c0e3d8fe0f6474f406922a26d12aca4550d
+  https://huggingface.co/bartowski/Qwen_Qwen3-1.7B-GGUF/tree/dcb19155b962dbb6389f4691a982043a8e651022
+  https://huggingface.co/bartowski/Qwen_Qwen3-4B-GGUF/tree/cb76885dc66d50759b207c5a48c4e78dfa00c638
+
+  These repository cards identify "bartowski" as the quantizer and the Qwen
+  repositories as the base models. They do not declare a separate license
+  field; review both the pinned quantization repository card and the upstream
+  Qwen3 Apache-2.0 terms before redistribution.
+
+These attributions do not imply endorsement by the upstream authors.
+
 Our sincere thanks to the maintainers and communities of the open-source
 projects NomiFun uses.
