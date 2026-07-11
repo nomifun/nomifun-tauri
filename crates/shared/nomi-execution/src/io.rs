@@ -27,6 +27,7 @@ struct StoredChunk {
 pub struct OutputBuffer {
     limit: usize,
     inner: Mutex<OutputBufferState>,
+    activity: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 struct OutputState {
@@ -69,7 +70,17 @@ impl OutputBuffer {
                 base_decoders,
                 finalized: false,
             })),
+            activity: None,
         }
+    }
+
+    pub(crate) fn with_activity(
+        limit_bytes: usize,
+        activity: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        let mut output = Self::new(limit_bytes);
+        output.activity = Some(activity);
+        output
     }
 
     pub fn push(&self, stream: OutputStream, bytes: &[u8]) -> Vec<ExecutionEvent> {
@@ -114,6 +125,12 @@ impl OutputBuffer {
             });
         }
 
+        drop(storage);
+        if !bytes.is_empty()
+            && let Some(activity) = &self.activity
+        {
+            activity();
+        }
         events
     }
 

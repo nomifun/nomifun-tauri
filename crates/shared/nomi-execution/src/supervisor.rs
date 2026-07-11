@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -9,7 +12,10 @@ use crate::{
     SessionId,
     io::FrozenOutput,
     platform::{ExitFact, ProcessOwner},
-    registry::Registry,
+    registry::{
+        CommitResult, LookupError, Registry, ReserveError, Retirement, SessionAction,
+        StartReservation,
+    },
 };
 
 const BACKGROUND_WAIT_HORIZON: Duration = Duration::from_secs(365 * 24 * 60 * 60);
@@ -18,7 +24,7 @@ const MAX_INTERRUPT_GRACE: Duration = Duration::from_secs(1);
 const MAX_TERMINATE_GRACE: Duration = Duration::from_secs(1);
 const MAX_REAP_GRACE: Duration = Duration::from_secs(3);
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ExecutionHandle {
     pub owner: ExecutionOwner,
     pub session_id: SessionId,
@@ -49,11 +55,19 @@ pub enum PollResult {
 }
 
 pub struct ProcessSupervisor {
-    registry: Registry,
+    registry: Arc<Registry>,
+    reaper_started: AtomicBool,
+    reaper_stop: tokio_util::sync::CancellationToken,
+    shutdown: Arc<ShutdownState>,
+    reaper_interval: Duration,
+}
+
+struct ShutdownState {
+    started: AtomicBool,
+    report: tokio::sync::watch::Sender<Option<ShutdownReport>>,
 }
 
 pub(crate) struct Session {
-    owner: ExecutionOwner,
     process: Arc<dyn ProcessOwner>,
     output: Arc<OutputBuffer>,
     policy: ExecutionPolicy,
@@ -64,6 +78,25 @@ pub(crate) struct Session {
     lifecycle: tokio::sync::watch::Sender<u64>,
     #[cfg(test)]
     before_lost_commit: Mutex<Option<Arc<LostCommitHook>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// Outcomes for sessions that required cleanup after shutdown closed the start gate.
+///
+/// Sessions that had already completed naturally are omitted. A `Lost` outcome
+/// whose cleanup report has `reaped == false` is an explicit unresolved
+/// quarantine result; callers must retain it for reconciliation rather than
+/// interpreting shutdown completion as proof that the OS process tree vanished.
+pub struct ShutdownReport {
+    pub sessions: Vec<ShutdownSessionReport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+/// The exact owner, session id, and terminal cleanup outcome produced by shutdown.
+pub struct ShutdownSessionReport {
+    pub session_id: SessionId,
+    pub owner: ExecutionOwner,
+    pub outcome: ExecutionOutcome,
 }
 
 struct SessionState {
@@ -140,36 +173,84 @@ struct LostCommitHook {
 }
 
 impl ProcessSupervisor {
-    pub fn new(_config: SupervisorConfig) -> Arc<Self> {
-        Arc::new(Self {
-            registry: Registry::new(),
-        })
+    pub fn new(config: SupervisorConfig) -> Arc<Self> {
+        let supervisor = Arc::new(Self {
+            registry: Arc::new(Registry::new(config.max_sessions)),
+            reaper_started: AtomicBool::new(false),
+            reaper_stop: tokio_util::sync::CancellationToken::new(),
+            shutdown: Arc::new(ShutdownState {
+                started: AtomicBool::new(false),
+                report: tokio::sync::watch::channel(None).0,
+            }),
+            reaper_interval: config.reaper_interval,
+        });
+        supervisor
     }
 
     pub async fn start(
         self: &Arc<Self>,
         request: NormalizedExecutionRequest,
     ) -> Result<ExecutionHandle, ExecutionError> {
-        let output = Arc::new(OutputBuffer::new(request.policy.output_limit_bytes));
+        self.ensure_reaper_started();
+        let mut reservation = self.reserve_start_capacity().await?;
+        let activity_registry = Arc::downgrade(&self.registry);
+        let session_id = SessionId::new();
+        let output = Arc::new(OutputBuffer::with_activity(
+            request.policy.output_limit_bytes,
+            Arc::new(move || {
+                if let Some(registry) = activity_registry.upgrade() {
+                    registry.touch_session(session_id, Instant::now());
+                }
+            }),
+        ));
         let spawned = crate::platform::spawn(request.clone(), output.clone()).await?;
-        self.register_owned(request, spawned.owner, output).await
+        self.register_reserved(
+            request,
+            spawned.owner,
+            output,
+            &mut reservation,
+            session_id,
+        )
+        .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn register_owned(
         self: &Arc<Self>,
         request: NormalizedExecutionRequest,
         process: Arc<dyn ProcessOwner>,
         output: Arc<OutputBuffer>,
     ) -> Result<ExecutionHandle, ExecutionError> {
-        let session_id = SessionId::new();
+        self.ensure_reaper_started();
+        let mut reservation = self.reserve_start_capacity().await?;
+        self.register_reserved(
+            request,
+            process,
+            output,
+            &mut reservation,
+            SessionId::new(),
+        )
+        .await
+    }
+
+    async fn register_reserved(
+        self: &Arc<Self>,
+        request: NormalizedExecutionRequest,
+        process: Arc<dyn ProcessOwner>,
+        output: Arc<OutputBuffer>,
+        reservation: &mut StartReservation,
+        session_id: SessionId,
+    ) -> Result<ExecutionHandle, ExecutionError> {
         let started_at = Instant::now();
+        let owner = request.owner;
+        let policy = request.policy;
+        let lease = policy.lease;
         let (exit, _exit_receiver) = tokio::sync::watch::channel(None);
         let (lifecycle, _lifecycle_receiver) = tokio::sync::watch::channel(0);
         let session = Arc::new(Session {
-            owner: request.owner.clone(),
             process,
             output,
-            policy: request.policy,
+            policy,
             started_at,
             last_activity_at: Mutex::new(started_at),
             state: Mutex::new(SessionState {
@@ -182,13 +263,27 @@ impl ProcessSupervisor {
             #[cfg(test)]
             before_lost_commit: Mutex::new(None),
         });
-        self.registry.insert(session_id, session.clone());
-        start_waiter(session);
-        Ok(ExecutionHandle {
-            owner: request.owner,
+        let commit = self.registry.commit(
+            reservation,
             session_id,
+            owner.clone(),
+            session.clone(),
+            lease,
             started_at,
-        })
+        );
+        start_waiter(session);
+        match commit {
+            CommitResult::Active => Ok(ExecutionHandle {
+                owner,
+                session_id,
+                started_at,
+            }),
+            CommitResult::Retiring(retirement) => {
+                self.start_retirement(retirement.clone());
+                let _ = retirement.wait_outcome().await;
+                Err(ExecutionError::SupervisorShuttingDown)
+            }
+        }
     }
 
     pub async fn status(
@@ -196,8 +291,8 @@ impl ProcessSupervisor {
         owner: &ExecutionOwner,
         session_id: &SessionId,
     ) -> Result<ProcessSnapshot, ExecutionError> {
-        let session = self.session(owner, session_id)?;
-        Ok(session.snapshot())
+        let action = self.session(owner, session_id)?;
+        Ok(action.snapshot())
     }
 
     pub async fn poll(
@@ -207,7 +302,8 @@ impl ProcessSupervisor {
         cursor: OutputCursor,
         yield_until: Instant,
     ) -> Result<PollResult, ExecutionError> {
-        let session = self.session(owner, session_id)?;
+        let action = self.session(owner, session_id)?;
+        let session = action.session_arc();
         let mut exits = session.exit.subscribe();
         let mut lifecycle = session.lifecycle.subscribe();
         let yield_timer = tokio::time::sleep_until(tokio::time::Instant::from_std(yield_until));
@@ -231,7 +327,6 @@ impl ProcessSupervisor {
                 () = &mut yield_timer => break,
             }
         }
-        session.touch();
         let snapshot = session.snapshot();
         let output = session.output.snapshot_from(cursor);
         if let Some(terminal) = session.terminal() {
@@ -251,13 +346,12 @@ impl ProcessSupervisor {
         session_id: &SessionId,
         bytes: &[u8],
     ) -> Result<(), ExecutionError> {
-        let session = self.session(owner, session_id)?;
-        session
+        let action = self.session(owner, session_id)?;
+        action
             .process
             .write(bytes)
             .await
             .map_err(|error| owner_io_error("write stdin", error))?;
-        session.touch();
         Ok(())
     }
 
@@ -266,13 +360,12 @@ impl ProcessSupervisor {
         owner: &ExecutionOwner,
         session_id: &SessionId,
     ) -> Result<(), ExecutionError> {
-        let session = self.session(owner, session_id)?;
-        session
+        let action = self.session(owner, session_id)?;
+        action
             .process
             .close_stdin()
             .await
             .map_err(|error| owner_io_error("close stdin", error))?;
-        session.touch();
         Ok(())
     }
 
@@ -288,13 +381,12 @@ impl ProcessSupervisor {
                 reason: "PTY dimensions must be non-zero".to_owned(),
             });
         }
-        let session = self.session(owner, session_id)?;
-        session
+        let action = self.session(owner, session_id)?;
+        action
             .process
             .resize(cols, rows)
             .await
             .map_err(|error| owner_io_error("resize terminal", error))?;
-        session.touch();
         Ok(())
     }
 
@@ -303,13 +395,12 @@ impl ProcessSupervisor {
         owner: &ExecutionOwner,
         session_id: &SessionId,
     ) -> Result<(), ExecutionError> {
-        let session = self.session(owner, session_id)?;
-        session
+        let action = self.session(owner, session_id)?;
+        action
             .process
             .interrupt()
             .await
             .map_err(|error| owner_io_error("interrupt process", error))?;
-        session.touch();
         Ok(())
     }
 
@@ -319,7 +410,8 @@ impl ProcessSupervisor {
         session_id: &SessionId,
     ) -> Result<ExecutionOutcome, ExecutionError> {
         let request_started_at = tokio::time::Instant::now();
-        let session = self.session(owner, session_id)?;
+        let action = self.session(owner, session_id)?;
+        let session = action.session_arc();
         Ok(stop_session(
             session,
             &[SignalStage::Terminate, SignalStage::ForceKill],
@@ -334,7 +426,8 @@ impl ProcessSupervisor {
         session_id: &SessionId,
     ) -> Result<ExecutionOutcome, ExecutionError> {
         let request_started_at = tokio::time::Instant::now();
-        let session = self.session(owner, session_id)?;
+        let action = self.session(owner, session_id)?;
+        let session = action.session_arc();
         Ok(stop_session(
             session,
             &[
@@ -347,27 +440,254 @@ impl ProcessSupervisor {
         .await)
     }
 
+    pub fn heartbeat(&self, run_id: uuid::Uuid) -> usize {
+        self.registry.heartbeat_run(run_id, Instant::now())
+    }
+
+    pub async fn shutdown(&self) -> ShutdownReport {
+        if let Some(report) = self.shutdown.report.borrow().clone() {
+            return report;
+        }
+        if self
+            .shutdown
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.reaper_stop.cancel();
+            self.registry.begin_shutdown();
+            let registry = self.registry.clone();
+            let shutdown = self.shutdown.clone();
+            tokio::spawn(async move {
+                run_shutdown(registry, shutdown).await;
+            });
+        }
+        let mut reports = self.shutdown.report.subscribe();
+        loop {
+            if let Some(report) = reports.borrow_and_update().clone() {
+                return report;
+            }
+            reports
+                .changed()
+                .await
+                .expect("execution shutdown report sender unexpectedly closed");
+        }
+    }
+
     fn session(
         &self,
         owner: &ExecutionOwner,
         session_id: &SessionId,
-    ) -> Result<Arc<Session>, ExecutionError> {
-        let session = self
+    ) -> Result<SessionAction, ExecutionError> {
+        match self
             .registry
-            .get(session_id)
-            .ok_or(ExecutionError::SessionNotFound {
-                session_id: *session_id,
-            })?;
-        if &session.owner != owner {
-            return Err(ExecutionError::OwnerMismatch {
-                session_id: *session_id,
-            });
+            .begin_action(session_id, owner, Instant::now())
+        {
+            Ok(action) => Ok(action),
+            Err(LookupError::NotFound) => {
+                Err(ExecutionError::SessionNotFound {
+                    session_id: *session_id,
+                })
+            }
+            Err(LookupError::OwnerMismatch) => {
+                Err(ExecutionError::OwnerMismatch {
+                    session_id: *session_id,
+                })
+            }
         }
-        Ok(session)
+    }
+
+    async fn reserve_start_capacity(
+        self: &Arc<Self>,
+    ) -> Result<StartReservation, ExecutionError> {
+        loop {
+            match self.registry.reserve_start() {
+                Ok(reservation) => return Ok(reservation),
+                Err(ReserveError::ShuttingDown) => {
+                    return Err(ExecutionError::SupervisorShuttingDown);
+                }
+                Err(ReserveError::Capacity) => {
+                    if self.registry.evict_oldest_finished() {
+                        continue;
+                    }
+                    let mut retirements = self.registry.claim_expired(Instant::now());
+                    retirements.extend(self.registry.pending_retirements());
+                    for retirement in &retirements {
+                        self.start_retirement(retirement.clone());
+                    }
+                    if let Some(retirement) = retirements.into_iter().next() {
+                        let outcome = retirement.wait_outcome().await;
+                        if outcome_reaped(&outcome) {
+                            continue;
+                        }
+                        return Err(ExecutionError::CapacityExhausted {
+                            max_sessions: self.registry.max_sessions(),
+                        });
+                    }
+                    return Err(ExecutionError::CapacityExhausted {
+                        max_sessions: self.registry.max_sessions(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn ensure_reaper_started(self: &Arc<Self>) {
+        if self
+            .reaper_started
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let stop = self.reaper_stop.clone();
+        let interval = self.reaper_interval.max(Duration::from_millis(1));
+        tokio::spawn(async move {
+            run_reaper(weak, stop, interval).await;
+        });
+    }
+
+    fn start_retirement(&self, retirement: Arc<Retirement>) {
+        start_retirement_driver(self.registry.clone(), retirement);
+    }
+}
+
+async fn run_reaper(
+    supervisor: Weak<ProcessSupervisor>,
+    stop: tokio_util::sync::CancellationToken,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            () = stop.cancelled() => return,
+            _ = ticker.tick() => {}
+        }
+        let Some(supervisor) = supervisor.upgrade() else {
+            return;
+        };
+        let retirements = supervisor.registry.claim_expired(Instant::now());
+        for retirement in retirements {
+            supervisor.start_retirement(retirement);
+        }
+        drop(supervisor);
+    }
+}
+
+fn start_retirement_driver(registry: Arc<Registry>, retirement: Arc<Retirement>) {
+    if !retirement.try_start_driver() {
+        return;
+    }
+    let worker_retirement = retirement.clone();
+    let worker = tokio::spawn(async move {
+        retire_session(worker_retirement.session()).await
+    });
+    tokio::spawn(async move {
+        let outcome = match worker.await {
+            Ok(outcome) => outcome,
+            Err(error) => retirement
+                .session()
+                .force_lost(format!("retirement driver stopped unexpectedly: {error}")),
+        };
+        let proven_reaped = outcome_reaped(&outcome);
+        registry.finish_retirement(&retirement, proven_reaped);
+        retirement.complete(outcome);
+    });
+}
+
+async fn retire_session(session: Arc<Session>) -> ExecutionOutcome {
+    if let Some(terminal) = session.terminal() {
+        return session.outcome(&terminal, OutputCursor::START);
+    }
+    stop_session(
+        session,
+        &[
+            SignalStage::Interrupt,
+            SignalStage::Terminate,
+            SignalStage::ForceKill,
+        ],
+        tokio::time::Instant::now(),
+    )
+    .await
+}
+
+fn outcome_reaped(outcome: &ExecutionOutcome) -> bool {
+    match outcome {
+        ExecutionOutcome::Exited { cleanup, .. }
+        | ExecutionOutcome::Cancelled { cleanup, .. }
+        | ExecutionOutcome::TimedOut { cleanup, .. }
+        | ExecutionOutcome::Lost { cleanup, .. } => cleanup.reaped,
+        ExecutionOutcome::SpawnFailed(_) => true,
+    }
+}
+
+async fn run_shutdown(registry: Arc<Registry>, shutdown: Arc<ShutdownState>) {
+    let mut changes = registry.subscribe_changes();
+    loop {
+        let snapshot = registry.shutdown_snapshot();
+        for retirement in &snapshot.retirements {
+            start_retirement_driver(registry.clone(), retirement.clone());
+        }
+        if snapshot.reservations == 0 {
+            for retirement in &snapshot.retirements {
+                let _ = retirement.wait_outcome().await;
+            }
+            let final_snapshot = registry.shutdown_snapshot();
+            let same_retirements = snapshot.retirements.len() == final_snapshot.retirements.len()
+                && snapshot.retirements.iter().all(|retirement| {
+                    final_snapshot
+                        .retirements
+                        .iter()
+                        .any(|candidate| candidate.id() == retirement.id())
+                });
+            if final_snapshot.reservations == 0 && same_retirements {
+                let mut sessions = final_snapshot
+                    .retirements
+                    .iter()
+                    .filter_map(|retirement| {
+                        let outcome = retirement
+                            .outcome()
+                            .expect("awaited retirement must have a terminal outcome");
+                        matches!(
+                            outcome,
+                            ExecutionOutcome::Cancelled { .. } | ExecutionOutcome::Lost { .. }
+                        )
+                        .then(|| ShutdownSessionReport {
+                            session_id: retirement.id(),
+                            owner: retirement.owner().clone(),
+                            outcome,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                sessions.sort_by_key(|session| session.session_id);
+                registry.complete_shutdown();
+                shutdown.report.send_replace(Some(ShutdownReport { sessions }));
+                return;
+            }
+            continue;
+        }
+        changes
+            .changed()
+            .await
+            .expect("execution registry change sender unexpectedly closed");
     }
 }
 
 impl Session {
+    pub(crate) fn is_reclaimable_terminal(&self) -> bool {
+        self.terminal()
+            .is_some_and(|terminal| terminal.cleanup.reaped)
+    }
+
+    pub(crate) fn touch_at(&self, now: Instant) {
+        *self
+            .last_activity_at
+            .lock()
+            .expect("execution session activity lock is poisoned") = now;
+    }
+
     fn snapshot(&self) -> ProcessSnapshot {
         let process_state = {
             let state = self
@@ -393,13 +713,6 @@ impl Session {
                 .lock()
                 .expect("execution session activity lock is poisoned"),
         }
-    }
-
-    fn touch(&self) {
-        *self
-            .last_activity_at
-            .lock()
-            .expect("execution session activity lock is poisoned") = Instant::now();
     }
 
     fn exit_observation(&self) -> Option<ExitObservation> {
@@ -533,6 +846,17 @@ impl Session {
         self.set_terminal(record)
     }
 
+    fn force_lost(&self, error: String) -> ExecutionOutcome {
+        let terminal = self.set_terminal(TerminalRecord {
+            kind: TerminalKind::Lost(lost_snapshot(self)),
+            cleanup: CleanupReport {
+                errors: vec![error],
+                ..CleanupReport::default()
+            },
+        });
+        self.outcome(&terminal, OutputCursor::START)
+    }
+
     fn outcome(&self, terminal: &TerminalRecord, cursor: OutputCursor) -> ExecutionOutcome {
         match &terminal.kind {
             TerminalKind::Exited { fact, output } => ExecutionOutcome::Exited {
@@ -633,17 +957,36 @@ impl Session {
 }
 
 fn start_waiter(session: Arc<Session>) {
-    tokio::spawn(async move {
+    start_waiter_attempt(session, 0);
+}
+
+fn start_waiter_attempt(session: Arc<Session>, attempt: usize) {
+    const MAX_WAITER_RESTARTS: usize = 1;
+    let worker_session = session.clone();
+    let worker = tokio::spawn(async move {
         let deadline = Instant::now()
             .checked_add(BACKGROUND_WAIT_HORIZON)
             .unwrap_or_else(Instant::now);
-        let observation = match session.process.wait_reaped(deadline).await {
-            Ok(fact) => ExitObservation::Reaped {
+        worker_session.process.wait_reaped(deadline).await
+    });
+    tokio::spawn(async move {
+        let observation = match worker.await {
+            Ok(Ok(fact)) => ExitObservation::Reaped {
                 fact,
                 observed_at: tokio::time::Instant::now(),
             },
-            Err(error) => ExitObservation::WaitFailed {
+            Ok(Err(error)) => ExitObservation::WaitFailed {
                 message: error.to_string(),
+            },
+            Err(_error) if attempt < MAX_WAITER_RESTARTS => {
+                start_waiter_attempt(session, attempt + 1);
+                return;
+            }
+            Err(error) => ExitObservation::WaitFailed {
+                message: format!(
+                    "waiter task stopped unexpectedly after {} attempts: {error}",
+                    attempt + 1
+                ),
             },
         };
         session.publish_exit_observation(observation.clone());
@@ -732,8 +1075,16 @@ async fn stop_session(
         StopStart::Leader => {
             let driver_session = session.clone();
             let budget = StopBudget::new(request_started_at, stages, &session.policy);
+            let monitor_session = session.clone();
             tokio::spawn(async move {
-                let _ = run_stop_escalation(&driver_session, &budget).await;
+                let worker = tokio::spawn(async move {
+                    let _ = run_stop_escalation(&driver_session, &budget).await;
+                });
+                if let Err(error) = worker.await {
+                    monitor_session.force_lost(format!(
+                        "cleanup driver stopped unexpectedly: {error}"
+                    ));
+                }
             });
             let terminal = session.wait_for_terminal().await;
             session.outcome(&terminal, OutputCursor::START)
@@ -992,7 +1343,10 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use super::{ExitObservation, ProcessSupervisor, SupervisorConfig};
+    use super::{
+        CommitResult, ExitObservation, ProcessSupervisor, Session, SessionState,
+        SupervisorConfig, outcome_reaped, start_waiter,
+    };
     use crate::{
         CapabilityPolicy, CommandSpec, ExecutionOwner, ExecutionPolicy,
         ExecutionOutcome, NormalizedExecutionRequest, OutputBuffer, OutputCursor, OutputSnapshot,
@@ -1040,6 +1394,8 @@ mod tests {
         reap_plan: ReapPlan,
         exit_tx: tokio::sync::watch::Sender<Option<ExitFact>>,
         signal_errors: Arc<Mutex<Vec<FakeSignal>>>,
+        panic_signal: Arc<Mutex<Option<FakeSignal>>>,
+        panic_waits_remaining: Arc<AtomicUsize>,
     }
 
     impl FakeOwner {
@@ -1060,6 +1416,8 @@ mod tests {
                 reap_plan: ReapPlan::Pending,
                 exit_tx,
                 signal_errors: Arc::new(Mutex::new(Vec::new())),
+                panic_signal: Arc::new(Mutex::new(None)),
+                panic_waits_remaining: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -1139,6 +1497,24 @@ mod tests {
             self
         }
 
+        fn panics_on_signal(self, signal: FakeSignal) -> Self {
+            *self
+                .panic_signal
+                .lock()
+                .expect("fake panic signal lock should not be poisoned") = Some(signal);
+            self
+        }
+
+        fn panics_while_waiting(self) -> Self {
+            self.panic_waits_remaining.store(1, Ordering::SeqCst);
+            self
+        }
+
+        fn always_panics_while_waiting(self) -> Self {
+            self.panic_waits_remaining.store(usize::MAX, Ordering::SeqCst);
+            self
+        }
+
         fn with_resize_error(self) -> Self {
             self.resize_error.store(true, Ordering::SeqCst);
             self
@@ -1195,6 +1571,14 @@ mod tests {
                 .lock()
                 .expect("fake signal timing lock should not be poisoned")
                 .push((label, tokio::time::Instant::now()));
+            if *self
+                .panic_signal
+                .lock()
+                .expect("fake panic signal lock should not be poisoned")
+                == Some(signal)
+            {
+                panic!("injected {label} panic");
+            }
             if let ReapPlan::OnSignal {
                 signal: trigger,
                 fact,
@@ -1268,6 +1652,13 @@ mod tests {
 
         async fn wait_reaped(&self, _deadline: Instant) -> io::Result<ExitFact> {
             self.wait_calls.fetch_add(1, Ordering::SeqCst);
+            let remaining = self.panic_waits_remaining.load(Ordering::SeqCst);
+            if remaining > 0 {
+                if remaining != usize::MAX {
+                    self.panic_waits_remaining.fetch_sub(1, Ordering::SeqCst);
+                }
+                panic!("injected wait_reaped panic");
+            }
             match &self.reap_plan {
                 ReapPlan::Pending => future::pending().await,
                 ReapPlan::Natural { after, fact } => {
@@ -1424,6 +1815,437 @@ mod tests {
             .await
             .expect("write task should join")
             .expect("write should finish");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_in_flight_action_prevents_reaper_retirement_until_it_completes() {
+        let policy = ExecutionPolicy {
+            lease: Duration::from_millis(10),
+            ..ExecutionPolicy::default()
+        };
+        let (supervisor, handle, fake, _output) =
+            register_fake_with_policy(FakeOwner::blocking_write(), policy).await;
+        let writing_supervisor = supervisor.clone();
+        let writing_handle = handle.clone();
+        let write = tokio::spawn(async move {
+            writing_supervisor
+                .write(
+                    &writing_handle.owner,
+                    &writing_handle.session_id,
+                    b"blocked",
+                )
+                .await
+        });
+        wait_for_test_condition(|| fake.write_entered.load(Ordering::SeqCst)).await;
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let claimed = supervisor.registry.claim_expired(Instant::now());
+        assert!(
+            claimed.is_empty(),
+            "reaper claimed a session while an authenticated action was in flight"
+        );
+        assert!(
+            fake.signal_calls().is_empty(),
+            "reaper retired a session while an authenticated action was in flight"
+        );
+
+        fake.write_release.notify_waiters();
+        write
+            .await
+            .expect("write task should join")
+            .expect("write should finish");
+        tokio::task::yield_now().await;
+        assert!(fake.signal_calls().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_shutdown_is_single_flight_and_reports_one_exact_retirement() {
+        let policy = ExecutionPolicy {
+            interrupt_grace: Duration::from_millis(10),
+            terminate_grace: Duration::from_millis(10),
+            reap_grace: Duration::from_millis(10),
+            ..ExecutionPolicy::default()
+        };
+        let (supervisor, handle, fake, _output) = register_fake_with_policy(
+            FakeOwner::reaps_on(FakeSignal::Interrupt, 130),
+            policy,
+        )
+        .await;
+
+        let first = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.shutdown().await }
+        });
+        let second = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.shutdown().await }
+        });
+        let first = first.await.expect("first shutdown should join");
+        let second = second.await.expect("second shutdown should join");
+
+        assert_eq!(first, second);
+        assert_eq!(first.sessions.len(), 1);
+        assert_eq!(first.sessions[0].session_id, handle.session_id);
+        assert_eq!(fake.signal_calls(), vec!["interrupt"]);
+        assert_eq!(fake.wait_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn retiring_session_keeps_its_capacity_until_exact_reap_finishes() {
+        let policy = ExecutionPolicy {
+            lease: Duration::from_millis(10),
+            interrupt_grace: Duration::from_millis(100),
+            terminate_grace: Duration::from_millis(100),
+            reap_grace: Duration::from_millis(500),
+            ..ExecutionPolicy::default()
+        };
+        let fake = Arc::new(FakeOwner::reaps_after_signal(
+            FakeSignal::ForceKill,
+            Duration::from_millis(250),
+            137,
+        ));
+        let supervisor = ProcessSupervisor::new(SupervisorConfig {
+            max_sessions: 1,
+            reaper_interval: Duration::from_secs(3_600),
+        });
+        let request = fake_request(policy);
+        let owner = request.owner;
+        let policy = request.policy;
+        let output = Arc::new(OutputBuffer::new(policy.output_limit_bytes));
+        let mut reservation = supervisor
+            .registry
+            .begin_test_reservation()
+            .expect("test process should reserve the sole capacity slot");
+        let session_id = SessionId::new();
+        let started_at = Instant::now();
+        let (exit, _exit_receiver) = tokio::sync::watch::channel(None);
+        let (lifecycle, _lifecycle_receiver) = tokio::sync::watch::channel(0);
+        let session = Arc::new(Session {
+            process: fake.clone(),
+            output,
+            policy: policy.clone(),
+            started_at,
+            last_activity_at: Mutex::new(started_at),
+            state: Mutex::new(SessionState {
+                process_state: ProcessState::Running,
+                exit_observation: None,
+                terminal: None,
+            }),
+            exit,
+            lifecycle,
+            before_lost_commit: Mutex::new(None),
+        });
+        assert!(matches!(
+            supervisor.registry.test_commit(
+                &mut reservation,
+                session_id,
+                owner,
+                session.clone(),
+                policy.lease,
+                started_at,
+            ),
+            CommitResult::Active
+        ));
+        start_waiter(session);
+
+        let retirements = supervisor
+            .registry
+            .claim_expired(started_at + Duration::from_millis(11));
+        assert_eq!(retirements.len(), 1);
+        supervisor.start_retirement(retirements[0].clone());
+        wait_for_test_condition(|| fake.wait_call_count() == 1).await;
+        assert_eq!(supervisor.registry.counts(), (0, 1, 0));
+        let capacity_error = match supervisor.registry.test_reserve_once() {
+            Ok(_) => panic!("unreaped retirement released the sole capacity slot"),
+            Err(error) => error,
+        };
+        assert_eq!(capacity_error, crate::registry::ReserveError::Capacity);
+
+        let outcome = retirements[0].wait_outcome().await;
+        assert!(outcome_reaped(&outcome), "unexpected retirement outcome: {outcome:?}");
+        let reservation = supervisor
+            .reserve_start_capacity()
+            .await
+            .expect("capacity should return after exact reap");
+        drop(reservation);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_waits_for_and_reports_a_reserved_session_that_commits_late() {
+        let supervisor = ProcessSupervisor::new(SupervisorConfig::default());
+        let request = fake_request(ExecutionPolicy {
+            interrupt_grace: Duration::from_millis(10),
+            terminate_grace: Duration::from_millis(10),
+            reap_grace: Duration::from_millis(10),
+            ..ExecutionPolicy::default()
+        });
+        let owner = request.owner.clone();
+        let policy = request.policy.clone();
+        let fake = Arc::new(FakeOwner::reaps_on(FakeSignal::Interrupt, 130));
+        let output = Arc::new(OutputBuffer::new(policy.output_limit_bytes));
+        let mut reservation = supervisor
+            .registry
+            .begin_test_reservation()
+            .expect("test start should reserve capacity before shutdown");
+
+        let shutdown = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.shutdown().await }
+        });
+        wait_for_test_condition(|| supervisor.shutdown.started.load(Ordering::Acquire)).await;
+        assert_eq!(supervisor.registry.counts(), (0, 0, 1));
+
+        let session_id = SessionId::new();
+        let started_at = Instant::now();
+        let (exit, _exit_receiver) = tokio::sync::watch::channel(None);
+        let (lifecycle, _lifecycle_receiver) = tokio::sync::watch::channel(0);
+        let session = Arc::new(Session {
+            process: fake.clone(),
+            output,
+            policy: policy.clone(),
+            started_at,
+            last_activity_at: Mutex::new(started_at),
+            state: Mutex::new(SessionState {
+                process_state: ProcessState::Running,
+                exit_observation: None,
+                terminal: None,
+            }),
+            exit,
+            lifecycle,
+            before_lost_commit: Mutex::new(None),
+        });
+        let commit = supervisor.registry.test_commit(
+            &mut reservation,
+            session_id,
+            owner.clone(),
+            session.clone(),
+            policy.lease,
+            started_at,
+        );
+        start_waiter(session);
+        let CommitResult::Retiring(retirement) = commit else {
+            panic!("a post-shutdown reservation commit must retire, never become active");
+        };
+        supervisor.start_retirement(retirement);
+
+        let report = shutdown.await.expect("shutdown task should join");
+        assert_eq!(report.sessions.len(), 1);
+        assert_eq!(report.sessions[0].session_id, session_id);
+        assert_eq!(report.sessions[0].owner, owner);
+        assert!(outcome_reaped(&report.sessions[0].outcome));
+        assert_eq!(fake.signal_calls(), vec!["interrupt"]);
+        assert_eq!(fake.wait_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_an_in_flight_action_before_retiring_the_session() {
+        let policy = ExecutionPolicy {
+            interrupt_grace: Duration::from_millis(10),
+            terminate_grace: Duration::from_millis(10),
+            reap_grace: Duration::from_millis(10),
+            ..ExecutionPolicy::default()
+        };
+        let mut owner = FakeOwner::blocking_write();
+        owner.reap_plan = ReapPlan::Controlled {
+            fact: ExitFact {
+                code: Some(130),
+                signal: None,
+                cleanup_errors: Vec::new(),
+            },
+        };
+        let (supervisor, handle, fake, _output) =
+            register_fake_with_policy(owner, policy).await;
+        let writing = tokio::spawn({
+            let supervisor = supervisor.clone();
+            let handle = handle.clone();
+            async move {
+                supervisor
+                    .write(&handle.owner, &handle.session_id, b"blocked")
+                    .await
+            }
+        });
+        wait_for_test_condition(|| fake.write_entered.load(Ordering::SeqCst)).await;
+
+        let shutdown = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.shutdown().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown must wait for the authenticated in-flight action"
+        );
+        assert!(fake.signal_calls().is_empty());
+
+        fake.block_write.store(false, Ordering::SeqCst);
+        fake.write_release.notify_waiters();
+        writing
+            .await
+            .expect("write task should join")
+            .expect("write should complete");
+        fake.release_reap();
+
+        let report = tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("shutdown should finish after the action releases")
+            .expect("shutdown task should join");
+        assert_eq!(report.sessions.len(), 1);
+        assert_eq!(report.sessions[0].session_id, handle.session_id);
+        assert!(matches!(
+            report.sessions[0].outcome,
+            ExecutionOutcome::Cancelled { .. } | ExecutionOutcome::Lost { .. }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_omits_an_exit_observed_during_the_final_output_drain() {
+        let (supervisor, handle, _fake, _output) =
+            register_fake(FakeOwner::exits_after(Duration::from_millis(5), 0)).await;
+        tokio::time::advance(Duration::from_millis(6)).await;
+        let session = supervisor
+            .registry
+            .get(&handle.session_id)
+            .expect("exit-observed session should still be registered");
+        wait_for_test_condition(|| session.exit_observation().is_some()).await;
+        assert!(
+            session.terminal().is_none(),
+            "test must enter shutdown before the final output drain installs terminal state"
+        );
+
+        let shutdown = tokio::spawn({
+            let supervisor = supervisor.clone();
+            async move { supervisor.shutdown().await }
+        });
+        tokio::time::advance(Duration::from_millis(120)).await;
+        let report = shutdown.await.expect("shutdown task should join");
+
+        assert!(
+            report.sessions.is_empty(),
+            "naturally exited sessions are not shutdown cancellations: {:?}",
+            report.sessions
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_signal_panic_becomes_lost_without_releasing_capacity() {
+        let policy = ExecutionPolicy {
+            lease: Duration::from_millis(10),
+            interrupt_grace: Duration::from_millis(10),
+            terminate_grace: Duration::from_millis(10),
+            reap_grace: Duration::from_millis(10),
+            ..ExecutionPolicy::default()
+        };
+        let (supervisor, _handle, _fake, _output) = register_fake_with_config(
+            FakeOwner::pending().panics_on_signal(FakeSignal::Interrupt),
+            policy,
+            SupervisorConfig {
+                max_sessions: 1,
+                reaper_interval: Duration::from_secs(3_600),
+            },
+        )
+        .await;
+        let retirements = supervisor
+            .registry
+            .claim_expired(Instant::now() + Duration::from_secs(1));
+        assert_eq!(retirements.len(), 1);
+        supervisor.start_retirement(retirements[0].clone());
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            retirements[0].wait_outcome(),
+        )
+        .await
+        .expect("retirement panic must not strand outcome waiters");
+        let ExecutionOutcome::Lost { cleanup, .. } = outcome else {
+            panic!("retirement panic must become Lost");
+        };
+        assert!(!cleanup.reaped);
+        assert!(
+            cleanup
+                .errors
+                .iter()
+                .any(|error| error.contains("cleanup driver stopped unexpectedly"))
+        );
+        assert_eq!(supervisor.registry.counts(), (0, 1, 0));
+        assert_eq!(
+            supervisor.registry.test_reserve_once().err(),
+            Some(crate::registry::ReserveError::Capacity)
+        );
+    }
+
+    #[tokio::test]
+    async fn waiter_panic_restarts_the_exact_wait_and_recovers_reap_proof() {
+        let (supervisor, handle, fake, _output) = register_fake(
+            FakeOwner::reaps_on(FakeSignal::Interrupt, 130).panics_while_waiting(),
+        )
+        .await;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            supervisor.cancel(&handle.owner, &handle.session_id),
+        )
+        .await
+        .expect("restarted waiter must remain bounded")
+        .expect("owned session should remain observable");
+
+        assert!(matches!(outcome, ExecutionOutcome::Cancelled { .. }));
+        assert_eq!(fake.wait_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn repeated_waiter_panic_publishes_lost_instead_of_stranding_waiters() {
+        let (supervisor, handle, fake, _output) =
+            register_fake(FakeOwner::pending().always_panics_while_waiting()).await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            supervisor.poll(
+                &handle.owner,
+                &handle.session_id,
+                OutputCursor::START,
+                Instant::now() + Duration::from_secs(10),
+            ),
+        )
+        .await
+        .expect("repeated waiter panic must wake poll")
+        .expect("owned session should remain observable");
+
+        let PollResult::Finished(ExecutionOutcome::Lost { cleanup, .. }) = result else {
+            panic!("repeated waiter panic must become a terminal Lost outcome");
+        };
+        assert!(cleanup.errors.iter().any(|error| {
+            error.contains("waiter task stopped unexpectedly after 2 attempts")
+        }));
+        assert_eq!(fake.wait_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_an_unreaped_lost_session_instead_of_omitting_it() {
+        let (supervisor, handle, _fake, _output) =
+            register_fake(FakeOwner::pending().always_panics_while_waiting()).await;
+        let result = supervisor
+            .poll(
+                &handle.owner,
+                &handle.session_id,
+                OutputCursor::START,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .expect("repeated waiter failure should remain observable");
+        let PollResult::Finished(ExecutionOutcome::Lost { cleanup, .. }) = result else {
+            panic!("repeated waiter failure must become Lost");
+        };
+        assert!(!cleanup.reaped);
+
+        let report = supervisor.shutdown().await;
+
+        assert_eq!(report.sessions.len(), 1);
+        assert_eq!(report.sessions[0].session_id, handle.session_id);
+        assert!(matches!(
+            &report.sessions[0].outcome,
+            ExecutionOutcome::Lost { cleanup, .. } if !cleanup.reaped
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2017,7 +2839,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
 
         let outcome = super::stop_session(
-            session,
+            session.session_arc(),
             &[
                 super::SignalStage::Interrupt,
                 super::SignalStage::Terminate,
@@ -2364,9 +3186,34 @@ mod tests {
         Arc<FakeOwner>,
         Arc<OutputBuffer>,
     ) {
+        register_fake_with_policy(fake, ExecutionPolicy::default()).await
+    }
+
+    async fn register_fake_with_policy(
+        fake: FakeOwner,
+        policy: ExecutionPolicy,
+    ) -> (
+        Arc<ProcessSupervisor>,
+        super::ExecutionHandle,
+        Arc<FakeOwner>,
+        Arc<OutputBuffer>,
+    ) {
+        register_fake_with_config(fake, policy, SupervisorConfig::default()).await
+    }
+
+    async fn register_fake_with_config(
+        fake: FakeOwner,
+        policy: ExecutionPolicy,
+        config: SupervisorConfig,
+    ) -> (
+        Arc<ProcessSupervisor>,
+        super::ExecutionHandle,
+        Arc<FakeOwner>,
+        Arc<OutputBuffer>,
+    ) {
         let fake = Arc::new(fake);
-        let supervisor = ProcessSupervisor::new(SupervisorConfig::default());
-        let request = fake_request(ExecutionPolicy::default());
+        let supervisor = ProcessSupervisor::new(config);
+        let request = fake_request(policy);
         let output = Arc::new(OutputBuffer::new(request.policy.output_limit_bytes));
         let handle = supervisor
             .register_owned(request, fake.clone(), output.clone())

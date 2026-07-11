@@ -16,4 +16,7 @@ pub use request::{
     CommandSpec, ExecutionError, ExecutionOwner, ExecutionPolicy, ExecutionRequest,
     NormalizedExecutionRequest, ShellKind, Transport, normalize_request,
 };
-pub use supervisor::{ExecutionHandle, PollResult, ProcessSupervisor, SupervisorConfig};
+pub use supervisor::{
+    ExecutionHandle, PollResult, ProcessSupervisor, ShutdownReport, ShutdownSessionReport,
+    SupervisorConfig,
+};

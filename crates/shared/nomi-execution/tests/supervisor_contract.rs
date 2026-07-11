@@ -90,6 +90,17 @@ fn helper_emit_split_utf8_preserves_the_exact_bytes() {
 }
 
 #[test]
+fn helper_emit_delayed_writes_each_flushed_record() {
+    let output = Command::new(helper_binary())
+        .args(["emit-delayed", "3", "5"])
+        .output()
+        .expect("execution_test_helper should start");
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"tick-0\ntick-1\ntick-2\n");
+}
+
+#[test]
 fn helper_flood_writes_the_requested_number_of_bytes() {
     let output = Command::new(helper_binary())
         .args(["flood", "16385"])

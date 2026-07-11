@@ -42,6 +42,14 @@ fn main() {
             require_len(&args, 1);
             emit_split_utf8().unwrap_or_else(|error| fail_io("emit split UTF-8", error));
         }
+        "emit-delayed" => {
+            require_len(&args, 3);
+            emit_delayed(
+                parse_u64(&args[1], "delayed output count"),
+                Duration::from_millis(parse_u64(&args[2], "delayed output interval")),
+            )
+            .unwrap_or_else(|error| fail_io("emit delayed output", error));
+        }
         "flood" => {
             require_len(&args, 2);
             flood(parse_u64(&args[1], "flood byte count"))
@@ -126,6 +134,16 @@ fn emit_split_utf8() -> io::Result<()> {
     for byte in UTF8_SAMPLE.as_bytes() {
         stdout.write_all(&[*byte])?;
         stdout.flush()?;
+    }
+    Ok(())
+}
+
+fn emit_delayed(count: u64, interval: Duration) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    for index in 0..count {
+        writeln!(stdout, "tick-{index}")?;
+        stdout.flush()?;
+        thread::sleep(interval);
     }
     Ok(())
 }

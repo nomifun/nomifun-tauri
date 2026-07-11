@@ -109,6 +109,10 @@ pub enum ExecutionError {
     SessionNotFound { session_id: SessionId },
     #[error("execution session {session_id} belongs to a different owner")]
     OwnerMismatch { session_id: SessionId },
+    #[error("execution supervisor capacity is exhausted (max sessions: {max_sessions})")]
+    CapacityExhausted { max_sessions: usize },
+    #[error("execution supervisor is shutting down")]
+    SupervisorShuttingDown,
     #[error("execution transport failure: {reason}")]
     Transport { reason: String },
     #[error("execution I/O failure during {operation}: {reason}")]
@@ -137,6 +141,8 @@ impl ExecutionError {
             Self::InvalidTransport { .. } => "invalid_transport",
             Self::SessionNotFound { .. } => "session_not_found",
             Self::OwnerMismatch { .. } => "owner_mismatch",
+            Self::CapacityExhausted { .. } => "capacity_exhausted",
+            Self::SupervisorShuttingDown => "supervisor_shutting_down",
             Self::Transport { .. } => "transport",
             Self::Io { .. } => "io",
             Self::SpawnFailed { .. } => "spawn_failed",
