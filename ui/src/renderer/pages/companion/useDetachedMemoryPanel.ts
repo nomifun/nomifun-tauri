@@ -8,7 +8,9 @@ import {
   MEMORY_PANEL_EVENTS,
   initialMemoryPanelState,
   memoryPanelReducer,
+  memoryPanelToggleIntent,
   nextMemoryPanelRequestId,
+  shouldCloseMemoryPanelForOwnerGeometryChange,
   type MemoryPanelAction,
   type MemoryPanelActionAckPayload,
   type MemoryPanelActivatePayload,
@@ -99,7 +101,7 @@ export function useDetachedMemoryPanel(options: {
   }, [options.companionId, stopProbe, transition]);
 
   const toggle = useCallback(() => {
-    if (stateRef.current.phase === 'closed') void open();
+    if (memoryPanelToggleIntent(stateRef.current.phase) === 'open') void open();
     else close('toggle');
   }, [close, open]);
 
@@ -197,13 +199,25 @@ export function useDetachedMemoryPanel(options: {
   useEffect(() => {
     if (!isTauriRuntime()) return;
     let disposed = false;
-    let unlisten: (() => void) | undefined;
+    const unlisteners: Array<() => void> = [];
+    const closeForGeometryChange = () => {
+      if (shouldCloseMemoryPanelForOwnerGeometryChange(stateRef.current.phase)) close('owner-invalid');
+    };
     void import('@tauri-apps/api/window')
-      .then(({ getCurrentWindow }) => getCurrentWindow().onMoved(() => {
-        if (stateRef.current.phase === 'open') close('owner-invalid');
-      }))
-      .then((nextUnlisten) => { if (disposed) nextUnlisten(); else unlisten = nextUnlisten; });
-    return () => { disposed = true; unlisten?.(); };
+      .then(({ getCurrentWindow }) => {
+        const win = getCurrentWindow();
+        return Promise.all([
+          win.onMoved(closeForGeometryChange),
+          win.onResized(closeForGeometryChange),
+          win.onScaleChanged(closeForGeometryChange),
+        ]);
+      })
+      .then((nextUnlisteners) => {
+        if (disposed) nextUnlisteners.forEach((unlisten) => unlisten());
+        else unlisteners.push(...nextUnlisteners);
+      })
+      .catch(() => {});
+    return () => { disposed = true; unlisteners.forEach((unlisten) => unlisten()); };
   }, [close]);
   useEffect(() => () => close('owner-invalid'), [close]);
 

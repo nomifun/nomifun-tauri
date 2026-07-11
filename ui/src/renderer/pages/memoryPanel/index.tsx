@@ -25,6 +25,7 @@ const MemoryPanelPage: React.FC = () => {
   const [phase, setPhase] = useState<MemoryPanelPhase>('closed');
   const [placement, setPlacement] = useState('above');
   const cardRef = useRef<HTMLElement | null>(null);
+  const firstItemRef = useRef<HTMLButtonElement | null>(null);
   const snapshotRef = useRef(snapshot);
   const phaseRef = useRef(phase);
   const activationPendingRef = useRef(false);
@@ -80,6 +81,7 @@ const MemoryPanelPage: React.FC = () => {
         if (previous && !sameRequest) {
           const closed: MemoryPanelClosedPayload = { requestId: previous.requestId, reason: 'owner-invalid', restoreFocus: false };
           void emitToWindow(previous.ownerWindowLabel, MEMORY_PANEL_EVENTS.closed, closed);
+          void hideMemoryPanelWindow(previous.requestId).catch(() => false);
         }
         if (closeTimerRef.current) {
           clearTimeout(closeTimerRef.current);
@@ -108,7 +110,11 @@ const MemoryPanelPage: React.FC = () => {
         requestAnimationFrame(() => {
           void import('@tauri-apps/api/window').then(({ getCurrentWindow }) =>
             getCurrentWindow().isFocused().then((focused) => {
-              if (!focused && !activationPendingRef.current) void finishClose({ requestId: payload.requestId, reason: 'blur' });
+              if (!focused && !activationPendingRef.current) {
+                void finishClose({ requestId: payload.requestId, reason: 'blur' });
+                return;
+              }
+              if (focused) firstItemRef.current?.focus({ preventScroll: true });
             })
           );
         });
@@ -166,8 +172,8 @@ const MemoryPanelPage: React.FC = () => {
     <main className={`nomi-memory-panel nomi-memory-panel--${phase} nomi-memory-panel--${placement}`}>
       <section ref={cardRef} className='nomi-memory-panel__card' role='dialog' aria-label={t('nomi.tabs.suggestions')}>
         <div className='nomi-memory-panel__list'>
-          {snapshot.suggestions.map((suggestion) => (
-            <button key={suggestion.id} type='button' className='nomi-memory-panel__item' onClick={() => activate(suggestion.id)}>
+          {snapshot.suggestions.map((suggestion, index) => (
+            <button ref={index === 0 ? firstItemRef : undefined} key={suggestion.id} type='button' className='nomi-memory-panel__item' onClick={() => activate(suggestion.id)}>
               <span className='nomi-memory-panel__title'>{suggestion.title}</span>
               <span className='nomi-memory-panel__body'>{suggestion.body}</span>
             </button>

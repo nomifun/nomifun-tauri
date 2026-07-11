@@ -10,8 +10,13 @@ export const MEMORY_PANEL_EVENTS = {
 
 export type MemoryPanelPhase = 'closed' | 'preparing' | 'opening' | 'open' | 'closing';
 export type MemoryPanelCloseReason = 'blur' | 'escape' | 'toggle' | 'empty' | 'owner-invalid' | 'activation';
+export type MemoryPanelToggleIntent = 'open' | 'close';
 export interface MemoryPanelState { phase: MemoryPanelPhase; requestId: string | null; ownerCompanionId: string | null; closeReason: MemoryPanelCloseReason | null }
 export const initialMemoryPanelState: MemoryPanelState = { phase: 'closed', requestId: null, ownerCompanionId: null, closeReason: null };
+export const memoryPanelToggleIntent = (phase: MemoryPanelPhase): MemoryPanelToggleIntent =>
+  phase === 'closed' || phase === 'closing' ? 'open' : 'close';
+export const shouldCloseMemoryPanelForOwnerGeometryChange = (phase: MemoryPanelPhase): boolean =>
+  phase === 'preparing' || phase === 'opening' || phase === 'open';
 export type MemoryPanelAction =
   | { type: 'begin'; requestId: string; ownerCompanionId: string }
   | { type: 'opening' | 'opened' | 'closed'; requestId: string }

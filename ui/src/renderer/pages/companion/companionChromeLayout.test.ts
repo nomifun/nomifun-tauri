@@ -31,6 +31,10 @@ describe('desktop companion chrome layout', () => {
     expect(controllerSource.includes('monitor.workArea.position')).toBe(true);
     expect(controllerSource.includes('monitor.position.x')).toBe(true);
     expect(controllerSource.includes('onMoved')).toBe(true);
+    expect(controllerSource.includes('onResized')).toBe(true);
+    expect(controllerSource.includes('onScaleChanged')).toBe(true);
+    expect(controllerSource.includes('memoryPanelToggleIntent')).toBe(true);
+    expect(controllerSource.includes('shouldCloseMemoryPanelForOwnerGeometryChange')).toBe(true);
     expect(controllerSource.includes("close('owner-invalid')")).toBe(true);
     expect(controllerSource.includes("current.phase !== 'open'")).toBe(true);
     expect(controllerSource.includes('MEMORY_PANEL_EVENTS.snapshot')).toBe(true);

@@ -14,6 +14,8 @@ describe('detached memory panel route', () => {
     expect(panelSource.includes('snapshotRef.current = payload')).toBe(true);
     expect(panelSource.includes("snapshotRef.current?.requestId !== payload.requestId")).toBe(true);
     expect(panelSource.includes("reason: 'owner-invalid'")).toBe(true);
+    expect(panelSource.includes('hideMemoryPanelWindow(previous.requestId)')).toBe(true);
+    expect(panelSource.includes('firstItemRef.current?.focus')).toBe(true);
     expect(panelSource.includes("sameRequest ? phaseRef.current : 'preparing'")).toBe(true);
     expect(panelSource.includes("phaseRef.current !== 'opening'")).toBe(true);
     expect(panelSource.includes('MEMORY_PANEL_EVENTS.activate')).toBe(true);
