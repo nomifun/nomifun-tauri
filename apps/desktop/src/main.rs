@@ -27,8 +27,9 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{Emitter, Manager};
 use tauri_plugin_deep_link::DeepLinkExt;
 
-mod relocate;
 mod memory_panel_window;
+mod relocate;
+mod updater_install_context;
 
 /// Build the webview initialization script. Injects the loopback backend port
 /// (`window.__backendPort`), the OS tag, and the per-boot local-trust secret
@@ -802,6 +803,7 @@ fn main() -> std::process::ExitCode {
         .manage(memory_panel_window::MemoryPanelWindowState::default())
         .invoke_handler(tauri::generate_handler![
             check_for_updates,
+            updater_install_context::get_updater_install_context,
             sync_companion_windows,
             memory_panel_window::prepare_companion_memory_panel,
             memory_panel_window::place_companion_memory_panel,

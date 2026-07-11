@@ -2,6 +2,7 @@
   "modalTitle": "Software update",
   "checking": "Checking for updates...",
   "checkFailed": "Failed to check for updates",
+  "crossDeviceInstallUnsupported": "NomiFun is running from a disk image, external drive, or another volume and cannot safely replace itself. Quit NomiFun, move NomiFun.app to Applications, eject the installer volume, then reopen and retry, or use the manual download.",
   "upToDateTitle": "You're up to date",
   "currentVersion": "Current version: {{version}}",
   "availableTitle": "Update available",

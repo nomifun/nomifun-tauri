@@ -4454,6 +4454,7 @@ export type I18nKey =
   | 'update.baiduMirrorLink'
   | 'update.checkFailed'
   | 'update.checking'
+  | 'update.crossDeviceInstallUnsupported'
   | 'update.currentVersion'
   | 'update.disclaimer'
   | 'update.downloadAndInstall'

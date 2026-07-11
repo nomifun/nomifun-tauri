@@ -183,7 +183,7 @@ const UpdateModal: React.FC = () => {
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error('Install failed:', err);
-      Message.error(msg);
+      Message.error(t(getUpdateErrorMessageKey(msg)));
     }
   };
 
