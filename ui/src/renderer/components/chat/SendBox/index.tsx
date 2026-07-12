@@ -268,7 +268,7 @@ const SendBox: React.FC<{
   const setInputRef = useLatestRef(setInput);
   const messageList = useMessageList();
   const pinnedPlan = useMemo(() => (showPinnedPlan ? derivePinnedPlan(messageList) : null), [messageList, showPinnedPlan]);
-  const hasInternalStatusRow = Boolean(pinnedPlan || topRightTools);
+  const hasInternalStatusRow = Boolean(topRightTools);
   const [historyNavigationIndex, setHistoryNavigationIndex] = useState<number | null>(null);
   const historyDraftRef = useRef<string | null>(null);
   const [replyQuote, setReplyQuote] = useState<ReplyQuote | null>(null);
@@ -1546,6 +1546,14 @@ const SendBox: React.FC<{
 
   return (
     <div className={`relative ${className ?? ''}`}>
+      {pinnedPlan && (
+        <div
+          className='absolute left-1/2 bottom-[calc(100%+8px)] -translate-x-1/2 z-30'
+          data-testid='sendbox-plan-anchor'
+        >
+          <PinnedPlan plan={pinnedPlan} />
+        </div>
+      )}
       <div
         ref={containerRef}
         className={`sendbox-panel relative p-16px border-3 b bg-dialog-fill-0 b-solid rd-20px flex flex-col ${isOverlayOpen ? 'overflow-visible' : 'overflow-hidden'} ${isFileDragging ? 'b-dashed sendbox-panel--dragging' : ''}`}
@@ -1635,11 +1643,6 @@ const SendBox: React.FC<{
             className='sendbox-internal-status-row mb-8px flex w-full flex-wrap items-start gap-8px'
             data-testid='sendbox-internal-status-row'
           >
-            {pinnedPlan && (
-              <div className='min-w-[220px] max-w-[420px] flex-[1_1_340px]' data-testid='sendbox-internal-plan'>
-                <PinnedPlan plan={pinnedPlan} />
-              </div>
-            )}
             {topRightTools && (
               <div className='ml-auto flex h-28px flex-shrink-0 items-center' data-testid='sendbox-internal-context-tools'>
                 {topRightTools}

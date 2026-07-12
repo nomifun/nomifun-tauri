@@ -68,8 +68,8 @@
     "disabled": "知识库回写未启用",
     "interrupted": "知识库回写中断"
   },
-  "planTodoList": "待办列表",
-  "planProgress": "已完成 {{done}}/{{total}}",
+  "planTodoList": "待办队列",
+  "planProgress": "{{done}}/{{total}}",
   "fileChanges": "文件变更",
   "fileChangesCount": "{{count}} 个文件变更",
   "conversationInProgress": "当前正在进行对话中...",
