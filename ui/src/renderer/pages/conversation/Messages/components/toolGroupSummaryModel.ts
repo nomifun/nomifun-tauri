@@ -185,6 +185,7 @@ const classifyToolForReceipt = (tool: NormalizedToolCall): ToolReceiptAction => 
   const text = getToolSearchText(tool);
   const nameText = getToolNameSearchText(tool);
 
+  if (normalizeToolSearchText(compactToolText(tool.name)) === 'update plan') return 'generic';
   if (/\b(bash|shell|exec|execute|terminal|command|run)\b/.test(nameText)) return 'run_commands';
   if (/\b(grep|rg|search|find)\b/.test(text)) return 'search_code';
   if (/\b(glob|list|ls|directory|dir)\b/.test(text)) return 'list_files';

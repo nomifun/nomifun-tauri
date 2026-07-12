@@ -83,6 +83,48 @@ describe('mergeFetchedMessagesForConversation', () => {
 });
 
 describe('composeMessageForTest', () => {
+  test('applies a hidden terminal update to the matching tool in the same turn', () => {
+    const running = baseMessage({
+      id: 'turn-1:tool:call-1',
+      msg_id: 'turn-1',
+      type: 'tool_call',
+      content: { call_id: 'call-1', name: 'update_plan', args: {}, status: 'running' },
+    } as any);
+    const completed = baseMessage({
+      id: 'turn-1:tool:call-1',
+      msg_id: 'turn-1',
+      type: 'tool_call',
+      hidden: true,
+      content: { call_id: 'call-1', name: 'update_plan', args: {}, status: 'completed' },
+    } as any);
+
+    const merged = composeMessageForTest(completed, [running]);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].hidden).toBe(true);
+    expect((merged[0] as any).content.status).toBe('completed');
+  });
+
+  test('does not merge reused provider call ids across turns', () => {
+    const firstTurn = baseMessage({
+      id: 'turn-1:tool:call-1',
+      msg_id: 'turn-1',
+      type: 'tool_call',
+      content: { call_id: 'call-1', name: 'Read', args: {}, status: 'completed' },
+    } as any);
+    const secondTurn = baseMessage({
+      id: 'turn-2:tool:call-1',
+      msg_id: 'turn-2',
+      type: 'tool_call',
+      content: { call_id: 'call-1', name: 'Read', args: {}, status: 'running' },
+    } as any);
+
+    const merged = composeMessageForTest(secondTurn, [firstTurn]);
+
+    expect(merged).toHaveLength(2);
+    expect(merged.map((message) => message.msg_id)).toEqual(['turn-1', 'turn-2']);
+  });
+
   test('replaces the current plan by session_id even when the incoming msg_id changes', () => {
     const oldPlan = baseMessage({
       id: 'turn-1:plan:update_plan',

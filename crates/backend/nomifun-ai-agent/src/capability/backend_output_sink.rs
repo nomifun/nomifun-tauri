@@ -273,23 +273,26 @@ impl OutputSink for BackendOutputSink {
     }
 
     fn emit_tool_result(&self, tool_use_id: &str, name: &str, is_error: bool, content: &str) {
-        // update_plan special case: emit a Plan event so the frontend renders
-        // the checklist (MessagePlan) instead of a raw JSON tool card.
-        if name == "update_plan" && !is_error {
-            if let Some(entries) = parse_plan_entries(content) {
-                let _ = self.event_tx.send(AgentStreamEvent::Plan(PlanEventData {
-                    session_id: Some("update_plan".to_string()),
-                    entries,
-                }));
-                return;
-            }
-            // Unparsable -> fall through to a normal tool result (don't drop it).
-        }
-
         let Some(call_id) = Self::internal_call_id(tool_use_id) else {
             tracing::error!(tool = name, "Cannot emit tool_result with empty tool_use_id");
             return;
         };
+
+        // update_plan special case: emit a Plan event so the frontend renders
+        // the checklist (MessagePlan) instead of a raw JSON tool card.
+        if name == "update_plan"
+            && !is_error
+            && let Some(entries) = parse_plan_entries(content)
+        {
+            self.forget_active_tool_call(&call_id);
+            let _ = self.event_tx.send(AgentStreamEvent::Plan(PlanEventData {
+                session_id: Some("update_plan".to_string()),
+                source_call_id: Some(call_id),
+                entries,
+            }));
+            return;
+        }
+        // Unparsable update_plan output falls through to a normal tool result.
 
         self.forget_active_tool_call(&call_id);
 
@@ -701,16 +704,21 @@ mod tests {
     fn update_plan_result_emits_plan_event() {
         let (sink, mut rx) = make_sink();
         let content = r#"{"kind":"plan_update","explanation":null,"entries":[{"content":"a","status":"completed"},{"content":"b","status":"in_progress"}]}"#;
+        sink.emit_tool_call("call_1", "update_plan", r#"{"plan":[]}"#);
+        assert!(matches!(rx.try_recv().unwrap(), AgentStreamEvent::ToolCall(_)));
         sink.emit_tool_result("call_1", "update_plan", false, content);
         match rx.try_recv().unwrap() {
             AgentStreamEvent::Plan(data) => {
                 assert_eq!(data.session_id.as_deref(), Some("update_plan"));
+                assert_eq!(data.source_call_id.as_deref(), Some("nomi-call_1"));
                 assert_eq!(data.entries.len(), 2);
                 assert_eq!(data.entries[1]["status"], "in_progress");
             }
             other => panic!("expected Plan, got {other:?}"),
         }
-        // No second ToolCall event (we returned early).
+        sink.complete_active_tool_calls_for_auto_continue("max_tokens");
+        // The successful plan result must settle the source tool without
+        // emitting a synthetic continuation recovery later.
         assert!(rx.try_recv().is_err());
     }
 

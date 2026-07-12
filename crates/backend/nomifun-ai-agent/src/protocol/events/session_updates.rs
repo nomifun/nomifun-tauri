@@ -29,6 +29,10 @@ pub struct ThinkingEventData {
 pub struct PlanEventData {
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Internal source tool call settled by this plan projection. ACP plans
+    /// have no source tool and leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_call_id: Option<String>,
     #[serde(default)]
     pub entries: Vec<serde_json::Value>,
 }

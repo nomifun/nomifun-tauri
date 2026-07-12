@@ -55,6 +55,40 @@ describe('turn process state', () => {
     ).toBe('completed');
   });
 
+  test('does not let an ordinary Nomi Bash exit fail the whole process receipt', () => {
+    expect(
+      getToolMessagesProcessState([
+        {
+          type: 'tool_call',
+          content: {
+            call_id: 'call-bash',
+            name: 'Bash',
+            status: 'error',
+            args: { command: 'node test.js' },
+            output: 'Exit code: 1\nSTDERR:\nReferenceError: location is not defined',
+          },
+        } as any,
+      ])
+    ).toBe('completed');
+  });
+
+  test('keeps Nomi Bash timeouts as failed process evidence', () => {
+    expect(
+      getToolMessagesProcessState([
+        {
+          type: 'tool_call',
+          content: {
+            call_id: 'call-bash',
+            name: 'Bash',
+            status: 'error',
+            args: { command: 'node test.js' },
+            output: 'Command timed out after 120000ms.\nPartial output:\nRESULT_PASS',
+          },
+        } as any,
+      ])
+    ).toBe('failed');
+  });
+
   test('does not let failed ACP read probes fail the whole process receipt', () => {
     expect(
       getToolMessagesProcessState([
@@ -68,8 +102,71 @@ describe('turn process state', () => {
               kind: 'read',
               status: 'failed',
               rawInput: { path: 'config.yaml' },
+              content: [
+                {
+                  type: 'content',
+                  content: { type: 'text', text: 'No such file or directory (os error 2)' },
+                },
+              ],
             },
           },
+        } as any,
+      ])
+    ).toBe('completed');
+  });
+
+  test('does not let an ordinary Nomi read miss fail the whole process receipt', () => {
+    expect(
+      getToolMessagesProcessState([
+        {
+          type: 'tool_call',
+          content: {
+            call_id: 'call-read',
+            name: 'Read',
+            status: 'error',
+            args: { file_path: 'missing.file' },
+            output: 'Failed to read file missing.file: No such file or directory (os error 2)',
+          },
+        } as any,
+      ])
+    ).toBe('completed');
+  });
+
+  test('keeps Nomi read permission failures as failed process evidence', () => {
+    expect(
+      getToolMessagesProcessState([
+        {
+          type: 'tool_call',
+          content: {
+            call_id: 'call-read',
+            name: 'Read',
+            status: 'error',
+            args: { file_path: 'secret.file' },
+            output: 'Failed to read file secret.file: Permission denied (os error 13)',
+          },
+        } as any,
+      ])
+    ).toBe('failed');
+  });
+
+  test('does not let a failed confirmed shell command group fail the whole process receipt', () => {
+    expect(
+      getToolMessagesProcessState([
+        {
+          type: 'tool_group',
+          content: [
+            {
+              call_id: 'call-shell',
+              name: 'Bash',
+              status: 'Error',
+              description: 'Run a validation command',
+              confirmationDetails: {
+                type: 'exec',
+                title: 'Run command',
+                command: 'node test.js',
+              },
+            },
+          ],
         } as any,
       ])
     ).toBe('completed');

@@ -96,6 +96,20 @@ describe('MessageList turn completion disclosure structure', () => {
     expect(source.includes("if (isContextCompressionTip(item)) return 'process';")).toBe(true);
   });
 
+  test('uses plan events as hard boundaries between tool receipt groups', () => {
+    const planBoundary = source.match(/if \(message\.type === 'plan'\) \{[\s\S]*?continue;[\s\S]*?\}/)?.[0] ?? '';
+
+    expect(planBoundary.includes('toolList = [];')).toBe(true);
+    expect(planBoundary.includes('toolSourceMessageIds = [];')).toBe(true);
+    expect(planBoundary.includes('diffsChanges = [];')).toBe(true);
+    expect(planBoundary.includes('diffsSourceMessageIds = [];')).toBe(true);
+  });
+
+  test('suppresses only legacy synthetic plan-tool failures with a persisted plan projection', () => {
+    expect(source.includes("from './planToolVisibility'")).toBe(true);
+    expect(source.includes('isSupersededPlanToolFailure(message, list.slice(i + 1))')).toBe(true);
+  });
+
   test('keeps the implementation scoped to the message content area', () => {
     expect(source.includes('PreviewPanel')).toBe(false);
     expect(source.includes('OrchestrationTopPanel')).toBe(false);

@@ -69,6 +69,7 @@ fn capability_roots_are_canonicalized() {
 
     let normalized = normalize_request(req, root.path()).unwrap();
 
+    assert_eq!(normalized.capability.cwd_roots.len(), 1);
     assert_eq!(
         normalized.capability.cwd_roots,
         vec![root.path().canonicalize().unwrap()]

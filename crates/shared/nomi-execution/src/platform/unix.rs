@@ -964,7 +964,7 @@ impl LegacyWatchdog {
     }
 
     fn signal_group(&self, signal: libc::c_int) -> io::Result<()> {
-        let open = self
+        let mut open = self
             .signal_gate
             .lock()
             .map_err(|_| io::Error::other("legacy Unix signal gate is poisoned"))?;
@@ -975,11 +975,20 @@ impl LegacyWatchdog {
             ));
         }
         if signal == libc::SIGKILL {
-            return seal_process_group_anchored_by(self.pgid, self.watchdog_pid).map(drop);
+            seal_process_group_anchored_by(self.pgid, self.watchdog_pid)?;
+            *open = false;
+            return Ok(());
         }
         // SAFETY: the exact direct-child watchdog anchors this process group;
         // only SIGKILL needs Darwin's all-zombie EPERM interpretation.
         if unsafe { libc::kill(-self.pgid, signal) } == 0 {
+            if signal == libc::SIGKILL {
+                // The kernel accepted the terminal signal for the anchored
+                // group. Retire the cached PGID immediately so the lifecycle
+                // worker cannot issue a redundant post-exit signal after the
+                // watchdog has already sealed the group.
+                *open = false;
+            }
             Ok(())
         } else {
             Err(io::Error::last_os_error())
@@ -3295,11 +3304,9 @@ impl LifecycleJob {
         let mut lifecycle_error: Option<io::Error> = None;
         let mut quiescing_seen = false;
         let mut host_kill_attempted = false;
-        let mut leader_observed = false;
 
         loop {
             if leader_exit_observed(leader_pid)? {
-                leader_observed = true;
                 break;
             }
             let events = poll_control(control_fd, 50)?;
@@ -3369,7 +3376,6 @@ impl LifecycleJob {
             .unwrap_or_else(Instant::now);
         let mut watchdog_status = None;
         while watchdog_status.is_none() && Instant::now() < watchdog_deadline {
-            leader_observed |= leader_exit_observed(leader_pid)?;
             watchdog_status = self.try_reap_watchdog()?;
             if watchdog_status.is_some() {
                 break;
@@ -3434,6 +3440,7 @@ impl LifecycleJob {
             &mut lifecycle_error,
         )?;
         let watchdog_status = watchdog_status.expect("watchdog status was established");
+        let watchdog_sealed_group = quiescing_seen && was_killed_by_group_sigkill(watchdog_status);
         if !was_killed_by_group_sigkill(watchdog_status) {
             lifecycle_error.get_or_insert_with(|| {
                 io::Error::other(format!(
@@ -3449,17 +3456,34 @@ impl LifecycleJob {
 
         // Even a valid QUIESCING + SIGKILL pair cannot prove that no concurrent
         // actor killed only the watchdog. Make one final idempotent group-kill
-        // attempt while the exact leader remains WNOWAIT-anchored.
-        self.host_fallback_kill(&mut host_kill_attempted)?;
-        while !leader_observed {
-            leader_observed = leader_exit_observed(leader_pid)?;
-            if !leader_observed {
-                poll_delay(50)?;
+        // attempt while the exact unreaped leader still anchors the PGID. Once
+        // the group is sealed it is safe to consume the exact child status;
+        // do not depend on platform-specific WNOWAIT observation after this
+        // point.
+        if let Err(error) = self.host_fallback_kill(&mut host_kill_attempted) {
+            #[cfg(target_os = "macos")]
+            if error.raw_os_error() == Some(libc::EPERM) && watchdog_sealed_group {
+                // A sandbox may deny the host's redundant negative-PGID
+                // signal. Continue only with the watchdog's authenticated
+                // QUIESCING + SIGKILL proof, then independently prove group
+                // absence after exact child reaps below.
+            } else {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("final host group seal: {error}"),
+                ));
             }
+            #[cfg(target_os = "linux")]
+            return Err(io::Error::new(
+                error.kind(),
+                format!("final host group seal: {error}"),
+            ));
         }
-
+        let leader_reap_deadline = Instant::now()
+            .checked_add(CLEANUP_RETRY_MAX)
+            .unwrap_or_else(Instant::now);
         self.retire_control();
-        let status = self.reap_leader()?;
+        let status = self.reap_leader_until(leader_reap_deadline)?;
         #[cfg(test)]
         if let Some(pause) = self.after_leader_reap_pause.as_ref() {
             pause.block();
@@ -3576,16 +3600,30 @@ impl LifecycleJob {
         Ok(status)
     }
 
-    fn reap_leader(&mut self) -> io::Result<ExitStatus> {
-        let child = self
-            .child
-            .as_mut()
-            .ok_or_else(|| io::Error::other("leader wait already completed"))?;
-        let status = child.wait()?;
-        self.child = None;
-        #[cfg(test)]
-        self.audit.record_leader_reap();
-        Ok(status)
+    fn reap_leader_until(&mut self, deadline: Instant) -> io::Result<ExitStatus> {
+        let retry_delay_ms = CLEANUP_RETRY_DELAY
+            .as_millis()
+            .min(libc::c_int::MAX as u128) as libc::c_int;
+        loop {
+            let status = self
+                .child
+                .as_mut()
+                .ok_or_else(|| io::Error::other("leader wait already completed"))?
+                .try_wait()?;
+            if let Some(status) = status {
+                self.child = None;
+                #[cfg(test)]
+                self.audit.record_leader_reap();
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "exact leader reap timed out after process-group seal",
+                ));
+            }
+            poll_delay(retry_delay_ms)?;
+        }
     }
 
     fn retire_control(&mut self) {
@@ -3911,6 +3949,7 @@ fn seal_process_group_anchored_by(
     Err(error)
 }
 
+#[cfg(target_os = "linux")]
 fn leader_exit_observed(pid: libc::pid_t) -> io::Result<bool> {
     loop {
         let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
@@ -3932,6 +3971,55 @@ fn leader_exit_observed(pid: libc::pid_t) -> io::Result<bool> {
         if error.raw_os_error() != Some(libc::EINTR) {
             return Err(error);
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn leader_exit_observed(pid: libc::pid_t) -> io::Result<bool> {
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let expected = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let returned = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                expected,
+            )
+        };
+        if returned == expected {
+            let info = unsafe { info.assume_init() };
+            if info.pbi_ppid != unsafe { libc::getpid() } as u32 {
+                return Err(io::Error::from_raw_os_error(libc::ECHILD));
+            }
+            return Ok(info.pbi_status == libc::SZOMB);
+        }
+        if returned == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                // Darwin no longer exposes a zombie through proc_pidinfo,
+                // but signal zero still recognizes the unreaped PID without
+                // consuming its status. A missing PID means exact ownership
+                // has already been lost.
+                if unsafe { libc::kill(pid, 0) } == 0 {
+                    return Ok(true);
+                }
+                let probe_error = io::Error::last_os_error();
+                if probe_error.raw_os_error() == Some(libc::ESRCH) {
+                    return Err(io::Error::from_raw_os_error(libc::ECHILD));
+                }
+                return Err(probe_error);
+            }
+            return Err(error);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected proc_pidinfo size for exact child {pid}: {returned}"),
+        ));
     }
 }
 
@@ -3968,15 +4056,35 @@ fn prove_group_absent(pgid: libc::pid_t) -> io::Result<()> {
 }
 
 fn probe_group_absent_once(pgid: libc::pid_t) -> io::Result<bool> {
-    // SAFETY: signal zero only probes the cached process-group identity.
-    if unsafe { libc::kill(-pgid, 0) } == 0 {
-        return Ok(false);
+    #[cfg(target_os = "macos")]
+    {
+        let mut member = 0 as libc::pid_t;
+        // proc_listpgrppids returns zero for an empty group. A one-element
+        // buffer is sufficient because any returned member disproves absence.
+        let returned = unsafe {
+            libc::proc_listpgrppids(
+                pgid,
+                (&mut member as *mut libc::pid_t).cast(),
+                std::mem::size_of::<libc::pid_t>() as libc::c_int,
+            )
+        };
+        if returned < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(returned == 0)
     }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(true)
-    } else {
-        Err(error)
+    #[cfg(target_os = "linux")]
+    {
+    // SAFETY: signal zero only probes the cached process-group identity.
+        if unsafe { libc::kill(-pgid, 0) } == 0 {
+            return Ok(false);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(true)
+        } else {
+            Err(error)
+        }
     }
 }
 
@@ -4627,7 +4735,19 @@ mod tests {
         };
         let leader = audit.leader_pid.load(Ordering::SeqCst);
         drop(result);
-        let reaped = wait_for_watchdog_reaps(&audit, 1, Duration::from_secs(2)).await;
+        let exact_cleanup = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if audit.watchdog_reaps.load(Ordering::SeqCst) == 1
+                    && audit.leader_reaps.load(Ordering::SeqCst) == 1
+                    && !process_exists(leader)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
         heartbeat.abort();
 
         assert_eq!(failure_code.as_deref(), Some("async_process_wrap_failed"));
@@ -4635,7 +4755,7 @@ mod tests {
             elapsed < Duration::from_millis(200),
             "async wrap failure blocked on delayed exact cleanup: {elapsed:?}"
         );
-        assert!(reaped, "lifecycle worker did not exactly reap the watchdog");
+        assert!(exact_cleanup, "lifecycle worker did not exactly reap both children");
         assert_eq!(audit.leader_reaps.load(Ordering::SeqCst), 1);
         assert!(!process_exists(leader), "async-wrap leader remained observable");
         assert!(
@@ -4708,7 +4828,10 @@ mod tests {
         );
         assert_eq!(audit.leader_reaps.load(Ordering::SeqCst), 1);
         assert!(!process_exists(leader), "aborted-start leader remained observable");
-        assert_eq!(audit.group_signals.load(Ordering::SeqCst), 1);
+        assert!(
+            audit.group_signals.load(Ordering::SeqCst) <= 1,
+            "cleanup must not issue redundant host group signals after the watchdog seal"
+        );
     }
 
     #[tokio::test]

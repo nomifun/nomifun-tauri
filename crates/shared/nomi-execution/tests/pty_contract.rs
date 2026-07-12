@@ -132,6 +132,31 @@ fn strip_terminal_controls(text: &str) -> String {
 }
 
 #[tokio::test]
+async fn consecutive_pty_sessions_do_not_lose_quick_exit_output() {
+    let first = ProcessSupervisor::new(SupervisorConfig::default());
+    let first_handle = start_pty(&first, &["exit", "0"])
+        .await
+        .expect("first PTY helper should start");
+    let first_outcome = wait_for_terminal(&first, &first_handle).await;
+    assert!(matches!(
+        first_outcome,
+        ExecutionOutcome::Exited { code: Some(0), .. }
+    ));
+    drop(first);
+
+    let second = ProcessSupervisor::new(SupervisorConfig::default());
+    let second_handle = start_pty(&second, &["emit-split-utf8"])
+        .await
+        .expect("second PTY helper should start");
+    let second_outcome = wait_for_terminal(&second, &second_handle).await;
+    let ExecutionOutcome::Exited { code, output, .. } = second_outcome else {
+        panic!("second PTY helper should exit, got {second_outcome:?}");
+    };
+    assert_eq!(code, Some(0));
+    assert_eq!(strip_terminal_controls(&output.text()), "中文🙂");
+}
+
+#[tokio::test]
 async fn pty_echoes_stdin_and_close_stdin_delivers_eof() {
     let supervisor = ProcessSupervisor::new(SupervisorConfig::default());
     let handle = start_pty(&supervisor, &["echo-stdin"])
@@ -232,7 +257,11 @@ async fn pty_decodes_utf8_split_one_byte_at_a_time() {
         panic!("split UTF-8 PTY helper should exit, got {outcome:?}");
     };
     assert_eq!(code, Some(0));
-    assert_eq!(strip_terminal_controls(&output.text()), "中文🙂");
+    assert_eq!(
+        strip_terminal_controls(&output.text()),
+        "中文🙂",
+        "split UTF-8 PTY output was not fully drained: {output:?}"
+    );
     assert_eq!(output.encoding.source_encoding, "utf-8");
     assert_eq!(output.encoding.decode_errors, 0);
     assert!(

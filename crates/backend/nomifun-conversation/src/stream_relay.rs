@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use nomifun_ai_agent::{
@@ -534,6 +534,18 @@ impl StreamRelay {
         let mut active_text: Option<TextSegmentState> = None;
         let mut active_thinking: Option<ThinkingSegmentState> = None;
         let mut active_tool_calls: HashMap<String, ToolCallEventData> = HashMap::new();
+        let mut terminal_tool_calls: HashSet<String> = HashSet::new();
+        let mut active_acp_tool_calls: HashMap<
+            String,
+            nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData,
+        > = HashMap::new();
+        let mut terminal_acp_tool_calls: HashSet<String> = HashSet::new();
+        let mut active_tool_groups: HashMap<
+            String,
+            Vec<nomifun_ai_agent::protocol::events::tool_call::ToolGroupEntry>,
+        > = HashMap::new();
+        let mut active_plan_ids: HashSet<String> = HashSet::new();
+        let mut active_agent_status: Option<nomifun_ai_agent::protocol::events::AgentStatusEventData> = None;
         let mut used_primary_segment_msg_id = false;
         let mut first_agent_event_logged = false;
         let mut first_visible_output_logged = false;
@@ -697,9 +709,21 @@ impl StreamRelay {
                             } else {
                                 if let Some(reason) = Self::incomplete_tool_reason(&event) {
                                     self.fail_active_tool_calls(&mut active_tool_calls, reason).await;
+                                    self.fail_active_acp_tool_calls(&mut active_acp_tool_calls, reason).await;
+                                    self.fail_active_tool_groups(&mut active_tool_groups, reason).await;
                                 }
                                 self.forward_to_websocket(&event);
                             }
+                            self.finalize_active_plans(
+                                &mut active_plan_ids,
+                                Self::plan_terminal_status(&event),
+                            )
+                            .await;
+                            self.finalize_active_agent_status(
+                                &mut active_agent_status,
+                                Self::plan_terminal_status(&event),
+                            )
+                            .await;
                             let outcome = self
                                 .finalize(
                                     &full_text_buffer,
@@ -732,10 +756,19 @@ impl StreamRelay {
                             emitted_response = true;
                             match data.status {
                                 ToolCallStatus::Running => {
+                                    if terminal_tool_calls.contains(&data.call_id) {
+                                        warn!(
+                                            call_id = %data.call_id,
+                                            tool = %data.name,
+                                            "Ignoring late running event for terminal tool call"
+                                        );
+                                        continue;
+                                    }
                                     active_tool_calls.insert(data.call_id.clone(), data.clone());
                                 }
                                 ToolCallStatus::Completed | ToolCallStatus::Error => {
                                     active_tool_calls.remove(&data.call_id);
+                                    terminal_tool_calls.insert(data.call_id.clone());
                                 }
                             }
                             self.complete_active_thinking(&mut active_thinking).await;
@@ -748,6 +781,23 @@ impl StreamRelay {
                             // Plan D4: see ToolCall — an ACP tool call is a
                             // visible, side-effecting action; block failover.
                             emitted_response = true;
+                            let tool_call_id = data.update.tool_call_id.clone();
+                            match data.update.status {
+                                Some(AcpToolCallStatus::Completed | AcpToolCallStatus::Failed) => {
+                                    active_acp_tool_calls.remove(&tool_call_id);
+                                    terminal_acp_tool_calls.insert(tool_call_id);
+                                }
+                                Some(AcpToolCallStatus::Pending | AcpToolCallStatus::InProgress) | None => {
+                                    if terminal_acp_tool_calls.contains(&tool_call_id) {
+                                        warn!(
+                                            tool_call_id,
+                                            "Ignoring late progress event for terminal ACP tool call"
+                                        );
+                                        continue;
+                                    }
+                                    active_acp_tool_calls.insert(tool_call_id, data.clone());
+                                }
+                            }
                             self.complete_active_thinking(&mut active_thinking).await;
                             self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
                                 .await;
@@ -758,6 +808,13 @@ impl StreamRelay {
                             // Plan D4: see ToolCall — a tool group is a visible,
                             // side-effecting action; block failover.
                             emitted_response = true;
+                            if let Some(group_id) = entries.first().map(|entry| entry.call_id.clone()) {
+                                if entries.iter().any(|entry| entry.status == ToolCallStatus::Running) {
+                                    active_tool_groups.insert(group_id, entries.clone());
+                                } else {
+                                    active_tool_groups.remove(&group_id);
+                                }
+                            }
                             self.complete_active_thinking(&mut active_thinking).await;
                             self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
                                 .await;
@@ -767,6 +824,11 @@ impl StreamRelay {
                         AgentStreamEvent::AgentStatus(data) => {
                             self.forward_to_websocket(&event);
                             if data.backend == "nomi" && (data.status == "preparing" || data.status == "prepared") {
+                                if data.status == "preparing" {
+                                    active_agent_status = Some(data.clone());
+                                } else {
+                                    active_agent_status = None;
+                                }
                                 self.persist_agent_status(data).await;
                             }
                         }
@@ -779,7 +841,33 @@ impl StreamRelay {
                                 "finish",
                             )
                             .await;
+                            if let Some(source_call_id) = data.source_call_id.as_deref() {
+                                let mut source = active_tool_calls.remove(source_call_id).unwrap_or_else(|| {
+                                    ToolCallEventData {
+                                        call_id: source_call_id.to_owned(),
+                                        name: "update_plan".to_owned(),
+                                        args: serde_json::Value::Null,
+                                        status: ToolCallStatus::Running,
+                                        input: None,
+                                        output: None,
+                                        description: None,
+                                    }
+                                });
+                                source.status = ToolCallStatus::Completed;
+                                source.output = Some("Plan updated".to_owned());
+                                terminal_tool_calls.insert(source_call_id.to_owned());
+                                let source_event = AgentStreamEvent::ToolCall(source.clone());
+                                self.forward_to_websocket_hidden(&source_event);
+                                self.persist_tool_call_with_hidden(&source, true).await;
+                            }
                             let plan_id = self.plan_message_id(data);
+                            if data.entries.iter().all(|entry| {
+                                entry.get("status").and_then(serde_json::Value::as_str) == Some("completed")
+                            }) {
+                                active_plan_ids.remove(&plan_id);
+                            } else {
+                                active_plan_ids.insert(plan_id.clone());
+                            }
                             self.forward_to_websocket_with_msg_id(&plan_id, &event);
                             self.persist_plan(data).await;
                         }
@@ -815,15 +903,31 @@ impl StreamRelay {
                         "StreamRelay channel closed without terminal event"
                     );
 
+                    let channel_error = AgentStreamEvent::Error(
+                        nomifun_ai_agent::protocol::events::ErrorEventData::legacy(
+                            "Agent event channel closed before the turn completed",
+                            None,
+                        ),
+                    );
                     self.complete_active_thinking(&mut active_thinking).await;
-                    self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
+                    self.close_active_text_segment(&mut active_text, &mut text_segments, "error")
                         .await;
-                    // Channel closed without finish/error — still finalize
+                    self.fail_active_tool_calls(&mut active_tool_calls, "channel_closed").await;
+                    self.fail_active_acp_tool_calls(&mut active_acp_tool_calls, "channel_closed")
+                        .await;
+                    self.fail_active_tool_groups(&mut active_tool_groups, "channel_closed")
+                        .await;
+                    self.finalize_active_plans(&mut active_plan_ids, "error").await;
+                    self.finalize_active_agent_status(&mut active_agent_status, "error")
+                        .await;
+                    self.forward_to_websocket(&channel_error);
+                    // Channel closure is an unexpected terminal failure. Finalize
+                    // partial output, but never manufacture a clean Finish.
                     let outcome = self
                         .finalize(
                             &full_text_buffer,
                             &text_segments,
-                            &AgentStreamEvent::Finish(nomifun_ai_agent::protocol::events::FinishEventData::default()),
+                            &channel_error,
                             RelayTerminal::ChannelClosed,
                             emitted_response,
                             // A channel-closed terminal is never an Error event,
@@ -920,8 +1024,21 @@ impl StreamRelay {
         self.forward_to_websocket_with_msg_id(&self.msg_id, event);
     }
 
+    fn forward_to_websocket_hidden(&self, event: &AgentStreamEvent) {
+        self.forward_to_websocket_with_msg_id_and_visibility(&self.msg_id, event, true);
+    }
+
     #[tracing::instrument(skip_all)]
     fn forward_to_websocket_with_msg_id(&self, msg_id: &str, event: &AgentStreamEvent) {
+        self.forward_to_websocket_with_msg_id_and_visibility(msg_id, event, false);
+    }
+
+    fn forward_to_websocket_with_msg_id_and_visibility(
+        &self,
+        msg_id: &str,
+        event: &AgentStreamEvent,
+        hidden: bool,
+    ) {
         let mut event_data = match serde_json::to_value(event) {
             Ok(v) => v,
             Err(e) => {
@@ -939,7 +1056,7 @@ impl StreamRelay {
             "msg_id": msg_id,
             "type": event_data.get("type").cloned().unwrap_or(json!("unknown")),
             "data": event_data.get("data").cloned().unwrap_or(json!({})),
-            "hidden": false,
+            "hidden": hidden,
         });
 
         self.broadcast_stream_payload(payload);
@@ -1069,7 +1186,7 @@ impl StreamRelay {
                     for segment in text_segments.iter().skip(1) {
                         let hide_update = nomifun_db::MessageRowUpdate {
                             content: None,
-                            status: Some(Some(status.to_owned())),
+                            status: None,
                             hidden: Some(true),
                         };
                         if let Err(e) = self.repo.update_message(&segment.id, &hide_update).await {
@@ -1079,16 +1196,9 @@ impl StreamRelay {
                     }
                 } else {
                     outcome.final_text_msg_id = text_segments.last().map(|segment| segment.id.clone());
-                    for segment in text_segments {
-                        let status_update = nomifun_db::MessageRowUpdate {
-                            content: None,
-                            status: Some(Some(status.to_owned())),
-                            hidden: Some(false),
-                        };
-                        if let Err(e) = self.repo.update_message(&segment.id, &status_update).await {
-                            error!(error = %ErrorChain(&e), "Failed to finalize text segment status");
-                        }
-                    }
+                    // Each segment was finalized at its own boundary. Preserve
+                    // those statuses: a later provider failure belongs only to
+                    // the active segment and must not rewrite earlier narration.
                 }
             } else if !hidden {
                 let row = MessageRow {
@@ -1149,12 +1259,16 @@ impl StreamRelay {
 
     #[tracing::instrument(skip_all)]
     async fn persist_agent_status(&self, data: &nomifun_ai_agent::protocol::events::AgentStatusEventData) {
-        let id = format!("{}:agent_status:model_activity", self.msg_id);
+        let id = self.agent_status_message_id();
         let content = serde_json::to_string(data).unwrap_or_else(|_| "{}".to_owned());
-        let status = if data.status == "prepared" { "finish" } else { "work" };
+        let status = match data.status.as_str() {
+            "prepared" => "finish",
+            "error" => "error",
+            _ => "work",
+        };
         let existing = self
             .repo
-            .get_message_by_msg_id(self.conv_id(), &id, "agent_status")
+            .get_message(self.conv_id(), &id)
             .await
             .unwrap_or(None);
 
@@ -1177,7 +1291,7 @@ impl StreamRelay {
         let row = MessageRow {
             id: id.clone(),
             conversation_id: self.conv_id(),
-            msg_id: Some(id),
+            msg_id: Some(self.msg_id.clone()),
             r#type: "agent_status".into(),
             content,
             position: Some("left".into()),
@@ -1192,6 +1306,28 @@ impl StreamRelay {
                 "Failed to persist agent_status message"
             );
         }
+    }
+
+    fn agent_status_message_id(&self) -> String {
+        format!("{}:agent_status:model_activity", self.msg_id)
+    }
+
+    async fn finalize_active_agent_status(
+        &self,
+        active_status: &mut Option<nomifun_ai_agent::protocol::events::AgentStatusEventData>,
+        terminal_status: &str,
+    ) {
+        let Some(mut data) = active_status.take() else {
+            return;
+        };
+        data.status = if terminal_status == "finish" {
+            "prepared".to_owned()
+        } else {
+            "error".to_owned()
+        };
+        let event = AgentStreamEvent::AgentStatus(data.clone());
+        self.forward_to_websocket(&event);
+        self.persist_agent_status(&data).await;
     }
 
     fn plan_session_id(&self, data: &PlanEventData) -> String {
@@ -1308,6 +1444,14 @@ impl StreamRelay {
     /// Persist a Gemini-style tool_call event.
     #[tracing::instrument(skip_all)]
     async fn persist_tool_call(&self, data: &nomifun_ai_agent::protocol::events::tool_call::ToolCallEventData) {
+        self.persist_tool_call_with_hidden(data, false).await;
+    }
+
+    async fn persist_tool_call_with_hidden(
+        &self,
+        data: &nomifun_ai_agent::protocol::events::tool_call::ToolCallEventData,
+        hidden: bool,
+    ) {
         if data.call_id.trim().is_empty() {
             warn!(
                 tool = %data.name,
@@ -1322,22 +1466,42 @@ impl StreamRelay {
             ToolCallStatus::Completed => "finish",
             ToolCallStatus::Error => "error",
         };
-        let content = serde_json::to_string(data).unwrap_or_default();
+        let message_id = self.tool_message_id(&data.call_id);
+        let mut content_value = serde_json::to_value(data).unwrap_or_default();
+        if let Some(object) = content_value.as_object_mut() {
+            object.insert("turn_id".to_owned(), json!(self.msg_id));
+        }
+        let content = content_value.to_string();
 
         let existing = self
             .repo
-            .get_message_by_msg_id(self.conv_id(), &data.call_id, "tool_call")
+            .get_message(self.conv_id(), &message_id)
             .await
             .unwrap_or(None);
 
         if let Some(existing_row) = existing {
+            let terminal_conflict = match (existing_row.status.as_deref(), data.status) {
+                (Some("finish"), ToolCallStatus::Completed) | (Some("error"), ToolCallStatus::Error) => false,
+                (Some("finish" | "error"), _) => true,
+                _ => false,
+            };
+            if terminal_conflict {
+                warn!(
+                    call_id = %data.call_id,
+                    tool = %data.name,
+                    stored_status = ?existing_row.status,
+                    incoming_status = ?data.status,
+                    "Ignoring tool call transition away from persisted terminal state"
+                );
+                return;
+            }
             let merged_content = Self::merge_json_content(&existing_row.content, &content);
             let update = nomifun_db::MessageRowUpdate {
                 content: Some(merged_content),
                 status: Some(Some(status.to_owned())),
-                hidden: None,
+                hidden: hidden.then_some(true),
             };
-            if let Err(e) = self.repo.update_message(&data.call_id, &update).await {
+            if let Err(e) = self.repo.update_message(&message_id, &update).await {
                 error!(
                     call_id = %data.call_id,
                     tool = %data.name,
@@ -1355,14 +1519,14 @@ impl StreamRelay {
             }
         } else {
             let row = MessageRow {
-                id: data.call_id.clone(),
+                id: message_id.clone(),
                 conversation_id: self.conv_id(),
-                msg_id: Some(data.call_id.clone()),
+                msg_id: Some(self.msg_id.clone()),
                 r#type: "tool_call".into(),
                 content,
                 position: Some("left".into()),
                 status: Some(status.to_owned()),
-                hidden: false,
+                hidden,
                 created_at: now_ms(),
             };
             if let Err(e) = self.repo.insert_message(&row).await {
@@ -1384,6 +1548,10 @@ impl StreamRelay {
         }
     }
 
+    fn tool_message_id(&self, call_id: &str) -> String {
+        format!("{}:tool:{call_id}", self.msg_id)
+    }
+
     fn incomplete_tool_reason(event: &AgentStreamEvent) -> Option<&'static str> {
         match event {
             AgentStreamEvent::Error(_) => Some("error"),
@@ -1398,6 +1566,36 @@ impl StreamRelay {
                 None => Some("finish"),
             },
             _ => None,
+        }
+    }
+
+    fn plan_terminal_status(event: &AgentStreamEvent) -> &'static str {
+        match event {
+            AgentStreamEvent::Finish(data)
+                if matches!(
+                    data.stop_reason,
+                    None | Some(nomifun_ai_agent::protocol::events::TurnStopReason::EndTurn)
+                ) => "finish",
+            AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_) => "error",
+            _ => "error",
+        }
+    }
+
+    async fn finalize_active_plans(&self, active_plan_ids: &mut HashSet<String>, status: &str) {
+        for plan_id in active_plan_ids.drain() {
+            let update = nomifun_db::MessageRowUpdate {
+                content: None,
+                status: Some(Some(status.to_owned())),
+                hidden: None,
+            };
+            if let Err(error) = self.repo.update_message(&plan_id, &update).await {
+                error!(
+                    plan_id,
+                    status,
+                    error = %ErrorChain(&error),
+                    "Failed to finalize active plan"
+                );
+            }
         }
     }
 
@@ -1429,11 +1627,70 @@ impl StreamRelay {
         }
     }
 
+    async fn fail_active_acp_tool_calls(
+        &self,
+        active_tool_calls: &mut HashMap<
+            String,
+            nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData,
+        >,
+        reason: &str,
+    ) {
+        let output = format!("The turn ended before this tool completed: {reason}");
+        let failed: Vec<_> = active_tool_calls
+            .drain()
+            .map(|(_, mut data)| {
+                data.update.session_update = AcpToolCallSessionUpdateKind::ToolCallUpdate;
+                data.update.status = Some(AcpToolCallStatus::Failed);
+                data.update.raw_output = Some(json!(output));
+                data
+            })
+            .collect();
+
+        for data in failed {
+            let event = AgentStreamEvent::AcpToolCall(data.clone());
+            self.forward_to_websocket(&event);
+            self.persist_acp_tool_call(&data).await;
+        }
+    }
+
+    async fn fail_active_tool_groups(
+        &self,
+        active_tool_groups: &mut HashMap<
+            String,
+            Vec<nomifun_ai_agent::protocol::events::tool_call::ToolGroupEntry>,
+        >,
+        reason: &str,
+    ) {
+        let failed: Vec<_> = active_tool_groups
+            .drain()
+            .map(|(_, mut entries)| {
+                for entry in &mut entries {
+                    if entry.status == ToolCallStatus::Running {
+                        entry.status = ToolCallStatus::Error;
+                        let detail = format!("The turn ended before this tool completed: {reason}");
+                        entry.description = Some(match entry.description.take() {
+                            Some(description) if !description.is_empty() => format!("{description}: {detail}"),
+                            _ => detail,
+                        });
+                    }
+                }
+                entries
+            })
+            .collect();
+
+        for entries in failed {
+            let event = AgentStreamEvent::ToolGroup(entries.clone());
+            self.forward_to_websocket(&event);
+            self.persist_tool_group(&entries).await;
+        }
+    }
+
     /// Persist an ACP (Claude CLI) tool call event.
     /// First event (ToolCall) inserts; subsequent events (ToolCallUpdate) update.
     #[tracing::instrument(skip_all)]
     async fn persist_acp_tool_call(&self, data: &nomifun_ai_agent::protocol::events::tool_call::AcpToolCallEventData) {
         let tool_call_id = &data.update.tool_call_id;
+        let message_id = self.acp_tool_message_id(tool_call_id);
         let status = match data.update.status {
             Some(AcpToolCallStatus::Pending) | None => "work",
             Some(AcpToolCallStatus::InProgress) => "work",
@@ -1443,37 +1700,61 @@ impl StreamRelay {
 
         let mut value = serde_json::to_value(data).unwrap_or_default();
         normalize_keys_to_snake_case(&mut value);
+        if let Some(object) = value.as_object_mut() {
+            object.insert("turn_id".to_owned(), json!(self.msg_id));
+        }
         let content = value.to_string();
 
-        match data.update.session_update {
-            AcpToolCallSessionUpdateKind::ToolCall => {
-                let row = MessageRow {
-                    id: tool_call_id.clone(),
-                    conversation_id: self.conv_id(),
-                    msg_id: Some(tool_call_id.clone()),
-                    r#type: "acp_tool_call".into(),
-                    content,
-                    position: Some("left".into()),
-                    status: Some(status.to_owned()),
-                    hidden: false,
-                    created_at: now_ms(),
-                };
-                if let Err(e) = self.repo.insert_message(&row).await {
-                    error!(error = %ErrorChain(&e), "Failed to persist acp_tool_call message");
-                }
+        let existing = self
+            .repo
+            .get_message(self.conv_id(), &message_id)
+            .await
+            .unwrap_or(None);
+        if let Some(existing_row) = existing {
+            let terminal_conflict = match (existing_row.status.as_deref(), status) {
+                (Some("finish"), "finish") | (Some("error"), "error") => false,
+                (Some("finish" | "error"), _) => true,
+                _ => false,
+            };
+            if terminal_conflict {
+                warn!(
+                    tool_call_id,
+                    stored_status = ?existing_row.status,
+                    incoming_status = status,
+                    "Ignoring ACP tool transition away from persisted terminal state"
+                );
+                return;
             }
-            AcpToolCallSessionUpdateKind::ToolCallUpdate => {
-                let merged_content = self.merge_acp_tool_call_content(tool_call_id, &value).await;
-                let update = nomifun_db::MessageRowUpdate {
-                    content: Some(merged_content),
-                    status: Some(Some(status.to_owned())),
-                    hidden: None,
-                };
-                if let Err(e) = self.repo.update_message(tool_call_id, &update).await {
-                    error!(error = %ErrorChain(&e), "Failed to update acp_tool_call message");
-                }
+            let merged_content = Self::merge_acp_tool_call_content(&existing_row.content, &value);
+            let update = nomifun_db::MessageRowUpdate {
+                content: Some(merged_content),
+                status: Some(Some(status.to_owned())),
+                hidden: None,
+            };
+            if let Err(e) = self.repo.update_message(&message_id, &update).await {
+                error!(error = %ErrorChain(&e), "Failed to update acp_tool_call message");
             }
+            return;
         }
+
+        let row = MessageRow {
+            id: message_id.clone(),
+            conversation_id: self.conv_id(),
+            msg_id: Some(self.msg_id.clone()),
+            r#type: "acp_tool_call".into(),
+            content,
+            position: Some("left".into()),
+            status: Some(status.to_owned()),
+            hidden: false,
+            created_at: now_ms(),
+        };
+        if let Err(e) = self.repo.insert_message(&row).await {
+            error!(error = %ErrorChain(&e), "Failed to persist acp_tool_call message");
+        }
+    }
+
+    fn acp_tool_message_id(&self, tool_call_id: &str) -> String {
+        format!("{}:acp_tool:{tool_call_id}", self.msg_id)
     }
 
     /// Merge two JSON content strings: overlays non-null fields from `new_json`
@@ -1494,19 +1775,15 @@ impl StreamRelay {
     /// Merge an AcpToolCall update into the existing DB record.
     /// Reads the stored content, overlays non-null fields from the update,
     /// preserving fields like `raw_input` that the update event omits.
-    async fn merge_acp_tool_call_content(&self, tool_call_id: &str, update_value: &serde_json::Value) -> String {
-        let existing = self
-            .repo
-            .get_message_by_msg_id(self.conv_id(), tool_call_id, "acp_tool_call")
-            .await
-            .ok()
-            .flatten();
-
-        let Some(existing_row) = existing else {
-            return update_value.to_string();
-        };
-
-        let mut base: serde_json::Value = serde_json::from_str(&existing_row.content).unwrap_or_default();
+    fn merge_acp_tool_call_content(existing_content: &str, update_value: &serde_json::Value) -> String {
+        let mut base: serde_json::Value = serde_json::from_str(existing_content).unwrap_or_default();
+        if let (Some(base_object), Some(update_object)) = (base.as_object_mut(), update_value.as_object()) {
+            for (key, value) in update_object {
+                if key != "update" && !value.is_null() {
+                    base_object.insert(key.clone(), value.clone());
+                }
+            }
+        }
         if let (Some(base_update), Some(new_update)) = (
             base.get_mut("update").and_then(|v| v.as_object_mut()),
             update_value.get("update").and_then(|v| v.as_object()),
@@ -1523,24 +1800,42 @@ impl StreamRelay {
     /// Persist a tool_group event (array of tool summaries).
     #[tracing::instrument(skip_all)]
     async fn persist_tool_group(&self, entries: &[nomifun_ai_agent::protocol::events::tool_call::ToolGroupEntry]) {
-        let all_done = entries
-            .iter()
-            .all(|e| matches!(e.status, ToolCallStatus::Completed | ToolCallStatus::Error));
-        let status = if all_done { "finish" } else { "work" };
+        let status = if entries.iter().any(|entry| entry.status == ToolCallStatus::Error) {
+            "error"
+        } else if entries.iter().all(|entry| entry.status == ToolCallStatus::Completed) {
+            "finish"
+        } else {
+            "work"
+        };
         let content = serde_json::to_string(entries).unwrap_or_default();
 
-        let group_id = entries
+        let source_group_id = entries
             .first()
             .map(|e| e.call_id.clone())
             .unwrap_or_else(ConversationService::mint_msg_id);
+        let group_id = format!("{}:tool_group:{source_group_id}", self.msg_id);
 
         let existing = self
             .repo
-            .get_message_by_msg_id(self.conv_id(), &group_id, "tool_group")
+            .get_message(self.conv_id(), &group_id)
             .await
             .unwrap_or(None);
 
-        if existing.is_some() {
+        if let Some(existing_row) = existing {
+            let terminal_conflict = match (existing_row.status.as_deref(), status) {
+                (Some("finish"), "finish") | (Some("error"), "error") => false,
+                (Some("finish" | "error"), _) => true,
+                _ => false,
+            };
+            if terminal_conflict {
+                warn!(
+                    group_id,
+                    stored_status = ?existing_row.status,
+                    incoming_status = status,
+                    "Ignoring tool group transition away from persisted terminal state"
+                );
+                return;
+            }
             let update = nomifun_db::MessageRowUpdate {
                 content: Some(content),
                 status: Some(Some(status.to_owned())),
@@ -1553,7 +1848,7 @@ impl StreamRelay {
             let row = MessageRow {
                 id: group_id.clone(),
                 conversation_id: self.conv_id(),
-                msg_id: Some(group_id),
+                msg_id: Some(self.msg_id.clone()),
                 r#type: "tool_group".into(),
                 content,
                 position: Some("left".into()),
@@ -1844,6 +2139,7 @@ mod tests {
 
         tx.send(AgentStreamEvent::Plan(PlanEventData {
             session_id: Some("session-1".into()),
+            source_call_id: None,
             entries: vec![
                 json!({ "content": "Inspect current renderer path", "status": "completed" }),
                 json!({ "content": "Persist plan rows", "status": "in_progress" }),
@@ -1864,7 +2160,106 @@ mod tests {
         assert_eq!(content["session_id"], "session-1");
         assert_eq!(content["entries"].as_array().unwrap().len(), 2);
         assert_eq!(content["entries"][1]["status"], "in_progress");
+        let updates = repo.take_updates();
+        let (_, terminal_update) = updates
+            .iter()
+            .find(|(id, _)| id == "asst-1:plan:session-1")
+            .expect("incomplete plan must be closed with the turn");
+        assert_eq!(
+            terminal_update.status.as_ref().map(|status| status.as_deref()),
+            Some(Some("finish"))
+        );
         assert!(outcome.emitted_response);
+    }
+
+    #[tokio::test]
+    async fn run_plan_event_completes_and_hides_its_source_tool() {
+        use nomifun_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(nomifun_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "1".into(),
+            "asst-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "tc-plan".into(),
+            name: "update_plan".into(),
+            args: json!({"plan": []}),
+            status: ToolCallStatus::Running,
+            input: Some(json!({"plan": []})),
+            output: None,
+            description: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Plan(PlanEventData {
+            session_id: Some("update_plan".into()),
+            source_call_id: Some("tc-plan".into()),
+            entries: vec![json!({"content": "Build game", "status": "completed"})],
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Error(ErrorEventData::legacy("later provider error", None)))
+            .unwrap();
+
+        relay.consume(rx).await;
+
+        let updates = repo.take_updates();
+        let source_updates: Vec<_> = updates
+            .iter()
+            .filter(|(id, _)| id == "asst-1:tool:tc-plan")
+            .collect();
+        assert_eq!(source_updates.len(), 1, "source tool must settle exactly once");
+        let update = &source_updates[0].1;
+        assert_eq!(update.status.as_ref().map(|v| v.as_deref()), Some(Some("finish")));
+        assert_eq!(update.hidden, Some(true));
+        let content: serde_json::Value =
+            serde_json::from_str(update.content.as_deref().expect("completed source content")).unwrap();
+        assert_eq!(content["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn run_terminal_error_closes_preparing_agent_status() {
+        use nomifun_ai_agent::protocol::events::AgentStatusEventData;
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(nomifun_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "1".into(),
+            "turn-a".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::AgentStatus(AgentStatusEventData {
+            backend: "nomi".into(),
+            status: "preparing".into(),
+            agent_name: Some("Nomi".into()),
+            session_id: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Error(ErrorEventData::legacy("provider failed", None)))
+            .unwrap();
+
+        relay.consume(rx).await;
+
+        let updates = repo.take_updates();
+        let (_, update) = updates
+            .iter()
+            .find(|(id, _)| id == "turn-a:agent_status:model_activity")
+            .expect("preparing agent status must close on terminal error");
+        assert_eq!(update.status.as_ref().map(|s| s.as_deref()), Some(Some("error")));
+        let content: serde_json::Value = serde_json::from_str(update.content.as_deref().unwrap()).unwrap();
+        assert_eq!(content["status"], "error");
     }
 
     #[tokio::test]
@@ -1922,6 +2317,56 @@ mod tests {
         assert_eq!(text_event_msg_ids.len(), 2);
         assert_eq!(text_event_msg_ids[0], "asst-1");
         assert_ne!(text_event_msg_ids[0], text_event_msg_ids[1]);
+    }
+
+    #[tokio::test]
+    async fn terminal_error_does_not_relabel_completed_text_segments() {
+        use nomifun_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(nomifun_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "1".into(),
+            "turn-a".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::Text(TextEventData { content: "Before".into() }))
+            .unwrap();
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "tc-1".into(),
+            name: "Read".into(),
+            args: json!({}),
+            status: ToolCallStatus::Completed,
+            input: None,
+            output: Some("ok".into()),
+            description: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Text(TextEventData { content: "After".into() }))
+            .unwrap();
+        tx.send(AgentStreamEvent::Error(ErrorEventData::legacy("provider failed", None)))
+            .unwrap();
+
+        relay.consume(rx).await;
+
+        let inserts = repo.take_inserts();
+        let text_rows: Vec<_> = inserts.iter().filter(|row| row.r#type == "text").collect();
+        assert_eq!(text_rows.len(), 2);
+        assert_eq!(text_rows[0].status.as_deref(), Some("finish"));
+        assert_eq!(text_rows[1].status.as_deref(), Some("error"));
+        let updates = repo.take_updates();
+        assert!(
+            updates.iter().all(|(id, update)| {
+                id != &text_rows[0].id
+                    || update.status.as_ref().map(|status| status.as_deref()) != Some(Some("error"))
+            }),
+            "a later provider error must not corrupt an earlier completed text segment"
+        );
     }
 
     #[tokio::test]
@@ -2060,12 +2505,140 @@ mod tests {
         let updates = repo.take_updates();
         let (_, update) = updates
             .iter()
-            .find(|(id, _)| id == "tc-write")
+            .find(|(id, _)| id == "asst-1:tool:tc-write")
             .expect("active tool call should be marked failed when the turn is truncated");
         assert_eq!(update.status.as_ref().map(|v| v.as_deref()), Some(Some("error")));
         let content: serde_json::Value = serde_json::from_str(update.content.as_deref().expect("updated content")).unwrap();
         assert_eq!(content["status"], "error");
         assert_eq!(content["output"], "The turn ended before this tool completed: max_tokens");
+    }
+
+    #[tokio::test]
+    async fn run_scopes_tool_message_identity_to_the_turn() {
+        use nomifun_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+
+        let repo = Arc::new(RecordingRepo::new());
+        for turn_id in ["turn-a", "turn-b"] {
+            let bus = Arc::new(nomifun_realtime::BroadcastEventBus::new(64));
+            let (tx, _) = broadcast::channel(64);
+            let relay = StreamRelay::new(
+                "1".into(),
+                turn_id.into(),
+                "user-1".into(),
+                repo.clone(),
+                bus,
+                None,
+            );
+            let rx = tx.subscribe();
+            tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+                call_id: "provider-call-1".into(),
+                name: "Read".into(),
+                args: json!({"path": "a.txt"}),
+                status: ToolCallStatus::Completed,
+                input: None,
+                output: Some("ok".into()),
+                description: None,
+            }))
+            .unwrap();
+            tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+            relay.consume(rx).await;
+        }
+
+        let inserts = repo.take_inserts();
+        let ids: Vec<_> = inserts
+            .iter()
+            .filter(|row| row.r#type == "tool_call")
+            .map(|row| row.id.as_str())
+            .collect();
+        assert_eq!(ids, ["turn-a:tool:provider-call-1", "turn-b:tool:provider-call-1"]);
+        let turns: Vec<_> = inserts
+            .iter()
+            .filter(|row| row.r#type == "tool_call")
+            .map(|row| serde_json::from_str::<serde_json::Value>(&row.content).unwrap()["turn_id"].clone())
+            .collect();
+        assert_eq!(turns, [json!("turn-a"), json!("turn-b")]);
+    }
+
+    #[tokio::test]
+    async fn run_does_not_regress_a_terminal_tool_to_running() {
+        use nomifun_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(nomifun_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "1".into(),
+            "turn-a".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let rx = tx.subscribe();
+        let event = |status, output| {
+            AgentStreamEvent::ToolCall(ToolCallEventData {
+                call_id: "provider-call-1".into(),
+                name: "Bash".into(),
+                args: json!({"command": "true"}),
+                status,
+                input: None,
+                output,
+                description: None,
+            })
+        };
+        tx.send(event(ToolCallStatus::Completed, Some("ok".into()))).unwrap();
+        tx.send(event(ToolCallStatus::Running, None)).unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        let updates = repo.take_updates();
+        assert!(
+            updates.iter().all(|(_, update)| update.status.as_ref().map(|s| s.as_deref()) != Some(Some("work"))),
+            "a late running event must not overwrite a terminal tool"
+        );
+        assert!(
+            updates.iter().all(|(_, update)| update.status.as_ref().map(|s| s.as_deref()) != Some(Some("error"))),
+            "a late running event must not reactivate the tool for terminal cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistence_does_not_regress_a_terminal_tool_after_relay_restart() {
+        use nomifun_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+
+        let repo = Arc::new(RecordingRepo::new());
+        for status in [ToolCallStatus::Completed, ToolCallStatus::Running] {
+            let bus = Arc::new(nomifun_realtime::BroadcastEventBus::new(64));
+            let (tx, _) = broadcast::channel(64);
+            let relay = StreamRelay::new(
+                "1".into(),
+                "turn-a".into(),
+                "user-1".into(),
+                repo.clone(),
+                bus,
+                None,
+            );
+            let rx = tx.subscribe();
+            tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+                call_id: "provider-call-1".into(),
+                name: "Bash".into(),
+                args: json!({"command": "true"}),
+                status,
+                input: None,
+                output: (status == ToolCallStatus::Completed).then(|| "ok".into()),
+                description: None,
+            }))
+            .unwrap();
+            tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+            relay.consume(rx).await;
+        }
+
+        let updates = repo.take_updates();
+        assert!(
+            updates.iter().all(|(_, update)| update.status.as_ref().map(|s| s.as_deref()) != Some(Some("work"))),
+            "stored terminal state must reject a late running update after relay restart"
+        );
     }
 
     #[tokio::test]
@@ -2454,6 +3027,7 @@ mod tests {
             None,
         );
 
+        let mut ws_rx = bus.subscribe();
         let rx = tx.subscribe();
 
         // Send text then drop sender (channel closes without Finish)
@@ -2469,8 +3043,19 @@ mod tests {
         // Should still persist the partial text
         let inserts = repo.take_inserts();
         assert_eq!(inserts.len(), 1);
+        assert_eq!(inserts[0].status.as_deref(), Some("error"));
         let content: serde_json::Value = serde_json::from_str(&inserts[0].content).unwrap();
         assert_eq!(content["content"], "partial");
+        let mut ws_events = Vec::new();
+        while let Ok(event) = ws_rx.try_recv() {
+            ws_events.push(event);
+        }
+        assert!(
+            ws_events
+                .iter()
+                .any(|event| event.name == "message.stream" && event.data["type"] == "error"),
+            "unexpected channel closure must be visible as a terminal error"
+        );
     }
 
     #[tokio::test]
@@ -2837,11 +3422,12 @@ mod tests {
         let tool_msg = inserts.iter().find(|m| m.r#type == "tool_call");
         assert!(tool_msg.is_some());
         let msg = tool_msg.unwrap();
-        assert_eq!(msg.id, "tc-001");
+        assert_eq!(msg.id, "asst-1:tool:tc-001");
+        assert_eq!(msg.msg_id.as_deref(), Some("asst-1"));
         assert_eq!(msg.status.as_deref(), Some("work"));
 
         let updates = repo.take_updates();
-        let tool_update = updates.iter().find(|(id, _)| id == "tc-001");
+        let tool_update = updates.iter().find(|(id, _)| id == "asst-1:tool:tc-001");
         assert!(tool_update.is_some());
         let (_, upd) = tool_update.unwrap();
         assert_eq!(upd.status, Some(Some("finish".to_owned())));
@@ -2922,11 +3508,14 @@ mod tests {
         let acp_msg = inserts.iter().find(|m| m.r#type == "acp_tool_call");
         assert!(acp_msg.is_some());
         let msg = acp_msg.unwrap();
-        assert_eq!(msg.id, "atc-001");
+        assert_eq!(msg.id, "asst-1:acp_tool:atc-001");
+        assert_eq!(msg.msg_id.as_deref(), Some("asst-1"));
         assert_eq!(msg.status.as_deref(), Some("work"));
 
         let updates = repo.take_updates();
-        let acp_update = updates.iter().find(|(id, _)| id == "atc-001");
+        let acp_update = updates
+            .iter()
+            .find(|(id, _)| id == "asst-1:acp_tool:atc-001");
         assert!(acp_update.is_some());
         let (_, upd) = acp_update.unwrap();
         assert_eq!(upd.status, Some(Some("finish".to_owned())));
@@ -2951,6 +3540,111 @@ mod tests {
         assert!(
             update_obj.get("raw_output").is_some(),
             "raw_output must be present after merge"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_acp_terminal_update_without_start_is_upserted() {
+        use nomifun_ai_agent::protocol::events::tool_call::{
+            AcpToolCallEventData, AcpToolCallSessionUpdateKind, AcpToolCallStatus, AcpToolCallUpdateData,
+        };
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(nomifun_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "1".into(),
+            "turn-a".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
+            session_id: "sess-1".into(),
+            update: AcpToolCallUpdateData {
+                session_update: AcpToolCallSessionUpdateKind::ToolCallUpdate,
+                tool_call_id: "atc-001".into(),
+                status: Some(AcpToolCallStatus::Completed),
+                title: Some("Bash".into()),
+                kind: None,
+                raw_input: None,
+                raw_output: Some(json!("Exit code: 0")),
+                content: None,
+                locations: None,
+            },
+            meta: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        let inserts = repo.take_inserts();
+        let row = inserts
+            .iter()
+            .find(|row| row.r#type == "acp_tool_call")
+            .expect("terminal ACP update must survive a missing start event");
+        assert_eq!(row.id, "turn-a:acp_tool:atc-001");
+        assert_eq!(row.status.as_deref(), Some("finish"));
+        let content: serde_json::Value = serde_json::from_str(&row.content).unwrap();
+        assert_eq!(content["turn_id"], "turn-a");
+    }
+
+    #[tokio::test]
+    async fn run_marks_active_acp_tool_failed_when_turn_is_truncated() {
+        use nomifun_ai_agent::protocol::events::{TurnStopReason, tool_call::{
+            AcpToolCallEventData, AcpToolCallSessionUpdateKind, AcpToolCallStatus, AcpToolCallUpdateData,
+        }};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(nomifun_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "1".into(),
+            "turn-a".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
+            session_id: "sess-1".into(),
+            update: AcpToolCallUpdateData {
+                session_update: AcpToolCallSessionUpdateKind::ToolCall,
+                tool_call_id: "atc-001".into(),
+                status: Some(AcpToolCallStatus::InProgress),
+                title: Some("Bash".into()),
+                kind: None,
+                raw_input: Some(json!({"command": "sleep 10"})),
+                raw_output: None,
+                content: None,
+                locations: None,
+            },
+            meta: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData {
+            session_id: None,
+            stop_reason: Some(TurnStopReason::MaxTokens),
+        }))
+        .unwrap();
+
+        relay.consume(rx).await;
+
+        let updates = repo.take_updates();
+        let (_, update) = updates
+            .iter()
+            .find(|(id, _)| id == "turn-a:acp_tool:atc-001")
+            .expect("active ACP tool must be terminalized");
+        assert_eq!(update.status.as_ref().map(|s| s.as_deref()), Some(Some("error")));
+        let content: serde_json::Value = serde_json::from_str(update.content.as_deref().unwrap()).unwrap();
+        assert_eq!(content["update"]["status"], "failed");
+        assert_eq!(
+            content["update"]["raw_output"],
+            "The turn ended before this tool completed: max_tokens"
         );
     }
 
@@ -2996,12 +3690,93 @@ mod tests {
         let group_msg = inserts.iter().find(|m| m.r#type == "tool_group");
         assert!(group_msg.is_some());
         let msg = group_msg.unwrap();
-        assert_eq!(msg.id, "tg-001");
+        assert_eq!(msg.id, "asst-1:tool_group:tg-001");
+        assert_eq!(msg.msg_id.as_deref(), Some("asst-1"));
         assert_eq!(msg.status.as_deref(), Some("finish"));
 
         let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
         assert!(content.is_array());
         assert_eq!(content.as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn run_tool_group_with_failed_entry_persists_error() {
+        use nomifun_ai_agent::protocol::events::tool_call::{ToolCallStatus, ToolGroupEntry};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(nomifun_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "1".into(),
+            "turn-a".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::ToolGroup(vec![
+            ToolGroupEntry {
+                call_id: "tg-001".into(),
+                name: "read_file".into(),
+                status: ToolCallStatus::Completed,
+                description: None,
+            },
+            ToolGroupEntry {
+                call_id: "tg-002".into(),
+                name: "write_file".into(),
+                status: ToolCallStatus::Error,
+                description: Some("permission denied".into()),
+            },
+        ]))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        relay.consume(rx).await;
+
+        let inserts = repo.take_inserts();
+        let row = inserts.iter().find(|row| row.r#type == "tool_group").unwrap();
+        assert_eq!(row.id, "turn-a:tool_group:tg-001");
+        assert_eq!(row.msg_id.as_deref(), Some("turn-a"));
+        assert_eq!(row.status.as_deref(), Some("error"));
+    }
+
+    #[tokio::test]
+    async fn run_marks_active_tool_group_failed_when_channel_closes() {
+        use nomifun_ai_agent::protocol::events::tool_call::{ToolCallStatus, ToolGroupEntry};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(nomifun_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "1".into(),
+            "turn-a".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::ToolGroup(vec![ToolGroupEntry {
+            call_id: "tg-001".into(),
+            name: "Bash".into(),
+            status: ToolCallStatus::Running,
+            description: Some("build".into()),
+        }]))
+        .unwrap();
+        drop(tx);
+
+        relay.consume(rx).await;
+
+        let updates = repo.take_updates();
+        let (_, update) = updates
+            .iter()
+            .find(|(id, _)| id == "turn-a:tool_group:tg-001")
+            .expect("active tool group must be terminalized on channel close");
+        assert_eq!(update.status.as_ref().map(|s| s.as_deref()), Some(Some("error")));
+        let content: serde_json::Value = serde_json::from_str(update.content.as_deref().unwrap()).unwrap();
+        assert_eq!(content[0]["status"], "error");
+        assert!(content[0]["description"].as_str().unwrap().contains("channel_closed"));
     }
 
     // ── Helpers ──────────────────────────────────────────────────
@@ -3137,6 +3912,15 @@ mod tests {
                 total: 0,
                 has_more: false,
             })
+        }
+        async fn get_message(&self, _conv_id: i64, message_id: &str) -> Result<Option<MessageRow>, DbError> {
+            Ok(self
+                .inserts
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|row| row.id == message_id)
+                .cloned())
         }
         async fn insert_message(&self, row: &MessageRow) -> Result<(), DbError> {
             self.inserts.lock().unwrap().push(row.clone());

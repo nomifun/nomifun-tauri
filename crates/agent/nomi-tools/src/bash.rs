@@ -189,6 +189,8 @@ impl Tool for BashTool {
              # Instructions\n\
              - Use PowerShell syntax: Get-ChildItem, Get-Content, Set-Location, $env:NAME, and ';' for sequencing. Run cmd /C \"...\" explicitly only when cmd.exe syntax is required.\n\
              - Use absolute paths to avoid working directory confusion.\n\
+             - Validate browser behavior with the Browser tool. Do not emulate DOM, AudioContext, canvas, or other Web APIs in a long inline `node -e` command.\n\
+             - For multiline code, use Write to create a temporary script in the workspace, execute that script, then remove it if appropriate. This avoids PowerShell interpolation, quoting, and command-length failures.\n\
              - When issuing multiple independent commands, make parallel tool calls instead of chaining them. Chain commands only when later commands depend on earlier ones.\n\
              - You may specify an optional timeout in milliseconds (default 120000, max 600000).\n\
              - For installs, dependency downloads, builds, migrations, or other long commands, choose a generous explicit timeout or use exec_command/write_stdin so you can poll instead of killing the command.\n\n\
@@ -205,6 +207,8 @@ impl Tool for BashTool {
              - Write files: use Write (not echo or cat with heredoc)\n\n\
              # Instructions\n\
              - Use absolute paths to avoid working directory confusion.\n\
+             - Validate browser behavior with the Browser tool. Do not emulate DOM, AudioContext, canvas, or other Web APIs in a long inline `node -e` command.\n\
+             - For multiline code, use Write to create a temporary script in the workspace, execute that script, then remove it if appropriate. This avoids shell interpolation, quoting, and command-length failures.\n\
              - When issuing multiple independent commands, make parallel tool calls instead of chaining them. Use `&&` only when commands depend on each other.\n\
              - You may specify an optional timeout in milliseconds (default 120000, max 600000).\n\
              - For installs, dependency downloads, builds, migrations, or other long commands, choose a generous explicit timeout or use exec_command/write_stdin so you can poll instead of killing the command.\n\n\

@@ -59,6 +59,7 @@ import {
   type TurnDisclosureOutputItem,
 } from './turnDisclosureModel';
 import { getProcessItemState } from './turnProcessState';
+import { isSupersededPlanToolFailure } from './planToolVisibility';
 
 type IMessageVO =
   | TMessage
@@ -715,10 +716,26 @@ const MessageList: React.FC<{
       const message = list[i];
       // Skip hidden and available_commands messages
       if (message.hidden) continue;
+      if (
+        message.type === 'tool_call' &&
+        message.content.name === 'update_plan' &&
+        isSupersededPlanToolFailure(message, list.slice(i + 1))
+      ) {
+        continue;
+      }
       if (message.type === 'available_commands') continue;
       // Plans are no longer rendered inline — they surface in the docked
       // PinnedPlan bar above the composer, which reads the raw list directly.
-      if (message.type === 'plan') continue;
+      // A plan also closes the preceding tool receipt. Without this boundary,
+      // update_plan and the next unrelated file operation are merged and a
+      // failure can be labelled with the later operation's target.
+      if (message.type === 'plan') {
+        toolList = [];
+        toolSourceMessageIds = [];
+        diffsChanges = [];
+        diffsSourceMessageIds = [];
+        continue;
+      }
       // Connection-handshake status banners (connecting/connected/authenticated/
       // session_active) are implementation noise: never render them as chat
       // items, and never let them fragment the tool-execution trace below.

@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, test } from 'bun:test';
-import { transformKnowledgeWritebackEvent, transformMessage, transformUserCreatedEvent } from './chatLib';
+import { composeMessage, transformKnowledgeWritebackEvent, transformMessage, transformUserCreatedEvent } from './chatLib';
 
 const baseWire = (overrides: Record<string, unknown>) =>
   ({
@@ -15,6 +15,21 @@ const baseWire = (overrides: Record<string, unknown>) =>
   }) as any;
 
 describe('transformMessage runtime field normalization', () => {
+  test('composeMessage keeps reused tool call ids isolated by turn', () => {
+    const first = transformMessage(baseWire({
+      msg_id: 'turn-1',
+      type: 'tool_call',
+      data: { call_id: 'call-1', name: 'Read', status: 'completed' },
+    }))!;
+    const second = transformMessage(baseWire({
+      msg_id: 'turn-2',
+      type: 'tool_call',
+      data: { call_id: 'call-1', name: 'Read', status: 'running' },
+    }))!;
+
+    expect(composeMessage(second, [first])).toHaveLength(2);
+  });
+
   test('serializes structured text payloads instead of leaking objects into message content', () => {
     const message = transformMessage(
       baseWire({

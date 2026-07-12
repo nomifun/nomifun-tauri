@@ -1157,6 +1157,7 @@ export const composeMessage = (
 
     const updatedList = list.map((existingMessage) => {
       if (existingMessage.type !== 'tool_group') return existingMessage;
+      if (existingMessage.msg_id !== message.msg_id) return existingMessage;
       if (!existingMessage.content.length) return existingMessage;
 
       let didMergeIntoThisMessage = false;
@@ -1197,9 +1198,13 @@ export const composeMessage = (
   if (message.type === 'tool_call') {
     for (let i = 0, len = list.length; i < len; i++) {
       const msg = list[i];
-      if (msg.type === 'tool_call' && msg.content.call_id === message.content.call_id) {
+      if (
+        msg.type === 'tool_call' &&
+        msg.msg_id === message.msg_id &&
+        msg.content.call_id === message.content.call_id
+      ) {
         // Create new object instead of mutating original
-        return updateMessage(i, { ...msg, content: { ...msg.content, ...message.content } });
+        return updateMessage(i, { ...msg, ...message, content: { ...msg.content, ...message.content } });
       }
     }
     // If no existing tool call found, add new one
@@ -1210,10 +1215,14 @@ export const composeMessage = (
   if (message.type === 'acp_tool_call') {
     for (let i = 0, len = list.length; i < len; i++) {
       const msg = list[i];
-      if (msg.type === 'acp_tool_call' && msg.content.update?.tool_call_id === message.content.update?.tool_call_id) {
+      if (
+        msg.type === 'acp_tool_call' &&
+        msg.msg_id === message.msg_id &&
+        msg.content.update?.tool_call_id === message.content.update?.tool_call_id
+      ) {
         // Create new object instead of mutating original
         const merged = mergeAcpToolCallContent(msg.content, message.content);
-        return updateMessage(i, { ...msg, content: merged });
+        return updateMessage(i, { ...msg, ...message, content: merged });
       }
     }
     // If no existing tool call found, add new one

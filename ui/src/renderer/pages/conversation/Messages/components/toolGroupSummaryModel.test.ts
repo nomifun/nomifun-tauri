@@ -19,6 +19,22 @@ const tool = (item: Partial<NormalizedToolCall> & Pick<NormalizedToolCall, 'key'
 });
 
 describe('buildToolReceiptSummaryParts', () => {
+  test('does not classify update_plan as a file edit', () => {
+    const parts = buildToolReceiptSummaryParts(
+      [tool({ key: 'plan-1', name: 'update_plan', status: 'completed' })],
+      'completed'
+    );
+
+    expect(parts).toEqual([
+      {
+        action: 'generic',
+        count: 1,
+        state: 'completed',
+        target: 'update_plan',
+      },
+    ]);
+  });
+
   test('summarizes mixed file reads and commands as separate receipt parts', () => {
     const parts = buildToolReceiptSummaryParts(
       [

@@ -280,10 +280,10 @@ async fn macos_seatbelt_program_pipe_allows_only_declared_write_roots() {
         .start(allowed)
         .await
         .expect("in-root sandboxed program should start");
-    let ExecutionOutcome::Exited { code, .. } = wait_for_terminal(&supervisor, &handle).await else {
+    let ExecutionOutcome::Exited { code, output, .. } = wait_for_terminal(&supervisor, &handle).await else {
         panic!("in-root sandboxed program must exit");
     };
-    assert_eq!(code, Some(0));
+    assert_eq!(code, Some(0), "sandbox output: {}", output.text());
     assert!(inside_marker.exists());
 
     let mut denied = request(

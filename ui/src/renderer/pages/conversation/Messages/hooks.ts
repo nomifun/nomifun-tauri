@@ -28,10 +28,19 @@ const beforeUpdateMessageListStack: Array<(list: TMessage[]) => TMessage[]> = []
 // Message index cache type definitions
 interface MessageIndex {
   msgIdIndex: Map<string, number>; // msg_id -> index
-  call_idIndex: Map<string, number>; // tool_call.call_id -> index
-  tool_call_idIndex: Map<string, number>; // acp_tool_call.update.tool_call_id -> index
+  call_idIndex: Map<string, number>; // turn + tool_call.call_id -> index
+  tool_call_idIndex: Map<string, number>; // turn + acp tool_call_id -> index
   permission_call_idIndex: Map<string, number>; // permission.content.call_id -> index
 }
+
+const getToolLifecycleKey = (message: TMessage, callId: string): string => {
+  const contentTurnId =
+    message.content && typeof message.content === 'object' && 'turn_id' in message.content
+      ? toDisplayText((message.content as { turn_id?: unknown }).turn_id)
+      : '';
+  const turnId = contentTurnId || message.msg_id || message.id;
+  return `${turnId}:${callId}`;
+};
 
 function getMessageIndexKey(message: TMessage): string | undefined {
   if (!message.msg_id) return undefined;
@@ -92,10 +101,10 @@ function buildMessageIndex(list: TMessage[]): MessageIndex {
       msgIdIndex.set(msgIndexKey, i);
     }
     if (msg.type === 'tool_call' && msg.content?.call_id) {
-      call_idIndex.set(msg.content.call_id, i);
+      call_idIndex.set(getToolLifecycleKey(msg, msg.content.call_id), i);
     }
     if (msg.type === 'acp_tool_call' && msg.content?.update?.tool_call_id) {
-      tool_call_idIndex.set(msg.content.update.tool_call_id, i);
+      tool_call_idIndex.set(getToolLifecycleKey(msg, msg.content.update.tool_call_id), i);
     }
     if (msg.type === 'permission' && msg.content?.call_id) {
       permission_call_idIndex.set(msg.content.call_id, i);
@@ -178,19 +187,20 @@ function composeMessageWithIndex(message: TMessage | undefined, list: TMessage[]
   // tool_call: 使用 call_idIndex 快速查找
   // tool_call: use call_idIndex for fast lookup
   if (message.type === 'tool_call' && message.content?.call_id) {
-    const existingIdx = index.call_idIndex.get(message.content.call_id);
+    const lifecycleKey = getToolLifecycleKey(message, message.content.call_id);
+    const existingIdx = index.call_idIndex.get(lifecycleKey);
     if (existingIdx !== undefined && existingIdx < list.length) {
       const existingMsg = list[existingIdx];
       if (existingMsg.type === 'tool_call') {
         const newList = list.slice();
         const merged = { ...existingMsg.content, ...message.content };
-        newList[existingIdx] = { ...existingMsg, content: merged };
+        newList[existingIdx] = { ...existingMsg, ...message, content: merged };
         return newList;
       }
     }
     // 未找到，添加新消息并更新索引
     const newIdx = list.length;
-    index.call_idIndex.set(message.content.call_id, newIdx);
+    index.call_idIndex.set(lifecycleKey, newIdx);
     const msgIndexKey = getMessageIndexKey(message);
     if (msgIndexKey) index.msgIdIndex.set(msgIndexKey, newIdx);
     return list.concat(message);
@@ -198,19 +208,20 @@ function composeMessageWithIndex(message: TMessage | undefined, list: TMessage[]
 
   // acp_tool_call: use tool_call_idIndex for fast lookup
   if (message.type === 'acp_tool_call' && message.content?.update?.tool_call_id) {
-    const existingIdx = index.tool_call_idIndex.get(message.content.update.tool_call_id);
+    const lifecycleKey = getToolLifecycleKey(message, message.content.update.tool_call_id);
+    const existingIdx = index.tool_call_idIndex.get(lifecycleKey);
     if (existingIdx !== undefined && existingIdx < list.length) {
       const existingMsg = list[existingIdx];
       if (existingMsg.type === 'acp_tool_call') {
         const newList = list.slice();
         const merged = mergeAcpToolCallContent(existingMsg.content, message.content);
-        newList[existingIdx] = { ...existingMsg, content: merged };
+        newList[existingIdx] = { ...existingMsg, ...message, content: merged };
         return newList;
       }
     }
     // 未找到，添加新消息并更新索引
     const newIdx = list.length;
-    index.tool_call_idIndex.set(message.content.update.tool_call_id, newIdx);
+    index.tool_call_idIndex.set(lifecycleKey, newIdx);
     const msgIndexKey = getMessageIndexKey(message);
     if (msgIndexKey) index.msgIdIndex.set(msgIndexKey, newIdx);
     return list.concat(message);
@@ -435,10 +446,10 @@ export const useAddOrUpdateMessage = () => {
           const msgIndexKey = getMessageIndexKey(msg);
           if (msgIndexKey) index.msgIdIndex.set(msgIndexKey, newIdx);
           if (msg.type === 'tool_call' && msg.content?.call_id) {
-            index.call_idIndex.set(msg.content.call_id, newIdx);
+            index.call_idIndex.set(getToolLifecycleKey(msg, msg.content.call_id), newIdx);
           }
           if (msg.type === 'acp_tool_call' && msg.content?.update?.tool_call_id) {
-            index.tool_call_idIndex.set(msg.content.update.tool_call_id, newIdx);
+            index.tool_call_idIndex.set(getToolLifecycleKey(msg, msg.content.update.tool_call_id), newIdx);
           }
           if (msg.type === 'permission' && msg.content?.call_id) {
             index.permission_call_idIndex.set(msg.content.call_id, newIdx);

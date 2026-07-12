@@ -31,7 +31,7 @@ export const getToolMessagesProcessState = (messages: ToolProcessMessage[]): Tur
     return message.content.map((tool) => {
       if (tool.status === 'Confirming') return 'waiting';
       if (tool.status === 'Executing' || tool.status === 'Pending') return 'running';
-      if (tool.status === 'Error') return 'failed';
+      if (tool.status === 'Error') return tool.confirmationDetails?.type === 'exec' ? 'completed' : 'failed';
       if (tool.status === 'Canceled') return 'canceled';
       return 'completed';
     });

@@ -73,6 +73,20 @@ fn bash_description_contains_parallel_guidance() {
     );
 }
 
+#[test]
+fn bash_description_avoids_fragile_inline_browser_test_harnesses() {
+    let tool = bash_tool();
+    let desc = tool.description();
+    assert!(
+        desc.contains("Browser") && desc.contains("node -e"),
+        "Bash description should direct browser validation away from inline node -e mocks"
+    );
+    assert!(
+        desc.contains("temporary script") && desc.contains("Write"),
+        "Bash description should recommend a file-based script for multiline code"
+    );
+}
+
 // --- TC-4.2-02: Read tool description contains usage constraints ---
 
 #[test]

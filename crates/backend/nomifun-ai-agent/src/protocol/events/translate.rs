@@ -97,6 +97,7 @@ pub(crate) fn session_notification_to_events(notif: &SessionNotification) -> Vec
 
             events.push(AgentStreamEvent::Plan(PlanEventData {
                 session_id: Some(session_id),
+                source_call_id: None,
                 entries,
             }));
         }
