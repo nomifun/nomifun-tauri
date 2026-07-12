@@ -149,12 +149,13 @@ pub(crate) fn prepend_knowledge_context(
     }
     let mut block = String::from(
         "[Relevant knowledge-base context, retrieved automatically for this message \
-         — open the full document with knowledge_read if you need more:]\n",
+         — to open a full document, call knowledge_read with the exact opaque handle shown below; \
+         copy the handle unchanged and do not rebuild it from the path:]\n",
     );
     for h in hits {
         block.push_str(&format!(
-            "- {}/{} § {}\n  {}\n",
-            h.kb_name, h.rel_path, h.heading, h.snippet
+            "- {}/{} § {}\n  {}\n  handle: {}\n",
+            h.kb_name, h.rel_path, h.heading, h.snippet, h.handle
         ));
     }
     format!("{block}\n{content}")
@@ -1747,6 +1748,11 @@ mod knowledge_prelude_tests {
         assert!(out.contains("Docs/a/b.md"));
         assert!(out.contains("Title"));
         assert!(out.contains("the snippet"));
+        assert!(out.contains("handle: h"), "proactive hit must expose its opaque handle: {out}");
+        assert!(
+            out.contains("knowledge_read") && out.contains("unchanged"),
+            "proactive guidance must tell the model to copy the handle unchanged: {out}"
+        );
         assert!(out.ends_with("do the task"), "original message preserved at end");
     }
     #[test]

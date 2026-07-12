@@ -65,7 +65,8 @@ impl Tool for KnowledgeSearchTool {
         "Search the knowledge bases mounted into THIS session for relevant documents. \
          Call this FIRST, before answering from memory, whenever the task or question touches \
          any topic the mounted bases may cover. Returns ranked results as `base / path — heading` \
-         with a snippet; then open the full document with the Read tool using the given path. \
+         with a snippet and an opaque `handle`; read the full document by calling knowledge_read \
+         with that exact handle. Copy the handle unchanged and do not rebuild it from the path. \
          This searches the real base content directly (not the workspace mount), so it always \
          finds matches even when Grep/Glob cannot."
     }
@@ -511,6 +512,14 @@ mod tests {
     fn tool_with(hits: Vec<KnowledgeHit>, kb_ids: Vec<String>) -> (KnowledgeSearchTool, Arc<FakeSink>) {
         let sink = Arc::new(FakeSink { hits, last_query: std::sync::Mutex::new(String::new()) });
         (KnowledgeSearchTool::new(sink.clone(), kb_ids), sink)
+    }
+
+    #[test]
+    fn search_description_requires_knowledge_read_handle() {
+        let (tool, _) = tool_with(vec![], vec!["kb1".into()]);
+        let description = tool.description();
+        assert!(description.contains("knowledge_read") && description.contains("handle"));
+        assert!(!description.contains("Read tool using the given path"));
     }
 
     #[tokio::test]
