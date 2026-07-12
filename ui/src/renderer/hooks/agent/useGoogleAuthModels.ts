@@ -10,6 +10,7 @@ import useSWR from 'swr';
 
 export interface GoogleAuthModelResult {
   isGoogleAuth: boolean;
+  isLoading: boolean;
   subscriptionStatus?: {
     isSubscriber: boolean;
     tier?: string;
@@ -19,11 +20,13 @@ export interface GoogleAuthModelResult {
 }
 
 export const useGoogleAuthModels = (): GoogleAuthModelResult => {
-  const { data: googleConfig } = useSWR('google.config', () => configService.get('google.config'));
+  const { data: googleConfig, isLoading: isGoogleConfigLoading } = useSWR('google.config', () =>
+    configService.get('google.config')
+  );
   const proxyKey = googleConfig?.proxy || '';
 
   // Check whether Google Auth CLI is ready.
-  const { data: isGoogleAuth } = useSWR('google.auth.status' + proxyKey, async () => {
+  const { data: isGoogleAuth, isLoading: isGoogleAuthLoading } = useSWR('google.auth.status' + proxyKey, async () => {
     const data = await ipcBridge.googleAuth.status.invoke({ proxy: googleConfig?.proxy });
     return data.success;
   });
@@ -38,6 +41,7 @@ export const useGoogleAuthModels = (): GoogleAuthModelResult => {
 
   return {
     isGoogleAuth: Boolean(isGoogleAuth),
+    isLoading: isGoogleConfigLoading || isGoogleAuthLoading,
     subscriptionStatus: subscriptionResponse ?? undefined,
   };
 };

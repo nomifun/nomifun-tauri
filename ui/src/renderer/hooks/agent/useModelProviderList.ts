@@ -8,6 +8,8 @@ import { hasSpecificModelCapability } from '@/renderer/utils/model/modelCapabili
 
 export interface ModelProviderListResult {
   providers: IProvider[];
+  configuredProviders: IProvider[];
+  isLoading: boolean;
   getAvailableModels: (provider: IProvider) => string[];
   formatModelLabel: (provider: { platform?: string } | undefined, modelName?: string) => string;
 }
@@ -35,9 +37,9 @@ export const useProvidersQuery = () => {
  * and exposes helpers consumed by both conversation and channel settings.
  */
 export const useModelProviderList = (): ModelProviderListResult => {
-  const { isGoogleAuth } = useGoogleAuthModels();
+  const { isGoogleAuth, isLoading: isGoogleAuthLoading } = useGoogleAuthModels();
 
-  const { data: modelConfig } = useProvidersQuery();
+  const { data: modelConfig, isLoading: isProvidersLoading } = useProvidersQuery();
 
   // Mutable cache for available-model filtering
   const available_modelsCacheRef = useRef(new Map<string, string[]>());
@@ -71,11 +73,8 @@ export const useModelProviderList = (): ModelProviderListResult => {
     return result;
   }, []);
 
-  const providers = useMemo(() => {
-    let list: IProvider[] = Array.isArray(modelConfig) ? modelConfig : [];
-    // 过滤掉被禁用的 provider（默认为启用）
-    list = list.filter((p) => p.enabled !== false);
-
+  const configuredProviders = useMemo(() => {
+    const list: IProvider[] = Array.isArray(modelConfig) ? modelConfig : [];
     if (isGoogleAuth) {
       const googleProvider: IProvider = {
         id: GOOGLE_AUTH_PROVIDER_ID,
@@ -87,16 +86,28 @@ export const useModelProviderList = (): ModelProviderListResult => {
         capabilities: [{ type: 'text' }, { type: 'vision' }, { type: 'function_calling' }],
         enabled: true, // Google Auth provider 始终启用
       } as unknown as IProvider;
-      list = [googleProvider, ...list];
+      return [googleProvider, ...list];
     }
+    return list;
+  }, [isGoogleAuth, modelConfig]);
+
+  const providers = useMemo(() => {
+    // 过滤掉被禁用的 provider（默认为启用）
+    const list = configuredProviders.filter((p) => p.enabled !== false);
     // 过滤掉没有可用模型的 provider
     return list.filter((p) => getAvailableModels(p).length > 0);
-  }, [getAvailableModels, isGoogleAuth, modelConfig]);
+  }, [configuredProviders, getAvailableModels]);
 
   const formatModelLabel = useCallback((_provider: { platform?: string } | undefined, modelName?: string) => {
     if (!modelName) return '';
     return modelName;
   }, []);
 
-  return { providers, getAvailableModels, formatModelLabel };
+  return {
+    providers,
+    configuredProviders,
+    isLoading: isProvidersLoading || isGoogleAuthLoading,
+    getAvailableModels,
+    formatModelLabel,
+  };
 };
