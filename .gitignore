@@ -1,6 +1,8 @@
 # Rust
 /target/
 **/target/
+# Task-scoped Cargo target dirs from local test/debug runs
+/build-task*/
 /build.noindex/
 Cargo.lock.bak
 
