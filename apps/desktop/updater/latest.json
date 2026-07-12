@@ -1,19 +1,15 @@
 {
-  "version": "0.2.16",
-  "notes": "- 修复 macOS 自动更新在跨设备安装位置的安全拦截，并补充恢复提示，降低更新失败后的处理成本。\n- 修复终端 UTF-8 locale 继承与默认策略，改善中文/Unicode 文件名和分块输出显示。\n- 优化会话工作区右侧工具栏，使入口保持贴边、布局更紧凑。\n- 优化 Companion 记忆面板预览与独立窗口生命周期。\n- 发布说明：本次为 macOS 首发，已包含 universal DMG 和 Tauri updater 包；Windows/Linux 产物后续在对应平台补发。",
-  "pub_date": "2026-07-11T12:02:31.337Z",
+  "version": "0.2.17",
+  "notes": "修复受控 Provider 的系统流程与配置管理覆盖，确保新旧 Provider 的创建、更新和删除行为一致。\n\n强化 Bash 和终端命令的受控执行、进程回收与跨平台可靠性，降低残留子进程和会话异常风险。\n\n新增计划任务操作菜单，并优化任务列表的响应式布局与检索体验。\n\n优化需求筛选与排序交互：筛选状态更清晰，弹层定位和可读性更稳定。",
+  "pub_date": "2026-07-12T05:19:13.975Z",
   "platforms": {
     "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxOC9QVUxCZ2duRDZ0d09TWUF6TDFnOEhRMXE2ekFJdGFXcDgwbnNmRURRNHo1Z1FLN2dWUUQrMFo1TVB6bW5Rb3A4VnhEVjVNMlFWYTMrc2JQSy9kamdzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNzY3NTg2CWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6CjhEalNKVlJRMlRJOG56SGl4UGhkdFFBcXpxUHlaSllEd09wTzUyemJhV1ZST3BURSs0eThQK0ZHaUVkNmViMDNFRHhZYVBKR2lhNEpneEczZ0JWSUFnPT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.16/NomiFun.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODRlVkxLOUZ6dmFVdElEQ0h1akVTVDNrQ2dEbHlDdm5IUmlvdG04Snc1OTFucWdDcTZad29jZnpOR1BDd1ZvS3F1a0pBZTd4L0RqTnVvZGVnc0JWTGdBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzODMzNDgwCWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6Cm1sOGNKcUhvNUgyNHEvQlpuMXcxZ2lZNExjT1lON3dUL2ZqVHBwM0NLODl4MloycVVwaUlxb3RycEpuNmc5Zlc5VHZiT0VLcElKMXhabnBaRjlMRENRPT0K",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.17/NomiFun.app.tar.gz"
     },
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxOC9QVUxCZ2duRDZ0d09TWUF6TDFnOEhRMXE2ekFJdGFXcDgwbnNmRURRNHo1Z1FLN2dWUUQrMFo1TVB6bW5Rb3A4VnhEVjVNMlFWYTMrc2JQSy9kamdzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNzY3NTg2CWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6CjhEalNKVlJRMlRJOG56SGl4UGhkdFFBcXpxUHlaSllEd09wTzUyemJhV1ZST3BURSs0eThQK0ZHaUVkNmViMDNFRHhZYVBKR2lhNEpneEczZ0JWSUFnPT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.16/NomiFun.app.tar.gz"
-    },
-    "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODI3M08xNlRFQVZMOEFFMzlZNHFRZjBWNExiSUFDZG5YRGIyUHBVejllZzFxdDJzc0xNTW5scm8zWWU3WW96SVdsbktSNVptdVpmaGZoWU5DRWVmYUFnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNzcxMzUwCWZpbGU6Tm9taUZ1bl8wLjIuMTZfeDY0LXNldHVwLmV4ZQplMnovU0RzUjBjZmh1bDQxVjUzR1Y0Uy96dzFoR3BlWXV6eTIrWkpoMG5nMS9KNGJVaTNsOXA1RGJaOWg1UXlUTWRPUnoyWjdjWHVNUGcvN21HdERDQT09Cg==",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.16/NomiFun_0.2.16_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODRlVkxLOUZ6dmFVdElEQ0h1akVTVDNrQ2dEbHlDdm5IUmlvdG04Snc1OTFucWdDcTZad29jZnpOR1BDd1ZvS3F1a0pBZTd4L0RqTnVvZGVnc0JWTGdBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzODMzNDgwCWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6Cm1sOGNKcUhvNUgyNHEvQlpuMXcxZ2lZNExjT1lON3dUL2ZqVHBwM0NLODl4MloycVVwaUlxb3RycEpuNmc5Zlc5VHZiT0VLcElKMXhabnBaRjlMRENRPT0K",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.17/NomiFun.app.tar.gz"
     }
   }
 }
