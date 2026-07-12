@@ -11,12 +11,14 @@ import {
   isAuthExpiredHttpError,
   isBackendHttpError,
   isHandledAuthExpiredHttpError,
+  wsEmitter,
 } from './httpBridge';
 
 const realFetch = globalThis.fetch;
 
 const realWindow = (globalThis as { window?: Window }).window;
 const realDocument = (globalThis as { document?: Document }).document;
+const realWebSocket = globalThis.WebSocket;
 
 function installBrowserGlobals(windowPatch: Partial<Window> & { __backendPort?: number; __nomiLocalTrust?: string }) {
   (globalThis as { window?: unknown }).window = {
@@ -166,6 +168,80 @@ describe('httpRequest client deadline + network-failure diagnosis', () => {
       expect(location.hash).toBe('');
     } finally {
       globalThis.fetch = realFetch;
+      restoreBrowserGlobals();
+    }
+  });
+});
+
+describe('httpBridge WebSocket heartbeat', () => {
+  test('handles application heartbeat internally', () => {
+    class FakeWebSocket {
+      static readonly CONNECTING = 0;
+      static readonly OPEN = 1;
+      static readonly CLOSING = 2;
+      static readonly CLOSED = 3;
+      static readonly instances: FakeWebSocket[] = [];
+
+      readyState = FakeWebSocket.OPEN;
+      readonly sent: string[] = [];
+      private readonly listeners = new Map<string, Array<(event: unknown) => void>>();
+
+      constructor(..._args: unknown[]) {
+        FakeWebSocket.instances.push(this);
+      }
+
+      addEventListener(type: string, listener: (event: unknown) => void) {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(listener);
+        this.listeners.set(type, listeners);
+      }
+
+      send(data: string) {
+        this.sent.push(data);
+      }
+
+      close() {
+        this.readyState = FakeWebSocket.CLOSED;
+      }
+
+      dispatch(type: string, event: unknown) {
+        for (const listener of this.listeners.get(type) ?? []) {
+          listener(event);
+        }
+      }
+    }
+
+    installBrowserGlobals({
+      location: {
+        protocol: 'http:',
+        host: 'localhost:25808',
+        pathname: '/sessions',
+        hash: '',
+      } as Location,
+    });
+    globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+
+    let unsubscribe = () => {};
+    let socket: FakeWebSocket | undefined;
+    try {
+      const dispatched: unknown[] = [];
+      unsubscribe = wsEmitter<unknown>('ping').on((payload) => dispatched.push(payload));
+      socket = FakeWebSocket.instances[0];
+      if (!socket) throw new Error('httpBridge did not create a WebSocket');
+
+      socket.dispatch('message', {
+        data: JSON.stringify({ name: 'ping', data: { timestamp: 123 } }),
+      });
+
+      expect(socket.sent.length).toBe(1);
+      const pong = JSON.parse(socket.sent[0]) as { name: string; data: { timestamp: unknown } };
+      expect(pong.name).toBe('pong');
+      expect(typeof pong.data.timestamp).toBe('number');
+      expect(dispatched.length).toBe(0);
+    } finally {
+      unsubscribe();
+      socket?.close();
+      globalThis.WebSocket = realWebSocket;
       restoreBrowserGlobals();
     }
   });

@@ -698,6 +698,17 @@ function ensureWs(): void {
       };
       const eventName = msg.name ?? msg.event;
       const payload = msg.data ?? msg.payload;
+      if (eventName === 'ping') {
+        if (current.readyState === WebSocket.OPEN) {
+          current.send(
+            JSON.stringify({
+              name: 'pong',
+              data: { timestamp: Date.now() },
+            })
+          );
+        }
+        return;
+      }
       if (isDebugEnabled('debug:ws') && eventName && !NOISY_WS_EVENTS.has(eventName)) {
         console.debug('[WS:msg]', eventName, JSON.stringify(payload).slice(0, 200));
       }
