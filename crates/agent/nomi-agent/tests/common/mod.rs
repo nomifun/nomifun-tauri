@@ -249,6 +249,7 @@ pub fn test_config() -> Config {
         max_tokens: 4096,
         max_turns: Some(10),
         system_prompt: Some("You are a test assistant.".to_string()),
+        project_instructions: Default::default(),
         thinking: None,
         prompt_caching: false,
         compat: nomi_config::compat::ProviderCompat::anthropic_defaults(),

@@ -27,6 +27,7 @@ fn openai_config(api_key: &str) -> Config {
         max_tokens: 256,
         max_turns: Some(3),
         system_prompt: Some("You are a helpful assistant. Be concise.".to_string()),
+        project_instructions: Default::default(),
         thinking: None,
         prompt_caching: false,
         compat: ProviderCompat::openai_defaults(),

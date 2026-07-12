@@ -6,7 +6,6 @@ use nomi_skills::prompt::format_skills_within_budget;
 use nomi_skills::types::SkillMetadata;
 use nomi_types::message::{ContentBlock, Message, Role};
 
-use crate::agents_md;
 use crate::plan::prompt as plan_prompt;
 
 /// Session-scoped cache for system prompt sections.
@@ -47,6 +46,12 @@ impl SystemPromptCache {
     /// Invalidate all cached sections (e.g., on /compact).
     pub fn invalidate_all(&mut self) {
         self.sections.clear();
+        self.joined = None;
+    }
+
+    /// Install the immutable AGENTS.md snapshot resolved by session bootstrap.
+    pub fn set_agents_md(&mut self, instructions: String) {
+        self.sections.insert("agents_md", instructions);
         self.joined = None;
     }
 }
@@ -224,12 +229,10 @@ pub fn build_system_prompt(
         parts.push(custom_cached.clone());
     }
 
-    // Section: AGENTS.md (session permanent, hierarchical)
-    let agents_section = cache.sections.entry("agents_md").or_insert_with(|| {
-        let files = agents_md::collect_agents_md(cwd);
-        agents_md::format_agents_md_section(&files)
-    });
-    if !agents_section.is_empty() {
+    // Section: AGENTS.md (session permanent, resolved once by bootstrap)
+    if let Some(agents_section) = cache.sections.get("agents_md")
+        && !agents_section.is_empty()
+    {
         parts.push(agents_section.clone());
     }
 
@@ -766,8 +769,14 @@ mod tests {
         std::fs::write(cwd.join("AGENTS.md"), "AGENTS_CONTENT_HERE").unwrap();
         std::fs::write(cwd.join("CLAUDE.md"), "CLAUDE_CONTENT_HERE").unwrap();
 
+        let snapshot = crate::agents_md::resolve_agents_md(
+            cwd,
+            &nomi_config::config::ProjectInstructionsConfig::default(),
+        );
+        let mut cache = SystemPromptCache::new();
+        cache.set_agents_md(snapshot.formatted);
         let result = build_system_prompt(
-            &mut SystemPromptCache::new(),
+            &mut cache,
             None,
             &cwd.to_string_lossy(),
             "test-model",
@@ -826,6 +835,31 @@ mod tests {
             !result.contains("(project instructions)"),
             "no project instructions should be injected"
         );
+    }
+
+    #[test]
+    fn pre_resolved_agents_are_composed_after_custom_prompt_before_environment() {
+        let mut cache = SystemPromptCache::new();
+        cache.set_agents_md("PRE_RESOLVED_PROJECT_RULE".to_owned());
+
+        let result = build_system_prompt(
+            &mut cache,
+            Some("CUSTOM_PROMPT_MARKER"),
+            "/workspace/project",
+            "test-model",
+            &[],
+            None,
+            None,
+            false,
+            false,
+            false,
+        );
+
+        let custom = result.find("CUSTOM_PROMPT_MARKER").unwrap();
+        let agents = result.find("PRE_RESOLVED_PROJECT_RULE").unwrap();
+        let environment = result.find("Working directory:").unwrap();
+        assert!(custom < agents);
+        assert!(agents < environment);
     }
 
     // --- Memory integration tests ---
@@ -951,8 +985,14 @@ mod tests {
 
         let skills = vec![make_test_skill("test-skill", "A skill", false, false)];
 
+        let snapshot = crate::agents_md::resolve_agents_md(
+            cwd,
+            &nomi_config::config::ProjectInstructionsConfig::default(),
+        );
+        let mut cache = SystemPromptCache::new();
+        cache.set_agents_md(snapshot.formatted);
         let result = build_system_prompt(
-            &mut SystemPromptCache::new(),
+            &mut cache,
             None,
             &cwd.to_string_lossy(),
             "test-model",

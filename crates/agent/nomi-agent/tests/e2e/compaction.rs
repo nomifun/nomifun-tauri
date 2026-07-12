@@ -38,6 +38,7 @@ fn openai_config(api_key: &str) -> Config {
         system_prompt: Some(
             "You are a helpful assistant. Be concise. Answer exactly what is asked.".to_string(),
         ),
+        project_instructions: Default::default(),
         thinking: None,
         prompt_caching: false,
         compat: ProviderCompat::openai_defaults(),

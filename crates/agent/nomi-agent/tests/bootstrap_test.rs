@@ -1,9 +1,14 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use nomi_agent::bootstrap::AgentBootstrap;
 use nomi_agent::output::null_sink::NullSink;
 use nomi_config::compat::ProviderCompat;
 use nomi_config::config::{Config, ProviderType};
+use nomi_providers::{LlmProvider, ProviderError};
+use nomi_types::llm::{LlmEvent, LlmRequest};
+use nomi_types::message::{StopReason, TokenUsage};
+use tokio::sync::mpsc;
 
 fn minimal_config() -> Config {
     Config {
@@ -15,6 +20,7 @@ fn minimal_config() -> Config {
         max_tokens: 1024,
         max_turns: Some(5),
         system_prompt: None,
+        project_instructions: Default::default(),
         thinking: None,
         prompt_caching: false,
         compat: ProviderCompat::openai_defaults(),
@@ -33,6 +39,28 @@ fn minimal_config() -> Config {
 
 fn null_output() -> Arc<dyn nomi_agent::output::OutputSink> {
     Arc::new(NullSink)
+}
+
+struct CapturingProvider {
+    systems: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl LlmProvider for CapturingProvider {
+    async fn stream(
+        &self,
+        request: &LlmRequest,
+    ) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
+        self.systems.lock().unwrap().push(request.system.clone());
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(LlmEvent::Done {
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage::default(),
+        })
+        .await
+        .unwrap();
+        Ok(rx)
+    }
 }
 
 #[tokio::test]
@@ -185,14 +213,42 @@ async fn bootstrap_with_custom_system_prompt() {
 #[tokio::test]
 async fn bootstrap_with_agents_md_in_workspace() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let workspace = tmp.path();
-    std::fs::write(workspace.join("AGENTS.md"), "PROJECT_RULES_MARKER").unwrap();
+    let root = tmp.path();
+    std::fs::create_dir(root.join(".git")).unwrap();
+    std::fs::write(root.join("AGENTS.md"), "ROOT_RULE_AT_STARTUP").unwrap();
+    let workspace = root.join("crates/agent");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("TEAM_GUIDE.md"), "LEAF_RULE_AT_STARTUP").unwrap();
 
-    let config = minimal_config();
-    let _result = AgentBootstrap::new(config, workspace.to_string_lossy().as_ref(), null_output())
+    let mut config = minimal_config();
+    config.project_instructions.project_doc_fallback_filenames = vec!["TEAM_GUIDE.md".into()];
+    let systems = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(CapturingProvider {
+        systems: Arc::clone(&systems),
+    });
+    let result = AgentBootstrap::new(config, workspace.to_string_lossy().as_ref(), null_output())
+        .provider(provider)
         .build()
         .await
         .unwrap();
+
+    std::fs::write(root.join("AGENTS.md"), "ROOT_RULE_AFTER_BOOTSTRAP").unwrap();
+    std::fs::write(workspace.join("TEAM_GUIDE.md"), "LEAF_RULE_AFTER_BOOTSTRAP").unwrap();
+
+    let mut engine = result.engine;
+    engine
+        .run("show active instructions", &workspace.to_string_lossy())
+        .await
+        .unwrap();
+
+    let captured = systems.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let system = &captured[0];
+    let root_pos = system.find("ROOT_RULE_AT_STARTUP").unwrap();
+    let leaf_pos = system.find("LEAF_RULE_AT_STARTUP").unwrap();
+    assert!(root_pos < leaf_pos);
+    assert!(!system.contains("ROOT_RULE_AFTER_BOOTSTRAP"));
+    assert!(!system.contains("LEAF_RULE_AFTER_BOOTSTRAP"));
 }
 
 #[tokio::test]

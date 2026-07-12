@@ -69,13 +69,6 @@ pub fn resolve_agents_md(
     resolve_agents_md_from(cwd, config, user_dir.as_deref())
 }
 
-/// Compatibility wrapper for callers that only need the ordered files.
-/// New session startup code should use [`resolve_agents_md`] so it can retain
-/// diagnostics and apply the runtime configuration.
-pub fn collect_agents_md(cwd: &str) -> Vec<AgentsMdFile> {
-    resolve_agents_md(Path::new(cwd), &ProjectInstructionsConfig::default()).files
-}
-
 pub fn format_agents_md_section(files: &[AgentsMdFile]) -> String {
     if files.is_empty() {
         return String::new();

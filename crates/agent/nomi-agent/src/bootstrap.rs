@@ -534,7 +534,28 @@ impl AgentBootstrap {
         )
         .await;
 
+        let agents_snapshot = crate::agents_md::resolve_agents_md(
+            cwd_path,
+            &self.config.project_instructions,
+        );
+        for file in &agents_snapshot.files {
+            tracing::debug!(
+                target: "nomi_agent",
+                path = %file.path.display(),
+                scope = if file.is_global { "user" } else { "project" },
+                "agent bootstrap: loaded instruction file"
+            );
+        }
+        for diagnostic in &agents_snapshot.diagnostics {
+            tracing::warn!(
+                target: "nomi_agent",
+                message = %diagnostic.message(),
+                "agent bootstrap: instruction diagnostic"
+            );
+        }
+
         let mut prompt_cache = crate::context::SystemPromptCache::new();
+        prompt_cache.set_agents_md(agents_snapshot.formatted);
         let system_prompt = crate::context::build_system_prompt(
             &mut prompt_cache,
             self.config.system_prompt.as_deref(),
