@@ -35,6 +35,33 @@ describe('turn process state', () => {
     ).toBe('canceled');
   });
 
+  test('keeps the root error failed while classifying barrier-skipped commands as canceled', () => {
+    const skipped = {
+      type: 'tool_call',
+      content: {
+        call_id: 'call-bash',
+        name: 'Bash',
+        status: 'error',
+        args: { command: 'find /workspace -maxdepth 2 -type d' },
+        output:
+          'Skipped because a previous tool call in this assistant turn failed. Inspect the failed result first.',
+      },
+    } as any;
+    const failedKnowledgeRead = {
+      type: 'tool_call',
+      content: {
+        call_id: 'call-knowledge',
+        name: 'knowledge_read',
+        status: 'error',
+        args: { handle: '/workspace/overview.md' },
+        output: 'knowledge_read failed: invalid handle: /workspace/overview.md',
+      },
+    } as any;
+
+    expect(getToolMessagesProcessState([skipped])).toBe('canceled');
+    expect(getToolMessagesProcessState([failedKnowledgeRead, skipped])).toBe('failed');
+  });
+
   test('does not let non-fatal ACP shell command exits fail the whole process receipt', () => {
     expect(
       getToolMessagesProcessState([

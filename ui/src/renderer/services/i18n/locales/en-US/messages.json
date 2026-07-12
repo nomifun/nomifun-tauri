@@ -9,7 +9,8 @@
     "waiting": "Waiting to confirm {{target}}",
     "completed": "Ran {{target}}",
     "failed": "Failed {{target}}",
-    "canceled": "Canceled {{target}}"
+    "canceled": "Canceled {{target}}",
+    "skipped": "Skipped {{target}}"
   },
   "processReceipt": {
     "tools": "{{count}} tools",

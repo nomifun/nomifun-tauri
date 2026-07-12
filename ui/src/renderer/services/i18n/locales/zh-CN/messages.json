@@ -9,7 +9,8 @@
     "waiting": "等待确认 {{target}}",
     "completed": "已运行 {{target}}",
     "failed": "运行失败 {{target}}",
-    "canceled": "已取消 {{target}}"
+    "canceled": "已取消 {{target}}",
+    "skipped": "已跳过 {{target}}"
   },
   "processReceipt": {
     "tools": "{{count}} 个工具",

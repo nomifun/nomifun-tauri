@@ -1755,6 +1755,7 @@ export type I18nKey =
   | 'messages.toolSummary.completed'
   | 'messages.toolSummary.failed'
   | 'messages.toolSummary.running'
+  | 'messages.toolSummary.skipped'
   | 'messages.toolSummary.waiting'
   | 'messages.turnCanceled'
   | 'messages.turnFailed'

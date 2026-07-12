@@ -41,6 +41,11 @@ describe('ProcessTraceItem Codex-style execution rows', () => {
     expect(source.includes('messages.processReceipt.contextCompressed')).toBe(true);
   });
 
+  test('renders barrier-skipped tool details with dedicated copy', () => {
+    expect(source.includes('row.skipped')).toBe(true);
+    expect(source.includes('messages.toolSummary.skipped')).toBe(true);
+  });
+
   test('renders read and edit steps with expandable file lists', () => {
     expect(source.includes('ToolFileListDetail')).toBe(true);
     expect(source.includes('ToolFileGroupTraceRow')).toBe(true);

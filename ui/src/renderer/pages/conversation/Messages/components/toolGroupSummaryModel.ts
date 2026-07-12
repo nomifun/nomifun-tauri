@@ -29,6 +29,7 @@ export interface ToolReceiptSummaryPart {
   count: number;
   state: TurnDisclosureProcessState;
   target?: string;
+  skipped?: boolean;
 }
 
 export interface ToolReceiptDetailRow {
@@ -40,6 +41,7 @@ export interface ToolReceiptDetailRow {
   input?: string;
   output?: string;
   truncated?: boolean;
+  skipped?: boolean;
 }
 
 const toolReceiptIconByAction: Record<ToolReceiptAction, ToolReceiptIcon> = {
@@ -230,13 +232,17 @@ export const buildToolReceiptSummaryParts = (
   tools: NormalizedToolCall[],
   _state: TurnDisclosureProcessState
 ): ToolReceiptSummaryPart[] => {
-  const grouped = new Map<ToolReceiptAction, { count: number; targets: string[]; states: TurnDisclosureProcessState[] }>();
+  const grouped = new Map<
+    ToolReceiptAction,
+    { count: number; skippedCount: number; targets: string[]; states: TurnDisclosureProcessState[] }
+  >();
 
   tools.forEach((tool) => {
     const action = classifyToolForReceipt(tool);
     const target = getToolReceiptTarget(tool, action);
-    const current = grouped.get(action) ?? { count: 0, targets: [], states: [] };
+    const current = grouped.get(action) ?? { count: 0, skippedCount: 0, targets: [], states: [] };
     current.count += 1;
+    if (tool.skipped) current.skippedCount += 1;
     current.states.push(getToolProcessState(tool));
     if (target) current.targets.push(target);
     grouped.set(action, current);
@@ -247,6 +253,7 @@ export const buildToolReceiptSummaryParts = (
     count: value.count,
     state: mergeProcessStates(value.states),
     ...(value.targets.length ? { target: Array.from(new Set(value.targets)).join(', ') } : {}),
+    ...(value.skippedCount === value.count ? { skipped: true } : {}),
   }));
 };
 
@@ -272,6 +279,7 @@ export const buildToolReceiptDetailRows = (tools: NormalizedToolCall[]): ToolRec
       ...(tool.input ? { input: tool.input } : {}),
       ...(tool.output ? { output: tool.output } : {}),
       ...(tool.truncated ? { truncated: tool.truncated } : {}),
+      ...(tool.skipped ? { skipped: true } : {}),
     };
   });
 

@@ -32,6 +32,24 @@ describe('normalizeToolCall', () => {
     expect(result?.nonFatalFailure).toBe(true);
   });
 
+  it('marks prior-error barrier results as skipped cancellations', () => {
+    const result = normalizeToolCall({
+      type: 'tool_call',
+      content: {
+        call_id: 'call-skipped',
+        name: 'Bash',
+        status: 'error',
+        args: { command: 'find /workspace -maxdepth 2 -type d' },
+        output:
+          'Skipped because a previous tool call in this assistant turn failed. Inspect the failed result first.',
+      },
+    } as any);
+
+    expect(result?.status).toBe('canceled');
+    expect(result?.skipped).toBe(true);
+    expect(result?.nonFatalFailure).toBeUndefined();
+  });
+
   const infrastructureFailures = [
     'Command timed out after 120000ms.\nPartial output:\nRESULT_PASS',
     'Command was cancelled.\nSTDOUT:\npartial',
