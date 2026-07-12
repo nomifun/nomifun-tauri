@@ -10,6 +10,7 @@ import { describe, expect, test } from 'bun:test';
 const stylesheet = readFileSync(new URL('./chat-layout.css', import.meta.url), 'utf8');
 const componentSource = readFileSync(new URL('./WorkspaceToolRail.tsx', import.meta.url), 'utf8');
 const workspaceRailBodySource = readFileSync(new URL('../../Workspace/WorkspaceRailBody.tsx', import.meta.url), 'utf8');
+const workspaceEventsSource = readFileSync(new URL('../../Workspace/hooks/useWorkspaceEvents.ts', import.meta.url), 'utf8');
 
 const rule = (selector: string) => {
   const match = stylesheet.match(new RegExp(`${selector}\\s*\\{([\\s\\S]*?)\\n\\}`, 'm'));
@@ -28,8 +29,9 @@ describe('workspace tool rail dimensions', () => {
     expect(badge.includes('background: rgb(var(--danger-6));')).toBe(true);
   });
 
-  test('loads the change count when the workspace snapshot initializes', () => {
-    expect(workspaceRailBodySource.includes('if (fileChangesHook.snapshotInfo) {\n      fileChangesHook.refreshChanges();')).toBe(true);
+  test('refreshes the change count from the existing agent workspace refresh signal', () => {
+    expect(workspaceRailBodySource.includes('refreshChanges: fileChangesHook.refreshChanges,')).toBe(true);
+    expect(workspaceEventsSource.includes('refreshChangesRef.current();')).toBe(true);
   });
 
   test('uses compact square desktop controls', () => {

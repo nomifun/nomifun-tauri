@@ -18,6 +18,7 @@ interface UseWorkspaceEventsOptions {
 
   // Dependencies from useWorkspaceTree (body-owned tree state)
   refreshWorkspace: () => void;
+  refreshChanges: () => Promise<void>;
   setFiles: React.Dispatch<React.SetStateAction<IDirOrFile[]>>;
   setSelected: React.Dispatch<React.SetStateAction<string[]>>;
   setExpandedKeys: React.Dispatch<React.SetStateAction<string[]>>;
@@ -52,6 +53,7 @@ export function useWorkspaceEvents(options: UseWorkspaceEventsOptions) {
   const {
     source,
     refreshWorkspace,
+    refreshChanges,
     setFiles,
     setSelected,
     setExpandedKeys,
@@ -71,6 +73,8 @@ export function useWorkspaceEvents(options: UseWorkspaceEventsOptions) {
   // every render. Behavior matches the old direct listeners.
   const refreshRef = useRef(refreshWorkspace);
   refreshRef.current = refreshWorkspace;
+  const refreshChangesRef = useRef(refreshChanges);
+  refreshChangesRef.current = refreshChanges;
   const onSelectFilesRef = useRef(source.onSelectFiles);
   onSelectFilesRef.current = source.onSelectFiles;
 
@@ -112,7 +116,10 @@ export function useWorkspaceEvents(options: UseWorkspaceEventsOptions) {
   const subscribeRefresh = source.subscribeRefresh;
   useEffect(() => {
     if (!subscribeRefresh) return;
-    return subscribeRefresh(() => refreshRef.current());
+    return subscribeRefresh(() => {
+      refreshRef.current();
+      refreshChangesRef.current();
+    });
   }, [subscribeRefresh]);
 
   /**
