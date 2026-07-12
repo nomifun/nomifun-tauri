@@ -966,12 +966,35 @@ pub async fn delete_skill(paths: &SkillPaths, skill_name: &str) -> Result<(), Ex
     }
 
     if user_path.is_symlink() || user_path.is_file() {
+        clear_readonly_for_deletion(&user_path)?;
         tokio::fs::remove_file(&user_path).await?;
     } else {
+        // ZIP imports may retain Windows read-only attributes, which makes
+        // remove_dir_all fail with Access Denied (os error 5).
+        clear_readonly_for_deletion(&user_path)?;
         tokio::fs::remove_dir_all(&user_path).await?;
     }
 
     debug!(skill = %skill_name, "skill deleted");
+    Ok(())
+}
+
+/// Clear read-only attributes without following symlinks outside the skill.
+fn clear_readonly_for_deletion(path: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            clear_readonly_for_deletion(&entry?.path())?;
+        }
+    }
+    let mut permissions = metadata.permissions();
+    if permissions.readonly() {
+        permissions.set_readonly(false);
+        std::fs::set_permissions(path, permissions)?;
+    }
     Ok(())
 }
 
@@ -2614,6 +2637,25 @@ mod tests {
 
         delete_skill(&paths, "to-delete").await.unwrap();
         assert!(!paths.user_skills_dir.join("to-delete").exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn delete_custom_skill_with_readonly_files_on_windows() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_test_paths(tmp.path());
+
+        create_skill_in_dir(&paths.user_skills_dir, "readonly-skill", "Will be deleted");
+        let skill_file = paths
+            .user_skills_dir
+            .join("readonly-skill")
+            .join("SKILL.md");
+        let mut permissions = std::fs::metadata(&skill_file).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&skill_file, permissions).unwrap();
+
+        delete_skill(&paths, "readonly-skill").await.unwrap();
+        assert!(!paths.user_skills_dir.join("readonly-skill").exists());
     }
 
     #[tokio::test]
