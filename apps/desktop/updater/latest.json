@@ -1,7 +1,7 @@
 {
   "version": "0.2.17",
   "notes": "修复受控 Provider 的系统流程与配置管理覆盖，确保新旧 Provider 的创建、更新和删除行为一致。\n\n强化 Bash 和终端命令的受控执行、进程回收与跨平台可靠性，降低残留子进程和会话异常风险。\n\n新增计划任务操作菜单，并优化任务列表的响应式布局与检索体验。\n\n优化需求筛选与排序交互：筛选状态更清晰，弹层定位和可读性更稳定。",
-  "pub_date": "2026-07-12T05:19:13.975Z",
+  "pub_date": "2026-07-12T05:41:15.418Z",
   "platforms": {
     "darwin-x86_64": {
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODRlVkxLOUZ6dmFVdElEQ0h1akVTVDNrQ2dEbHlDdm5IUmlvdG04Snc1OTFucWdDcTZad29jZnpOR1BDd1ZvS3F1a0pBZTd4L0RqTnVvZGVnc0JWTGdBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzODMzNDgwCWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6Cm1sOGNKcUhvNUgyNHEvQlpuMXcxZ2lZNExjT1lON3dUL2ZqVHBwM0NLODl4MloycVVwaUlxb3RycEpuNmc5Zlc5VHZiT0VLcElKMXhabnBaRjlMRENRPT0K",
@@ -10,6 +10,10 @@
     "darwin-aarch64": {
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODRlVkxLOUZ6dmFVdElEQ0h1akVTVDNrQ2dEbHlDdm5IUmlvdG04Snc1OTFucWdDcTZad29jZnpOR1BDd1ZvS3F1a0pBZTd4L0RqTnVvZGVnc0JWTGdBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzODMzNDgwCWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6Cm1sOGNKcUhvNUgyNHEvQlpuMXcxZ2lZNExjT1lON3dUL2ZqVHBwM0NLODl4MloycVVwaUlxb3RycEpuNmc5Zlc5VHZiT0VLcElKMXhabnBaRjlMRENRPT0K",
       "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.17/NomiFun.app.tar.gz"
+    },
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODdsQnlCeGFpSDR0ZHoyTzZXbXFRTHlzd2txcE1SWmNSNFJ0N0s1ZkFpbzZVc1NTcWdFcWhTYUwyT0s1YVBpcjRRS3JQMW90ZTVCUDJJWFpJRnJyU3dzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzODM0ODc0CWZpbGU6Tm9taUZ1bl8wLjIuMTdfeDY0LXNldHVwLmV4ZQo5MVdXRTEwRE13RHplLzZPTzYxSG9vZHVUbVJjMW11RDV6VFV6bHg3YUFEZ0FjSWNNSmJ5Szd3b1BWQ1FMcDh5TXdzdGkrczd4d2NyR3g0OEx3YVhCQT09Cg==",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.17/NomiFun_0.2.17_x64-setup.exe"
     }
   }
 }
