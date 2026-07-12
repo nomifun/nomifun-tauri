@@ -829,6 +829,7 @@ mod phase7_tests {
             max_tokens: 1024,
             max_turns: Some(5),
             system_prompt: None,
+            project_instructions: Default::default(),
             thinking: None,
             prompt_caching: false,
             compat: ProviderCompat::openai_defaults(),

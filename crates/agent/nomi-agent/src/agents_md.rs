@@ -1,490 +1,502 @@
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::io::ErrorKind;
+use std::path::{Component, Path, PathBuf};
 
-use nomi_config::config::app_config_dir;
-use nomi_skills::paths::stop_boundary;
+use nomi_config::config::{
+    ProjectInstructionsConfig, app_config_dir,
+};
 
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
+const INSTRUCTION_PREAMBLE: &str = "Codebase and user instructions are shown below. \
+Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any \
+default behavior and you MUST follow them exactly as written.";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentsMdFile {
     pub path: PathBuf,
     pub content: String,
     pub is_global: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentsMdDiagnostic {
+    path: Option<PathBuf>,
+    detail: String,
+}
 
-const MAX_INCLUDE_DEPTH: u8 = 5;
+impl AgentsMdDiagnostic {
+    fn for_path(path: impl Into<PathBuf>, detail: impl Into<String>) -> Self {
+        Self {
+            path: Some(path.into()),
+            detail: detail.into(),
+        }
+    }
 
-const ALLOWED_EXTENSIONS: &[&str] = &[".md", ".txt", ".json", ".yaml", ".yml", ".toml"];
+    fn for_config(detail: impl Into<String>) -> Self {
+        Self {
+            path: None,
+            detail: detail.into(),
+        }
+    }
 
-const INSTRUCTION_PREAMBLE: &str = "Codebase and user instructions are shown below. \
-Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any \
-default behavior and you MUST follow them exactly as written.";
+    pub fn message(&self) -> String {
+        match &self.path {
+            Some(path) => format!("{}: {}", path.display(), self.detail),
+            None => self.detail.clone(),
+        }
+    }
+}
 
-// ---------------------------------------------------------------------------
-// Discovery
-// ---------------------------------------------------------------------------
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentsMdSnapshot {
+    pub project_root: Option<PathBuf>,
+    pub files: Vec<AgentsMdFile>,
+    pub formatted: String,
+    pub project_bytes: usize,
+    pub truncated: bool,
+    pub diagnostics: Vec<AgentsMdDiagnostic>,
+}
 
+struct SelectedInstruction {
+    path: PathBuf,
+    content: String,
+}
+
+/// Resolve the immutable user/project instruction snapshot for a session.
+pub fn resolve_agents_md(
+    cwd: &Path,
+    config: &ProjectInstructionsConfig,
+) -> AgentsMdSnapshot {
+    let user_dir = app_config_dir();
+    resolve_agents_md_from(cwd, config, user_dir.as_deref())
+}
+
+/// Compatibility wrapper for callers that only need the ordered files.
+/// New session startup code should use [`resolve_agents_md`] so it can retain
+/// diagnostics and apply the runtime configuration.
 pub fn collect_agents_md(cwd: &str) -> Vec<AgentsMdFile> {
-    let cwd_path = Path::new(cwd);
-    let mut files = Vec::new();
-
-    // 1. Global: <config_dir>/nomi/AGENTS.md
-    if let Some(global_path) = app_config_dir().map(|d| d.join("AGENTS.md"))
-        && let Some(file) = read_agents_md(&global_path, true)
-    {
-        files.push(file);
-    }
-
-    // 2. Walk up from cwd to stop_boundary, collect AGENTS.md paths
-    let boundary = stop_boundary(cwd_path);
-    let mut project_paths = Vec::new();
-    let mut current = cwd_path.to_path_buf();
-
-    loop {
-        let candidate = current.join("AGENTS.md");
-        if candidate.is_file() {
-            project_paths.push(candidate);
-        }
-
-        if Some(&current) == boundary.as_ref() || current.parent().is_none() {
-            break;
-        }
-
-        match current.parent() {
-            Some(parent) if parent != current.as_path() => {
-                current = parent.to_path_buf();
-            }
-            _ => break,
-        }
-    }
-
-    // Reverse: collected deepest-first, we want root-first
-    project_paths.reverse();
-
-    for path in project_paths {
-        if let Some(file) = read_agents_md(&path, false) {
-            files.push(file);
-        }
-    }
-
-    files
+    resolve_agents_md(Path::new(cwd), &ProjectInstructionsConfig::default()).files
 }
-
-fn read_agents_md(path: &Path, is_global: bool) -> Option<AgentsMdFile> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    if raw.trim().is_empty() {
-        return None;
-    }
-    let base_dir = path.parent()?;
-    let mut seen = HashSet::new();
-    if let Ok(canonical) = path.canonicalize() {
-        seen.insert(canonical);
-    }
-    let content = expand_includes(&raw, base_dir, 0, &mut seen);
-    Some(AgentsMdFile {
-        path: path.to_path_buf(),
-        content,
-        is_global,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Formatting
-// ---------------------------------------------------------------------------
 
 pub fn format_agents_md_section(files: &[AgentsMdFile]) -> String {
     if files.is_empty() {
         return String::new();
     }
 
-    let mut parts = vec![INSTRUCTION_PREAMBLE.to_string()];
-
+    let mut parts = vec![INSTRUCTION_PREAMBLE.to_owned()];
     for file in files {
         let description = if file.is_global {
             "(user's global instructions for all projects)"
         } else {
             "(project instructions)"
         };
-        let header = format!("Contents of {} {}:", file.path.display(), description);
-        parts.push(format!("{header}\n\n{}", file.content.trim()));
+        parts.push(format!(
+            "Contents of {} {description}:\n\n{}",
+            file.path.display(),
+            file.content.trim()
+        ));
     }
-
     parts.join("\n\n")
 }
 
-// ---------------------------------------------------------------------------
-// @include expansion
-// ---------------------------------------------------------------------------
+fn resolve_agents_md_from(
+    cwd: &Path,
+    config: &ProjectInstructionsConfig,
+    user_dir: Option<&Path>,
+) -> AgentsMdSnapshot {
+    let cwd = normalize_path(cwd);
+    let project_root = detect_project_root(&cwd, &config.project_root_markers);
+    let mut files = Vec::new();
+    let mut diagnostics = Vec::new();
 
-fn is_allowed_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| {
-            let dotted = format!(".{e}");
-            ALLOWED_EXTENSIONS.contains(&dotted.as_str())
-        })
-        .unwrap_or(false)
-}
-
-fn resolve_include_path(raw: &str, base_dir: &Path) -> Option<PathBuf> {
-    let path_str = raw.trim();
-    if path_str.is_empty() {
-        return None;
+    if let Some(user_dir) = user_dir {
+        let candidates = vec!["AGENTS.override.md".to_owned(), "AGENTS.md".to_owned()];
+        if let Some(selected) = select_instruction_file(user_dir, &candidates, &mut diagnostics) {
+            files.push(AgentsMdFile {
+                path: selected.path,
+                content: selected.content,
+                is_global: true,
+            });
+        }
     }
 
-    let resolved = if let Some(rest) = path_str.strip_prefix("~/") {
-        dirs::home_dir()?.join(rest)
-    } else if let Some(rest) = path_str.strip_prefix("./") {
-        base_dir.join(rest)
-    } else if path_str.starts_with('/') {
-        PathBuf::from(path_str)
-    } else {
-        base_dir.join(path_str)
-    };
+    let project_candidates = project_candidate_names(config, &mut diagnostics);
+    let mut remaining = config.project_doc_max_bytes;
+    let mut project_bytes = 0;
+    let mut truncated = false;
 
-    Some(resolved)
-}
-
-fn expand_includes(
-    content: &str,
-    base_dir: &Path,
-    depth: u8,
-    seen: &mut HashSet<PathBuf>,
-) -> String {
-    let mut result = Vec::new();
-    let mut in_code_block = false;
-
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            in_code_block = !in_code_block;
-            result.push(line.to_string());
+    for directory in directory_chain(&project_root, &cwd) {
+        let Some(selected) =
+            select_instruction_file(&directory, &project_candidates, &mut diagnostics)
+        else {
             continue;
-        }
+        };
 
-        if in_code_block {
-            result.push(line.to_string());
-            continue;
-        }
-
-        let standalone = line.trim();
-        if standalone.starts_with('@') && !standalone.contains('`') {
-            let path_str = &standalone[1..];
-            // Strip fragment identifiers
-            let path_str = match path_str.find('#') {
-                Some(i) => &path_str[..i],
-                None => path_str,
-            };
-
-            if let Some(resolved) = resolve_include_path(path_str, base_dir) {
-                if !is_allowed_extension(&resolved) {
-                    continue;
-                }
-                let canonical = resolved.canonicalize().unwrap_or_else(|_| resolved.clone());
-                if seen.contains(&canonical) || depth >= MAX_INCLUDE_DEPTH {
-                    continue;
-                }
-                if let Ok(included) = std::fs::read_to_string(&resolved) {
-                    seen.insert(canonical);
-                    let expanded = expand_includes(
-                        &included,
-                        resolved.parent().unwrap_or(base_dir),
-                        depth + 1,
-                        seen,
-                    );
-                    result.push(expanded);
-                }
-                continue;
+        if selected.content.len() <= remaining {
+            project_bytes += selected.content.len();
+            remaining -= selected.content.len();
+            files.push(AgentsMdFile {
+                path: selected.path,
+                content: selected.content,
+                is_global: false,
+            });
+            if remaining == 0 {
+                break;
             }
+            continue;
         }
 
-        result.push(line.to_string());
+        let prefix = utf8_prefix(&selected.content, remaining);
+        project_bytes += prefix.len();
+        if !prefix.is_empty() {
+            files.push(AgentsMdFile {
+                path: selected.path.clone(),
+                content: prefix.to_owned(),
+                is_global: false,
+            });
+        }
+        truncated = true;
+        diagnostics.push(AgentsMdDiagnostic::for_path(
+            selected.path,
+            format!(
+                "project instructions truncated at the configured {} byte limit",
+                config.project_doc_max_bytes
+            ),
+        ));
+        break;
     }
 
-    result.join("\n")
+    let formatted = format_agents_md_section(&files);
+    AgentsMdSnapshot {
+        project_root: Some(project_root),
+        files,
+        formatted,
+        project_bytes,
+        truncated,
+        diagnostics,
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+fn normalize_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn detect_project_root(cwd: &Path, markers: &[String]) -> PathBuf {
+    if markers.is_empty() {
+        return cwd.to_path_buf();
+    }
+
+    let valid_markers: Vec<&str> = markers
+        .iter()
+        .map(String::as_str)
+        .filter(|marker| safe_relative_name(marker))
+        .collect();
+    if valid_markers.is_empty() {
+        return cwd.to_path_buf();
+    }
+
+    let mut current = cwd.to_path_buf();
+    loop {
+        if valid_markers
+            .iter()
+            .any(|marker| current.join(marker).exists())
+        {
+            return current;
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent.to_path_buf(),
+            _ => return cwd.to_path_buf(),
+        }
+    }
+}
+
+fn directory_chain(root: &Path, cwd: &Path) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    let mut current = cwd.to_path_buf();
+    loop {
+        directories.push(current.clone());
+        if current == root {
+            break;
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent.to_path_buf(),
+            _ => return vec![cwd.to_path_buf()],
+        }
+    }
+    directories.reverse();
+    directories
+}
+
+fn project_candidate_names(
+    config: &ProjectInstructionsConfig,
+    diagnostics: &mut Vec<AgentsMdDiagnostic>,
+) -> Vec<String> {
+    let mut candidates = vec!["AGENTS.override.md".to_owned(), "AGENTS.md".to_owned()];
+    for fallback in &config.project_doc_fallback_filenames {
+        if safe_relative_name(fallback) {
+            candidates.push(fallback.clone());
+        } else {
+            diagnostics.push(AgentsMdDiagnostic::for_config(format!(
+                "ignored unsafe project instruction fallback filename {fallback:?}"
+            )));
+        }
+    }
+    candidates
+}
+
+fn safe_relative_name(name: &str) -> bool {
+    if name.trim().is_empty() {
+        return false;
+    }
+    let path = Path::new(name);
+    if path.is_absolute() {
+        return false;
+    }
+    let mut has_normal_component = false;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => has_normal_component = true,
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    has_normal_component
+}
+
+fn select_instruction_file(
+    directory: &Path,
+    candidates: &[String],
+    diagnostics: &mut Vec<AgentsMdDiagnostic>,
+) -> Option<SelectedInstruction> {
+    for candidate in candidates {
+        let path = directory.join(candidate);
+        match std::fs::read_to_string(&path) {
+            Ok(content) if content.trim().is_empty() => continue,
+            Ok(content) => return Some(SelectedInstruction { path, content }),
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => diagnostics.push(AgentsMdDiagnostic::for_path(
+                path,
+                format!("failed to read instruction file: {error}"),
+            )),
+        }
+    }
+    None
+}
+
+fn utf8_prefix(content: &str, max_bytes: usize) -> &str {
+    let mut end = content.len().min(max_bytes);
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    &content[..end]
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nomi_config::config::ProjectInstructionsConfig;
     use std::fs;
     use tempfile::TempDir;
 
-    // --- @include expansion tests ---
-
-    #[test]
-    fn test_no_includes_passthrough() {
-        let tmp = TempDir::new().unwrap();
-        let mut seen = HashSet::new();
-        let input = "Hello world\nNo includes here.";
-        let result = expand_includes(input, tmp.path(), 0, &mut seen);
-        assert_eq!(result, input);
+    fn default_config() -> ProjectInstructionsConfig {
+        ProjectInstructionsConfig::default()
     }
 
     #[test]
-    fn test_simple_include() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("other.md"), "INCLUDED_CONTENT").unwrap();
-        let mut seen = HashSet::new();
-        let input = "@other.md";
-        let result = expand_includes(input, tmp.path(), 0, &mut seen);
-        assert!(result.contains("INCLUDED_CONTENT"));
-        assert!(!result.contains("@other.md"));
-    }
-
-    #[test]
-    fn test_include_relative_dot() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("sub.md"), "SUB_CONTENT").unwrap();
-        let mut seen = HashSet::new();
-        let input = "@./sub.md";
-        let result = expand_includes(input, tmp.path(), 0, &mut seen);
-        assert!(result.contains("SUB_CONTENT"));
-    }
-
-    #[test]
-    fn test_include_inside_code_block_ignored() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("skip.md"), "SHOULD_NOT_APPEAR").unwrap();
-        let mut seen = HashSet::new();
-        let input = "```\n@skip.md\n```";
-        let result = expand_includes(input, tmp.path(), 0, &mut seen);
-        assert!(!result.contains("SHOULD_NOT_APPEAR"));
-        assert!(result.contains("@skip.md"));
-    }
-
-    #[test]
-    fn test_include_missing_file_silently_skipped() {
-        let tmp = TempDir::new().unwrap();
-        let mut seen = HashSet::new();
-        let input = "before\n@nonexistent.md\nafter";
-        let result = expand_includes(input, tmp.path(), 0, &mut seen);
-        assert!(result.contains("before"));
-        assert!(result.contains("after"));
-        assert!(!result.contains("@nonexistent.md"));
-    }
-
-    #[test]
-    fn test_include_circular_reference() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("a.md"), "A_CONTENT\n@b.md").unwrap();
-        fs::write(tmp.path().join("b.md"), "B_CONTENT\n@a.md").unwrap();
-        let mut seen = HashSet::new();
-        let result = expand_includes("@a.md", tmp.path(), 0, &mut seen);
-        assert!(result.contains("A_CONTENT"));
-        assert!(result.contains("B_CONTENT"));
-        // @a.md in b.md should be skipped (circular)
-    }
-
-    #[test]
-    fn test_include_max_depth() {
-        let tmp = TempDir::new().unwrap();
-        // Chain: d0 → d1 → d2 → d3 → d4 → d5 → d6
-        // With MAX_INCLUDE_DEPTH=5, expansion from the outer call:
-        // outer(0) expands @d0 at depth 0 → d0 content expanded at depth 1
-        // depth 1 expands @d1 → d1 at depth 2 → ... → d3 at depth 4
-        // depth 4 expands @d4 → d4 at depth 5 → depth 5 >= MAX, @d5 NOT expanded
-        for i in 0..7 {
-            let content = if i < 6 {
-                format!("DEPTH_{i}\n@d{}.md", i + 1)
-            } else {
-                format!("DEPTH_{i}")
-            };
-            fs::write(tmp.path().join(format!("d{i}.md")), content).unwrap();
-        }
-        let mut seen = HashSet::new();
-        let result = expand_includes("@d0.md", tmp.path(), 0, &mut seen);
-        assert!(result.contains("DEPTH_0"));
-        assert!(result.contains("DEPTH_3"));
-        assert!(result.contains("DEPTH_4"));
-        // DEPTH_5 should NOT appear — depth limit reached
-        assert!(!result.contains("DEPTH_5"));
-    }
-
-    #[test]
-    fn test_include_disallowed_extension() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("image.png"), "BINARY_DATA").unwrap();
-        let mut seen = HashSet::new();
-        let input = "@image.png";
-        let result = expand_includes(input, tmp.path(), 0, &mut seen);
-        assert!(!result.contains("BINARY_DATA"));
-    }
-
-    #[test]
-    fn test_include_with_surrounding_text() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("inc.md"), "MIDDLE").unwrap();
-        let mut seen = HashSet::new();
-        let input = "TOP\n@inc.md\nBOTTOM";
-        let result = expand_includes(input, tmp.path(), 0, &mut seen);
-        assert_eq!(result, "TOP\nMIDDLE\nBOTTOM");
-    }
-
-    #[test]
-    fn test_is_allowed_extension() {
-        assert!(is_allowed_extension(Path::new("file.md")));
-        assert!(is_allowed_extension(Path::new("file.txt")));
-        assert!(is_allowed_extension(Path::new("file.yaml")));
-        assert!(is_allowed_extension(Path::new("file.yml")));
-        assert!(is_allowed_extension(Path::new("file.toml")));
-        assert!(is_allowed_extension(Path::new("file.json")));
-        assert!(!is_allowed_extension(Path::new("file.png")));
-        assert!(!is_allowed_extension(Path::new("file.rs")));
-        assert!(!is_allowed_extension(Path::new("file")));
-    }
-
-    #[test]
-    fn test_inline_code_span_not_expanded() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("x.md"), "SHOULD_NOT_APPEAR").unwrap();
-        let mut seen = HashSet::new();
-        let input = "Use `@x.md` for config";
-        let result = expand_includes(input, tmp.path(), 0, &mut seen);
-        assert!(!result.contains("SHOULD_NOT_APPEAR"));
-    }
-
-    #[test]
-    fn test_home_path_expansion() {
-        let tmp = TempDir::new().unwrap();
-        let mut seen = HashSet::new();
-        let input = "@~/nonexistent-test-file.md";
-        let result = expand_includes(input, tmp.path(), 0, &mut seen);
-        assert!(!result.contains("@~/"));
-    }
-
-    // --- Discovery tests ---
-
-    #[test]
-    fn test_collect_no_agents_md_anywhere() {
-        let tmp = TempDir::new().unwrap();
-        let cwd = tmp.path();
-        fs::create_dir(cwd.join(".git")).unwrap();
-        let files = collect_agents_md(&cwd.to_string_lossy());
-        assert!(files.is_empty());
-    }
-
-    #[test]
-    fn test_collect_cwd_only() {
-        let tmp = TempDir::new().unwrap();
-        let cwd = tmp.path();
-        fs::create_dir(cwd.join(".git")).unwrap();
-        fs::write(cwd.join("AGENTS.md"), "CWD_RULES").unwrap();
-
-        let files = collect_agents_md(&cwd.to_string_lossy());
-        assert_eq!(files.len(), 1);
-        assert!(files[0].content.contains("CWD_RULES"));
-        assert!(!files[0].is_global);
-    }
-
-    #[test]
-    fn test_collect_hierarchical_ordering() {
+    fn nested_workspace_loads_project_root_before_leaf() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         fs::create_dir(root.join(".git")).unwrap();
-        fs::write(root.join("AGENTS.md"), "ROOT_RULES").unwrap();
+        fs::write(root.join("AGENTS.md"), "ROOT_RULE").unwrap();
+        let leaf = root.join("crates").join("agent");
+        fs::create_dir_all(&leaf).unwrap();
+        fs::write(leaf.join("AGENTS.md"), "LEAF_RULE").unwrap();
 
-        let sub = root.join("packages").join("server");
-        fs::create_dir_all(&sub).unwrap();
-        fs::write(sub.join("AGENTS.md"), "SUB_RULES").unwrap();
+        let snapshot = resolve_agents_md_from(&leaf, &default_config(), None);
 
-        let files = collect_agents_md(&sub.to_string_lossy());
-        assert_eq!(files.len(), 2);
-        assert!(files[0].content.contains("ROOT_RULES"));
-        assert!(files[1].content.contains("SUB_RULES"));
+        let canonical_root = root.canonicalize().unwrap();
+        let canonical_leaf = leaf.canonicalize().unwrap();
+        assert_eq!(snapshot.project_root.as_deref(), Some(canonical_root.as_path()));
+        assert_eq!(snapshot.files.len(), 2);
+        assert_eq!(snapshot.files[0].path, canonical_root.join("AGENTS.md"));
+        assert_eq!(snapshot.files[1].path, canonical_leaf.join("AGENTS.md"));
+        assert!(
+            snapshot.formatted.find("ROOT_RULE").unwrap()
+                < snapshot.formatted.find("LEAF_RULE").unwrap()
+        );
     }
 
     #[test]
-    fn test_collect_stops_at_git_root() {
+    fn override_wins_over_regular_and_fallback_in_the_same_directory() {
         let tmp = TempDir::new().unwrap();
-        let above_git = tmp.path();
-        fs::write(above_git.join("AGENTS.md"), "ABOVE_GIT_SHOULD_NOT_APPEAR").unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        fs::write(tmp.path().join("AGENTS.override.md"), "OVERRIDE_RULE").unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "REGULAR_RULE").unwrap();
+        fs::write(tmp.path().join("TEAM.md"), "FALLBACK_RULE").unwrap();
+        let config = ProjectInstructionsConfig {
+            project_doc_fallback_filenames: vec!["TEAM.md".into()],
+            ..Default::default()
+        };
 
-        let repo = above_git.join("repo");
-        fs::create_dir_all(&repo).unwrap();
-        fs::create_dir(repo.join(".git")).unwrap();
-        fs::write(repo.join("AGENTS.md"), "REPO_RULES").unwrap();
+        let snapshot = resolve_agents_md_from(tmp.path(), &config, None);
 
-        let files = collect_agents_md(&repo.to_string_lossy());
-        assert_eq!(files.len(), 1);
-        assert!(files[0].content.contains("REPO_RULES"));
+        assert_eq!(snapshot.files.len(), 1);
+        assert_eq!(
+            snapshot.files[0].path,
+            tmp.path().canonicalize().unwrap().join("AGENTS.override.md")
+        );
+        assert!(snapshot.formatted.contains("OVERRIDE_RULE"));
+        assert!(!snapshot.formatted.contains("REGULAR_RULE"));
+        assert!(!snapshot.formatted.contains("FALLBACK_RULE"));
     }
 
     #[test]
-    fn test_collect_skips_empty_agents_md() {
+    fn empty_and_invalid_utf8_candidates_fall_through_in_priority_order() {
         let tmp = TempDir::new().unwrap();
-        let cwd = tmp.path();
-        fs::create_dir(cwd.join(".git")).unwrap();
-        fs::write(cwd.join("AGENTS.md"), "   \n  ").unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        fs::write(tmp.path().join("AGENTS.override.md"), "  \n").unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), [0xff, 0xfe]).unwrap();
+        fs::write(tmp.path().join("TEAM.md"), "FALLBACK_RULE").unwrap();
+        let config = ProjectInstructionsConfig {
+            project_doc_fallback_filenames: vec!["TEAM.md".into()],
+            ..Default::default()
+        };
 
-        let files = collect_agents_md(&cwd.to_string_lossy());
-        assert!(files.is_empty());
+        let snapshot = resolve_agents_md_from(tmp.path(), &config, None);
+
+        assert_eq!(snapshot.files.len(), 1);
+        assert_eq!(
+            snapshot.files[0].path,
+            tmp.path().canonicalize().unwrap().join("TEAM.md")
+        );
+        assert!(snapshot.formatted.contains("FALLBACK_RULE"));
+        assert!(
+            snapshot
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message().contains("AGENTS.md"))
+        );
     }
 
     #[test]
-    fn test_collect_with_include_expanded() {
+    fn missing_root_marker_limits_project_scope_to_working_directory() {
         let tmp = TempDir::new().unwrap();
-        let cwd = tmp.path();
-        fs::create_dir(cwd.join(".git")).unwrap();
-        fs::write(cwd.join("AGENTS.md"), "@rules.md").unwrap();
-        fs::write(cwd.join("rules.md"), "INCLUDED_RULES").unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "PARENT_RULE").unwrap();
+        let leaf = tmp.path().join("nested");
+        fs::create_dir(&leaf).unwrap();
+        fs::write(leaf.join("AGENTS.md"), "LEAF_RULE").unwrap();
 
-        let files = collect_agents_md(&cwd.to_string_lossy());
-        assert_eq!(files.len(), 1);
-        assert!(files[0].content.contains("INCLUDED_RULES"));
-    }
+        let snapshot = resolve_agents_md_from(&leaf, &default_config(), None);
 
-    // --- Formatting tests ---
-
-    #[test]
-    fn test_format_empty() {
-        let files: Vec<AgentsMdFile> = vec![];
-        let result = format_agents_md_section(&files);
-        assert!(result.is_empty());
+        let canonical_leaf = leaf.canonicalize().unwrap();
+        assert_eq!(snapshot.project_root.as_deref(), Some(canonical_leaf.as_path()));
+        assert_eq!(snapshot.files.len(), 1);
+        assert!(snapshot.formatted.contains("LEAF_RULE"));
+        assert!(!snapshot.formatted.contains("PARENT_RULE"));
     }
 
     #[test]
-    fn test_format_single_project() {
-        let files = vec![AgentsMdFile {
-            path: PathBuf::from("/workspace/AGENTS.md"),
-            content: "My rules".to_string(),
-            is_global: false,
-        }];
-        let result = format_agents_md_section(&files);
-        assert!(result.contains("Be sure to adhere to these instructions"));
-        assert!(result.contains("Contents of /workspace/AGENTS.md (project instructions):"));
-        assert!(result.contains("My rules"));
+    fn custom_and_empty_project_root_markers_match_codex() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join(".hg")).unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "ROOT_RULE").unwrap();
+        let leaf = tmp.path().join("nested");
+        fs::create_dir(&leaf).unwrap();
+        fs::write(leaf.join("AGENTS.md"), "LEAF_RULE").unwrap();
+
+        let custom = ProjectInstructionsConfig {
+            project_root_markers: vec![".hg".into()],
+            ..Default::default()
+        };
+        let custom_snapshot = resolve_agents_md_from(&leaf, &custom, None);
+        assert_eq!(custom_snapshot.files.len(), 2);
+
+        let disabled = ProjectInstructionsConfig {
+            project_root_markers: Vec::new(),
+            ..Default::default()
+        };
+        let disabled_snapshot = resolve_agents_md_from(&leaf, &disabled, None);
+        assert_eq!(disabled_snapshot.files.len(), 1);
+        assert!(disabled_snapshot.formatted.contains("LEAF_RULE"));
+        assert!(!disabled_snapshot.formatted.contains("ROOT_RULE"));
     }
 
     #[test]
-    fn test_format_global_and_project() {
-        let files = vec![
-            AgentsMdFile {
-                path: PathBuf::from("/home/user/.config/nomi/AGENTS.md"),
-                content: "Global rules".to_string(),
-                is_global: true,
-            },
-            AgentsMdFile {
-                path: PathBuf::from("/workspace/AGENTS.md"),
-                content: "Project rules".to_string(),
-                is_global: false,
-            },
-        ];
-        let result = format_agents_md_section(&files);
-        let global_pos = result.find("Global rules").unwrap();
-        let project_pos = result.find("Project rules").unwrap();
-        assert!(global_pos < project_pos, "global before project");
-        assert!(result.contains("(user's global instructions for all projects)"));
-        assert!(result.contains("(project instructions)"));
+    fn combined_budget_truncates_utf8_safely_and_skips_later_files() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "1234éROOT_TAIL").unwrap();
+        let leaf = tmp.path().join("nested");
+        fs::create_dir(&leaf).unwrap();
+        fs::write(leaf.join("AGENTS.md"), "LEAF_RULE").unwrap();
+        let config = ProjectInstructionsConfig {
+            project_doc_max_bytes: 5,
+            ..Default::default()
+        };
+
+        let snapshot = resolve_agents_md_from(&leaf, &config, None);
+
+        assert!(snapshot.truncated);
+        assert_eq!(snapshot.project_bytes, 4);
+        assert_eq!(snapshot.files.len(), 1);
+        assert!(snapshot.formatted.contains("1234"));
+        assert!(!snapshot.formatted.contains('é'));
+        assert!(!snapshot.formatted.contains("LEAF_RULE"));
+    }
+
+    #[test]
+    fn user_override_is_independent_from_zero_project_budget() {
+        let project = TempDir::new().unwrap();
+        fs::create_dir(project.path().join(".git")).unwrap();
+        fs::write(project.path().join("AGENTS.md"), "PROJECT_RULE").unwrap();
+        let user = TempDir::new().unwrap();
+        fs::write(user.path().join("AGENTS.override.md"), "USER_OVERRIDE").unwrap();
+        fs::write(user.path().join("AGENTS.md"), "USER_REGULAR").unwrap();
+        let config = ProjectInstructionsConfig {
+            project_doc_max_bytes: 0,
+            ..Default::default()
+        };
+
+        let snapshot = resolve_agents_md_from(project.path(), &config, Some(user.path()));
+
+        assert_eq!(snapshot.files.len(), 1);
+        assert!(snapshot.files[0].is_global);
+        assert!(snapshot.formatted.contains("USER_OVERRIDE"));
+        assert!(!snapshot.formatted.contains("USER_REGULAR"));
+        assert!(!snapshot.formatted.contains("PROJECT_RULE"));
+    }
+
+    #[test]
+    fn unsafe_fallback_names_are_rejected_but_safe_nested_names_work() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        fs::create_dir(tmp.path().join(".agent")).unwrap();
+        fs::write(tmp.path().join(".agent/TEAM.md"), "SAFE_FALLBACK").unwrap();
+        let config = ProjectInstructionsConfig {
+            project_doc_fallback_filenames: vec![
+                "../outside.md".into(),
+                "/absolute.md".into(),
+                "".into(),
+                ".agent/TEAM.md".into(),
+            ],
+            ..Default::default()
+        };
+
+        let snapshot = resolve_agents_md_from(tmp.path(), &config, None);
+
+        assert_eq!(snapshot.files.len(), 1);
+        assert!(snapshot.formatted.contains("SAFE_FALLBACK"));
+        assert_eq!(snapshot.diagnostics.len(), 3);
+    }
+
+    #[test]
+    fn include_syntax_remains_literal_for_codex_compatibility() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join(".git")).unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "@rules.md").unwrap();
+        fs::write(tmp.path().join("rules.md"), "MUST_NOT_EXPAND").unwrap();
+
+        let snapshot = resolve_agents_md_from(tmp.path(), &default_config(), None);
+
+        assert!(snapshot.formatted.contains("@rules.md"));
+        assert!(!snapshot.formatted.contains("MUST_NOT_EXPAND"));
     }
 }
