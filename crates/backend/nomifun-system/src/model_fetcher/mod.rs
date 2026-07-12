@@ -63,6 +63,12 @@ impl ModelFetchService {
         provider_id: &str,
         req: &FetchModelsRequest,
     ) -> Result<FetchModelsResponse, AppError> {
+        if crate::managed_model::is_managed_provider_identity(Some(provider_id.trim()), None) {
+            return Err(AppError::Forbidden(
+                "Managed model catalogs are available through the dedicated model-service API"
+                    .into(),
+            ));
+        }
         let config = self.load_provider_config(provider_id).await?;
         self.fetch_with_config(&config, req.try_fix).await
     }
@@ -74,6 +80,12 @@ impl ModelFetchService {
         &self,
         req: &FetchModelsAnonymousRequest,
     ) -> Result<FetchModelsResponse, AppError> {
+        if crate::managed_model::is_managed_provider_identity(None, Some(req.platform.trim())) {
+            return Err(AppError::Forbidden(
+                "Reserved managed model platforms cannot be used for anonymous model fetching"
+                    .into(),
+            ));
+        }
         validate_anonymous_request(req)?;
         let config = FetchConfig {
             platform: req.platform.clone(),
@@ -114,6 +126,15 @@ impl ModelFetchService {
             .find_by_id(provider_id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("Provider {provider_id} not found")))?;
+        if crate::managed_model::is_managed_provider_identity(
+            Some(&row.id),
+            Some(&row.platform),
+        ) {
+            return Err(AppError::Forbidden(
+                "Managed model catalogs are available through the dedicated model-service API"
+                    .into(),
+            ));
+        }
 
         let api_key = decrypt_string(&row.api_key_encrypted, &self.encryption_key)?;
         if api_key.trim().is_empty() {
@@ -331,6 +352,52 @@ mod tests {
         let req = FetchModelsRequest { try_fix: false };
         let err = svc.fetch_models("no_such_id", &req).await.unwrap_err();
         assert_eq!(err.status_code(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn fetch_models_rejects_reserved_managed_id_before_lookup() {
+        let (svc, _db) = setup().await;
+        let err = svc
+            .fetch_models(
+                crate::managed_model::FREE_MODEL_PROVIDER_ID,
+                &FetchModelsRequest::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn fetch_models_rejects_persisted_managed_platform_alias() {
+        let (svc, db) = setup().await;
+        let id = create_provider(
+            &db,
+            crate::managed_model::FREE_MODEL_PROVIDER_ID,
+            "http://127.0.0.1:12345/v1",
+            "internal-token",
+        )
+        .await;
+        let err = svc
+            .fetch_models(&id, &FetchModelsRequest::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn anonymous_fetch_rejects_reserved_managed_platform() {
+        let (svc, _db) = setup().await;
+        let err = svc
+            .fetch_models_anonymous(&FetchModelsAnonymousRequest {
+                platform: crate::managed_model::LOCAL_MODEL_PROVIDER_ID.into(),
+                base_url: "https://example.com".into(),
+                api_key: "secret".into(),
+                bedrock_config: None,
+                try_fix: false,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::Forbidden(_)));
     }
 
     #[tokio::test]

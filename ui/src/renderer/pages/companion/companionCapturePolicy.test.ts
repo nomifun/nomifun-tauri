@@ -9,7 +9,6 @@ describe('shouldCaptureWholeCompanionWindow', () => {
         barRevealed: true,
         hasInput: true,
         sending: true,
-        showSuggestions: true,
         dragOver: false,
       })
     ).toBe(false);
@@ -22,7 +21,6 @@ describe('shouldCaptureWholeCompanionWindow', () => {
         barRevealed: false,
         hasInput: false,
         sending: false,
-        showSuggestions: false,
         dragOver: true,
       })
     ).toBe(true);

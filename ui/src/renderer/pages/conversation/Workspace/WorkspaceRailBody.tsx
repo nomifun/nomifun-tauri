@@ -8,6 +8,11 @@ import type { IDirOrFile } from '@/common/adapter/ipcBridge';
 import FlexFullContainer from '@/renderer/components/layout/FlexFullContainer';
 import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
 import { usePreviewContext } from '@/renderer/pages/conversation/Preview';
+import {
+  WORKSPACE_PANEL_TAB_EVENT,
+  dispatchWorkspacePanelMetaEvent,
+  type WorkspacePanelTabDetail,
+} from '@/renderer/pages/conversation/components/ChatLayout/WorkspaceToolRail';
 import { getWorkspaceDisplayName as getDisplayName } from '@/renderer/utils/workspace/workspace';
 import { Empty, Tree } from '@arco-design/web-react';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
@@ -17,7 +22,6 @@ import FileChangeList from './components/FileChangeList';
 import PasteConfirmModal from './components/PasteConfirmModal';
 import WorkspaceContextMenu from './components/WorkspaceContextMenu';
 import WorkspaceDialogs from './components/WorkspaceDialogs';
-import WorkspaceTabBar from './components/WorkspaceTabBar';
 import WorkspaceToolbar from './components/WorkspaceToolbar';
 import { useFileChanges } from './hooks/useFileChanges';
 import { useWorkspaceCollapse } from './hooks/useWorkspaceCollapse';
@@ -75,11 +79,47 @@ const WorkspaceRailBody: React.FC<{ source: WorkspaceSource; messageApi?: Messag
   // EAGER on mount (snapshot baseline captured at init time), which is required:
   // for non-git/snapshot-mode workspaces, deferring init would fold agent edits
   // made before the tab is opened into the baseline so they'd never show.
-  const [activeTab, setActiveTab] = useState<WorkspaceTab>('files');
+  const [activeTab, setActiveTab] = useState<WorkspaceTab>(() => {
+    if (typeof window === 'undefined') return 'files';
+    try {
+      return localStorage.getItem(`workspace-panel-tab-${source.tree.key}`) || 'files';
+    } catch {
+      return 'files';
+    }
+  });
   const [changesTabEverOpened, setChangesTabEverOpened] = useState(false);
 
   const fileChangesEnabled = source.lazyChanges ? changesTabEverOpened : true;
   const fileChangesHook = useFileChanges({ workspace, enabled: fileChangesEnabled });
+
+  useEffect(() => {
+    dispatchWorkspacePanelMetaEvent({
+      sourceKey: source.tree.key,
+      changeCount: fileChangesHook.changeCount,
+    });
+  }, [fileChangesHook.changeCount, source.tree.key]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined;
+    const handlePanelTab = (event: Event) => {
+      const nextTab = (event as CustomEvent<WorkspacePanelTabDetail>).detail?.tab;
+      const sourceKey = (event as CustomEvent<WorkspacePanelTabDetail>).detail?.sourceKey;
+      if (sourceKey && sourceKey !== source.tree.key) return;
+      if (!nextTab) return;
+      if (nextTab === 'changes') setChangesTabEverOpened(true);
+      setActiveTab(nextTab);
+    };
+    window.addEventListener(WORKSPACE_PANEL_TAB_EVENT, handlePanelTab);
+    return () => window.removeEventListener(WORKSPACE_PANEL_TAB_EVENT, handlePanelTab);
+  }, [source.tree.key]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(`workspace-panel-tab-${source.tree.key}`, activeTab);
+    } catch {
+      /* ignore storage failures */
+    }
+  }, [activeTab, source.tree.key]);
 
   // Initialize all hooks
   const { isWorkspaceCollapsed, setIsWorkspaceCollapsed } = useWorkspaceCollapse();
@@ -231,6 +271,12 @@ const WorkspaceRailBody: React.FC<{ source: WorkspaceSource; messageApi?: Messag
 
   const snapshotDisabled = fileChangesHook.snapshotInfo?.mode === 'disabled';
   const activeExtraTab = source.extraTabs?.find((tab) => tab.key === activeTab);
+  const resolvedActiveTab =
+    activeTab === 'files' || activeTab === 'changes' || activeExtraTab ? activeTab : ('files' as WorkspaceTab);
+
+  useEffect(() => {
+    if (resolvedActiveTab !== activeTab) setActiveTab(resolvedActiveTab);
+  }, [activeTab, resolvedActiveTab]);
 
   return (
     <>
@@ -306,41 +352,30 @@ const WorkspaceRailBody: React.FC<{ source: WorkspaceSource; messageApi?: Messag
           handleDeleteConfirm={fileOpsHook.handleDeleteConfirm}
         />
 
-        {/* Tab bar */}
-        <WorkspaceTabBar
-          t={t}
-          activeTab={activeTab}
-          onTabChange={(tab) => {
-            if (tab === 'changes') setChangesTabEverOpened(true);
-            setActiveTab(tab);
-          }}
-          changeCount={fileChangesHook.changeCount}
-          branch={fileChangesHook.snapshotInfo?.branch ?? null}
-          extraTabs={source.extraTabs}
-        />
-
-        {/* Toolbar: search input + directory name + action buttons */}
-        {activeTab === 'files' && (
-          <WorkspaceToolbar
-            t={t}
-            isWorkspaceCollapsed={isWorkspaceCollapsed}
-            setIsWorkspaceCollapsed={setIsWorkspaceCollapsed}
-            workspaceDisplayName={workspaceDisplayName}
-            showSearch={searchHook.showSearch}
-            searchText={searchHook.searchText}
-            setSearchText={searchHook.setSearchText}
-            onSearch={searchHook.onSearch}
-            searchInputRef={searchHook.searchInputRef}
-            loading={treeHook.loading}
-            refreshWorkspace={treeHook.refreshWorkspace}
-            handleSelectHostFiles={pasteHook.handleSelectHostFiles}
-            handleUploadDeviceFiles={pasteHook.handleUploadDeviceFiles}
-            setShowHostFileSelector={searchHook.setShowHostFileSelector}
-          />
+        {resolvedActiveTab === 'files' && (
+          <>
+            {/* Toolbar: search input + directory name + action buttons */}
+            <WorkspaceToolbar
+              t={t}
+              isWorkspaceCollapsed={isWorkspaceCollapsed}
+              setIsWorkspaceCollapsed={setIsWorkspaceCollapsed}
+              workspaceDisplayName={workspaceDisplayName}
+              showSearch={searchHook.showSearch}
+              searchText={searchHook.searchText}
+              setSearchText={searchHook.setSearchText}
+              onSearch={searchHook.onSearch}
+              searchInputRef={searchHook.searchInputRef}
+              loading={treeHook.loading}
+              refreshWorkspace={treeHook.refreshWorkspace}
+              handleSelectHostFiles={pasteHook.handleSelectHostFiles}
+              handleUploadDeviceFiles={pasteHook.handleUploadDeviceFiles}
+              setShowHostFileSelector={searchHook.setShowHostFileSelector}
+            />
+          </>
         )}
 
         {/* Main content area */}
-        {!isWorkspaceCollapsed && activeTab === 'files' && (
+        {!isWorkspaceCollapsed && resolvedActiveTab === 'files' && (
           <FlexFullContainer containerClassName='overflow-y-auto'>
             {/* Context Menu */}
             <WorkspaceContextMenu
@@ -506,7 +541,7 @@ const WorkspaceRailBody: React.FC<{ source: WorkspaceSource; messageApi?: Messag
         )}
 
         {/* Changes tab content */}
-        {!isWorkspaceCollapsed && activeTab === 'changes' && (
+        {resolvedActiveTab === 'changes' && (
           <FlexFullContainer containerClassName='overflow-y-auto'>
             {snapshotDisabled ? (
               <div className='flex-1 size-full flex items-center justify-center px-12px box-border'>
@@ -541,7 +576,7 @@ const WorkspaceRailBody: React.FC<{ source: WorkspaceSource; messageApi?: Messag
           </FlexFullContainer>
         )}
 
-        {!isWorkspaceCollapsed && activeExtraTab && (
+        {activeExtraTab && (
           <FlexFullContainer containerClassName='overflow-y-auto'>{activeExtraTab.content}</FlexFullContainer>
         )}
       </div>

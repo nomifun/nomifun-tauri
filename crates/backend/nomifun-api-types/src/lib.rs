@@ -18,6 +18,7 @@ mod file;
 mod idmm;
 mod knowledge;
 mod lifecycle;
+mod managed_model;
 mod mcp;
 pub mod dispatch_target;
 pub mod model_capability;
@@ -132,6 +133,12 @@ pub use knowledge::{
 pub use lifecycle::{
     GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult,
     UpdateReleaseInfo, UpdateWorkDirRequest,
+};
+pub use managed_model::{
+    ManagedModel, ManagedModelHealthBatchResult, ManagedModelHealthErrorKind,
+    ManagedModelHealthResult, ManagedModelHealthStatus, ManagedModelServiceAvailability,
+    ManagedModelServiceKind, ManagedModelServiceStatus, SetManagedModelEnabledRequest,
+    SetManagedModelServiceEnabledRequest,
 };
 pub use mcp::{
     BatchImportMcpServersRequest, CreateMcpServerRequest, DetectedMcpServerEntry,

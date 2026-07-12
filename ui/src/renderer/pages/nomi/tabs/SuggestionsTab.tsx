@@ -4,10 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
-import { Button, Empty, Message, Radio, Spin, Tag } from '@arco-design/web-react';
+import { Button, Empty, Message, Pagination, Radio, Spin, Tag } from '@arco-design/web-react';
 import { ipcBridge } from '@/common';
 import type { ICompanionSuggestion } from '@/common/adapter/ipcBridge';
 
@@ -27,19 +27,40 @@ const SuggestionsTab: React.FC = () => {
   const [filter, setFilter] = useState('new');
   const [items, setItems] = useState<ICompanionSuggestion[]>([]);
   const [loading, setLoading] = useState(true);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
+  const [total, setTotal] = useState(0);
+
+  const refreshSeq = useRef(0);
 
   const refresh = useCallback(async () => {
+    const seq = ++refreshSeq.current;
     setLoading(true);
     try {
-      const list = await ipcBridge.companion.listSuggestions.invoke({
+      const result = await ipcBridge.companion.listSuggestions.invoke({
         status: filter === 'all' ? undefined : filter,
-        limit: 200,
+        limit: pageSize,
+        offset: (page - 1) * pageSize,
       });
-      setItems(list);
+      if (seq === refreshSeq.current) {
+        const maxPage = Math.max(1, Math.ceil(result.total / pageSize));
+        setTotal(result.total);
+        if (page > maxPage) {
+          setPage(maxPage);
+          return;
+        }
+        setItems(result.items);
+      }
+    } catch (e) {
+      if (seq === refreshSeq.current) Message.error(String(e));
     } finally {
-      setLoading(false);
+      if (seq === refreshSeq.current) setLoading(false);
     }
-  }, [filter]);
+  }, [filter, page, pageSize]);
+
+  useEffect(() => {
+    setPage(1);
+  }, [filter, pageSize]);
 
   useEffect(() => {
     void refresh();
@@ -72,6 +93,17 @@ const SuggestionsTab: React.FC = () => {
     [navigate, refresh]
   );
 
+  const handlePageChange = useCallback(
+    (nextPage: number, nextPageSize: number) => {
+      const pageSizeChanged = nextPageSize !== pageSize;
+      if (pageSizeChanged) setPageSize(nextPageSize);
+      setPage(pageSizeChanged ? 1 : nextPage);
+    },
+    [pageSize]
+  );
+
+  const initialLoading = loading && items.length === 0 && total === 0;
+
   return (
     <div className='flex flex-col gap-12px py-8px'>
       <Radio.Group type='button' value={filter} onChange={setFilter}>
@@ -80,14 +112,14 @@ const SuggestionsTab: React.FC = () => {
         <Radio value='dismissed'>{t('nomi.suggestions.filterDismissed')}</Radio>
         <Radio value='all'>{t('nomi.suggestions.filterAll')}</Radio>
       </Radio.Group>
-      {loading ? (
+      {initialLoading ? (
         <div className='flex justify-center py-40px'>
           <Spin />
         </div>
       ) : items.length === 0 ? (
         <Empty description={t('nomi.suggestions.empty')} />
       ) : (
-        <div className='flex flex-col gap-8px'>
+        <div className='flex flex-col gap-8px transition-opacity duration-150' style={{ opacity: loading ? 0.6 : 1 }}>
           {items.map((s) => (
             <div key={s.id} className='flex items-start gap-10px bg-fill-2 rd-10px px-12px py-10px'>
               <span className='text-18px leading-none mt-2px'>{KIND_EMOJI[s.kind] || '🐰'}</span>
@@ -115,6 +147,21 @@ const SuggestionsTab: React.FC = () => {
               )}
             </div>
           ))}
+        </div>
+      )}
+
+      {total > 0 && (
+        <div className='flex justify-end pt-2px'>
+          <Pagination
+            current={page}
+            pageSize={pageSize}
+            total={total}
+            showTotal
+            sizeCanChange
+            sizeOptions={[10, 20, 50]}
+            showJumper={total > pageSize}
+            onChange={handlePageChange}
+          />
         </div>
       )}
     </div>

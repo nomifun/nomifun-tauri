@@ -16,6 +16,7 @@ serde_json.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
+getrandom.workspace = true
 aws-config.workspace = true
 aws-sdk-bedrock.workspace = true
 semver.workspace = true

@@ -66,6 +66,11 @@
     "description": "按计划自动运行任务，也可以从会话顶部入口带入指定会话后创建。",
     "searchPlaceholder": "搜索任务名称、会话、指令或调度规则",
     "noSearchResults": "没有匹配的定时任务",
+    "list": {
+      "task": "任务标题",
+      "status": "任务状态",
+      "action": "启停"
+    },
     "awakeBanner": "定时任务仅在电脑唤醒状态下运行。",
     "keepAwake": "保持唤醒",
     "keepAwakeTooltip": "开启后，开盖状态下 Nomi 会保持电脑唤醒；显示器仍可正常熄屏，不影响定时任务运行。注意：合盖仍会休眠——除非插电并同时连接外接显示器和外接键鼠（clamshell 模式）。",

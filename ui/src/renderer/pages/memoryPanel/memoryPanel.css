@@ -1,0 +1,15 @@
+html, body, #root { margin: 0; width: 100%; height: 100%; background: transparent !important; overflow: hidden; }
+.nomi-memory-panel { width: 100vw; height: 100vh; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif; }
+.nomi-memory-panel__card { box-sizing: border-box; width: 100%; min-height: min(120px, 100vh); max-height: min(320px, 100vh); overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--bg-4) transparent; border: 1px solid var(--border-base); border-radius: 14px; background: var(--bg-base); color: var(--text-primary); opacity: 0; transform: scale(.98); transition: opacity 140ms ease, transform 140ms ease; }
+.nomi-memory-panel--open .nomi-memory-panel__card { opacity: 1; transform: scale(1); }
+.nomi-memory-panel--closing .nomi-memory-panel__card { opacity: 0; transform: scale(.98); pointer-events: none; }
+.nomi-memory-panel__list { padding: 6px; }
+.nomi-memory-panel__item { display: block; width: 100%; padding: 9px 10px; border: 0; border-radius: 9px; background: transparent; color: inherit; text-align: left; font: inherit; cursor: pointer; }
+.nomi-memory-panel__item + .nomi-memory-panel__item { margin-top: 4px; }
+.nomi-memory-panel__item:hover, .nomi-memory-panel__item:focus-visible { background: var(--bg-2); outline: none; }
+.nomi-memory-panel__title, .nomi-memory-panel__body { display: block; overflow-wrap: anywhere; }
+.nomi-memory-panel__title { font-size: 12px; line-height: 1.45; font-weight: 700; }
+.nomi-memory-panel__body { display: -webkit-box; margin-top: 3px; overflow: hidden; font-size: 12px; line-height: 1.55; color: var(--text-secondary); white-space: normal; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.nomi-memory-panel__card::-webkit-scrollbar { width: 6px; }
+.nomi-memory-panel__card::-webkit-scrollbar-thumb { border-radius: 3px; background: var(--bg-4); }
+@media (prefers-reduced-motion: reduce) { .nomi-memory-panel__card { transition-duration: 0ms; transform: none; } }

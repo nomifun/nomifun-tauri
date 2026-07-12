@@ -6,7 +6,7 @@
 
 import React, { Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { EveryUser, Help, Left, Loading, Right } from '@icon-park/react';
+import { EveryUser, Help, Loading, Right } from '@icon-park/react';
 import { Modal, Spin } from '@arco-design/web-react';
 import { ipcBridge } from '@/common';
 import type { TReplanRequest, TRunTask } from '@/common/types/orchestrator/orchestratorTypes';
@@ -45,8 +45,6 @@ const CANVAS_WIDTH_KEY = 'nomifun:orchestration-canvas-width';
 const MIN_W = 320;
 const MAX_W = 860;
 const DEFAULT_W = 480;
-/** Collapsed (hidden) preference, persisted so the pane stays where the user left it. */
-const CANVAS_COLLAPSED_KEY = 'nomifun:orchestration-canvas-collapsed';
 
 function readInitialWidth(): number {
   try {
@@ -56,14 +54,6 @@ function readInitialWidth(): number {
     /* ignore */
   }
   return DEFAULT_W;
-}
-
-function readInitialCollapsed(): boolean {
-  try {
-    return localStorage.getItem(CANVAS_COLLAPSED_KEY) === '1';
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -77,8 +67,8 @@ function readInitialCollapsed(): boolean {
  * Reads {@link useOrchestration} (always inside an `OrchestrationProvider`):
  *  - `runId == null` → renders nothing (no run linked → pane absent; the chat takes
  *    the full width, so a plain nomi conversation looks exactly as before).
- *  - collapsed → a thin vertical strip on the right edge (status dot + a 「‹」expand
- *    affordance) so the canvas can be hidden and the chat reclaim the width.
+ *  - closed → renders nothing; the persistent workspace tool rail remains the
+ *    discoverable entry point and can reopen the canvas.
  *  - expanded → a width-resizable column: a left-edge drag handle to widen/narrow;
  *    a header (collapse 「›」 + 「编排画布」title + status pill {@link STATUS_META} +
  *    「规划中…」hint + compact {@link RunControls}); and a full-height body hosting
@@ -99,7 +89,6 @@ const OrchestrationTopPanel: React.FC = () => {
   const { buildModelRange } = useModelRange();
 
   // Collapsed (hidden) ⟷ expanded. Default expanded for discoverability.
-  const [collapsed, setCollapsed] = useState<boolean>(readInitialCollapsed);
   // Resizable pane width (px). Persisted; drag the left edge to change it.
   const [width, setWidth] = useState<number>(readInitialWidth);
   const dragState = useRef<{ startX: number; startWidth: number } | null>(null);
@@ -111,14 +100,6 @@ const OrchestrationTopPanel: React.FC = () => {
       /* ignore */
     }
   }, [width]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(CANVAS_COLLAPSED_KEY, collapsed ? '1' : '0');
-    } catch {
-      /* ignore */
-    }
-  }, [collapsed]);
 
   // ── Resize (drag the LEFT edge; pane is on the right, so dragging left widens) ──
   const onResizePointerDown = useCallback(
@@ -153,7 +134,8 @@ const OrchestrationTopPanel: React.FC = () => {
   const [replanAutonomy, setReplanAutonomy] = useState<AutonomyLevel>('interactive');
   const [replanSubmitting, setReplanSubmitting] = useState(false);
 
-  const { runId, detail, leadThinking, loading, refetch, projectTask, projectedTaskId } = orchestration;
+  const { runId, detail, leadThinking, loading, refetch, projectTask, projectedTaskId, canvasOpen, setCanvasOpen } =
+    orchestration;
 
   const openTask = useCallback(
     (task: TRunTask) => {
@@ -216,7 +198,7 @@ const OrchestrationTopPanel: React.FC = () => {
   );
 
   // No run linked to this conversation → the pane does not exist.
-  if (runId == null) return null;
+  if (runId == null || !canvasOpen) return null;
 
   const status = detail?.run.status ?? '';
   const statusMeta = STATUS_META[status];
@@ -245,34 +227,6 @@ const OrchestrationTopPanel: React.FC = () => {
       });
   const showProgressSummary = questionTasks.length > 0 || tasks.length > 0 || (planning && phaseKeys.length > 0);
 
-  // ── Collapsed: thin vertical strip on the right edge ──────────────────────────
-  if (collapsed) {
-    // Self-describing so the collapsed strip never reads as "the controls vanished":
-    // the vertical label carries both the pane title AND the live run status.
-    const collapsedLabel = `${panelTitle} · ${statusLabel}`;
-    return (
-      <div
-        role='button'
-        tabIndex={0}
-        aria-label={t('conversation.orchestration.expandCanvas', { defaultValue: '展开编排画布' })}
-        title={collapsedLabel}
-        onClick={() => setCollapsed(false)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            setCollapsed(false);
-          }
-        }}
-        className={styles.collapsedStrip}
-      >
-        {msgCtx}
-        <Left theme='outline' size='14' strokeWidth={3} />
-        <span className={styles.collapsedDot} style={{ background: statusColor }} />
-        <span className={styles.collapsedLabel}>{collapsedLabel}</span>
-      </div>
-    );
-  }
-
   // ── Expanded: width-resizable right column ────────────────────────────────────
   return (
     <div className={`${styles.panel} shrink-0 flex flex-col`} style={{ width }}>
@@ -297,11 +251,11 @@ const OrchestrationTopPanel: React.FC = () => {
           role='button'
           tabIndex={0}
           aria-label={t('conversation.orchestration.collapseCanvas', { defaultValue: '收起编排画布' })}
-          onClick={() => setCollapsed(true)}
+          onClick={() => setCanvasOpen(false)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault();
-              setCollapsed(true);
+              setCanvasOpen(false);
             }
           }}
           className={`${styles.toggle} inline-flex items-center gap-6px cursor-pointer select-none`}

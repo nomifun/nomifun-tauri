@@ -38,6 +38,9 @@ export interface OrchestrationContextValue {
   projectedPayload: OpenTaskPayload | null; // cached so F7 can resolve the worker conversation_id
   projectTask: (payload: OpenTaskPayload) => void;
   returnToMain: () => void;
+  canvasOpen: boolean;
+  setCanvasOpen: (open: boolean) => void;
+  toggleCanvas: () => void;
 }
 
 const OrchestrationContext = createContext<OrchestrationContextValue | null>(null);
@@ -60,6 +63,7 @@ export const OrchestrationProvider: React.FC<{ conversation: TChatConversation; 
 
   const [projectedTaskId, setProjectedTaskId] = useState<string | null>(null);
   const [projectedPayload, setProjectedPayload] = useState<OpenTaskPayload | null>(null);
+  const [canvasOpen, setCanvasOpen] = useState(false);
 
   const projectTask = useCallback((payload: OpenTaskPayload) => {
     setProjectedTaskId(payload.task.id);
@@ -71,6 +75,10 @@ export const OrchestrationProvider: React.FC<{ conversation: TChatConversation; 
     setProjectedPayload(null);
   }, []);
 
+  const toggleCanvas = useCallback(() => {
+    setCanvasOpen((open) => !open);
+  }, []);
+
   // Reset the projection whenever the linked run changes or disappears, so we
   // never keep projecting to a task belonging to a previous run. Depends only
   // on `runId` (a primitive) — the projection is local UI state, so clearing it
@@ -78,6 +86,7 @@ export const OrchestrationProvider: React.FC<{ conversation: TChatConversation; 
   useEffect(() => {
     setProjectedTaskId(null);
     setProjectedPayload(null);
+    setCanvasOpen(Boolean(runId));
   }, [runId]);
 
   const value = useMemo<OrchestrationContextValue>(
@@ -92,6 +101,9 @@ export const OrchestrationProvider: React.FC<{ conversation: TChatConversation; 
       projectedPayload,
       projectTask,
       returnToMain,
+      canvasOpen,
+      setCanvasOpen,
+      toggleCanvas,
     }),
     [
       conversationId,
@@ -104,6 +116,8 @@ export const OrchestrationProvider: React.FC<{ conversation: TChatConversation; 
       projectedPayload,
       projectTask,
       returnToMain,
+      canvasOpen,
+      toggleCanvas,
     ]
   );
 

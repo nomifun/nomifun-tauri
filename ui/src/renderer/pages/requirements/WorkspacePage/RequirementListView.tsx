@@ -15,7 +15,7 @@
  * Pure/presentational: data, selection set, and the detail drawer all live in
  * the parent (WorkspacePage); this component only fans callbacks back out.
  */
-import { Button, Checkbox, Pagination, Result } from '@arco-design/web-react';
+import { Button, Pagination, Result } from '@arco-design/web-react';
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -34,8 +34,6 @@ interface RequirementListViewProps {
   onRetry?: () => void;
   selectedIds: Set<number>;
   onToggleSelect: (id: number) => void;
-  onToggleSelectAll: (pageIds: number[], checked: boolean) => void;
-  onClearSelection: () => void;
   onOpenDetail: (id: number) => void;
   onStatusChange: (id: number, next: RequirementStatus) => void;
   onEdit: (id: number) => void;
@@ -56,8 +54,6 @@ const RequirementListView: React.FC<RequirementListViewProps> = ({
   onRetry,
   selectedIds,
   onToggleSelect,
-  onToggleSelectAll,
-  onClearSelection,
   onOpenDetail,
   onStatusChange,
   onEdit,
@@ -65,12 +61,6 @@ const RequirementListView: React.FC<RequirementListViewProps> = ({
   onCreate,
 }) => {
   const { t } = useTranslation();
-
-  // Current-page selection state for the header "select all on page" checkbox.
-  const pageIds = items.map((i) => i.id);
-  const allOnPageSelected = pageIds.length > 0 && pageIds.every((id) => selectedIds.has(id));
-  const someOnPageSelected = pageIds.some((id) => selectedIds.has(id));
-  const selectedCount = selectedIds.size;
 
   if (error) {
     return (
@@ -110,31 +100,6 @@ const RequirementListView: React.FC<RequirementListViewProps> = ({
 
   return (
     <div className='flex flex-col gap-12px'>
-      {/* List header — select-all-on-page + total / selected count + clear. */}
-      <div className='flex items-center gap-12px px-2px text-13px text-[var(--color-text-3)]'>
-        <Checkbox
-          checked={allOnPageSelected}
-          indeterminate={someOnPageSelected && !allOnPageSelected}
-          onChange={(checked) => onToggleSelectAll(pageIds, checked)}
-        >
-          <span className='text-13px text-[var(--color-text-2)]'>
-            {t('requirements.selection.selectAllPage')}
-          </span>
-        </Checkbox>
-        <span className='tabular-nums'>{t('requirements.selection.totalCount', { count: total })}</span>
-        {selectedCount > 0 && (
-          <>
-            <span aria-hidden>·</span>
-            <span className='tabular-nums'>
-              {t('requirements.selection.selectedCount', { count: selectedCount })}
-            </span>
-            <Button type='text' size='mini' onClick={onClearSelection}>
-              {t('requirements.selection.clear')}
-            </Button>
-          </>
-        )}
-      </div>
-
       <div
         className='flex flex-col gap-8px transition-opacity duration-150'
         style={{ opacity: loading ? 0.6 : 1 }}

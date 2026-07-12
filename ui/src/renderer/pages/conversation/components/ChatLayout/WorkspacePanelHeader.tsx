@@ -1,9 +1,9 @@
 import { WORKSPACE_HEADER_HEIGHT } from '@/renderer/pages/conversation/utils/layoutCalc';
-import { dispatchWorkspaceToggleEvent } from '@/renderer/utils/workspace/workspaceEvents';
 import { ExpandLeft, ExpandRight } from '@icon-park/react';
 import React from 'react';
 import WorkspaceBindButton from './WorkspaceBindButton';
 import WorkspaceOpenButton from './WorkspaceOpenButton';
+import type { WorkspaceTab } from '@/renderer/pages/conversation/Workspace/types';
 
 type WorkspaceHeaderProps = {
   children?: React.ReactNode;
@@ -24,6 +24,7 @@ type WorkspaceHeaderProps = {
    * to redirect a temporary session's workspace via a PATCH.
    */
   conversation_id?: number;
+  activeTab?: WorkspaceTab;
 };
 
 // Compact header bar for the workspace side panel with optional collapse toggle
@@ -36,6 +37,7 @@ const WorkspacePanelHeader: React.FC<WorkspaceHeaderProps> = ({
   workspacePath,
   isTemporaryWorkspace = false,
   conversation_id,
+  activeTab = 'files',
 }) => (
   <div
     className='workspace-panel-header flex items-center justify-start px-12px py-4px gap-12px border-b border-[var(--bg-3)]'
@@ -58,6 +60,7 @@ const WorkspacePanelHeader: React.FC<WorkspaceHeaderProps> = ({
         workspaces offer the "open in external tool" button. Each guards for the
         desktop shell internally, so nothing renders in WebUI/browser mode. */}
     {!collapsed &&
+      activeTab === 'files' &&
       (isTemporaryWorkspace ? (
         <WorkspaceBindButton conversation_id={conversation_id} />
       ) : (
@@ -70,19 +73,6 @@ const WorkspacePanelHeader: React.FC<WorkspaceHeaderProps> = ({
       </button>
     )}
   </div>
-);
-
-// Small floating button shown when the workspace panel is collapsed on desktop
-export const DesktopWorkspaceToggle: React.FC = () => (
-  <button
-    type='button'
-    className='workspace-toggle-floating workspace-header__toggle absolute top-1/2 right-2 z-10'
-    style={{ transform: 'translateY(-50%)' }}
-    onClick={() => dispatchWorkspaceToggleEvent()}
-    aria-label='Expand workspace'
-  >
-    <ExpandLeft size={16} />
-  </button>
 );
 
 export default WorkspacePanelHeader;

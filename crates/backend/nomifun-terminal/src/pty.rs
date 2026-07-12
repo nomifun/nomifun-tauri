@@ -67,6 +67,27 @@ pub struct SpawnParams {
     pub rows: u16,
 }
 
+/// Remove inherited locale variables that have higher POSIX precedence than a
+/// locale override supplied for this PTY session. `CommandBuilder` snapshots
+/// the parent environment at construction, so merely adding `LC_CTYPE` or
+/// `LANG` does not make it effective when the parent has `LC_ALL`/`LC_CTYPE`.
+#[cfg(unix)]
+fn remove_inherited_locale_vars_shadowing_overrides(
+    cmd: &mut CommandBuilder,
+    env: &HashMap<String, String>,
+) {
+    if env.contains_key("LC_ALL") {
+        // The session supplies the highest-precedence category itself.
+        return;
+    }
+    if env.contains_key("LC_CTYPE") {
+        cmd.env_remove("LC_ALL");
+    } else if env.contains_key("LANG") {
+        cmd.env_remove("LC_ALL");
+        cmd.env_remove("LC_CTYPE");
+    }
+}
+
 impl PtyHandle {
     /// Spawn a child in a new PTY.
     ///
@@ -105,6 +126,8 @@ impl PtyHandle {
         if !params.cwd.is_empty() {
             cmd.cwd(&params.cwd);
         }
+        #[cfg(unix)]
+        remove_inherited_locale_vars_shadowing_overrides(&mut cmd, &params.env);
         for (k, v) in &params.env {
             cmd.env(k, v);
         }
@@ -285,6 +308,50 @@ fn append_scrollback(scrollback: &Arc<Mutex<Vec<u8>>>, chunk: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_lc_ctype_removes_inherited_lc_all() {
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.env("LC_ALL", "C");
+        let env = HashMap::from([("LC_CTYPE".to_owned(), "UTF-8".to_owned())]);
+
+        remove_inherited_locale_vars_shadowing_overrides(&mut cmd, &env);
+
+        assert!(cmd.get_env("LC_ALL").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_lang_removes_inherited_character_locale_overrides() {
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.env("LC_ALL", "C");
+        cmd.env("LC_CTYPE", "zh_CN.GB18030");
+        let env = HashMap::from([("LANG".to_owned(), "en_US.UTF-8".to_owned())]);
+
+        remove_inherited_locale_vars_shadowing_overrides(&mut cmd, &env);
+
+        assert!(cmd.get_env("LC_ALL").is_none());
+        assert!(cmd.get_env("LC_CTYPE").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_lc_all_keeps_highest_precedence_override() {
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.env("LC_ALL", "C");
+        let env = HashMap::from([("LC_ALL".to_owned(), "en_US.UTF-8".to_owned())]);
+
+        remove_inherited_locale_vars_shadowing_overrides(&mut cmd, &env);
+        for (key, value) in &env {
+            cmd.env(key, value);
+        }
+
+        assert_eq!(
+            cmd.get_env("LC_ALL"),
+            Some(std::ffi::OsStr::new("en_US.UTF-8"))
+        );
+    }
 
     #[test]
     fn scrollback_is_bounded() {

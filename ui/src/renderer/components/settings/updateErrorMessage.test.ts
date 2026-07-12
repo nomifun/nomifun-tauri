@@ -17,4 +17,12 @@ describe('getUpdateErrorMessageKey', () => {
   test('keeps unknown updater errors on the generic failure message', () => {
     expect(getUpdateErrorMessageKey('permission denied')).toBe('update.checkFailed');
   });
+
+  test.each([
+    'NOMIFUN_UPDATER_AUTO_INSTALL_UNSUPPORTED:mounted_volume',
+    'Cross-device link (os error 18)',
+    'operation crosses devices',
+  ])('maps unsafe macOS install error %s to recovery guidance', (message) => {
+    expect(getUpdateErrorMessageKey(message)).toBe('update.crossDeviceInstallUnsupported');
+  });
 });

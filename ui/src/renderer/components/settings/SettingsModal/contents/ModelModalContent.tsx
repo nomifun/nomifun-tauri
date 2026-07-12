@@ -48,7 +48,8 @@ import { useSettingsViewMode } from '../settingsViewContext';
 import { consumePendingDeepLink } from '@/renderer/hooks/system/useDeepLink';
 import { ContextLimitSelect, formatContextLimit } from '@/renderer/pages/settings/components/ContextLimitSelect';
 import { cloneProviderConfig } from '@/renderer/utils/model/providerClone';
-import { reorderById, reorderStrings, withDenseSortOrder } from './modelProviderOrdering';
+import { isManagedModelProvider } from '@/common/types/provider/managedModelService';
+import { reorderById, reorderStrings } from './modelProviderOrdering';
 import {
   buildModelProfileUpsertRequest,
   editableModelTasks,
@@ -476,13 +477,20 @@ const ModelModalContent: React.FC = () => {
   const [collapseKey, setCollapseKey] = useState<Record<string, boolean>>({});
   const [healthCheckLoading, setHealthCheckLoading] = useState<Record<string, boolean>>({});
   const { data, mutate } = useProvidersQuery();
+  // Managed providers have dedicated pages. Keeping them out of generic CRUD
+  // prevents exposing or accidentally overwriting their internal endpoint and
+  // per-boot credential.
+  const editableProviders = useMemo(() => (data ?? []).filter((provider) => !isManagedModelProvider(provider)), [data]);
   const { profileFor, mutate: mutateProfiles } = useModelProfiles();
   const [message, messageContext] = useArcoMessage();
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
   );
-  const providerSortableItems = useMemo(() => (data || []).map((platform) => providerSortableId(platform.id)), [data]);
+  const providerSortableItems = useMemo(
+    () => editableProviders.map((platform) => providerSortableId(platform.id)),
+    [editableProviders]
+  );
 
   /**
    * Create when the provider id is new, update otherwise.
@@ -589,13 +597,21 @@ const ModelModalContent: React.FC = () => {
   const handleProviderDragEnd = (activeData: SortableDragData, overData: SortableDragData) => {
     if (!data || activeData.type !== 'provider' || overData.type !== 'provider') return;
 
-    const reordered = reorderById(data, activeData.providerId, overData.providerId);
-    if (reordered === data) return;
+    const reordered = reorderById(editableProviders, activeData.providerId, overData.providerId);
+    if (reordered === editableProviders) return;
 
-    const nextArray = withDenseSortOrder(reordered);
+    // Preserve every managed provider's full-list slot. Refill only editable
+    // slots and assign their full-list position as sort_order, avoiding a
+    // duplicate sort_order with a managed row (whose CRUD is protected).
+    let editableIndex = 0;
+    const nextArray = data.map((item, fullIndex) => {
+      if (isManagedModelProvider(item)) return item;
+      return { ...reordered[editableIndex++], sort_order: fullIndex };
+    });
+    const reorderedWithOrder = nextArray.filter((item) => !isManagedModelProvider(item));
     void mutate(nextArray, false);
 
-    persistProviderOrder(nextArray, data)
+    persistProviderOrder(reorderedWithOrder, editableProviders)
       .then(() => {
         void mutate();
       })
@@ -763,14 +779,18 @@ const ModelModalContent: React.FC = () => {
 
   const clearAllHealthData = () => {
     if (!data) return;
-    const nextArray: IProvider[] = data.map((platform: IProvider) => ({
-      ...platform,
-      model_health: undefined as IProvider['model_health'],
-    }));
+    const nextArray: IProvider[] = data.map((platform: IProvider) =>
+      isManagedModelProvider(platform)
+        ? platform
+        : {
+            ...platform,
+            model_health: undefined as IProvider['model_health'],
+          }
+    );
     void mutate(nextArray, false);
 
     Promise.all(
-      (data || []).map((platform) => ipcBridge.mode.updateProvider.invoke({ id: platform.id, model_health: {} }))
+      editableProviders.map((platform) => ipcBridge.mode.updateProvider.invoke({ id: platform.id, model_health: {} }))
     )
       .then(() => {
         void mutate();
@@ -866,7 +886,7 @@ const ModelModalContent: React.FC = () => {
 
       {/* Content Area */}
       <NomiScrollArea className='flex-1 min-h-0' disableOverflow={isPageMode}>
-        {!data || data.length === 0 ? (
+        {!data || editableProviders.length === 0 ? (
           <div className='flex flex-col items-center justify-center py-40px'>
             <Info theme='outline' size='48' className='text-t-secondary mb-16px' />
             <h3 className='text-16px font-500 text-t-primary mb-8px'>{t('settings.noConfiguredModels')}</h3>
@@ -887,7 +907,7 @@ const ModelModalContent: React.FC = () => {
           <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
             <SortableContext items={providerSortableItems} strategy={verticalListSortingStrategy}>
               <div className='space-y-16px'>
-            {(data || []).map((platform: IProvider) => {
+            {editableProviders.map((platform: IProvider) => {
               const key = platform.id;
               const isExpanded = collapseKey[platform.id] ?? false;
               return (

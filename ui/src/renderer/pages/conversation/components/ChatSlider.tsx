@@ -7,15 +7,14 @@
 import type { TChatConversation } from '@/common/config/storage';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 import React from 'react';
-import { useTranslation } from 'react-i18next';
 import ChatWorkspace from '../Workspace';
-import NomiSessionMetricsPanel from '../platforms/nomi/NomiSessionMetricsPanel';
+import type { WorkspaceExtraTab } from '../Workspace/types';
 
 const ChatSlider: React.FC<{
   conversation?: TChatConversation;
-}> = ({ conversation }) => {
+  extraTabs?: WorkspaceExtraTab[];
+}> = ({ conversation, extraTabs }) => {
   const [messageApi, messageContext] = useArcoMessage({ maxCount: 1 });
-  const { t } = useTranslation();
 
   let workspaceNode: React.ReactNode = null;
   if (conversation?.type === 'acp' && conversation.extra?.workspace) {
@@ -52,13 +51,7 @@ const ChatSlider: React.FC<{
         }
         eventPrefix='nomi'
         messageApi={messageApi}
-        extraTabs={[
-          {
-            key: 'nomi-session-metrics',
-            title: t('conversation.sessionMetrics.tab'),
-            content: <NomiSessionMetricsPanel conversation={conversation} />,
-          },
-        ]}
+        extraTabs={extraTabs}
       ></ChatWorkspace>
     );
   } else if (conversation?.type === 'openclaw-gateway' && conversation.extra?.workspace) {

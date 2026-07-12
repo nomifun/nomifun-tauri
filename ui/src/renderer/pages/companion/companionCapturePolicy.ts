@@ -9,7 +9,6 @@ export interface CompanionCapturePolicyState {
   barRevealed: boolean;
   hasInput: boolean;
   sending: boolean;
-  showSuggestions: boolean;
   dragOver: boolean;
 }
 

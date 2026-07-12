@@ -34,7 +34,13 @@ import { browserNarrationFor } from './browserNarration';
 import { getDeskSpecFor } from './characters';
 import { customFigureMetaOf } from './characters/customMeta';
 import type { CompanionActivity as RabbitActivity, CompanionMood as RabbitMood } from './characters';
-import { placeResizedWindow } from './windowGeometry';
+import {
+  pickHostMonitor,
+  resolveDeskRestoreLayout,
+  type MonitorLayout,
+} from './memoryPanelGeometry';
+import { useDetachedMemoryPanel } from './useDetachedMemoryPanel';
+import { placeResizedWindow, type GeomRect } from './windowGeometry';
 import { buildCompanionMenuEntries, type CompanionMenuAction } from './companionNativeMenu';
 import { useCompanionClickThrough } from './useCompanionClickThrough';
 import { createCompanionBarRevealController, type CompanionBarRevealController } from './companionBarReveal';
@@ -47,6 +53,16 @@ const STREAM_STALL_MS = 45_000;
 const INIT_RETRY_MS = 5_000;
 const INIT_MAX_RETRIES = 6;
 const BAR_REVEAL_HIDE_DELAY_MS = 280;
+const MAX_WINDOW_RESTORE_RETRIES = 2;
+
+type ExpandedWindowMode = 'chat';
+
+interface ExpandedWindowSession {
+  anchor: GeomRect;
+  scaleFactor: number;
+  hostMonitorId: string | null;
+  mode: ExpandedWindowMode;
+}
 
 /** Platform → bubble-header logo for remote IM turns (keys follow the
  *  backend's PluginType::Display strings on `channel_platform`). */
@@ -104,7 +120,6 @@ const CompanionPage: React.FC = () => {
   const [bubbleLoading, setBubbleLoading] = useState(false);
   const [unread, setUnread] = useState(0);
   const [suggestions, setSuggestions] = useState<ICompanionSuggestion[]>([]);
-  const [showSuggestions, setShowSuggestions] = useState(false);
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   /** 光标是否停在伙伴交互区（由 useCompanionClickThrough 上报）：驱动「悬停才出现」的
@@ -125,6 +140,7 @@ const CompanionPage: React.FC = () => {
   const [dragging, setDragging] = useState(false);
   /** 立绘命中元素 ref：传给 CompanionAvatar→CustomFigure 挂 alpha 掩码。 */
   const figureHitRef = useRef<HTMLDivElement | null>(null);
+  const unreadBadgeRef = useRef<HTMLButtonElement | null>(null);
   /** 'sendbox' 上传进度：粘贴/选择图片落盘期间用于 loading 态与暂禁发送。 */
   const sendboxUpload = useUploadState('sendbox');
   /** 本地回合是否正在流式生成（驱动气泡上的「打断 □」按钮显隐）。镜像 turnActiveRef。 */
@@ -147,11 +163,15 @@ const CompanionPage: React.FC = () => {
    *  several assistant msg_ids; rendered joined in arrival order). */
   const segmentsRef = useRef(new Map<string, string>());
   const segmentOrderRef = useRef<string[]>([]);
-  /** True while the native window has been grown to chat size (elastic bubble
-   *  needs room beyond the 240×320 desk window). Guards against thrashing
-   *  setSize per streaming chunk — we resize once entering chat mode and once
-   *  restoring the desk size when the bubble clears. */
-  const chatSizedRef = useRef(false);
+  /** One native-window expansion session shared by replies, the composer, and
+   *  the memory panel. `anchor` remains the exact desk rectangle until every
+   *  expanded surface closes, so internal resizes never become saved position. */
+  const expandedWindowSessionRef = useRef<ExpandedWindowSession | null>(null);
+  const expandedWindowQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const expandedWindowRestoreRetriesRef = useRef(0);
+  const expandedWindowRequestedModeRef = useRef<ExpandedWindowMode | null>(null);
+  const expandedWindowRestoreTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const internalWindowLayoutRef = useRef(false);
   /** 气泡正文滚动视口 + 内容包裹，用于「粘底自动追尾」（持续对话感）。 */
   const bubbleScrollRef = useRef<HTMLDivElement | null>(null);
   const bubbleContentRef = useRef<HTMLDivElement | null>(null);
@@ -319,10 +339,9 @@ const CompanionPage: React.FC = () => {
   // computation here would be wrong.
   const applyDeskSize = useCallback(async (cfg: ICompanionProfile, opts?: { anchor?: 'bottom' | 'top-left' }) => {
     if (!isTauriRuntime() || !cfg.appearance.companion_enabled) return;
-    // 聊天模式下窗口被 enterChatSize 故意放大；此时 config-updated 回声里的
-    // applyDeskSize 不能把它缩回桌面伙伴尺寸（会和 enterChatSize 打架、把气泡挤没）。
-    // exitChatSize 会先清掉该标记再调本函数还原，故不影响正常收尾还原。
-    if (chatSizedRef.current) return;
+    // An expanded surface owns the native rectangle until it closes. Config
+    // echoes must not shrink it or turn its temporary top-left into desk state.
+    if (expandedWindowSessionRef.current) return;
     try {
       const { getCurrentWindow, PhysicalPosition, PhysicalSize, availableMonitors } = await import('@tauri-apps/api/window');
       const win = getCurrentWindow();
@@ -370,77 +389,175 @@ const CompanionPage: React.FC = () => {
     }
   }, []);
 
-  // ---- 聊天模式窗口尺寸（弹性气泡，badcase 3）----
-  // 桌面伙伴原生窗口只有 240×320，父容器 overflow:hidden，纯 CSS 撑不出窗口外。
-  // 进入聊天（首条内容或本地发送时）把 Tauri 窗口放大到能容纳弹性气泡的尺寸：
-  // 宽 ~ min(480, 工作区宽 42%)，高 ~ min(560, 工作区高 56%)；底边锚定、显示器钳制，
-  // 与 applyDeskSize 同一套读回+锚定逻辑。chatSizedRef 防抖：流式分片不重复 setSize。
-  const enterChatSize = useCallback(async () => {
-    if (!isTauriRuntime() || chatSizedRef.current) return;
-    const cfg = profileRef.current;
-    if (!cfg || !cfg.appearance.companion_enabled) return;
-    chatSizedRef.current = true; // 先占位防抖，失败再回退
-    try {
+  // ---- expanded native-window session (reply / composer / memory panel) ----
+  // The transparent WebView clips everything outside its native bounds. Capture
+  // the exact desk rect once, lay expanded surfaces out inside the host monitor,
+  // and restore that rect verbatim when the last surface closes.
+  const syncExpandedWindow = useCallback((mode: ExpandedWindowMode | null): Promise<void> => {
+    if (!isTauriRuntime()) return Promise.resolve();
+    expandedWindowRequestedModeRef.current = mode;
+    if (expandedWindowRestoreTimerRef.current) {
+      clearTimeout(expandedWindowRestoreTimerRef.current);
+      expandedWindowRestoreTimerRef.current = null;
+    }
+    if (mode !== null) expandedWindowRestoreRetriesRef.current = 0;
+    const queued = expandedWindowQueueRef.current.then(async () => {
+      const cfg = profileRef.current;
       const { getCurrentWindow, PhysicalPosition, PhysicalSize, availableMonitors } = await import('@tauri-apps/api/window');
       const win = getCurrentWindow();
-      const [pos, size, scale] = await Promise.all([win.outerPosition(), win.outerSize(), win.scaleFactor()]);
-      let monitors: { x: number; y: number; width: number; height: number }[] = [];
+      internalWindowLayoutRef.current = true;
       try {
-        monitors = (await availableMonitors()).map((m) => ({
-          x: m.position.x,
-          y: m.position.y,
-          width: m.size.width,
-          height: m.size.height,
-        }));
-      } catch {
-        // 取不到显示器就不钳制
+        let monitors: MonitorLayout[] = [];
+        try {
+          monitors = (await availableMonitors()).map((monitor) => ({
+            id: `${monitor.name ?? 'monitor'}:${monitor.position.x}:${monitor.position.y}:${monitor.size.width}:${monitor.size.height}:${monitor.scaleFactor}`,
+            bounds: {
+              x: monitor.position.x,
+              y: monitor.position.y,
+              width: monitor.size.width,
+              height: monitor.size.height,
+            },
+            workArea: {
+              x: monitor.workArea.position.x,
+              y: monitor.workArea.position.y,
+              width: monitor.workArea.size.width,
+              height: monitor.workArea.size.height,
+            },
+            scaleFactor: monitor.scaleFactor,
+          }));
+        } catch {
+          // Fall back to browser screen metrics below.
+        }
+
+        if (!mode) {
+          const session = expandedWindowSessionRef.current;
+          if (!session) return;
+          const deskNow = cfg ? getDeskSpecFor(cfg.character, customFigureMetaOf(cfg)) : null;
+          const logicalDesk = deskNow
+            ? { width: deskNow.windowWidth, height: deskNow.windowHeight }
+            : {
+                width: session.anchor.width / session.scaleFactor,
+                height: session.anchor.height / session.scaleFactor,
+              };
+          const restored = resolveDeskRestoreLayout({
+            anchor: session.anchor,
+            originalMonitorId: session.hostMonitorId,
+            monitors,
+            logicalDesk,
+          });
+          await win.setSize(new PhysicalSize(restored.rect.width, restored.rect.height));
+          const achieved = await win.outerSize();
+          if (achieved.width !== restored.rect.width || achieved.height !== restored.rect.height) {
+            console.warn('[companion] native window refused desk-size restoration');
+            if (expandedWindowRestoreRetriesRef.current < MAX_WINDOW_RESTORE_RETRIES) {
+              expandedWindowRestoreRetriesRef.current += 1;
+              expandedWindowRestoreTimerRef.current = setTimeout(() => {
+                expandedWindowRestoreTimerRef.current = null;
+                if (expandedWindowRequestedModeRef.current !== null) return;
+                void syncExpandedWindow(null);
+              }, 120);
+            }
+            return;
+          }
+          await win.setPosition(new PhysicalPosition(restored.rect.x, restored.rect.y));
+          expandedWindowSessionRef.current = null;
+          expandedWindowRestoreRetriesRef.current = 0;
+          return;
+        }
+
+        if (!cfg || !cfg.appearance.companion_enabled) return;
+
+        let session = expandedWindowSessionRef.current;
+        if (!session) {
+          const [pos, size, scaleFactor] = await Promise.all([win.outerPosition(), win.outerSize(), win.scaleFactor()]);
+          session = {
+            anchor: { x: pos.x, y: pos.y, width: size.width, height: size.height },
+            scaleFactor,
+            hostMonitorId: null,
+            mode,
+          };
+          expandedWindowSessionRef.current = session;
+        }
+        session.mode = mode;
+
+        const originalHost = session.hostMonitorId
+          ? monitors.find((monitor) => monitor.id === session.hostMonitorId)
+          : null;
+        const overlappingBounds = pickHostMonitor(
+          session.anchor,
+          monitors.map((monitor) => monitor.bounds)
+        );
+        const overlappingHost = overlappingBounds
+          ? monitors.find(
+              (monitor) =>
+                monitor.bounds.x === overlappingBounds.x &&
+                monitor.bounds.y === overlappingBounds.y &&
+                monitor.bounds.width === overlappingBounds.width &&
+                monitor.bounds.height === overlappingBounds.height
+            )
+          : null;
+        const hostMonitor = originalHost ?? overlappingHost;
+        if (!session.hostMonitorId && hostMonitor) session.hostMonitorId = hostMonitor.id;
+        const scale =
+          hostMonitor?.scaleFactor ??
+          (session.scaleFactor > 0 ? session.scaleFactor : window.devicePixelRatio || 1);
+        const fallbackHost: GeomRect = {
+          x: Math.min(0, session.anchor.x),
+          y: Math.min(0, session.anchor.y),
+          width: Math.max(window.screen.availWidth * scale, session.anchor.x + session.anchor.width),
+          height: Math.max(window.screen.availHeight * scale, session.anchor.y + session.anchor.height),
+        };
+        const host = hostMonitor?.workArea ?? fallbackHost;
+        const deskNow = getDeskSpecFor(cfg.character, customFigureMetaOf(cfg));
+        const reservePx = deskNow.figureHeight + 84;
+        const screenWidth = host.width / scale;
+        const screenHeight = host.height / scale;
+        const clampPx = (min: number, value: number, max: number) => Math.round(Math.max(min, Math.min(max, value)));
+        const targetSize = {
+          width: Math.max(session.anchor.width, Math.round(clampPx(360, screenWidth * 0.3, 560) * scale)),
+          height: Math.max(
+            session.anchor.height,
+            Math.round(clampPx(440, Math.max(screenHeight * 0.6, reservePx + 220), 720) * scale)
+          ),
+        };
+        const workAreas = monitors.map((monitor) => monitor.workArea);
+        const position = placeResizedWindow(session.anchor, targetSize, workAreas.length > 0 ? workAreas : [host]);
+        const targetRect: GeomRect = { ...position, ...targetSize };
+
+        await win.setSize(new PhysicalSize(targetRect.width, targetRect.height));
+        const achieved = await win.outerSize();
+        if (achieved.width !== targetRect.width || achieved.height !== targetRect.height) {
+          console.warn('[companion] native window refused expanded surface size');
+          await win.setSize(new PhysicalSize(session.anchor.width, session.anchor.height));
+          const restored = await win.outerSize();
+          if (restored.width === session.anchor.width && restored.height === session.anchor.height) {
+            await win.setPosition(new PhysicalPosition(session.anchor.x, session.anchor.y));
+            expandedWindowSessionRef.current = null;
+            expandedWindowRestoreRetriesRef.current = 0;
+          }
+          return;
+        }
+        await win.setPosition(new PhysicalPosition(targetRect.x, targetRect.y));
+        lastLocalMoveAt.current = Date.now();
+      } catch (error) {
+        console.error('companion expanded window layout failed:', error);
+      } finally {
+        internalWindowLayoutRef.current = false;
       }
-      // 以当前窗口所在显示器的工作区（近似用整屏物理尺寸）按比例取目标尺寸。
-      const host = monitors.length
-        ? (monitors.find((m) => pos.x >= m.x && pos.x < m.x + m.width && pos.y >= m.y && pos.y < m.y + m.height) ?? monitors[0])
-        : null;
-      // 聊天态窗口随显示器比例自适应（大屏更大、小屏自动收、超大屏封顶），而非旧的
-      // 恒等于 480×560 固定值。clamp 上限保证「不太占屏」；高度再保证立绘上方至少留出
-      // ~220px 给气泡，免得大立绘（自定义形象 figureHeight 可达 ~430）把气泡压扁。
-      const clampPx = (min: number, val: number, max: number) => Math.round(Math.max(min, Math.min(max, val)));
-      const deskNow = getDeskSpecFor(cfg.character, customFigureMetaOf(cfg));
-      const reservePx = deskNow.figureHeight + 84; // 与 CSS 变量 --companion-reserve 保持一致
-      const screenW = host ? host.width / scale : 1920;
-      const screenH = host ? host.height / scale : 1080;
-      const targetLogical = {
-        width: clampPx(360, screenW * 0.3, 560),
-        height: clampPx(440, Math.max(screenH * 0.6, reservePx + 220), 720),
-      };
-      const target = { width: Math.round(targetLogical.width * scale), height: Math.round(targetLogical.height * scale) };
-      // 已经够大（窗口比目标还大，如全身角色）就不动，避免缩小桌面伙伴画面。
-      if (size.width >= target.width && size.height >= target.height) {
-        chatSizedRef.current = false;
-        return;
-      }
-      await win.setSize(new PhysicalSize(target.width, target.height));
-      const achieved = await win.outerSize();
-      if (achieved.width === size.width && achieved.height === size.height) {
-        // WM 拒绝了 resize：撤销占位，下次还能再试。
-        chatSizedRef.current = false;
-        return;
-      }
-      // 底边锚定 + 显示器钳制：气泡在头顶向上长，底部图标不动，且不飞出屏。
-      const next = placeResizedWindow({ x: pos.x, y: pos.y, width: size.width, height: size.height }, achieved, monitors);
-      await win.setPosition(new PhysicalPosition(next.x, next.y));
-      lastLocalMoveAt.current = Date.now();
-    } catch (e) {
-      console.error('companion chat size apply failed:', e);
-      chatSizedRef.current = false;
-    }
+    });
+    expandedWindowQueueRef.current = queued.catch(() => {});
+    return queued;
   }, []);
 
-  // 退出聊天（气泡清空）→ 还原桌面伙伴原生尺寸。复用 applyDeskSize（底边锚定）。
-  const exitChatSize = useCallback(async () => {
-    if (!chatSizedRef.current) return;
-    chatSizedRef.current = false;
-    const cfg = profileRef.current;
-    if (cfg) await applyDeskSize(cfg, { anchor: 'bottom' });
-  }, [applyDeskSize]);
+  useEffect(
+    () => () => {
+      if (expandedWindowRestoreTimerRef.current) {
+        clearTimeout(expandedWindowRestoreTimerRef.current);
+        expandedWindowRestoreTimerRef.current = null;
+      }
+    },
+    []
+  );
 
   // No companionId in the URL (direct open / web preview): fall back to the first
   // enabled companion in the registry (retry — the embedded backend may be booting).
@@ -514,8 +631,8 @@ const CompanionPage: React.FC = () => {
         if (disposed) return;
         setProfile(withStatus);
         setMood((withStatus.status?.mood as RabbitMood) || 'content');
-        setUnread(news.length);
-        setSuggestions(news);
+        setUnread(news.total);
+        setSuggestions(news.items);
         await applyWindowState(withStatus);
         await applyDeskSize(withStatus, { anchor: 'top-left' });
       } catch (e) {
@@ -572,7 +689,7 @@ const CompanionPage: React.FC = () => {
       // Skip reapplying the persisted position right after a local drag:
       // the broadcast echoes our own debounced save and would teleport the
       // window back mid-drag.
-      const justMoved = Date.now() - lastLocalMoveAt.current < 2_000;
+      const justMoved = Date.now() - lastLocalMoveAt.current < 2_000 || Boolean(expandedWindowSessionRef.current);
       void applyWindowState(next, { skipPosition: justMoved }).then(() => applyDeskSize(next));
     });
     // Our companion was deleted (from /nomi or the API): this window is orphaned —
@@ -857,6 +974,7 @@ const CompanionPage: React.FC = () => {
     void (async () => {
       const { getCurrentWindow } = await import('@tauri-apps/api/window');
       unlisten = await getCurrentWindow().onMoved(({ payload }) => {
+        if (internalWindowLayoutRef.current || expandedWindowSessionRef.current) return;
         lastLocalMoveAt.current = Date.now();
         if (timer) clearTimeout(timer);
         timer = setTimeout(() => {
@@ -879,23 +997,20 @@ const CompanionPage: React.FC = () => {
     };
   }, [companionId]);
 
-  // 聊天模式窗口尺寸切换（弹性气泡，badcase 3）。仅随「有无气泡」这一布尔翻转触发，
-  // 流式过程中气泡文本在两个非空值之间变化不会重跑本 effect —— 天然防抖，
-  // 不会每个分片都 setSize。气泡出现→放大；气泡清空→还原桌面伙伴尺寸。
+  // Reply and composer continue to share one expanded companion rectangle.
+  // Memory uses its own native window and never participates here.
   const hasBubble = bubble.length > 0;
+  const expandedMode: ExpandedWindowMode | null = hasBubble || composerOpen ? 'chat' : null;
   useEffect(() => {
     if (!isTauriRuntime()) return;
-    // 气泡或展开态 composer 都需要放大原生窗口才能撑得开。
-    if (hasBubble || composerOpen) void enterChatSize();
-    else void exitChatSize();
-  }, [hasBubble, composerOpen, enterChatSize, exitChatSize]);
+    void syncExpandedWindow(expandedMode);
+  }, [expandedMode, syncExpandedWindow]);
 
   const forceCompanionCapture = shouldCaptureWholeCompanionWindow({
     composerOpen,
     barRevealed,
     hasInput: Boolean(input),
     sending,
-    showSuggestions,
     dragOver,
   });
 
@@ -1060,6 +1175,14 @@ const CompanionPage: React.FC = () => {
       console.error('companion→main navigate failed:', e);
     }
   }, []);
+
+  const memoryPanel = useDetachedMemoryPanel({
+    companionId,
+    suggestions,
+    onActivate: async (suggestion) => openMainAt(suggestion.action?.to || '/nomi?tab=suggestions'),
+    onFallback: async () => openMainAt('/nomi?tab=suggestions'),
+    badgeRef: unreadBadgeRef,
+  });
 
   /** 解析（或幂等创建）该伙伴的唯一专属会话 id。单会话契约（FE2）：
    *  先读 getCompanionSession，有 id 直接用；否则 ensureCompanionSession 幂等创建。
@@ -1284,6 +1407,7 @@ const CompanionPage: React.FC = () => {
 
   const hideCompanion = useCallback(async () => {
     if (!companionId) return;
+    memoryPanel.close('owner-invalid');
     const next = await ipcBridge.companion.patchCompanion
       .invoke({ companion_id: companionId, patch: { appearance: { companion_enabled: false } } })
       .catch(() => null);
@@ -1294,11 +1418,11 @@ const CompanionPage: React.FC = () => {
       // through the config-updated path; kept for call-site symmetry.
       await applyDeskSize(next);
     }
-  }, [applyDeskSize, applyWindowState, companionId]);
+  }, [applyDeskSize, applyWindowState, companionId, memoryPanel]);
 
   const clearUnreadSuggestions = useCallback(() => {
     setUnread(0);
-    setShowSuggestions(false);
+    memoryPanel.close('empty');
     // Dismiss server-side too — otherwise the badge resurrects on the next
     // window load.
     const pending = suggestionsRef.current;
@@ -1306,7 +1430,7 @@ const CompanionPage: React.FC = () => {
     void Promise.allSettled(
       pending.map((s) => ipcBridge.companion.decideSuggestion.invoke({ id: s.id, accept: false }))
     );
-  }, []);
+  }, [memoryPanel]);
 
   const runMenuAction = useCallback(
     (action: CompanionMenuAction) => {
@@ -1366,18 +1490,6 @@ const CompanionPage: React.FC = () => {
       console.error('companion native context menu failed:', e);
     }
   }, [runMenuAction, t]);
-
-  const clickSuggestion = useCallback(
-    async (s: ICompanionSuggestion) => {
-      // Click = "take me to handle it", NOT accept. We don't decide here (no
-      // silent accept, no xp): the suggestion stays pending until the owner
-      // explicitly accepts/dismisses it in the panel, and the resulting
-      // companion.suggestion-decided event then syncs this bubble.
-      setShowSuggestions(false);
-      await openMainAt(s.action?.to || '/nomi?tab=suggestions');
-    },
-    [openMainAt]
-  );
 
   const desk = getDeskSpecFor(profile?.character, customFigureMetaOf(profile));
 
@@ -1493,44 +1605,40 @@ const CompanionPage: React.FC = () => {
           </div>
         </div>
       )}
-      <div className='nomi-companion-stage'>
-        {unread > 0 && (
+      <div className='nomi-companion-stage-shell'>
+        <div className='nomi-companion-stage'>
+          {unread > 0 && (
+            <button
+              ref={unreadBadgeRef}
+              type='button'
+              className='nomi-companion-badge'
+              data-companion-hit
+              aria-label={t('nomi.tabs.suggestions')}
+              aria-expanded={memoryPanel.isExpanded}
+              onClick={(e) => {
+                e.stopPropagation();
+                memoryPanel.toggle();
+              }}
+            >
+              {unread > 99 ? '99+' : unread}
+            </button>
+          )}
           <div
-            className='nomi-companion-badge'
+            ref={figureHitRef}
+            className='nomi-companion-figure-hit'
             data-companion-hit
-            onClick={(e) => {
-              e.stopPropagation();
-              setShowSuggestions((v) => !v);
-            }}
+            onMouseDown={(e) => void startDrag(e)}
           >
-            {unread > 99 ? '99+' : unread}
+            <CompanionAvatar
+              character={profile?.character}
+              mood={mood}
+              activity={activity}
+              size={desk.figureHeight}
+              companionId={companionId ?? undefined}
+              customFigure={customFigureMetaOf(profile)}
+              figureHitRef={figureHitRef}
+            />
           </div>
-        )}
-        {showSuggestions && suggestions.length > 0 && (
-          <div className='nomi-companion-suggestions' data-companion-hit onClick={(e) => e.stopPropagation()}>
-            {suggestions.map((s) => (
-              <div key={s.id} className='nomi-companion-suggestions__item' onClick={() => void clickSuggestion(s)}>
-                <div className='nomi-companion-suggestions__title'>{s.title}</div>
-                <div className='nomi-companion-suggestions__body'>{s.body}</div>
-              </div>
-            ))}
-          </div>
-        )}
-        <div
-          ref={figureHitRef}
-          className='nomi-companion-figure-hit'
-          data-companion-hit
-          onMouseDown={(e) => void startDrag(e)}
-        >
-          <CompanionAvatar
-            character={profile?.character}
-            mood={mood}
-            activity={activity}
-            size={desk.figureHeight}
-            companionId={companionId ?? undefined}
-            customFigure={customFigureMetaOf(profile)}
-            figureHitRef={figureHitRef}
-          />
         </div>
       </div>
       {composerOpen ? (

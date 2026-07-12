@@ -26,6 +26,8 @@
 
 import type { AutoUpdateStatus } from '@/common/update/updateTypes';
 import { isTauriRuntime } from './tauriRuntime';
+import { tauriGetUpdaterInstallContext } from './tauriShell';
+import { installUpdateWithPreflight } from './tauriUpdateInstall';
 
 // Structural mirror of @tauri-apps/plugin-updater's public surface, so this
 // module type-checks without a static import (the plugin loads lazily).
@@ -198,9 +200,16 @@ export async function tauriUpdateDownload(emit: (s: AutoUpdateStatus) => void): 
  */
 export async function tauriUpdateInstallAndRelaunch(): Promise<void> {
   if (!isTauriRuntime()) return;
-  if (pendingUpdate) await pendingUpdate.install();
-  const { relaunch } = await import('@tauri-apps/plugin-process');
-  await relaunch();
+  if (!pendingUpdate) return;
+  const update = pendingUpdate;
+  await installUpdateWithPreflight({
+    getContext: tauriGetUpdaterInstallContext,
+    install: () => update.install(),
+    relaunch: async () => {
+      const { relaunch } = await import('@tauri-apps/plugin-process');
+      await relaunch();
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------

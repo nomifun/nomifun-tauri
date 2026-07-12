@@ -13,6 +13,12 @@ pub trait IModelProfileRepository: Send + Sync {
     async fn get(&self, provider_id: &str, model: &str) -> Result<Option<ModelProfileRow>, DbError>;
     /// Insert or replace a profile.
     async fn upsert(&self, params: &UpsertModelProfileParams<'_>) -> Result<ModelProfileRow, DbError>;
+    /// Insert a profile only when the composite key does not already exist.
+    ///
+    /// Returns `true` when a row was inserted. This is the safe primitive for
+    /// background catalog reconciliation: a concurrent user/catalog upsert must
+    /// never be overwritten by a stale "missing profile" observation.
+    async fn insert_if_absent(&self, params: &UpsertModelProfileParams<'_>) -> Result<bool, DbError>;
     /// Delete one profile; returns whether a row was removed.
     async fn delete(&self, provider_id: &str, model: &str) -> Result<bool, DbError>;
 }

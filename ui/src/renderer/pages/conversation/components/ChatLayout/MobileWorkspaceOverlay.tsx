@@ -3,6 +3,7 @@ import { WORKSPACE_HEADER_HEIGHT } from '@/renderer/pages/conversation/utils/lay
 import { dispatchWorkspaceToggleEvent } from '@/renderer/utils/workspace/workspaceEvents';
 import { Layout as ArcoLayout } from '@arco-design/web-react';
 import React from 'react';
+import type { WorkspaceTab } from '@/renderer/pages/conversation/Workspace/types';
 
 type MobileWorkspaceOverlayProps = {
   rightSiderCollapsed: boolean;
@@ -14,6 +15,8 @@ type MobileWorkspaceOverlayProps = {
   workspacePath?: string;
   isTemporaryWorkspace?: boolean;
   conversation_id?: number;
+  activeTab?: WorkspaceTab;
+  activeTitle?: React.ReactNode;
 };
 
 // Full-screen overlay + fixed workspace panel + floating collapse handle for mobile viewports
@@ -27,6 +30,8 @@ const MobileWorkspaceOverlay: React.FC<MobileWorkspaceOverlayProps> = ({
   workspacePath,
   isTemporaryWorkspace,
   conversation_id,
+  activeTab = 'files',
+  activeTitle,
 }) => (
   <>
     {/* Backdrop */}
@@ -57,8 +62,9 @@ const MobileWorkspaceOverlay: React.FC<MobileWorkspaceOverlayProps> = ({
         workspacePath={workspacePath}
         isTemporaryWorkspace={isTemporaryWorkspace}
         conversation_id={conversation_id}
+        activeTab={activeTab}
       >
-        {siderTitle}
+        {activeTitle ?? siderTitle}
       </WorkspacePanelHeader>
       <ArcoLayout.Content className='bg-1' style={{ height: `calc(100% - ${WORKSPACE_HEADER_HEIGHT}px)` }}>
         {sider}

@@ -25,6 +25,7 @@
  * the WebUI browser bundle never evaluates Tauri IPC code.
  */
 import { isTauriRuntime } from './tauriRuntime';
+import type { UpdaterInstallContext } from './tauriUpdateInstall';
 
 // ---------------------------------------------------------------------------
 // Channel shapes — mirror the bridge.buildProvider / bridge.buildEmitter API
@@ -141,6 +142,12 @@ export async function tauriSetKeepAwake(enabled: boolean): Promise<void> {
 export async function tauriSetTrayLabels(show: string, quit: string): Promise<void> {
   const { invoke } = await import('@tauri-apps/api/core');
   await invoke('set_tray_labels', { show, quit });
+}
+
+/** Inspect whether the running desktop bundle can be safely replaced by the updater. */
+export async function tauriGetUpdaterInstallContext(): Promise<UpdaterInstallContext> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  return invoke<UpdaterInstallContext>('get_updater_install_context');
 }
 
 /** Electron-style OpenDialog options accepted by call sites. */

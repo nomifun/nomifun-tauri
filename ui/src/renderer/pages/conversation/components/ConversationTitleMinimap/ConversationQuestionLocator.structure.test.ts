@@ -71,6 +71,8 @@ describe('conversation question locator structure', () => {
     expect(cssSource.includes('.dot')).toBe(true);
     expect(cssSource.includes('left: -18px')).toBe(true);
     expect(cssSource.includes('right:')).toBe(false);
+    expect(cssSource.includes('gap: 1px')).toBe(true);
+    expect(cssSource.includes('height: 12px')).toBe(true);
     expect(cssSource.includes('--locator-dot-size')).toBe(true);
     expect(cssSource.includes('--locator-dot-size: 5px')).toBe(true);
     expect(cssSource.includes('--locator-dot-size: 6px')).toBe(true);

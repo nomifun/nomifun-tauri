@@ -7,6 +7,7 @@ use nomifun_db::{CreateProviderParams, IProviderRepository, UpdateProviderParams
 use serde::de::DeserializeOwned;
 use tracing::warn;
 
+use crate::managed_model::is_managed_provider_identity;
 use crate::provider_deletion::SharedProviderDeletionCoordinator;
 
 /// Business logic for model provider CRUD with API key encryption/masking.
@@ -46,6 +47,7 @@ impl ProviderService {
     /// frontend-local-store → backend migration path where existing provider
     /// ids must be preserved.
     pub async fn create(&self, req: CreateProviderRequest) -> Result<ProviderResponse, AppError> {
+        reject_managed_create(&req)?;
         validate_create_request(&req)?;
 
         let encrypted_key = encrypt_string(&req.api_key, &self.encryption_key)?;
@@ -85,6 +87,8 @@ impl ProviderService {
 
     /// Update an existing provider. Only provided fields are changed.
     pub async fn update(&self, id: &str, req: UpdateProviderRequest) -> Result<ProviderResponse, AppError> {
+        reject_managed_update(id, &req)?;
+        self.reject_persisted_managed_provider(id).await?;
         validate_update_request(&req)?;
 
         let encrypted_key = req
@@ -131,6 +135,8 @@ impl ProviderService {
     /// the provider. After a successful delete, soft references are cleaned up
     /// on a best-effort basis (failures are logged, not propagated).
     pub async fn delete(&self, id: &str) -> Result<(), AppError> {
+        reject_managed_id(id)?;
+        self.reject_persisted_managed_provider(id).await?;
         if let Some(coord) = &self.coordinator {
             let usages = coord.usages(id).await?;
             if !usages.is_empty() {
@@ -150,6 +156,18 @@ impl ProviderService {
     // Internal helpers
     // -----------------------------------------------------------------------
 
+    async fn reject_persisted_managed_provider(&self, id: &str) -> Result<(), AppError> {
+        if let Some(row) = self.repo.find_by_id(id).await?
+            && is_managed_provider_identity(Some(&row.id), Some(&row.platform))
+        {
+            return Err(AppError::Forbidden(
+                "Managed model providers must be changed through their dedicated model-service API"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Convert a DB row into a response DTO with the plaintext API key
     /// (decrypted) and deserialized JSON fields.
     ///
@@ -157,7 +175,12 @@ impl ProviderService {
     /// frontend can migrate its local store to the backend without losing
     /// the key on re-read. Storage remains encrypted at rest.
     fn row_to_response(&self, row: Provider) -> Result<ProviderResponse, AppError> {
-        let api_key = decrypt_string(&row.api_key_encrypted, &self.encryption_key)?;
+        let managed = is_managed_provider_identity(Some(&row.id), Some(&row.platform));
+        let api_key = if managed {
+            String::new()
+        } else {
+            decrypt_string(&row.api_key_encrypted, &self.encryption_key)?
+        };
 
         let models: Vec<String> = serde_json::from_str(&row.models)
             .map_err(|e| AppError::Internal(format!("Failed to parse models JSON: {e}")))?;
@@ -271,6 +294,41 @@ fn validate_create_request(req: &CreateProviderRequest) -> Result<(), AppError> 
         if req.api_key.trim().is_empty() {
             return Err(AppError::BadRequest("apiKey is required".into()));
         }
+    }
+    Ok(())
+}
+
+fn reject_managed_create(req: &CreateProviderRequest) -> Result<(), AppError> {
+    if is_managed_provider_identity(
+        req.id.as_deref().map(str::trim),
+        Some(req.platform.trim()),
+    ) {
+        return Err(AppError::Forbidden(
+            "Managed model providers are created and configured by their dedicated model-service API"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_managed_update(id: &str, req: &UpdateProviderRequest) -> Result<(), AppError> {
+    if is_managed_provider_identity(
+        Some(id.trim()),
+        req.platform.as_deref().map(str::trim),
+    ) {
+        return Err(AppError::Forbidden(
+            "Managed model providers must be changed through their dedicated model-service API"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_managed_id(id: &str) -> Result<(), AppError> {
+    if is_managed_provider_identity(Some(id.trim()), None) {
+        return Err(AppError::Forbidden(
+            "Managed model providers cannot be deleted through the provider API".into(),
+        ));
     }
     Ok(())
 }
@@ -462,6 +520,42 @@ mod tests {
     #[test]
     fn validate_create_valid() {
         assert!(validate_create_request(&sample_create_request()).is_ok());
+    }
+
+    #[test]
+    fn generic_create_rejects_managed_id_or_platform() {
+        let by_id = CreateProviderRequest {
+            id: Some(crate::managed_model::FREE_MODEL_PROVIDER_ID.into()),
+            ..sample_create_request()
+        };
+        assert!(matches!(
+            reject_managed_create(&by_id),
+            Err(AppError::Forbidden(_))
+        ));
+
+        let by_platform = CreateProviderRequest {
+            platform: crate::managed_model::LOCAL_MODEL_PROVIDER_ID.into(),
+            ..sample_create_request()
+        };
+        assert!(matches!(
+            reject_managed_create(&by_platform),
+            Err(AppError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn generic_update_and_delete_reject_managed_provider() {
+        assert!(matches!(
+            reject_managed_update(
+                crate::managed_model::FREE_MODEL_PROVIDER_ID,
+                &UpdateProviderRequest::default()
+            ),
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            reject_managed_id(crate::managed_model::LOCAL_MODEL_PROVIDER_ID),
+            Err(AppError::Forbidden(_))
+        ));
     }
 
     #[test]
@@ -740,6 +834,84 @@ mod tests {
         let created = svc.create(req).await.unwrap();
         assert_eq!(created.api_key, "sk-secret-original-value");
         assert!(!created.api_key.contains("***"));
+    }
+
+    #[tokio::test]
+    async fn managed_provider_secret_is_redacted_from_generic_list() {
+        let db = init_database_memory().await.unwrap();
+        let repo = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+        let encrypted = encrypt_string("internal-loopback-token", &TEST_KEY).unwrap();
+        repo.create(CreateProviderParams {
+            id: Some(crate::managed_model::FREE_MODEL_PROVIDER_ID),
+            platform: crate::managed_model::FREE_MODEL_PROVIDER_ID,
+            name: "NomiFun Free Model",
+            base_url: "http://127.0.0.1:12345/v1",
+            api_key_encrypted: &encrypted,
+            models: r#"["big-pickle"]"#,
+            enabled: true,
+            capabilities: "[]",
+            context_limit: None,
+            model_context_limits: None,
+            model_protocols: None,
+            model_descriptions: None,
+            model_enabled: None,
+            model_health: None,
+            bedrock_config: None,
+            is_full_url: false,
+            sort_order: None,
+        })
+        .await
+        .unwrap();
+        let svc = ProviderService::new(repo, TEST_KEY);
+        let providers = svc.list().await.unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id, crate::managed_model::FREE_MODEL_PROVIDER_ID);
+        assert!(providers[0].api_key.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persisted_managed_platform_is_protected_by_update_and_delete() {
+        let db = init_database_memory().await.unwrap();
+        let repo = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+        let encrypted = encrypt_string("internal-loopback-token", &TEST_KEY).unwrap();
+        repo.create(CreateProviderParams {
+            id: Some("legacy-managed-alias"),
+            platform: crate::managed_model::FREE_MODEL_PROVIDER_ID,
+            name: "Legacy managed alias",
+            base_url: "http://127.0.0.1:12345/v1",
+            api_key_encrypted: &encrypted,
+            models: r#"["big-pickle"]"#,
+            enabled: true,
+            capabilities: "[]",
+            context_limit: None,
+            model_context_limits: None,
+            model_protocols: None,
+            model_descriptions: None,
+            model_enabled: None,
+            model_health: None,
+            bedrock_config: None,
+            is_full_url: false,
+            sort_order: None,
+        })
+        .await
+        .unwrap();
+        let svc = ProviderService::new(repo, TEST_KEY);
+
+        assert!(matches!(
+            svc.update(
+                "legacy-managed-alias",
+                UpdateProviderRequest {
+                    name: Some("changed".into()),
+                    ..Default::default()
+                }
+            )
+            .await,
+            Err(AppError::Forbidden(_))
+        ));
+        assert!(matches!(
+            svc.delete("legacy-managed-alias").await,
+            Err(AppError::Forbidden(_))
+        ));
     }
 
     #[tokio::test]

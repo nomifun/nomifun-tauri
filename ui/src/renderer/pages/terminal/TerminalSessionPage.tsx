@@ -19,7 +19,13 @@ import { PreviewPanel, PreviewProvider, usePreviewContext } from '@/renderer/pag
 import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
 import { isDesktopShell, isMacOS, isWindows } from '@/renderer/utils/platform';
 import { useWorkspaceCollapse } from '@/renderer/pages/conversation/hooks/useWorkspaceCollapse';
-import WorkspacePanelHeader, { DesktopWorkspaceToggle } from '@/renderer/pages/conversation/components/ChatLayout/WorkspacePanelHeader';
+import WorkspacePanelHeader from '@/renderer/pages/conversation/components/ChatLayout/WorkspacePanelHeader';
+import WorkspaceToolRail, {
+  WORKSPACE_PANEL_META_EVENT,
+  dispatchWorkspacePanelTabEvent,
+  type WorkspacePanelMetaDetail,
+} from '@/renderer/pages/conversation/components/ChatLayout/WorkspaceToolRail';
+import { useWorkspacePanelTabs } from '@/renderer/pages/conversation/hooks/useWorkspacePanelTabs';
 import { dispatchWorkspaceToggleEvent } from '@/renderer/utils/workspace/workspaceEvents';
 import { WORKSPACE_HEADER_HEIGHT } from '@/renderer/pages/conversation/utils/layoutCalc';
 import RegisterKnowledgeButton from './RegisterKnowledgeButton';
@@ -53,8 +59,8 @@ const TERMINAL_PREVIEW_MIN_PX = 260;
  *    `WORKSPACE_STATE_EVENT` keeps the titlebar icon in sync.
  *  - {@link WorkspacePanelHeader} is the header, with the in-panel toggle gated
  *    to non-mac/Windows desktop (identical to ChatLayout).
- *  - The rail collapses to width 0; {@link DesktopWorkspaceToggle} is the
- *    floating expand affordance when collapsed (Linux/web only).
+ *  - The rail collapses to width 0 while the persistent vertical tool strip
+ *    remains visible as the expand / panel-selection affordance.
  *  - It explicitly auto-expands on the current terminal's
  *    `WORKSPACE_HAS_FILES_EVENT` once the cwd's files load (not a temp
  *    workspace), so a terminal opened on a populated dir shows the rail without
@@ -80,7 +86,7 @@ const TerminalRightRegion: React.FC<{ session: ITerminalSession }> = ({ session 
   // workspace button (WORKSPACE_TOGGLE_EVENT) toggles it and the titlebar icon
   // stays in sync (WORKSPACE_STATE_EVENT). Per-session preference key; not a
   // temp workspace, so it auto-expands once the cwd's files load.
-  const { rightSiderCollapsed } = useWorkspaceCollapse({
+  const { rightSiderCollapsed, persistRightSiderCollapsed } = useWorkspaceCollapse({
     workspaceEnabled: true,
     isMobile,
     preferenceKey: `terminal-${session.id}`,
@@ -88,6 +94,24 @@ const TerminalRightRegion: React.FC<{ session: ITerminalSession }> = ({ session 
     autoExpandOnFiles: true,
     workspaceEventKey: String(session.id),
   });
+  const { activeWorkspaceTab, setActiveWorkspaceTab } = useWorkspacePanelTabs(`terminal-${session.id}`);
+  const [workspaceChangeCount, setWorkspaceChangeCount] = useState(0);
+
+  useEffect(() => {
+    const handleMeta = (event: Event) => {
+      const detail = (event as CustomEvent<WorkspacePanelMetaDetail>).detail;
+      if (detail?.sourceKey === String(session.id)) setWorkspaceChangeCount(detail.changeCount);
+    };
+    window.addEventListener(WORKSPACE_PANEL_META_EVENT, handleMeta);
+    return () => window.removeEventListener(WORKSPACE_PANEL_META_EVENT, handleMeta);
+  }, [session.id]);
+
+  const selectWorkspaceTool = (tab: string) => {
+    const clickingActivePanel = !rightSiderCollapsed && activeWorkspaceTab === tab;
+    setActiveWorkspaceTab(tab);
+    dispatchWorkspacePanelTabEvent(tab, String(session.id));
+    persistRightSiderCollapsed(clickingActivePanel);
+  };
 
   // Rail width (px), persisted. Drag handle on the rail's LEFT edge → reverse:true.
   const { splitRatio: railWidthPx, createDragHandle: createRailDragHandle } = useResizableSplit({
@@ -133,7 +157,7 @@ const TerminalRightRegion: React.FC<{ session: ITerminalSession }> = ({ session 
         </div>
       )}
 
-      {/* Workspace rail — mirrors the conversation right sider: collapses to
+      {/* Workspace panel — mirrors the conversation right sider: collapses to
           width 0, WorkspacePanelHeader on top (in-panel toggle gated to
           non-mac/Windows), left-edge resize handle when expanded. */}
       {!isMobile && (
@@ -158,9 +182,12 @@ const TerminalRightRegion: React.FC<{ session: ITerminalSession }> = ({ session 
             onToggle={() => dispatchWorkspaceToggleEvent()}
             togglePlacement={isMobile ? 'left' : 'right'}
             workspacePath={session.cwd}
+            activeTab={activeWorkspaceTab}
           >
             <span className='text-14px font-medium text-t-primary truncate'>
-              {t('terminal.workspace.title', { defaultValue: '项目' })}
+              {activeWorkspaceTab === 'changes'
+                ? t('conversation.workspace.changes.tab')
+                : t('terminal.workspace.title', { defaultValue: '项目' })}
             </span>
           </WorkspacePanelHeader>
           <div style={{ height: `calc(100% - ${WORKSPACE_HEADER_HEIGHT}px)` }}>
@@ -169,9 +196,25 @@ const TerminalRightRegion: React.FC<{ session: ITerminalSession }> = ({ session 
         </div>
       )}
 
-      {/* Desktop expand button when collapsed — Linux/web only (mac/Windows use
-          the titlebar workspace button). */}
-      {!isMacRuntime && !isWindowsRuntime && rightSiderCollapsed && !isMobile && <DesktopWorkspaceToggle />}
+      {!isMobile && (
+        <WorkspaceToolRail
+          t={t}
+          activeTab={activeWorkspaceTab}
+          expanded={!rightSiderCollapsed}
+          onSelect={selectWorkspaceTool}
+          changeCount={workspaceChangeCount}
+          footer={
+            <button
+              type='button'
+              className='workspace-tool-rail__item workspace-tool-rail__item--collapse'
+              onClick={() => persistRightSiderCollapsed(!rightSiderCollapsed)}
+              aria-label={rightSiderCollapsed ? 'Expand workspace' : 'Collapse workspace'}
+            >
+              {rightSiderCollapsed ? <span>‹</span> : <span>›</span>}
+            </button>
+          }
+        />
+      )}
     </>
   );
 };

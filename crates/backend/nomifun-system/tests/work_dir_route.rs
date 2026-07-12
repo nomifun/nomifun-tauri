@@ -37,6 +37,7 @@ async fn setup(data_dir: std::path::PathBuf) -> axum::Router {
         model_profile_service: nomifun_system::ModelProfileService::new(std::sync::Arc::new(
             nomifun_db::SqliteModelProfileRepository::new(db.pool().clone()),
         )),
+        managed_model_service: None,
         protocol_detection_service: ProtocolDetectionService::new(http_client.clone()),
         version_check_service: VersionCheckService::new(http_client, "1.0.0".to_owned()),
         data_dir,

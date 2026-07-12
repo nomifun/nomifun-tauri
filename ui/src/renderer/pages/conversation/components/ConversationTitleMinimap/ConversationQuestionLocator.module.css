@@ -20,7 +20,7 @@
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 5px;
+  gap: 1px;
   overflow-y: auto;
   padding: 10px 4px;
   pointer-events: auto;
@@ -39,7 +39,7 @@
 
   display: flex;
   width: 22px;
-  height: 18px;
+  height: 12px;
   align-items: center;
   justify-content: center;
   cursor: pointer;
@@ -188,7 +188,7 @@
   }
 
   .track {
-    gap: 3px;
+    gap: 0;
     padding: 8px 4px;
   }
 

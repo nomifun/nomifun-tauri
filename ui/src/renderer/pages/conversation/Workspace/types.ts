@@ -136,6 +136,8 @@ export interface WorkspaceUploadConfig {
 export interface WorkspaceExtraTab {
   key: string;
   title: ReactNode;
+  /** Optional icon rendered by the persistent vertical tool rail. */
+  icon?: ReactNode;
   content: ReactNode;
 }
 

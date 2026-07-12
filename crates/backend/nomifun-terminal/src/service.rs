@@ -19,26 +19,112 @@ use crate::events::TerminalEventEmitter;
 use crate::pty::{PtyHandle, SpawnParams};
 use crate::types::{resolve_command, row_to_response};
 
-/// Set default environment that describes the emulator the PTY is actually
-/// wired to: `xterm.js` — an xterm-compatible, truecolor-capable terminal.
+/// Locale keys whose presence in a create request means the caller explicitly
+/// owns the session's character encoding. We preserve those values verbatim.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const EXPLICIT_LOCALE_KEYS: [&str; 3] = ["LC_ALL", "LC_CTYPE", "LANG"];
+
+/// macOS accepts `UTF-8` as the character-locale alias, while `LC_ALL` needs a
+/// complete locale name (`LC_ALL=UTF-8` silently falls back to `C`).
+#[cfg(target_os = "macos")]
+const UTF8_LANG: &str = "en_US.UTF-8";
+#[cfg(target_os = "macos")]
+const UTF8_CTYPE: &str = "UTF-8";
+
+/// `C.UTF-8` is the locale-independent UTF-8 baseline on current glibc and
+/// musl Linux systems.
+#[cfg(target_os = "linux")]
+const UTF8_LANG: &str = "C.UTF-8";
+#[cfg(target_os = "linux")]
+const UTF8_CTYPE: &str = "C.UTF-8";
+
+/// Set default environment that describes the emulator and byte encoding the
+/// PTY is actually wired to: xterm.js consuming UTF-8.
 ///
 /// `portable-pty` seeds the child from the app process's own environment. A
 /// macOS app launched from Finder/Dock/launchd inherits a *minimal* environment
-/// with **no `TERM`** (the same reason `nomifun-runtime::shell_env` has to
-/// repair `PATH`). With no `TERM`, interactive programs fall back to a dumb,
-/// monochrome, no-cursor-control mode: `claude` renders gray-on-gray and zsh's
-/// `zle` emits no cursor-movement/erase sequences for Backspace, so a delete
-/// looks like the cursor just walks backward without removing the character.
+/// with neither `TERM` nor a character locale (the same reason
+/// `nomifun-runtime::shell_env` repairs `PATH`). Missing `TERM` breaks terminal
+/// capabilities. Missing/`C` locale makes TTY-aware tools such as macOS `ls`
+/// replace each non-ASCII filename byte with `?` before output reaches NomiFun.
 ///
-/// These are *defaults*: an explicit per-session env (or an inherited value the
-/// caller chose to forward) still wins via `or_insert`. We deliberately set
-/// `xterm-256color` regardless of any inherited `TERM`, because the child talks
-/// to xterm.js, not to whatever terminal happened to launch the app.
+/// These are terminal-session defaults. Explicit per-session terminal and
+/// locale values win. Inherited terminal capabilities are deliberately
+/// replaced because the child talks to xterm.js, not to the app's launcher.
 fn apply_emulator_env_defaults(env: &mut HashMap<String, String>) {
+    apply_emulator_env_defaults_with(env, |key| std::env::var_os(key));
+}
+
+/// Injectable form used by tests so inherited locale cases can be exercised
+/// without mutating the process environment while Rust tests run in parallel.
+fn apply_emulator_env_defaults_with<F>(env: &mut HashMap<String, String>, inherited: F)
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
     env.entry("TERM".to_owned())
         .or_insert_with(|| "xterm-256color".to_owned());
     env.entry("COLORTERM".to_owned())
         .or_insert_with(|| "truecolor".to_owned());
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    apply_utf8_locale_defaults(env, inherited);
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = inherited;
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn apply_utf8_locale_defaults<F>(env: &mut HashMap<String, String>, inherited: F)
+where
+    F: Fn(&str) -> Option<std::ffi::OsString>,
+{
+    if EXPLICIT_LOCALE_KEYS.iter().any(|key| env.contains_key(*key)) {
+        return;
+    }
+
+    // LC_CTYPE is the narrow setting: it fixes filename/character handling
+    // without changing the user's date, numeric, collation, or message locale.
+    env.insert("LANG".to_owned(), UTF8_LANG.to_owned());
+    env.insert("LC_CTYPE".to_owned(), UTF8_CTYPE.to_owned());
+
+    // Inherited LC_ALL has higher POSIX precedence than LC_CTYPE. Materialize
+    // any non-empty value into the overrides: preserve a valid UTF-8 locale
+    // exactly, or replace malformed/non-Unicode/legacy values with the safe
+    // platform fallback. This also tells the PTY layer not to remove a valid
+    // inherited LC_ALL while resolving explicit-locale precedence.
+    if let Some(value) = inherited("LC_ALL").filter(|value| !value.is_empty()) {
+        let value = if is_utf8_lc_all(value.as_os_str()) {
+            value
+                .into_string()
+                .expect("a validated UTF-8 locale is Unicode")
+        } else {
+            UTF8_LANG.to_owned()
+        };
+        env.insert("LC_ALL".to_owned(), value);
+    }
+}
+
+/// `LC_ALL` requires a complete POSIX locale name. In particular, macOS treats
+/// bare `LC_ALL=UTF-8` as invalid and falls back to `C`, even though the same
+/// `UTF-8` token is valid for `LC_CTYPE`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn is_utf8_lc_all(value: &std::ffi::OsStr) -> bool {
+    let Some(value) = value.to_str() else {
+        return false;
+    };
+    // Locale names never allow surrounding whitespace. Trimming for the check
+    // would accept a value the OS itself rejects and silently degrades to `C`.
+    if value.is_empty() || value.trim() != value {
+        return false;
+    }
+    let Some((_, codeset_and_modifier)) = value.rsplit_once('.') else {
+        return false;
+    };
+    codeset_and_modifier
+        .split('@')
+        .next()
+        .unwrap_or_default()
+        .replace('-', "")
+        .eq_ignore_ascii_case("utf8")
 }
 
 /// Interval between debounced scrollback persistence passes. Each pass writes
@@ -1555,6 +1641,96 @@ mod tests {
         assert_eq!(env.get("COLORTERM").map(String::as_str), Some("truecolor"));
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn emulator_env_defaults_add_utf8_locale_when_inherited_locale_is_missing() {
+        let mut env = HashMap::new();
+        apply_emulator_env_defaults_with(&mut env, |_| None);
+        assert_eq!(env.get("LANG").map(String::as_str), Some(UTF8_LANG));
+        assert_eq!(env.get("LC_CTYPE").map(String::as_str), Some(UTF8_CTYPE));
+        assert!(!env.contains_key("LC_ALL"));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn emulator_env_defaults_repairs_inherited_non_utf8_lc_all() {
+        for inherited in [
+            "C",
+            "POSIX",
+            "UTF-8",
+            "zh_CN.GB18030",
+            " ",
+            " C.UTF-8",
+            "C.UTF-8 ",
+        ] {
+            let mut env = HashMap::new();
+            apply_emulator_env_defaults_with(&mut env, |key| {
+                (key == "LC_ALL").then(|| inherited.into())
+            });
+            assert_eq!(env.get("LC_ALL").map(String::as_str), Some(UTF8_LANG));
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn emulator_env_defaults_preserves_inherited_utf8_lc_all_as_override() {
+        let mut env = HashMap::new();
+        apply_emulator_env_defaults_with(&mut env, |key| {
+            (key == "LC_ALL").then(|| "C.UTF-8".into())
+        });
+        assert_eq!(env.get("LC_ALL").map(String::as_str), Some("C.UTF-8"));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn emulator_env_defaults_repairs_non_unicode_inherited_lc_all() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid_locale = OsString::from_vec(vec![0xff]);
+        let mut env = HashMap::new();
+        apply_emulator_env_defaults_with(&mut env, |key| {
+            (key == "LC_ALL").then(|| invalid_locale.clone())
+        });
+        assert_eq!(env.get("LC_ALL").map(String::as_str), Some(UTF8_LANG));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn emulator_env_defaults_preserve_any_explicit_session_locale() {
+        for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
+            let mut env = HashMap::from([(key.to_owned(), "zh_CN.GB18030".to_owned())]);
+            apply_emulator_env_defaults_with(&mut env, |name| {
+                (name == "LC_ALL").then(|| "C".into())
+            });
+            assert_eq!(env.get(key).map(String::as_str), Some("zh_CN.GB18030"));
+            assert_eq!(
+                ["LC_ALL", "LC_CTYPE", "LANG"]
+                    .iter()
+                    .filter(|candidate| env.contains_key(**candidate))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn utf8_lc_all_detection_requires_a_complete_locale_name() {
+        for value in ["C.UTF-8", "en_US.utf8", "zh_CN.UTF-8@variant"] {
+            assert!(
+                is_utf8_lc_all(std::ffi::OsStr::new(value)),
+                "expected UTF-8 LC_ALL: {value}"
+            );
+        }
+        for value in ["", "C", "POSIX", "UTF-8", "utf8", "zh_CN.GB18030"] {
+            assert!(
+                !is_utf8_lc_all(std::ffi::OsStr::new(value)),
+                "expected invalid/non-UTF-8 LC_ALL: {value}"
+            );
+        }
+    }
+
     // End-to-end: prove the injected TERM/COLORTERM actually reach the spawned
     // child through the REAL PtyHandle path (not just the env map). This mirrors
     // the Finder-launch case: `cmd.env()` overrides portable-pty's inherited
@@ -1605,6 +1781,113 @@ mod tests {
         assert!(
             out.contains("CT=[truecolor]"),
             "child must receive the injected COLORTERM, got: {out:?}"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn pty_child_preserves_valid_inherited_utf8_lc_all() {
+        use crate::pty::{PtyHandle, SpawnParams};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut env = HashMap::new();
+        apply_emulator_env_defaults_with(&mut env, |key| {
+            (key == "LC_ALL").then(|| "C.UTF-8".into())
+        });
+
+        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let cap = captured.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let done_cb = done.clone();
+        let _handle = PtyHandle::spawn(
+            SpawnParams {
+                program: "sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "printf 'LC_ALL=[%s] LC_CTYPE=[%s] LANG=[%s]\n' \"$LC_ALL\" \"$LC_CTYPE\" \"$LANG\""
+                        .to_owned(),
+                ],
+                cwd: String::new(),
+                env,
+                cols: 80,
+                rows: 24,
+            },
+            0,
+            move |chunk| cap.lock().unwrap().extend_from_slice(&chunk),
+            move |_code, _sb| done_cb.store(true, Ordering::SeqCst),
+        )
+        .expect("spawn sh");
+
+        for _ in 0..250 {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        let output = String::from_utf8(captured.lock().unwrap().clone()).expect("UTF-8 output");
+        assert!(
+            output.contains("LC_ALL=[C.UTF-8]"),
+            "valid inherited LC_ALL must survive normalization and PTY spawn: {output:?}"
+        );
+    }
+
+    /// Regression for the production screenshot: macOS `ls` sanitizes
+    /// non-ASCII filename bytes to `?` when stdout is a TTY under `LC_ALL=C`.
+    /// Prove the environment repair reaches a real PTY child before bytes are
+    /// captured, persisted, Base64-encoded, or decoded by the frontend.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pty_child_lists_unicode_filename_under_repaired_locale() {
+        use crate::pty::{PtyHandle, SpawnParams};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let filename = "中文文件名.md";
+        std::fs::write(dir.path().join(filename), b"content").expect("write unicode file");
+
+        let mut env = HashMap::new();
+        apply_emulator_env_defaults_with(&mut env, |key| {
+            (key == "LC_ALL").then(|| "C".into())
+        });
+
+        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let cap = captured.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let done_cb = done.clone();
+        let _handle = PtyHandle::spawn(
+            SpawnParams {
+                program: "/bin/ls".to_owned(),
+                args: vec!["-1".to_owned()],
+                cwd: dir.path().to_string_lossy().into_owned(),
+                env,
+                cols: 80,
+                rows: 24,
+            },
+            0,
+            move |chunk| cap.lock().unwrap().extend_from_slice(&chunk),
+            move |_code, _sb| done_cb.store(true, Ordering::SeqCst),
+        )
+        .expect("spawn ls");
+
+        for _ in 0..250 {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        let output =
+            String::from_utf8(captured.lock().unwrap().clone()).expect("UTF-8 PTY output");
+        assert!(
+            output.contains(filename),
+            "unicode filename missing: {output:?}"
+        );
+        assert!(
+            !output.contains("????"),
+            "filename was replaced before transport: {output:?}"
         );
     }
 

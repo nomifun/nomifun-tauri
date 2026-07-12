@@ -1,7 +1,11 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 import { ipcBridge } from '@/common';
 import { isHandledAuthExpiredHttpError } from '@/common/adapter/httpBridge';
 import type { IListRequirementsParams, IRequirement } from '@/common/adapter/ipcBridge';
+import {
+  initialRequirementTagLoadState,
+  reduceRequirementTagLoadState,
+} from './requirementTagLoadState';
 
 export function useRequirements(params: IListRequirementsParams) {
   const [items, setItems] = useState<IRequirement[]>([]);
@@ -50,14 +54,25 @@ export function useRequirements(params: IListRequirementsParams) {
 }
 
 export function useRequirementTags() {
-  const [tags, setTags] = useState<{ tag: string; done: number; total: number }[]>([]);
+  const [state, dispatch] = useReducer(reduceRequirementTagLoadState, initialRequirementTagLoadState);
+  const requestIdRef = useRef(0);
   const refresh = useCallback(async () => {
+    const requestId = ++requestIdRef.current;
+    dispatch({ type: 'start', requestId });
     try {
       const res = await ipcBridge.requirements.tags.invoke();
-      setTags(res.map((t) => ({ tag: t.tag, done: t.done, total: t.total })));
+      dispatch({
+        type: 'success',
+        requestId,
+        tags: res.map((tag) => ({ tag: tag.tag, done: tag.done, total: tag.total })),
+      });
     } catch (e) {
-      if (isHandledAuthExpiredHttpError(e)) return;
-      console.error('Failed to load tags', e);
+      if (!isHandledAuthExpiredHttpError(e)) {
+        console.error('Failed to load tags', e);
+        dispatch({ type: 'failure', requestId, error: String(e) });
+      }
+    } finally {
+      dispatch({ type: 'finish', requestId });
     }
   }, []);
   useEffect(() => {
@@ -71,5 +86,5 @@ export function useRequirementTags() {
     ];
     return () => unsubs.forEach((u) => u());
   }, [refresh]);
-  return { tags, refresh };
+  return { tags: state.tags, loading: state.loading, error: state.error, refresh };
 }

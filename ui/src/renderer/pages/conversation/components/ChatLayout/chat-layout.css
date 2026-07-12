@@ -54,6 +54,193 @@
   color: var(--color-text-1);
 }
 
+/* Persistent workspace tool rail: always visible between the main content and
+   the expandable right panel, so Files / Changes / Metrics / DAG remain
+   discoverable even while the panel itself is closed. */
+.workspace-tool-rail {
+  position: relative;
+  z-index: 12;
+  flex: 0 0 32px;
+  width: 32px;
+  min-width: 32px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  padding: 8px 2px;
+  border-left: 1px solid var(--bg-3);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--bg-2) 78%, transparent), var(--bg-1) 38%),
+    var(--bg-1);
+  box-shadow: -8px 0 22px color-mix(in srgb, #000 5%, transparent);
+}
+
+.workspace-tool-rail__item {
+  position: relative;
+  width: 28px;
+  height: 28px;
+  aspect-ratio: 1 / 1;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  outline: none;
+  transition:
+    color 0.16s ease,
+    border-color 0.16s ease,
+    background-color 0.16s ease,
+    transform 0.16s ease;
+}
+
+.workspace-tool-rail__item:hover {
+  color: var(--text-primary);
+  border-color: var(--border-light);
+  background: var(--bg-hover);
+  transform: translateX(-1px);
+}
+
+.workspace-tool-rail__item:focus-visible {
+  box-shadow: 0 0 0 2px color-mix(in srgb, rgb(var(--primary-6)) 32%, transparent);
+}
+
+.workspace-tool-rail__item--active {
+  color: rgb(var(--primary-6));
+  border-color: color-mix(in srgb, rgb(var(--primary-6)) 36%, var(--border-light));
+  background:
+    linear-gradient(
+      135deg,
+      color-mix(in srgb, rgb(var(--primary-6)) 18%, var(--bg-1)),
+      color-mix(in srgb, rgb(var(--primary-6)) 8%, var(--bg-2))
+    );
+  box-shadow: 0 4px 10px color-mix(in srgb, rgb(var(--primary-6)) 12%, transparent);
+}
+
+.workspace-tool-rail__icon {
+  display: inline-flex;
+  line-height: 0;
+}
+
+.workspace-tool-rail__label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.workspace-tool-rail__tooltip .arco-tooltip-content {
+  padding: 3px 6px;
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.workspace-tool-rail__badge {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 3px;
+  border: 1px solid var(--bg-1);
+  border-radius: 99px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: rgb(var(--primary-6));
+  color: #fff;
+  font-size: 8px;
+  line-height: 1;
+  font-weight: 700;
+}
+
+.workspace-tool-rail__status {
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  width: 6px;
+  height: 6px;
+  border: 1px solid var(--bg-1);
+  border-radius: 50%;
+}
+
+.workspace-tool-rail__divider {
+  width: 20px;
+  height: 1px;
+  margin: 2px 0;
+  background: var(--bg-3);
+}
+
+.workspace-tool-rail__footer {
+  width: 100%;
+  margin-top: auto;
+  padding-top: 6px;
+  border-top: 1px solid var(--bg-3);
+  display: flex;
+  justify-content: center;
+}
+
+.workspace-tool-rail__item--collapse {
+  height: 28px;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--text-tertiary);
+}
+
+.workspace-tool-rail__item--collapse::before {
+  display: none;
+}
+
+.workspace-panel-header {
+  background: color-mix(in srgb, var(--bg-2) 58%, transparent);
+}
+
+.chat-layout-right-sider {
+  box-shadow: -12px 0 28px color-mix(in srgb, #000 4%, transparent);
+}
+
+[data-theme='dark'] .workspace-tool-rail {
+  box-shadow: -8px 0 26px rgba(0, 0, 0, 0.16);
+}
+
+.workspace-tool-rail-mobile-trigger {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  z-index: 80;
+  width: 24px;
+  height: 70px;
+  padding: 0;
+  transform: translateY(-50%);
+  border: 1px solid var(--bg-3);
+  border-radius: 12px 0 0 12px;
+  border-right: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  color: rgb(var(--primary-6));
+  background: color-mix(in srgb, var(--bg-1) 92%, transparent);
+  box-shadow: -6px 6px 18px color-mix(in srgb, #000 10%, transparent);
+}
+
+.workspace-tool-rail-mobile-trigger__dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
 /* Header model pill — only cap width on mobile, where the titlebar slot has
    limited horizontal room. Desktop lets the pill grow to fit the full name. */
 @media (max-width: 767px) {

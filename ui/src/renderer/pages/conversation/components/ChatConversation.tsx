@@ -11,14 +11,14 @@ import { CronJobManager } from '@/renderer/pages/cron';
 import { usePresetAssistantInfo, resolveAssistantConfigId } from '@/renderer/hooks/agent/usePresetAssistantInfo';
 import { iconColors } from '@/renderer/styles/colors';
 import { Button, Dropdown, Menu, Message, Tooltip, Typography } from '@arco-design/web-react';
-import { History } from '@icon-park/react';
+import { ChartHistogram, History } from '@icon-park/react';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
 import useSWR from 'swr';
 import { emitter } from '../../../utils/emitter';
 import AcpChat from '../platforms/acp/AcpChat';
-import ChatLayout from './ChatLayout';
+import ChatLayout, { type ChatLayoutProps } from './ChatLayout';
 import ChatSlider from './ChatSlider.tsx';
 import NanobotChat from '../platforms/nanobot/NanobotChat';
 import OpenClawChat from '../platforms/openclaw/OpenClawChat';
@@ -36,11 +36,13 @@ import CompanionChatPanel from '@/renderer/pages/nomi/companion/CompanionChatPan
 import GuidCollaboratorSelector from '@/renderer/pages/guid/components/GuidCollaboratorSelector';
 import ClusterModePill from './ClusterModePill';
 import type { TModelRange, TModelRef } from '@/common/types/orchestrator/orchestratorTypes';
-import { OrchestrationProvider } from '../orchestration/OrchestrationContext';
+import { OrchestrationProvider, useOrchestration } from '../orchestration/OrchestrationContext';
 import OrchestrationTopPanel from '../orchestration/OrchestrationTopPanel';
 import ConversationContentSwitcher from '../orchestration/ConversationContentSwitcher';
 import PlanApprovalBanner from '../orchestration/PlanApprovalBanner';
 import StarOfficeMonitorCard from '../platforms/openclaw/StarOfficeMonitorCard.tsx';
+import NomiSessionMetricsPanel from '../platforms/nomi/NomiSessionMetricsPanel';
+import { STATUS_META } from '@/renderer/pages/orchestrator/RunDetail/runStatusMeta';
 // import SkillRuleGenerator from './components/SkillRuleGenerator'; // Temporarily hidden
 
 /** Check whether a specific skill is mounted on the conversation. */
@@ -148,6 +150,69 @@ const _AddNewConversation: React.FC<{ conversation: TChatConversation }> = ({ co
 };
 
 type NomiConversation = Extract<TChatConversation, { type: 'nomi' }>;
+
+const NomiConversationLayout: React.FC<{
+  conversation: NomiConversation;
+  chatLayoutProps: Omit<ChatLayoutProps, 'children' | 'workspaceOrchestration' | 'workspaceExtraTabs'>;
+  modelSelection: React.ComponentProps<typeof NomiChat>['modelSelection'];
+  collaboratorSelectorNode: React.ReactNode;
+  presetAssistantName?: string;
+}> = ({ conversation, chatLayoutProps, modelSelection, collaboratorSelectorNode, presetAssistantName }) => {
+  const { t } = useTranslation();
+  const orchestration = useOrchestration();
+  const status = orchestration.detail?.run.status ?? '';
+  const workspaceExtraTabs = useMemo(
+    () => [
+      {
+        key: 'nomi-session-metrics',
+        title: t('conversation.sessionMetrics.tab'),
+        icon: <ChartHistogram size={18} />,
+        content: <NomiSessionMetricsPanel conversation={conversation} />,
+      },
+    ],
+    [conversation, t]
+  );
+
+  return (
+    <ChatLayout
+      {...chatLayoutProps}
+      sider={<ChatSlider conversation={conversation} extraTabs={workspaceExtraTabs} />}
+      conversation_id={conversation.id}
+      workspaceExtraTabs={workspaceExtraTabs}
+      workspaceOrchestration={{
+        active: orchestration.canvasOpen,
+        available: Boolean(orchestration.runId),
+        statusColor: STATUS_META[status]?.color,
+        onClick: orchestration.toggleCanvas,
+      }}
+    >
+      <div className='flex flex-row flex-1 min-h-0'>
+        <div className='flex-1 min-w-0 min-h-0 flex flex-col'>
+          <PlanApprovalBanner />
+          <ConversationContentSwitcher>
+            <NomiChat
+              conversation_id={conversation.id}
+              workspace={conversation.extra.workspace}
+              modelSelection={modelSelection}
+              session_mode={conversation.extra?.session_mode}
+              cron_job_id={(conversation.extra as { cron_job_id?: string })?.cron_job_id}
+              loadedSkills={(conversation.extra as { skills?: string[] } | undefined)?.skills}
+              loadedMcpServers={(conversation.extra as { mcp_servers?: string[] } | undefined)?.mcp_servers}
+              loadedMcpStatuses={
+                (conversation.extra as { mcp_statuses?: IConversationMcpStatus[] } | undefined)?.mcp_statuses
+              }
+              agent_name={presetAssistantName}
+              collaboratorSelectorNode={collaboratorSelectorNode}
+              extraRightTools={<ClusterModePill conversation={conversation} />}
+              isProcessing={isConversationProcessing(conversation)}
+            />
+          </ConversationContentSwitcher>
+        </div>
+        <OrchestrationTopPanel />
+      </div>
+    </ChatLayout>
+  );
+};
 
 const NomiConversationPanel: React.FC<{ conversation: NomiConversation; sliderTitle: React.ReactNode }> = ({
   conversation,
@@ -296,43 +361,13 @@ const NomiConversationPanel: React.FC<{ conversation: NomiConversation; sliderTi
 
   return (
     <OrchestrationProvider conversation={conversation}>
-      <ChatLayout {...chatLayoutProps} conversation_id={conversation.id}>
-        {/* 编排画布:左右分屏 —— 主 agent 聊天在左(flex-1),编排画布作为右侧
-            可拖拽改宽 / 可收起的侧栏。OrchestrationTopPanel 在 run 不存在时渲染
-            null,普通会话看起来与从前一致。点右侧画布节点把 worker 转录投射进
-            左侧聊天区(默认 main)。 */}
-        <div className='flex flex-row flex-1 min-h-0'>
-          <div className='flex-1 min-w-0 min-h-0 flex flex-col'>
-            {/* 智能编排「编排后不自动执行」提示条:仅当本会话关联的 run 停在
-                awaiting_plan_approval 时显示,复用批准 IPC;其余情况渲染 null。 */}
-            <PlanApprovalBanner />
-            {/* Content-area projection (会话原生编排, F7): keeps NomiChat ALWAYS
-                mounted and just toggles its visibility, overlaying a clicked DAG
-                worker node's read-only transcript when a node is projected. Node
-                clicks in the right canvas pane project the worker transcript into
-                this chat region; default main. */}
-            <ConversationContentSwitcher>
-              <NomiChat
-                conversation_id={conversation.id}
-                workspace={conversation.extra.workspace}
-                modelSelection={modelSelection}
-                session_mode={conversation.extra?.session_mode}
-                cron_job_id={(conversation.extra as { cron_job_id?: string })?.cron_job_id}
-                loadedSkills={(conversation.extra as { skills?: string[] } | undefined)?.skills}
-                loadedMcpServers={(conversation.extra as { mcp_servers?: string[] } | undefined)?.mcp_servers}
-                loadedMcpStatuses={
-                  (conversation.extra as { mcp_statuses?: IConversationMcpStatus[] } | undefined)?.mcp_statuses
-                }
-                agent_name={presetAssistantInfo?.name}
-                collaboratorSelectorNode={collaboratorSelectorNode}
-                extraRightTools={<ClusterModePill conversation={conversation} />}
-                isProcessing={isConversationProcessing(conversation)}
-              />
-            </ConversationContentSwitcher>
-          </div>
-          <OrchestrationTopPanel />
-        </div>
-      </ChatLayout>
+      <NomiConversationLayout
+        conversation={conversation}
+        chatLayoutProps={chatLayoutProps}
+        modelSelection={modelSelection}
+        collaboratorSelectorNode={collaboratorSelectorNode}
+        presetAssistantName={presetAssistantInfo?.name}
+      />
     </OrchestrationProvider>
   );
 };

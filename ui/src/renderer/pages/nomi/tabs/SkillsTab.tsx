@@ -6,7 +6,7 @@
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Button, Empty, Input, Message, Modal, Popconfirm, Select, Spin, Tag, Tooltip } from '@arco-design/web-react';
+import { Button, Empty, Input, Message, Modal, Pagination, Popconfirm, Select, Spin, Tag, Tooltip } from '@arco-design/web-react';
 import { ipcBridge } from '@/common';
 import type { ICompanionSkill } from '@/common/adapter/ipcBridge';
 import type { useCompanion } from '../useNomi';
@@ -28,6 +28,9 @@ const SkillsTab: React.FC<Props> = ({ companion }) => {
   const [skills, setSkills] = useState<ICompanionSkill[]>([]);
   const [loading, setLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState('');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
+  const [total, setTotal] = useState(0);
 
   // In-app SKILL.md editor (Modal).
   const [editName, setEditName] = useState<string | null>(null);
@@ -49,20 +52,39 @@ const SkillsTab: React.FC<Props> = ({ companion }) => {
   const refresh = useCallback(async () => {
     if (!companionId) {
       setSkills([]);
+      setTotal(0);
       setLoading(false);
       return;
     }
     const seq = ++refreshSeq.current;
     setLoading(true);
     try {
-      const list = await ipcBridge.companion.listSkills.invoke({ companion_id: companionId, include_shared: true });
-      if (seq === refreshSeq.current) setSkills(list);
+      const result = await ipcBridge.companion.listSkills.invoke({
+        companion_id: companionId,
+        include_shared: true,
+        status: statusFilter || undefined,
+        limit: pageSize,
+        offset: (page - 1) * pageSize,
+      });
+      if (seq === refreshSeq.current) {
+        const maxPage = Math.max(1, Math.ceil(result.total / pageSize));
+        setTotal(result.total);
+        if (page > maxPage) {
+          setPage(maxPage);
+          return;
+        }
+        setSkills(result.items);
+      }
     } catch (e) {
       if (seq === refreshSeq.current) Message.error(String(e));
     } finally {
       if (seq === refreshSeq.current) setLoading(false);
     }
-  }, [companionId]);
+  }, [companionId, page, pageSize, statusFilter]);
+
+  useEffect(() => {
+    setPage(1);
+  }, [companionId, pageSize, statusFilter]);
 
   useEffect(() => {
     void refresh();
@@ -87,8 +109,6 @@ const SkillsTab: React.FC<Props> = ({ companion }) => {
     ];
     return () => subs.forEach((u) => u());
   }, [companionId, refresh, t]);
-
-  const visible = statusFilter ? skills.filter((s) => s.status === statusFilter) : skills;
 
   const decide = useCallback(
     async (s: ICompanionSkill, accept: boolean) => {
@@ -190,6 +210,17 @@ const SkillsTab: React.FC<Props> = ({ companion }) => {
     }
   }, [companionId, giftFor, giftTarget, t]);
 
+  const handlePageChange = useCallback(
+    (nextPage: number, nextPageSize: number) => {
+      const pageSizeChanged = nextPageSize !== pageSize;
+      if (pageSizeChanged) setPageSize(nextPageSize);
+      setPage(pageSizeChanged ? 1 : nextPage);
+    },
+    [pageSize]
+  );
+
+  const initialLoading = loading && skills.length === 0 && total === 0;
+
   return (
     <div className='flex flex-col gap-12px py-8px'>
       <div className='flex gap-8px items-center flex-wrap'>
@@ -211,15 +242,15 @@ const SkillsTab: React.FC<Props> = ({ companion }) => {
           {t('nomi.skills.teach', { defaultValue: '示范教学' })}
         </Button>
       </div>
-      {loading ? (
+      {initialLoading ? (
         <div className='flex justify-center py-40px'>
           <Spin />
         </div>
-      ) : visible.length === 0 ? (
+      ) : skills.length === 0 ? (
         <Empty description={t('nomi.skills.empty', { defaultValue: '还没有技能。多用平台，伙伴会自己学会。' })} />
       ) : (
-        <div className='flex flex-col gap-8px'>
-          {visible.map((s) => (
+        <div className='flex flex-col gap-8px transition-opacity duration-150' style={{ opacity: loading ? 0.6 : 1 }}>
+          {skills.map((s) => (
             <div
               key={`${s.scope_companion_id}/${s.skill_name}`}
               className='flex items-start gap-10px bg-fill-2 rd-10px px-12px py-10px'
@@ -275,6 +306,20 @@ const SkillsTab: React.FC<Props> = ({ companion }) => {
               </div>
             </div>
           ))}
+        </div>
+      )}
+      {total > 0 && (
+        <div className='flex justify-end pt-2px'>
+          <Pagination
+            current={page}
+            pageSize={pageSize}
+            total={total}
+            showTotal
+            sizeCanChange
+            sizeOptions={[10, 20, 50]}
+            showJumper={total > pageSize}
+            onChange={handlePageChange}
+          />
         </div>
       )}
       <Modal

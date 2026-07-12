@@ -4,10 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Button, Empty, Input, Message, Modal, Popconfirm, Radio, Select, Spin, Tag, Tooltip } from '@arco-design/web-react';
-import { Pin } from '@icon-park/react';
+import { Button, Dropdown, Empty, Input, Menu, Message, Modal, Pagination, Radio, Select, Spin, Tag, Tooltip } from '@arco-design/web-react';
+import { More, Pin } from '@icon-park/react';
 import { ipcBridge } from '@/common';
 import type { ICompanionMemory } from '@/common/adapter/ipcBridge';
 
@@ -43,6 +43,9 @@ const MemoriesTab: React.FC<MemoriesTabProps> = ({ companionId = null, companion
   const [kind, setKind] = useState<string>('');
   const [q, setQ] = useState('');
   const [memStatus, setMemStatus] = useState('active');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
+  const [total, setTotal] = useState(0);
   // 'self' = shared + this companion's private (default when a companion is
   // selected); 'all' = every companion's memories (cross-companion view).
   const [scopeMode, setScopeMode] = useState<'self' | 'all'>(companionId ? 'self' : 'all');
@@ -57,6 +60,7 @@ const MemoriesTab: React.FC<MemoriesTabProps> = ({ companionId = null, companion
   const [editContent, setEditContent] = useState('');
   const [editScopeKind, setEditScopeKind] = useState<ScopeKind>('user');
   const [editScopeCompanionId, setEditScopeCompanionId] = useState<string>('');
+  const [deleteTarget, setDeleteTarget] = useState<ICompanionMemory | null>(null);
 
   const companionName = useCallback(
     (id: string) => companions.find((c) => c.id === id)?.name || id,
@@ -69,31 +73,47 @@ const MemoriesTab: React.FC<MemoriesTabProps> = ({ companionId = null, companion
     const seq = ++refreshSeq.current;
     setLoading(true);
     try {
-      const list = await ipcBridge.companion.listMemories.invoke({
+      const result = await ipcBridge.companion.listMemories.invoke({
         kind: kind || undefined,
         q: q || undefined,
         status: memStatus,
         // 'self' scopes to shared + selected companion's private; 'all' omits
         // the filter so every companion's memories show.
         scope_companion_id: scopeMode === 'self' && companionId ? companionId : undefined,
-        limit: 200,
+        limit: pageSize,
+        offset: (page - 1) * pageSize,
       });
       // Out-of-order guard: a slow stale response must not clobber the
       // results of a newer query (rapid typing fires overlapping requests).
-      if (seq === refreshSeq.current) setMemories(list);
+      if (seq === refreshSeq.current) {
+        const maxPage = Math.max(1, Math.ceil(result.total / pageSize));
+        setTotal(result.total);
+        // A deletion can leave the current page past the end. Keep the existing
+        // rows visible while the next request loads the last valid page.
+        if (page > maxPage) {
+          setPage(maxPage);
+          return;
+        }
+        setMemories(result.items);
+      }
     } catch (e) {
       if (seq === refreshSeq.current) Message.error(String(e));
     } finally {
       if (seq === refreshSeq.current) setLoading(false);
     }
-  }, [kind, q, memStatus, scopeMode, companionId]);
+  }, [kind, q, memStatus, scopeMode, companionId, page, pageSize]);
 
-  // Debounce keystroke-driven refetches; filter changes flush immediately
-  // because the debounce window is short enough not to feel laggy.
+  // Debounce refetches slightly so typing does not create overlapping requests.
   useEffect(() => {
     const timer = setTimeout(() => void refresh(), 250);
     return () => clearTimeout(timer);
   }, [refresh]);
+
+  // A new result set always begins at its first page. Page navigation itself
+  // changes only `page`, so it keeps the current filters intact.
+  useEffect(() => {
+    setPage(1);
+  }, [kind, q, memStatus, scopeMode, companionId, pageSize]);
 
   // nomi can save/edit/delete memories mid-chat or from another surface —
   // reflect them live.
@@ -129,6 +149,12 @@ const MemoriesTab: React.FC<MemoriesTabProps> = ({ companionId = null, companion
     },
     [refresh]
   );
+
+  const confirmRemove = useCallback(async () => {
+    if (!deleteTarget) return;
+    await remove(deleteTarget);
+    setDeleteTarget(null);
+  }, [deleteTarget, remove]);
 
   const openAdd = useCallback(() => {
     setAddKind('knowledge');
@@ -230,6 +256,39 @@ const MemoriesTab: React.FC<MemoriesTabProps> = ({ companionId = null, companion
       <Tag bordered>{t('nomi.memories.scopeShared')}</Tag>
     );
 
+  const memoryActionMenu = (m: ICompanionMemory) => (
+    <Menu
+      onClickMenuItem={(key) => {
+        if (key === 'edit') {
+          openEdit(m);
+          return;
+        }
+        if (key === 'archive') {
+          void toggleArchive(m);
+          return;
+        }
+        if (key === 'delete') setDeleteTarget(m);
+      }}
+    >
+      <Menu.Item key='edit'>{t('nomi.memories.edit')}</Menu.Item>
+      <Menu.Item key='archive'>{m.status === 'active' ? t('nomi.memories.archive') : t('nomi.memories.restore')}</Menu.Item>
+      <Menu.Item key='delete' className='!text-[rgb(var(--danger-6))]'>
+        {t('nomi.memories.delete')}
+      </Menu.Item>
+    </Menu>
+  );
+
+  const handlePageChange = useCallback(
+    (nextPage: number, nextPageSize: number) => {
+      const pageSizeChanged = nextPageSize !== pageSize;
+      if (pageSizeChanged) setPageSize(nextPageSize);
+      setPage(pageSizeChanged ? 1 : nextPage);
+    },
+    [pageSize]
+  );
+
+  const initialLoading = loading && memories.length === 0 && total === 0;
+
   return (
     <div className='flex flex-col gap-12px py-8px'>
       <div className='flex gap-8px flex-wrap items-center'>
@@ -262,20 +321,23 @@ const MemoriesTab: React.FC<MemoriesTabProps> = ({ companionId = null, companion
           {t('nomi.memories.add')}
         </Button>
       </div>
-      {loading ? (
+      {initialLoading ? (
         <div className='flex justify-center py-40px'>
           <Spin />
         </div>
       ) : memories.length === 0 ? (
         <Empty description={t('nomi.memories.empty')} />
       ) : (
-        <div className='flex flex-col gap-8px'>
+        <div className='flex flex-col gap-8px transition-opacity duration-150' style={{ opacity: loading ? 0.6 : 1 }}>
           {memories.map((m) => (
-            <div key={m.id} className='flex items-start gap-10px bg-fill-2 rd-10px px-12px py-10px'>
+            <div
+              key={m.id}
+              className='group flex items-start gap-10px rounded-12px border border-solid border-[var(--color-border-2)] bg-[var(--color-bg-2)] px-12px py-10px transition-colors hover:bg-fill-2'
+            >
               <Tag color={KIND_COLORS[m.kind]}>{t(`nomi.kinds.${m.kind}`)}</Tag>
               <div className='flex-1 min-w-0'>
-                <div className='text-13px text-t-primary break-words'>{m.content}</div>
-                <div className='mt-4px flex items-center gap-10px text-11px text-t-tertiary'>
+                <div className='line-clamp-2 text-13px leading-20px text-t-primary break-words'>{m.content}</div>
+                <div className='mt-5px flex flex-wrap items-center gap-x-10px gap-y-4px text-11px text-t-tertiary'>
                   {scopeBadge(m)}
                   <span>
                     {t('nomi.memories.strength')} {(m.strength * 100).toFixed(0)}%
@@ -293,20 +355,30 @@ const MemoriesTab: React.FC<MemoriesTabProps> = ({ companionId = null, companion
                     onClick={() => void togglePin(m)}
                   />
                 </Tooltip>
-                <Button size='mini' onClick={() => openEdit(m)}>
-                  {t('nomi.memories.edit')}
-                </Button>
-                <Button size='mini' onClick={() => void toggleArchive(m)}>
-                  {m.status === 'active' ? t('nomi.memories.archive') : t('nomi.memories.restore')}
-                </Button>
-                <Popconfirm title={t('nomi.memories.deleteConfirm')} onOk={() => void remove(m)}>
-                  <Button size='mini' status='danger'>
-                    {t('nomi.memories.delete')}
-                  </Button>
-                </Popconfirm>
+                <Dropdown droplist={memoryActionMenu(m)} trigger='click' position='br' getPopupContainer={() => document.body}>
+                  <Tooltip content={t('nomi.memories.more')}>
+                    <Button size='mini' type='text' icon={<More theme='outline' size='14' />} aria-label={t('nomi.memories.more')} />
+                  </Tooltip>
+                </Dropdown>
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {total > 0 && (
+        <div className='flex flex-wrap items-center justify-between gap-10px pt-2px'>
+          <span className='text-12px text-t-tertiary tabular-nums'>{t('nomi.memories.total', { count: total })}</span>
+          <Pagination
+            current={page}
+            pageSize={pageSize}
+            total={total}
+            showTotal
+            sizeCanChange
+            sizeOptions={[10, 20, 50]}
+            showJumper={total > pageSize}
+            onChange={handlePageChange}
+          />
         </div>
       )}
 
@@ -347,6 +419,16 @@ const MemoriesTab: React.FC<MemoriesTabProps> = ({ companionId = null, companion
           <Input.TextArea rows={5} value={editContent} onChange={setEditContent} />
           <div className='text-11px text-t-tertiary'>{t('nomi.memories.editHint')}</div>
         </div>
+      </Modal>
+
+      <Modal
+        title={t('nomi.memories.delete')}
+        visible={!!deleteTarget}
+        onOk={() => void confirmRemove()}
+        onCancel={() => setDeleteTarget(null)}
+        okButtonProps={{ status: 'danger' }}
+      >
+        {t('nomi.memories.deleteConfirm')}
       </Modal>
     </div>
   );

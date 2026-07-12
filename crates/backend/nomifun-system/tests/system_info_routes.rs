@@ -45,6 +45,7 @@ fn build_state(db: &nomifun_db::Database, version_check_service: VersionCheckSer
         model_profile_service: nomifun_system::ModelProfileService::new(std::sync::Arc::new(
             nomifun_db::SqliteModelProfileRepository::new(db.pool().clone()),
         )),
+        managed_model_service: None,
         protocol_detection_service: ProtocolDetectionService::new(http_client),
         version_check_service,
         data_dir: std::env::temp_dir(),

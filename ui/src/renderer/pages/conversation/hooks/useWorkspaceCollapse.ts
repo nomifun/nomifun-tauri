@@ -44,6 +44,7 @@ type UseWorkspaceCollapseParams = {
 type UseWorkspaceCollapseReturn = {
   rightSiderCollapsed: boolean;
   setRightSiderCollapsed: React.Dispatch<React.SetStateAction<boolean>>;
+  persistRightSiderCollapsed: (collapsed: boolean) => void;
 };
 
 type WorkspaceCollapsePreference = 'expanded' | 'collapsed' | null;
@@ -128,6 +129,16 @@ export function useWorkspaceCollapse({
 
   // Mirror ref for collapse state
   const rightCollapsedRef = useRef(rightSiderCollapsed);
+
+  const persistRightSiderCollapsed = (collapsed: boolean) => {
+    setRightSiderCollapsed(collapsed);
+    if (!preferenceKey) return;
+    try {
+      localStorage.setItem(`workspace-preference-${preferenceKey}`, collapsed ? 'collapsed' : 'expanded');
+    } catch {
+      // ignore errors
+    }
+  };
 
   // Keep ref in sync
   useEffect(() => {
@@ -252,5 +263,5 @@ export function useWorkspaceCollapse({
     return () => cancelAnimationFrame(rafId);
   }, [conversation_id, isMobile]);
 
-  return { rightSiderCollapsed, setRightSiderCollapsed };
+  return { rightSiderCollapsed, setRightSiderCollapsed, persistRightSiderCollapsed };
 }

@@ -268,7 +268,7 @@ const WorkspacePage: React.FC = () => {
   );
 
   return (
-    <div className='flex flex-col gap-16px'>
+    <div className='flex flex-col'>
       {messageCtx}
 
       {/* Header row: view toggle (left) + 新建 (right) */}
@@ -284,47 +284,60 @@ const WorkspacePage: React.FC = () => {
         </Button>
       </div>
 
-      {/* Filters + batch bar */}
-      <RequirementFilters
-        tag={tag}
-        status={status}
-        search={search}
-        orderBy={orderBy}
-        order={order}
-        onTagChange={handleTagChange}
-        onStatusChange={handleStatusChange}
-        onSearchChange={handleSearchChange}
-        onOrderByChange={handleOrderByChange}
-        onOrderChange={handleOrderChange}
-        tagOptions={tagOptions}
-        selectedCount={selectedIds.size}
-        onBatchDelete={handleBatchDelete}
-      />
+      {/* Filters + list selection controls + batch bar */}
+      <div className='mt-8px'>
+        <RequirementFilters
+          tag={tag}
+          status={status}
+          search={search}
+          orderBy={orderBy}
+          order={order}
+          onTagChange={handleTagChange}
+          onStatusChange={handleStatusChange}
+          onSearchChange={handleSearchChange}
+          onOrderByChange={handleOrderByChange}
+          onOrderChange={handleOrderChange}
+          tagOptions={tagOptions}
+          selectedCount={selectedIds.size}
+          onBatchDelete={handleBatchDelete}
+          listSelection={
+            view === 'list' && !error && items.length > 0
+              ? {
+                  total,
+                  pageIds: items.map((item) => item.id),
+                  selectedIds,
+                  onToggleSelectAll: selectAllOnPage,
+                  onClearSelection: clearSelection,
+                }
+              : undefined
+          }
+        />
+      </div>
 
       {/* The view */}
-      {view === 'board' ? (
-        <RequirementBoardView items={items} onOpenDetail={openDetail} onStatusChange={handleRowStatusChange} />
-      ) : (
-        <RequirementListView
-          items={items}
-          total={total}
-          page={page}
-          pageSize={pageSize}
-          onPageChange={handlePageChange}
-          loading={loading}
-          error={!!error}
-          onRetry={() => void refresh()}
-          selectedIds={selectedIds}
-          onToggleSelect={toggleSelect}
-          onToggleSelectAll={selectAllOnPage}
-          onClearSelection={clearSelection}
-          onOpenDetail={openDetail}
-          onStatusChange={handleRowStatusChange}
-          onEdit={openEdit}
-          onDelete={handleDelete}
-          onCreate={openCreate}
-        />
-      )}
+      <div className='mt-10px'>
+        {view === 'board' ? (
+          <RequirementBoardView items={items} onOpenDetail={openDetail} onStatusChange={handleRowStatusChange} />
+        ) : (
+          <RequirementListView
+            items={items}
+            total={total}
+            page={page}
+            pageSize={pageSize}
+            onPageChange={handlePageChange}
+            loading={loading}
+            error={!!error}
+            onRetry={() => void refresh()}
+            selectedIds={selectedIds}
+            onToggleSelect={toggleSelect}
+            onOpenDetail={openDetail}
+            onStatusChange={handleRowStatusChange}
+            onEdit={openEdit}
+            onDelete={handleDelete}
+            onCreate={openCreate}
+          />
+        )}
+      </div>
 
       {/* Unified drawer — open/mode/target derived from URL params. */}
       <RequirementDrawer

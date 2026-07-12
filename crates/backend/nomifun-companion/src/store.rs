@@ -93,6 +93,13 @@ pub struct CompanionSuggestion {
     pub decided_at: Option<TimestampMs>,
 }
 
+/// One suggestion page and the number of rows matching the same status filter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuggestionPage {
+    pub items: Vec<CompanionSuggestion>,
+    pub total: i64,
+}
+
 
 /// One registered companion chat thread (a real `type='nomi'` conversation
 /// owned by the main conversation domain; the companion only tracks membership).
@@ -159,6 +166,31 @@ pub struct MemoryFilter {
     pub scope_companion_id: Option<String>,
     pub limit: i64,
     pub offset: i64,
+}
+
+/// One page of memories and the number of rows matching the same filter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryPage {
+    pub items: Vec<CompanionMemory>,
+    pub total: i64,
+}
+
+fn memory_filter_clause(filter: &MemoryFilter) -> String {
+    let mut sql = String::from(" WHERE 1=1");
+    if filter.kind.is_some() {
+        sql.push_str(" AND kind = ?");
+    }
+    if filter.q.is_some() {
+        sql.push_str(" AND content LIKE ?");
+    }
+    if filter.status.is_some() {
+        sql.push_str(" AND status = ?");
+    }
+    if filter.scope_companion_id.is_some() {
+        // Shared (all companions) + this companion's own private memories.
+        sql.push_str(" AND (scope_kind = 'user' OR scope_companion_id = ?)");
+    }
+    sql
 }
 
 #[derive(Clone)]
@@ -1024,20 +1056,7 @@ impl CompanionStore {
     }
 
     pub async fn list_memories(&self, filter: &MemoryFilter) -> Result<Vec<CompanionMemory>, AppError> {
-        let mut sql = String::from("SELECT * FROM companion_memories WHERE 1=1");
-        if filter.kind.is_some() {
-            sql.push_str(" AND kind = ?");
-        }
-        if filter.q.is_some() {
-            sql.push_str(" AND content LIKE ?");
-        }
-        if filter.status.is_some() {
-            sql.push_str(" AND status = ?");
-        }
-        if filter.scope_companion_id.is_some() {
-            // Shared (all companions) + this companion's own private memories.
-            sql.push_str(" AND (scope_kind = 'user' OR scope_companion_id = ?)");
-        }
+        let mut sql = format!("SELECT * FROM companion_memories{}", memory_filter_clause(filter));
         sql.push_str(" ORDER BY pinned DESC, strength DESC, updated_at DESC LIMIT ? OFFSET ?");
         let mut query = sqlx::query(&sql);
         if let Some(kind) = &filter.kind {
@@ -1056,6 +1075,52 @@ impl CompanionStore {
         query = query.bind(limit).bind(filter.offset.max(0));
         let rows = query.fetch_all(&self.pool).await.map_err(db_err)?;
         Ok(rows.iter().map(row_to_memory).collect())
+    }
+
+    pub async fn list_memory_page(&self, filter: &MemoryFilter) -> Result<MemoryPage, AppError> {
+        let mut items_sql = format!("SELECT * FROM companion_memories{}", memory_filter_clause(filter));
+        items_sql.push_str(" ORDER BY pinned DESC, strength DESC, updated_at DESC LIMIT ? OFFSET ?");
+        let mut items_query = sqlx::query(&items_sql);
+        if let Some(kind) = &filter.kind {
+            items_query = items_query.bind(kind);
+        }
+        if let Some(q) = &filter.q {
+            items_query = items_query.bind(format!("%{q}%"));
+        }
+        if let Some(status) = &filter.status {
+            items_query = items_query.bind(status);
+        }
+        if let Some(cid) = &filter.scope_companion_id {
+            items_query = items_query.bind(cid);
+        }
+        let limit = if filter.limit <= 0 { 100 } else { filter.limit.min(500) };
+        let rows = items_query
+            .bind(limit)
+            .bind(filter.offset.max(0))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+
+        let count_sql = format!("SELECT COUNT(*) AS n FROM companion_memories{}", memory_filter_clause(filter));
+        let mut count_query = sqlx::query(&count_sql);
+        if let Some(kind) = &filter.kind {
+            count_query = count_query.bind(kind);
+        }
+        if let Some(q) = &filter.q {
+            count_query = count_query.bind(format!("%{q}%"));
+        }
+        if let Some(status) = &filter.status {
+            count_query = count_query.bind(status);
+        }
+        if let Some(cid) = &filter.scope_companion_id {
+            count_query = count_query.bind(cid);
+        }
+        let total = count_query.fetch_one(&self.pool).await.map_err(db_err)?.get("n");
+
+        Ok(MemoryPage {
+            items: rows.iter().map(row_to_memory).collect(),
+            total,
+        })
     }
 
     pub async fn count_memories(&self, status: &str) -> Result<i64, AppError> {
@@ -1506,6 +1571,52 @@ impl CompanionStore {
         Ok(rows.iter().map(row_to_suggestion).collect())
     }
 
+    pub async fn list_suggestion_page(
+        &self,
+        status: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<SuggestionPage, AppError> {
+        let limit = limit.clamp(1, 500);
+        let offset = offset.max(0);
+        let (rows, total) = if let Some(status) = status {
+            let rows = sqlx::query(
+                "SELECT * FROM companion_suggestions WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            )
+            .bind(status)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+            let total: i64 = sqlx::query("SELECT COUNT(*) AS n FROM companion_suggestions WHERE status = ?")
+                .bind(status)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(db_err)?
+                .get("n");
+            (rows, total)
+        } else {
+            let rows = sqlx::query("SELECT * FROM companion_suggestions ORDER BY created_at DESC LIMIT ? OFFSET ?")
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(db_err)?;
+            let total: i64 = sqlx::query("SELECT COUNT(*) AS n FROM companion_suggestions")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(db_err)?
+                .get("n");
+            (rows, total)
+        };
+
+        Ok(SuggestionPage {
+            items: rows.iter().map(row_to_suggestion).collect(),
+            total,
+        })
+    }
+
     pub async fn count_suggestions(&self, status: &str) -> Result<i64, AppError> {
         let row = sqlx::query("SELECT COUNT(*) AS n FROM companion_suggestions WHERE status = ?")
             .bind(status)
@@ -1889,6 +2000,13 @@ pub struct CompanionSkill {
     pub signature: String,
 }
 
+/// One page of skills visible to a companion and the number of matching rows.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CompanionSkillPage {
+    pub items: Vec<CompanionSkill>,
+    pub total: i64,
+}
+
 fn row_to_skill(row: &sqlx::sqlite::SqliteRow) -> CompanionSkill {
     let prov: String = row.get("provenance");
     CompanionSkill {
@@ -1947,12 +2065,60 @@ impl CompanionStore {
     /// List a companion's own skills; with `include_shared`, also the user-scoped (shared) ones.
     pub async fn list_skills(&self, companion_id: &str, include_shared: bool) -> Result<Vec<CompanionSkill>, AppError> {
         let sql = if include_shared {
-            "SELECT * FROM companion_skills WHERE scope_companion_id = ? OR scope_kind = 'user' ORDER BY strength DESC"
+            "SELECT * FROM companion_skills WHERE scope_companion_id = ? OR scope_kind = 'user' \
+             ORDER BY strength DESC, updated_at DESC, scope_kind ASC, scope_companion_id ASC, skill_name ASC"
         } else {
-            "SELECT * FROM companion_skills WHERE scope_companion_id = ? ORDER BY strength DESC"
+            "SELECT * FROM companion_skills WHERE scope_companion_id = ? \
+             ORDER BY strength DESC, updated_at DESC, scope_kind ASC, scope_companion_id ASC, skill_name ASC"
         };
         let rows = sqlx::query(sql).bind(companion_id).fetch_all(&self.pool).await.map_err(db_err)?;
         Ok(rows.iter().map(row_to_skill).collect())
+    }
+
+    /// List one page of skills visible to a companion, optionally limited to one lifecycle status.
+    pub async fn list_skill_page(
+        &self,
+        companion_id: &str,
+        include_shared: bool,
+        status: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<CompanionSkillPage, AppError> {
+        let scope_clause = if include_shared {
+            " WHERE (scope_companion_id = ? OR scope_kind = 'user')"
+        } else {
+            " WHERE scope_companion_id = ?"
+        };
+        let status_clause = if status.is_some() { " AND status = ?" } else { "" };
+        let limit = limit.clamp(1, 500);
+        let offset = offset.max(0);
+
+        let items_sql = format!(
+            "SELECT * FROM companion_skills{scope_clause}{status_clause} \
+             ORDER BY strength DESC, updated_at DESC, scope_kind ASC, scope_companion_id ASC, skill_name ASC LIMIT ? OFFSET ?"
+        );
+        let mut items_query = sqlx::query(&items_sql).bind(companion_id);
+        if let Some(status) = status {
+            items_query = items_query.bind(status);
+        }
+        let rows = items_query
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+
+        let count_sql = format!("SELECT COUNT(*) AS n FROM companion_skills{scope_clause}{status_clause}");
+        let mut count_query = sqlx::query(&count_sql).bind(companion_id);
+        if let Some(status) = status {
+            count_query = count_query.bind(status);
+        }
+        let total = count_query.fetch_one(&self.pool).await.map_err(db_err)?.get("n");
+
+        Ok(CompanionSkillPage {
+            items: rows.iter().map(row_to_skill).collect(),
+            total,
+        })
     }
 
     pub async fn get_skill(&self, companion_id: &str, name: &str) -> Result<Option<CompanionSkill>, AppError> {
@@ -2285,6 +2451,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_skill_page_filters_counts_and_pages() {
+        let store = CompanionStore::open_memory().await.unwrap();
+        let skill = |name: &str, owner: &str, scope_kind: &str, status: &str, strength: f64| CompanionSkill {
+            skill_name: name.into(),
+            scope_kind: scope_kind.into(),
+            scope_companion_id: owner.into(),
+            status: status.into(),
+            source: "mined".into(),
+            confidence: 0.7,
+            provenance: vec![],
+            strength,
+            version: 1,
+            superseded_by: None,
+            usage_count: 0,
+            last_used_at: None,
+            created_at: 100,
+            updated_at: 100,
+            signature: String::new(),
+        };
+
+        for s in [
+            skill("own-strong", "c1", "companion", "active", 0.9),
+            skill("own-next", "c1", "companion", "active", 0.8),
+            skill("shared", "", "user", "active", 0.7),
+            skill("other", "c2", "companion", "active", 1.0),
+            skill("own-draft", "c1", "companion", "draft", 1.0),
+        ] {
+            store.insert_skill(&s).await.unwrap();
+        }
+
+        let page = store.list_skill_page("c1", true, Some("active"), 2, 1).await.unwrap();
+
+        assert_eq!(page.total, 3);
+        assert_eq!(
+            page.items.iter().map(|s| s.skill_name.as_str()).collect::<Vec<_>>(),
+            vec!["own-next", "shared"]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_skill_page_stably_orders_equal_strength() {
+        let store = CompanionStore::open_memory().await.unwrap();
+        for name in ["zeta", "alpha"] {
+            store
+                .insert_skill(&CompanionSkill {
+                    skill_name: name.into(),
+                    scope_kind: "companion".into(),
+                    scope_companion_id: "c1".into(),
+                    status: "active".into(),
+                    source: "mined".into(),
+                    confidence: 0.7,
+                    provenance: vec![],
+                    strength: 0.8,
+                    version: 1,
+                    superseded_by: None,
+                    usage_count: 0,
+                    last_used_at: None,
+                    created_at: 100,
+                    updated_at: 100,
+                    signature: String::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let page = store.list_skill_page("c1", false, Some("active"), 10, 0).await.unwrap();
+
+        assert_eq!(
+            page.items.iter().map(|s| s.skill_name.as_str()).collect::<Vec<_>>(),
+            vec!["alpha", "zeta"]
+        );
+    }
+
+    #[tokio::test]
     async fn fresh_db_has_evolution_tables() {
         let store = CompanionStore::open_memory().await.unwrap();
         for t in ["companion_skills", "skill_pattern_stats", "evolution_feedback"] {
@@ -2495,6 +2735,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_memory_page_counts_the_same_filtered_scope() {
+        let store = CompanionStore::open_memory().await.unwrap();
+        store.insert_memory("knowledge", "shared fact", &[], 0.9, "learn").await.unwrap();
+        store
+            .insert_memory_scoped("knowledge", "c1 private one", &[], 0.9, "chat", MemoryScope::Companion("c1".into()))
+            .await
+            .unwrap();
+        store
+            .insert_memory_scoped("knowledge", "c1 private two", &[], 0.9, "chat", MemoryScope::Companion("c1".into()))
+            .await
+            .unwrap();
+        store
+            .insert_memory_scoped("knowledge", "c2 private", &[], 0.9, "chat", MemoryScope::Companion("c2".into()))
+            .await
+            .unwrap();
+
+        let page = store
+            .list_memory_page(&MemoryFilter {
+                scope_companion_id: Some("c1".into()),
+                limit: 2,
+                offset: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(page.total, 3);
+        assert_eq!(page.items.len(), 2);
+        assert!(page.items.iter().all(|m| m.scope_companion_id != "c2"));
+    }
+
+    #[tokio::test]
     async fn update_memory_redacts_secret_and_rejects_empty() {
         let store = CompanionStore::open_memory().await.unwrap();
         let m = store.insert_memory("knowledge", "original", &[], 0.8, "manual").await.unwrap();
@@ -2672,6 +2944,21 @@ mod tests {
         let after = &store.list_suggestions(None, 10).await.unwrap()[0];
         assert_eq!(after.created_at, decided.created_at);
         assert_eq!(after.status, "accepted");
+    }
+
+    #[tokio::test]
+    async fn list_suggestion_page_counts_the_same_status() {
+        let store = CompanionStore::open_memory().await.unwrap();
+        store.insert_suggestion("insight", "new one", "first pending", None).await.unwrap();
+        store.insert_suggestion("insight", "new two", "second pending", None).await.unwrap();
+        let decided = store.insert_suggestion("insight", "accepted", "already reviewed", None).await.unwrap();
+        store.decide_suggestion(&decided.id, true).await.unwrap();
+
+        let page = store.list_suggestion_page(Some("new"), 1, 1).await.unwrap();
+
+        assert_eq!(page.total, 2);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].status, "new");
     }
 
     #[tokio::test]

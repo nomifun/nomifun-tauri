@@ -8,12 +8,19 @@ import AutoWorkControl from '@/renderer/pages/conversation/components/AutoWorkCo
 import IdmmControl from '@/renderer/pages/conversation/components/IdmmControl';
 import KnowledgeControl from '@/renderer/pages/conversation/components/KnowledgeControl';
 import MobileWorkspaceOverlay from './MobileWorkspaceOverlay';
-import WorkspacePanelHeader, { DesktopWorkspaceToggle } from './WorkspacePanelHeader';
+import WorkspacePanelHeader from './WorkspacePanelHeader';
+import WorkspaceToolRail, {
+  WORKSPACE_PANEL_META_EVENT,
+  dispatchWorkspacePanelTabEvent,
+  type WorkspacePanelMetaDetail,
+  type WorkspaceToolRailOrchestration,
+} from './WorkspaceToolRail';
 import { useContainerWidth } from '@/renderer/pages/conversation/hooks/useContainerWidth';
 import { useLayoutConstraints } from '@/renderer/pages/conversation/hooks/useLayoutConstraints';
 import { usePreviewAutoCollapse } from '@/renderer/pages/conversation/hooks/usePreviewAutoCollapse';
 import { useTitleRename } from '@/renderer/pages/conversation/hooks/useTitleRename';
 import { useWorkspaceCollapse } from '@/renderer/pages/conversation/hooks/useWorkspaceCollapse';
+import { useWorkspacePanelTabs } from '@/renderer/pages/conversation/hooks/useWorkspacePanelTabs';
 import { PreviewPanel, PreviewProvider, usePreviewContext } from '@/renderer/pages/conversation/Preview';
 import { dispatchWorkspaceToggleEvent } from '@/renderer/utils/workspace/workspaceEvents';
 import { useConversationAgents } from '@/renderer/pages/conversation/hooks/useConversationAgents';
@@ -29,11 +36,13 @@ import {
 import { Layout as ArcoLayout } from '@arco-design/web-react';
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { useTranslation } from 'react-i18next';
+import type { WorkspaceExtraTab, WorkspaceTab } from '@/renderer/pages/conversation/Workspace/types';
 import './chat-layout.css';
 
 // headerExtra allows injecting custom actions (e.g., model picker) into the header's right area
-interface ChatLayoutProps {
-  children: React.ReactNode;
+export interface ChatLayoutProps {
+  children?: React.ReactNode;
   title?: React.ReactNode;
   sider: React.ReactNode;
   siderTitle?: React.ReactNode;
@@ -80,6 +89,10 @@ interface ChatLayoutProps {
   onRenameTitle?: (new_name: string) => Promise<boolean>;
   /** Optional override for the leading icon shown before the title (e.g. team Peoples icon) */
   headerLeading?: React.ReactNode;
+  /** Extra panels exposed by the persistent vertical tool rail. */
+  workspaceExtraTabs?: WorkspaceExtraTab[];
+  /** Optional orchestration canvas entry merged into the same tool rail. */
+  workspaceOrchestration?: WorkspaceToolRailOrchestration;
 }
 
 /**
@@ -90,6 +103,7 @@ interface ChatLayoutProps {
  * workspace rail, MermaidBlock, …) resolves against THIS surface's provider.
  */
 const ChatLayoutInner: React.FC<ChatLayoutProps> = (props) => {
+  const { t } = useTranslation();
   const { conversation_id, workspacePath, isTemporaryWorkspace } = props;
   const { backend, presetAssistant, agent_name, workspaceEnabled = true, workspacePreferenceKey } = props;
   const layout = useLayoutContext();
@@ -108,14 +122,45 @@ const ChatLayoutInner: React.FC<ChatLayoutProps> = (props) => {
   const { isOpen: isPreviewOpen } = usePreviewContext();
 
   // --- Hook A: workspace collapse ---
-  const { rightSiderCollapsed, setRightSiderCollapsed } = useWorkspaceCollapse({
+  const workspacePanelPreferenceKey =
+    workspacePreferenceKey ?? (conversation_id != null ? String(conversation_id) : undefined);
+  const { rightSiderCollapsed, setRightSiderCollapsed, persistRightSiderCollapsed } = useWorkspaceCollapse({
     workspaceEnabled,
     isMobile,
     conversation_id,
-    preferenceKey: workspacePreferenceKey ?? (conversation_id != null ? String(conversation_id) : undefined),
+    preferenceKey: workspacePanelPreferenceKey,
     isTemporaryWorkspace,
     autoExpandOnFiles: false,
   });
+  const { activeWorkspaceTab, setActiveWorkspaceTab } = useWorkspacePanelTabs(workspacePanelPreferenceKey);
+
+  const activeWorkspaceTitle =
+    activeWorkspaceTab === 'files'
+      ? props.siderTitle
+      : activeWorkspaceTab === 'changes'
+        ? t('conversation.workspace.changes.tab')
+        : props.workspaceExtraTabs?.find((tab) => tab.key === activeWorkspaceTab)?.title ?? props.siderTitle;
+
+  const selectWorkspaceTool = (tab: string) => {
+    const nextTab = tab as WorkspaceTab;
+    const clickingActivePanel = !rightSiderCollapsed && activeWorkspaceTab === nextTab;
+    if (props.workspaceOrchestration?.active) props.workspaceOrchestration.onClick();
+    setActiveWorkspaceTab(nextTab);
+    dispatchWorkspacePanelTabEvent(nextTab, conversation_id != null ? String(conversation_id) : undefined);
+    persistRightSiderCollapsed(clickingActivePanel);
+  };
+
+  const workspaceOrchestration = props.workspaceOrchestration
+    ? {
+        ...props.workspaceOrchestration,
+        onClick: () => {
+          if (!props.workspaceOrchestration?.active) {
+            setRightSiderCollapsed(true);
+          }
+          props.workspaceOrchestration?.onClick();
+        },
+      }
+    : undefined;
 
   // --- Hook B: container width ---
   const { containerRef, containerWidth } = useContainerWidth();
@@ -215,6 +260,7 @@ const ChatLayoutInner: React.FC<ChatLayoutProps> = (props) => {
   });
 
   const [mobileActionsSlot, setMobileActionsSlot] = useState<HTMLElement | null>(null);
+  const [workspaceChangeCount, setWorkspaceChangeCount] = useState(0);
   useEffect(() => {
     if (!layout?.isMobile) {
       setMobileActionsSlot(null);
@@ -229,6 +275,17 @@ const ChatLayoutInner: React.FC<ChatLayoutProps> = (props) => {
     observer.observe(document.body, { childList: true, subtree: true });
     return () => observer.disconnect();
   }, [layout?.isMobile]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined;
+    const handleWorkspaceMeta = (event: Event) => {
+      const detail = (event as CustomEvent<WorkspacePanelMetaDetail>).detail;
+      if (!detail || (conversation_id != null && detail.sourceKey !== String(conversation_id))) return;
+      setWorkspaceChangeCount(detail.changeCount);
+    };
+    window.addEventListener(WORKSPACE_PANEL_META_EVENT, handleWorkspaceMeta);
+    return () => window.removeEventListener(WORKSPACE_PANEL_META_EVENT, handleWorkspaceMeta);
+  }, [conversation_id]);
 
   const desktopHeader = (
     <ArcoLayout.Header
@@ -353,6 +410,22 @@ const ChatLayoutInner: React.FC<ChatLayoutProps> = (props) => {
             )}
           </div>
         </div>
+        {workspaceEnabled && layout?.isMobile && rightSiderCollapsed && (
+          <button
+            type='button'
+            className='workspace-tool-rail-mobile-trigger'
+            onClick={() => {
+              setActiveWorkspaceTab('files');
+              dispatchWorkspacePanelTabEvent('files', conversation_id != null ? String(conversation_id) : undefined);
+              persistRightSiderCollapsed(false);
+            }}
+            aria-label={t('conversation.workspace.changes.filesTab')}
+          >
+            <span className='workspace-tool-rail-mobile-trigger__dot' />
+            <span className='workspace-tool-rail-mobile-trigger__dot' />
+            <span className='workspace-tool-rail-mobile-trigger__dot' />
+          </button>
+        )}
         {workspaceEnabled && !layout?.isMobile && (
           <div
             className={classNames('!bg-1 relative chat-layout-right-sider layout-sider')}
@@ -377,13 +450,44 @@ const ChatLayoutInner: React.FC<ChatLayoutProps> = (props) => {
               workspacePath={workspacePath}
               isTemporaryWorkspace={isTemporaryWorkspace}
               conversation_id={conversation_id}
+              activeTab={activeWorkspaceTab}
             >
-              {props.siderTitle}
+              {activeWorkspaceTitle}
             </WorkspacePanelHeader>
             <ArcoLayout.Content style={{ height: `calc(100% - ${WORKSPACE_HEADER_HEIGHT}px)` }}>
               {props.sider}
             </ArcoLayout.Content>
           </div>
+        )}
+        {workspaceEnabled && !layout?.isMobile && (
+          <WorkspaceToolRail
+            t={t}
+            activeTab={activeWorkspaceTab}
+            expanded={!rightSiderCollapsed}
+            onSelect={selectWorkspaceTool}
+            changeCount={workspaceChangeCount}
+            extraTabs={props.workspaceExtraTabs}
+            orchestration={workspaceOrchestration}
+            footer={
+              <button
+                type='button'
+                className='workspace-tool-rail__item workspace-tool-rail__item--collapse'
+                onClick={() => {
+                  if (rightSiderCollapsed && props.workspaceOrchestration?.active) {
+                    props.workspaceOrchestration.onClick();
+                  }
+                  persistRightSiderCollapsed(!rightSiderCollapsed);
+                }}
+                aria-label={
+                  rightSiderCollapsed
+                    ? t('conversation.workspace.expand', { defaultValue: '展开侧栏' })
+                    : t('conversation.workspace.collapse', { defaultValue: '收起侧栏' })
+                }
+              >
+                {rightSiderCollapsed ? <span>‹</span> : <span>›</span>}
+              </button>
+            }
+          />
         )}
 
         {/* Mobile workspace overlay: backdrop + fixed panel + floating collapse handle */}
@@ -398,14 +502,10 @@ const ChatLayoutInner: React.FC<ChatLayoutProps> = (props) => {
             workspacePath={workspacePath}
             isTemporaryWorkspace={isTemporaryWorkspace}
             conversation_id={conversation_id}
+            activeTab={activeWorkspaceTab}
+            activeTitle={activeWorkspaceTitle}
           />
         )}
-
-        {/* Desktop expand button when workspace is collapsed */}
-        {(Boolean(props.selfContainedWorkspaceToggle) || (!isMacRuntime && !isWindowsRuntime)) &&
-          workspaceEnabled &&
-          rightSiderCollapsed &&
-          !layout?.isMobile && <DesktopWorkspaceToggle />}
       </div>
     </ArcoLayout>
   );

@@ -27,7 +27,9 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{Emitter, Manager};
 use tauri_plugin_deep_link::DeepLinkExt;
 
+mod memory_panel_window;
 mod relocate;
+mod updater_install_context;
 
 /// Build the webview initialization script. Injects the loopback backend port
 /// (`window.__backendPort`), the OS tag, and the per-boot local-trust secret
@@ -37,7 +39,7 @@ mod relocate;
 /// multipart uploads with progress events, …) is trusted without per-call
 /// instrumentation, while requests to external origins are untouched (the
 /// secret never leaks off-box). Runs before any page script.
-fn webui_init_script(port: u16, trust_secret: &str) -> String {
+pub(crate) fn webui_init_script(port: u16, trust_secret: &str) -> String {
     // `{:?}` emits properly quoted/escaped JS string literals.
     format!(
         r#"window.__backendPort = {port}; window.__os = {os:?}; window.__nomiLocalTrust = {secret:?};
@@ -167,7 +169,7 @@ struct CompanionWindowSpec {
 
 type MainThreadTask = Box<dyn FnOnce() + Send + 'static>;
 
-async fn run_on_main_thread_task<D, F>(dispatch: D, work: F) -> Result<(), String>
+pub(crate) async fn run_on_main_thread_task<D, F>(dispatch: D, work: F) -> Result<(), String>
 where
     D: FnOnce(MainThreadTask) -> Result<(), String>,
     F: FnOnce() -> Result<(), String> + Send + 'static,
@@ -387,13 +389,21 @@ fn set_tray_labels(
 async fn sync_companion_windows(
     app: tauri::AppHandle,
     server: tauri::State<'_, Arc<DesktopServer>>,
+    memory_panel: tauri::State<'_, memory_panel_window::MemoryPanelWindowState>,
     specs: Vec<CompanionWindowSpec>,
 ) -> Result<(), String> {
     let init_script = webui_init_script(server.loopback_port(), server.local_trust_secret());
+    let enabled_ids = specs
+        .iter()
+        .filter(|spec| spec.enabled)
+        .map(|spec| spec.companion_id.clone())
+        .collect();
+    let hide_memory_panel = memory_panel.invalidate_owner_unless(&enabled_ids);
+    let memory_panel_for_task = memory_panel.inner().clone();
     let app_for_task = app.clone();
     run_on_main_thread_task(
         move |task| app.run_on_main_thread(task).map_err(|e| e.to_string()),
-        move || reconcile_companion_windows(app_for_task, init_script, specs),
+        move || reconcile_companion_windows(app_for_task, init_script, specs, hide_memory_panel, memory_panel_for_task),
     )
     .await
 }
@@ -402,8 +412,17 @@ fn reconcile_companion_windows(
     app: tauri::AppHandle,
     init_script: String,
     specs: Vec<CompanionWindowSpec>,
+    hide_memory_panel: bool,
+    memory_panel: memory_panel_window::MemoryPanelWindowState,
 ) -> Result<(), String> {
     use std::collections::HashSet;
+
+    if hide_memory_panel {
+        memory_panel.run_if_empty(|| {
+            if let Some(window) = app.get_webview_window(memory_panel_window::MEMORY_PANEL_LABEL) { let _ = window.hide(); }
+            Ok(())
+        })?;
+    }
 
     let known: HashSet<String> = specs
         .iter()
@@ -781,9 +800,15 @@ fn main() -> std::process::ExitCode {
         // feedback, auto-update status) register here as #[tauri::command]s (P3).
         .manage(AwakeState(Mutex::new(None)))
         .manage(QuitFlag(AtomicBool::new(false)))
+        .manage(memory_panel_window::MemoryPanelWindowState::default())
         .invoke_handler(tauri::generate_handler![
             check_for_updates,
+            updater_install_context::get_updater_install_context,
             sync_companion_windows,
+            memory_panel_window::prepare_companion_memory_panel,
+            memory_panel_window::place_companion_memory_panel,
+            memory_panel_window::show_companion_memory_panel,
+            memory_panel_window::hide_companion_memory_panel,
             webui_get_status,
             webui_start,
             webui_stop,
