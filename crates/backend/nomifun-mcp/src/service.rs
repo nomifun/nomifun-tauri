@@ -267,10 +267,9 @@ impl McpConfigService {
     }
 }
 
-/// Parses a wire-level MCP server id (the host-local integer primary key,
-/// carried as a string in URL paths and the connection-test request) into an
-/// `i64`. A non-numeric id can never match a stored row, so it is reported as
-/// `NotFound` rather than a parse error.
+/// Parses a host-local MCP server primary key carried as a URL path string into
+/// an `i64`. A non-numeric id can never match a stored row, so it is reported
+/// as `NotFound` rather than a parse error.
 fn parse_server_id(id: &str) -> Result<i64, McpError> {
     id.parse::<i64>().map_err(|_| McpError::NotFound(id.to_owned()))
 }

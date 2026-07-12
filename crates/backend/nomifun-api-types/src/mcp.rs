@@ -572,8 +572,15 @@ mod tests {
     }
 
     #[test]
-    fn test_connection_request_rejects_non_numeric_or_fractional_id() {
-        for invalid_id in [serde_json::json!("mcp_123"), serde_json::json!(1.5)] {
+    fn test_connection_request_rejects_invalid_id_shapes() {
+        for invalid_id in [
+            serde_json::json!("mcp_123"),
+            serde_json::json!(1.5),
+            serde_json::json!(true),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!(u64::MAX),
+        ] {
             let json = serde_json::json!({
                 "id": invalid_id,
                 "name": "test-server",
