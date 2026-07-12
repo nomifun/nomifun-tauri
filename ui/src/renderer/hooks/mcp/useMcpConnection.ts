@@ -4,6 +4,7 @@ import type { TFunction } from 'i18next';
 import { useTranslation } from 'react-i18next';
 import { isBackendHttpError } from '@/common/adapter/httpBridge';
 import { mcpService } from '@/common/adapter/ipcBridge';
+import { buildMcpConnectionTestRequest } from '@/common/adapter/mcpRequest';
 import type { IMcpServer } from '@/common/config/storage';
 import { globalMessageQueue } from './messageQueue';
 
@@ -160,7 +161,7 @@ export const useMcpConnection = (
       await updateServerStatus('testing');
 
       try {
-        const result = await mcpService.testMcpConnection.invoke(server);
+        const result = await mcpService.testMcpConnection.invoke(buildMcpConnectionTestRequest(server));
         const needsAuth = result.needsAuth ?? result.needs_auth;
 
         // 检查是否需要认证

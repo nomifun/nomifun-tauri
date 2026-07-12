@@ -14,6 +14,7 @@
 
 import type { IConfirmation } from '@/common/chat/chatLib';
 import { bridge } from '@/platform';
+import type { McpConnectionTestRequest } from './mcpRequest';
 import {
   noopEmitter,
   shellEmitter,
@@ -1119,7 +1120,7 @@ export const mcpService = {
       wwwAuthenticate?: string;
       www_authenticate?: string;
     },
-    IMcpServer
+    McpConnectionTestRequest
   >('/api/mcp/test-connection'),
   checkOAuthStatus: httpPost<{ authenticated: boolean }, { server_url: string }>('/api/mcp/oauth/check-status'),
   loginMcpOAuth: httpPost<{ success: boolean; error?: string }, { server_url: string }>('/api/mcp/oauth/login'),
