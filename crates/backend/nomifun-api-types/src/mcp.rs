@@ -163,8 +163,11 @@ pub struct DetectedMcpServerResponse {
 /// Request body for `POST /api/mcp/test-connection`.
 #[derive(Debug, Deserialize)]
 pub struct TestMcpConnectionRequest {
-    #[serde(default)]
-    pub id: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_util::deserialize_optional_i64_from_string_or_integer"
+    )]
+    pub id: Option<i64>,
     pub name: String,
     pub transport: McpTransport,
 }
@@ -538,20 +541,45 @@ mod tests {
     // -- TestMcpConnectionRequest ---------------------------------------------
 
     #[test]
-    fn test_connection_request_deserialization() {
+    fn test_connection_request_accepts_numeric_id() {
+        let body = r#"{"id":1,"name":"test-server","transport":{"type":"http","url":"https://example.com/mcp"}}"#;
+        let req: TestMcpConnectionRequest =
+            serde_json::from_str(body).expect("numeric MCP catalog id must deserialize");
+        assert_eq!(req.id, Some(1));
+        assert_eq!(req.name, "test-server");
+    }
+
+    #[test]
+    fn test_connection_request_accepts_legacy_decimal_string_id() {
         let json = serde_json::json!({
-            "id": "mcp_123",
+            "id": "123",
             "name": "test-server",
             "transport": { "type": "http", "url": "https://example.com/mcp" }
         });
         let req: TestMcpConnectionRequest = serde_json::from_value(json).unwrap();
-        assert_eq!(req.id.as_deref(), Some("mcp_123"));
-        assert_eq!(req.name, "test-server");
-        match req.transport {
-            McpTransport::Http { ref url, .. } => {
-                assert_eq!(url, "https://example.com/mcp");
-            }
-            _ => panic!("expected Http"),
+        assert_eq!(req.id, Some(123));
+    }
+
+    #[test]
+    fn test_connection_request_allows_missing_or_null_id() {
+        for id_fragment in ["", r#""id":null,"#] {
+            let body = format!(
+                r#"{{{id_fragment}"name":"test-server","transport":{{"type":"http","url":"https://example.com/mcp"}}}}"#
+            );
+            let req: TestMcpConnectionRequest = serde_json::from_str(&body).unwrap();
+            assert!(req.id.is_none());
+        }
+    }
+
+    #[test]
+    fn test_connection_request_rejects_non_numeric_or_fractional_id() {
+        for invalid_id in [serde_json::json!("mcp_123"), serde_json::json!(1.5)] {
+            let json = serde_json::json!({
+                "id": invalid_id,
+                "name": "test-server",
+                "transport": { "type": "http", "url": "https://example.com/mcp" }
+            });
+            assert!(serde_json::from_value::<TestMcpConnectionRequest>(json).is_err());
         }
     }
 

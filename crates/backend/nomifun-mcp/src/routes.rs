@@ -147,7 +147,7 @@ async fn test_connection(
         .connection_test_service
         .test_connection(&req.name, &transport)
         .await;
-    if let Some(server_id) = req.id.as_deref() {
+    if let Some(server_id) = req.id {
         state.config_service.persist_test_result(server_id, &result).await?;
     }
     if result.success || result.needs_auth == Some(true) {

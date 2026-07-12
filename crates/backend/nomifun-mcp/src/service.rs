@@ -208,8 +208,7 @@ impl McpConfigService {
     }
 
     /// Persist the latest connection test result for an existing MCP server.
-    pub async fn persist_test_result(&self, id: &str, result: &McpConnectionTestResult) -> Result<(), McpError> {
-        let id = parse_server_id(id)?;
+    pub async fn persist_test_result(&self, id: i64, result: &McpConnectionTestResult) -> Result<(), McpError> {
         let status = if result.success { "connected" } else { "error" };
         let last_connected = if result.success { Some(now_ms()) } else { None };
         let tools_json = result.tools.as_ref().map(serde_json::to_string).transpose()?;
@@ -1165,7 +1164,7 @@ mod tests {
             www_authenticate: None,
         };
 
-        svc.persist_test_result(&created.id.to_string(), &result).await.unwrap();
+        svc.persist_test_result(created.id, &result).await.unwrap();
 
         let updated = svc.get_server(&created.id.to_string()).await.unwrap();
         assert_eq!(updated.last_test_status, nomifun_common::McpServerStatus::Connected);
@@ -1192,7 +1191,7 @@ mod tests {
             auth_method: None,
             www_authenticate: None,
         };
-        svc.persist_test_result(&created.id.to_string(), &success).await.unwrap();
+        svc.persist_test_result(created.id, &success).await.unwrap();
 
         let failure = McpConnectionTestResult {
             success: false,
@@ -1204,7 +1203,7 @@ mod tests {
             auth_method: None,
             www_authenticate: None,
         };
-        svc.persist_test_result(&created.id.to_string(), &failure).await.unwrap();
+        svc.persist_test_result(created.id, &failure).await.unwrap();
 
         let updated = svc.get_server(&created.id.to_string()).await.unwrap();
         assert_eq!(updated.last_test_status, nomifun_common::McpServerStatus::Error);

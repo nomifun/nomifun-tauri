@@ -41,3 +41,72 @@ where
     }
     deserializer.deserialize_any(TargetIdVisitor)
 }
+
+/// Deserialize an optional numeric database id from either a JSON integer or
+/// a legacy decimal string. Missing fields are handled by `#[serde(default)]`;
+/// explicit JSON null is normalized to `None`.
+pub(crate) fn deserialize_optional_i64_from_string_or_integer<'de, D>(
+    deserializer: D,
+) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OptionalI64Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for OptionalI64Visitor {
+        type Value = Option<i64>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a numeric id as an integer, decimal string, or null")
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Some(value))
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            i64::try_from(value)
+                .map(Some)
+                .map_err(|_| E::custom("numeric id exceeds the signed 64-bit range"))
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            value
+                .parse::<i64>()
+                .map(Some)
+                .map_err(|_| E::custom("numeric id string must contain a decimal integer"))
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.visit_str(&value)
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(OptionalI64Visitor)
+}
