@@ -141,6 +141,7 @@ struct Observation {
 struct ActiveWatchdog {
     config: WatchdogConfig,
     kqueue_fd: RawFd,
+    leader_exit_observed: bool,
 }
 
 fn classify_receipt(
@@ -205,7 +206,11 @@ pub(super) unsafe fn run_watchdog(config: WatchdogConfig) -> ! {
         Ok(descriptor) => descriptor,
         Err(_) => unsafe { exit_without_group(config, -1, EXIT_KQUEUE_FAILED) },
     };
-    let mut watchdog = ActiveWatchdog { config, kqueue_fd };
+    let mut watchdog = ActiveWatchdog {
+        config,
+        kqueue_fd,
+        leader_exit_observed: false,
+    };
 
     if unsafe {
         register_process(
@@ -381,6 +386,7 @@ pub(super) unsafe fn run_watchdog(config: WatchdogConfig) -> ! {
             }
         }
     };
+    watchdog.leader_exit_observed |= post_registration.child_exited;
     if post_registration.parent_exited
         || !unsafe { parent_is_original(watchdog.config.parent_pid) }
     {
@@ -478,6 +484,7 @@ pub(super) unsafe fn run_watchdog(config: WatchdogConfig) -> ! {
             Ok(observation) => observation,
             Err(_) => unsafe { quiesce_and_kill(watchdog, leader, EXIT_MONITOR_FAILED) },
         };
+        watchdog.leader_exit_observed |= observation.child_exited;
         if observation.parent_exited
             || !unsafe { parent_is_original(watchdog.config.parent_pid) }
         {
@@ -517,6 +524,7 @@ pub(super) unsafe fn run_watchdog(config: WatchdogConfig) -> ! {
             Ok(observation) => observation,
             Err(_) => unsafe { quiesce_and_kill(watchdog, leader, EXIT_MONITOR_FAILED) },
         };
+        watchdog.leader_exit_observed |= final_observation.child_exited;
         if final_observation.parent_exited
             || !unsafe { parent_is_original(watchdog.config.parent_pid) }
         {
@@ -605,6 +613,7 @@ pub(super) unsafe fn run_watchdog(config: WatchdogConfig) -> ! {
             Ok(observation) => observation,
             Err(_) => unsafe { quiesce_and_kill(watchdog, leader, EXIT_MONITOR_FAILED) },
         };
+        watchdog.leader_exit_observed |= observation.child_exited;
         if observation.parent_exited
             || observation.child_exited
             || !unsafe { parent_is_original(watchdog.config.parent_pid) }
@@ -1004,16 +1013,33 @@ unsafe fn control_ready(control_fd: RawFd) -> Result<bool, libc::c_int> {
 }
 
 unsafe fn quiesce_and_kill(
-    watchdog: ActiveWatchdog,
+    mut watchdog: ActiveWatchdog,
     leader: libc::pid_t,
     _reason: libc::c_int,
 ) -> ! {
+    if let Ok(observation) = unsafe {
+        observe_processes(
+            watchdog.kqueue_fd,
+            watchdog.config.parent_pid,
+            leader,
+            0,
+        )
+    } {
+        watchdog.leader_exit_observed |= observation.child_exited;
+    }
     if let Ok(deadline) = Deadline::after(std::time::Duration::from_millis(EXIT_PREPARE_MS)) {
         let quiescing = Frame::new(FrameKind::Quiescing, watchdog.config.nonce, leader, leader);
         let _ = send_frame(watchdog.config.control_fd, &quiescing, deadline);
     }
     let mut kill_attempt = 0_u32;
-    let kill_result = unsafe { try_final_group_kill(watchdog.config, leader, kill_attempt) };
+    let kill_result = unsafe {
+        try_final_group_kill(
+            watchdog.config,
+            leader,
+            kill_attempt,
+            watchdog.leader_exit_observed,
+        )
+    };
     let Some(retry_delay_ms) = final_kill_retry_delay_ms(kill_result) else {
         unsafe { finish_after_group_seal(watchdog.config) };
     };
@@ -1024,8 +1050,23 @@ unsafe fn quiesce_and_kill(
     loop {
         unsafe { raw_poll_delay(retry_delay_ms) };
         kill_attempt = kill_attempt.saturating_add(1);
+        if let Ok(observation) = unsafe {
+            observe_processes(
+                watchdog.kqueue_fd,
+                watchdog.config.parent_pid,
+                leader,
+                0,
+            )
+        } {
+            watchdog.leader_exit_observed |= observation.child_exited;
+        }
         if !group_kill_needs_failure(unsafe {
-            try_final_group_kill(watchdog.config, leader, kill_attempt)
+            try_final_group_kill(
+                watchdog.config,
+                leader,
+                kill_attempt,
+                watchdog.leader_exit_observed,
+            )
         }) {
             unsafe { finish_after_group_seal(watchdog.config) };
         }
@@ -1033,15 +1074,150 @@ unsafe fn quiesce_and_kill(
 }
 
 unsafe fn try_final_group_kill(
-    _config: WatchdogConfig,
+    config: WatchdogConfig,
     leader: libc::pid_t,
     _attempt: u32,
+    leader_exit_observed: bool,
 ) -> libc::c_int {
     #[cfg(test)]
-    if _config.fault == FAULT_FAIL_FINAL_GROUP_KILL_ONCE && _attempt == 0 {
+    if config.fault == FAULT_FAIL_FINAL_GROUP_KILL_ONCE && _attempt == 0 {
         return -1;
     }
-    unsafe { libc::kill(-leader, libc::SIGKILL) }
+    let result = unsafe { libc::kill(-leader, libc::SIGKILL) };
+    if result == 0 {
+        return 0;
+    }
+    let errno = last_errno();
+    // The original host remains our parent only while it still owns the sole
+    // unreaped StdChild leader lease. This watchdog-side EPERM acceptance is
+    // provisional: after reaping the watchdog, the host unconditionally
+    // repeats the group seal under waitid(WNOWAIT) before it reaps the leader
+    // and proves group absence.
+    if errno == libc::ESRCH
+        || (errno == libc::EPERM
+            && leader_exit_observed
+            && unsafe { parent_is_original(config.parent_pid) }
+            && unsafe { group_contains_only_zombies_anchored_by(leader, leader) }
+            && unsafe { parent_is_original(config.parent_pid) })
+    {
+        return 0;
+    }
+    -1
+}
+
+/// Darwin returns `EPERM` when a process group contains only zombies. The
+/// caller must independently observe the anchor child's exit. The host path
+/// directly retains an unreaped waitid lease; the external watchdog relies on
+/// the protocol invariant described in `try_final_group_kill` and is followed
+/// by the host's own leased seal. Legacy host supervision can instead use its
+/// watchdog, which is an exact direct child that joined the same group. We
+/// verify the anchor is present in both complete snapshots and every member is
+/// still a zombie in the requested group. A full buffer or any
+/// inconsistent/disappearing member fails closed.
+pub(super) unsafe fn group_contains_only_zombies_anchored_by(
+    leader: libc::pid_t,
+    anchor: libc::pid_t,
+) -> bool {
+    const CAPACITY: usize = 64;
+    const SNAPSHOT_ATTEMPTS: usize = 3;
+    for attempt in 0..SNAPSHOT_ATTEMPTS {
+        let mut first = [0 as libc::pid_t; CAPACITY];
+        let Some(first_count) = (unsafe { complete_group_snapshot(leader, &mut first) }) else {
+            return false;
+        };
+        let first = &first[..first_count];
+        if !first.contains(&anchor) {
+            return false;
+        }
+        let first_all_zombies = unsafe { all_members_are_exact_zombies(leader, first) };
+
+        // Close the enumeration/inspection race with a second complete
+        // snapshot. A reaper can remove a zombie between these calls, so retry
+        // a small fixed number of times; no unstable snapshot is accepted.
+        let mut second = [0 as libc::pid_t; CAPACITY];
+        let second_count = unsafe { complete_group_snapshot(leader, &mut second) };
+        if let Some(second_count) = second_count {
+            let second = &second[..second_count];
+            if first_all_zombies
+                && same_member_set(first, second)
+                && unsafe { all_members_are_exact_zombies(leader, second) }
+            {
+                return true;
+            }
+        }
+
+        if attempt + 1 < SNAPSHOT_ATTEMPTS {
+            unsafe { raw_poll_delay(1) };
+        }
+    }
+    false
+}
+
+unsafe fn complete_group_snapshot(
+    leader: libc::pid_t,
+    members: &mut [libc::pid_t],
+) -> Option<usize> {
+    let count = unsafe {
+        libc::proc_listpgrppids(
+            leader,
+            members.as_mut_ptr().cast(),
+            std::mem::size_of_val(members) as libc::c_int,
+        )
+    };
+    if count <= 0 || count as usize >= members.len() {
+        return None;
+    }
+    let count = count as usize;
+    member_snapshot_is_unique_and_safe(&members[..count]).then_some(count)
+}
+
+unsafe fn all_members_are_exact_zombies(
+    leader: libc::pid_t,
+    members: &[libc::pid_t],
+) -> bool {
+    members.iter().all(|&member| {
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let expected = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let returned = unsafe {
+            libc::proc_pidinfo(
+                member,
+                libc::PROC_PIDTBSDINFO,
+                // XNU searches the zombie list only when this argument is nonzero.
+                1,
+                info.as_mut_ptr().cast(),
+                expected,
+            )
+        };
+        if returned != expected {
+            return false;
+        }
+        // SAFETY: proc_pidinfo reported that it initialized the full structure.
+        let info = unsafe { info.assume_init() };
+        bsd_info_is_exact_zombie_group_member(leader, member, &info)
+    })
+}
+
+fn same_member_set(left: &[libc::pid_t], right: &[libc::pid_t]) -> bool {
+    left.len() == right.len()
+        && member_snapshot_is_unique_and_safe(left)
+        && member_snapshot_is_unique_and_safe(right)
+        && left.iter().all(|member| right.contains(member))
+}
+
+fn member_snapshot_is_unique_and_safe(members: &[libc::pid_t]) -> bool {
+    members.iter().enumerate().all(|(index, member)| {
+        *member > 1 && !members[..index].iter().any(|prior| prior == member)
+    })
+}
+
+fn bsd_info_is_exact_zombie_group_member(
+    leader: libc::pid_t,
+    member: libc::pid_t,
+    info: &libc::proc_bsdinfo,
+) -> bool {
+    info.pbi_pid == member as u32
+        && info.pbi_pgid == leader as u32
+        && info.pbi_status == libc::SZOMB
 }
 
 unsafe fn finish_after_group_seal(config: WatchdogConfig) -> ! {
@@ -1102,7 +1278,9 @@ mod tests {
         FAULT_EXIT_AFTER_COMMIT_BEFORE_COMMITTED, FAULT_EXIT_BEFORE_ACK,
         FAULT_EXIT_BEFORE_BOOT_READY, ReceiptSnapshot, TestFaultCheckpoint, WatchdogEvent,
         WatchdogState, classify_receipt, fd_list_batch_complete, final_kill_retry_delay_ms,
-        group_kill_needs_failure, next_state, should_close_inherited_fd, test_fault_matches,
+        bsd_info_is_exact_zombie_group_member, group_kill_needs_failure, next_state,
+        member_snapshot_is_unique_and_safe, same_member_set, should_close_inherited_fd,
+        test_fault_matches,
     };
 
     #[test]
@@ -1164,6 +1342,42 @@ mod tests {
         assert!(group_kill_needs_failure(-1));
         assert_eq!(final_kill_retry_delay_ms(0), None);
         assert_eq!(final_kill_retry_delay_ms(-1), Some(100));
+    }
+
+    #[test]
+    fn zombie_group_member_requires_exact_pid_pgid_and_zombie_status() {
+        let leader = 4_242;
+        let member = 4_243;
+        let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+        info.pbi_pid = member as u32;
+        info.pbi_pgid = leader as u32;
+        info.pbi_status = libc::SZOMB;
+
+        assert!(bsd_info_is_exact_zombie_group_member(
+            leader, member, &info,
+        ));
+        info.pbi_status = libc::SRUN;
+        assert!(!bsd_info_is_exact_zombie_group_member(
+            leader, member, &info,
+        ));
+        info.pbi_status = libc::SZOMB;
+        info.pbi_pid += 1;
+        assert!(!bsd_info_is_exact_zombie_group_member(
+            leader, member, &info,
+        ));
+        info.pbi_pid = member as u32;
+        info.pbi_pgid += 1;
+        assert!(!bsd_info_is_exact_zombie_group_member(
+            leader, member, &info,
+        ));
+
+        assert!(same_member_set(&[leader, member], &[member, leader]));
+        assert!(!same_member_set(&[leader], &[leader, member]));
+        assert!(!same_member_set(&[leader, member], &[leader, member + 1]));
+        assert!(!same_member_set(&[leader, leader], &[leader, member]));
+        assert!(member_snapshot_is_unique_and_safe(&[leader, member]));
+        assert!(!member_snapshot_is_unique_and_safe(&[leader, leader]));
+        assert!(!member_snapshot_is_unique_and_safe(&[0, leader]));
     }
 
     #[test]

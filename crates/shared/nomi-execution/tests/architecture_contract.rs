@@ -584,6 +584,29 @@ fn bootstrap_creates_one_supervisor_and_shares_it_with_all_command_tools() {
 }
 
 #[test]
+fn native_exec_tools_are_registered_before_mcp_collision_snapshot() {
+    let bootstrap = without_whitespace(&production_source(
+        "crates/agent/nomi-agent/src/bootstrap.rs",
+    ));
+    let snapshot = bootstrap
+        .find("letbuiltin_names:Vec<String>=registry.tool_names();")
+        .expect("bootstrap must snapshot builtin names before MCP registration");
+
+    for native in [
+        "nomi_tools::exec_command::ExecCommandTool::new(",
+        "nomi_tools::write_stdin::WriteStdinTool::new(",
+    ] {
+        let registration = bootstrap
+            .find(native)
+            .unwrap_or_else(|| panic!("missing native registration: {native}"));
+        assert!(
+            registration < snapshot,
+            "{native} must be included in the MCP collision snapshot"
+        );
+    }
+}
+
+#[test]
 fn legacy_pty_modules_and_portable_pty_are_test_only() {
     let lib_path = "crates/agent/nomi-tools/src/lib.rs";
     let complete_lib = without_whitespace(&rust_code_mask(&read_workspace(lib_path)));

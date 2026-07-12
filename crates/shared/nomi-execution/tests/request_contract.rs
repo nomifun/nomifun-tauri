@@ -35,7 +35,10 @@ fn relative_cwd_is_anchored_and_validated() {
     let mut req = request(PathBuf::from("child"));
     req.capability = CapabilityPolicy::local_owner(root.path().to_path_buf());
     let normalized = normalize_request(req, root.path()).unwrap();
-    assert_eq!(normalized.cwd, root.path().join("child"));
+    assert_eq!(
+        normalized.cwd,
+        root.path().join("child").canonicalize().unwrap()
+    );
 }
 
 #[test]
@@ -68,7 +71,7 @@ fn capability_roots_are_canonicalized() {
 
     assert_eq!(
         normalized.capability.cwd_roots,
-        vec![root.path().to_path_buf()]
+        vec![root.path().canonicalize().unwrap()]
     );
 }
 
@@ -220,6 +223,7 @@ fn outcome_variants_preserve_process_facts() {
                 started_at: now,
                 last_activity_at: now,
             },
+            output: snapshot(),
             cleanup: cleanup(),
         },
     ];

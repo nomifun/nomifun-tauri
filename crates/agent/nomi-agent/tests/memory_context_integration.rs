@@ -5,7 +5,11 @@
 
 use std::fs;
 
-use nomi_agent::context::{SystemPromptCache, build_system_prompt};
+use nomi_agent::{
+    agents_md::resolve_agents_md,
+    context::{SystemPromptCache, build_system_prompt},
+};
+use nomi_config::config::ProjectInstructionsConfig;
 
 // ---------------------------------------------------------------------------
 // TC-7.1: With memory_dir, system prompt includes memory content
@@ -135,8 +139,13 @@ fn tc_7_3_section_ordering() {
         skill_root: None,
     };
 
+    // Runtime bootstrap resolves project instructions once and installs the
+    // immutable snapshot into the session prompt cache.
+    let snapshot = resolve_agents_md(cwd, &ProjectInstructionsConfig::default());
+    let mut cache = SystemPromptCache::new();
+    cache.set_agents_md(snapshot.formatted);
     let result = build_system_prompt(
-        &mut SystemPromptCache::new(),
+        &mut cache,
         None,
         &cwd.to_string_lossy(),
         "test-model",

@@ -1977,6 +1977,21 @@ fn command_argv(spec: &CommandSpec) -> Result<(OsString, Vec<OsString>), Executi
             ],
         )),
         CommandSpec::Shell {
+            shell: ShellKind::PowerShellLiteral,
+            script,
+        } => Ok((
+            powershell_executable()?,
+            vec![
+                OsString::from("-NoLogo"),
+                OsString::from("-NoProfile"),
+                OsString::from("-NonInteractive"),
+                OsString::from("-ExecutionPolicy"),
+                OsString::from("Bypass"),
+                OsString::from("-Command"),
+                OsString::from(script),
+            ],
+        )),
+        CommandSpec::Shell {
             shell: ShellKind::Posix,
             ..
         } => Err(invalid_command(
@@ -2827,6 +2842,19 @@ mod tests {
             .expect("valid command line should encode")),
             r#""C:\Program Files\helper.exe" "a\\\"b" """#
         );
+    }
+
+    #[test]
+    fn literal_powershell_kind_does_not_rewrite_script_source() {
+        let script = "param($Name)\n#requires -Version 5\nWrite-Output $Name";
+        let (_, args) = command_argv(&CommandSpec::Shell {
+            shell: ShellKind::PowerShellLiteral,
+            script: script.to_owned(),
+        })
+        .expect("trusted PowerShell should resolve");
+
+        assert_eq!(args.last(), Some(&OsString::from(script)));
+        assert!(!args.last().unwrap().to_string_lossy().contains("ErrorActionPreference"));
     }
 
     #[test]

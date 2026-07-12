@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -11,6 +12,7 @@ use nomi_types::tool::{JsonSchema, ToolImage, ToolResult};
 
 use crate::Tool;
 use crate::file_cache::{FileStateCache, file_mtime_ms};
+use crate::output_truncation::{TruncationBudget, truncate_middle};
 
 /// Stub returned when a file has not changed since the model last read it.
 /// Saves tokens by avoiding re-sending identical content.
@@ -21,6 +23,28 @@ const FILE_UNCHANGED_STUB: &str = "File unchanged since last read. The content f
 /// Image read returns the bytes to the LLM as a ToolImage instead of the
 /// "(binary file)" stub. Capped so a huge image cannot blow up the request.
 const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
+/// A batch may contain several image paths, but it must not multiply the
+/// single-file multimodal payload bound. This is the padded base64 size of one
+/// maximum-size image.
+const MAX_BATCH_IMAGE_DATA_BYTES: usize = MAX_IMAGE_BYTES.div_ceil(3) * 4;
+
+/// Amazon Bedrock Converse, the strictest supported provider, accepts at most
+/// 20 images in one request.
+const MAX_BATCH_IMAGES: usize = 20;
+
+/// Keep a single model-visible Read invocation bounded while still covering
+/// the common "inspect a known set of source files" case.
+const MAX_BATCH_FILES: usize = 32;
+
+/// Batch sections share the same result budget advertised by `ReadTool`.
+const MAX_RESULT_BYTES: usize = 100_000;
+
+#[derive(Clone, Copy)]
+struct BatchImageBudget {
+    data_bytes: usize,
+    slots: usize,
+}
 
 /// MIME type for image extensions the LLM API accepts as image content blocks
 /// (jpeg/png/gif/webp). bmp/tiff keep the binary stub; svg is text and is read
@@ -36,6 +60,7 @@ fn image_media_type(path: &str) -> Option<&'static str> {
     }
 }
 
+#[derive(Clone)]
 pub struct ReadTool {
     file_cache: Option<Arc<RwLock<FileStateCache>>>,
     /// Session working directory used to resolve relative `file_path` inputs
@@ -54,69 +79,65 @@ impl ReadTool {
     pub fn new(file_cache: Option<Arc<RwLock<FileStateCache>>>, cwd: Option<PathBuf>) -> Self {
         Self { file_cache, cwd }
     }
-}
 
-#[async_trait]
-impl Tool for ReadTool {
-    fn name(&self) -> &str {
-        "Read"
+    fn requested_paths(input: &Value) -> Result<Vec<String>, String> {
+        let has_single = input.get("file_path").is_some();
+        let has_batch = input.get("file_paths").is_some();
+        if has_single == has_batch {
+            return Err("Provide exactly one of file_path or file_paths".to_string());
+        }
+
+        if has_single {
+            let path = input
+                .get("file_path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "file_path must be a string".to_string())?;
+            return Ok(vec![path.to_string()]);
+        }
+
+        let paths = input
+            .get("file_paths")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "file_paths must be an array of strings".to_string())?;
+        if paths.is_empty() {
+            return Err("file_paths must contain at least one path".to_string());
+        }
+        if paths.len() > MAX_BATCH_FILES {
+            return Err(format!(
+                "file_paths accepts at most {MAX_BATCH_FILES} paths per Read call"
+            ));
+        }
+
+        let mut seen = HashSet::with_capacity(paths.len());
+        let mut requested = Vec::with_capacity(paths.len());
+        for path in paths {
+            let path = path
+                .as_str()
+                .ok_or_else(|| "every file_paths entry must be a string".to_string())?;
+            if seen.insert(path.to_string()) {
+                requested.push(path.to_string());
+            }
+        }
+        Ok(requested)
     }
 
-    fn description(&self) -> &str {
-        "Reads a file from the local filesystem. Returns content with line numbers.\n\n\
-         Usage:\n\
-         - Prefer an absolute path for file_path; a relative path is resolved against the session working directory.\n\
-         - By default, it reads the entire file. Use offset and limit for partial reads on large files.\n\
-         - Results are returned with line numbers (1-based) followed by a tab and the line content.\n\
-         - Image files (jpg/png/gif/webp) are returned as viewable images. Other binary files return \"(binary file, N bytes)\".\n\
-         - This tool can only read files, not directories. To list a directory, use Bash with ls."
-    }
-
-    fn input_schema(&self) -> JsonSchema {
-        json!({
-            "type": "object",
-            "properties": {
-                "file_path": {
-                    "type": "string",
-                    "description": "Path to the file to read (absolute preferred; a relative path resolves against the session working directory)"
-                },
-                "offset": {
-                    "type": "integer",
-                    "description": "Line number to start reading from (0-based)"
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of lines to read"
-                }
-            },
-            "required": ["file_path"]
-        })
-    }
-
-    fn is_concurrency_safe(&self, _input: &Value) -> bool {
-        true
-    }
-
-    async fn execute(&self, input: Value) -> ToolResult {
-        let Some(raw_path) = input["file_path"].as_str() else {
-            return ToolResult {
-                content: "Missing required parameter: file_path".to_string(),
-                is_error: true,
-                images: Vec::new(),
-            };
-        };
-
+    fn read_one(
+        &self,
+        raw_path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+        batch_image_budget: Option<BatchImageBudget>,
+    ) -> ToolResult {
         // Relative paths resolve against the session working directory when one
         // was injected (matching Grep/Glob/Bash). Everything below — including
         // the cache key — uses the resolved path so dedup stays consistent.
         let resolved: String = match &self.cwd {
-            Some(cwd) if !Path::new(raw_path).is_absolute() => cwd.join(raw_path).to_string_lossy().into_owned(),
+            Some(cwd) if !Path::new(raw_path).is_absolute() => {
+                cwd.join(raw_path).to_string_lossy().into_owned()
+            }
             _ => raw_path.to_owned(),
         };
         let file_path = resolved.as_str();
-
-        let offset = input["offset"].as_u64().map(|v| v as usize);
-        let limit = input["limit"].as_u64().map(|v| v as usize);
 
         // Get file mtime for dedup and cache.
         let mtime_ms = file_mtime_ms(Path::new(file_path));
@@ -163,6 +184,28 @@ impl Tool for ReadTool {
                     images: Vec::new(),
                 };
             }
+            let encoded_bytes = content.len().div_ceil(3) * 4;
+            if let Some(budget) = batch_image_budget {
+                let reason = if budget.slots == 0 {
+                    Some(format!("the batch already retained {MAX_BATCH_IMAGES} images"))
+                } else if encoded_bytes > budget.data_bytes {
+                    Some(format!(
+                        "the batch image payload would exceed {MAX_BATCH_IMAGE_DATA_BYTES} base64 bytes"
+                    ))
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    return ToolResult {
+                        content: format!(
+                            "(image: {file_path}, {} bytes, {media_type}; attachment omitted before base64 encoding because {reason})",
+                            content.len()
+                        ),
+                        is_error: false,
+                        images: Vec::new(),
+                    };
+                }
+            }
             let data = base64::engine::general_purpose::STANDARD.encode(&content);
             return ToolResult {
                 content: format!("(image: {}, {} bytes, {})", file_path, content.len(), media_type),
@@ -189,7 +232,7 @@ impl Tool for ReadTool {
         let effective_offset = offset.unwrap_or(0);
         let effective_limit = limit.unwrap_or(lines.len());
 
-        let end = (effective_offset + effective_limit).min(lines.len());
+        let end = effective_offset.saturating_add(effective_limit).min(lines.len());
         let slice = &lines[effective_offset.min(lines.len())..end];
 
         let numbered: Vec<String> = slice
@@ -222,8 +265,189 @@ impl Tool for ReadTool {
         }
     }
 
+    fn render_batch_with<F>(paths: &[String], mut read: F) -> ToolResult
+    where
+        F: FnMut(&str, BatchImageBudget) -> ToolResult,
+    {
+        let total = paths.len();
+        let display_paths: Vec<String> = paths
+            .iter()
+            .map(|path| truncate_middle(path, TruncationBudget::Bytes(512)))
+            .collect();
+        let overhead_bytes: usize = display_paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                format!(
+                    "===== FILE {}/{}: {} =====\n\n===== END FILE {}/{} =====\n",
+                    index + 1,
+                    total,
+                    path,
+                    index + 1,
+                    total
+                )
+                .len()
+            })
+            .sum();
+        let body_budget = MAX_RESULT_BYTES
+            .saturating_sub(overhead_bytes)
+            .checked_div(total.max(1))
+            .unwrap_or(0)
+            .saturating_sub(64);
+
+        let mut content = String::with_capacity(MAX_RESULT_BYTES);
+        let mut images = Vec::new();
+        let mut image_data_bytes = 0_usize;
+        let mut is_error = false;
+        for (index, (path, display_path)) in paths.iter().zip(display_paths).enumerate() {
+            let result = read(
+                path,
+                BatchImageBudget {
+                    data_bytes: MAX_BATCH_IMAGE_DATA_BYTES.saturating_sub(image_data_bytes),
+                    slots: MAX_BATCH_IMAGES.saturating_sub(images.len()),
+                },
+            );
+            let ToolResult {
+                content: mut body,
+                is_error: entry_is_error,
+                images: entry_images,
+            } = result;
+            let mut omitted_images = 0_usize;
+            for image in entry_images {
+                let next_bytes = image_data_bytes.saturating_add(image.data.len());
+                if images.len() < MAX_BATCH_IMAGES && next_bytes <= MAX_BATCH_IMAGE_DATA_BYTES {
+                    image_data_bytes = next_bytes;
+                    images.push(image);
+                } else {
+                    omitted_images = omitted_images.saturating_add(1);
+                }
+            }
+            if omitted_images > 0 {
+                body.push_str(&format!(
+                    "\n({omitted_images} image attachment omitted because the batch exceeded {MAX_BATCH_IMAGES} images or {MAX_BATCH_IMAGE_DATA_BYTES} base64 bytes)"
+                ));
+            }
+            if index > 0 {
+                content.push('\n');
+            }
+            content.push_str(&format!(
+                "===== FILE {}/{}: {} =====\n",
+                index + 1,
+                total,
+                display_path
+            ));
+            content.push_str(&truncate_middle(
+                &body,
+                TruncationBudget::Bytes(body_budget),
+            ));
+            content.push_str(&format!(
+                "\n===== END FILE {}/{} =====\n",
+                index + 1,
+                total
+            ));
+            is_error |= entry_is_error;
+        }
+
+        ToolResult {
+            content,
+            is_error,
+            images,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for ReadTool {
+    fn name(&self) -> &str {
+        "Read"
+    }
+
+    fn description(&self) -> &str {
+        "Reads one or more files from the local filesystem. Returns content with line numbers.\n\n\
+         Usage:\n\
+         - Use file_path for one file, or file_paths for several already-known files that need the same slice.\n\
+         - Prefer absolute paths; relative paths are resolved against the session working directory.\n\
+         - By default, it reads the entire file. Use offset and limit for partial reads on large files.\n\
+         - Results are returned with line numbers (1-based) followed by a tab and the line content.\n\
+         - Image files (jpg/png/gif/webp) are returned as viewable images. Other binary files return \"(binary file, N bytes)\".\n\
+         - This tool can only read files, not directories. To list a directory, use Bash with ls."
+    }
+
+    fn input_schema(&self) -> JsonSchema {
+        json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to the file to read (absolute preferred; a relative path resolves against the session working directory)"
+                },
+                "file_paths": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_BATCH_FILES,
+                    "items": { "type": "string" },
+                    "description": "Paths to read in one call, preserving first-seen order (absolute preferred; relative paths resolve against the session working directory)"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Line number to start reading from (0-based)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of lines to read"
+                }
+            },
+            "oneOf": [
+                {
+                    "required": ["file_path"],
+                    "not": { "required": ["file_paths"] }
+                },
+                {
+                    "required": ["file_paths"],
+                    "not": { "required": ["file_path"] }
+                }
+            ]
+        })
+    }
+
+    fn is_concurrency_safe(&self, _input: &Value) -> bool {
+        true
+    }
+
+    async fn execute(&self, input: Value) -> ToolResult {
+        let offset = input["offset"].as_u64().map(|v| v as usize);
+        let limit = input["limit"].as_u64().map(|v| v as usize);
+
+        let paths = match Self::requested_paths(&input) {
+            Ok(paths) => paths,
+            Err(content) => {
+                return ToolResult {
+                    content,
+                    is_error: true,
+                    images: Vec::new(),
+                };
+            }
+        };
+
+        let single = paths.len() == 1 && input.get("file_path").is_some();
+        let worker = self.clone();
+        match tokio::task::spawn_blocking(move || {
+            if single {
+                return worker.read_one(&paths[0], offset, limit, None);
+            }
+            Self::render_batch_with(&paths, |path, image_budget| {
+                worker.read_one(path, offset, limit, Some(image_budget))
+            })
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => ToolResult::error(format!("Read worker failed: {error}")),
+        }
+    }
+
     fn max_result_size(&self) -> usize {
-        100_000
+        MAX_RESULT_BYTES
     }
 
     fn category(&self) -> ToolCategory {
@@ -231,6 +455,9 @@ impl Tool for ReadTool {
     }
 
     fn describe(&self, input: &Value) -> String {
+        if let Some(paths) = input.get("file_paths").and_then(Value::as_array) {
+            return format!("Read {} files", paths.len());
+        }
         let path = input
             .get("file_path")
             .and_then(|v| v.as_str())
@@ -595,5 +822,170 @@ mod tests {
         let r2 = tool.execute(json!({ "file_path": abs.to_str().unwrap() })).await;
         assert!(!r2.is_error);
         assert_eq!(r2.content, FILE_UNCHANGED_STUB);
+    }
+
+    // -- Batched reads --
+
+    #[tokio::test]
+    async fn batch_reads_known_files_and_populates_shared_cache() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        std::fs::write(&first, "alpha\n").unwrap();
+        std::fs::write(&second, "beta\n").unwrap();
+
+        let cache = make_cache();
+        let tool = ReadTool::new(Some(cache.clone()), None);
+        let result = tool
+            .execute(json!({
+                "file_paths": [first.to_str().unwrap(), second.to_str().unwrap()]
+            }))
+            .await;
+
+        assert!(!result.is_error, "unexpected error: {}", result.content);
+        assert!(result.content.contains(first.to_str().unwrap()));
+        assert!(result.content.contains(second.to_str().unwrap()));
+        assert!(result.content.contains("alpha"));
+        assert!(result.content.contains("beta"));
+
+        let mut cache = cache.write().unwrap();
+        assert!(cache.get(&first).is_some(), "first file must be cached");
+        assert!(cache.get(&second).is_some(), "second file must be cached");
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_empty_oversized_and_mixed_path_inputs() {
+        let tool = ReadTool::new(None, None);
+
+        let empty = tool.execute(json!({ "file_paths": [] })).await;
+        assert!(empty.is_error);
+        assert!(empty.content.contains("at least one"));
+
+        let oversized: Vec<String> = (0..=MAX_BATCH_FILES)
+            .map(|index| format!("file-{index}.txt"))
+            .collect();
+        let oversized = tool.execute(json!({ "file_paths": oversized })).await;
+        assert!(oversized.is_error);
+        assert!(oversized.content.contains(&MAX_BATCH_FILES.to_string()));
+
+        let mixed = tool
+            .execute(json!({
+                "file_path": "one.txt",
+                "file_paths": ["two.txt"]
+            }))
+            .await;
+        assert!(mixed.is_error);
+        assert!(mixed.content.contains("exactly one"));
+    }
+
+    #[tokio::test]
+    async fn batch_deduplicates_paths_in_first_seen_order() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        std::fs::write(&first, "alpha\n").unwrap();
+        std::fs::write(&second, "beta\n").unwrap();
+
+        let tool = ReadTool::new(None, None);
+        let result = tool
+            .execute(json!({
+                "file_paths": [
+                    first.to_str().unwrap(),
+                    second.to_str().unwrap(),
+                    first.to_str().unwrap()
+                ]
+            }))
+            .await;
+
+        assert!(!result.is_error, "unexpected error: {}", result.content);
+        assert_eq!(result.content.matches("===== FILE ").count(), 2);
+        assert!(
+            result.content.find(first.to_str().unwrap())
+                < result.content.find(second.to_str().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_reports_missing_member_without_discarding_successes() {
+        let dir = tempdir().unwrap();
+        let present = dir.path().join("present.txt");
+        let missing = dir.path().join("missing.txt");
+        std::fs::write(&present, "kept result\n").unwrap();
+
+        let cache = make_cache();
+        let tool = ReadTool::new(Some(cache.clone()), None);
+        let result = tool
+            .execute(json!({
+                "file_paths": [present.to_str().unwrap(), missing.to_str().unwrap()]
+            }))
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("kept result"));
+        assert!(result.content.contains("Failed to read file"));
+
+        let mut cache = cache.write().unwrap();
+        assert!(cache.get(&present).is_some());
+        assert!(cache.get(&missing).is_none());
+    }
+
+    #[test]
+    fn batch_caps_aggregate_image_attachment_payload() {
+        let encoded_single_image_budget = MAX_IMAGE_BYTES.div_ceil(3) * 4;
+        let entries = vec![
+            (
+                "first.png".to_string(),
+                ToolResult {
+                    content: "first image".to_string(),
+                    is_error: false,
+                    images: vec![ToolImage {
+                        media_type: "image/png".to_string(),
+                        data: "a".repeat(encoded_single_image_budget),
+                    }],
+                },
+            ),
+            (
+                "second.png".to_string(),
+                ToolResult {
+                    content: "second image".to_string(),
+                    is_error: false,
+                    images: vec![ToolImage {
+                        media_type: "image/png".to_string(),
+                        data: "b".to_string(),
+                    }],
+                },
+            ),
+        ];
+
+        let paths = entries
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        let mut entries = entries.into_iter();
+        let result = ReadTool::render_batch_with(&paths, |_, _| {
+            entries.next().expect("one result per path").1
+        });
+
+        assert_eq!(result.images.len(), 1);
+        assert!(result.content.contains("attachment omitted"));
+    }
+
+    #[tokio::test]
+    async fn batch_execution_caps_image_count_before_base64_allocation() {
+        let dir = tempdir().unwrap();
+        let paths = (0..=MAX_BATCH_IMAGES)
+            .map(|index| {
+                let path = dir.path().join(format!("tiny-{index}.png"));
+                std::fs::write(&path, [index as u8]).unwrap();
+                path.to_string_lossy().into_owned()
+            })
+            .collect::<Vec<_>>();
+        let tool = ReadTool::new(None, None);
+
+        let result = tool.execute(json!({ "file_paths": paths })).await;
+
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(result.images.len(), MAX_BATCH_IMAGES);
+        assert!(result.content.contains("omitted before base64 encoding"));
     }
 }

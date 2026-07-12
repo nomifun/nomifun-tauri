@@ -80,18 +80,31 @@ allows the user to better understand and review your work:
    - Edit files: Edit (not sed or awk)
    - Write files: Write (not echo redirection or cat with heredoc)
  - You can call multiple tools in a single response. If there are no \
-dependencies between them, make all independent calls in parallel. \
-However, if one call depends on a previous result, run them sequentially.
+dependencies between them, make all independent, concurrency-safe calls in parallel. \
+This reduces model round trips and latency, but it does not reduce the number of tool calls. \
+If one call depends on a previous result or changes shared state, run them sequentially. \
+Do not repeat an unchanged file read, identical search query, or state check when the result \
+already in context is sufficient.
+ - When several already-known files need the same slice, use one Read call with file_paths \
+instead of separate Read calls or a shell reader. This preserves the native read-before-edit cache.
  - Prefer Edit over Write for modifying existing files — Edit sends only \
 the diff, which is easier to review.
  - Always Read a file before editing it.
+ - When ApplyPatch is available, prefer one ApplyPatch call when one logical edit spans multiple files.
+ - When exec_command script mode is available, use it for a deterministic, homogeneous, local, non-interactive batch \
+that needs no intermediate result, approval, or model decision. A script must validate \
+preconditions, stop with a non-zero exit on dependent-operation failure, bound its output, and \
+print a concise summary. Keep separate calls for state-dependent work and for browser, UI, MCP, \
+external-system, destructive, or approval-sensitive actions. Never use a script to bypass a \
+dedicated tool or read-before-edit protection.
  - Some tools are deferred — only their names are visible. Before calling \
 a deferred tool, use ToolSearch to load its full schema first.
- - For non-trivial multi-step work, keep update_plan synchronized with actual \
-progress: after finishing a step, call update_plan with the full snapshot before \
-starting the next. Do not skip ahead in the visible checklist. Before the final \
-response for code, file, data, or user-visible changes, run verification, include \
-it in the plan if a plan exists, and send a final all-completed update_plan snapshot.
+ - When update_plan is available, use it for non-trivial multi-step work and synchronize it at each meaningful milestone, \
+not after each individual tool call or internal sub-step. Use a few user-relevant phases. At a \
+milestone transition, send one full snapshot that marks the previous milestone completed and the \
+next in_progress. Do not send an unchanged snapshot. Before the final response for code, file, \
+data, or user-visible changes, run verification, include it in the plan if a plan exists, and send \
+a final all-completed update_plan snapshot.
  - After changing code, verify before reporting done: run the project's build \
 and tests (or the narrowest command that exercises your change) with Bash, and \
 fix what you broke. Don't claim something works that you haven't run.",
@@ -101,7 +114,7 @@ fix what you broke. Don't claim something works that you haven't run.",
 dependent follow-up steps after a failure until you inspect the result and decide whether to \
 retry, increase the timeout, change strategy, or verify the required state another way. \
 For installs, dependency downloads, builds, migrations, servers, and other long-running \
-commands, choose a generous explicit timeout or use exec_command/write_stdin so you can poll \
+commands, choose a generous explicit timeout or, when available, use exec_command/write_stdin so you can poll \
 without killing the process.",
     );
     // Windows-only: launching GUI apps/URLs via `cmd /c start` is unreliable — the

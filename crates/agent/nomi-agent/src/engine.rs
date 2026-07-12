@@ -12,6 +12,7 @@ use nomi_tools::registry::ToolRegistry;
 use nomi_types::llm::{LlmEvent, LlmRequest};
 use nomi_types::message::{ContentBlock, Message, Role, StopReason, TokenUsage};
 use nomi_types::skill_types::{ContextModifier, PlanModeTransition, effort_to_string};
+use serde_json::Value;
 use tracing::Instrument;
 
 use crate::cache_diagnostics::{CacheBreakDetector, CacheDiagnostic, CacheStats};
@@ -19,7 +20,8 @@ use crate::compact::state::CompactState;
 use crate::compact::{auto, emergency, estimate, micro};
 use crate::confirm::ToolConfirmer;
 use crate::orchestration::{
-    ExecutionControl, execute_tool_calls, execute_tool_calls_with_approval,
+    ExecutionControl, SKIPPED_AFTER_PRIOR_ERROR, execute_tool_calls,
+    execute_tool_calls_with_approval,
 };
 use crate::output::OutputSink;
 use crate::plan::prompt as plan_prompt;
@@ -126,6 +128,155 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// bounds the otherwise-unbounded `None` case. Mirrors Claude Code's ~200-turn
 /// guard. See docs/superpowers/specs/2026-06-21-nomi-agent-overhaul-design.md §5 F0.3.
 const DEFAULT_SAFETY_MAX_TURNS: usize = 200;
+
+/// Strictest image-count limit among the supported message providers. Amazon
+/// Bedrock Converse rejects a request containing more than 20 images.
+const MAX_PROVIDER_REQUEST_IMAGES: usize = 20;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ToolEfficiencyStats {
+    model_turn_attempts: usize,
+    model_turns_with_tools: usize,
+    total_tool_calls: usize,
+    max_calls_in_model_turn: usize,
+    exec_command_script_calls: usize,
+    batch_read_files_requested: usize,
+    error_results: usize,
+    skipped_after_prior_error: usize,
+    cooperative_cancelled: bool,
+}
+
+impl ToolEfficiencyStats {
+    fn observe_model_turn_attempt(&mut self) {
+        self.model_turn_attempts = self.model_turn_attempts.saturating_add(1);
+    }
+
+    fn observe_calls(&mut self, registry: &ToolRegistry, blocks: &[ContentBlock]) {
+        let calls = blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse { name, input, .. } => {
+                    let input = registry
+                        .get(name)
+                        .map(|tool| {
+                            nomi_tools::coerce_input_to_schema(&tool.input_schema(), input.clone())
+                        })
+                        .unwrap_or_else(|| input.clone());
+                    Some((name.as_str(), input))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if calls.is_empty() {
+            return;
+        }
+
+        self.model_turns_with_tools = self.model_turns_with_tools.saturating_add(1);
+        self.total_tool_calls = self.total_tool_calls.saturating_add(calls.len());
+        self.max_calls_in_model_turn = self.max_calls_in_model_turn.max(calls.len());
+        for (name, input) in &calls {
+            if *name == "exec_command" && input.get("script").is_some() {
+                self.exec_command_script_calls =
+                    self.exec_command_script_calls.saturating_add(1);
+            }
+            if *name == "Read"
+                && let Some(paths) = input.get("file_paths").and_then(Value::as_array)
+            {
+                self.batch_read_files_requested = self
+                    .batch_read_files_requested
+                    .saturating_add(paths.len());
+            }
+        }
+    }
+
+    fn observe_cooperative_cancellation(&mut self) {
+        self.cooperative_cancelled = true;
+    }
+
+    fn terminal_dimensions(
+        &self,
+        result: &Result<AgentResult, AgentError>,
+    ) -> (&'static str, &'static str, &'static str, usize) {
+        if self.cooperative_cancelled {
+            let turns = result
+                .as_ref()
+                .map(|result| result.turns)
+                .unwrap_or(self.model_turn_attempts);
+            return ("cancelled", "cancelled", "none", turns);
+        }
+
+        match result {
+            Ok(result) => (
+                "ok",
+                match result.stop_reason {
+                    StopReason::EndTurn => "end_turn",
+                    StopReason::ToolUse => "tool_use",
+                    StopReason::MaxTokens => "max_tokens",
+                    StopReason::MaxTurns => "max_turns",
+                },
+                "none",
+                result.turns,
+            ),
+            Err(error) => (
+                "error",
+                "error",
+                match error {
+                    AgentError::ApiError(_) => "api_error",
+                    AgentError::Provider(_) => "provider_error",
+                    AgentError::UserAborted => "user_aborted",
+                    AgentError::ContextTooLong { .. } => "context_too_long",
+                },
+                self.model_turn_attempts,
+            ),
+        }
+    }
+
+    fn observe_results(&mut self, blocks: &[ContentBlock]) {
+        for block in blocks {
+            let ContentBlock::ToolResult {
+                content, is_error, ..
+            } = block
+            else {
+                continue;
+            };
+            if *is_error {
+                self.error_results = self.error_results.saturating_add(1);
+            }
+            if *is_error && content == SKIPPED_AFTER_PRIOR_ERROR {
+                self.skipped_after_prior_error =
+                    self.skipped_after_prior_error.saturating_add(1);
+            }
+        }
+    }
+
+    fn log(
+        &self,
+        session_id: &str,
+        msg_id: &str,
+        result: &Result<AgentResult, AgentError>,
+    ) {
+        let (terminal, stop_reason, error_kind, agent_turns) =
+            self.terminal_dimensions(result);
+        tracing::info!(
+            target: "nomi_agent::tool_efficiency",
+            session_id,
+            msg_id,
+            agent_turns,
+            stop_reason,
+            terminal,
+            error_kind,
+            model_turn_attempts = self.model_turn_attempts,
+            model_turns_with_tools = self.model_turns_with_tools,
+            tool_calls_total = self.total_tool_calls,
+            max_calls_in_model_turn = self.max_calls_in_model_turn,
+            exec_command_script_calls = self.exec_command_script_calls,
+            batch_read_files_requested = self.batch_read_files_requested,
+            tool_error_results = self.error_results,
+            skipped_after_prior_error = self.skipped_after_prior_error,
+            "agent tool efficiency summary"
+        );
+    }
+}
 
 /// Consecutive turns with the identical tool-call signature that trip the
 /// stagnation nudge. 3 is already a degenerate loop (same action, same args,
@@ -659,7 +810,14 @@ impl AgentEngine {
             session_id = %session_id,
             msg_id = %msg_id,
         );
-        self.run_inner(user_input, msg_id).instrument(span).await
+        let mut efficiency = ToolEfficiencyStats::default();
+        async {
+            let result = self.run_inner(user_input, msg_id, &mut efficiency).await;
+            efficiency.log(&session_id, msg_id, &result);
+            result
+        }
+        .instrument(span)
+        .await
     }
 
     /// Return metadata for all registered slash commands.
@@ -675,6 +833,7 @@ impl AgentEngine {
         &mut self,
         user_input: &str,
         msg_id: &str,
+        efficiency: &mut ToolEfficiencyStats,
     ) -> Result<AgentResult, AgentError> {
         // Slash command interception — before any LLM call
         if let Some(result) = self.handle_command(user_input).await {
@@ -732,6 +891,7 @@ impl AgentEngine {
             if let Some(token) = &self.cancel_token
                 && token.is_cancelled()
             {
+                efficiency.observe_cooperative_cancellation();
                 self.save_session();
                 return Ok(AgentResult {
                     text: String::new(),
@@ -740,6 +900,12 @@ impl AgentEngine {
                     turns: turn,
                 });
             }
+
+            // Enforce the per-request provider ceiling on preloaded/resumed
+            // history as well as newly appended tool results. This must happen
+            // before compaction because autocompaction can itself call the
+            // provider with the current conversation.
+            self.prune_old_tool_images();
 
             // Pre-send token estimate (§3.1): feed the CURRENT message size into
             // the compaction watermark so a turn that grew large (a big tool
@@ -806,6 +972,7 @@ impl AgentEngine {
                 reasoning_effort: self.current_reasoning_effort.clone(),
             };
 
+            efficiency.observe_model_turn_attempt();
             let stream_start = std::time::Instant::now();
             let mut rx = self.provider.stream(&request).await?;
             let mut assistant_text = String::new();
@@ -932,16 +1099,19 @@ impl AgentEngine {
                         turn_usage = usage;
                     }
                     LlmEvent::Error(e) => {
+                        efficiency.observe_calls(&self.tools, &tool_calls);
                         return Err(AgentError::ApiError(e));
                     }
                 }
             }
 
+            efficiency.observe_calls(&self.tools, &tool_calls);
             if cancelled_midstream {
                 // Cooperative cancel while awaiting the model stream: stop before
                 // pushing this turn's assistant message so self.messages stays
                 // consistent (no dangling tool_use). The host maps this to a
                 // Finish(Cancelled) terminal event via the token. (Phase 0 F0.4)
+                efficiency.observe_cooperative_cancellation();
                 self.save_session();
                 return Ok(AgentResult {
                     text: assistant_text,
@@ -1097,6 +1267,7 @@ impl AgentEngine {
                     }
                 }
             };
+            efficiency.observe_results(&outcome.results);
 
             // Apply any context modifiers from skill executions before the next turn
             self.apply_context_modifiers(&outcome.modifiers);
@@ -1173,20 +1344,34 @@ impl AgentEngine {
         }
     }
 
-    /// Strip images from all but the most recent `max_recent_images`
-    /// image-bearing tool results. Keeps request tokens and session files
-    /// bounded; the text part of each result is preserved.
+    /// Keep at most `max_recent_images` individual images, additionally bounded
+    /// by the strictest supported provider request limit. The text part of each
+    /// result is preserved.
     fn prune_old_tool_images(&mut self) {
-        let mut keep = self.max_recent_images;
+        let mut keep = self.max_recent_images.min(MAX_PROVIDER_REQUEST_IMAGES);
         for msg in self.messages.iter_mut().rev() {
             for block in msg.content.iter_mut().rev() {
-                if let ContentBlock::ToolResult { images, .. } = block
+                if let ContentBlock::ToolResult {
+                    content, images, ..
+                } = block
                     && !images.is_empty()
                 {
-                    if keep > 0 {
-                        keep -= 1;
-                    } else {
+                    if keep == 0 {
+                        let removed = images.len();
                         images.clear();
+                        content.push_str(&format!(
+                            "\n({removed} image attachment(s) from this tool result were omitted by the recent-image/provider request limit.)"
+                        ));
+                    } else if images.len() > keep {
+                        let retained = keep;
+                        let removed = images.len() - retained;
+                        images.truncate(keep);
+                        keep = 0;
+                        content.push_str(&format!(
+                            "\n(Only the first {retained} image attachment(s) in this tool result remain; {removed} later attachment(s) were omitted by the recent-image/provider request limit.)"
+                        ));
+                    } else {
+                        keep -= images.len();
                     }
                 }
             }
@@ -2287,13 +2472,14 @@ mod phase6_tests {
 
 #[cfg(test)]
 mod compact_tests {
+    use super::MAX_PROVIDER_REQUEST_IMAGES;
     use std::sync::{Arc, Mutex};
 
     use nomi_config::compact::CompactConfig;
     use nomi_providers::{LlmProvider, ProviderError};
     use nomi_tools::registry::ToolRegistry;
     use nomi_types::llm::{LlmEvent, LlmRequest};
-    use nomi_types::message::{ContentBlock, Message, Role};
+    use nomi_types::message::{ContentBlock, Message, Role, StopReason};
     use serde_json::json;
 
     use crate::compact::state::CompactState;
@@ -2343,6 +2529,31 @@ mod compact_tests {
             _: &LlmRequest,
         ) -> Result<tokio::sync::mpsc::Receiver<LlmEvent>, ProviderError> {
             let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            Ok(rx)
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingProvider {
+        request_image_counts: Mutex<Vec<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for RecordingProvider {
+        async fn stream(
+            &self,
+            request: &LlmRequest,
+        ) -> Result<tokio::sync::mpsc::Receiver<LlmEvent>, ProviderError> {
+            self.request_image_counts
+                .lock()
+                .unwrap()
+                .push(count_images(&request.messages));
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            tx.try_send(LlmEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: Default::default(),
+            })
+            .unwrap();
             Ok(rx)
         }
     }
@@ -2490,7 +2701,8 @@ mod compact_tests {
         for (i, msg) in engine.messages.iter().enumerate() {
             if let ContentBlock::ToolResult { images, content, .. } = &msg.content[0] {
                 assert_eq!(images.is_empty(), i < 2, "msg {i}");
-                assert_eq!(content, "screenshot");
+                assert!(content.starts_with("screenshot"));
+                assert_eq!(content.contains("attachment(s)"), i < 2);
             }
         }
     }
@@ -2505,6 +2717,57 @@ mod compact_tests {
         engine.max_recent_images = 3;
         engine.prune_old_tool_images();
         assert_eq!(count_images(&engine.messages), 1);
+    }
+
+    #[test]
+    fn prune_old_tool_images_counts_images_inside_one_result() {
+        let mut message = tool_result_msg_with_image("batch");
+        let ContentBlock::ToolResult { images, .. } = &mut message.content[0] else {
+            unreachable!();
+        };
+        let image = images[0].clone();
+        images.resize(25, image);
+        let mut engine = make_compact_engine(
+            CompactConfig::default(),
+            CompactState::new(),
+            vec![message],
+        );
+        engine.max_recent_images = 100;
+
+        engine.prune_old_tool_images();
+
+        assert_eq!(count_images(&engine.messages), MAX_PROVIDER_REQUEST_IMAGES);
+        let ContentBlock::ToolResult { content, .. } = &engine.messages[0].content[0] else {
+            unreachable!();
+        };
+        assert!(content.contains("5 later attachment(s) were omitted"));
+    }
+
+    #[tokio::test]
+    async fn first_request_prunes_images_from_preloaded_or_resumed_history() {
+        let mut message = tool_result_msg_with_image("legacy-batch");
+        let ContentBlock::ToolResult { images, .. } = &mut message.content[0] else {
+            unreachable!();
+        };
+        let image = images[0].clone();
+        images.resize(25, image);
+
+        let provider = Arc::new(RecordingProvider::default());
+        let mut engine = make_compact_engine(
+            CompactConfig::default(),
+            CompactState::new(),
+            vec![message],
+        );
+        engine.provider = provider.clone();
+        engine.max_recent_images = 100;
+
+        engine.run("continue", "resume-image-limit").await.unwrap();
+
+        assert_eq!(
+            *provider.request_image_counts.lock().unwrap(),
+            vec![MAX_PROVIDER_REQUEST_IMAGES]
+        );
+        assert_eq!(count_images(&engine.messages), MAX_PROVIDER_REQUEST_IMAGES);
     }
 
     #[test]
@@ -3269,5 +3532,138 @@ mod transcript_tests {
         let cut = truncate_chars(&long, 600);
         assert!(cut.contains("(truncated)"));
         assert!(cut.chars().count() < 700);
+    }
+}
+
+#[cfg(test)]
+mod tool_efficiency_tests {
+    use super::{AgentResult, ToolEfficiencyStats};
+    use crate::orchestration::SKIPPED_AFTER_PRIOR_ERROR;
+    use nomi_execution::{CapabilityPolicy, ProcessSupervisor, SupervisorConfig};
+    use nomi_tools::{
+        exec_command::ExecCommandTool, process_store::ProcessStore, read::ReadTool,
+        registry::ToolRegistry,
+    };
+    use nomi_types::message::ContentBlock;
+    use nomi_types::message::{StopReason, TokenUsage};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn efficiency_registry() -> ToolRegistry {
+        let cwd = std::env::current_dir().expect("current directory");
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ReadTool::new(None, Some(cwd.clone()))));
+        registry.register(Box::new(ExecCommandTool::new(
+            ProcessSupervisor::new(SupervisorConfig::default()),
+            Arc::new(ProcessStore::new()),
+            cwd.clone(),
+            CapabilityPolicy::local_owner(cwd),
+        )));
+        registry
+    }
+
+    #[test]
+    fn accounting_distinguishes_parallel_width_scripts_and_batch_reads() {
+        let calls = vec![
+            ContentBlock::ToolUse {
+                id: "exec".into(),
+                name: "exec_command".into(),
+                input: json!({ "script": "print('x')", "language": "python", "timeout": 1000 }),
+                extra: None,
+            },
+            ContentBlock::ToolUse {
+                id: "read".into(),
+                name: "Read".into(),
+                input: json!({ "file_paths": ["a", "b", "c"] }),
+                extra: None,
+            },
+            ContentBlock::ToolUse {
+                id: "grep".into(),
+                name: "Grep".into(),
+                input: json!({ "pattern": "needle" }),
+                extra: None,
+            },
+        ];
+        let mut stats = ToolEfficiencyStats::default();
+        let registry = efficiency_registry();
+
+        stats.observe_model_turn_attempt();
+        stats.observe_model_turn_attempt();
+        stats.observe_calls(&registry, &calls);
+        stats.observe_calls(&registry, &calls[..1]);
+
+        assert_eq!(stats.model_turn_attempts, 2);
+        assert_eq!(stats.model_turns_with_tools, 2);
+        assert_eq!(stats.total_tool_calls, 4);
+        assert_eq!(stats.max_calls_in_model_turn, 3);
+        assert_eq!(stats.exec_command_script_calls, 2);
+        assert_eq!(stats.batch_read_files_requested, 3);
+    }
+
+    #[test]
+    fn accounting_uses_the_same_schema_coercion_as_execution() {
+        let calls = vec![
+            ContentBlock::ToolUse {
+                id: "exec".into(),
+                name: "exec_command".into(),
+                input: serde_json::Value::String(
+                    r#"{"script":"print(1)","language":"python","timeout":1000}"#.into(),
+                ),
+                extra: None,
+            },
+            ContentBlock::ToolUse {
+                id: "read".into(),
+                name: "Read".into(),
+                input: json!({ "file_paths": "[\"a\",\"b\"]" }),
+                extra: None,
+            },
+        ];
+        let mut stats = ToolEfficiencyStats::default();
+
+        stats.observe_calls(&efficiency_registry(), &calls);
+
+        assert_eq!(stats.exec_command_script_calls, 1);
+        assert_eq!(stats.batch_read_files_requested, 2);
+    }
+
+    #[test]
+    fn cooperative_cancel_has_a_distinct_terminal_classification() {
+        let mut stats = ToolEfficiencyStats::default();
+        stats.observe_cooperative_cancellation();
+        let result = Ok(AgentResult {
+            text: String::new(),
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage::default(),
+            turns: 2,
+        });
+
+        assert_eq!(
+            stats.terminal_dimensions(&result),
+            ("cancelled", "cancelled", "none", 2)
+        );
+    }
+
+    #[test]
+    fn accounting_counts_errors_and_prior_error_skips() {
+        let results = vec![
+            ContentBlock::ToolResult {
+                tool_use_id: "failed".into(),
+                content: "boom".into(),
+                is_error: true,
+                images: vec![],
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "skipped".into(),
+                content: SKIPPED_AFTER_PRIOR_ERROR.into(),
+                is_error: true,
+                images: vec![],
+            },
+        ];
+        let mut stats = ToolEfficiencyStats::default();
+
+        stats.observe_results(&results);
+
+        assert_eq!(stats.error_results, 2);
+        assert_eq!(stats.skipped_after_prior_error, 1);
     }
 }

@@ -129,7 +129,13 @@ enum TerminalKind {
     Cancelled {
         output: FrozenOutput,
     },
-    Lost(ProcessSnapshot),
+    TimedOut {
+        output: FrozenOutput,
+    },
+    Lost {
+        last_known: ProcessSnapshot,
+        output: FrozenOutput,
+    },
 }
 
 enum StopStart {
@@ -153,6 +159,12 @@ enum SignalStage {
     Interrupt,
     Terminate,
     ForceKill,
+}
+
+#[derive(Clone, Copy)]
+enum StopCause {
+    Cancelled,
+    TimedOut,
 }
 
 struct StopBudget {
@@ -270,13 +282,16 @@ impl ProcessSupervisor {
             lease,
             started_at,
         );
-        start_waiter(session);
+        start_waiter(Arc::clone(&session));
         match commit {
-            CommitResult::Active => Ok(ExecutionHandle {
-                owner,
-                session_id,
-                started_at,
-            }),
+            CommitResult::Active => {
+                start_execution_deadline(session);
+                Ok(ExecutionHandle {
+                    owner,
+                    session_id,
+                    started_at,
+                })
+            }
             CommitResult::Retiring(retirement) => {
                 self.start_retirement(retirement.clone());
                 let _ = retirement.wait_outcome().await;
@@ -500,6 +515,7 @@ impl ProcessSupervisor {
             session,
             &[SignalStage::Terminate, SignalStage::ForceKill],
             request_started_at,
+            StopCause::Cancelled,
         )
         .await)
     }
@@ -520,6 +536,30 @@ impl ProcessSupervisor {
                 SignalStage::ForceKill,
             ],
             request_started_at,
+            StopCause::Cancelled,
+        )
+        .await)
+    }
+
+    /// Stop a session because its hard execution deadline elapsed. Unlike
+    /// `poll`, this records a durable `TimedOut` terminal outcome.
+    pub async fn timeout(
+        &self,
+        owner: &ExecutionOwner,
+        session_id: &SessionId,
+    ) -> Result<ExecutionOutcome, ExecutionError> {
+        let request_started_at = tokio::time::Instant::now();
+        let action = self.session(owner, session_id)?;
+        let session = action.session_arc();
+        Ok(stop_session(
+            session,
+            &[
+                SignalStage::Interrupt,
+                SignalStage::Terminate,
+                SignalStage::ForceKill,
+            ],
+            request_started_at,
+            StopCause::TimedOut,
         )
         .await)
     }
@@ -693,6 +733,7 @@ async fn retire_session(session: Arc<Session>) -> ExecutionOutcome {
             SignalStage::ForceKill,
         ],
         tokio::time::Instant::now(),
+        StopCause::Cancelled,
     )
     .await
 }
@@ -858,7 +899,8 @@ impl Session {
             state.process_state = match &record.kind {
                 TerminalKind::Exited { .. } => ProcessState::Exited,
                 TerminalKind::Cancelled { .. } => ProcessState::Cancelled,
-                TerminalKind::Lost(_) => ProcessState::Lost,
+                TerminalKind::TimedOut { .. } => ProcessState::TimedOut,
+                TerminalKind::Lost { .. } => ProcessState::Lost,
             };
             state.terminal = Some(record.clone());
             record
@@ -900,12 +942,15 @@ impl Session {
         cleanup.errors.push(error.to_owned());
         cleanup.elapsed = cleanup_started_at.elapsed();
         let record = TerminalRecord {
-            kind: TerminalKind::Lost(ProcessSnapshot {
-                pid: self.process.pid(),
-                state: ProcessState::Lost,
-                started_at: self.started_at,
-                last_activity_at,
-            }),
+            kind: TerminalKind::Lost {
+                last_known: ProcessSnapshot {
+                    pid: self.process.pid(),
+                    state: ProcessState::Lost,
+                    started_at: self.started_at,
+                    last_activity_at,
+                },
+                output: self.output.freeze(),
+            },
             cleanup,
         };
         state.process_state = ProcessState::Lost;
@@ -924,7 +969,10 @@ impl Session {
         cleanup.errors.push(error.to_owned());
         cleanup.elapsed = cleanup_started_at.elapsed();
         let record = TerminalRecord {
-            kind: TerminalKind::Lost(lost_snapshot(self)),
+            kind: TerminalKind::Lost {
+                last_known: lost_snapshot(self),
+                output: self.output.freeze(),
+            },
             cleanup,
         };
         self.set_terminal(record)
@@ -932,7 +980,10 @@ impl Session {
 
     fn force_lost(&self, error: String) -> ExecutionOutcome {
         let terminal = self.set_terminal(TerminalRecord {
-            kind: TerminalKind::Lost(lost_snapshot(self)),
+            kind: TerminalKind::Lost {
+                last_known: lost_snapshot(self),
+                output: self.output.freeze(),
+            },
             cleanup: CleanupReport {
                 errors: vec![error],
                 ..CleanupReport::default()
@@ -953,8 +1004,13 @@ impl Session {
                 output: output.snapshot_from(cursor),
                 cleanup: terminal.cleanup.clone(),
             },
-            TerminalKind::Lost(last_known) => ExecutionOutcome::Lost {
+            TerminalKind::TimedOut { output } => ExecutionOutcome::TimedOut {
+                output: output.snapshot_from(cursor),
+                cleanup: terminal.cleanup.clone(),
+            },
+            TerminalKind::Lost { last_known, output } => ExecutionOutcome::Lost {
                 last_known: last_known.clone(),
+                output: output.snapshot_from(cursor),
                 cleanup: terminal.cleanup.clone(),
             },
         }
@@ -1025,7 +1081,8 @@ impl Session {
             state.process_state = match &record.kind {
                 TerminalKind::Exited { .. } => ProcessState::Exited,
                 TerminalKind::Cancelled { .. } => ProcessState::Cancelled,
-                TerminalKind::Lost(_) => ProcessState::Lost,
+                TerminalKind::TimedOut { .. } => ProcessState::TimedOut,
+                TerminalKind::Lost { .. } => ProcessState::Lost,
             };
             state.terminal = Some(record.clone());
             record
@@ -1042,6 +1099,66 @@ impl Session {
 
 fn start_waiter(session: Arc<Session>) {
     start_waiter_attempt(session, 0);
+}
+
+fn start_execution_deadline(session: Arc<Session>) {
+    let Some(deadline) = session.policy.deadline else {
+        return;
+    };
+    let mut lifecycle = session.lifecycle.subscribe();
+    let session = Arc::downgrade(&session);
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::from_std(deadline);
+        let timer = tokio::time::sleep_until(deadline);
+        tokio::pin!(timer);
+        loop {
+            tokio::select! {
+                () = &mut timer => break,
+                changed = lifecycle.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    let Some(active) = session.upgrade() else {
+                        return;
+                    };
+                    if active.terminal().is_some() {
+                        return;
+                    }
+                }
+            }
+        }
+        let Some(session) = session.upgrade() else {
+            return;
+        };
+        let _ = stop_session(
+            session,
+            &[
+                SignalStage::Interrupt,
+                SignalStage::Terminate,
+                SignalStage::ForceKill,
+            ],
+            tokio::time::Instant::now(),
+            StopCause::TimedOut,
+        )
+        .await;
+    });
+}
+
+fn completed_process_kind(
+    session: &Session,
+    fact: ExitFact,
+    observed_at: tokio::time::Instant,
+    output: FrozenOutput,
+) -> TerminalKind {
+    if session
+        .policy
+        .deadline
+        .is_some_and(|deadline| observed_at >= tokio::time::Instant::from_std(deadline))
+    {
+        TerminalKind::TimedOut { output }
+    } else {
+        TerminalKind::Exited { fact, output }
+    }
 }
 
 fn start_waiter_attempt(session: Arc<Session>, attempt: usize) {
@@ -1078,10 +1195,12 @@ fn start_waiter_attempt(session: Arc<Session>, attempt: usize) {
             ExitObservation::Reaped { fact, observed_at } => {
                 tokio::time::sleep_until(observed_at + FINAL_OUTPUT_DRAIN).await;
                 TerminalRecord {
-                    kind: TerminalKind::Exited {
-                        fact: fact.clone(),
-                        output: session.output.freeze(),
-                    },
+                    kind: completed_process_kind(
+                        &session,
+                        fact.clone(),
+                        observed_at,
+                        session.output.freeze(),
+                    ),
                     cleanup: CleanupReport {
                         reaped: true,
                         errors: fact.cleanup_errors,
@@ -1090,7 +1209,10 @@ fn start_waiter_attempt(session: Arc<Session>, attempt: usize) {
                 }
             }
             ExitObservation::WaitFailed { message } => TerminalRecord {
-                kind: TerminalKind::Lost(lost_snapshot(&session)),
+                kind: TerminalKind::Lost {
+                    last_known: lost_snapshot(&session),
+                    output: session.output.freeze(),
+                },
                 cleanup: CleanupReport {
                     errors: vec![format!("wait_reaped: {message}")],
                     ..CleanupReport::default()
@@ -1110,10 +1232,12 @@ async fn finish_observed_exit(
         ExitObservation::Reaped { fact, observed_at } => {
             tokio::time::sleep_until(observed_at + FINAL_OUTPUT_DRAIN).await;
             let natural = TerminalRecord {
-                kind: TerminalKind::Exited {
-                    fact: fact.clone(),
-                    output: session.output.freeze(),
-                },
+                kind: completed_process_kind(
+                    session,
+                    fact.clone(),
+                    observed_at,
+                    session.output.freeze(),
+                ),
                 cleanup: CleanupReport {
                     reaped: true,
                     errors: fact.cleanup_errors,
@@ -1127,7 +1251,10 @@ async fn finish_observed_exit(
         }
         ExitObservation::WaitFailed { message } => {
             let failed = TerminalRecord {
-                kind: TerminalKind::Lost(lost_snapshot(session)),
+                kind: TerminalKind::Lost {
+                    last_known: lost_snapshot(session),
+                    output: session.output.freeze(),
+                },
                 cleanup: CleanupReport {
                     errors: vec![format!("wait_reaped: {message}")],
                     ..CleanupReport::default()
@@ -1146,6 +1273,7 @@ async fn stop_session(
     session: Arc<Session>,
     stages: &[SignalStage],
     request_started_at: tokio::time::Instant,
+    cause: StopCause,
 ) -> ExecutionOutcome {
     if let Some(observation @ ExitObservation::Reaped { .. }) = session.exit_observation() {
         return finish_observed_exit(&session, observation, OutputCursor::START).await;
@@ -1162,7 +1290,7 @@ async fn stop_session(
             let monitor_session = session.clone();
             tokio::spawn(async move {
                 let worker = tokio::spawn(async move {
-                    let _ = run_stop_escalation(&driver_session, &budget).await;
+                    let _ = run_stop_escalation(&driver_session, &budget, cause).await;
                 });
                 if let Err(error) = worker.await {
                     monitor_session.force_lost(format!(
@@ -1176,14 +1304,18 @@ async fn stop_session(
     }
 }
 
-async fn run_stop_escalation(session: &Session, budget: &StopBudget) -> ExecutionOutcome {
+async fn run_stop_escalation(
+    session: &Session,
+    budget: &StopBudget,
+    cause: StopCause,
+) -> ExecutionOutcome {
     let mut cleanup = CleanupReport::default();
     let mut wait_error_recorded = false;
 
     if let Some(observation) = session.exit_observation() {
         match observation {
             ExitObservation::Reaped { fact, observed_at } => {
-                return finish_reaped(session, fact, observed_at, cleanup, budget).await;
+                return finish_reaped(session, fact, observed_at, cleanup, budget, cause).await;
             }
             ExitObservation::WaitFailed { message } => {
                 record_wait_error(&mut cleanup, &mut wait_error_recorded, &message);
@@ -1195,6 +1327,7 @@ async fn run_stop_escalation(session: &Session, budget: &StopBudget) -> Executio
             session,
             cleanup,
             budget,
+            cause,
             "cleanup driver resumed after cleanup deadline without timely reap proof",
         )
         .await;
@@ -1210,6 +1343,7 @@ async fn run_stop_escalation(session: &Session, budget: &StopBudget) -> Executio
                         observed_at,
                         cleanup,
                         budget,
+                        cause,
                     )
                     .await;
                 }
@@ -1253,6 +1387,7 @@ async fn run_stop_escalation(session: &Session, budget: &StopBudget) -> Executio
                         observed_at,
                         cleanup,
                         budget,
+                        cause,
                     )
                     .await;
                 }
@@ -1264,12 +1399,13 @@ async fn run_stop_escalation(session: &Session, budget: &StopBudget) -> Executio
     }
 
     if let Some(ExitObservation::Reaped { fact, observed_at }) = session.exit_observation() {
-        return finish_reaped(session, fact, observed_at, cleanup, budget).await;
+        return finish_reaped(session, fact, observed_at, cleanup, budget, cause).await;
     }
     finish_lost(
         session,
         cleanup,
         budget,
+        cause,
         "process was not proven reaped before cleanup deadline",
     )
     .await
@@ -1281,6 +1417,7 @@ async fn finish_reaped(
     observed_at: tokio::time::Instant,
     mut cleanup: CleanupReport,
     budget: &StopBudget,
+    cause: StopCause,
 ) -> ExecutionOutcome {
     cleanup.errors.extend(fact.cleanup_errors);
     if observed_at > budget.cleanup_deadline {
@@ -1296,9 +1433,11 @@ async fn finish_reaped(
     tokio::time::sleep_until(drain_until).await;
     cleanup.reaped = true;
     cleanup.elapsed = budget.started_at.elapsed();
+    let output = session.output.freeze();
     let terminal = session.set_terminal(TerminalRecord {
-        kind: TerminalKind::Cancelled {
-            output: session.output.freeze(),
+        kind: match cause {
+            StopCause::Cancelled => TerminalKind::Cancelled { output },
+            StopCause::TimedOut => TerminalKind::TimedOut { output },
         },
         cleanup,
     });
@@ -1309,6 +1448,7 @@ async fn finish_lost(
     session: &Session,
     cleanup: CleanupReport,
     budget: &StopBudget,
+    cause: StopCause,
     error: &str,
 ) -> ExecutionOutcome {
     #[cfg(test)]
@@ -1331,7 +1471,7 @@ async fn finish_lost(
             fact,
             observed_at,
             cleanup,
-        } => finish_reaped(session, fact, observed_at, cleanup, budget).await,
+        } => finish_reaped(session, fact, observed_at, cleanup, budget, cause).await,
     }
 }
 
@@ -1794,6 +1934,150 @@ mod tests {
         assert_eq!(snapshot.pid, 4_242);
         assert_eq!(snapshot.state, ProcessState::Running);
         assert_eq!(fake.wait_call_count(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hard_deadline_classifies_a_just_after_deadline_exit_as_timed_out() {
+        let deadline = tokio::time::Instant::now().into_std() + Duration::from_millis(10);
+        let policy = ExecutionPolicy {
+            deadline: Some(deadline),
+            interrupt_grace: Duration::from_millis(20),
+            terminate_grace: Duration::from_millis(20),
+            reap_grace: Duration::from_millis(20),
+            ..ExecutionPolicy::default()
+        };
+        let (supervisor, handle, fake, _output) = register_fake_with_policy(
+            FakeOwner::exits_after(Duration::from_millis(11), 0),
+            policy,
+        )
+        .await;
+
+        wait_for_test_condition(|| fake.wait_call_count() == 1).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(200)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(500)).await;
+        wait_for_test_condition(|| {
+            matches!(
+                supervisor.terminal_outcome_if_ready(
+                    &handle.owner,
+                    &handle.session_id,
+                    OutputCursor::START,
+                ),
+                Ok(Some(_))
+            )
+        })
+        .await;
+        let result = supervisor
+            .poll(
+                &handle.owner,
+                &handle.session_id,
+                OutputCursor::START,
+                Instant::now(),
+            )
+            .await
+            .expect("deadline outcome should remain pollable");
+
+        assert!(matches!(
+            &result,
+            PollResult::Finished(ExecutionOutcome::TimedOut { .. })
+        ), "unexpected deadline result: {result:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pre_deadline_exit_stays_exited_when_final_output_drain_crosses_deadline() {
+        let deadline = tokio::time::Instant::now().into_std() + Duration::from_millis(10);
+        let policy = ExecutionPolicy {
+            deadline: Some(deadline),
+            interrupt_grace: Duration::from_millis(20),
+            terminate_grace: Duration::from_millis(20),
+            reap_grace: Duration::from_millis(20),
+            ..ExecutionPolicy::default()
+        };
+        let (supervisor, handle, fake, _output) = register_fake_with_policy(
+            FakeOwner::exits_after(Duration::from_millis(9), 0),
+            policy,
+        )
+        .await;
+        let session = supervisor
+            .session(&handle.owner, &handle.session_id)
+            .expect("registered session")
+            .session_arc();
+
+        wait_for_test_condition(|| fake.wait_call_count() == 1).await;
+        tokio::time::advance(Duration::from_millis(9)).await;
+        wait_for_test_condition(|| session.exit_observation().is_some()).await;
+        let Some(ExitObservation::Reaped { observed_at, .. }) = session.exit_observation() else {
+            panic!("pre-deadline reap must be observed");
+        };
+        assert!(observed_at < tokio::time::Instant::from_std(deadline));
+        tokio::time::advance(Duration::from_millis(200)).await;
+        wait_for_test_condition(|| {
+            matches!(
+                supervisor.terminal_outcome_if_ready(
+                    &handle.owner,
+                    &handle.session_id,
+                    OutputCursor::START,
+                ),
+                Ok(Some(_))
+            )
+        })
+        .await;
+        let result = supervisor
+            .poll(
+                &handle.owner,
+                &handle.session_id,
+                OutputCursor::START,
+                Instant::now(),
+            )
+            .await
+            .expect("natural outcome should remain pollable");
+
+        assert!(matches!(
+            &result,
+            PollResult::Finished(ExecutionOutcome::Exited { code: Some(0), .. })
+        ), "unexpected pre-deadline result: {result:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_watcher_does_not_retain_an_evicted_terminal_session() {
+        let policy = ExecutionPolicy {
+            deadline: Some(
+                tokio::time::Instant::now().into_std() + Duration::from_secs(3_600),
+            ),
+            ..ExecutionPolicy::default()
+        };
+        let (supervisor, handle, fake, _output) =
+            register_fake_with_policy(FakeOwner::exits_after(Duration::ZERO, 0), policy).await;
+        let session = supervisor
+            .session(&handle.owner, &handle.session_id)
+            .expect("registered session")
+            .session_arc();
+        let weak_session = Arc::downgrade(&session);
+        drop(session);
+
+        wait_for_test_condition(|| fake.wait_call_count() == 1).await;
+        tokio::time::advance(Duration::from_millis(200)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(200)).await;
+        wait_for_test_condition(|| {
+            matches!(
+                supervisor.terminal_outcome_if_ready(
+                    &handle.owner,
+                    &handle.session_id,
+                    OutputCursor::START,
+                ),
+                Ok(Some(_))
+            )
+        })
+        .await;
+
+        assert!(supervisor.registry.evict_oldest_finished());
+        tokio::task::yield_now().await;
+        assert!(
+            weak_session.upgrade().is_none(),
+            "the sleeping deadline watcher retained the evicted session"
+        );
     }
 
     #[tokio::test]
@@ -2864,6 +3148,7 @@ mod tests {
         let ExecutionOutcome::Lost {
             last_known,
             cleanup,
+            ..
         } = outcome
         else {
             panic!("unproven reap must be Lost");
@@ -3015,6 +3300,7 @@ mod tests {
                 super::SignalStage::ForceKill,
             ],
             request_started_at,
+            super::StopCause::Cancelled,
         )
         .await;
 
@@ -3058,7 +3344,12 @@ mod tests {
         assert!(observed_at <= budget.cleanup_deadline);
         tokio::time::advance(Duration::from_millis(1_100)).await;
 
-        let outcome = super::run_stop_escalation(&session, &budget).await;
+        let outcome = super::run_stop_escalation(
+            &session,
+            &budget,
+            super::StopCause::Cancelled,
+        )
+        .await;
         assert!(matches!(outcome, ExecutionOutcome::Cancelled { .. }));
     }
 
@@ -3092,7 +3383,12 @@ mod tests {
         assert!(observed_at > budget.cleanup_deadline);
         tokio::time::advance(Duration::from_millis(999)).await;
 
-        let outcome = super::run_stop_escalation(&session, &budget).await;
+        let outcome = super::run_stop_escalation(
+            &session,
+            &budget,
+            super::StopCause::Cancelled,
+        )
+        .await;
         let ExecutionOutcome::Lost { cleanup, .. } = outcome else {
             panic!("a late recorded reap fact must remain Lost");
         };
@@ -3319,8 +3615,9 @@ mod tests {
         match outcome {
             ExecutionOutcome::Exited { output, .. }
             | ExecutionOutcome::Cancelled { output, .. }
-            | ExecutionOutcome::TimedOut { output, .. } => output,
-            ExecutionOutcome::SpawnFailed(_) | ExecutionOutcome::Lost { .. } => {
+            | ExecutionOutcome::TimedOut { output, .. }
+            | ExecutionOutcome::Lost { output, .. } => output,
+            ExecutionOutcome::SpawnFailed(_) => {
                 panic!("outcome has no output snapshot")
             }
         }

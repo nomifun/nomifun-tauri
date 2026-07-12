@@ -8,9 +8,9 @@ use nomi_types::tool::{JsonSchema, ToolResult};
 use crate::Tool;
 
 const INCOMPLETE_PLAN_REMINDER: &str = "\
-[progress] Plan updated. Keep the visible checklist synchronized with the real work: \
-after each completed step, call update_plan with the full snapshot before moving to the next step. \
-Before final response, run or record verification and mark every step completed; if verification is missing from the plan, add and complete it before finalizing.\n";
+[progress] Plan updated. Send the next full snapshot only when a meaningful milestone changes \
+state, scope changes, a blocker appears, or final verification completes. Before final response, \
+run or record verification and mark every real milestone completed.\n";
 
 const MISSING_VERIFICATION_REMINDER: &str = "\
 [verification] No explicit verification step is present in the completed plan. If this task changed code, files, data, or user-visible behavior, run the narrowest meaningful verification and update the plan before final response.\n";
@@ -84,9 +84,11 @@ impl Tool for UpdatePlanTool {
          This is a stateless full snapshot — send the entire current plan every time, not a diff. \
          There should be exactly one in_progress step until all are completed; mark a step \
          completed before starting the next. Use it for non-trivial multi-step work; do not use \
-         it for simple single-step queries, and do not pad with filler steps. Keep the visible \
-         checklist synchronized with actual work: call update_plan after completing each step, \
-         and before the final response send a full snapshot where every real step is completed. \
+         it for simple single-step queries, and do not pad with filler steps. Each step should be \
+         a meaningful milestone, not an individual tool call or internal sub-step. Do not send an \
+         unchanged snapshot or one that changes only the explanation. At a transition, use one \
+         snapshot that marks the previous milestone completed and the next milestone in_progress. \
+         Before the final response send a full snapshot where every real step is completed. \
          For code/file/user-visible changes, include and complete a verification step before \
          finalizing. After calling it, do not repeat the full plan in your reply — just note \
          what changed and the next step."
@@ -232,6 +234,16 @@ mod tests {
         assert!(item_req.iter().any(|v| v == "status"));
     }
 
+    #[test]
+    fn description_limits_updates_to_material_milestone_transitions() {
+        let tool = UpdatePlanTool::new();
+        let description = tool.description();
+        assert!(description.contains("meaningful milestone"));
+        assert!(description.contains("individual tool call"));
+        assert!(description.contains("unchanged snapshot"));
+        assert!(description.contains("previous milestone completed"));
+    }
+
     #[tokio::test]
     async fn execute_rejects_empty_plan() {
         let r = UpdatePlanTool::new().execute(json!({ "plan": [] })).await;
@@ -287,9 +299,11 @@ mod tests {
             .await;
         assert!(!r.is_error);
         assert!(r.content.contains("[progress]"));
-        assert!(r.content.contains("call update_plan"));
+        assert!(r.content.contains("next full snapshot"));
         assert!(r.content.contains("Before final response"));
         assert!(r.content.contains("verification"));
+        assert!(!r.content.contains("after each completed step"));
+        assert!(r.content.contains("milestone"));
         let start = r.content.find('{').unwrap();
         let v: serde_json::Value = serde_json::from_str(&r.content[start..]).unwrap();
         assert_eq!(v["entries"].as_array().unwrap().len(), 3);

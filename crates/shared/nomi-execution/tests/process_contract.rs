@@ -128,14 +128,25 @@ async fn unix_pipe_preserves_zero_and_nonzero_exit_codes() {
             .await
             .expect("Unix pipe helper should start");
 
+        // A freshly linked Rust helper can spend more than 250 ms in dyld on
+        // current macOS debug builds even though the lifecycle wakeup is
+        // immediate. Keep the bound far below the 30-second poll deadline
+        // without making loader startup part of the process-kernel contract.
+        let quick_exit_bound = if cfg!(target_os = "macos") {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_millis(250)
+        };
         let poll_started = Instant::now();
         let outcome = tokio::time::timeout(
-            Duration::from_millis(250),
+            quick_exit_bound,
             wait_for_terminal(&supervisor, &handle),
         )
         .await
-        .expect("quick natural exit must wake a far-yield poll within 250 ms");
-        assert!(poll_started.elapsed() < Duration::from_millis(250));
+        .unwrap_or_else(|_| {
+            panic!("quick natural exit must wake a far-yield poll within {quick_exit_bound:?}")
+        });
+        assert!(poll_started.elapsed() < quick_exit_bound);
         let ExecutionOutcome::Exited { code, signal, .. } = outcome else {
             panic!("helper exit should produce Exited, got {outcome:?}");
         };
@@ -238,8 +249,12 @@ async fn unix_pipe_round_trips_stdin_and_close_stdin_delivers_eof() {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn macos_seatbelt_program_pipe_allows_only_declared_write_roots() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let outside = tempfile::tempdir().expect("outside");
+    // Darwin's trusted temporary directories are intentionally writable in
+    // the profile. Keep both fixtures beside the checkout so `outside` really
+    // exercises the declared write-root boundary.
+    let fixture_root = std::env::current_dir().expect("current directory");
+    let workspace = tempfile::tempdir_in(&fixture_root).expect("workspace");
+    let outside = tempfile::tempdir_in(&fixture_root).expect("outside");
     let workspace = workspace.path().canonicalize().expect("canonical workspace");
     let outside = outside.path().canonicalize().expect("canonical outside");
     let inside_marker = workspace.join("inside.marker");

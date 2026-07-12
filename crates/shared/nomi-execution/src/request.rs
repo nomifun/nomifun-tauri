@@ -46,6 +46,9 @@ pub enum Transport {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShellKind {
     PowerShell,
+    /// PowerShell source passed literally after `-Command`, without the legacy
+    /// compatibility prologue/exit-status wrapper.
+    PowerShellLiteral,
     Posix,
 }
 

@@ -158,6 +158,36 @@ fn tc_4_3_03b_failure_checkpoint_guidance() {
     );
 }
 
+#[test]
+fn tool_call_efficiency_guidance_routes_batches_without_removing_checkpoints() {
+    let result = build_system_prompt(
+        &mut SystemPromptCache::new(),
+        None,
+        "/tmp",
+        "test-model",
+        &[],
+        None,
+        None,
+        false,
+        false,
+        false,
+    );
+
+    for required in [
+        "file_paths",
+        "ApplyPatch",
+        "deterministic",
+        "exec_command script mode",
+        "intermediate result",
+        "meaningful milestone",
+    ] {
+        assert!(result.contains(required), "missing efficiency rule: {required}");
+    }
+    assert!(result.contains("does not reduce the number of tool calls"));
+    assert!(result.contains("Do not repeat"));
+    assert!(result.contains("individual tool call"));
+}
+
 // ---------------------------------------------------------------------------
 // TC-4.3-04: Edit-over-Write and Read-before-Edit rules
 // ---------------------------------------------------------------------------
@@ -317,9 +347,11 @@ fn tc_4_3_07_all_sections_coexist() {
     .unwrap();
 
     let skills = vec![make_skill("coexist-skill", "Coexist test")];
+    let mut cache = SystemPromptCache::new();
+    cache.set_agents_md(fs::read_to_string(cwd.join("AGENTS.md")).unwrap());
 
     let result = build_system_prompt(
-        &mut SystemPromptCache::new(),
+        &mut cache,
         Some("CUSTOM_COEXIST"),
         &cwd.to_string_lossy(),
         "test-model",

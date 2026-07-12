@@ -246,8 +246,9 @@ pub struct ToolsConfig {
     /// Skill-level deny/allow rules. Merged by concatenation across global + project configs.
     #[serde(default)]
     pub skills: SkillsPermissionConfig,
-    /// How many recent image-bearing tool results keep their images in
-    /// history. Older images are stripped (text kept) to bound token use.
+    /// How many individual recent tool-result images remain in history.
+    /// Older/excess attachments are stripped (text kept), and the engine also
+    /// enforces the supported-provider ceiling of 20 images per request.
     #[serde(default = "default_max_recent_images")]
     pub max_recent_images: usize,
     #[serde(default)]

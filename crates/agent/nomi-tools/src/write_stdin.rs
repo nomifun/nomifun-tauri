@@ -213,8 +213,9 @@ fn outcome_output(outcome: &ExecutionOutcome) -> Option<&nomi_execution::OutputS
     match outcome {
         ExecutionOutcome::Exited { output, .. }
         | ExecutionOutcome::Cancelled { output, .. }
-        | ExecutionOutcome::TimedOut { output, .. } => Some(output),
-        ExecutionOutcome::Lost { .. } | ExecutionOutcome::SpawnFailed(_) => None,
+        | ExecutionOutcome::TimedOut { output, .. }
+        | ExecutionOutcome::Lost { output, .. } => Some(output),
+        ExecutionOutcome::SpawnFailed(_) => None,
     }
 }
 
@@ -363,10 +364,11 @@ mod tests {
         let started = exec
             .execute(json!({
                 "cmd": pty_test_helper_shell_cmd("echo-stdin"),
-                "yield-time_ms": 400
+                "yield_time_ms": 400
             }))
             .await;
-        let id = parse_session_id(&started.content).expect("session id");
+        let id = parse_session_id(&started.content)
+            .unwrap_or_else(|| panic!("session id: {}", started.content));
         let output = writer
             .execute(json!({
                 "session_id": id,
@@ -384,10 +386,11 @@ mod tests {
         let started = exec
             .execute(json!({
                 "cmd": pty_test_helper_shell_cmd("echo-stdin"),
-                "yield-time_ms": 250
+                "yield_time_ms": 250
             }))
             .await;
-        let id = parse_session_id(&started.content).expect("session id");
+        let id = parse_session_id(&started.content)
+            .unwrap_or_else(|| panic!("session id: {}", started.content));
         let began = Instant::now();
         let output = writer
             .execute(json!({
@@ -410,7 +413,8 @@ mod tests {
                 "yield_time_ms": 250
             }))
             .await;
-        let id = parse_session_id(&started.content).expect("session id");
+        let id = parse_session_id(&started.content)
+            .unwrap_or_else(|| panic!("session id: {}", started.content));
         tokio::time::sleep(Duration::from_millis(700)).await;
         let output = writer
             .execute(json!({"session_id": id, "chars": "", "yield_time_ms": 5000}))
@@ -638,10 +642,11 @@ mod tests {
             .execute(json!({
                 "cmd": pty_test_helper_shell_cmd("ignore-interrupt"),
                 "tty": true,
-                "yield-time_ms": 500
+                "yield_time_ms": 500
             }))
             .await;
-        let id = parse_session_id(&started.content).expect("session id");
+        let id = parse_session_id(&started.content)
+            .unwrap_or_else(|| panic!("session id: {}", started.content));
         assert!(started.content.contains("ready"), "{}", started.content);
         let result = writer
             .execute(json!({

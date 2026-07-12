@@ -86,7 +86,17 @@ async fn bootstrap_registers_all_expected_tools() {
 
     let names = result.engine.tool_names();
 
-    for expected in &["Read", "Write", "Edit", "Bash", "Grep", "Glob"] {
+    for expected in &[
+        "Read",
+        "Write",
+        "Edit",
+        "Bash",
+        "Grep",
+        "Glob",
+        "exec_command",
+        "write_stdin",
+        "update_plan",
+    ] {
         assert!(
             names.iter().any(|n| n == expected),
             "missing built-in tool: {expected}"
@@ -141,12 +151,37 @@ async fn bootstrap_builtin_allowlist_restricts_tools() {
     assert!(names.iter().any(|n| n == "Read"));
     assert!(names.iter().any(|n| n == "Grep"));
     assert!(names.iter().any(|n| n == "Glob"));
-    for denied in &["Bash", "Write", "Edit", "Spawn", "Skill"] {
+    for denied in &[
+        "Bash",
+        "Write",
+        "Edit",
+        "Spawn",
+        "Skill",
+        "exec_command",
+        "write_stdin",
+        "update_plan",
+    ] {
         assert!(
             !names.iter().any(|n| n == denied),
             "白名单外的工具必须被过滤: {denied}"
         );
     }
+}
+
+#[tokio::test]
+async fn bootstrap_builtin_allowlist_can_keep_native_exec_pair() {
+    let mut config = minimal_config();
+    config.tools.builtin_allowlist = vec!["exec_command".into(), "write_stdin".into()];
+
+    let result = AgentBootstrap::new(config, "/tmp/test-workspace", null_output())
+        .build()
+        .await
+        .unwrap();
+    let names = result.engine.tool_names();
+
+    assert!(names.iter().any(|name| name == "exec_command"));
+    assert!(names.iter().any(|name| name == "write_stdin"));
+    assert!(!names.iter().any(|name| name == "Bash"));
 }
 
 #[tokio::test]

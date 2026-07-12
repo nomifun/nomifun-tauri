@@ -18,7 +18,7 @@ const RECOVERED_PARTIAL_WRITE_KEY: &str = "__nomi_recovered_partial_write";
 const RECOVERED_PARTIAL_WRITE_RESULT_HINT: &str = "\
 Recovered a partial Write from an output-token cutoff. The file now contains the generated prefix only. \
 Read the file, inspect the tail, then append or edit small chunks until the deliverable is complete before finalizing.";
-const SKIPPED_AFTER_PRIOR_ERROR: &str = "\
+pub(crate) const SKIPPED_AFTER_PRIOR_ERROR: &str = "\
 Skipped because a previous tool call in this assistant turn failed. Inspect the failed result first, then decide whether to retry with a larger timeout, use exec_command/write_stdin for long-running commands, or choose a different next step. Do not assume this step ran.";
 
 /// The combined output of a tool execution batch: protocol content blocks

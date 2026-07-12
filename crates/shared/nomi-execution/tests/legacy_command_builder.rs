@@ -10,6 +10,43 @@ use nomi_execution::{CommandBuilder, kill_legacy_process_tree};
 #[cfg(unix)]
 mod unix {
     use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn invalid_working_directory_fails_without_a_fresh_setup_timeout() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let missing = directory.path().join("missing");
+        let mut builder = CommandBuilder::new(env!("CARGO_BIN_EXE_execution_test_helper"));
+        builder.arg("exit-code").arg("0").current_dir(&missing);
+
+        let started = Instant::now();
+        let error = builder
+            .spawn()
+            .expect_err("an invalid working directory must fail");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "spawn failure waited for a new setup timeout: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn exec_failure_after_registration_accepts_the_expected_std_reap() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let missing_program = directory.path().join("missing-program");
+        let builder = CommandBuilder::new(&missing_program);
+
+        let error = builder
+            .spawn()
+            .expect_err("a missing executable must fail after pre_exec registration");
+        let message = error.to_string();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!message.contains("reap legacy child"), "{message}");
+        assert!(!message.contains("cached PGID quarantined"), "{message}");
+    }
 
     #[tokio::test]
     async fn explicit_kill_reaps_the_legacy_child_and_grandchild_group() {

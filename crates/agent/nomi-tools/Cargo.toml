@@ -30,6 +30,7 @@ glob.workspace        = true
 lru.workspace         = true
 libc.workspace        = true
 uuid.workspace        = true
+which.workspace       = true
 
 
 [dev-dependencies]

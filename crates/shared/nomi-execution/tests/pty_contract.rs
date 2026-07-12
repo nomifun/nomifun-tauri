@@ -243,6 +243,26 @@ async fn pty_decodes_utf8_split_one_byte_at_a_time() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn pty_preserves_fast_output_after_a_prior_terminal_session() {
+    let supervisor = ProcessSupervisor::new(SupervisorConfig::default());
+    let warmup = start_pty(&supervisor, &["exit", "0"])
+        .await
+        .expect("warmup PTY helper should start");
+    let _ = wait_for_terminal(&supervisor, &warmup).await;
+
+    let handle = start_pty(&supervisor, &["emit-split-utf8"])
+        .await
+        .expect("fast PTY helper should start after warmup");
+    let outcome = wait_for_terminal(&supervisor, &handle).await;
+    let ExecutionOutcome::Exited { code, output, .. } = outcome else {
+        panic!("fast PTY helper should exit, got {outcome:?}");
+    };
+    assert_eq!(code, Some(0));
+    assert_eq!(strip_terminal_controls(&output.text()), "中文🙂");
+}
+
 #[tokio::test]
 async fn quick_pty_exit_wakes_a_far_yield_within_one_second() {
     let supervisor = ProcessSupervisor::new(SupervisorConfig::default());
@@ -285,8 +305,12 @@ async fn quick_pty_exit_wakes_a_far_yield_within_one_second() {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn macos_seatbelt_program_pty_blocks_out_of_root_writes() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let outside = tempfile::tempdir().expect("outside");
+    // Darwin's trusted temporary directories are intentionally writable in
+    // the profile. Keep both fixtures beside the checkout so `outside` really
+    // exercises the declared write-root boundary.
+    let fixture_root = std::env::current_dir().expect("current directory");
+    let workspace = tempfile::tempdir_in(&fixture_root).expect("workspace");
+    let outside = tempfile::tempdir_in(&fixture_root).expect("outside");
     let workspace = workspace.path().canonicalize().expect("canonical workspace");
     let outside_marker = outside
         .path()

@@ -249,10 +249,10 @@ impl PersistentShell {
         while let Some(rel) = buf[search_from..].find(prefix) {
             let start = search_from + rel;
             let after = &buf[start + prefix.len()..];
-            if let Some(end) = after.find("__") {
-                if let Ok(rc) = after[..end].parse::<i32>() {
-                    return Some((start, rc));
-                }
+            if let Some(end) = after.find("__")
+                && let Ok(rc) = after[..end].parse::<i32>()
+            {
+                return Some((start, rc));
             }
             search_from = start + prefix.len();
         }

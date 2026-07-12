@@ -499,6 +499,22 @@ impl AgentBootstrap {
             cwd_path.to_path_buf(),
         )));
 
+        // Legacy interactive schemas share the same supervisor as Bash. The
+        // ProcessStore is only a numeric-id adapter; it owns no OS process.
+        // Register these before the builtin-name snapshot so an MCP tool with
+        // the same name is namespaced instead of shadowing the native tool.
+        let process_store = Arc::new(nomi_tools::process_store::ProcessStore::new());
+        registry.register(Box::new(nomi_tools::exec_command::ExecCommandTool::new(
+            Arc::clone(&process_supervisor),
+            Arc::clone(&process_store),
+            cwd_path.to_path_buf(),
+            execution_capability.clone(),
+        )));
+        registry.register(Box::new(nomi_tools::write_stdin::WriteStdinTool::new(
+            Arc::clone(&process_supervisor),
+            Arc::clone(&process_store),
+        )));
+
         let builtin_names: Vec<String> = registry.tool_names();
 
         let mut mcp_managers: Vec<Arc<McpManager>> = Vec::new();
@@ -752,20 +768,6 @@ impl AgentBootstrap {
                  native Browser tool is not registered."
             );
         }
-
-        // Legacy interactive schemas share the same supervisor as Bash. The
-        // ProcessStore is only a numeric-id adapter; it owns no OS process.
-        let process_store = Arc::new(nomi_tools::process_store::ProcessStore::new());
-        registry.register(Box::new(nomi_tools::exec_command::ExecCommandTool::new(
-            Arc::clone(&process_supervisor),
-            Arc::clone(&process_store),
-            cwd_path.to_path_buf(),
-            execution_capability.clone(),
-        )));
-        registry.register(Box::new(nomi_tools::write_stdin::WriteStdinTool::new(
-            Arc::clone(&process_supervisor),
-            Arc::clone(&process_store),
-        )));
 
         // codex-style stateless todo checklist tool. Always registered (not
         // deferred), surfaced to the frontend via the Plan event bridge.

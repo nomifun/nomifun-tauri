@@ -47,7 +47,7 @@ NOMIFUN_BROWSER_USE=1    # 所有 nomi 会话默认启用 Browser（进程内 na
 
 ```toml
 [tools]
-max_recent_images = 3        # 历史中保留图片的工具结果条数（旧图自动剥离省 token）
+max_recent_images = 3        # 历史中保留的工具结果图片总数（旧图自动剥离省 token）
 
 [tools.computer]
 enabled = true
@@ -92,7 +92,7 @@ Computer 能力首次使用需在「系统设置 → 隐私与安全性」中授
 ## 截图与 token 治理
 
 - 截图自动降采样到长边 ≤ `max_screenshot_edge`（默认 1568px，Anthropic 视觉推荐区间），文本中标注缩放后尺寸；模型给的坐标自动映射回真实屏幕（含 Retina 缩放）。
-- 历史消息中只保留最近 `max_recent_images`（默认 3）个带图结果的图片，更早的图片在轮次结束时剥离（文本保留），避免会话文件与请求 token 膨胀。
+- 历史消息中只保留最近 `max_recent_images`（默认 3）张工具结果图片，并受每次请求最多 20 张的提供商兼容上限约束；超出的附件会在轮次结束时剥离，但保留文本和省略说明，避免会话文件与请求 token 膨胀。
 - OpenAI 协议的 tool 消息不支持图片：图片以紧随其后的 user 消息（`image_url` data URI）传递，并标注来源 call id。Anthropic/Bedrock/Vertex 走原生 `tool_result` 图片块。
 - 外接 MCP 工具回传的图片同样经 `McpToolProxy` 映射进图片管道（单图 ≤ 5 MiB 上限）。
 

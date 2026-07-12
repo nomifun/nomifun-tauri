@@ -72,20 +72,72 @@ impl PtyPair {
         })
     }
 
-    pub(super) fn into_master(self) -> PtyMaster {
-        let Self { master, slave } = self;
-        drop(slave);
-        PtyMaster(master)
+    pub(super) fn prepare_reader(
+        &self,
+        runtime: &tokio::runtime::Handle,
+        output: Arc<OutputBuffer>,
+    ) -> io::Result<(PreparedPty, std::sync::mpsc::Receiver<()>)> {
+        let master_fd = duplicate_owned(self.master.as_raw_fd())?;
+        let startup_slave = duplicate_owned(self.slave.as_raw_fd())?;
+        let master = {
+            let _runtime = runtime.enter();
+            Arc::new(AsyncPtyMaster::new(master_fd, startup_slave)?)
+        };
+        let (startup_ready, reader_started) = std::sync::mpsc::channel();
+        let reader = runtime.spawn(read_output(
+            Arc::clone(&master),
+            output,
+            startup_ready,
+        ));
+        Ok((
+            PreparedPty {
+                master,
+                reader: Some(reader),
+            },
+            reader_started,
+        ))
     }
 }
 
-pub(super) struct PtyMaster(OwnedFd);
+pub(super) struct PreparedPty {
+    master: Arc<AsyncPtyMaster>,
+    reader: Option<tokio::task::JoinHandle<io::Result<()>>>,
+}
 
-impl PtyMaster {
-    pub(super) fn into_async(self) -> io::Result<AsyncPtyMaster> {
-        set_nonblocking(self.0.as_raw_fd())?;
-        Ok(AsyncPtyMaster {
-            fd: AsyncFd::new(self.0)?,
+impl PreparedPty {
+    pub(super) fn release_startup_slave(&self) -> io::Result<()> {
+        self.master.release_startup_slave()
+    }
+
+    pub(super) fn into_parts(
+        mut self,
+    ) -> (
+        Arc<AsyncPtyMaster>,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        let master = Arc::clone(&self.master);
+        let reader = self
+            .reader
+            .take()
+            .expect("prepared PTY reader is transferred exactly once");
+        (master, reader)
+    }
+}
+
+impl Drop for PreparedPty {
+    fn drop(&mut self) {
+        if let Some(reader) = self.reader.take() {
+            reader.abort();
+        }
+    }
+}
+
+impl AsyncPtyMaster {
+    fn new(master: OwnedFd, startup_slave: OwnedFd) -> io::Result<Self> {
+        set_nonblocking(master.as_raw_fd())?;
+        Ok(Self {
+            fd: AsyncFd::new(master)?,
+            startup_slave: Mutex::new(Some(startup_slave)),
             input: tokio::sync::Mutex::new(PtyInputState { closed: false }),
             resize_gate: Mutex::new(()),
         })
@@ -94,6 +146,10 @@ impl PtyMaster {
 
 pub(super) struct AsyncPtyMaster {
     fd: AsyncFd<OwnedFd>,
+    /// Prevents Darwin from converting a pre-reader terminal close into EIO
+    /// before queued output can be drained. The reader releases this guard as
+    /// its first action.
+    startup_slave: Mutex<Option<OwnedFd>>,
     /// Serializes writes and canonical EOF as one state transition, so no
     /// write can race past a successfully delivered EOF.
     input: tokio::sync::Mutex<PtyInputState>,
@@ -107,6 +163,14 @@ struct PtyInputState {
 }
 
 impl AsyncPtyMaster {
+    pub(super) fn release_startup_slave(&self) -> io::Result<()> {
+        self.startup_slave
+            .lock()
+            .map_err(|_| io::Error::other("PTY startup slave gate is poisoned"))?
+            .take();
+        Ok(())
+    }
+
     pub(super) async fn write_all(&self, mut bytes: &[u8]) -> io::Result<()> {
         let input = self.input.lock().await;
         if input.closed {
@@ -203,22 +267,47 @@ impl AsyncPtyMaster {
 }
 
 fn duplicate_stdio(fd: RawFd) -> io::Result<Stdio> {
+    Ok(Stdio::from(duplicate_owned(fd)?))
+}
+
+fn duplicate_owned(fd: RawFd) -> io::Result<OwnedFd> {
     // SAFETY: F_DUPFD_CLOEXEC creates a distinct owned descriptor.
     let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
     if duplicated < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: fcntl returned a fresh owned descriptor.
-    Ok(Stdio::from(unsafe { OwnedFd::from_raw_fd(duplicated) }))
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
 }
 
 pub(super) async fn read_output(
     master: Arc<AsyncPtyMaster>,
     output: Arc<OutputBuffer>,
+    startup_ready: std::sync::mpsc::Sender<()>,
 ) -> io::Result<()> {
     let mut buffer = [0_u8; READ_BUFFER_BYTES];
+    let mut startup_ready = Some(startup_ready);
     loop {
-        let read = master.read(&mut buffer).await?;
+        let read = if let Some(startup_ready) = startup_ready.take() {
+            let mut readiness = Box::pin(master.fd.readable());
+            let mut startup_ready = Some(startup_ready);
+            let mut ready = std::future::poll_fn(move |context| {
+                let poll = std::future::Future::poll(readiness.as_mut(), context);
+                if let Some(startup_ready) = startup_ready.take() {
+                    let _ = startup_ready.send(());
+                }
+                poll
+            })
+            .await?;
+            match ready.try_io(|fd| read_once(fd.get_ref().as_raw_fd(), &mut buffer)) {
+                Ok(Ok(read)) => read,
+                Ok(Err(error)) if error.raw_os_error() == Some(libc::EIO) => 0,
+                Ok(Err(error)) => return Err(error),
+                Err(_) => continue,
+            }
+        } else {
+            master.read(&mut buffer).await?
+        };
         if read == 0 {
             return Ok(());
         }

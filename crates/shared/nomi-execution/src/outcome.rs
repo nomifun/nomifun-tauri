@@ -152,6 +152,7 @@ pub enum ExecutionOutcome {
     },
     Lost {
         last_known: ProcessSnapshot,
+        output: OutputSnapshot,
         cleanup: CleanupReport,
     },
 }

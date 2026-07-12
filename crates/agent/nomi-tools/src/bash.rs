@@ -149,7 +149,7 @@ impl BashTool {
                 render_outcome(outcome)
             }
             PollResult::Running { output, .. } => {
-                let outcome = match supervisor.cancel(&handle.owner, &handle.session_id).await {
+                let outcome = match supervisor.timeout(&handle.owner, &handle.session_id).await {
                     Ok(outcome) => outcome,
                     Err(error) => {
                         session_guard.disarm();
@@ -376,7 +376,15 @@ fn render_timeout(
         | ExecutionOutcome::TimedOut { output, .. } => {
             (Some(output), format_outcome_summary(&outcome))
         }
-        ExecutionOutcome::Lost { .. } | ExecutionOutcome::SpawnFailed(_) => {
+        ExecutionOutcome::Lost { output, .. } => {
+            let output = if output.chunks.is_empty() && output.dropped_bytes == 0 {
+                partial.as_ref()
+            } else {
+                Some(output)
+            };
+            (output, format_outcome_summary(&outcome))
+        }
+        ExecutionOutcome::SpawnFailed(_) => {
             (partial.as_ref(), format_outcome_summary(&outcome))
         }
     };
@@ -440,11 +448,14 @@ fn render_outcome(outcome: ExecutionOutcome) -> ToolResult {
         }
         ExecutionOutcome::Lost {
             last_known,
+            output,
             cleanup,
         } => {
             let mut content = format!(
-                "Command cleanup is unproven (pid={}, state={:?}). Do not blindly retry.",
-                last_known.pid, last_known.state
+                "Command cleanup is unproven (pid={}, state={:?}). Do not blindly retry.\n{}",
+                last_known.pid,
+                last_known.state,
+                render_output(&output)
             );
             append_cleanup(&mut content, &cleanup);
             ToolResult {
@@ -522,6 +533,7 @@ fn format_outcome_summary(outcome: &ExecutionOutcome) -> String {
         ExecutionOutcome::Lost {
             last_known,
             cleanup,
+            ..
         } => format!(
             "lost pid={} reaped={} errors={}",
             last_known.pid,
@@ -682,6 +694,40 @@ mod tests {
             "terminal cleanup output was omitted: {}",
             result.content
         );
+    }
+
+    #[test]
+    fn timeout_lost_outcome_prefers_frozen_cleanup_tail() {
+        let snapshot = |text: &str| OutputSnapshot {
+            chunks: vec![nomi_execution::OutputChunk {
+                seq: 1,
+                start: 0,
+                stream: OutputStream::Stdout,
+                bytes: text.as_bytes().to_vec(),
+                text: text.to_owned(),
+            }],
+            next_cursor: OutputCursor::new(text.len() as u64),
+            retained_bytes: text.len(),
+            dropped_bytes: 0,
+            encoding: nomi_execution::EncodingMetadata::default(),
+        };
+        let now = Instant::now();
+        let result = render_timeout(
+            ExecutionOutcome::Lost {
+                last_known: nomi_execution::ProcessSnapshot {
+                    pid: 42,
+                    state: nomi_execution::ProcessState::Lost,
+                    started_at: now,
+                    last_activity_at: now,
+                },
+                output: snapshot("before-timeout\ncleanup-tail\n"),
+                cleanup: CleanupReport::default(),
+            },
+            Some(snapshot("before-timeout\n")),
+            100,
+        );
+
+        assert!(result.content.contains("cleanup-tail"), "{}", result.content);
     }
 
     #[tokio::test]

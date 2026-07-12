@@ -977,7 +977,11 @@ mod phase7_tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn child_registry_inherits_seatbelt_and_cannot_write_outside_child_cwd() {
-        let parent = tempfile::tempdir().unwrap();
+        // `tempfile::tempdir()` lives inside Darwin's trusted user temporary
+        // directory, which the Seatbelt profile intentionally keeps writable.
+        // Place this fixture beside the checkout so the sibling path actually
+        // exercises the child-root restriction.
+        let parent = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let child = parent.path().join("child");
         std::fs::create_dir(&child).unwrap();
         let parent_root = parent.path().canonicalize().unwrap();
