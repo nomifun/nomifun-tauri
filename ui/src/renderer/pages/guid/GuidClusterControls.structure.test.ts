@@ -44,4 +44,20 @@ describe('Guid agent cluster controls', () => {
     expect(sendSource.includes('orchestrator_model_range: clusterMode ? orchestratorModelRange : undefined')).toBe(true);
     expect(sendSource.includes('orchestrator_approval_mode: clusterMode ? orchestratorApprovalMode : undefined')).toBe(true);
   });
+
+  test('reconciles persisted collaborators before rendering or creating a range', () => {
+    const pageSource = readSource(new URL('./GuidPage.tsx', import.meta.url));
+    const selectorSource = readSource(new URL('./components/GuidCollaboratorSelector.tsx', import.meta.url));
+
+    expect(pageSource.includes("import { reconcileModelRefs, sameModelRefs }")).toBe(true);
+    expect(pageSource.includes('const activeCollaborators = collaboratorReconciliation?.active ?? []')).toBe(true);
+    expect(pageSource.includes('...activeCollaborators.filter(')).toBe(true);
+    expect(pageSource.includes('value={activeCollaborators}')).toBe(true);
+    expect(pageSource.includes('collaboratorReconciliation.removed.length === 0')).toBe(true);
+    expect(pageSource.includes('sameModelRefs(orchestrationCollaborators, collaboratorReconciliation.retained)')).toBe(true);
+
+    expect(selectorSource.includes('const availableKeys = useMemo(')).toBe(true);
+    expect(selectorSource.includes('availableKeys.has(encodedMain)')).toBe(true);
+    expect(selectorSource.includes('disabled={isLoading}')).toBe(true);
+  });
 });

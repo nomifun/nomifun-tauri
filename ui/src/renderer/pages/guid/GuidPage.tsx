@@ -41,6 +41,8 @@ import { useGuidInput } from './hooks/useGuidInput';
 import { useGuidMention } from './hooks/useGuidMention';
 import { useGuidModelSelection } from './hooks/useGuidModelSelection';
 import { useGuidSend } from './hooks/useGuidSend';
+import { useModelRange } from '@/renderer/pages/orchestrator/useModelRange';
+import { reconcileModelRefs, sameModelRefs } from '@/renderer/pages/orchestrator/collaboratorModelRefs';
 import { usePendingConversation } from '@/renderer/pages/conversation/components/ConversationShell/PendingConversationContext';
 import { useTypewriterPlaceholder } from './hooks/useTypewriterPlaceholder';
 import { ensureBackendMcpCatalog } from '@/renderer/hooks/mcp/catalog';
@@ -148,6 +150,19 @@ const GuidPage: React.FC = () => {
   // Only nomi uses this provider-based model picker now (Gemini runs as a
   // regular ACP backend with its own model selector).
   const modelSelection = useGuidModelSelection('nomi');
+  const {
+    configuredPairs,
+    allPairs,
+    isLoading: isModelCatalogLoading,
+  } = useModelRange();
+  const collaboratorReconciliation = useMemo(
+    () =>
+      isModelCatalogLoading
+        ? null
+        : reconcileModelRefs(orchestrationCollaborators, configuredPairs, allPairs),
+    [allPairs, configuredPairs, isModelCatalogLoading, orchestrationCollaborators]
+  );
+  const activeCollaborators = collaboratorReconciliation?.active ?? [];
   const mainModelRef = useMemo<TModelRef | null>(
     () =>
       modelSelection.current_model
@@ -161,16 +176,21 @@ const GuidPage: React.FC = () => {
       console.error('[GuidPage] Failed to save orchestration collaborators:', error);
     });
   }, []);
+  useEffect(() => {
+    if (!collaboratorReconciliation || collaboratorReconciliation.removed.length === 0) return;
+    if (sameModelRefs(orchestrationCollaborators, collaboratorReconciliation.retained)) return;
+    handleOrchestrationCollaboratorsChange(collaboratorReconciliation.retained);
+  }, [collaboratorReconciliation, handleOrchestrationCollaboratorsChange, orchestrationCollaborators]);
   const orchestratorModelRange = useMemo<TModelRange | undefined>(() => {
     if (!mainModelRef) return undefined;
     const models = [
       mainModelRef,
-      ...orchestrationCollaborators.filter(
+      ...activeCollaborators.filter(
         (item) => item.provider_id !== mainModelRef.provider_id || item.model !== mainModelRef.model
       ),
     ];
     return { mode: 'range', models };
-  }, [mainModelRef, orchestrationCollaborators]);
+  }, [activeCollaborators, mainModelRef]);
   const orchestratorApprovalMode = clusterApprovalMode;
 
   const navState = location.state as { resetAssistant?: boolean; selectedAgentKey?: string } | null;
@@ -584,7 +604,7 @@ const GuidPage: React.FC = () => {
   );
   const collaboratorSelectorNode = (
     <GuidCollaboratorSelector
-      value={orchestrationCollaborators}
+      value={activeCollaborators}
       onChange={handleOrchestrationCollaboratorsChange}
       mainModel={mainModelRef}
       className='nomi-sendbox-model-btn'

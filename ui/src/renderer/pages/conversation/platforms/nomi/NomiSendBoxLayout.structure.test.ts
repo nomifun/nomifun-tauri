@@ -70,6 +70,17 @@ describe('Nomi sendbox control layout', () => {
     expect(permissionIndex).toBeGreaterThan(clusterIndex);
   });
 
+  test('reconciles conversation collaborators before rendering or persisting executable ranges', () => {
+    const chatSource = readSource(new URL('../../components/ChatConversation.tsx', import.meta.url));
+
+    expect(chatSource.includes("import { reconcileModelRefs, sameModelRefs }")).toBe(true);
+    expect(chatSource.includes('const activeCollaborators = collaboratorReconciliation?.active ?? []')).toBe(true);
+    expect(chatSource.includes('value={activeCollaborators}')).toBe(true);
+    expect(chatSource.includes('}, activeCollaborators);')).toBe(true);
+    expect(chatSource.includes('collaboratorReconciliation.removed.length === 0')).toBe(true);
+    expect(chatSource.includes('sameModelRefs(collaborators, collaboratorReconciliation.retained)')).toBe(true);
+  });
+
   test('keeps the cluster trigger icon-only instead of showing status text in the toolbar', () => {
     const source = readSource(new URL('../../components/ClusterModePill.tsx', import.meta.url));
 

@@ -43,6 +43,8 @@ import PlanApprovalBanner from '../orchestration/PlanApprovalBanner';
 import StarOfficeMonitorCard from '../platforms/openclaw/StarOfficeMonitorCard.tsx';
 import NomiSessionMetricsPanel from '../platforms/nomi/NomiSessionMetricsPanel';
 import { STATUS_META } from '@/renderer/pages/orchestrator/RunDetail/runStatusMeta';
+import { useModelRange } from '@/renderer/pages/orchestrator/useModelRange';
+import { reconcileModelRefs, sameModelRefs } from '@/renderer/pages/orchestrator/collaboratorModelRefs';
 // import SkillRuleGenerator from './components/SkillRuleGenerator'; // Temporarily hidden
 
 /** Check whether a specific skill is mounted on the conversation. */
@@ -225,6 +227,17 @@ const NomiConversationPanel: React.FC<{ conversation: NomiConversation; sliderTi
     const range = conversation.extra?.orchestrator_model_range;
     return range?.mode === 'range' ? range.models.slice(1) : [];
   });
+  const {
+    configuredPairs,
+    allPairs,
+    isLoading: isModelCatalogLoading,
+  } = useModelRange();
+  const collaboratorReconciliation = useMemo(
+    () =>
+      isModelCatalogLoading ? null : reconcileModelRefs(collaborators, configuredPairs, allPairs),
+    [allPairs, collaborators, configuredPairs, isModelCatalogLoading]
+  );
+  const activeCollaborators = collaboratorReconciliation?.active ?? [];
 
   // 写回:主模型 FIRST(models[0]=lead/planner)+ 协作池,按 `${provider_id} ${model}`
   // 去重(与旧 useGuidSend 一致),整体作为 range 落到会话 extra;后端 caps_orchestrator
@@ -268,11 +281,11 @@ const NomiConversationPanel: React.FC<{ conversation: NomiConversation; sliderTi
         void saveNomiDefaultModel(_provider.id, modelName);
         // 主模型即 range 的 models[0](lead/planner):切换主模型后同步重写 range,
         // 让协作池仍钉在新主模型之后。
-        void persistModelRange({ provider_id: _provider.id, model: modelName }, collaborators);
+        void persistModelRange({ provider_id: _provider.id, model: modelName }, activeCollaborators);
       }
       return Boolean(ok);
     },
-    [conversation.id, persistModelRange, collaborators]
+    [activeCollaborators, conversation.id, persistModelRange]
   );
 
   const modelSelection = useNomiModelSelection({
@@ -297,11 +310,18 @@ const NomiConversationPanel: React.FC<{ conversation: NomiConversation; sliderTi
     [mainModelRef, persistModelRange]
   );
 
+  useEffect(() => {
+    if (!collaboratorReconciliation || collaboratorReconciliation.removed.length === 0) return;
+    if (sameModelRefs(collaborators, collaboratorReconciliation.retained)) return;
+    setCollaboratorsState(collaboratorReconciliation.retained);
+    void persistModelRange(mainModelRef, collaboratorReconciliation.retained);
+  }, [collaboratorReconciliation, collaborators, mainModelRef, persistModelRange]);
+
   // 会话内「协作模型」选择器:紧跟主模型选择器渲染。集群开关另放到权限旁边，
   // 避免把主模型 / 协作模型的关系打断。
   const collaboratorSelectorNode = (
     <GuidCollaboratorSelector
-      value={collaborators}
+      value={activeCollaborators}
       onChange={onCollaboratorsChange}
       mainModel={mainModelRef}
       className='nomi-sendbox-model-btn'
@@ -324,11 +344,24 @@ const NomiConversationPanel: React.FC<{ conversation: NomiConversation; sliderTi
       const ok = await ipcBridge.conversation.update.invoke({ id: conversation.id, updates: { model: selected } });
       if (ok) {
         void saveNomiDefaultModel(heal.provider.id, heal.use_model);
+        void persistModelRange(
+          { provider_id: heal.provider.id, model: heal.use_model },
+          activeCollaborators
+        );
         Message.info(t('conversation.chat.modelHealedToDefault', { model: heal.use_model }));
       }
     })();
     // 仅在会话或供应商列表变化时评估
-  }, [conversation.id, conversation.model?.id, conversation.model?.use_model, healProviders, healGetAvailable, t]);
+  }, [
+    activeCollaborators,
+    conversation.id,
+    conversation.model?.id,
+    conversation.model?.use_model,
+    healProviders,
+    healGetAvailable,
+    persistModelRange,
+    t,
+  ]);
 
   const workspaceEnabled = Boolean(conversation.extra?.workspace);
   const { info: presetAssistantInfo } = usePresetAssistantInfo(conversation);

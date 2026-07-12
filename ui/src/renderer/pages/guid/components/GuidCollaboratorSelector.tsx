@@ -50,19 +50,25 @@ const filterByLabel = (input: string, option: React.ReactNode): boolean => {
  */
 const GuidCollaboratorSelector: React.FC<GuidCollaboratorSelectorProps> = ({ value, onChange, mainModel, className }) => {
   const { t } = useTranslation();
-  const { providers, getAvailableModels, formatModelLabel, hasModels } = useModelRange();
+  const { providers, getAvailableModels, formatModelLabel, allPairs, hasModels, isLoading } = useModelRange();
   const [open, setOpen] = useState(false);
 
-  const mainKey = useMemo(() => (mainModel ? encodePair(mainModel) : null), [mainModel]);
+  const availableKeys = useMemo(() => new Set(allPairs.map(encodePair)), [allPairs]);
+  const mainKey = useMemo(() => {
+    if (!mainModel) return null;
+    const encodedMain = encodePair(mainModel);
+    return availableKeys.has(encodedMain) ? encodedMain : null;
+  }, [availableKeys, mainModel]);
 
   // The 主模型 is ALWAYS part of the run — it is the lead/planner AND a worker the
   // planner can assign to nodes — so it is PINNED into this selection: shown
   // selected and not removable here (change it in the 主模型 picker). The user only
   // adds EXTRA collaborators on top.
   const encodedValue = useMemo(() => {
+    if (isLoading) return [];
     const collab = value.map(encodePair);
     return mainKey ? Array.from(new Set([mainKey, ...collab])) : collab;
-  }, [value, mainKey]);
+  }, [isLoading, value, mainKey]);
 
   const handleChange = useCallback(
     (v: unknown) => {
@@ -138,6 +144,7 @@ const GuidCollaboratorSelector: React.FC<GuidCollaboratorSelectorProps> = ({ val
         className={classNames('sendbox-model-btn guid-config-btn', className)}
         shape='round'
         size='small'
+        disabled={isLoading}
         data-testid='guid-collaborator-selector'
       >
         <span className='flex items-center gap-6px min-w-0'>
