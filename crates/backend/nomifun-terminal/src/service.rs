@@ -574,6 +574,8 @@ impl TerminalService {
         backend: Option<&str>,
     ) -> Result<(), TerminalError> {
         let (program, resolved_args) = resolve_command(command, args);
+        #[cfg(all(test, windows))]
+        let program = resolve_windows_test_program(&program);
         // Inject platform capabilities (MCP + lifecycle hooks) into the
         // native CLI launch. Unknown CLIs are returned unchanged (honest).
         let (resolved_args, hook_env) = {
@@ -1594,6 +1596,26 @@ fn default_name(command: &str, backend: Option<&str>) -> String {
     } else {
         command.to_owned()
     }
+}
+
+#[cfg(all(test, windows))]
+fn resolve_windows_test_program(program: &str) -> String {
+    let Some(name) = std::path::Path::new(program).file_name().and_then(|name| name.to_str()) else {
+        return program.to_owned();
+    };
+    let executable = match name {
+        "cat" | "printf" | "yes" => format!("{name}.exe"),
+        _ => return program.to_owned(),
+    };
+
+    ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(std::path::PathBuf::from)
+        .map(|root| root.join("Git").join("usr").join("bin").join(&executable))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+        .unwrap_or_else(|| program.to_owned())
 }
 
 /// Return the last `max_bytes` of `s` on a UTF-8 char boundary, plus whether it

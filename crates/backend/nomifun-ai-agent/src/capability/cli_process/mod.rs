@@ -295,24 +295,35 @@ pub(super) fn tracked_process_group_id(_pid: u32) -> Option<u32> {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use nomifun_common::{CommandSpec, EnvVar};
 
     use super::*;
     use tokio::time::timeout;
 
-    pub(super) fn echo_json_config(json_str: &str) -> CommandSpec {
-        CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), format!("echo '{json_str}'")],
-            env: vec![],
-            cwd: None,
-        }
+    #[cfg(windows)]
+    pub(crate) fn test_shell_program() -> std::path::PathBuf {
+        ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"]
+            .into_iter()
+            .filter_map(std::env::var_os)
+            .map(std::path::PathBuf::from)
+            .map(|root| root.join("Git").join("bin").join("sh.exe"))
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| "sh".into())
     }
 
-    pub(super) fn simple_script_config(script: &str) -> CommandSpec {
+    #[cfg(not(windows))]
+    pub(crate) fn test_shell_program() -> std::path::PathBuf {
+        "sh".into()
+    }
+
+    pub(crate) fn echo_json_config(json_str: &str) -> CommandSpec {
+        simple_script_config(&format!("echo '{json_str}'"))
+    }
+
+    pub(crate) fn simple_script_config(script: &str) -> CommandSpec {
         CommandSpec {
-            command: "sh".into(),
+            command: test_shell_program(),
             args: vec!["-c".into(), script.into()],
             env: vec![],
             cwd: None,
@@ -362,7 +373,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn spawn_with_env_and_cwd() {
         let config = CommandSpec {
-            command: "sh".into(),
+            command: test_shell_program(),
             args: vec!["-c".into(), "echo \"{\\\"val\\\":\\\"$MY_TEST_VAR\\\"}\"".into()],
             env: vec![EnvVar {
                 name: "MY_TEST_VAR".into(),
@@ -388,7 +399,7 @@ pub(super) mod tests {
         let cwd_with_trailing_space = format!("{} ", cwd.to_string_lossy());
 
         let config = CommandSpec {
-            command: "sh".into(),
+            command: test_shell_program(),
             args: vec!["-c".into(), "echo \"{\\\"cwd\\\":\\\"$PWD\\\"}\"".into()],
             env: vec![],
             cwd: Some(cwd_with_trailing_space.clone()),
@@ -411,7 +422,7 @@ pub(super) mod tests {
         fs::create_dir(&cwd).unwrap();
 
         let config = CommandSpec {
-            command: "sh".into(),
+            command: test_shell_program(),
             args: vec!["-c".into(), "echo \"{\\\"cwd\\\":\\\"$PWD\\\"}\"".into()],
             env: vec![],
             cwd: Some(cwd.to_string_lossy().into_owned()),
@@ -449,7 +460,7 @@ pub(super) mod tests {
         let data_dir = tempfile::tempdir().unwrap();
 
         let config = CommandSpec {
-            command: "sh".into(),
+            command: test_shell_program(),
             args: vec!["-c".into(), "echo ready".into()],
             env: vec![],
             cwd: Some(cwd.to_string_lossy().into_owned()),
@@ -466,7 +477,7 @@ pub(super) mod tests {
         assert!(!missing_cwd.exists());
 
         let config = CommandSpec {
-            command: "sh".into(),
+            command: test_shell_program(),
             args: vec!["-c".into(), "echo \"{\\\"cwd\\\":\\\"$PWD\\\"}\"".into()],
             env: vec![],
             cwd: Some(missing_cwd.to_string_lossy().into_owned()),
@@ -488,7 +499,7 @@ pub(super) mod tests {
         assert!(!missing_cwd.exists());
 
         let config = CommandSpec {
-            command: "sh".into(),
+            command: test_shell_program(),
             args: vec!["-c".into(), "sleep 10".into()],
             env: vec![],
             cwd: Some(missing_cwd.to_string_lossy().into_owned()),

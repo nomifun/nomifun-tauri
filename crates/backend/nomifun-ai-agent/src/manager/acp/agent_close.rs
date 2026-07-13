@@ -117,7 +117,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use nomifun_common::{AppError, CommandSpec};
+    use nomifun_common::AppError;
 
     use crate::capability::cli_process::CliAgentProcess;
     use crate::manager::acp::agent::{exit_status_parts, user_facing_message};
@@ -129,12 +129,7 @@ mod tests {
         // Heredoc protects apostrophes etc.; escape any literal `'` first.
         let payload = stderr_payload.replace('\'', "'\\''");
         let script = format!("cat <<'EOF' >&2\n{payload}\nEOF\nexit {exit_code}");
-        let config = CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), script],
-            env: vec![],
-            cwd: None,
-        };
+        let config = crate::capability::cli_process::tests::simple_script_config(&script);
         let proc = CliAgentProcess::spawn(config).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), proc.wait_for_exit())
             .await

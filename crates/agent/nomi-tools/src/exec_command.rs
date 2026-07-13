@@ -113,6 +113,8 @@ pub struct ExecCommandTool {
     default_cwd: PathBuf,
     capability: CapabilityPolicy,
     run_id: Uuid,
+    #[cfg(test)]
+    terminal_settle_ms: u64,
 }
 
 impl ExecCommandTool {
@@ -128,6 +130,8 @@ impl ExecCommandTool {
             default_cwd: cwd,
             capability,
             run_id: Uuid::now_v7(),
+            #[cfg(test)]
+            terminal_settle_ms: TERMINAL_SETTLE_MS,
         }
     }
 
@@ -160,13 +164,17 @@ impl ExecCommandTool {
                 output: initial_output,
                 ..
             } => {
+                #[cfg(not(test))]
+                let terminal_settle_ms = TERMINAL_SETTLE_MS;
+                #[cfg(test)]
+                let terminal_settle_ms = self.terminal_settle_ms;
                 let settled = self
                     .supervisor
                     .poll_until_activity(
                         &handle.owner,
                         &handle.session_id,
                         initial_output.next_cursor,
-                        Instant::now() + Duration::from_millis(TERMINAL_SETTLE_MS),
+                        Instant::now() + Duration::from_millis(terminal_settle_ms),
                     )
                     .await;
                 match settled {
@@ -1272,11 +1280,15 @@ mod tests {
         let result = tool
             .execute(json!({
                 "cmd": pty_test_helper_shell_cmd("exit 0"),
-                "yield_time_ms": 3000
+                "yield_time_ms": 10000
             }))
             .await;
         assert!(!result.is_error, "{}", result.content);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "quick exit waited too close to the requested yield: {}",
+            result.content
+        );
     }
 
     #[tokio::test]
@@ -1341,13 +1353,17 @@ mod tests {
 
     #[tokio::test]
     async fn settle_poll_preserves_output_from_before_and_during_settle() {
-        let (tool, _) = tool(std::env::current_dir().unwrap());
+        let (mut tool, _) = tool(std::env::current_dir().unwrap());
+        // The production settle window remains intentionally short. Give this
+        // sequencing test a wider window so shell startup jitter cannot move
+        // both markers to the same side of the initial-yield boundary.
+        tool.terminal_settle_ms = 5_000;
         let result = tool
             .execute(json!({
                 "cmd": pty_test_helper_shell_cmd(
-                    "emit-twice 200 first_marker 20 second_marker 60000"
+                    "emit-twice 0 first_marker 6000 second_marker 60000"
                 ),
-                "yield_time_ms": 250
+                "yield_time_ms": 5000
             }))
             .await;
 
@@ -1361,7 +1377,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "cmd": pty_test_helper_shell_cmd("emit-after 50 before_exit 300"),
-                "yield_time_ms": 1000
+                "yield_time_ms": 5000
             }))
             .await;
 

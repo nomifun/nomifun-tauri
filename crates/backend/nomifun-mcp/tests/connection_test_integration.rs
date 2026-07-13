@@ -23,6 +23,32 @@ fn make_service_with_timeout(timeout: Duration) -> McpConnectionTestService {
     McpConnectionTestService::new(test_http_client()).with_timeout(timeout)
 }
 
+#[cfg(windows)]
+fn quiet_sleep_command() -> (String, Vec<String>) {
+    (
+        "cmd.exe".into(),
+        vec!["/D".into(), "/C".into(), "ping -n 60 127.0.0.1 >NUL".into()],
+    )
+}
+
+#[cfg(not(windows))]
+fn quiet_sleep_command() -> (String, Vec<String>) {
+    ("sleep".into(), vec!["60".into()])
+}
+
+#[cfg(windows)]
+fn echo_command() -> (String, Vec<String>) {
+    (
+        "cmd.exe".into(),
+        vec!["/D".into(), "/C".into(), "echo hello".into()],
+    )
+}
+
+#[cfg(not(windows))]
+fn echo_command() -> (String, Vec<String>) {
+    ("echo".into(), vec!["hello".into()])
+}
+
 fn test_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
@@ -341,11 +367,12 @@ async fn write_http_response(
 
 #[tokio::test]
 async fn stdio_timeout_returns_timeout_error() {
-    // Use `sleep` which produces no stdout — our protocol read will block
+    // Use a platform-native command that produces no stdout so the protocol read blocks.
     let svc = make_service_with_timeout(Duration::from_secs(1));
+    let (command, args) = quiet_sleep_command();
     let transport = McpServerTransport::Stdio {
-        command: "sleep".into(),
-        args: vec!["60".into()],
+        command,
+        args,
         env: HashMap::new(),
     };
 
@@ -457,20 +484,21 @@ async fn http_custom_headers_are_sent() {
 
 #[tokio::test]
 async fn stdio_with_args_spawns_correctly() {
-    // Use echo as a simple command that exits immediately
-    // Since echo doesn't speak MCP, we expect a protocol error (not a spawn error)
+    // Use a platform-native echo command that exits immediately. Since it doesn't
+    // speak MCP, we expect a protocol error rather than a spawn error.
     let svc = make_service_with_timeout(Duration::from_secs(3));
+    let (command, args) = echo_command();
     let transport = McpServerTransport::Stdio {
-        command: "echo".into(),
-        args: vec!["hello".into()],
+        command,
+        args,
         env: HashMap::new(),
     };
 
     let result = svc.test_connection("echo-server", &transport).await;
 
-    // echo outputs "hello\n" then exits — not valid JSON-RPC
+    // The command outputs "hello\n" then exits — not valid JSON-RPC.
     assert!(!result.success);
     let error = result.error.as_deref().unwrap();
     // Should be a protocol error, not a spawn error
-    assert!(!error.contains("Command not found"), "echo should be found");
+    assert!(!error.contains("Command not found"), "echo command should be found");
 }

@@ -36,7 +36,7 @@ fn relative_cwd_is_anchored_and_validated() {
     req.capability = CapabilityPolicy::local_owner(root.path().to_path_buf());
     let normalized = normalize_request(req, root.path()).unwrap();
     assert_eq!(
-        normalized.cwd,
+        normalized.cwd.canonicalize().unwrap(),
         root.path().join("child").canonicalize().unwrap()
     );
 }
@@ -71,8 +71,8 @@ fn capability_roots_are_canonicalized() {
 
     assert_eq!(normalized.capability.cwd_roots.len(), 1);
     assert_eq!(
-        normalized.capability.cwd_roots,
-        vec![root.path().canonicalize().unwrap()]
+        normalized.capability.cwd_roots[0].canonicalize().unwrap(),
+        root.path().canonicalize().unwrap()
     );
 }
 

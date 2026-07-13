@@ -947,15 +947,9 @@ mod tests {
     /// exits with `exit_code`. Used to simulate ACP CLI crashes/exits in
     /// close-path tests. Lines containing `'` are escaped for the heredoc.
     async fn spawn_with_stderr_and_exit(stderr_payload: &str, exit_code: u8) -> Arc<CliAgentProcess> {
-        use nomifun_common::CommandSpec;
         let payload = stderr_payload.replace('\'', "'\\''");
         let script = format!("cat <<'EOF' >&2\n{payload}\nEOF\nexit {exit_code}");
-        let config = CommandSpec {
-            command: "sh".into(),
-            args: vec!["-c".into(), script],
-            env: vec![],
-            cwd: None,
-        };
+        let config = crate::capability::cli_process::tests::simple_script_config(&script);
         let proc = CliAgentProcess::spawn(config).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), proc.wait_for_exit())
             .await

@@ -39,6 +39,16 @@ fn env_mutex() -> &'static Mutex<()> {
     ENV_MUTEX.get_or_init(|| Mutex::new(()))
 }
 
+#[cfg(windows)]
+fn available_test_command() -> &'static str {
+    "cmd.exe"
+}
+
+#[cfg(not(windows))]
+fn available_test_command() -> &'static str {
+    "sh"
+}
+
 /// Acquire ENV_MUTEX.  `tokio::sync::Mutex` guards are async-aware and
 /// may be held across await points without triggering clippy's
 /// `await_holding_lock` lint.
@@ -75,7 +85,7 @@ async fn custom_agent_full_roundtrip() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    // Create — use "sh" so which::which resolves it and the registry marks
+    // Use a platform-native command so which::which resolves it and the registry marks
     // the new row as available (list_all filters out unavailable rows).
     let (status, json) = create_agent(
         &mut app,
@@ -83,7 +93,7 @@ async fn custom_agent_full_roundtrip() {
         &csrf,
         json!({
             "name": "My Claude",
-            "command": "sh",
+            "command": available_test_command(),
             "icon": "🤖",
             "args": ["--acp"],
             "env": []
@@ -105,13 +115,13 @@ async fn custom_agent_full_roundtrip() {
         "newly created agent should appear in GET /api/agents"
     );
 
-    // Update — keep "sh" so the row stays available after rehydrate.
+    // Keep the platform-native command so the row stays available after rehydrate.
     let req = json_with_token(
         "PUT",
         &format!("/api/agents/custom/{id}"),
         json!({
             "name": "My Claude v2",
-            "command": "sh",
+            "command": available_test_command(),
             "icon": "🚀",
             "args": [],
             "env": []
@@ -194,7 +204,7 @@ async fn custom_agent_advanced_overrides_persist() {
         &csrf,
         json!({
             "name": "With Advanced",
-            "command": "sh",
+            "command": available_test_command(),
             "advanced": {
                 "yolo_id": "bypassPermissions",
                 "native_skills_dirs": [".claude/skills"],
@@ -224,7 +234,13 @@ async fn create_rejects_empty_name() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    let (status, json) = create_agent(&mut app, &token, &csrf, json!({ "name": "", "command": "sh" })).await;
+    let (status, json) = create_agent(
+        &mut app,
+        &token,
+        &csrf,
+        json!({ "name": "", "command": available_test_command() }),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(json["success"], false);
     assert!(json["error"].as_str().unwrap().to_lowercase().contains("name"));
@@ -255,7 +271,7 @@ async fn update_unknown_id_returns_404() {
     let req = json_with_token(
         "PUT",
         "/api/agents/custom/does-not-exist",
-        json!({ "name": "x", "command": "sh" }),
+        json!({ "name": "x", "command": available_test_command() }),
         &token,
         &csrf,
     );
@@ -281,7 +297,7 @@ async fn update_builtin_id_returns_403() {
     let req = json_with_token(
         "PUT",
         "/api/agents/custom/agent_builtin_claude",
-        json!({ "name": "hacked", "command": "sh" }),
+        json!({ "name": "hacked", "command": available_test_command() }),
         &token,
         &csrf,
     );

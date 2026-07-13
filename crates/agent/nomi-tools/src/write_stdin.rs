@@ -647,7 +647,19 @@ mod tests {
             .await;
         let id = parse_session_id(&started.content)
             .unwrap_or_else(|| panic!("session id: {}", started.content));
-        assert!(started.content.contains("ready"), "{}", started.content);
+        let ready_content = if started.content.contains("ready") {
+            started.content
+        } else {
+            writer
+                .execute(json!({
+                    "session_id": id,
+                    "chars": "",
+                    "yield_time_ms": 5000
+                }))
+                .await
+                .content
+        };
+        assert!(ready_content.contains("ready"), "{ready_content}");
         let result = writer
             .execute(json!({
                 "session_id": id,

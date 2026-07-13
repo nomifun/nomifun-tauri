@@ -60,7 +60,7 @@ use crate::{
 const READ_BUFFER_BYTES: usize = 8 * 1024;
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
-const POST_EXIT_READER_DRAIN: Duration = Duration::from_millis(120);
+const POST_EXIT_READER_DRAIN: Duration = Duration::from_secs(1);
 const CONPTY_NATURAL_CLOSE_WAIT: Duration = Duration::from_millis(250);
 const CONPTY_INPUT_CLOSE_GRACE: Duration = Duration::from_millis(250);
 const JOB_EMPTY_POLL: Duration = Duration::from_millis(2);
@@ -2369,6 +2369,25 @@ mod tests {
         Created,
         Assigned,
         Resumed,
+    }
+
+    #[test]
+    fn finish_readers_tolerates_post_exit_scheduler_jitter() {
+        let (sender, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            sender
+                .send(Ok(()))
+                .expect("reader completion receiver should remain live");
+        });
+
+        let result = finish_readers(
+            vec![ReaderCompletion { receiver }],
+            Instant::now() + Duration::from_secs(2),
+        );
+        worker.join().expect("reader completion worker should join");
+
+        result.expect("brief scheduler jitter after exit must not make cleanup unproven");
     }
 
     struct AuditFacade {
