@@ -56,7 +56,9 @@ fn is_retryable_initial_request_error(error: &ProviderError) -> bool {
     match error {
         ProviderError::Http(err) => err.is_connect(),
         ProviderError::Connection(_) => true,
-        ProviderError::Api { status, .. } => matches!(status, 500 | 502 | 503 | 504),
+        ProviderError::Api { status, .. } => {
+            matches!(status, 500 | 502 | 503 | 504) && !error.is_tool_schema_incompatible()
+        }
         _ => false,
     }
 }

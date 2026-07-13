@@ -53,6 +53,44 @@ impl ProviderError {
             _ => false,
         }
     }
+
+    pub(crate) fn is_tool_schema_incompatible(&self) -> bool {
+        let ProviderError::Api { message, .. } = self else {
+            return false;
+        };
+        let lower = message.to_ascii_lowercase();
+        lower.contains("tool_schema_invalid")
+            || (lower.contains("input_schema")
+                && lower.contains("top level")
+                && ["oneof", "allof", "anyof"]
+                    .iter()
+                    .any(|keyword| lower.contains(keyword)))
+    }
+}
+
+/// Split the stored provider credential into individual API keys.
+///
+/// Provider settings persist multiple credentials as a comma-separated string;
+/// older data may use one key per line. Keep this parser in the provider layer
+/// so every Nomi execution path (interactive sessions, compaction and one-shot
+/// sidecars) sends one credential per HTTP request rather than the whole list
+/// as a single invalid bearer token.
+pub(crate) fn parse_api_keys(raw: &str) -> Vec<String> {
+    raw.split([',', '\n'])
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+pub(crate) fn is_api_key_rotation_error(error: &ProviderError) -> bool {
+    matches!(
+        error,
+        ProviderError::Api {
+            status: 401 | 403,
+            ..
+        } | ProviderError::RateLimited { .. }
+    )
 }
 
 /// Parse a `Retry-After` HTTP header into milliseconds, honouring the provider's
@@ -180,7 +218,7 @@ pub fn create_provider(config: &Config) -> Arc<dyn LlmProvider> {
 #[cfg(test)]
 mod retryable_tests {
     use super::ProviderError;
-    use super::parse_retry_after_ms;
+    use super::{is_api_key_rotation_error, parse_api_keys, parse_retry_after_ms};
 
     #[test]
     fn parse_retry_after_seconds_clamped() {
@@ -227,5 +265,70 @@ mod retryable_tests {
         assert!(ProviderError::Connection("x".to_string()).is_retryable());
         assert!(!ProviderError::PromptTooLong("x".to_string()).is_retryable());
         assert!(!ProviderError::Parse("x".to_string()).is_retryable());
+    }
+
+    #[test]
+    fn tool_schema_classifier_accepts_bedrock_gateway_signals() {
+        let reason = ProviderError::Api {
+            status: 500,
+            message: r#"{"reason":"TOOL_SCHEMA_INVALID"}"#.into(),
+        };
+        let wording = ProviderError::Api {
+            status: 400,
+            message: "input_schema does not support oneOf, allOf, or anyOf at the top level".into(),
+        };
+        assert!(reason.is_tool_schema_incompatible());
+        assert!(wording.is_tool_schema_incompatible());
+    }
+
+    #[test]
+    fn tool_schema_classifier_rejects_unrelated_failures() {
+        let errors = [
+            ProviderError::Api {
+                status: 500,
+                message: "upstream unavailable".into(),
+            },
+            ProviderError::Api {
+                status: 400,
+                message: "input_schema is malformed".into(),
+            },
+            ProviderError::Connection("input_schema connection reset".into()),
+        ];
+        assert!(
+            errors
+                .iter()
+                .all(|error| !error.is_tool_schema_incompatible())
+        );
+    }
+
+    #[test]
+    fn api_key_list_supports_comma_and_legacy_newline_separators() {
+        assert_eq!(
+            parse_api_keys(" key-one,\nkey-two\r\n, key-three "),
+            vec!["key-one", "key-two", "key-three"]
+        );
+        assert!(parse_api_keys(" , \n ").is_empty());
+    }
+
+    #[test]
+    fn auth_and_rate_limit_errors_rotate_api_keys() {
+        for status in [401, 403] {
+            assert!(is_api_key_rotation_error(&ProviderError::Api {
+                status,
+                message: "rejected".into(),
+            }));
+        }
+        assert!(is_api_key_rotation_error(&ProviderError::RateLimited {
+            retry_after_ms: 1000,
+            message: "limited".into(),
+        }));
+        assert!(!is_api_key_rotation_error(&ProviderError::Api {
+            status: 400,
+            message: "bad request".into(),
+        }));
+        assert!(!is_api_key_rotation_error(&ProviderError::Api {
+            status: 500,
+            message: "server error".into(),
+        }));
     }
 }

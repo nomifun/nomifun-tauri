@@ -545,3 +545,57 @@ pub fn credentials_from_config(bc: &nomi_config::config::BedrockConfig) -> AwsCr
         AwsCredentials::Environment
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nomi_types::message::{ContentBlock, Message, Role};
+    use nomi_types::tool::ToolDef;
+
+    #[test]
+    fn bedrock_request_removes_top_level_tool_schema_composition() {
+        let provider = BedrockProvider::new(
+            "us-east-1",
+            AwsCredentials::Environment,
+            false,
+            ProviderCompat::bedrock_defaults(),
+        );
+        let request = LlmRequest {
+            model: "anthropic.claude-test".into(),
+            system: "test".into(),
+            messages: vec![Message::new(
+                Role::User,
+                vec![ContentBlock::Text { text: "hi".into() }],
+            )],
+            tools: vec![ToolDef {
+                name: "Read".into(),
+                description: "Read one or more files".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "file_path": { "type": "string" },
+                        "file_paths": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        }
+                    },
+                    "oneOf": [
+                        { "required": ["file_path"] },
+                        { "required": ["file_paths"] }
+                    ]
+                }),
+                deferred: false,
+            }],
+            max_tokens: 16,
+            thinking: None,
+            reasoning_effort: None,
+        };
+
+        let body = provider.build_request_body(&request);
+        let schema = &body["tools"][0]["input_schema"];
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"].get("file_path").is_some());
+        assert!(schema["properties"].get("file_paths").is_some());
+        assert!(schema.get("oneOf").is_none());
+    }
+}

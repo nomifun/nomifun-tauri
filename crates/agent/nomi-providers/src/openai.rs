@@ -1,34 +1,44 @@
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+use nomi_config::compat::{self, ProviderCompat};
 use nomi_types::llm::{LlmEvent, LlmRequest};
 use nomi_types::message::{ContentBlock, Message, Role, StopReason, TokenUsage};
 use nomi_types::tool::{ToolDef, truncate_deferred_description};
 
 use crate::anthropic_shared::StreamOutcome;
 use crate::{LlmProvider, ProviderError};
-use nomi_config::compat::ProviderCompat;
 
 pub struct OpenAIProvider {
-    api_key: String,
+    api_keys: Vec<String>,
+    current_api_key: AtomicUsize,
     base_url: String,
     compat: ProviderCompat,
+    sanitize_tool_schemas: AtomicBool,
 }
 
 impl OpenAIProvider {
     pub fn new(api_key: &str, base_url: &str, compat: ProviderCompat) -> Self {
         Self {
-            api_key: api_key.to_string(),
+            api_keys: crate::parse_api_keys(api_key),
+            current_api_key: AtomicUsize::new(0),
             base_url: base_url.to_string(),
             compat,
+            sanitize_tool_schemas: AtomicBool::new(false),
         }
     }
 
-    fn build_headers(&self) -> Result<HeaderMap, ProviderError> {
+    fn should_sanitize_tool_schemas(&self) -> bool {
+        self.compat.sanitize_schema() || self.sanitize_tool_schemas.load(Ordering::Acquire)
+    }
+
+    fn build_headers(api_key: &str) -> Result<HeaderMap, ProviderError> {
         let mut headers = HeaderMap::new();
-        let bearer = format!("Bearer {}", self.api_key);
+        let bearer = format!("Bearer {api_key}");
         let auth = HeaderValue::from_str(&bearer).map_err(|e| {
             ProviderError::Connection(format!("Invalid authorization header: {}", e))
         })?;
@@ -316,7 +326,7 @@ impl OpenAIProvider {
         result
     }
 
-    fn build_tools(tools: &[ToolDef]) -> Vec<Value> {
+    fn build_tools(tools: &[ToolDef], sanitize: bool) -> Vec<Value> {
         tools
             .iter()
             .map(|t| {
@@ -336,12 +346,17 @@ impl OpenAIProvider {
                         }
                     })
                 } else {
+                    let parameters = if sanitize {
+                        compat::sanitize_json_schema(&t.input_schema)
+                    } else {
+                        t.input_schema.clone()
+                    };
                     json!({
                         "type": "function",
                         "function": {
                             "name": t.name,
                             "description": t.description,
-                            "parameters": t.input_schema
+                            "parameters": parameters
                         }
                     })
                 }
@@ -349,7 +364,11 @@ impl OpenAIProvider {
             .collect()
     }
 
-    fn build_request_body(&self, request: &LlmRequest) -> Value {
+    fn build_request_body(
+        &self,
+        request: &LlmRequest,
+        sanitize_tool_schemas: bool,
+    ) -> Value {
         let max_tokens_field = self
             .compat
             .max_tokens_field
@@ -370,7 +389,10 @@ impl OpenAIProvider {
         body[max_tokens_field] = json!(request.max_tokens);
 
         if !request.tools.is_empty() {
-            body["tools"] = json!(Self::build_tools(&request.tools));
+            body["tools"] = json!(Self::build_tools(
+                &request.tools,
+                sanitize_tool_schemas,
+            ));
         }
 
         if let Some(effort) = &request.reasoning_effort {
@@ -378,6 +400,80 @@ impl OpenAIProvider {
         }
 
         body
+    }
+
+    async fn send_initial(
+        client: &reqwest::Client,
+        url: &str,
+        headers: &HeaderMap,
+        body: &Value,
+    ) -> Result<reqwest::Response, ProviderError> {
+        crate::retry::with_initial_request_retry(|| async {
+            let response = client
+                .post(url)
+                .headers(headers.clone())
+                .json(body)
+                .send()
+                .await?;
+            let status = response.status();
+            if status.is_success() {
+                return Ok(response);
+            }
+            let retry_after_ms = crate::parse_retry_after_ms(response.headers()).unwrap_or(5000);
+            let body_text = response.text().await.unwrap_or_default();
+            if status.as_u16() == 429 {
+                return Err(ProviderError::RateLimited {
+                    retry_after_ms,
+                    message: crate::non_empty_rate_limit_message(body_text),
+                });
+            }
+            Err(ProviderError::Api {
+                status: status.as_u16(),
+                message: body_text,
+            })
+        })
+        .await
+    }
+
+    async fn send_initial_with_key_rotation(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        body: &Value,
+    ) -> Result<(reqwest::Response, HeaderMap), ProviderError> {
+        let mut last_error = None;
+        let key_count = self.api_keys.len();
+        let start_index = self.current_api_key.load(Ordering::Acquire) % key_count.max(1);
+
+        for offset in 0..key_count {
+            let index = (start_index + offset) % key_count;
+            let api_key = &self.api_keys[index];
+            let headers = Self::build_headers(api_key)?;
+            match Self::send_initial(client, url, &headers, body).await {
+                Ok(response) => {
+                    self.current_api_key.store(index, Ordering::Release);
+                    return Ok((response, headers));
+                }
+                Err(error) if crate::is_api_key_rotation_error(&error) && offset + 1 < key_count => {
+                    let next_index = (index + 1) % key_count;
+                    tracing::warn!(
+                        target: "nomi_providers",
+                        provider = "openai",
+                        key_index = index + 1,
+                        key_count = self.api_keys.len(),
+                        error = %error,
+                        "provider rejected API key; trying the next configured key"
+                    );
+                    self.current_api_key.store(next_index, Ordering::Release);
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            ProviderError::Connection("No usable API key configured".to_owned())
+        }))
     }
 }
 
@@ -663,39 +759,41 @@ impl LlmProvider for OpenAIProvider {
         request: &LlmRequest,
     ) -> Result<mpsc::Receiver<LlmEvent>, ProviderError> {
         let url = format!("{}{}", self.base_url, self.compat.api_path());
-        let body = self.build_request_body(request);
-        let headers = self.build_headers()?;
         let client = crate::http_client();
+
+        let sanitize_tool_schemas = self.should_sanitize_tool_schemas();
+        let mut body = self.build_request_body(request, sanitize_tool_schemas);
 
         tracing::debug!(target: "nomi_providers", body = %serde_json::to_string_pretty(&body).unwrap_or_default(), "outgoing request");
 
-        let response = crate::retry::with_initial_request_retry(|| async {
-            let response = client
-                .post(&url)
-                .headers(headers.clone())
-                .json(&body)
-                .send()
-                .await?;
-
-            let status = response.status();
-            if !status.is_success() {
-                let retry_after_ms = crate::parse_retry_after_ms(response.headers()).unwrap_or(5000);
-                let body_text = response.text().await.unwrap_or_default();
-                if status.as_u16() == 429 {
-                    return Err(ProviderError::RateLimited {
-                        retry_after_ms,
-                        message: crate::non_empty_rate_limit_message(body_text),
-                    });
-                }
-                return Err(ProviderError::Api {
-                    status: status.as_u16(),
-                    message: body_text,
-                });
+        let (response, headers) = match self
+            .send_initial_with_key_rotation(&client, &url, &body)
+            .await
+        {
+            Ok(result) => result,
+            Err(error)
+                if !request.tools.is_empty()
+                    && !sanitize_tool_schemas
+                    && error.is_tool_schema_incompatible() =>
+            {
+                let ProviderError::Api { status, .. } = &error else {
+                    unreachable!("schema classifier only accepts API errors");
+                };
+                tracing::warn!(
+                    target: "nomi_providers",
+                    provider = "openai",
+                    status,
+                    "provider rejected tool schemas; retrying with Bedrock-compatible schema roots"
+                );
+                body = self.build_request_body(request, true);
+                let (response, headers) = self
+                    .send_initial_with_key_rotation(&client, &url, &body)
+                    .await?;
+                self.sanitize_tool_schemas.store(true, Ordering::Release);
+                (response, headers)
             }
-
-            Ok(response)
-        })
-        .await?;
+            Err(error) => return Err(error),
+        };
 
         let (tx, rx) = mpsc::channel(64);
         let auto_tool_id = self.compat.auto_tool_id();
@@ -2142,7 +2240,7 @@ mod tests {
             ),
         ];
 
-        let body = provider.build_request_body(&request);
+        let body = provider.build_request_body(&request, provider.should_sanitize_tool_schemas());
         let assistant = body["messages"]
             .as_array()
             .unwrap()
@@ -2165,7 +2263,7 @@ mod tests {
             }],
         )];
 
-        let body = provider.build_request_body(&request);
+        let body = provider.build_request_body(&request, provider.should_sanitize_tool_schemas());
         assert!(
             body["messages"][0].get("reasoning_content").is_none(),
             "unrelated models must retain normal OpenAI message semantics"
@@ -2228,7 +2326,7 @@ mod tests {
             thinking: None,
             reasoning_effort: None,
         };
-        let body = provider.build_request_body(&req);
+        let body = provider.build_request_body(&req, provider.should_sanitize_tool_schemas());
         assert_eq!(body["max_tokens"], 1024);
         assert!(body.get("max_completion_tokens").is_none());
     }
@@ -2249,7 +2347,7 @@ mod tests {
             thinking: None,
             reasoning_effort: None,
         };
-        let body = provider.build_request_body(&req);
+        let body = provider.build_request_body(&req, provider.should_sanitize_tool_schemas());
         assert_eq!(body["max_completion_tokens"], 2048);
         assert!(body.get("max_tokens").is_none());
     }
@@ -2491,7 +2589,7 @@ mod tests {
                 deferred: true,
             },
         ];
-        let result = OpenAIProvider::build_tools(&tools);
+        let result = OpenAIProvider::build_tools(&tools, false);
 
         // Core tool has full parameters
         let read_params = &result[0]["function"]["parameters"];
@@ -2502,6 +2600,38 @@ mod tests {
         assert!(spawn_params["properties"].as_object().unwrap().is_empty());
         let spawn_desc = result[1]["function"]["description"].as_str().unwrap();
         assert!(spawn_desc.contains("ToolSearch"));
+    }
+
+    #[test]
+    fn test_request_body_uses_explicit_schema_sanitize_snapshot() {
+        let provider = OpenAIProvider::new("key", "http://localhost", openai_compat());
+        let mut request = simple_request();
+        request.tools.push(ToolDef {
+            name: "Read".into(),
+            description: "Read a file".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "oneOf": [{ "required": ["path"] }]
+            }),
+            deferred: false,
+        });
+
+        provider.sanitize_tool_schemas.store(true, Ordering::Release);
+
+        let unsanitized = provider.build_request_body(&request, false);
+        assert!(
+            unsanitized["tools"][0]["function"]["parameters"]
+                .get("oneOf")
+                .is_some()
+        );
+
+        let sanitized = provider.build_request_body(&request, true);
+        assert!(
+            sanitized["tools"][0]["function"]["parameters"]
+                .get("oneOf")
+                .is_none()
+        );
     }
 
     #[test]

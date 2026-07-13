@@ -20,6 +20,12 @@ impl ToolRegistry {
         self.tools.push(tool);
     }
 
+    /// Remove every registered tool.
+    /// Unlike an empty allowlist, this is an explicit deny-all operation.
+    pub fn clear(&mut self) {
+        self.tools.clear();
+    }
+
     /// Find a tool by name
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
         self.tools
@@ -310,6 +316,15 @@ mod tests {
         assert!(registry.get("Grep").is_some());
         assert!(registry.get("Bash").is_none(), "白名单外的工具必须被移除");
         assert_eq!(registry.tool_names().len(), 2);
+    }
+
+    #[test]
+    fn clear_removes_every_registered_tool() {
+        let mut registry = ToolRegistry::new();
+        registry.register(make_tool("Read", "read files"));
+        registry.register(make_tool("exec_command", "run commands"));
+        registry.clear();
+        assert!(registry.tool_names().is_empty());
     }
 
     // --- deferred flag tests ---
