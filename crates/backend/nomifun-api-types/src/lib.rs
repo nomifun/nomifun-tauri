@@ -220,8 +220,8 @@ pub use skill::{
     MaterializeSkillsResponse, MaterializedSkillRef, NamedPathResponse, ReadPresetRuleRequest,
     ReadBuiltinResourceRequest, ReadSkillInfoRequest, ReadSkillInfoResponse,
     RemoveExternalPathRequest, ScanForSkillsRequest, ScanForSkillsResponse, ScannedSkillResponse,
-    SetSkillTagsRequest, SkillListItemResponse, SkillPathsResponse, SkillSourceResponse,
-    WritePresetRuleRequest,
+    SetSkillTagsRequest, SkillListItemResponse, SkillMarketItemResponse, SkillMarketSyncRequest,
+    SkillMarketSyncResponse, SkillPathsResponse, SkillSourceResponse, WritePresetRuleRequest,
 };
 pub use system::{
     ClientPreferencesResponse, SystemSettingsResponse, UpdateClientPreferencesRequest,

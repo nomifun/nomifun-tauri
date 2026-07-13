@@ -64,6 +64,25 @@
     "tagsSaved": "标签已保存",
     "tagsSaveFailed": "保存标签失败"
   },
+  "skillsPage": {
+    "libraryTab": "已安装技能",
+    "marketTab": "技能市场"
+  },
+  "skillsMarket": {
+    "title": "技能市场",
+    "description": "浏览 ClawHub 与 Skills.sh 当前榜单，并把经过检查的安装草稿交给 Nomi。",
+    "syncSuccess": "技能市场已更新",
+    "syncEmpty": "未采集到榜单数据。",
+    "syncError": "更新技能市场失败",
+    "openMarketFailed": "无法打开技能市场",
+    "searchPlaceholder": "搜索当前市场技能...",
+    "empty": "暂未获取到榜单数据，请点击刷新重试。",
+    "noSearchMatch": "{{source}} 中未找到与“{{query}}”相关的技能。",
+    "noMatch": "没有符合当前筛选条件的技能。",
+    "noDescription": "暂无描述。",
+    "lastUpdated": "上次更新：{{time}}",
+    "openInBrowser": "在浏览器中打开市场"
+  },
   "agentSkillImport": {
     "title": "从 Agent 导入",
     "shortAction": "从 Agent 导入",

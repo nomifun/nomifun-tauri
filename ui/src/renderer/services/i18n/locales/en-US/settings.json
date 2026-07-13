@@ -64,6 +64,25 @@
     "tagsSaved": "Tags saved",
     "tagsSaveFailed": "Failed to save tags"
   },
+  "skillsPage": {
+    "libraryTab": "Installed Skills",
+    "marketTab": "Skill Market"
+  },
+  "skillsMarket": {
+    "title": "Skill Market",
+    "description": "Browse current ClawHub and Skills.sh rankings, then hand a reviewed installation draft to Nomi.",
+    "syncSuccess": "Skill Market updated",
+    "syncEmpty": "No ranking data was found.",
+    "syncError": "Failed to update Skill Market",
+    "openMarketFailed": "Unable to open the Skill Market",
+    "searchPlaceholder": "Search skills in this market...",
+    "empty": "Ranking data is not available yet. Refresh to try again.",
+    "noSearchMatch": "No {{source}} skills matched “{{query}}”.",
+    "noMatch": "No skills match the current filters.",
+    "noDescription": "No description available.",
+    "lastUpdated": "Last updated: {{time}}",
+    "openInBrowser": "Open market in browser"
+  },
   "agentSkillImport": {
     "title": "Import from Agent",
     "shortAction": "Import from Agent",

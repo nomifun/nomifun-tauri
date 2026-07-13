@@ -315,6 +315,26 @@ const NomiSendBox: React.FC<{
   useEffect(() => {
     if (!conversation_id || !current_model?.use_model) return;
 
+    const draftStorageKey = `nomi_draft_message_${conversation_id}`;
+    const draftProcessedKey = `nomi_draft_processed_${conversation_id}`;
+    if (!sessionStorage.getItem(draftProcessedKey)) {
+      const storedDraft = sessionStorage.getItem(draftStorageKey);
+      if (storedDraft) {
+        sessionStorage.setItem(draftProcessedKey, '1');
+        sessionStorage.removeItem(draftStorageKey);
+        try {
+          const { input } = JSON.parse(storedDraft) as { input?: unknown };
+          if (typeof input === 'string') {
+            setContent(input.slice(0, 6000));
+          }
+        } catch (error) {
+          console.error('[NomiSendBox] Failed to fill draft message:', error);
+          sessionStorage.removeItem(draftProcessedKey);
+        }
+        return;
+      }
+    }
+
     const storageKey = `nomi_initial_message_${conversation_id}`;
     const processedKey = `nomi_initial_processed_${conversation_id}`;
 
@@ -336,7 +356,7 @@ const NomiSendBox: React.FC<{
     };
 
     void processInitialMessage();
-  }, [conversation_id, current_model?.use_model, executeCommand]);
+  }, [conversation_id, current_model?.use_model, executeCommand, setContent]);
 
   const onSendHandler = async (message: string) => {
     const filesToSend = collectSelectedFiles(uploadFile, atPath);

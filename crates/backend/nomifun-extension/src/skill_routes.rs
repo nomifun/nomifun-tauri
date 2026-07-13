@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
@@ -12,7 +13,8 @@ use nomifun_api_types::{
     ImportSkillRequest, ImportSkillResponse, MaterializeSkillsRequest, MaterializeSkillsResponse, MaterializedSkillRef,
     NamedPathResponse, ReadPresetRuleRequest, ReadBuiltinResourceRequest, ReadSkillInfoRequest,
     ReadSkillInfoResponse, RemoveExternalPathRequest, ScanForSkillsRequest, ScanForSkillsResponse,
-    ScannedSkillResponse, SetSkillTagsRequest, SkillListItemResponse, SkillPathsResponse, SkillSourceResponse,
+    ScannedSkillResponse, SetSkillTagsRequest, SkillListItemResponse, SkillMarketItemResponse,
+    SkillMarketSyncRequest, SkillMarketSyncResponse, SkillPathsResponse, SkillSourceResponse,
     WritePresetRuleRequest,
 };
 use nomifun_common::AppError;
@@ -97,6 +99,10 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
         // Skills market
         .route("/api/skills/market/enable", post(enable_skills_market))
         .route("/api/skills/market/disable", post(disable_skills_market))
+        .route(
+            "/api/skills/market/rankings/sync",
+            post(sync_skill_market_rankings),
+        )
         .with_state(state)
 }
 
@@ -561,6 +567,502 @@ async fn disable_skills_market(State(state): State<SkillRouterState>) -> Result<
     Ok(Json(ApiResponse::success()))
 }
 
+async fn sync_skill_market_rankings(
+    body: Result<Json<SkillMarketSyncRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<SkillMarketSyncResponse>>, AppError> {
+    let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let resp = fetch_skill_market_rankings(req.sources).await?;
+    Ok(Json(ApiResponse::ok(resp)))
+}
+
+const CLAWHUB_SOURCE: &str = "clawhub";
+const SKILLS_SH_SOURCE: &str = "skills_sh";
+const CLAWHUB_RANKING_URL: &str = "https://clawhub.ai/";
+const SKILLS_SH_RANKING_URL: &str = "https://www.skills.sh/";
+// Skills.sh is currently just under 1 MiB. Keep a bounded amount of headroom
+// for normal page growth while still preventing an unbounded response body.
+const MAX_MARKET_BODY_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_MARKET_ITEMS_PER_SOURCE: usize = 40;
+
+async fn fetch_skill_market_rankings(sources: Vec<String>) -> Result<SkillMarketSyncResponse, AppError> {
+    let selected = normalize_market_sources(sources)?;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(3))
+        .timeout(Duration::from_secs(12))
+        .user_agent("NomiFun-SkillMarket/1.0")
+        .build()
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let include_clawhub = selected.contains(&CLAWHUB_SOURCE);
+    let include_skills_sh = selected.contains(&SKILLS_SH_SOURCE);
+    // The sources are independent. Fetch them concurrently so one slow market
+    // cannot make the user wait for two sequential timeout windows.
+    let (clawhub_result, skills_sh_result) = tokio::join!(
+        async {
+            if include_clawhub {
+                Some(fetch_market_source(&client, CLAWHUB_SOURCE).await)
+            } else {
+                None
+            }
+        },
+        async {
+            if include_skills_sh {
+                Some(fetch_market_source(&client, SKILLS_SH_SOURCE).await)
+            } else {
+                None
+            }
+        }
+    );
+
+    let mut items = Vec::new();
+    let mut errors = Vec::new();
+    for (source, result) in [
+        (CLAWHUB_SOURCE, clawhub_result),
+        (SKILLS_SH_SOURCE, skills_sh_result),
+    ] {
+        if let Some(result) = result {
+            match result {
+                Ok(mut source_items) => items.append(&mut source_items),
+                Err(error) => errors.push(format!("{source}: {error}")),
+            }
+        }
+    }
+
+    Ok(SkillMarketSyncResponse {
+        fetched_at: now_epoch_ms(),
+        items,
+        errors,
+    })
+}
+
+fn normalize_market_sources(sources: Vec<String>) -> Result<Vec<&'static str>, AppError> {
+    if sources.is_empty() {
+        return Ok(vec![CLAWHUB_SOURCE, SKILLS_SH_SOURCE]);
+    }
+
+    let mut selected = Vec::new();
+    let mut seen = HashSet::new();
+    for source in sources {
+        let normalized = source.trim().to_ascii_lowercase();
+        let source = match normalized.as_str() {
+            CLAWHUB_SOURCE => CLAWHUB_SOURCE,
+            SKILLS_SH_SOURCE => SKILLS_SH_SOURCE,
+            other => return Err(AppError::BadRequest(format!("unsupported skill market source: {other}"))),
+        };
+        if seen.insert(source) {
+            selected.push(source);
+        }
+    }
+    Ok(selected)
+}
+
+async fn fetch_market_source(
+    client: &reqwest::Client,
+    source: &'static str,
+) -> Result<Vec<SkillMarketItemResponse>, AppError> {
+    let url = match source {
+        CLAWHUB_SOURCE => CLAWHUB_RANKING_URL,
+        SKILLS_SH_SOURCE => SKILLS_SH_RANKING_URL,
+        _ => return Err(AppError::BadRequest("unsupported skill market source".into())),
+    };
+
+    let mut response = client.get(url).send().await.map_err(map_market_fetch_error)?;
+    if !response.status().is_success() {
+        return Err(AppError::BadGateway(format!("ranking page returned {}", response.status())));
+    }
+    if response.content_length().unwrap_or(0) > MAX_MARKET_BODY_BYTES {
+        return Err(AppError::BadGateway("ranking page is too large".into()));
+    }
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(map_market_fetch_error)? {
+        if bytes.len().saturating_add(chunk.len()) as u64 > MAX_MARKET_BODY_BYTES {
+            return Err(AppError::BadGateway("ranking page is too large".into()));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    let html = String::from_utf8_lossy(&bytes);
+    Ok(match source {
+        CLAWHUB_SOURCE => parse_clawhub_rankings(&html),
+        SKILLS_SH_SOURCE => parse_skills_sh_rankings(&html),
+        _ => Vec::new(),
+    })
+}
+
+fn map_market_fetch_error(error: reqwest::Error) -> AppError {
+    if error.is_timeout() {
+        AppError::Timeout(format!("skill market fetch timed out: {error}"))
+    } else {
+        AppError::BadGateway(format!("skill market fetch failed: {error}"))
+    }
+}
+
+fn parse_clawhub_rankings(html: &str) -> Vec<SkillMarketItemResponse> {
+    let mut seen = HashSet::new();
+    let mut parsed = Vec::new();
+
+    for (href, text) in market_anchors(html) {
+        let Some(url) = market_url(CLAWHUB_SOURCE, &href) else {
+            continue;
+        };
+        let Some((owner, slug)) = clawhub_owner_slug(&url) else {
+            continue;
+        };
+        let id = format!("{CLAWHUB_SOURCE}:{owner}/{slug}");
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+
+        let name = extract_clawhub_name(&text, &owner, &slug);
+        let description = extract_clawhub_description(&text, &owner, &name);
+        let stats = extract_stats(&text);
+        let (tags, audience_tags, scenario_tags) = infer_market_tags(&format!("{name} {description}"));
+        let rank = parsed.len() + 1;
+        parsed.push(SkillMarketItemResponse {
+            id,
+            source: CLAWHUB_SOURCE.into(),
+            rank,
+            name,
+            description,
+            url: format!("https://clawhub.ai/{owner}/skills/{slug}"),
+            install_command: format!("openclaw skills install @{owner}/{slug}"),
+            tags,
+            audience_tags,
+            scenario_tags,
+            stats,
+        });
+        if parsed.len() >= MAX_MARKET_ITEMS_PER_SOURCE {
+            break;
+        }
+    }
+
+    parsed
+}
+
+fn parse_skills_sh_rankings(html: &str) -> Vec<SkillMarketItemResponse> {
+    let mut seen = HashSet::new();
+    let mut parsed = Vec::new();
+
+    for (href, text) in market_anchors(html) {
+        let Some(url) = market_url(SKILLS_SH_SOURCE, &href) else {
+            continue;
+        };
+        let Some((owner, slug)) = skills_sh_owner_slug(&url) else {
+            continue;
+        };
+        let id = format!("{SKILLS_SH_SOURCE}:{owner}/skills/{slug}");
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+
+        let name = extract_skills_sh_name(&text, &owner, &slug);
+        let stats = extract_stats(&text);
+        let description = extract_skills_sh_description(&text, &owner, &name, stats.as_deref());
+        let (tags, audience_tags, scenario_tags) = infer_market_tags(&format!("{name} {description}"));
+        let install_command = if owner.contains('.') {
+            format!("npx skills add https://www.skills.sh/{owner}/skills/{slug}")
+        } else {
+            format!("npx skills add https://github.com/{owner}/skills --skill {slug}")
+        };
+        let rank = parsed.len() + 1;
+        parsed.push(SkillMarketItemResponse {
+            id,
+            source: SKILLS_SH_SOURCE.into(),
+            rank,
+            name,
+            description,
+            url: format!("https://www.skills.sh/{owner}/skills/{slug}"),
+            install_command,
+            tags,
+            audience_tags,
+            scenario_tags,
+            stats,
+        });
+        if parsed.len() >= MAX_MARKET_ITEMS_PER_SOURCE {
+            break;
+        }
+    }
+
+    parsed
+}
+
+fn market_anchors(html: &str) -> Vec<(String, String)> {
+    let anchor_re = regex::Regex::new(r#"(?is)<a\b[^>]*\bhref=["']([^"']+)["'][^>]*>(.*?)</a>"#).unwrap();
+    anchor_re
+        .captures_iter(html)
+        .filter_map(|cap| {
+            let href = cap.get(1)?.as_str().trim();
+            let inner = cap.get(2)?.as_str();
+            let text = clean_market_text(&strip_html_tags(inner), 360);
+            if href.is_empty() || text.is_empty() {
+                return None;
+            }
+            Some((href.to_string(), text))
+        })
+        .collect()
+}
+
+fn market_url(source: &str, href: &str) -> Option<String> {
+    let href = href.trim();
+    if href.starts_with('#') || href.starts_with("mailto:") || href.starts_with("javascript:") {
+        return None;
+    }
+    let url = if href.starts_with("http://") || href.starts_with("https://") {
+        href.to_string()
+    } else if href.starts_with('/') {
+        match source {
+            CLAWHUB_SOURCE => format!("https://clawhub.ai{href}"),
+            SKILLS_SH_SOURCE => format!("https://www.skills.sh{href}"),
+            _ => return None,
+        }
+    } else {
+        return None;
+    };
+
+    match source {
+        CLAWHUB_SOURCE if url.starts_with("https://clawhub.ai/") => Some(url),
+        SKILLS_SH_SOURCE if url.starts_with("https://www.skills.sh/") || url.starts_with("https://skills.sh/") => {
+            Some(url.replacen("https://skills.sh/", "https://www.skills.sh/", 1))
+        }
+        _ => None,
+    }
+}
+
+fn clawhub_owner_slug(url: &str) -> Option<(String, String)> {
+    let segments = market_path_segments(url, "https://clawhub.ai")?;
+    let reserved = ["skills", "plugins", "docs", "about", "login", "sign-in", "search"];
+    if segments.len() >= 3 && segments.get(1).is_some_and(|s| s == "skills") {
+        return valid_owner_slug(&segments[0], &segments[2]);
+    }
+    if segments.len() == 2 && !reserved.contains(&segments[0].as_str()) && !reserved.contains(&segments[1].as_str()) {
+        return valid_owner_slug(&segments[0], &segments[1]);
+    }
+    None
+}
+
+fn skills_sh_owner_slug(url: &str) -> Option<(String, String)> {
+    let segments = market_path_segments(url, "https://www.skills.sh")?;
+    if segments.len() >= 3 && segments.get(1).is_some_and(|s| s == "skills") {
+        return valid_owner_slug(&segments[0], &segments[2]);
+    }
+    None
+}
+
+fn market_path_segments(url: &str, origin: &str) -> Option<Vec<String>> {
+    let rest = url.strip_prefix(origin)?;
+    let path = rest
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_matches('/');
+    if path.is_empty() {
+        return None;
+    }
+    Some(path.split('/').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+}
+
+fn valid_owner_slug(owner: &str, slug: &str) -> Option<(String, String)> {
+    if is_market_slug(owner) && is_market_slug(slug) {
+        Some((owner.to_string(), slug.to_string()))
+    } else {
+        None
+    }
+}
+
+fn is_market_slug(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 96
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+fn extract_clawhub_name(text: &str, owner: &str, slug: &str) -> String {
+    let owner_marker = format!("@ {owner}");
+    let before_owner = text
+        .split(&owner_marker)
+        .next()
+        .unwrap_or(text)
+        .split('@')
+        .next()
+        .unwrap_or(text);
+    let candidate = clean_market_text(before_owner.trim_matches(|c: char| c == '#' || c.is_ascii_digit()), 80);
+    if candidate.len() >= 2 {
+        candidate
+    } else {
+        title_from_slug(slug)
+    }
+}
+
+fn extract_clawhub_description(text: &str, owner: &str, name: &str) -> String {
+    let owner_marker = format!("@ {owner}");
+    let tail = text.split(&owner_marker).nth(1).unwrap_or(text);
+    let cleaned = strip_known_stats(tail);
+    let cleaned = clean_market_text(&cleaned.replace(name, ""), 180);
+    if cleaned.len() >= 12 {
+        cleaned
+    } else {
+        "Trending ClawHub skill package.".into()
+    }
+}
+
+fn extract_skills_sh_name(text: &str, owner: &str, slug: &str) -> String {
+    let repo_marker = format!("{owner}/skills");
+    let before_repo = text.split(&repo_marker).next().unwrap_or(text);
+    let candidate = clean_market_text(
+        before_repo.trim_matches(|c: char| c == '#' || c.is_ascii_digit() || c == '.'),
+        80,
+    );
+    if candidate.len() >= 2 && !candidate.eq_ignore_ascii_case("skill") {
+        candidate
+    } else {
+        title_from_slug(slug)
+    }
+}
+
+fn extract_skills_sh_description(text: &str, owner: &str, name: &str, stats: Option<&str>) -> String {
+    let without_stats = stats.map_or_else(|| text.to_string(), |s| text.replace(s, ""));
+    let without_repo = without_stats.replace(&format!("{owner}/skills"), "");
+    let cleaned = clean_market_text(&without_repo.replace(name, ""), 180);
+    if cleaned.len() >= 18 {
+        cleaned
+    } else {
+        format!("Ranked Skills.sh skill from {owner}/skills.")
+    }
+}
+
+fn extract_stats(text: &str) -> Option<String> {
+    let stats_re =
+        regex::Regex::new(r"(?i)(\d+(?:\.\d+)?\s*[km]?\+?\s*(?:installs?|downloads?|uses?|stars?)?)").unwrap();
+    let mut matches = stats_re
+        .captures_iter(text)
+        .filter_map(|cap| cap.get(1).map(|m| clean_market_text(m.as_str(), 40)))
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    matches.dedup();
+    matches.last().cloned()
+}
+
+fn strip_known_stats(text: &str) -> String {
+    let stats_re = regex::Regex::new(r"(?i)\d+(?:\.\d+)?\s*[km]?\+?\s*(?:installs?|downloads?|uses?|stars?)?").unwrap();
+    stats_re.replace_all(text, " ").to_string()
+}
+
+fn strip_html_tags(html: &str) -> String {
+    let tag_re = regex::Regex::new(r"(?is)<[^>]+>").unwrap();
+    tag_re.replace_all(html, " ").to_string()
+}
+
+fn clean_market_text(text: &str, max_chars: usize) -> String {
+    let decoded = text
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ");
+    let mut out = String::new();
+    let mut last_was_space = false;
+    for ch in decoded.chars() {
+        let is_space = ch.is_whitespace() || ch.is_control();
+        if is_space {
+            if !last_was_space {
+                out.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_was_space = false;
+        }
+        if out.chars().count() >= max_chars {
+            break;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn title_from_slug(slug: &str) -> String {
+    slug.split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn infer_market_tags(text: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let lower = text.to_ascii_lowercase();
+    let mut audience = Vec::new();
+    let mut scenario = Vec::new();
+
+    if contains_any(&lower, &["code", "github", "git", "api", "cli", "npm", "python", "typescript", "developer"]) {
+        audience.push("developer".to_string());
+        scenario.push("coding".to_string());
+    }
+    if contains_any(&lower, &["doc", "pdf", "word", "office", "excel", "sheet", "ppt", "slide"]) {
+        audience.push("office".to_string());
+        if contains_any(&lower, &["excel", "sheet", "spreadsheet"]) {
+            scenario.push("spreadsheet".to_string());
+        }
+        if contains_any(&lower, &["ppt", "slide", "presentation"]) {
+            scenario.push("presentation".to_string());
+        }
+        if contains_any(&lower, &["doc", "pdf", "word"]) {
+            scenario.push("document".to_string());
+        }
+    }
+    if contains_any(&lower, &["design", "image", "figma", "ui", "ux"]) {
+        audience.push("designer".to_string());
+        scenario.push("design".to_string());
+    }
+    if contains_any(&lower, &["research", "paper", "academic", "web search"]) {
+        audience.push("student".to_string());
+        scenario.push("research".to_string());
+    }
+    if contains_any(&lower, &["write", "blog", "copy", "content"]) {
+        scenario.push("writing".to_string());
+    }
+    if contains_any(&lower, &["plan", "project", "task", "calendar"]) {
+        scenario.push("planning".to_string());
+    }
+    if contains_any(&lower, &["social", "tweet", "x.com", "marketing"]) {
+        audience.push("marketing".to_string());
+        scenario.push("social".to_string());
+    }
+    if contains_any(&lower, &["setup", "install", "configure", "config"]) {
+        scenario.push("setup".to_string());
+    }
+
+    dedup_strings(&mut audience);
+    dedup_strings(&mut scenario);
+    let mut tags = audience.clone();
+    tags.extend(scenario.clone());
+    dedup_strings(&mut tags);
+    (tags, audience, scenario)
+}
+
+fn contains_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+fn dedup_strings(values: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    values.retain(|value| seen.insert(value.clone()));
+}
+
+fn now_epoch_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
@@ -627,5 +1129,66 @@ mod tests {
     async fn skill_routes_builds_router() {
         let state = make_state().await;
         let _router = skill_routes(state);
+    }
+
+    #[test]
+    fn normalize_market_sources_rejects_unknown_source() {
+        let err = normalize_market_sources(vec!["unknown".into()]).unwrap_err();
+        assert!(err.to_string().contains("unsupported skill market source"));
+    }
+
+    #[test]
+    fn parse_clawhub_rankings_extracts_safe_install_command() {
+        let html = r#"
+          <a href="/pskoett/self-improving-agent">
+            <span>self-improving agent</span>
+            <span>@<!-- -->pskoett</span>
+            <p>Captures discoveries from agent sessions into reusable skills.</p>
+            <span>468k installs</span>
+          </a>
+        "#;
+        let items = parse_clawhub_rankings(html);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].source, CLAWHUB_SOURCE);
+        assert_eq!(items[0].install_command, "openclaw skills install @pskoett/self-improving-agent");
+        assert!(items[0].url.starts_with("https://clawhub.ai/"));
+    }
+
+    #[test]
+    fn parse_skills_sh_rankings_extracts_skills_command() {
+        let html = r#"
+          <a href="/vercel-labs/skills/find-skills">
+            <span>find-skills</span>
+            <span>vercel-labs/skills</span>
+            <span>2.5M installs</span>
+          </a>
+        "#;
+        let items = parse_skills_sh_rankings(html);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].source, SKILLS_SH_SOURCE);
+        assert_eq!(
+            items[0].install_command,
+            "npx skills add https://github.com/vercel-labs/skills --skill find-skills"
+        );
+    }
+
+    /// Manual contract smoke test for the two third-party pages. Kept ignored
+    /// in normal CI because it requires public network access and those sites
+    /// are outside NomiFun's availability control.
+    #[tokio::test]
+    #[ignore = "requires public ClawHub and Skills.sh access"]
+    async fn live_market_pages_still_match_the_ranking_contract() {
+        let response = fetch_skill_market_rankings(vec![CLAWHUB_SOURCE.into(), SKILLS_SH_SOURCE.into()])
+            .await
+            .unwrap();
+
+        assert!(response.errors.is_empty(), "live fetch errors: {:?}", response.errors);
+        assert!(response.items.iter().any(|item| item.source == CLAWHUB_SOURCE));
+        assert!(response.items.iter().any(|item| item.source == SKILLS_SH_SOURCE));
+        assert!(response.items.iter().all(|item| {
+            item.url.starts_with("https://")
+                && (item.install_command.starts_with("openclaw skills install @")
+                    || item.install_command.starts_with("npx skills add "))
+        }));
     }
 }

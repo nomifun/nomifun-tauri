@@ -16,16 +16,18 @@ import { useGuidModelSelection } from '@/renderer/pages/guid/hooks/useGuidModelS
 export interface NomiQuickStartOptions {
   /** Conversation title. */
   name: string;
-  /** First user message — auto-sent by NomiSendBox once the model is ready. */
+  /** Initial user content, either sent automatically or restored as a draft. */
   prompt: string;
+  /** Defaults to true. When false, the prompt is prefilled instead of sent. */
+  send?: boolean;
 }
 
 /**
- * Spin up a fresh Nomi conversation seeded with an initial prompt, then jump to
+ * Spin up a fresh Nomi conversation seeded with initial content, then jump to
  * it. Mirrors the Nomi branch of `useGuidSend`: create → refresh history →
- * stash the initial message in sessionStorage (consumed by `NomiSendBox`) →
- * navigate. Used by the "one-click install" / "set up with Nomi" buttons so a
- * single click hands the task to the built-in Nomi agent.
+ * stash the initial content in sessionStorage (consumed by `NomiSendBox`) →
+ * navigate. Callers can opt out of auto-send when the user must review or
+ * confirm the content first.
  */
 export const useNomiQuickStart = () => {
   const { t } = useTranslation();
@@ -33,7 +35,7 @@ export const useNomiQuickStart = () => {
   const { current_model } = useGuidModelSelection('nomi');
 
   const start = useCallback(
-    async ({ name, prompt }: NomiQuickStartOptions): Promise<boolean> => {
+    async ({ name, prompt, send = true }: NomiQuickStartOptions): Promise<boolean> => {
       if (!current_model) {
         Message.warning(t('conversation.noModelConfigured'));
         return false;
@@ -50,7 +52,10 @@ export const useNomiQuickStart = () => {
           return false;
         }
         emitter.emit('chat.history.refresh');
-        sessionStorage.setItem(`nomi_initial_message_${conversation.id}`, JSON.stringify({ input: prompt }));
+        sessionStorage.setItem(
+          send ? `nomi_initial_message_${conversation.id}` : `nomi_draft_message_${conversation.id}`,
+          JSON.stringify({ input: prompt })
+        );
         seedConversationCache(conversation);
         await navigate(`/conversation/${conversation.id}`);
         return true;

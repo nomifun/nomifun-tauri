@@ -5,7 +5,9 @@ notes at a high level rather than a complete historical log.
 
 ## Unreleased
 
-No unreleased changes yet.
+- Added a Skill Market tab to the independent Skills capability, with bounded
+  ClawHub and Skills.sh ranking sync, tag/search filtering, localized skill
+  descriptions, and a reviewed installation draft handoff to Nomi.
 
 ## v0.1.13 - 2026-07-01
 

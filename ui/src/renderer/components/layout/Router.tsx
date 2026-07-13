@@ -9,7 +9,7 @@ import { isTauriRuntime } from '@/common/adapter/tauriRuntime';
 const Conversation = React.lazy(() => import('@renderer/pages/conversation'));
 const Guid = React.lazy(() => import('@renderer/pages/guid'));
 const PresetSettings = React.lazy(() => import('@renderer/pages/settings/PresetSettings'));
-const SkillsHubSettings = React.lazy(() => import('@renderer/pages/settings/SkillsHubSettings'));
+const SkillsSettingsPage = React.lazy(() => import('@renderer/pages/settings/SkillsSettingsPage'));
 const ModelHubPage = React.lazy(() => import('@renderer/pages/modelHub'));
 const McpPage = React.lazy(() => import('@renderer/pages/mcp'));
 const OpenCapabilitiesPage = React.lazy(() => import('@renderer/pages/openCapabilities'));
@@ -172,7 +172,7 @@ const PanelRoute: React.FC<{ layout: React.ReactElement }> = ({ layout }) => {
           <Route path='/mcp' element={withRouteFallback(McpPage)} />
           <Route path='/open-capabilities' element={withRouteFallback(OpenCapabilitiesPage)} />
           <Route path='/presets' element={withRouteFallback(PresetSettings)} />
-          <Route path='/skills' element={withRouteFallback(SkillsHubSettings)} />
+          <Route path='/skills' element={withRouteFallback(SkillsSettingsPage)} />
           {/* Session section — the secondary sidebar (ContentSider) persists across these routes */}
           <Route
             element={
