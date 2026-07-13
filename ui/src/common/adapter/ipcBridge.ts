@@ -679,6 +679,28 @@ export const dialog = {
 // File System — routed to /api/fs/* and /api/skills/*
 // ---------------------------------------------------------------------------
 
+export type SkillMarketSource = 'clawhub' | 'shillhub';
+
+export interface ISkillMarketItem {
+  id: string;
+  source: SkillMarketSource;
+  rank: number;
+  name: string;
+  description: string;
+  url: string;
+  install_command: string;
+  tags?: string[];
+  audience_tags?: string[];
+  scenario_tags?: string[];
+  stats?: string;
+}
+
+export interface ISkillMarketSyncResponse {
+  fetched_at: number;
+  items: ISkillMarketItem[];
+  errors?: string[];
+}
+
 export const fs = {
   getFilesByDir: httpPost<Array<IDirOrFile>, { dir: string; root: string }>('/api/fs/dir'),
   listWorkspaceFiles: withResponseMap(
@@ -784,6 +806,9 @@ export const fs = {
   ),
   enableSkillsMarket: httpPost<void, void>('/api/skills/market/enable'),
   disableSkillsMarket: httpPost<void, void>('/api/skills/market/disable'),
+  syncSkillMarketRankings: httpPost<ISkillMarketSyncResponse, { sources?: SkillMarketSource[] }>(
+    '/api/skills/market/rankings/sync'
+  ),
 };
 
 // ---------------------------------------------------------------------------

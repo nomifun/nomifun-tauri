@@ -26,6 +26,7 @@ import coworkSvg from '@/renderer/assets/icons/cowork.svg';
 import NomiScrollArea from '@/renderer/components/base/NomiScrollArea';
 import HubPageShell from '@/renderer/components/layout/HubPageShell';
 import { useDetectedAgents, useAssistantEditor, useAssistantList, useAssistantTags } from '@/renderer/hooks/assistant';
+import SkillMarketSettings from '../SkillMarketSettings';
 import SkillsHubSettings from '../SkillsHubSettings';
 import { resolveAvatarImageSrc } from './assistantUtils';
 import AssistantEditDrawer from './AssistantEditDrawer';
@@ -39,10 +40,10 @@ type AssistantNavigationState = {
   openAssistantEditor?: boolean;
 };
 const OPEN_ASSISTANT_EDITOR_INTENT_KEY = 'guid.openAssistantEditorIntent';
-type AssistantSkillsTab = 'assistants' | 'skills';
+type AssistantSkillsTab = 'assistants' | 'skills' | 'market';
 
 const isAssistantSkillsTab = (value: string | null): value is AssistantSkillsTab =>
-  value === 'assistants' || value === 'skills';
+  value === 'assistants' || value === 'skills' || value === 'market';
 
 const AssistantSettings: React.FC = () => {
   const { t } = useTranslation();
@@ -275,7 +276,7 @@ const AssistantSettings: React.FC = () => {
         activeTab={activeTab}
         onChange={handleTabChange}
         type='line'
-        className='flex flex-col flex-1 min-h-0 [&>.arco-tabs-content]:pt-0'
+        className='flex flex-col flex-1 min-h-0 md:mt-[-44px] [&>.arco-tabs-content]:pt-0 [&_.arco-tabs-header-nav]:ml-auto'
       >
         <Tabs.TabPane
           key='assistants'
@@ -285,6 +286,9 @@ const AssistantSettings: React.FC = () => {
         </Tabs.TabPane>
         <Tabs.TabPane key='skills' title={t('settings.assistantSkillsHub.skillsTab', { defaultValue: 'Skills' })}>
           <SkillsHubSettings withWrapper={false} />
+        </Tabs.TabPane>
+        <Tabs.TabPane key='market' title={t('settings.assistantSkillsHub.marketTab', { defaultValue: '技能市场' })}>
+          <SkillMarketSettings />
         </Tabs.TabPane>
       </Tabs>
     </HubPageShell>

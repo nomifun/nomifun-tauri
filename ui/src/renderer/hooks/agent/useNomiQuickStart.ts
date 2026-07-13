@@ -18,6 +18,8 @@ export interface NomiQuickStartOptions {
   name: string;
   /** First user message — auto-sent by NomiSendBox once the model is ready. */
   prompt: string;
+  /** Defaults to true. When false, the prompt is prefilled instead of sent. */
+  send?: boolean;
 }
 
 /**
@@ -33,7 +35,7 @@ export const useNomiQuickStart = () => {
   const { current_model } = useGuidModelSelection('nomi');
 
   const start = useCallback(
-    async ({ name, prompt }: NomiQuickStartOptions): Promise<boolean> => {
+    async ({ name, prompt, send = true }: NomiQuickStartOptions): Promise<boolean> => {
       if (!current_model) {
         Message.warning(t('conversation.noModelConfigured'));
         return false;
@@ -50,7 +52,10 @@ export const useNomiQuickStart = () => {
           return false;
         }
         emitter.emit('chat.history.refresh');
-        sessionStorage.setItem(`nomi_initial_message_${conversation.id}`, JSON.stringify({ input: prompt }));
+        sessionStorage.setItem(
+          send ? `nomi_initial_message_${conversation.id}` : `nomi_draft_message_${conversation.id}`,
+          JSON.stringify({ input: prompt })
+        );
         seedConversationCache(conversation);
         await navigate(`/conversation/${conversation.id}`);
         return true;

@@ -5,7 +5,9 @@ notes at a high level rather than a complete historical log.
 
 ## Unreleased
 
-No unreleased changes yet.
+- Added a Skill Market tab under Assistant & Skill, with ClawHub and shillhub
+  ranking sync, tag/search filtering, translated skill descriptions, install
+  draft handoff to Nomi, and a browser entry to the selected market source.
 
 ## v0.1.13 - 2026-07-01
 

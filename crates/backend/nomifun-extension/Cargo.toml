@@ -24,6 +24,8 @@ thiserror.workspace = true
 tracing.workspace = true
 mime_guess.workspace = true
 zip.workspace = true
+reqwest.workspace = true
+regex.workspace = true
 
 # NTFS junctions are used on Windows to materialize skill links without
 # requiring `SeCreateSymbolicLink` (Developer Mode / Admin). Pulled in
