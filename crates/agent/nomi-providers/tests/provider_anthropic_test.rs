@@ -1,13 +1,17 @@
 // Integration tests for AnthropicProvider using wiremock to mock the Anthropic API.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use wiremock::matchers::{header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 use nomi_config::compat::ProviderCompat;
 use nomi_providers::anthropic::AnthropicProvider;
 use nomi_providers::{LlmProvider, ProviderError};
 use nomi_types::llm::{LlmEvent, LlmRequest, ThinkingConfig};
 use nomi_types::message::{ContentBlock, Message, Role, StopReason};
+use nomi_types::tool::ToolDef;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -55,6 +59,169 @@ async fn collect_events(mut rx: tokio::sync::mpsc::Receiver<LlmEvent>) -> Vec<Ll
         events.push(ev);
     }
     events
+}
+
+#[derive(Clone)]
+struct AnthropicBedrockSchemaResponder;
+
+impl Respond for AnthropicBedrockSchemaResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let schema = &body["tools"][0]["input_schema"];
+        if schema.get("oneOf").is_some() {
+            ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": {
+                    "message": "input_schema does not support oneOf, allOf, or anyOf at the top level",
+                    "reason": "TOOL_SCHEMA_INVALID"
+                }
+            }))
+        } else {
+            ResponseTemplate::new(200)
+                .set_body_raw(text_sse_body("Recovered"), "text/event-stream")
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AnthropicFailedSanitizedResendResponder {
+    attempt: Arc<AtomicUsize>,
+}
+
+impl Respond for AnthropicFailedSanitizedResendResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        match self.attempt.fetch_add(1, Ordering::SeqCst) {
+            0 => ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": {
+                    "message": "input_schema does not support oneOf at the top level",
+                    "reason": "TOOL_SCHEMA_INVALID"
+                }
+            })),
+            1 => ResponseTemplate::new(503).set_body_string("sanitized resend unavailable"),
+            _ => ResponseTemplate::new(200)
+                .set_body_raw(text_sse_body("Recovered"), "text/event-stream"),
+        }
+    }
+}
+
+fn request_with_composed_tool_schema() -> LlmRequest {
+    let mut request = minimal_request();
+    request.tools.push(ToolDef {
+        name: "Read".into(),
+        description: "Read one or more files".into(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "file_path": { "type": "string" },
+                "file_paths": { "type": "array", "items": { "type": "string" } }
+            },
+            "oneOf": [
+                { "required": ["file_path"] },
+                { "required": ["file_paths"] }
+            ]
+        }),
+        deferred: false,
+    });
+    request
+}
+
+#[tokio::test]
+async fn anthropic_gateway_recovers_and_remembers_bedrock_schema_requirement() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(AnthropicBedrockSchemaResponder)
+        .expect(3)
+        .mount(&server)
+        .await;
+    let provider = AnthropicProvider::new(
+        "test-api-key",
+        &server.uri(),
+        ProviderCompat::anthropic_defaults(),
+    )
+    .with_cache(false);
+    let request = request_with_composed_tool_schema();
+    for _ in 0..2 {
+        let events = collect_events(provider.stream(&request).await.unwrap()).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, LlmEvent::TextDelta(text) if text == "Recovered"))
+        );
+    }
+    let received = server.received_requests().await.unwrap();
+    let has_root_one_of: Vec<bool> = received
+        .iter()
+        .map(|request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            body["tools"][0]["input_schema"].get("oneOf").is_some()
+        })
+        .collect();
+    assert_eq!(has_root_one_of, vec![true, false, false]);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn anthropic_gateway_does_not_schema_retry_an_unrelated_500() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream unavailable"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = AnthropicProvider::new(
+        "test-api-key",
+        &server.uri(),
+        ProviderCompat::anthropic_defaults(),
+    )
+    .with_cache(false);
+    let error = provider
+        .stream(&request_with_composed_tool_schema())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ProviderError::Api { status: 500, .. }));
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn anthropic_gateway_does_not_remember_a_failed_sanitized_resend() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(AnthropicFailedSanitizedResendResponder {
+            attempt: Arc::new(AtomicUsize::new(0)),
+        })
+        .expect(3)
+        .mount(&server)
+        .await;
+    let provider = AnthropicProvider::new(
+        "test-api-key",
+        &server.uri(),
+        ProviderCompat::anthropic_defaults(),
+    )
+    .with_cache(false);
+    let request = request_with_composed_tool_schema();
+
+    let error = provider.stream(&request).await.unwrap_err();
+    assert!(matches!(error, ProviderError::Api { status: 503, .. }));
+
+    let events = collect_events(provider.stream(&request).await.unwrap()).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, LlmEvent::TextDelta(text) if text == "Recovered"))
+    );
+
+    let received = server.received_requests().await.unwrap();
+    let has_root_one_of: Vec<bool> = received
+        .iter()
+        .map(|request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            body["tools"][0]["input_schema"].get("oneOf").is_some()
+        })
+        .collect();
+    assert_eq!(has_root_one_of, vec![true, false, true]);
+    server.verify().await;
 }
 
 // ---------------------------------------------------------------------------
