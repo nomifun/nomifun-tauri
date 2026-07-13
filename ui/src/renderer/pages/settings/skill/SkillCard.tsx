@@ -125,7 +125,7 @@ const SkillCard: React.FC<SkillCardProps> = ({
         }
       }}
       className={[
-        'group relative flex flex-col rounded-16px border border-solid p-14px cursor-pointer outline-none',
+        'group relative flex flex-col rounded-16px border border-solid p-14px pb-42px cursor-pointer outline-none',
         'transition-all duration-180',
         highlighted
           ? 'border-[rgb(var(--primary-5))] bg-[var(--color-primary-light-1)] shadow-[0_0_0_3px_rgba(var(--primary-6),0.12)]'
@@ -196,7 +196,7 @@ const SkillCard: React.FC<SkillCardProps> = ({
 
       {/* Hover footer — quiet action links, revealed on card hover */}
       <div
-        className='mt-12px pt-10px flex items-center justify-end gap-14px border-t border-solid border-[var(--color-border-1)] opacity-0 group-hover:opacity-100 transition-opacity duration-180'
+        className='absolute bottom-14px right-14px flex items-center justify-end gap-14px opacity-0 group-hover:opacity-100 transition-opacity duration-180'
         onClick={(e) => e.stopPropagation()}
       >
         {canDelete && (
@@ -230,10 +230,10 @@ const SkillCard: React.FC<SkillCardProps> = ({
               onEditTags(skill);
             }
           }}
-          className='inline-flex items-center gap-4px text-12px text-[rgb(var(--primary-6))] cursor-pointer hover:text-[rgb(var(--primary-7))] transition-colors'
+          className='inline-flex items-center gap-4px text-12px leading-none text-[var(--color-text-3)] cursor-pointer hover:text-[var(--color-text-2)] transition-colors'
         >
-          <SettingOne theme='outline' size={13} strokeWidth={3} />
-          {t('settings.skillsHub.editTags', { defaultValue: 'Edit Tags' })}
+          <SettingOne theme='outline' size={13} strokeWidth={3} fill='currentColor' className='relative top-px shrink-0' />
+          <span className='leading-none'>{t('settings.skillsHub.editTags', { defaultValue: 'Edit Tags' })}</span>
         </span>
       </div>
     </div>
