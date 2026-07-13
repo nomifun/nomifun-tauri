@@ -196,6 +196,10 @@
   background: color-mix(in srgb, var(--bg-2) 58%, transparent);
 }
 
+.workspace-panel-header__title {
+  color: var(--text-primary);
+}
+
 .chat-layout-right-sider {
   box-shadow: -12px 0 28px color-mix(in srgb, #000 4%, transparent);
 }

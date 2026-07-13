@@ -53,7 +53,7 @@ const WorkspacePanelHeader: React.FC<WorkspaceHeaderProps> = ({
         {collapsed ? <ExpandRight size={16} /> : <ExpandLeft size={16} />}
       </button>
     )}
-    <div className='flex-1 truncate'>{children}</div>
+    <div className='workspace-panel-header__title flex-1 truncate'>{children}</div>
 
     {/* Right-side workspace action. Temporary sessions offer a "bind a real
         directory" entry so the agent can work inside a project on disk; bound

@@ -56,6 +56,12 @@ describe('workspace tool rail dimensions', () => {
     expect(collapse.includes('color: var(--text-secondary);')).toBe(true);
   });
 
+  test('sets an explicit theme-aware color for the workspace panel title', () => {
+    const title = rule('\\.workspace-panel-header__title');
+
+    expect(title.includes('color: var(--text-primary);')).toBe(true);
+  });
+
   test('does not change the mobile workspace trigger dimensions', () => {
     const trigger = rule('\\.workspace-tool-rail-mobile-trigger');
 
