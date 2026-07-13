@@ -10,6 +10,16 @@ pub const COMPACT_SYSTEM_PROMPT: &str =
 /// Maximum output tokens for the compact LLM call.
 pub const COMPACT_MAX_OUTPUT_TOKENS: u32 = 20_000;
 
+/// Scale summary output for providers whose context window is below the 200k
+/// default. Keeping the summary within one eighth of the window leaves room for
+/// both the conversation being summarized and the compaction instructions.
+pub fn compact_max_output_tokens(context_window: usize) -> u32 {
+    let context_cap = (context_window / 8).max(1);
+    u32::try_from(context_cap)
+        .unwrap_or(u32::MAX)
+        .min(COMPACT_MAX_OUTPUT_TOKENS)
+}
+
 // ── Prompt construction ─────────────────────────────────────────────────────
 
 /// Build the 9-section compact prompt that asks the LLM to summarize.
@@ -198,6 +208,14 @@ mod tests {
         let prompt = build_compact_prompt();
         assert!(prompt.contains("<analysis>"));
         assert!(prompt.contains("<summary>"));
+    }
+
+    #[test]
+    fn compact_output_budget_scales_with_context_window() {
+        assert_eq!(compact_max_output_tokens(4096), 512);
+        assert_eq!(compact_max_output_tokens(8192), 1024);
+        assert_eq!(compact_max_output_tokens(32_000), 4000);
+        assert_eq!(compact_max_output_tokens(200_000), COMPACT_MAX_OUTPUT_TOKENS);
     }
 
     // ── format_compact_summary ──────────────────────────────────────────

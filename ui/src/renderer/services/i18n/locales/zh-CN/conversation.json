@@ -422,6 +422,7 @@
       "stopShort": "停止",
       "transcribingShort": "...",
       "audioCaptureError": "未检测到可用麦克风",
+      "audioNormalizationError": "无法将本次录音转换为本地语音识别所需的格式。请重新录音，或上传 WAV、MP3、OGG 或 FLAC 文件",
       "emptyTranscript": "未识别到语音内容",
       "fileTooLarge": "音频文件过大",
       "networkError": "音频转写时网络异常",
@@ -540,8 +541,8 @@
   },
   "mcp": {
     "loaded": "已加载 MCP",
-    "managementHint": "如果某个 MCP 加载异常，通常是 MCP JSON 配置有问题。请到工具设置页检查并手动检测。",
-    "openSettings": "前往工具设置",
+    "managementHint": "如果某个 MCP 加载异常，请检查其 JSON 配置，并在 MCP 管理页手动检测可用性。",
+    "openSettings": "前往 MCP 管理",
     "status": {
       "loaded": "已加载",
       "failed": "失败",

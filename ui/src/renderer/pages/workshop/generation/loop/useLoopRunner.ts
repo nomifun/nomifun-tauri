@@ -13,6 +13,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { useReactFlow } from '@xyflow/react';
+import { useTranslation } from 'react-i18next';
 import type { WorkshopFlowEdge, WorkshopFlowNode } from '../../canvas/model';
 import type { ModelOption } from '../genTypes';
 import { abortLoopRun, getLoopProgress, isLoopRunning, subscribeLoop } from './loopRegistry';
@@ -39,6 +40,7 @@ export interface LoopRunner {
 export function useLoopRunner(args: UseLoopRunnerArgs): LoopRunner {
   const { loopId, targetId, canvasId, config, model } = args;
   const rf = useReactFlow<WorkshopFlowNode, WorkshopFlowEdge>();
+  const { t } = useTranslation();
   const [progress, setProgress] = useState<LoopProgress>(() => getLoopProgress(loopId));
 
   useEffect(() => subscribeLoop(loopId, setProgress), [loopId]);
@@ -48,8 +50,18 @@ export function useLoopRunner(args: UseLoopRunnerArgs): LoopRunner {
 
   const start = useCallback(() => {
     if (!targetId || !model) return;
-    startLoopRun({ rf, loopId, targetId, canvasId, config, model });
-  }, [rf, loopId, targetId, canvasId, config, model]);
+    startLoopRun({
+      rf,
+      loopId,
+      targetId,
+      canvasId,
+      config,
+      model,
+      localZImageInputError: t('workshopGeneration.run.localTextToImageOnly', {
+        defaultValue: '本地 Z-Image 当前仅支持纯文字生成图片，请移除图片输入、蒙版和图片引用后重试。',
+      }),
+    });
+  }, [rf, loopId, targetId, canvasId, config, model, t]);
 
   const stop = useCallback(() => abortLoopRun(loopId), [loopId]);
 

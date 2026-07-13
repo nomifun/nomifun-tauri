@@ -141,6 +141,13 @@ const formatToolReceiptDetailLabel = (
 ): string => {
   const displayTarget = getToolReceiptDetailDisplayTarget(row, workspaceRoots);
 
+  if (row.skipped) {
+    return t('messages.toolSummary.skipped', {
+      target: displayTarget ?? row.title,
+      defaultValue: 'Skipped {{target}}',
+    });
+  }
+
   if ((row.state === 'failed' || row.state === 'canceled') && displayTarget) {
     return t(`messages.toolSummary.${row.state}`, {
       target: displayTarget,

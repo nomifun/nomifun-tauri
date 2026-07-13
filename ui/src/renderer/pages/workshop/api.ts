@@ -37,6 +37,7 @@ import type {
   WorkshopCanvasDoc,
   WorkshopCanvasMeta,
 } from './types';
+import { validateLocalZImageTask } from './generation/localZImage';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // URL helpers
@@ -271,8 +272,18 @@ export function uploadAsset(file: File, hooks: UploadAssetHooks = {}): Promise<W
 // §3.3 Creation tasks
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Submit a generation task. At M0 the backend immediately fails it (adapter_unavailable). */
+/** Submit a generation task after applying model-specific client invariants. */
 export async function createTask(body: CreateTaskBody): Promise<CreationTask> {
+  const issue = validateLocalZImageTask(body);
+  if (issue === 'text_to_image_only') {
+    throw new Error('Local Z-Image currently supports text-to-image only.');
+  }
+  if (issue === 'invalid_dimensions') {
+    throw new Error('Local Z-Image dimensions must be 256–2048 pixels and divisible by 8.');
+  }
+  if (issue === 'single_image_only') {
+    throw new Error('Local Z-Image generates exactly one image per task.');
+  }
   return httpRequest<CreationTask>('POST', '/api/creation/tasks', body);
 }
 

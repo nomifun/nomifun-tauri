@@ -50,6 +50,7 @@ pub struct OpenFolderWithRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SpeechToTextProvider {
+    Local,
     Openai,
     Deepgram,
 }
@@ -97,6 +98,12 @@ pub struct DeepgramSpeechToTextConfig {
 pub struct SpeechToTextConfig {
     pub enabled: bool,
     pub provider: SpeechToTextProvider,
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
     #[serde(default)]
     pub auto_send: Option<bool>,
     #[serde(default)]
@@ -190,6 +197,7 @@ mod tests {
 
     #[test]
     fn stt_provider_serializes_lowercase() {
+        assert_eq!(serde_json::to_value(SpeechToTextProvider::Local).unwrap(), "local");
         assert_eq!(serde_json::to_value(SpeechToTextProvider::Openai).unwrap(), "openai");
         assert_eq!(
             serde_json::to_value(SpeechToTextProvider::Deepgram).unwrap(),
@@ -199,6 +207,8 @@ mod tests {
 
     #[test]
     fn stt_provider_deserializes_lowercase() {
+        let local: SpeechToTextProvider = serde_json::from_str(r#""local""#).unwrap();
+        assert_eq!(local, SpeechToTextProvider::Local);
         let o: SpeechToTextProvider = serde_json::from_str(r#""openai""#).unwrap();
         assert_eq!(o, SpeechToTextProvider::Openai);
         let d: SpeechToTextProvider = serde_json::from_str(r#""deepgram""#).unwrap();

@@ -270,7 +270,7 @@ impl LlmProvider for VertexProvider {
                 .map_err(|e| ProviderError::Connection(format!("Header error: {}", e)))?,
         );
 
-        let response = crate::retry::with_initial_connect_retry(|| async {
+        let response = crate::retry::with_initial_request_retry(|| async {
             let response = client
                 .post(&url)
                 .headers(headers.clone())

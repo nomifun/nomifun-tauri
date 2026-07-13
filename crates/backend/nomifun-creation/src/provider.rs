@@ -87,7 +87,7 @@ pub enum PollResult {
 }
 
 /// A media generation backend. Adapter ids: `openai_images | gemini_image |
-/// openai_video | ark | modelscope | comfyui`.
+/// openai_video | local_image | ark | modelscope | comfyui`.
 #[async_trait]
 pub trait MediaProvider: Send + Sync {
     /// Stable adapter id (matches the routing tag chosen by the engine).

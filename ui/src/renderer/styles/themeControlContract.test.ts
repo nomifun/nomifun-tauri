@@ -20,6 +20,10 @@ const requirementSourceCardSource = readFileSync(
   'utf8'
 );
 const knowledgeEmptyStateSource = readFileSync(new URL('../pages/knowledge/KnowledgeEmptyState.tsx', import.meta.url), 'utf8');
+const assistantTagFilterSource = readFileSync(
+  new URL('../pages/settings/AssistantSettings/AssistantTagFilterBar.tsx', import.meta.url),
+  'utf8'
+);
 
 const CONTROL_TOKENS = [
   '--control-selected-bg',
@@ -75,5 +79,17 @@ describe('theme control contract', () => {
       expect(source.includes('--control-selected-bg')).toBe(true);
       expect(source.includes('--control-selected-fg')).toBe(true);
     }
+  });
+
+  test('uses a matte black and white active state for assistant tag filters', () => {
+    expect(assistantTagFilterSource.includes('bg-[#151515] text-white border-white')).toBe(true);
+    expect(assistantTagFilterSource.includes('shadow-[0_1px_2px_rgba(var(--primary-6),0.08)]')).toBe(false);
+  });
+
+  test('uses a green track and white thumb for checked switches in dark themes', () => {
+    expect(controlCss.includes("body[arco-theme='dark'] .arco-switch-checked")).toBe(true);
+    expect(controlCss.includes('background-color: #1f9d55')).toBe(true);
+    expect(controlCss.includes("body[arco-theme='dark'] .arco-switch-checked .arco-switch-dot")).toBe(true);
+    expect(controlCss.includes('background-color: #ffffff')).toBe(true);
   });
 });

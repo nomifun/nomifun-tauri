@@ -669,7 +669,7 @@ impl LlmProvider for OpenAIProvider {
 
         tracing::debug!(target: "nomi_providers", body = %serde_json::to_string_pretty(&body).unwrap_or_default(), "outgoing request");
 
-        let response = crate::retry::with_initial_connect_retry(|| async {
+        let response = crate::retry::with_initial_request_retry(|| async {
             let response = client
                 .post(&url)
                 .headers(headers.clone())

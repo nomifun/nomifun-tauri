@@ -12,7 +12,7 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 
 use nomifun_api_types::AgentStreamErrorData;
 use nomifun_common::{ConversationStatus, TimestampMs, now_ms};
@@ -26,6 +26,7 @@ pub struct AgentRuntime {
     status: Arc<RwLock<Option<ConversationStatus>>>,
     last_activity: Arc<AtomicI64>,
     event_tx: broadcast::Sender<AgentStreamEvent>,
+    finished_notify: Arc<Notify>,
 }
 
 impl AgentRuntime {
@@ -42,6 +43,7 @@ impl AgentRuntime {
             status: Arc::new(RwLock::new(None)),
             last_activity: Arc::new(AtomicI64::new(now_ms())),
             event_tx,
+            finished_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -65,6 +67,25 @@ impl AgentRuntime {
 
     pub fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Wait until a running turn has completed, bounded by `timeout`.
+    ///
+    /// The notification future is registered before checking status, avoiding
+    /// the classic check-then-sleep race when a turn finishes concurrently.
+    /// A runtime with no active turn returns immediately.
+    pub async fn wait_until_finished(&self, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.finished_notify.notified();
+            if !matches!(self.status(), Some(ConversationStatus::Running)) {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
+                return !matches!(self.status(), Some(ConversationStatus::Running));
+            }
+        }
     }
 
     /// Crate-private accessor for the broadcast sender, exposed so
@@ -137,6 +158,7 @@ impl AgentRuntime {
                 session_id,
                 stop_reason,
             }));
+        self.finished_notify.notify_waiters();
     }
 
     /// Atomic: set status ← Finished AND broadcast `Error { message }`.
@@ -160,6 +182,7 @@ impl AgentRuntime {
             return;
         }
         let _ = self.event_tx.send(AgentStreamEvent::Error(data));
+        self.finished_notify.notify_waiters();
     }
 }
 
@@ -304,5 +327,23 @@ mod tests {
             }
             other => panic!("expected Finish, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn wait_until_finished_blocks_running_turn_until_terminal_event() {
+        let rt = runtime();
+        rt.reset_for_new_turn(ConversationStatus::Running);
+
+        let waiter_runtime = rt.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_runtime
+                .wait_until_finished(std::time::Duration::from_secs(1))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "running turn must keep teardown barrier closed");
+
+        rt.emit_finish_with_reason(None, Some(TurnStopReason::Cancelled));
+        assert!(waiter.await.unwrap(), "terminal event should open teardown barrier");
     }
 }

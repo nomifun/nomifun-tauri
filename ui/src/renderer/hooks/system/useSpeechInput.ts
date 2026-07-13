@@ -6,6 +6,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLatestRef } from '@/renderer/hooks/ui/useLatestRef';
+import { convertRecordedAudioToWav } from '@/renderer/services/RecordedAudioWav';
 import { transcribeAudioBlob } from '@/renderer/services/SpeechToTextService';
 import { isDesktopShell } from '@/renderer/utils/platform';
 
@@ -14,6 +15,7 @@ export type SpeechInputStatus = 'idle' | 'recording' | 'transcribing' | 'error';
 export type SpeechInputErrorCode =
   | 'aborted'
   | 'audio-capture'
+  | 'audio-normalization'
   | 'empty-transcript'
   | 'file-too-large'
   | 'network'
@@ -143,7 +145,9 @@ const mapSpeechInputError = (error: unknown): SpeechInputErrorCode => {
   if (
     message.includes('STT_OPENAI_NOT_CONFIGURED') ||
     message.includes('STT_DEEPGRAM_NOT_CONFIGURED') ||
-    message.includes('STT_DISABLED')
+    message.includes('STT_DISABLED') ||
+    message.includes('ASR_NOT_CONFIGURED') ||
+    message.includes('ASR_NOT_READY')
   ) {
     return 'not-configured';
   }
@@ -181,7 +185,7 @@ export const useSpeechInput = ({ locale, onTranscript }: UseSpeechInputOptions) 
   const onTranscriptRef = useLatestRef(onTranscript);
   const availability = useMemo(() => getSpeechInputAvailability(), []);
 
-  const recognitionLocale = locale?.trim() || 'en-US';
+  const recognitionLocale = locale?.trim() || undefined;
 
   const pauseSpeechVisualizer = useCallback(() => {
     if (visualizerIntervalRef.current !== null) {
@@ -334,6 +338,28 @@ export const useSpeechInput = ({ locale, onTranscript }: UseSpeechInputOptions) 
     [onTranscriptRef, recognitionLocale, resetSpeechVisualizer]
   );
 
+  const transcribeRecordedBlob = useCallback(
+    async (blob: Blob) => {
+      let normalizedBlob: Blob;
+      try {
+        normalizedBlob = await convertRecordedAudioToWav(blob);
+      } catch (error) {
+        // Local whisper.cpp intentionally accepts only WAV/MP3/OGG/FLAC.
+        // Uploading the original WebM/MP4 recording after normalization fails
+        // would be routed to an active local model and fail opaquely, without a
+        // safe way for the client to know whether cloud fallback is configured.
+        console.warn('[speech-input] Failed to normalize recording to WAV', error);
+        setErrorCode('audio-normalization');
+        setErrorMessage(null);
+        setStatus('error');
+        resetSpeechVisualizer();
+        return;
+      }
+      await transcribeBlob(normalizedBlob);
+    },
+    [resetSpeechVisualizer, transcribeBlob]
+  );
+
   const startRecording = useCallback(async () => {
     if (availability !== 'record') {
       setErrorCode('recording-unsupported');
@@ -368,7 +394,7 @@ export const useSpeechInput = ({ locale, onTranscript }: UseSpeechInputOptions) 
           type: recorder.mimeType || mimeType || 'audio/webm',
         });
         cleanupRecorder();
-        void transcribeBlob(audioBlob);
+        void transcribeRecordedBlob(audioBlob);
       };
 
       setErrorCode(null);
@@ -382,7 +408,7 @@ export const useSpeechInput = ({ locale, onTranscript }: UseSpeechInputOptions) 
       setStatus('error');
       resetSpeechVisualizer();
     }
-  }, [availability, cleanupRecorder, resetSpeechVisualizer, startSpeechVisualizer, transcribeBlob]);
+  }, [availability, cleanupRecorder, resetSpeechVisualizer, startSpeechVisualizer, transcribeRecordedBlob]);
 
   const stopRecording = useCallback(() => {
     const recorder = recorderRef.current;

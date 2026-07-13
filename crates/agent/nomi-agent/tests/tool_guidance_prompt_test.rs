@@ -106,6 +106,44 @@ fn tc_4_3_02_bash_prohibition_list() {
     );
 }
 
+#[test]
+fn tool_guidance_routes_directory_listing_to_glob() {
+    let result = build_system_prompt(
+        &mut SystemPromptCache::new(),
+        None,
+        "/tmp",
+        "test-model",
+        &[],
+        None,
+        None,
+        false,
+        false,
+        false, // browser_enabled
+    );
+    let lower = result.to_lowercase();
+
+    assert!(
+        lower.contains("file listing") || lower.contains("list files"),
+        "tool guidance should explicitly cover directory file listing"
+    );
+    assert!(
+        lower.contains("every operating system") || lower.contains("os-agnostic"),
+        "tool guidance should make directory listing OS-agnostic"
+    );
+    assert!(
+        result.contains("Glob"),
+        "tool guidance should route directory listing to Glob"
+    );
+    assert!(
+        lower.contains("get-childitem") && lower.contains("ls") && lower.contains("dir"),
+        "tool guidance should discourage shell listing commands"
+    );
+    assert!(
+        result.contains("\"*\"") && result.contains("\"**/*\""),
+        "tool guidance should teach top-level and recursive Glob listing patterns"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // TC-4.3-03: Parallel call guidance
 // ---------------------------------------------------------------------------

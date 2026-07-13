@@ -96,6 +96,11 @@ describe('MessageList turn completion disclosure structure', () => {
     expect(source.includes("if (isContextCompressionTip(item)) return 'process';")).toBe(true);
   });
 
+  test('renders barrier-skipped receipt summaries with dedicated copy', () => {
+    expect(source.includes('part.skipped')).toBe(true);
+    expect(source.includes('messages.toolSummary.skipped')).toBe(true);
+  });
+
   test('uses plan events as hard boundaries between tool receipt groups', () => {
     const planBoundary = source.match(/if \(message\.type === 'plan'\) \{[\s\S]*?continue;[\s\S]*?\}/)?.[0] ?? '';
 

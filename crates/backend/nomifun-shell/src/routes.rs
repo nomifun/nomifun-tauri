@@ -1,11 +1,13 @@
-use axum::extract::{Multipart, State};
+use axum::extract::{DefaultBodyLimit, Multipart, State};
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
+use tower_http::limit::RequestBodyLimitLayer;
 
 use nomifun_api_types::{
-    ApiResponse, CheckToolInstalledRequest, CheckToolInstalledResponse, OpenExternalRequest, OpenFileRequest,
-    OpenFolderWithRequest, ShowItemInFolderRequest, SpeechToTextConfig,
+    ApiResponse, CheckToolInstalledRequest, CheckToolInstalledResponse, ClientPreferencesResponse,
+    DeepgramSpeechToTextConfig, OpenAISpeechToTextConfig, OpenExternalRequest, OpenFileRequest,
+    OpenFolderWithRequest, ShowItemInFolderRequest, SpeechToTextConfig, SpeechToTextProvider,
 };
 use nomifun_common::AppError;
 
@@ -13,14 +15,19 @@ use crate::error::SttError;
 use crate::state::ShellRouterState;
 
 pub fn shell_routes(state: ShellRouterState) -> Router {
-    Router::new()
+    let shell = Router::new()
         .route("/api/shell/open-file", post(open_file))
         .route("/api/shell/show-item-in-folder", post(show_item_in_folder))
         .route("/api/shell/open-external", post(open_external))
         .route("/api/shell/check-tool-installed", post(check_tool_installed))
-        .route("/api/shell/open-folder-with", post(open_folder_with))
+        .route("/api/shell/open-folder-with", post(open_folder_with));
+    let stt = Router::new()
         .route("/api/stt", post(speech_to_text))
-        .with_state(state)
+        // Disable the application's 10 MiB extractor default, then make the
+        // transport layer the sole cap: 30 MiB audio plus multipart overhead.
+        .layer(DefaultBodyLimit::disable())
+        .layer(RequestBodyLimitLayer::new(31 * 1024 * 1024));
+    shell.merge(stt).with_state(state)
 }
 
 async fn open_file(
@@ -73,6 +80,35 @@ struct SttMultipartFields {
     file_name: String,
     mime_type: String,
     language_hint: Option<String>,
+}
+
+fn local_asr_supports_audio(file_name: &str, mime_type: &str) -> bool {
+    let extension = std::path::Path::new(file_name)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::to_ascii_lowercase);
+    let mime_type = mime_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    matches!(
+        extension.as_deref(),
+        Some("wav" | "mp3" | "ogg" | "oga" | "opus" | "flac")
+    ) || matches!(
+        mime_type.as_str(),
+        "audio/wav"
+            | "audio/wave"
+            | "audio/x-wav"
+            | "audio/mpeg"
+            | "audio/mp3"
+            | "audio/ogg"
+            | "audio/opus"
+            | "audio/flac"
+            | "audio/x-flac"
+    )
 }
 
 async fn extract_stt_multipart(mut multipart: Multipart) -> Result<SttMultipartFields, AppError> {
@@ -154,7 +190,7 @@ async fn speech_to_text(
 
     let prefs = state
         .client_pref_service
-        .get_preferences(Some(&["speechToText"]))
+        .get_preferences(Some(&["tools.speechToText", "speechToText"]))
         .await
         .map_err(|e| {
             let status = e.status_code();
@@ -166,16 +202,53 @@ async fn speech_to_text(
             (status, Json(body))
         })?;
 
-    let config: SpeechToTextConfig = prefs
-        .get("speechToText")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or(SpeechToTextConfig {
-            enabled: false,
-            provider: nomifun_api_types::SpeechToTextProvider::Openai,
-            auto_send: None,
-            openai: None,
-            deepgram: None,
+    let config = speech_to_text_config_from_preferences(&prefs);
+
+    if config.enabled && config.provider == SpeechToTextProvider::Local {
+        let asr = state
+            .lazy_local_model_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.asr_if_started())
+            .filter(|_| local_asr_supports_audio(&fields.file_name, &fields.mime_type))
+            .ok_or_else(|| stt_error_response(&SttError::LocalNotConfigured))?;
+        let local_status = asr.status().await;
+        if !local_status.ready || local_status.active_model_id.as_deref() != config.model.as_deref() {
+            return Err(stt_error_response(&SttError::LocalNotConfigured));
+        }
+        let result = asr
+            .transcribe(
+                fields.file_data,
+                &fields.file_name,
+                &fields.mime_type,
+                config
+                    .language
+                    .as_deref()
+                    .or(fields.language_hint.as_deref()),
+            )
+            .await
+            .map_err(|error| {
+                let body = serde_json::json!({
+                    "success": false,
+                    "error": error.to_string(),
+                    "code": "STT_LOCAL_FAILED",
+                });
+                (error.status_code(), Json(body))
+            })?;
+        let body = serde_json::json!({
+            "success": true,
+            "data": {
+                "text": result.text,
+                "model": result.model_id,
+                "provider": "local",
+                "language": result.language,
+            },
         });
+        return Ok((StatusCode::OK, Json(body)));
+    }
+
+    let config = resolve_cloud_speech_to_text_config(&state, config)
+        .await
+        .map_err(|error| stt_error_response(&error))?;
 
     let result = state
         .stt_service
@@ -183,7 +256,10 @@ async fn speech_to_text(
             fields.file_data,
             &fields.file_name,
             &fields.mime_type,
-            fields.language_hint.as_deref(),
+            config
+                .language
+                .as_deref()
+                .or(fields.language_hint.as_deref()),
             &config,
         )
         .await
@@ -194,6 +270,100 @@ async fn speech_to_text(
         "data": result,
     });
     Ok((StatusCode::OK, Json(body)))
+}
+
+fn speech_to_text_config_from_preferences(prefs: &ClientPreferencesResponse) -> SpeechToTextConfig {
+    ["tools.speechToText", "speechToText"]
+        .into_iter()
+        .filter_map(|key| prefs.get(key))
+        .find_map(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or(SpeechToTextConfig {
+            enabled: false,
+            provider: SpeechToTextProvider::Local,
+            provider_id: None,
+            model: None,
+            language: None,
+            auto_send: None,
+            openai: None,
+            deepgram: None,
+        })
+}
+
+    async fn resolve_cloud_speech_to_text_config(
+    state: &ShellRouterState,
+    config: SpeechToTextConfig,
+) -> Result<SpeechToTextConfig, SttError> {
+    if !config.enabled || config.provider == SpeechToTextProvider::Local {
+        return Ok(config);
+    }
+    let Some(provider_id) = config.provider_id.as_deref() else {
+        return Ok(config);
+    };
+    let Some(provider_service) = state.provider_service.as_ref() else {
+        return Err(SttError::Unknown(
+            "provider service is unavailable for speech recognition".into(),
+        ));
+    };
+    let provider = provider_service
+        .list()
+        .await
+        .map_err(|error| SttError::Unknown(error.to_string()))?
+        .into_iter()
+        .find(|provider| provider.id == provider_id && provider.enabled)
+        .ok_or_else(|| SttError::Unknown("selected speech provider was not found or is disabled".into()))?;
+    if provider.api_key.trim().is_empty() {
+        return Err(match config.provider {
+            SpeechToTextProvider::Openai => SttError::OpenaiNotConfigured,
+            SpeechToTextProvider::Deepgram => SttError::DeepgramNotConfigured,
+            SpeechToTextProvider::Local => SttError::LocalNotConfigured,
+        });
+    }
+
+    let model = config
+        .model
+        .clone()
+        .ok_or_else(|| SttError::Unknown("selected speech provider has no selected speech model".into()))?;
+    let model_is_enabled = provider
+        .model_enabled
+        .as_ref()
+        .and_then(|models| models.get(&model))
+        .copied()
+        .unwrap_or(true);
+    if !provider.models.contains(&model) || !model_is_enabled {
+        return Err(SttError::Unknown(
+            "selected speech model was not found or is disabled".into(),
+        ));
+    }
+    let language = config.language.clone().filter(|value| !value.trim().is_empty());
+
+    Ok(match config.provider {
+        SpeechToTextProvider::Openai => SpeechToTextConfig {
+            openai: Some(OpenAISpeechToTextConfig {
+                api_key: provider.api_key,
+                base_url: Some(provider.base_url),
+                model,
+                language: language.clone(),
+                prompt: None,
+                temperature: None,
+            }),
+            language,
+            ..config
+        },
+        SpeechToTextProvider::Deepgram => SpeechToTextConfig {
+            deepgram: Some(DeepgramSpeechToTextConfig {
+                api_key: provider.api_key,
+                base_url: Some(provider.base_url),
+                model,
+                language: language.clone(),
+                detect_language: Some(language.is_none()),
+                punctuate: Some(true),
+                smart_format: Some(true),
+            }),
+            language,
+            ..config
+        },
+        SpeechToTextProvider::Local => config,
+    })
 }
 
 fn stt_error_response(err: &SttError) -> (StatusCode, Json<serde_json::Value>) {
@@ -211,7 +381,9 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use bytes::Bytes;
     use http_body_util::BodyExt;
+    use serde_json::json;
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -228,6 +400,8 @@ mod tests {
             shell_service: Arc::new(ShellService::new(Arc::new(NoopSystemOpener))),
             stt_service: Arc::new(SttService::new(reqwest::Client::new())),
             client_pref_service,
+            provider_service: None,
+            lazy_local_model_runtime: None,
         }
     }
 
@@ -238,6 +412,156 @@ mod tests {
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn multipart_request(audio_len: usize) -> Request<Body> {
+        multipart_request_with_format(audio_len, "audio.wav", "audio/wav")
+    }
+
+    fn multipart_request_with_format(
+        audio_len: usize,
+        file_name: &str,
+        mime_type: &str,
+    ) -> Request<Body> {
+        const BOUNDARY: &str = "nomifun-stt-limit-test";
+        let prefix = format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\nContent-Type: {mime_type}\r\n\r\n"
+        );
+        let suffix = format!(
+            "\r\n--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"fileName\"\r\n\r\n{file_name}\r\n--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"mimeType\"\r\n\r\n{mime_type}\r\n--{BOUNDARY}--\r\n"
+        );
+        let stream = futures_util::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from(prefix)),
+            Ok(Bytes::from(vec![0_u8; audio_len])),
+            Ok(Bytes::from(suffix)),
+        ]);
+        Request::builder()
+            .method("POST")
+            .uri("/api/stt")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={BOUNDARY}"),
+            )
+            .body(Body::from_stream(stream))
+            .unwrap()
+    }
+
+    #[test]
+    fn local_asr_audio_format_detection_matches_whisper_cli_inputs() {
+        assert!(local_asr_supports_audio("speech.wav", "application/octet-stream"));
+        assert!(local_asr_supports_audio("speech.bin", "audio/ogg; codecs=opus"));
+        assert!(local_asr_supports_audio("speech.flac", "audio/flac"));
+        assert!(!local_asr_supports_audio("speech.webm", "audio/webm"));
+        assert!(!local_asr_supports_audio("speech.m4a", "audio/mp4"));
+    }
+
+    #[test]
+    fn speech_to_text_config_prefers_tools_key_and_supports_legacy_key() {
+        let legacy = json!({
+            "enabled": true,
+            "provider": "openai",
+            "openai": {
+                "api_key": "legacy-key",
+                "model": "legacy-model"
+            }
+        });
+        let current = json!({
+            "enabled": true,
+            "provider": "deepgram",
+            "deepgram": {
+                "api_key": "current-key",
+                "model": "nova-2"
+            }
+        });
+
+        let legacy_only = ClientPreferencesResponse::from([("speechToText".into(), legacy.clone())]);
+        let config = speech_to_text_config_from_preferences(&legacy_only);
+        assert!(matches!(
+            config.provider,
+            nomifun_api_types::SpeechToTextProvider::Openai
+        ));
+        assert_eq!(
+            config.openai.as_ref().map(|value| value.api_key.as_str()),
+            Some("legacy-key")
+        );
+
+        let both = ClientPreferencesResponse::from([
+            ("speechToText".into(), legacy),
+            ("tools.speechToText".into(), current),
+        ]);
+        let config = speech_to_text_config_from_preferences(&both);
+        assert!(matches!(
+            config.provider,
+            nomifun_api_types::SpeechToTextProvider::Deepgram
+        ));
+        assert_eq!(
+            config.deepgram.as_ref().map(|value| value.api_key.as_str()),
+            Some("current-key")
+        );
+    }
+
+    #[test]
+    fn invalid_current_speech_to_text_config_falls_back_to_legacy_key() {
+        let prefs = ClientPreferencesResponse::from([
+            ("tools.speechToText".into(), json!({"enabled": true})),
+            (
+                "speechToText".into(),
+                json!({
+                    "enabled": true,
+                    "provider": "openai",
+                    "openai": {
+                        "api_key": "legacy-key",
+                        "model": "whisper-1"
+                    }
+                }),
+            ),
+        ]);
+
+        let config = speech_to_text_config_from_preferences(&prefs);
+        assert!(matches!(
+            config.provider,
+            nomifun_api_types::SpeechToTextProvider::Openai
+        ));
+        assert_eq!(
+            config.openai.as_ref().map(|value| value.api_key.as_str()),
+            Some("legacy-key")
+        );
+    }
+
+    #[test]
+    fn current_local_speech_to_text_selection_parses_without_cloud_secrets() {
+        let prefs = ClientPreferencesResponse::from([(
+            "tools.speechToText".into(),
+            json!({
+                "enabled": true,
+                "provider": "local",
+                "model": "whisper-small-q5_1",
+                "language": "zh"
+            }),
+        )]);
+
+        let config = speech_to_text_config_from_preferences(&prefs);
+        assert_eq!(config.provider, SpeechToTextProvider::Local);
+        assert_eq!(config.model.as_deref(), Some("whisper-small-q5_1"));
+        assert_eq!(config.language.as_deref(), Some("zh"));
+        assert!(config.openai.is_none());
+        assert!(config.deepgram.is_none());
+    }
+
+    #[tokio::test]
+    async fn stt_route_accepts_body_larger_than_global_ten_mib_limit() {
+        let response = make_router()
+            .oneshot(multipart_request(10 * 1024 * 1024 + 1))
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        // The lazy in-memory preference repository used by this unit test can
+        // return 500 before configuration lookup; reaching that handler is the
+        // contract under test (the transport did not reject at 10 MiB).
+        assert!(matches!(
+            response.status(),
+            StatusCode::BAD_REQUEST | StatusCode::INTERNAL_SERVER_ERROR
+        ));
     }
 
     #[tokio::test]

@@ -63,11 +63,11 @@ const AssistantCard: React.FC<AssistantCardProps> = ({
       data-testid={`assistant-card-${assistant.id}`}
       onClick={() => onEdit(assistant)}
       className={[
-        'group relative flex flex-col rounded-16px border border-solid p-14px cursor-pointer',
+        'group relative flex flex-col rounded-16px p-14px cursor-pointer',
         'transition-all duration-180',
         highlighted
-          ? 'border-[rgb(var(--primary-5))] bg-[var(--color-primary-light-1)] shadow-[0_0_0_3px_rgba(var(--primary-6),0.12)]'
-          : 'border-[var(--color-border-2)] bg-[var(--color-bg-2)] hover:border-[var(--color-primary-light-4)] hover:shadow-[0_4px_16px_rgba(0,0,0,0.06)]',
+          ? 'bg-[var(--color-fill-3)] shadow-[0_8px_22px_rgba(0,0,0,0.14)]'
+          : 'bg-[var(--color-bg-1)] hover:bg-[var(--color-fill-2)] hover:shadow-[0_8px_22px_rgba(0,0,0,0.12)]',
       ].join(' ')}
     >
       {/* Header: avatar + name/badge, enable Switch pinned top-right */}
@@ -109,7 +109,7 @@ const AssistantCard: React.FC<AssistantCardProps> = ({
 
       {/* Description — fixed 2-line clamp so cards stay even-height */}
       <div
-        className='mt-10px text-12px leading-18px text-[var(--color-text-3)] min-h-[36px]'
+        className='mt-10px text-12px leading-18px text-[var(--color-text-3)]'
         style={{
           display: '-webkit-box',
           WebkitLineClamp: 2,
@@ -128,7 +128,7 @@ const AssistantCard: React.FC<AssistantCardProps> = ({
               key={tag.key}
               className={[
                 'inline-flex items-center rounded-[12px] px-8px py-1px text-11px leading-16px',
-                'bg-[var(--color-fill-2)] text-[var(--color-text-2)] border border-solid border-[var(--color-border-2)]',
+                'bg-[var(--color-fill-3)] text-[var(--color-text-2)]',
               ].join(' ')}
             >
               {tag.label_i18n?.[localeKey] || tag.label}
@@ -144,7 +144,7 @@ const AssistantCard: React.FC<AssistantCardProps> = ({
 
       {/* Hover footer — quiet action links, revealed on card hover */}
       <div
-        className='mt-12px pt-10px flex items-center justify-end gap-14px border-t border-solid border-[var(--color-border-1)] opacity-0 group-hover:opacity-100 transition-opacity duration-180'
+        className='mt-auto pt-12px flex min-h-36px items-center justify-end gap-12px opacity-0 group-hover:opacity-100 transition-opacity duration-180'
         onClick={(e) => e.stopPropagation()}
       >
         <span
@@ -158,7 +158,7 @@ const AssistantCard: React.FC<AssistantCardProps> = ({
               onDuplicate(assistant);
             }
           }}
-          className='inline-flex items-center gap-4px text-12px text-[var(--color-text-3)] cursor-pointer hover:text-[rgb(var(--primary-6))] transition-colors'
+          className='inline-flex items-center gap-4px leading-none text-12px text-[var(--color-text-3)] cursor-pointer hover:text-[var(--color-text-1)] transition-colors'
         >
           <Copy theme='outline' size={13} strokeWidth={3} />
           {t('settings.duplicateAssistant', { defaultValue: 'Duplicate' })}
@@ -174,7 +174,7 @@ const AssistantCard: React.FC<AssistantCardProps> = ({
               onEdit(assistant);
             }
           }}
-          className='inline-flex items-center gap-4px text-12px text-[rgb(var(--primary-6))] cursor-pointer hover:text-[rgb(var(--primary-7))] transition-colors'
+          className='inline-flex items-center gap-4px leading-none text-12px text-[var(--color-text-2)] cursor-pointer hover:text-[var(--color-text-1)] transition-colors'
         >
           <SettingOne theme='outline' size={13} strokeWidth={3} />
           {t('settings.editAssistant', { defaultValue: 'Assistant Details' })}

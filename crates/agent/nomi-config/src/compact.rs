@@ -129,9 +129,44 @@ fn default_true() -> bool {
 /// the engine's compaction window in agreement.
 pub fn resolve_context_window(context_limit: Option<u64>, default_window: usize) -> usize {
     match context_limit {
-        Some(v) if v > 0 => v as usize,
+        Some(v) if v > 0 => usize::try_from(v).unwrap_or(usize::MAX),
         _ => default_window,
     }
+}
+
+/// Fit the response and compaction budgets inside the resolved context window.
+///
+/// Nomi's defaults target a 200k context window. Reusing them unchanged for a
+/// small provider can reserve more tokens than the provider accepts before the
+/// first user message is considered. The effective response limit is capped at
+/// one quarter of the window. Oversized compaction defaults are reduced to a
+/// response-sized output reserve plus an eighth-window autocompact buffer,
+/// while already-balanced custom settings are preserved.
+pub fn fit_context_budget(config: &mut CompactConfig, requested_max_tokens: u32) -> u32 {
+    let context_window = config.context_window.max(1);
+    let output_cap = (context_window / 4).max(1);
+    let output_cap_u32 = u32::try_from(output_cap).unwrap_or(u32::MAX);
+    let max_tokens = requested_max_tokens.min(output_cap_u32);
+
+    // The compactor must reserve at least as much as the provider may emit.
+    config.output_reserve = config.output_reserve.max(max_tokens as usize);
+
+    if config
+        .output_reserve
+        .saturating_add(config.autocompact_buffer)
+        > context_window / 2
+    {
+        config.output_reserve = max_tokens as usize;
+        config.autocompact_buffer = config
+            .autocompact_buffer
+            .min((context_window / 8).max(1));
+    }
+
+    config.emergency_buffer = config
+        .emergency_buffer
+        .min((context_window / 16).max(1));
+
+    max_tokens
 }
 
 #[cfg(test)]
@@ -293,5 +328,57 @@ cache_diagnostics = true
         assert_eq!(resolve_context_window(Some(128_000), 200_000), 128_000);
         assert_eq!(resolve_context_window(None, 200_000), 200_000);
         assert_eq!(resolve_context_window(Some(0), 200_000), 200_000); // 0 treated as unset
+    }
+
+    #[test]
+    fn context_budget_preserves_balanced_large_window_defaults() {
+        let mut cfg = CompactConfig::default();
+
+        assert_eq!(fit_context_budget(&mut cfg, 8192), 8192);
+        assert_eq!(cfg.output_reserve, 20_000);
+        assert_eq!(cfg.autocompact_buffer, 13_000);
+        assert_eq!(cfg.emergency_buffer, 3_000);
+    }
+
+    #[test]
+    fn context_budget_scales_defaults_for_local_window() {
+        let mut cfg = CompactConfig {
+            context_window: 65_536,
+            ..Default::default()
+        };
+
+        assert_eq!(fit_context_budget(&mut cfg, 8192), 8192);
+        assert_eq!(cfg.output_reserve, 8192);
+        assert_eq!(cfg.autocompact_buffer, 8192);
+        assert_eq!(cfg.emergency_buffer, 3_000);
+    }
+
+    #[test]
+    fn context_budget_clamps_response_and_buffers_for_small_window() {
+        let mut cfg = CompactConfig {
+            context_window: 4096,
+            ..Default::default()
+        };
+
+        assert_eq!(fit_context_budget(&mut cfg, 8192), 1024);
+        assert_eq!(cfg.output_reserve, 1024);
+        assert_eq!(cfg.autocompact_buffer, 512);
+        assert_eq!(cfg.emergency_buffer, 256);
+    }
+
+    #[test]
+    fn context_budget_keeps_custom_values_when_they_already_fit() {
+        let mut cfg = CompactConfig {
+            context_window: 32_000,
+            output_reserve: 6000,
+            autocompact_buffer: 4000,
+            emergency_buffer: 1000,
+            ..Default::default()
+        };
+
+        assert_eq!(fit_context_budget(&mut cfg, 4096), 4096);
+        assert_eq!(cfg.output_reserve, 6000);
+        assert_eq!(cfg.autocompact_buffer, 4000);
+        assert_eq!(cfg.emergency_buffer, 1000);
     }
 }

@@ -1,8 +1,7 @@
 name: Command reliability
 
 on:
-  push:
-  pull_request:
+  # Keep this costly three-runner matrix opt-in until CI is needed again.
   workflow_dispatch:
 
 permissions:

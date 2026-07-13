@@ -11,7 +11,6 @@ import { Button, Switch, Tag, Tooltip } from '@arco-design/web-react';
 import {
   ApiApp,
   CloudStorage,
-  DataServer,
   Heartbeat,
   Info,
   Lightning,
@@ -26,7 +25,6 @@ import type {
   ManagedModelServiceAvailability,
   ManagedModelServiceStatus,
 } from '@/common/types/provider/managedModelService';
-import { NOMIFUN_LOCAL_MODEL_PROVIDER_ID } from '@/common/types/provider/managedModelService';
 import { useFreeModels } from './useFreeModels';
 
 const availabilityColor = (availability: ManagedModelServiceAvailability): string => {
@@ -82,9 +80,6 @@ const FreeModelsContent: React.FC = () => {
     error,
     isLoading,
     mutate,
-    localStatus,
-    localError,
-    isLocalLoading,
     pendingAction,
     healthResults,
     healthCheckPending,
@@ -203,7 +198,7 @@ const FreeModelsContent: React.FC = () => {
                   </Tag>
                 )}
               </div>
-              <div className='mt-2px text-12px text-t-tertiary'>
+              <div className='mt-2px text-13px leading-18px text-t-secondary'>
                 {t('settings.modelHub.free.providerId', { id: status?.providerId ?? 'nomifun-free-model' })}
               </div>
             </div>
@@ -246,15 +241,17 @@ const FreeModelsContent: React.FC = () => {
         </div>
 
         <div
-          className='flex items-start gap-8px rd-8px px-12px py-8px text-12px leading-5 border border-solid'
+          className='flex items-start gap-9px rd-10px px-12px py-10px border border-solid'
           style={{
-            borderColor: 'rgba(var(--primary-6),0.32)',
-            backgroundColor: 'rgba(var(--primary-6),0.08)',
-            color: 'rgb(var(--primary-6))',
+            borderColor: 'rgba(var(--primary-6),0.24)',
+            backgroundColor: 'rgba(var(--primary-6),0.06)',
           }}
         >
-          <Info theme='outline' size='15' className='mt-2px shrink-0' />
-          <span>{t('settings.modelHub.free.privacyNotice')}</span>
+          <Info theme='outline' size='16' className='mt-1px shrink-0 text-[rgb(var(--primary-6))]' />
+          <div className='min-w-0'>
+            <div className='text-13px font-600 leading-18px text-t-primary'>{t('settings.modelHub.free.privacyTitle')}</div>
+            <div className='mt-2px text-12px leading-18px text-t-secondary'>{t('settings.modelHub.free.privacyNotice')}</div>
+          </div>
         </div>
       </div>
 
@@ -302,11 +299,11 @@ const FreeModelsContent: React.FC = () => {
 
             <div className='grid grid-cols-1 min-[520px]:grid-cols-2 min-[820px]:grid-cols-4 gap-8px'>
               <div className='rd-10px border border-solid border-[var(--color-border-2)] bg-[var(--color-bg-2)] px-12px py-10px'>
-                <div className='text-11px text-t-tertiary'>{t('settings.modelHub.free.serviceStatus')}</div>
+                <div className='text-12px font-500 text-t-secondary'>{t('settings.modelHub.free.serviceStatus')}</div>
                 <div className='mt-4px text-13px font-500 text-t-primary'>{serviceLabel}</div>
               </div>
               <div className='rd-10px border border-solid border-[var(--color-border-2)] bg-[var(--color-bg-2)] px-12px py-10px'>
-                <div className='text-11px text-t-tertiary'>{t('settings.modelHub.free.availableModels')}</div>
+                <div className='text-12px font-500 text-t-secondary'>{t('settings.modelHub.free.availableModels')}</div>
                 <div className='mt-4px text-13px font-500 text-t-primary'>
                   {t('settings.modelHub.free.modelCount', {
                     enabled: enabledModelCount,
@@ -315,11 +312,11 @@ const FreeModelsContent: React.FC = () => {
                 </div>
               </div>
               <div className='rd-10px border border-solid border-[var(--color-border-2)] bg-[var(--color-bg-2)] px-12px py-10px min-w-0'>
-                <div className='text-11px text-t-tertiary'>{t('settings.modelHub.free.upstream')}</div>
+                <div className='text-12px font-500 text-t-secondary'>{t('settings.modelHub.free.upstream')}</div>
                 <div className='mt-4px text-13px font-500 text-t-primary truncate'>{managedSourceAlias()}</div>
               </div>
               <div className='rd-10px border border-solid border-[var(--color-border-2)] bg-[var(--color-bg-2)] px-12px py-10px'>
-                <div className='text-11px text-t-tertiary'>{t('settings.modelHub.free.lastRefresh')}</div>
+                <div className='text-12px font-500 text-t-secondary'>{t('settings.modelHub.free.lastRefresh')}</div>
                 <div className='mt-4px text-13px font-500 text-t-primary truncate' title={lastRefresh}>
                   {lastRefresh}
                 </div>
@@ -339,7 +336,7 @@ const FreeModelsContent: React.FC = () => {
                       : t('settings.modelHub.free.automaticRefreshOff')}
                   </Tag>
                 </div>
-                <div className='flex items-center gap-x-14px gap-y-4px flex-wrap text-11px text-t-tertiary'>
+                <div className='flex items-center gap-x-14px gap-y-4px flex-wrap text-12px text-t-secondary'>
                   <span>{t('settings.modelHub.free.refreshInterval', { interval: refreshInterval })}</span>
                   <span title={nextRefresh}>
                     {t('settings.modelHub.free.nextRefresh', {
@@ -348,7 +345,7 @@ const FreeModelsContent: React.FC = () => {
                   </span>
                 </div>
               </div>
-              <div className='mt-4px text-11px leading-17px text-t-tertiary'>
+              <div className='mt-4px text-12px leading-18px text-t-secondary'>
                 {status.automaticRefresh
                   ? t('settings.modelHub.free.automaticRefreshHint')
                   : t('settings.modelHub.free.manualRefreshHint')}
@@ -374,7 +371,7 @@ const FreeModelsContent: React.FC = () => {
                         {t('settings.modelHub.free.freeBadge')}
                       </Tag>
                     </div>
-                    <div className='mt-1px text-11px leading-15px text-t-tertiary'>
+                    <div className='mt-2px text-12px leading-17px text-t-secondary'>
                       {t('settings.modelHub.free.modelCount', {
                         enabled: enabledModelCount,
                         total: status.models.length,
@@ -383,7 +380,7 @@ const FreeModelsContent: React.FC = () => {
                   </div>
                 </div>
                 <div className='flex items-center gap-9px flex-wrap'>
-                  <span className='text-11px text-t-tertiary'>
+                  <span className='text-12px text-t-secondary'>
                     {t('settings.modelHub.free.protocolVersion', { version: status.protocolVersion })}
                   </span>
                   <Tooltip content={t('settings.modelHub.free.health.checkAllHint')}>
@@ -478,7 +475,7 @@ const FreeModelsContent: React.FC = () => {
                                   {model.name || model.id}
                                 </div>
                                 {model.name && model.name !== model.id && (
-                                  <div className='truncate font-mono text-10px leading-13px text-t-tertiary' title={model.id}>
+                                  <div className='truncate font-mono text-11px leading-15px text-t-secondary' title={model.id}>
                                     {model.id}
                                   </div>
                                 )}
@@ -506,7 +503,7 @@ const FreeModelsContent: React.FC = () => {
                           </div>
                         </div>
 
-                        <div className='mt-7px flex items-center justify-between gap-8px pl-36px text-10px leading-14px text-t-tertiary'>
+                        <div className='mt-7px flex items-center justify-between gap-8px pl-36px text-11px leading-15px text-t-secondary'>
                           <span className='truncate'>
                             {t('settings.modelHub.free.source', {
                               source: managedSourceAlias(),
@@ -548,7 +545,7 @@ const FreeModelsContent: React.FC = () => {
                               />
                               <span>{healthLabel}</span>
                               {!checking && healthResult?.status === 'healthy' && healthResult.latencyMs != null && (
-                                <span className='text-t-tertiary'>{healthResult.latencyMs}ms</span>
+                                <span className='text-t-secondary'>{healthResult.latencyMs}ms</span>
                               )}
                             </span>
                           </Tooltip>
@@ -560,37 +557,6 @@ const FreeModelsContent: React.FC = () => {
               )}
             </section>
 
-            <div className='rd-12px border border-dashed border-[var(--color-border-3)] bg-[var(--fill-0)] px-14px py-12px'>
-              <div className='flex items-start justify-between gap-12px flex-wrap'>
-                <div className='flex items-start gap-10px min-w-0 flex-1'>
-                  <span className='size-30px flex items-center justify-center rd-8px bg-[var(--color-bg-2)] text-t-secondary shrink-0'>
-                    <DataServer theme='outline' size='18' />
-                  </span>
-                  <div className='min-w-0'>
-                    <div className='flex items-center gap-8px flex-wrap'>
-                      <span className='text-14px font-600 text-t-primary'>
-                        {t('settings.modelHub.free.local.title')}
-                      </span>
-                      <Tag size='small' color={availabilityColor(localStatus?.availability ?? 'planned')}>
-                        {isLocalLoading
-                          ? t('settings.modelHub.free.local.loading')
-                          : localError
-                            ? t('settings.modelHub.free.local.unavailable')
-                            : t('settings.modelHub.free.local.planned')}
-                      </Tag>
-                    </div>
-                    <div className='mt-3px text-12px leading-18px text-t-secondary'>
-                      {t('settings.modelHub.free.local.description')}
-                    </div>
-                    <div className='mt-5px text-11px text-t-tertiary'>
-                      {t('settings.modelHub.free.providerId', {
-                        id: localStatus?.providerId ?? NOMIFUN_LOCAL_MODEL_PROVIDER_ID,
-                      })}
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
           </div>
         )}
       </NomiScrollArea>

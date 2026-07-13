@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use agent_client_protocol::schema::{
-    AgentCapabilities, AuthMethod, AvailableCommand, SessionConfigKind, SessionConfigOption, SessionModeState,
-    SessionModelState, UsageUpdate,
+    AgentCapabilities, AuthMethod, AvailableCommand, ModelInfo, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelectOptions, SessionModeState, SessionModelState, UsageUpdate,
 };
 
 use super::agent_event_tracker::AcpSessionEvent;
@@ -465,6 +465,14 @@ impl AcpSession {
                 }
             }
         }
+        // Newer ACP agents such as OpenCode expose model selection through
+        // the stable `configOptions` API instead of the older top-level
+        // unstable `models` field. Project that standard model selector into
+        // SessionModelState so existing model APIs and UI work with both
+        // protocol representations.
+        if let Some(models) = model_state_from_config_options(&options) {
+            self.apply_advertised_models(models);
+        }
         self.advertised.config_options = Some(options);
         if changed {
             let selections = self.observed.config_current.clone();
@@ -603,6 +611,38 @@ fn extract_config_current_value(kind: &SessionConfigKind) -> Option<String> {
         SessionConfigKind::Select(sel) => Some(sel.current_value.to_string()),
         _ => None,
     }
+}
+
+fn model_state_from_config_options(options: &[SessionConfigOption]) -> Option<SessionModelState> {
+    let option = options.iter().find(|option| {
+        matches!(option.category, Some(SessionConfigOptionCategory::Model))
+            || option.id.to_string().eq_ignore_ascii_case("model")
+    })?;
+    let SessionConfigKind::Select(select) = &option.kind else {
+        return None;
+    };
+
+    let available_models = match &select.options {
+        SessionConfigSelectOptions::Ungrouped(options) => options
+            .iter()
+            .map(|option| ModelInfo::new(option.value.to_string(), option.name.clone()))
+            .collect(),
+        SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| {
+                group
+                    .options
+                    .iter()
+                    .map(|option| ModelInfo::new(option.value.to_string(), option.name.clone()))
+            })
+            .collect(),
+        _ => return None,
+    };
+
+    Some(SessionModelState::new(
+        select.current_value.to_string(),
+        available_models,
+    ))
 }
 
 // Tests live in `session_tests.rs` (linked via `#[path]`) so this file

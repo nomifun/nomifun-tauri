@@ -82,6 +82,21 @@
   color: var(--control-selected-fg, var(--color-white)) !important;
 }
 
+/* In dark themes, a green track makes enabled switches immediately legible
+   without competing with the neutral black-and-white selection language. */
+body[arco-theme='dark'] .arco-switch-checked {
+  background-color: #1f9d55 !important;
+}
+
+body[arco-theme='dark'] .arco-switch-checked .arco-switch-dot {
+  background-color: #ffffff !important;
+  color: #1f9d55 !important;
+}
+
+body[arco-theme='dark'] .arco-switch-checked .arco-switch-text {
+  color: #ffffff !important;
+}
+
 .arco-switch[disabled].arco-switch-checked,
 .arco-switch.arco-switch-loading.arco-switch-checked {
   background-color: var(--control-disabled-selected-bg, var(--color-primary-light-3)) !important;

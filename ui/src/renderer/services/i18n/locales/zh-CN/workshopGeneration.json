@@ -38,6 +38,7 @@
   "param": {
     "size": "尺寸",
     "count": "数量",
+    "localSingleImage": "本地 Z-Image 每次生成 1 张；需要批量时可使用循环节点",
     "quality": "质量",
     "duration": "时长",
     "seconds": "秒",
@@ -65,7 +66,8 @@
     "run": "生成",
     "regenerate": "重新生成",
     "cancel": "取消",
-    "noModel": "请先选择模型"
+    "noModel": "请先选择模型",
+    "localTextToImageOnly": "本地 Z-Image 当前仅支持纯文字生成图片，请移除图片输入、蒙版和图片引用后重试。"
   },
   "result": {
     "continuePlaceholder": "继续编辑：输入指令回车…",
@@ -73,6 +75,7 @@
     "loading": "加载中…",
     "loadFailed": "加载失败",
     "toTextNode": "转为文本节点",
-    "batch": "{{count}} 张"
+    "batch": "{{count}} 张",
+    "localContinueUnavailable": "本地 Z-Image 当前仅支持文生图，暂不支持继续编辑图片"
   }
 }

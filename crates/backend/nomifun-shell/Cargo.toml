@@ -18,10 +18,13 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tower-http.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]
 nomifun-db.workspace = true
 http-body-util.workspace = true
+bytes = "1"
 sqlx.workspace = true
 tempfile.workspace = true
 tower = { workspace = true, features = ["util"] }

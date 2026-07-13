@@ -850,7 +850,16 @@ const ModelModalContent: React.FC = () => {
       {/* Header with Add Button */}
       <div className='flex-shrink-0 border-b border-[var(--color-border-2)] pb-12px mb-14px flex flex-col gap-10px'>
         <div className='flex items-center justify-between gap-8px flex-wrap'>
-          <div className='text-20px font-600 text-t-primary leading-34px'>{t('settings.model')}</div>
+          <div className='min-w-0'>
+            <div className='text-20px font-600 text-t-primary leading-28px'>
+              {isPageMode ? t('settings.modelHub.provider.title') : t('settings.model')}
+            </div>
+            {isPageMode && (
+              <div className='mt-2px text-13px leading-18px text-t-secondary'>
+                {t('settings.modelHub.provider.subtitle')}
+              </div>
+            )}
+          </div>
           <div className='flex items-center gap-8px flex-wrap'>
             <Button
               type='outline'
@@ -873,14 +882,29 @@ const ModelModalContent: React.FC = () => {
           </div>
         </div>
         <div
-          className='rd-8px px-12px py-8px text-12px leading-5 border border-solid'
+          className='rd-10px px-12px py-10px border border-solid flex items-start gap-9px'
           style={{
-            borderColor: 'rgba(var(--primary-6),0.32)',
-            backgroundColor: 'rgba(var(--primary-6),0.08)',
-            color: 'rgb(var(--primary-6))',
+            borderColor: 'rgba(var(--primary-6),0.24)',
+            backgroundColor: 'rgba(var(--primary-6),0.06)',
           }}
         >
-          {t('settings.customModelSupportNote')}
+          {isPageMode && <Info theme='outline' size='16' className='mt-1px shrink-0 text-[rgb(var(--primary-6))]' />}
+          <div className='min-w-0'>
+            {isPageMode && (
+              <div className='text-13px font-600 leading-18px text-t-primary'>
+                {t('settings.modelHub.provider.noticeTitle')}
+              </div>
+            )}
+            <div
+              className={
+                isPageMode
+                  ? 'mt-2px text-12px leading-18px text-t-secondary'
+                  : 'text-12px leading-5 text-[rgb(var(--primary-6))]'
+              }
+            >
+              {isPageMode ? t('settings.modelHub.provider.note') : t('settings.customModelSupportNote')}
+            </div>
+          </div>
         </div>
       </div>
 

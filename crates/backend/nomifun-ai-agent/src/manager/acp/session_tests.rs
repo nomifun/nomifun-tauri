@@ -454,6 +454,53 @@ fn apply_advertised_config_options_idempotent_when_unchanged() {
 }
 
 #[test]
+fn model_config_option_populates_switchable_model_state() {
+    use agent_client_protocol::schema::{
+        SessionConfigOptionCategory, SessionConfigSelectGroup, SessionConfigSelectOption,
+    };
+
+    let mut session = AcpSession::new(None, None, HashMap::new());
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "model",
+            "Model",
+            "custom/my-model",
+            vec![
+                SessionConfigSelectOption::new("custom/my-model", "Custom/My Model"),
+                SessionConfigSelectOption::new("opencode/big-pickle", "OpenCode/Big Pickle"),
+            ],
+        )
+        .category(SessionConfigOptionCategory::Model),
+    ]);
+
+    let models = session.model_info().expect("model config option should populate model state");
+    assert_eq!(models.current_model_id.to_string(), "custom/my-model");
+    assert_eq!(models.available_models.len(), 2);
+    assert_eq!(models.available_models[0].model_id.to_string(), "custom/my-model");
+    assert_eq!(models.available_models[0].name, "Custom/My Model");
+    assert!(session.can_select_model("opencode/big-pickle"));
+
+    session.apply_advertised_config_options(vec![
+        SessionConfigOption::select(
+            "model",
+            "Model",
+            "provider/grouped-model",
+            vec![SessionConfigSelectGroup::new(
+                "provider",
+                "Provider",
+                vec![SessionConfigSelectOption::new(
+                    "provider/grouped-model",
+                    "Grouped Model",
+                )],
+            )],
+        )
+        .category(SessionConfigOptionCategory::Model),
+    ]);
+    let grouped = session.model_info().expect("grouped model options should be supported");
+    assert_eq!(grouped.available_models[0].model_id.to_string(), "provider/grouped-model");
+}
+
+#[test]
 fn pending_model_notice_roundtrip_and_take_once() {
     use crate::shared_kernel::ModelId;
 

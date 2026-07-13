@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -8,7 +8,7 @@ use nomi_agent::session::SessionManager;
 use nomifun_common::{
     AgentKillReason, AgentType, AppError, ConversationStatus, ErrorChain, OnConversationDelete, TimestampMs, now_ms,
 };
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use tracing::{info, warn};
 
 use crate::agent_task::AgentInstance;
@@ -89,6 +89,7 @@ const RESTART_WINDOW_MS: i64 = 60_000;
 /// zero-delay respawn cannot re-enter the same crashing operation instantly.
 const RESTART_BASE_BACKOFF_MS: u64 = 500;
 const RESTART_MAX_BACKOFF_MS: u64 = 8_000;
+const MAX_CACHED_LIFECYCLE_GATES: usize = 256;
 
 #[derive(Clone, Copy)]
 struct RestartRecord {
@@ -174,7 +175,11 @@ impl RestartGovernor {
 
 /// Default implementation of [`IWorkerTaskManager`] using a concurrent hash map.
 pub struct WorkerTaskManagerImpl {
-    tasks: DashMap<String, TaskSlot>,
+    tasks: Arc<DashMap<String, TaskSlot>>,
+    /// Serializes build and awaitable teardown for each conversation. The gate
+    /// intentionally outlives a removed task slot so no replacement factory
+    /// can start while the old agent is still unwinding.
+    lifecycle_gates: Arc<DashMap<String, Weak<AsyncMutex<()>>>>,
     factory: AgentFactory,
     /// Bounds rapid crash-respawn loops per conversation (see [`RestartGovernor`]).
     governor: RestartGovernor,
@@ -183,7 +188,8 @@ pub struct WorkerTaskManagerImpl {
 impl WorkerTaskManagerImpl {
     pub fn new(factory: AgentFactory) -> Self {
         Self {
-            tasks: DashMap::new(),
+            tasks: Arc::new(DashMap::new()),
+            lifecycle_gates: Arc::new(DashMap::new()),
             factory,
             governor: RestartGovernor::default(),
         }
@@ -192,6 +198,33 @@ impl WorkerTaskManagerImpl {
     /// Look up a fully-initialised instance by conversation id.
     fn initialised_instance(&self, conversation_id: &str) -> Option<AgentInstance> {
         self.tasks.get(conversation_id).and_then(|slot| slot.get().cloned())
+    }
+
+    fn lifecycle_gate(&self, conversation_id: &str) -> Arc<AsyncMutex<()>> {
+        if self.lifecycle_gates.len() >= MAX_CACHED_LIFECYCLE_GATES {
+            self.lifecycle_gates.retain(|_, gate| gate.strong_count() > 0);
+        }
+        if let Some(gate) = self
+            .lifecycle_gates
+            .get(conversation_id)
+            .and_then(|gate| gate.upgrade())
+        {
+            return gate;
+        }
+
+        let candidate = Arc::new(AsyncMutex::new(()));
+        match self.lifecycle_gates.entry(conversation_id.to_owned()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                if let Some(gate) = entry.get().upgrade() {
+                    return gate;
+                }
+                entry.insert(Arc::downgrade(&candidate));
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(Arc::downgrade(&candidate));
+            }
+        }
+        candidate
     }
 
     /// Feed a kill into the restart governor. Only a crash-recovery eviction
@@ -226,6 +259,9 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         conversation_id: &str,
         options: BuildTaskOptions,
     ) -> Result<AgentInstance, AppError> {
+        let lifecycle_gate = self.lifecycle_gate(conversation_id);
+        let _lifecycle = lifecycle_gate.lock().await;
+
         // Atomically obtain the per-conversation slot. `DashMap::entry` is
         // synchronous and side-effect-free — only an empty OnceCell is
         // allocated on the miss path, so concurrent callers for the same id
@@ -296,13 +332,18 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         reason: Option<AgentKillReason>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         self.note_kill_for_governor(conversation_id, reason);
-        if let Some((id, slot)) = self.tasks.remove(conversation_id) {
-            info!(conversation_id = %id, ?reason, "Killing agent task (awaitable)");
-            if let Some(agent) = slot.get() {
-                return agent.kill_and_wait(reason);
+        let conversation_id = conversation_id.to_owned();
+        let lifecycle_gate = self.lifecycle_gate(&conversation_id);
+        let tasks = Arc::clone(&self.tasks);
+        Box::pin(async move {
+            let _lifecycle = lifecycle_gate.lock().await;
+            if let Some((id, slot)) = tasks.remove(&conversation_id) {
+                info!(conversation_id = %id, ?reason, "Killing agent task (awaitable)");
+                if let Some(agent) = slot.get() {
+                    agent.kill_and_wait(reason).await;
+                }
             }
-        }
-        Box::pin(std::future::ready(()))
+        })
     }
 
     fn clear(&self) {
@@ -412,7 +453,7 @@ mod tests {
     use futures_util::FutureExt;
     use nomifun_common::{AgentKillReason, AgentType, ConversationStatus, ProviderWithModel};
     use std::sync::atomic::{AtomicI64, Ordering};
-    use tokio::sync::broadcast;
+    use tokio::sync::{Semaphore, broadcast};
 
     /// A minimal mock agent for testing task manager logic. Lives behind
     /// the `AgentInstance::Mock` trait-object variant so we don't have to
@@ -425,6 +466,8 @@ mod tests {
         status: Option<ConversationStatus>,
         last_activity: AtomicI64,
         event_tx: broadcast::Sender<AgentStreamEvent>,
+        kill_started: Option<Arc<Semaphore>>,
+        kill_release: Option<Arc<Semaphore>>,
     }
 
     impl MockAgent {
@@ -437,7 +480,15 @@ mod tests {
                 status,
                 last_activity: AtomicI64::new(now_ms()),
                 event_tx,
+                kill_started: None,
+                kill_release: None,
             }
+        }
+
+        fn with_blocking_kill(mut self, started: Arc<Semaphore>, release: Arc<Semaphore>) -> Self {
+            self.kill_started = Some(started);
+            self.kill_release = Some(release);
+            self
         }
 
         fn with_agent_type(mut self, t: AgentType) -> Self {
@@ -485,7 +536,24 @@ mod tests {
         }
     }
 
-    impl IMockAgent for MockAgent {}
+    impl IMockAgent for MockAgent {
+        fn kill_and_wait(
+            &self,
+            reason: Option<AgentKillReason>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            let _ = self.kill(reason);
+            let started = self.kill_started.clone();
+            let release = self.kill_release.clone();
+            Box::pin(async move {
+                if let Some(started) = started {
+                    started.add_permits(1);
+                }
+                if let Some(release) = release {
+                    let _ = release.acquire().await;
+                }
+            })
+        }
+    }
 
     fn make_options(conversation_id: &str) -> BuildTaskOptions {
         BuildTaskOptions {
@@ -526,6 +594,19 @@ mod tests {
     fn get_task_returns_none_when_empty() {
         let mgr = make_manager();
         assert!(mgr.get_task("nonexistent").is_none());
+    }
+
+    #[test]
+    fn lifecycle_gate_cache_reclaims_expired_conversations_without_replacing_live_gate() {
+        let mgr = make_manager();
+        let live = mgr.lifecycle_gate("live");
+        for index in 0..=MAX_CACHED_LIFECYCLE_GATES {
+            drop(mgr.lifecycle_gate(&format!("expired-{index}")));
+        }
+
+        let same_live = mgr.lifecycle_gate("live");
+        assert!(Arc::ptr_eq(&live, &same_live));
+        assert!(mgr.lifecycle_gates.len() < MAX_CACHED_LIFECYCLE_GATES);
     }
 
     #[tokio::test]
@@ -629,6 +710,58 @@ mod tests {
         mgr.kill("conv-1", Some(AgentKillReason::IdleTimeout)).unwrap();
         assert_eq!(mgr.active_count(), 0);
         assert!(mgr.get_task("conv-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn kill_and_wait_blocks_rebuild_until_old_agent_finishes() {
+        use std::sync::atomic::AtomicUsize;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let kill_started = Arc::new(Semaphore::new(0));
+        let kill_release = Arc::new(Semaphore::new(0));
+        let factory: AgentFactory = {
+            let calls = Arc::clone(&calls);
+            let kill_started = Arc::clone(&kill_started);
+            let kill_release = Arc::clone(&kill_release);
+            Arc::new(move |opts: BuildTaskOptions| {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                let agent = if call == 0 {
+                    MockAgent::new(&opts.conversation_id, Some(ConversationStatus::Running))
+                        .with_blocking_kill(Arc::clone(&kill_started), Arc::clone(&kill_release))
+                } else {
+                    MockAgent::new(&opts.conversation_id, None)
+                };
+                async move { Ok(mock_instance(agent)) }.boxed()
+            })
+        };
+        let mgr = Arc::new(WorkerTaskManagerImpl::new(factory));
+        mgr.get_or_build_task("conv-teardown", make_options("conv-teardown"))
+            .await
+            .unwrap();
+
+        let teardown = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr.kill_and_wait("conv-teardown", None).await;
+            })
+        };
+        kill_started.acquire().await.unwrap().forget();
+
+        let rebuild = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                mgr.get_or_build_task("conv-teardown", make_options("conv-teardown"))
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "factory must wait behind teardown");
+        assert!(!rebuild.is_finished());
+
+        kill_release.add_permits(1);
+        teardown.await.unwrap();
+        rebuild.await.unwrap().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

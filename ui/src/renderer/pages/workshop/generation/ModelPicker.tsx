@@ -18,6 +18,7 @@ import { Down, MagicWand, Search } from '@icon-park/react';
 import type { GenMode, ModelOption } from './genTypes';
 import { useGeneratorModels } from './useGeneratorModels';
 import Floating from './Floating';
+import { modelHubPathForMode } from './localZImage';
 
 export interface ModelPickerProps {
   mode: GenMode;
@@ -66,7 +67,7 @@ const ModelPicker: React.FC<ModelPickerProps> = ({ mode, providerId, model, onCh
 
   const goToModelHub = (): void => {
     setOpen(false);
-    navigate(mode === 'text' ? '/models?section=models' : '/models?section=creation');
+    navigate(modelHubPathForMode(mode));
   };
 
   return (

@@ -9,6 +9,8 @@ export interface NormalizedToolCall {
   status: NormalizedToolStatus;
   /** Tool reported an error-like outcome, but it should not fail the turn-level process receipt. */
   nonFatalFailure?: boolean;
+  /** Tool was not executed because an earlier call in the same assistant turn failed. */
+  skipped?: boolean;
   description?: string;
   input?: string;
   output?: string;
@@ -290,6 +292,11 @@ const isOrdinaryDirectProbeFailure = (name: unknown, status: unknown, output: un
   return isExplicitProbeMiss(name, output);
 };
 
+const skippedAfterPriorErrorPrefix = 'Skipped because a previous tool call in this assistant turn failed.';
+
+const isSkippedAfterPriorError = (status: unknown, output: unknown): boolean =>
+  status === 'error' && toDisplayText(output).trimStart().startsWith(skippedAfterPriorErrorPrefix);
+
 export function normalizeToolCall(message: IMessageToolCall): NormalizedToolCall | undefined {
   const { call_id, name, status, input, output, args, description } = message.content;
   if (!call_id) return undefined;
@@ -299,11 +306,13 @@ export function normalizeToolCall(message: IMessageToolCall): NormalizedToolCall
     : args && Object.keys(args).length > 0
       ? formatValue(args)
       : undefined;
+  const skipped = isSkippedAfterPriorError(status, output);
 
   return {
     key: toDisplayText(call_id),
     name: toDisplayText(name, 'Tool'),
-    status: normalizeToolCallStatus(status),
+    status: skipped ? 'canceled' : normalizeToolCallStatus(status),
+    ...(skipped ? { skipped: true } : {}),
     ...(isOrdinaryShellExit(name, status, output) || isOrdinaryDirectProbeFailure(name, status, output)
       ? { nonFatalFailure: true }
       : {}),

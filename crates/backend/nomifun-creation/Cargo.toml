@@ -11,6 +11,7 @@ nomifun-api-types.workspace = true
 nomifun-auth.workspace = true
 nomifun-db.workspace = true
 nomifun-net.workspace = true
+nomifun-runtime.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

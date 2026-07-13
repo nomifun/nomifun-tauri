@@ -34,6 +34,9 @@ async fn st1_openai_transcribe_success() {
     let config = SpeechToTextConfig {
         enabled: true,
         provider: SpeechToTextProvider::Openai,
+        provider_id: None,
+        model: None,
+        language: None,
         auto_send: None,
         openai: Some(OpenAISpeechToTextConfig {
             api_key: "sk-test-key".into(),
@@ -91,6 +94,9 @@ async fn st2_deepgram_transcribe_success() {
     let config = SpeechToTextConfig {
         enabled: true,
         provider: SpeechToTextProvider::Deepgram,
+        provider_id: None,
+        model: None,
+        language: None,
         auto_send: None,
         openai: None,
         deepgram: Some(DeepgramSpeechToTextConfig {
@@ -123,6 +129,9 @@ async fn st3_stt_disabled() {
     let config = SpeechToTextConfig {
         enabled: false,
         provider: SpeechToTextProvider::Openai,
+        provider_id: None,
+        model: None,
+        language: None,
         auto_send: None,
         openai: None,
         deepgram: None,
@@ -149,6 +158,9 @@ async fn st5_openai_empty_api_key() {
     let config = SpeechToTextConfig {
         enabled: true,
         provider: SpeechToTextProvider::Openai,
+        provider_id: None,
+        model: None,
+        language: None,
         auto_send: None,
         openai: Some(OpenAISpeechToTextConfig {
             api_key: String::new(),
@@ -173,6 +185,9 @@ async fn st5b_openai_config_section_missing() {
     let config = SpeechToTextConfig {
         enabled: true,
         provider: SpeechToTextProvider::Openai,
+        provider_id: None,
+        model: None,
+        language: None,
         auto_send: None,
         openai: None,
         deepgram: None,
@@ -193,6 +208,9 @@ async fn st6_deepgram_empty_api_key() {
     let config = SpeechToTextConfig {
         enabled: true,
         provider: SpeechToTextProvider::Deepgram,
+        provider_id: None,
+        model: None,
+        language: None,
         auto_send: None,
         openai: None,
         deepgram: Some(DeepgramSpeechToTextConfig {
@@ -218,6 +236,9 @@ async fn st6b_deepgram_config_section_missing() {
     let config = SpeechToTextConfig {
         enabled: true,
         provider: SpeechToTextProvider::Deepgram,
+        provider_id: None,
+        model: None,
+        language: None,
         auto_send: None,
         openai: None,
         deepgram: None,
@@ -251,6 +272,9 @@ async fn st7_openai_upstream_failure() {
     let config = SpeechToTextConfig {
         enabled: true,
         provider: SpeechToTextProvider::Openai,
+        provider_id: None,
+        model: None,
+        language: None,
         auto_send: None,
         openai: Some(OpenAISpeechToTextConfig {
             api_key: "sk-invalid".into(),
@@ -291,6 +315,9 @@ async fn st7b_deepgram_upstream_failure() {
     let config = SpeechToTextConfig {
         enabled: true,
         provider: SpeechToTextProvider::Deepgram,
+        provider_id: None,
+        model: None,
+        language: None,
         auto_send: None,
         openai: None,
         deepgram: Some(DeepgramSpeechToTextConfig {
@@ -332,6 +359,9 @@ async fn st10_openai_language_hint_passed() {
     let config = SpeechToTextConfig {
         enabled: true,
         provider: SpeechToTextProvider::Openai,
+        provider_id: None,
+        model: None,
+        language: None,
         auto_send: None,
         openai: Some(OpenAISpeechToTextConfig {
             api_key: "sk-test".into(),
@@ -377,6 +407,9 @@ async fn st10b_deepgram_language_hint_passed() {
     let config = SpeechToTextConfig {
         enabled: true,
         provider: SpeechToTextProvider::Deepgram,
+        provider_id: None,
+        model: None,
+        language: None,
         auto_send: None,
         openai: None,
         deepgram: Some(DeepgramSpeechToTextConfig {
@@ -415,6 +448,9 @@ async fn openai_with_all_optional_params() {
     let config = SpeechToTextConfig {
         enabled: true,
         provider: SpeechToTextProvider::Openai,
+        provider_id: None,
+        model: None,
+        language: None,
         auto_send: Some(true),
         openai: Some(OpenAISpeechToTextConfig {
             api_key: "sk-full".into(),
@@ -466,6 +502,9 @@ async fn deepgram_with_all_optional_flags() {
     let config = SpeechToTextConfig {
         enabled: true,
         provider: SpeechToTextProvider::Deepgram,
+        provider_id: None,
+        model: None,
+        language: None,
         auto_send: None,
         openai: None,
         deepgram: Some(DeepgramSpeechToTextConfig {

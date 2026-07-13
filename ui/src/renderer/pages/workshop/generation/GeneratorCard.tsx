@@ -32,6 +32,7 @@ import PromptField from './PromptField';
 import ParamControls from './ParamControls';
 import InputSummary from './InputSummary';
 import ResultView from './ResultView';
+import { isLocalZImageModel } from './localZImage';
 
 const MODE_META: Record<GenMode, { icon: React.ReactNode }> = {
   image: { icon: <Pic theme='outline' size={12} strokeWidth={3} /> },
@@ -77,6 +78,7 @@ const GeneratorCard: React.FC<GeneratorCardProps> = ({ id, data }) => {
     const explicit = models.flat.find((m) => m.providerId === data.providerId && m.model === data.model);
     return explicit ?? models.flat[0] ?? null;
   }, [models.flat, data.providerId, data.model]);
+  const localZImage = isLocalZImageModel(effectiveModel);
 
   const { run, cancel } = useGenerationRun({
     nodeId: id,
@@ -217,11 +219,17 @@ const GeneratorCard: React.FC<GeneratorCardProps> = ({ id, data }) => {
       {/* Body */}
       <div className='nowheel flex min-h-0 min-w-0 flex-1 flex-col gap-10px overflow-y-auto px-11px py-10px'>
         {status === 'success' && results.length > 0 && (
-          <ResultView mode={mode} resultAssetIds={results} batch={data.batch} onContinueEdit={continueEdit} onToTextNode={toTextNode} />
+          <ResultView
+            mode={mode}
+            resultAssetIds={results}
+            batch={data.batch}
+            onContinueEdit={localZImage ? undefined : continueEdit}
+            onToTextNode={toTextNode}
+          />
         )}
         <PromptField value={prompt} mode={mode} selfId={id} onChange={setPrompt} onAddMention={addMention} />
         <InputSummary selfId={id} mentions={mentions} onRemoveMention={removeMention} />
-        <ParamControls mode={mode} params={params} onChange={setParams} />
+        <ParamControls mode={mode} model={effectiveModel} params={params} onChange={setParams} />
       </div>
 
       {/* Footer */}

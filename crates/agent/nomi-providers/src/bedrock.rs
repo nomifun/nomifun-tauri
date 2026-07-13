@@ -305,7 +305,7 @@ impl LlmProvider for BedrockProvider {
 
         // Initial request with connect-failure retry (status/rate-limit errors
         // are surfaced immediately, same as the other providers).
-        let response = crate::retry::with_initial_connect_retry(|| {
+        let response = crate::retry::with_initial_request_retry(|| {
             send_signed(&self.region, &client, &url, &body_bytes, &credentials)
         })
         .await?;

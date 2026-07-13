@@ -73,12 +73,41 @@ async fn set_stt_config(app: &mut axum::Router, token: &str, csrf: &str, config:
     let req = json_with_token(
         "PUT",
         "/api/settings/client",
-        json!({ "speechToText": config }),
+        json!({ "tools.speechToText": config }),
         token,
         csrf,
     );
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+async fn create_provider(
+    app: &mut axum::Router,
+    token: &str,
+    csrf: &str,
+    id: &str,
+    base_url: &str,
+    api_key: &str,
+    models: &[&str],
+) {
+    let req = json_with_token(
+        "POST",
+        "/api/providers",
+        json!({
+            "id": id,
+            "platform": "custom",
+            "name": id,
+            "base_url": base_url,
+            "api_key": api_key,
+            "models": models,
+            "enabled": true,
+            "capabilities": []
+        }),
+        token,
+        csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
 }
 
 // ===========================================================================
@@ -561,6 +590,55 @@ async fn st2_deepgram_transcription_success() {
     assert_eq!(json["success"], true);
     assert_eq!(json["data"]["text"], "hello from deepgram");
     assert_eq!(json["data"]["provider"], "deepgram");
+}
+
+#[tokio::test]
+async fn st11_configured_provider_is_resolved_by_id() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "text": "provider reference works" })))
+        .mount(&mock_server)
+        .await;
+
+    let (mut app, services) = build_app_with_noop_opener().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    create_provider(
+        &mut app,
+        &token,
+        &csrf,
+        "speech-provider",
+        &mock_server.uri(),
+        "sk-from-provider",
+        &["whisper-1"],
+    )
+    .await;
+    set_stt_config(
+        &mut app,
+        &token,
+        &csrf,
+        json!({
+            "enabled": true,
+            "provider": "openai",
+            "provider_id": "speech-provider",
+            "model": "whisper-1",
+            "language": "en"
+        }),
+    )
+    .await;
+
+    let (content_type, body) = MultipartBuilder::new()
+        .add_file("file", "test.wav", "audio/wav", b"fake audio data")
+        .add_text("fileName", "test.wav")
+        .add_text("mimeType", "audio/wav")
+        .build();
+
+    let req = multipart_request("/api/stt", &content_type, body, &token, &csrf);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["data"]["text"], "provider reference works");
+    assert_eq!(body["data"]["model"], "whisper-1");
 }
 
 // ST-10: languageHint passed through

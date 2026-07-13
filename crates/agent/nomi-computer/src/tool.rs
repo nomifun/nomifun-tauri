@@ -317,7 +317,14 @@ impl ComputerTool {
 
         nomi_a11y::overlay::draw_set_of_marks(&mut shot.image, &display);
         match encode_png(&shot.image) {
-            Ok(img) => ToolResult::text(header).with_images(vec![img]),
+            Ok(encoded) => {
+                let mut geometry = shot.geometry;
+                geometry.img_w = encoded.width;
+                geometry.img_h = encoded.height;
+                *self.last_capture.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(geometry);
+                ToolResult::text(header).with_images(vec![encoded.image])
+            }
             Err(_) => ToolResult::text(header),
         }
     }
@@ -572,19 +579,24 @@ impl ComputerTool {
 
         match captured {
             Ok(shot) => {
-                *self.last_capture.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                    Some(shot.geometry);
-                let text = format!(
-                    "Screenshot captured: {}x{} (display {}, scaled from {}x{} physical). \
-                     Coordinates you provide will be mapped back to the screen automatically.",
-                    shot.geometry.img_w,
-                    shot.geometry.img_h,
-                    shot.display_index,
-                    shot.physical_w,
-                    shot.physical_h
-                );
                 match encode_png(&shot.image) {
-                    Ok(img) => ToolResult::text(text).with_images(vec![img]),
+                    Ok(encoded) => {
+                        let mut geometry = shot.geometry;
+                        geometry.img_w = encoded.width;
+                        geometry.img_h = encoded.height;
+                        *self.last_capture.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some(geometry);
+                        let text = format!(
+                            "Screenshot captured: {}x{} (display {}, scaled from {}x{} physical). \
+                             Coordinates you provide will be mapped back to the screen automatically.",
+                            encoded.width,
+                            encoded.height,
+                            shot.display_index,
+                            shot.physical_w,
+                            shot.physical_h
+                        );
+                        ToolResult::text(text).with_images(vec![encoded.image])
+                    }
                     Err(e) => ToolResult::error(e),
                 }
             }

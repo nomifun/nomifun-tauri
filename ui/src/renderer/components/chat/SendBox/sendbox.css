@@ -1,5 +1,28 @@
 /* Sendbox component styles */
 
+/*
+ * The primary send affordance is icon-only and circular. Keep every painted
+ * interaction layer (including Arco's loading mask) clipped to that same
+ * circle so hover, active, disabled, and loading states never show square
+ * corners.
+ */
+.send-button-custom,
+.send-button-custom.arco-btn,
+.sendbox-stop-button,
+.sendbox-stop-button.arco-btn {
+  border-radius: 50% !important;
+  overflow: clip;
+}
+
+@supports not (overflow: clip) {
+  .send-button-custom,
+  .send-button-custom.arco-btn,
+  .sendbox-stop-button,
+  .sendbox-stop-button.arco-btn {
+    overflow: hidden;
+  }
+}
+
 /* Send button disabled state - override Arco Design default disabled styles */
 .send-button-custom:disabled,
 .send-button-custom.arco-btn:disabled,

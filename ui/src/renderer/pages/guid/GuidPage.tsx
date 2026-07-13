@@ -12,6 +12,7 @@ import { resolveLocaleKey } from '@/common/utils';
 
 import { useInputFocusRing } from '@/renderer/hooks/chat/useInputFocusRing';
 import { isSubmitGesture } from '@/renderer/hooks/chat/useCompositionInput';
+import { appendSpeechTranscript } from '@/renderer/hooks/system/useSpeechInput';
 import { useConfig } from '@/renderer/hooks/config/useConfig';
 import { resolveExtensionAssetUrl } from '@/renderer/utils/platform';
 import { CUSTOM_AVATAR_IMAGE_MAP } from './constants';
@@ -30,6 +31,7 @@ import GuidResourceCards from './components/GuidResourceCards';
 import MentionDropdown, { MentionSelectorBadge } from './components/MentionDropdown';
 import QuickActionButtons from './components/QuickActionButtons';
 import SummonDrawer from './components/SummonDrawer';
+import SpeechInputButton from '@/renderer/components/chat/SpeechInputButton';
 import FeedbackReportModal from '@/renderer/components/settings/SettingsModal/contents/FeedbackReportModal';
 import AutoWorkControl from '@/renderer/pages/conversation/components/AutoWorkControl';
 import IdmmControl from '@/renderer/pages/conversation/components/IdmmControl';
@@ -670,6 +672,15 @@ const GuidPage: React.FC = () => {
       onToggleMcpServer={handleToggleMcpServer}
       hidePresetTag
       loading={guidInput.loading}
+      speechInputNode={
+        <SpeechInputButton
+          disabled={guidInput.loading}
+          locale={i18n.language}
+          onTranscript={(transcript) => {
+            guidInput.setInput((current) => appendSpeechTranscript(current, transcript));
+          }}
+        />
+      }
       autoWorkMode={isAutoWorkMode}
       isButtonDisabled={
         isAutoWorkMode

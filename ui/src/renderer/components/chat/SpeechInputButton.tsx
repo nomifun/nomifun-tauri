@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { configService } from '@/common/config/configService';
+import { ipcBridge } from '@/common';
 import { Message, Button, Tooltip } from '@arco-design/web-react';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -13,6 +13,12 @@ import {
   type SpeechInputAvailability,
   type SpeechInputErrorCode,
 } from '@/renderer/hooks/system/useSpeechInput';
+import { LOCAL_ASR_STATUS_CHANGED_EVENT } from '@/renderer/services/localAsrEvents';
+import {
+  getSpeechToTextConfig,
+  SPEECH_TO_TEXT_CONFIG_CHANGED_EVENT,
+} from '@/renderer/services/speechToTextConfig';
+import { useProvidersQuery } from '@/renderer/hooks/agent/useModelProviderList';
 
 type SpeechInputButtonProps = {
   disabled?: boolean;
@@ -36,8 +42,6 @@ const SpeechStopIcon = () => (
 
 const SpeechLoaderIcon = () => <span className='speech-loader-spinner' aria-hidden='true' />;
 
-const SPEECH_TO_TEXT_CONFIG_CHANGED_EVENT = 'nomifun:speech-to-text-config-changed';
-
 const getAvailabilityMessageKey = (availability: SpeechInputAvailability) => {
   switch (availability) {
     case 'file':
@@ -53,6 +57,8 @@ const getErrorMessageKey = (errorCode: SpeechInputErrorCode) => {
   switch (errorCode) {
     case 'audio-capture':
       return 'conversation.chat.speech.audioCaptureError';
+    case 'audio-normalization':
+      return 'conversation.chat.speech.audioNormalizationError';
     case 'empty-transcript':
       return 'conversation.chat.speech.emptyTranscript';
     case 'file-too-large':
@@ -98,8 +104,9 @@ const getTooltipKey = (availability: SpeechInputAvailability, isListening: boole
 const SpeechInputButton: React.FC<SpeechInputButtonProps> = ({ disabled, locale, onTranscript }) => {
   const { t } = useTranslation();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const [isSpeechToTextEnabled, setIsSpeechToTextEnabled] = useState(false);
+  const [isSpeechInputEnabled, setIsSpeechInputEnabled] = useState(false);
   const [isConfigLoaded, setIsConfigLoaded] = useState(false);
+  const { data: providers } = useProvidersQuery();
   const {
     availability,
     clearError,
@@ -130,22 +137,52 @@ const SpeechInputButton: React.FC<SpeechInputButtonProps> = ({ disabled, locale,
     let cancelled = false;
 
     const syncSpeechToTextEnabled = async () => {
-      try {
-        const config = configService.get('tools.speechToText');
-        if (cancelled) {
-          return;
-        }
-        setIsSpeechToTextEnabled(Boolean(config?.enabled));
-      } catch {
-        if (cancelled) {
-          return;
-        }
-        setIsSpeechToTextEnabled(false);
-      } finally {
-        if (!cancelled) {
-          setIsConfigLoaded(true);
+      const config = getSpeechToTextConfig();
+      const selectedCloudProvider = config.provider_id
+        ? providers?.find((provider) => provider.id === config.provider_id)
+        : undefined;
+      const referencedCloudModelIsReady = Boolean(
+        selectedCloudProvider &&
+          selectedCloudProvider.enabled !== false &&
+          selectedCloudProvider.api_key.trim() &&
+          config.model &&
+          selectedCloudProvider.models.includes(config.model) &&
+          selectedCloudProvider.model_enabled?.[config.model] !== false
+      );
+      const legacyCloudConfigIsReady = Boolean(
+        !config.provider_id &&
+          (config.provider === 'openai'
+            ? config.openai?.api_key.trim()
+            : config.provider === 'deepgram'
+              ? config.deepgram?.api_key.trim()
+              : false)
+      );
+      const cloudEnabled = Boolean(
+        config.enabled &&
+          config.provider !== 'local' &&
+          (referencedCloudModelIsReady || legacyCloudConfigIsReady)
+      );
+      let localEnabled = false;
+      if (config?.enabled && config.provider === 'local') {
+        try {
+          const status = await ipcBridge.managedModelService.local.asr.status.invoke();
+          localEnabled = Boolean(
+            status.enabled &&
+              status.ready &&
+              status.activeModelId &&
+              config.model === status.activeModelId
+          );
+        } catch {
+          // Local ASR is optional. A failed status probe must not hide a
+          // configured cloud speech provider.
         }
       }
+
+      if (cancelled) {
+        return;
+      }
+      setIsSpeechInputEnabled(cloudEnabled || localEnabled);
+      setIsConfigLoaded(true);
     };
 
     const handleConfigChanged = () => {
@@ -154,12 +191,14 @@ const SpeechInputButton: React.FC<SpeechInputButtonProps> = ({ disabled, locale,
 
     void syncSpeechToTextEnabled();
     window.addEventListener(SPEECH_TO_TEXT_CONFIG_CHANGED_EVENT, handleConfigChanged);
+    window.addEventListener(LOCAL_ASR_STATUS_CHANGED_EVENT, handleConfigChanged);
 
     return () => {
       cancelled = true;
       window.removeEventListener(SPEECH_TO_TEXT_CONFIG_CHANGED_EVENT, handleConfigChanged);
+      window.removeEventListener(LOCAL_ASR_STATUS_CHANGED_EVENT, handleConfigChanged);
     };
-  }, []);
+  }, [providers]);
 
   useEffect(() => {
     if (!errorCode) {
@@ -209,7 +248,7 @@ const SpeechInputButton: React.FC<SpeechInputButtonProps> = ({ disabled, locale,
     void transcribeFile(file);
   };
 
-  if (!isConfigLoaded || !isSpeechToTextEnabled) {
+  if (!isConfigLoaded || !isSpeechInputEnabled) {
     return null;
   }
 

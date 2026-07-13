@@ -10,6 +10,8 @@
 //!   (t2v / i2v).
 //! - [`openai_chat`] — OpenAI-compatible sync `/v1/chat/completions` (`text`);
 //!   the reply is returned inline as `text/plain` UTF-8.
+//! - [`local_image`] - an app-injected adapter for the pinned Z-Image-Turbo
+//!   `sd-cli` recipe (`t2i` only; no implicit download).
 //! - [`gemini_text`] — Google `:generateContent` text mode (`text`).
 //!
 //! `ark` (火山方舟) and `modelscope` are P1 stubs (empty module files that keep
@@ -27,6 +29,7 @@ use crate::types::MediaCapability;
 pub(crate) mod ark;
 pub(crate) mod gemini_image;
 pub(crate) mod gemini_text;
+pub(crate) mod local_image;
 pub(crate) mod modelscope;
 pub(crate) mod openai_chat;
 pub(crate) mod openai_images;
@@ -44,8 +47,24 @@ pub fn default_adapters(http: reqwest::Client) -> Vec<Arc<dyn MediaProvider>> {
     ]
 }
 
+/// Build the standard adapter set plus an app-injected local image backend.
+///
+/// Kept separate from [`default_adapters`] because the creation crate does not
+/// own model/runtime installation. App assembly should call this only after the
+/// local control plane has resolved verified `sd-cli` and model artifact paths.
+pub fn default_adapters_with_local_image(
+    http: reqwest::Client,
+    backend: Arc<dyn local_image::LocalImageBackend>,
+) -> Vec<Arc<dyn MediaProvider>> {
+    let mut adapters = default_adapters(http);
+    adapters.push(Arc::new(local_image::LocalImageAdapter::new(backend)));
+    adapters
+}
+
 /// Pick the adapter id for a `(capability, platform, model)` triple. Explicit,
-/// extensible dispatch (P1 adds `ark` / `modelscope` branches):
+/// extensible dispatch (P1 adds `ark` / `modelscope` branches). The managed
+/// local Z-Image id routes to `local_image`; that adapter then enforces its
+/// current t2i-only capability:
 /// - video caps → `openai_video`;
 /// - `gemini` platform or a model whose name contains `gemini` → `gemini_image`
 ///   (which serves t2i/i2i; inpaint always falls to `openai_images`);
@@ -57,6 +76,9 @@ pub fn route_adapter_id(cap: MediaCapability, platform: &str, model: &str) -> Op
     use MediaCapability::*;
     match cap {
         T2v | I2v | V2v => Some("openai_video"),
+        T2i | I2i | Inpaint if is_local_z_image(platform, model) => {
+            Some(local_image::LOCAL_IMAGE_ADAPTER_ID)
+        }
         Inpaint => Some("openai_images"),
         T2i | I2i => {
             if is_gemini(platform, model) {
@@ -74,6 +96,11 @@ pub fn route_adapter_id(cap: MediaCapability, platform: &str, model: &str) -> Op
         }
         Tts => None,
     }
+}
+
+fn is_local_z_image(platform: &str, model: &str) -> bool {
+    platform.eq_ignore_ascii_case("nomifun-local-model")
+        && model.eq_ignore_ascii_case(local_image::LOCAL_Z_IMAGE_TURBO_MODEL_ID)
 }
 
 fn is_gemini(platform: &str, model: &str) -> bool {
@@ -239,6 +266,25 @@ mod tests {
         assert_eq!(route_adapter_id(Text, "custom", "gemini-flash"), Some("gemini_text"));
         // unrouted
         assert_eq!(route_adapter_id(Tts, "openai", "tts-1"), None);
+        assert_eq!(
+            route_adapter_id(
+                T2i,
+                "nomifun-local-model",
+                local_image::LOCAL_Z_IMAGE_TURBO_MODEL_ID,
+            ),
+            Some(local_image::LOCAL_IMAGE_ADAPTER_ID)
+        );
+        // Route references to the local adapter too, so its capability check
+        // yields a local unsupported-capability error rather than making an
+        // unrelated OpenAI Images HTTP request.
+        assert_eq!(
+            route_adapter_id(
+                I2i,
+                "nomifun-local-model",
+                local_image::LOCAL_Z_IMAGE_TURBO_MODEL_ID,
+            ),
+            Some(local_image::LOCAL_IMAGE_ADAPTER_ID)
+        );
     }
 
     #[test]

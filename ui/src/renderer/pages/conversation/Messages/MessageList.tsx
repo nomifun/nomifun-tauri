@@ -240,6 +240,18 @@ const formatToolReceiptPart = (
 ): string => {
   const displayTarget = getToolReceiptDisplayTarget(part, workspaceRoots);
 
+  if (part.skipped) {
+    return t('messages.toolSummary.skipped', {
+      target:
+        displayTarget ??
+        t('messages.processReceipt.tools', {
+          count: part.count,
+          defaultValue: '{{count}} tools',
+        }),
+      defaultValue: 'Skipped {{target}}',
+    });
+  }
+
   if ((part.state === 'failed' || part.state === 'canceled') && displayTarget) {
     return t(`messages.toolSummary.${part.state}`, {
       target: displayTarget,

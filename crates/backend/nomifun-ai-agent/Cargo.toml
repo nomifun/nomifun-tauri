@@ -18,6 +18,7 @@ nomifun-net.workspace = true
 reqwest.workspace = true
 axum.workspace = true
 base64.workspace = true
+image = { workspace = true, features = ["jpeg", "webp"] }
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 ed25519-dalek.workspace = true

@@ -42,16 +42,74 @@ pub struct CapturedScreen {
     pub display_index: usize,
 }
 
-/// Encode a (possibly overlay-annotated) RGBA frame as a base64 PNG `ToolImage`.
-pub fn encode_png(img: &image::RgbaImage) -> Result<ToolImage, String> {
+const MAX_SCREENSHOT_PNG_BYTES: usize = 5 * 1024 * 1024;
+const MIN_SCREENSHOT_LONG_EDGE: u32 = 320;
+const MAX_ENCODE_ATTEMPTS: usize = 12;
+
+/// Encoded screenshot and the exact pixel geometry sent to the model.
+#[derive(Debug)]
+pub struct EncodedPng {
+    pub image: ToolImage,
+    pub width: u32,
+    pub height: u32,
+}
+
+fn png_bytes(img: &image::RgbaImage) -> Result<Vec<u8>, String> {
     let mut png = Vec::new();
     image::DynamicImage::ImageRgba8(img.clone())
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .map_err(|e| format!("Failed to encode screenshot as PNG: {e}"))?;
-    Ok(ToolImage {
-        media_type: "image/png".to_string(),
-        data: base64::engine::general_purpose::STANDARD.encode(&png),
-    })
+    Ok(png)
+}
+
+/// Encode a (possibly overlay-annotated) RGBA frame as a byte-bounded PNG.
+/// High-entropy or unusually large frames are downscaled deterministically so
+/// native Computer screenshots can never exceed the shared 5 MiB image limit.
+pub fn encode_png(img: &image::RgbaImage) -> Result<EncodedPng, String> {
+    if img.width() == 0 || img.height() == 0 {
+        return Err("Cannot encode an empty screenshot".to_owned());
+    }
+
+    let mut working = img.clone();
+    for _ in 0..MAX_ENCODE_ATTEMPTS {
+        let png = png_bytes(&working)?;
+        if png.len() <= MAX_SCREENSHOT_PNG_BYTES {
+            return Ok(EncodedPng {
+                width: working.width(),
+                height: working.height(),
+                image: ToolImage {
+                    media_type: "image/png".to_string(),
+                    data: base64::engine::general_purpose::STANDARD.encode(&png),
+                },
+            });
+        }
+
+        let old_w = working.width();
+        let old_h = working.height();
+        if old_w.max(old_h) <= MIN_SCREENSHOT_LONG_EDGE {
+            break;
+        }
+        let ratio = ((MAX_SCREENSHOT_PNG_BYTES as f64 / png.len() as f64).sqrt() * 0.92)
+            .clamp(0.1, 0.9);
+        let min_ratio = MIN_SCREENSHOT_LONG_EDGE as f64 / old_w.max(old_h) as f64;
+        let ratio = ratio.max(min_ratio.min(0.9));
+        let new_w = ((old_w as f64 * ratio).floor() as u32).max(1);
+        let new_h = ((old_h as f64 * ratio).floor() as u32).max(1);
+        if (new_w, new_h) == (old_w, old_h) {
+            break;
+        }
+        working = image::imageops::resize(
+            &working,
+            new_w,
+            new_h,
+            image::imageops::FilterType::Triangle,
+        );
+    }
+
+    Err(format!(
+        "Screenshot could not be reduced below the {} MiB provider image limit",
+        MAX_SCREENSHOT_PNG_BYTES / (1024 * 1024)
+    ))
 }
 
 /// Pick the monitor to capture: explicit index, else the primary, else the
@@ -164,8 +222,8 @@ mod tests {
         let captured = capture_screen(None, 1568).expect("capture should succeed");
         assert!(captured.image.width() > 0 && captured.image.height() > 0);
         let encoded = encode_png(&captured.image).expect("encode should succeed");
-        assert_eq!(encoded.media_type, "image/png");
-        assert!(!encoded.data.is_empty());
+        assert_eq!(encoded.image.media_type, "image/png");
+        assert!(!encoded.image.data.is_empty());
         assert!(captured.geometry.img_w.max(captured.geometry.img_h) <= 1568);
         assert!(captured.physical_w >= captured.geometry.img_w);
     }
@@ -175,6 +233,31 @@ mod tests {
     fn capture_invalid_display_errors_real() {
         let err = capture_screen(Some(99), 1568).unwrap_err();
         assert!(err.contains("99"), "error should name the display: {err}");
+    }
+
+    #[test]
+    fn encode_png_bounds_high_entropy_screenshot_payload() {
+        let img = image::RgbaImage::from_fn(3_000, 2_000, |x, y| {
+            let mut value = x
+                .wrapping_mul(0x9e37_79b9)
+                .wrapping_add(y.wrapping_mul(0x85eb_ca6b));
+            value ^= value >> 16;
+            value = value.wrapping_mul(0x7feb_352d);
+            value ^= value >> 15;
+            image::Rgba([
+                value as u8,
+                (value >> 8) as u8,
+                (value >> 16) as u8,
+                255,
+            ])
+        });
+
+        let encoded = encode_png(&img).expect("encode should succeed");
+
+        const MAX_BASE64_BYTES: usize = (5 * 1024 * 1024_usize).div_ceil(3) * 4;
+        assert!(encoded.image.data.len() <= MAX_BASE64_BYTES);
+        assert!(encoded.width > 0 && encoded.height > 0);
+        assert!(encoded.width < img.width() || encoded.height < img.height());
     }
 
     #[cfg(target_os = "macos")]

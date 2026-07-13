@@ -93,19 +93,17 @@ type ProfileCapabilityIndex = Map<string, CreationCapability[]>;
 const profileKey = (providerId: string, model: string): string => JSON.stringify([providerId, model]);
 
 /**
- * Index the authoritative per-model profiles by `(providerId, model)`, keeping
- * only `source === 'user'` rows: those are the explicit signal the user gave in
- * the model config UI (`ModelProfile.tasks`, written via
- * `ipcBridge.modelProfile.upsert`) and therefore override the name heuristic.
- * Other sources (`inferred` / `catalog`) are skipped so auto-seeded profiles
- * never silently change the legacy behavior. Returns `undefined` when nothing
- * authoritative exists, letting callers cheaply skip the lookup.
+ * Index authoritative per-model profiles by `(providerId, model)`. User edits
+ * and NomiFun's pinned local catalog are authoritative; name-inferred rows are
+ * skipped so automatic guesses retain the legacy heuristic behavior.
  */
-const buildUserProfileIndex = (profiles: ModelProfile[] | undefined): ProfileCapabilityIndex | undefined => {
+const buildAuthoritativeProfileIndex = (
+  profiles: ModelProfile[] | undefined
+): ProfileCapabilityIndex | undefined => {
   if (!profiles || profiles.length === 0) return undefined;
   const index: ProfileCapabilityIndex = new Map();
   for (const profile of profiles) {
-    if (profile.source !== 'user') continue;
+    if (profile.source === 'inferred') continue;
     index.set(profileKey(profile.provider_id, profile.model), profileCreationCapabilities(profile));
   }
   return index.size > 0 ? index : undefined;
@@ -113,9 +111,8 @@ const buildUserProfileIndex = (profiles: ModelProfile[] | undefined): ProfileCap
 
 /**
  * Resolve whether a specific model has a creation capability. Precedence:
- *   1. authoritative per-model user profile (`profileCaps`) — sole authority
- *      when present, both positively (task present → capable) and negatively
- *      (absent → not capable);
+ *   1. authoritative user/catalog profile (`profileCaps`) — sole authority
+ *      when present, both positively and negatively;
  *   2. provider-level user override (`capabilities` + `is_user_selected`);
  *   3. the model-name heuristic.
  */
@@ -152,7 +149,7 @@ export const getCreationModels = (
   filter?: CreationCapability,
   profiles?: ModelProfile[]
 ): CreationModelEntry[] => {
-  const profileIndex = buildUserProfileIndex(profiles);
+  const profileIndex = buildAuthoritativeProfileIndex(profiles);
   const out: CreationModelEntry[] = [];
   for (const provider of providers ?? []) {
     if (provider.enabled === false) continue;

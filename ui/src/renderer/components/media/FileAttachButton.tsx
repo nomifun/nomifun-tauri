@@ -108,7 +108,7 @@ const FileAttachButton: React.FC<FileAttachButtonProps> = ({
     setOpen(false);
     setSkillsOpen(false);
     setMcpOpen(false);
-    void navigate('/settings/capabilities?tab=tools');
+    void navigate('/mcp');
   }, [navigate]);
 
   const handleLocalFileChange = useCallback(
@@ -204,7 +204,7 @@ const FileAttachButton: React.FC<FileAttachButtonProps> = ({
         <div className='text-12px leading-16px text-t-secondary whitespace-normal break-words'>
           {t('conversation.mcp.managementHint', {
             defaultValue:
-              'If an MCP looks abnormal, it is usually caused by the MCP JSON configuration. Go to Tools settings and test it there.',
+              'If an MCP looks abnormal, review its JSON configuration and run an availability check in MCP management.',
           })}
         </div>
         <Button
@@ -215,7 +215,7 @@ const FileAttachButton: React.FC<FileAttachButtonProps> = ({
         >
           <span className='leading-none'>
             {t('conversation.mcp.openSettings', {
-              defaultValue: 'Open Tools settings',
+              defaultValue: 'Open MCP management',
             })}
           </span>
           <span className='inline-flex h-12px w-12px flex-shrink-0 items-center justify-center'>

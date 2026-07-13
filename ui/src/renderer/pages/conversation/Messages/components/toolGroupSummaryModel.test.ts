@@ -143,6 +143,31 @@ describe('buildToolReceiptSummaryParts', () => {
     ]);
   });
 
+  test('summarizes prior-error barrier commands as skipped instead of failed', () => {
+    const parts = buildToolReceiptSummaryParts(
+      [
+        tool({
+          key: 'bash-skipped',
+          name: 'Bash',
+          status: 'canceled',
+          skipped: true,
+          input: '{"command":"find /workspace -maxdepth 2 -type d"}',
+        }),
+      ],
+      'canceled'
+    );
+
+    expect(parts).toEqual([
+      {
+        action: 'run_commands',
+        count: 1,
+        state: 'canceled',
+        target: 'find /workspace -maxdepth 2 -type d',
+        skipped: true,
+      },
+    ]);
+  });
+
   test('handles structured tool descriptions without throwing during receipt rendering', () => {
     const parts = buildToolReceiptSummaryParts(
       [
@@ -322,6 +347,30 @@ describe('buildToolReceiptDetailRows', () => {
         title: 'Bash',
         target: 'grep -rn "missing" .',
         output: 'exit code 1',
+      },
+    ]);
+  });
+
+  test('keeps skipped command details distinct from user cancellation', () => {
+    const rows = buildToolReceiptDetailRows([
+      tool({
+        key: 'bash-skipped',
+        name: 'Bash',
+        status: 'canceled',
+        skipped: true,
+        input: '{"command":"find /workspace -maxdepth 2 -type d"}',
+      }),
+    ]);
+
+    expect(rows).toEqual([
+      {
+        key: 'bash-skipped',
+        action: 'run_commands',
+        state: 'canceled',
+        title: 'Bash',
+        target: 'find /workspace -maxdepth 2 -type d',
+        input: '{"command":"find /workspace -maxdepth 2 -type d"}',
+        skipped: true,
       },
     ]);
   });

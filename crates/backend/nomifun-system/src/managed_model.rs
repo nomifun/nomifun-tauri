@@ -1146,7 +1146,10 @@ pub async fn start_and_provision_free_model_with_preferences(
         .into_iter()
         .find(|row| {
             row.id != FREE_MODEL_PROVIDER_ID
-                && is_managed_provider_identity(None, Some(&row.platform))
+                && row
+                    .platform
+                    .trim()
+                    .eq_ignore_ascii_case(FREE_MODEL_PROVIDER_ID)
         })
     {
         return Err(AppError::Conflict(format!(
@@ -1927,6 +1930,41 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn free_provision_allows_canonical_local_provider_to_coexist() {
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IProviderRepository> =
+            Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+        let encrypted = encrypt_string("local-token", &TEST_KEY).unwrap();
+        repo.create(CreateProviderParams {
+            id: Some(LOCAL_MODEL_PROVIDER_ID),
+            platform: LOCAL_MODEL_PROVIDER_ID,
+            name: "NomiFun Local Model",
+            base_url: "http://127.0.0.1:12346/v1",
+            api_key_encrypted: &encrypted,
+            models: "[]",
+            enabled: false,
+            capabilities: "[]",
+            context_limit: None,
+            model_context_limits: None,
+            model_protocols: None,
+            model_descriptions: None,
+            model_enabled: None,
+            model_health: None,
+            bedrock_config: None,
+            is_full_url: false,
+            sort_order: None,
+        })
+        .await
+        .unwrap();
+
+        let (_service, mut server) =
+            start_and_provision_free_model(repo.clone(), TEST_KEY).await.unwrap();
+        assert!(repo.find_by_id(FREE_MODEL_PROVIDER_ID).await.unwrap().is_some());
+        assert!(repo.find_by_id(LOCAL_MODEL_PROVIDER_ID).await.unwrap().is_some());
+        server.stop();
     }
 
     #[tokio::test]

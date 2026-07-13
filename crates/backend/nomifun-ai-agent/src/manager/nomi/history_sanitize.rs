@@ -12,83 +12,138 @@
 //!   - Some OpenAI-compatible proxies (e.g. DeepSeek behind a strict gateway)
 //!     return `400 invalid_request_error` for the same reason.
 //!
-//! Fix: drop assistant messages that
-//!   1. contain at least one `ToolUse` block,
-//!   2. have NO non-empty `Text` content, AND
-//!   3. have NO subsequent `ToolResult` block (in any later message) that
-//!      references one of those tool-use ids.
-//!
-//! A complete `assistant(tool_use) → user(tool_result)` pair is left intact —
-//! that shape is valid and required by every provider.
+//! Fix: repair tool calls as ordered adjacent pairs. A result may answer only
+//! the assistant tool-call group immediately before it; a matching id later in
+//! history must not make a broken transcript appear valid. Historical tool
+//! screenshots are also removed before replay, and provider-specific thinking
+//! blocks are removed when switching providers.
 //!
 //! This logic is intentionally a free function (not a method on
 //! `NomiAgentManager`) so it can be unit-tested in isolation and so we do
 //! not add yet another field to a manager (per `AGENTS.md`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use nomi_types::message::{ContentBlock, Message, Role};
 
-/// Drop orphaned assistant tool-call messages from a session's history.
-///
-/// Returns the number of messages removed.
-///
-/// Operates in-place on `messages`. Safe to call on an empty vector.
-pub fn sanitize_session_messages(messages: &mut Vec<Message>) -> usize {
-    if messages.is_empty() {
-        return 0;
-    }
+const HISTORICAL_IMAGE_NOTE: &str =
+    "(Image attachment omitted during historical session recovery; capture a fresh observation if needed.)";
 
-    // Collect every tool_use_id that has a matching tool_result anywhere
-    // in the entire history. We do this in one pass so that the lookup
-    // for each candidate assistant message is O(1).
-    let mut answered_tool_use_ids: HashSet<String> = HashSet::new();
-    for msg in messages.iter() {
-        for block in &msg.content {
-            if let ContentBlock::ToolResult { tool_use_id, .. } = block {
-                answered_tool_use_ids.insert(tool_use_id.clone());
-            }
-        }
-    }
-
-    let original_len = messages.len();
-    messages.retain(|msg| !is_orphaned_assistant_tool_call(msg, &answered_tool_use_ids));
-    original_len - messages.len()
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SessionRepairStats {
+    pub removed_messages: usize,
+    pub removed_tool_calls: usize,
+    pub removed_tool_results: usize,
+    pub removed_images: usize,
+    pub removed_thinking: usize,
 }
 
-/// True iff `msg` is an assistant message that has tool_use blocks, no
-/// non-empty text, and at least one of its tool_use ids has no matching
-/// tool_result anywhere in the history.
-fn is_orphaned_assistant_tool_call(msg: &Message, answered: &HashSet<String>) -> bool {
-    if msg.role != Role::Assistant {
-        return false;
+/// Repair a resumed transcript to the provider-safe subset of its history.
+///
+/// A tool result is valid only when it belongs to the immediately preceding
+/// assistant tool-call group. Operates in-place and is safe on empty input.
+pub fn sanitize_session_messages(
+    messages: &mut Vec<Message>,
+    provider_changed: bool,
+) -> SessionRepairStats {
+    if messages.is_empty() {
+        return SessionRepairStats::default();
     }
 
-    let mut has_tool_use = false;
-    let mut has_unanswered = false;
-    let mut has_text = false;
-
-    for block in &msg.content {
-        match block {
-            ContentBlock::ToolUse { id, .. } => {
-                has_tool_use = true;
-                if !answered.contains(id) {
-                    has_unanswered = true;
-                }
+    // Track validity by message position, not only by id. Provider-generated
+    // ids are normally unique, but legacy/corrupt histories can reuse one; a
+    // later valid pair must never rescue an earlier orphan with the same id.
+    let mut keep_tool_uses = vec![HashSet::new(); messages.len()];
+    let mut keep_tool_results = vec![HashSet::new(); messages.len()];
+    for index in 0..messages.len().saturating_sub(1) {
+        let assistant = &messages[index];
+        let result_group = &messages[index + 1];
+        if assistant.role != Role::Assistant
+            || !matches!(result_group.role, Role::User | Role::Tool)
+        {
+            continue;
+        }
+        let mut calls: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (block_index, block) in assistant.content.iter().enumerate() {
+            if let ContentBlock::ToolUse { id, .. } = block {
+                calls.entry(id.as_str()).or_default().push(block_index);
             }
-            ContentBlock::Text { text } => {
-                if !text.trim().is_empty() {
-                    has_text = true;
-                }
+        }
+        let mut results: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (block_index, block) in result_group.content.iter().enumerate() {
+            if let ContentBlock::ToolResult { tool_use_id, .. } = block {
+                results.entry(tool_use_id.as_str()).or_default().push(block_index);
             }
-            // Thinking, ToolResult, and Image blocks do not change the orphan
-            // determination. ToolResult should not appear on assistant
-            // messages, but if it does we ignore it here.
-            ContentBlock::Thinking { .. } | ContentBlock::ToolResult { .. } | ContentBlock::Image { .. } => {}
+        }
+        for (id, call_positions) in calls {
+            let Some(result_positions) = results.get(id) else {
+                continue;
+            };
+            if !id.trim().is_empty() && call_positions.len() == 1 && result_positions.len() == 1 {
+                keep_tool_uses[index].insert(call_positions[0]);
+                keep_tool_results[index + 1].insert(result_positions[0]);
+            }
         }
     }
 
-    has_tool_use && has_unanswered && !has_text
+    let mut stats = SessionRepairStats::default();
+    let original_len = messages.len();
+    for (index, message) in messages.iter_mut().enumerate() {
+        let role = message.role;
+        let old_content = std::mem::take(&mut message.content);
+        message.content = old_content
+            .into_iter()
+            .enumerate()
+            .filter_map(|(block_index, mut block)| {
+                let keep = match &mut block {
+            ContentBlock::ToolUse { .. } => {
+                let keep = role == Role::Assistant && keep_tool_uses[index].contains(&block_index);
+                stats.removed_tool_calls += usize::from(!keep);
+                keep
+            }
+            ContentBlock::ToolResult {
+                content,
+                images,
+                ..
+            } => {
+                let keep = matches!(role, Role::User | Role::Tool)
+                    && keep_tool_results[index].contains(&block_index);
+                if !keep {
+                    stats.removed_tool_results += 1;
+                    stats.removed_images += images.len();
+                    false
+                } else {
+                    if !images.is_empty() {
+                        stats.removed_images += images.len();
+                        images.clear();
+                        if !content.contains(HISTORICAL_IMAGE_NOTE) {
+                            if !content.is_empty() {
+                                content.push_str("\n\n");
+                            }
+                            content.push_str(HISTORICAL_IMAGE_NOTE);
+                        }
+                    }
+                    true
+                }
+            }
+            ContentBlock::Thinking { .. } if provider_changed => {
+                stats.removed_thinking += 1;
+                false
+            }
+            ContentBlock::Text { text } => {
+                // Empty streamed deltas have no semantic value and otherwise
+                // keep a fully-repaired message artificially alive.
+                !text.trim().is_empty()
+            }
+                    ContentBlock::Thinking { .. } | ContentBlock::Image { .. } => true,
+                };
+                keep.then_some(block)
+            })
+            .collect();
+    }
+    messages.retain(|message| !message.content.is_empty());
+    stats.removed_messages = original_len - messages.len();
+    stats
 }
 
 #[cfg(test)]
@@ -137,6 +192,21 @@ mod tests {
         )
     }
 
+    fn user_tool_results(tool_use_ids: &[&str]) -> Message {
+        Message::new(
+            Role::User,
+            tool_use_ids
+                .iter()
+                .map(|tool_use_id| ContentBlock::ToolResult {
+                    tool_use_id: (*tool_use_id).to_owned(),
+                    content: "ok".to_owned(),
+                    is_error: false,
+                    images: Vec::new(),
+                })
+                .collect(),
+        )
+    }
+
     fn user_text(text: &str) -> Message {
         Message::new(Role::User, vec![ContentBlock::Text { text: text.to_owned() }])
     }
@@ -149,7 +219,7 @@ mod tests {
     fn drops_orphaned_assistant_tool_call_with_no_matching_result() {
         // user → assistant(tool_use, no text) — Stop pressed before tool_result
         let mut messages = vec![user_text("do thing"), assistant_tool_call(&["call_orphan"])];
-        let removed = sanitize_session_messages(&mut messages);
+        let removed = sanitize_session_messages(&mut messages, false).removed_messages;
         assert_eq!(removed, 1);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, Role::User);
@@ -163,7 +233,7 @@ mod tests {
             assistant_tool_call(&["call_ok"]),
             user_tool_result("call_ok"),
         ];
-        let removed = sanitize_session_messages(&mut messages);
+        let removed = sanitize_session_messages(&mut messages, false).removed_messages;
         assert_eq!(removed, 0);
         assert_eq!(messages.len(), 3);
     }
@@ -171,46 +241,39 @@ mod tests {
     #[test]
     fn keeps_regular_assistant_text_message() {
         let mut messages = vec![user_text("hi"), assistant_text("hello there")];
-        let removed = sanitize_session_messages(&mut messages);
+        let removed = sanitize_session_messages(&mut messages, false).removed_messages;
         assert_eq!(removed, 0);
         assert_eq!(messages.len(), 2);
     }
 
     #[test]
-    fn keeps_assistant_with_text_and_orphan_tool_call() {
-        // Assistant emitted some streamed text before the tool was cancelled.
-        // Provider will accept this because content is non-null even though
-        // tool_calls is unmatched. We keep it to preserve the visible turn.
-        // (A future iteration could strip just the orphan ToolUse blocks; for
-        // now we only drop messages that would crash the provider.)
+    fn strips_orphan_tool_call_but_keeps_assistant_text() {
         let mut messages = vec![
             user_text("hi"),
             assistant_text_plus_tool_call("partial reply", "call_orphan"),
         ];
-        let removed = sanitize_session_messages(&mut messages);
+        let removed = sanitize_session_messages(&mut messages, false).removed_messages;
         assert_eq!(removed, 0);
         assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content.len(), 1);
+        assert!(matches!(messages[1].content[0], ContentBlock::Text { .. }));
     }
 
     #[test]
-    fn drops_orphan_when_some_calls_are_answered_but_not_all() {
-        // assistant fired two tool calls; only one got a result before Stop.
-        // The whole assistant message is still invalid for strict providers
-        // because at least one call_id has no tool_result, so we drop it.
+    fn keeps_matched_call_and_result_when_sibling_call_is_orphaned() {
         let mut messages = vec![
             user_text("do two things"),
             assistant_tool_call(&["call_a", "call_b"]),
             user_tool_result("call_a"),
         ];
-        let removed = sanitize_session_messages(&mut messages);
-        assert_eq!(removed, 1);
-        // The dangling tool_result for call_a now has no matching tool_use,
-        // but it is structurally a user message and providers tolerate that
-        // shape. Dropping it would risk losing user-visible context. We only
-        // sanitize the assistant side here.
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, Role::User);
-        assert_eq!(messages[1].role, Role::User);
+        let removed = sanitize_session_messages(&mut messages, false).removed_messages;
+        assert_eq!(removed, 0);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].content.len(), 1);
+        assert!(matches!(
+            &messages[1].content[0],
+            ContentBlock::ToolUse { id, .. } if id == "call_a"
+        ));
     }
 
     #[test]
@@ -222,12 +285,11 @@ mod tests {
             assistant_text("done"),
             user_text("again"),
             assistant_tool_call(&["c2", "c3"]),
-            user_tool_result("c2"),
-            user_tool_result("c3"),
+            user_tool_results(&["c2", "c3"]),
             assistant_text("all done"),
         ];
         let original_len = messages.len();
-        let removed = sanitize_session_messages(&mut messages);
+        let removed = sanitize_session_messages(&mut messages, false).removed_messages;
         assert_eq!(removed, 0);
         assert_eq!(messages.len(), original_len);
     }
@@ -235,7 +297,7 @@ mod tests {
     #[test]
     fn no_op_on_empty_history() {
         let mut messages: Vec<Message> = Vec::new();
-        let removed = sanitize_session_messages(&mut messages);
+        let removed = sanitize_session_messages(&mut messages, false).removed_messages;
         assert_eq!(removed, 0);
         assert!(messages.is_empty());
     }
@@ -257,8 +319,122 @@ mod tests {
             ],
         );
         let mut messages = vec![user_text("hi"), msg];
-        let removed = sanitize_session_messages(&mut messages);
+        let removed = sanitize_session_messages(&mut messages, false).removed_messages;
         assert_eq!(removed, 1);
         assert_eq!(messages.len(), 1);
+    }
+
+    #[test]
+    fn drops_stray_tool_result_without_a_preceding_assistant_call() {
+        let mut messages = vec![user_text("hi"), user_tool_result("stray")];
+        let removed = sanitize_session_messages(&mut messages, false).removed_messages;
+        assert_eq!(removed, 1);
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[test]
+    fn late_tool_result_does_not_rescue_an_orphaned_call() {
+        let mut messages = vec![
+            user_text("do thing"),
+            assistant_tool_call(&["late"]),
+            assistant_text("intervening reply"),
+            user_tool_result("late"),
+        ];
+        let removed = sanitize_session_messages(&mut messages, false).removed_messages;
+        assert_eq!(removed, 2);
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|message| {
+            message.content.iter().all(|block| {
+                !matches!(block, ContentBlock::ToolUse { .. } | ContentBlock::ToolResult { .. })
+            })
+        }));
+    }
+
+    #[test]
+    fn later_pair_with_reused_id_does_not_rescue_earlier_orphans() {
+        let mut messages = vec![
+            assistant_tool_call(&["duplicate"]),
+            assistant_text("break adjacency"),
+            user_tool_result("duplicate"),
+            assistant_tool_call(&["duplicate"]),
+            user_tool_result("duplicate"),
+        ];
+
+        let stats = sanitize_session_messages(&mut messages, false);
+
+        assert_eq!(stats.removed_tool_calls, 1);
+        assert_eq!(stats.removed_tool_results, 1);
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(messages[1].content[0], ContentBlock::ToolUse { .. }));
+        assert!(matches!(messages[2].content[0], ContentBlock::ToolResult { .. }));
+    }
+
+    #[test]
+    fn duplicate_ids_inside_one_group_are_removed_as_ambiguous() {
+        let mut messages = vec![
+            assistant_tool_call(&["duplicate", "duplicate"]),
+            user_tool_result("duplicate"),
+        ];
+
+        let stats = sanitize_session_messages(&mut messages, false);
+
+        assert_eq!(stats.removed_tool_calls, 2);
+        assert_eq!(stats.removed_tool_results, 1);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn empty_tool_ids_are_never_replayed() {
+        for id in ["", "   ", "\t"] {
+            let mut messages = vec![assistant_tool_call(&[id]), user_tool_result(id)];
+
+            let stats = sanitize_session_messages(&mut messages, false);
+
+            assert_eq!(stats.removed_tool_calls, 1, "id={id:?}");
+            assert_eq!(stats.removed_tool_results, 1, "id={id:?}");
+            assert!(messages.is_empty(), "id={id:?}");
+        }
+    }
+
+    #[test]
+    fn strips_images_from_completed_historical_tool_results() {
+        let mut result = user_tool_result("shot");
+        let ContentBlock::ToolResult { images, .. } = &mut result.content[0] else {
+            unreachable!()
+        };
+        images.push(nomi_types::tool::ToolImage {
+            media_type: "image/png".to_owned(),
+            data: "large-base64".to_owned(),
+        });
+        let mut messages = vec![user_text("look"), assistant_tool_call(&["shot"]), result];
+        sanitize_session_messages(&mut messages, false);
+        let ContentBlock::ToolResult { content, images, .. } = &messages[2].content[0] else {
+            panic!("expected tool result")
+        };
+        assert!(images.is_empty());
+        assert!(content.contains("historical session recovery"));
+    }
+
+    #[test]
+    fn provider_switch_strips_thinking_but_keeps_visible_text() {
+        let mut messages = vec![Message::new(
+            Role::Assistant,
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "provider scratchpad".to_owned(),
+                    signature: Some("opaque-signature".to_owned()),
+                },
+                ContentBlock::Text {
+                    text: "visible answer".to_owned(),
+                },
+            ],
+        )];
+
+        let stats = sanitize_session_messages(&mut messages, true);
+
+        assert_eq!(stats.removed_thinking, 1);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content.len(), 1);
+        assert!(matches!(messages[0].content[0], ContentBlock::Text { .. }));
     }
 }

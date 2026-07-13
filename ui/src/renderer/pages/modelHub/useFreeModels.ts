@@ -16,7 +16,6 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import useSWR, { mutate as mutateGlobal, type KeyedMutator, type SWRConfiguration } from 'swr';
 
 export const FREE_MODEL_SERVICE_SWR_KEY = 'model-services/free/status';
-export const LOCAL_MODEL_SERVICE_SWR_KEY = 'model-services/local/status';
 export const FREE_MODEL_HEALTH_SWR_KEY = 'model-services/free/health';
 
 const STATUS_SWR_OPTIONS: SWRConfiguration<ManagedModelServiceStatus, Error> = {
@@ -46,7 +45,6 @@ const fetchFreeStatus = async () => {
   lastFreeStatusSignature = signature;
   return status;
 };
-const fetchLocalStatus = () => ipcBridge.managedModelService.local.status.invoke();
 const fetchFreeHealthSnapshot = () => ipcBridge.managedModelService.free.healthSnapshot.invoke();
 
 /**
@@ -58,11 +56,6 @@ const fetchFreeHealthSnapshot = () => ipcBridge.managedModelService.free.healthS
  */
 export const useFreeModels = () => {
   const query = useSWR<ManagedModelServiceStatus>(FREE_MODEL_SERVICE_SWR_KEY, fetchFreeStatus, STATUS_SWR_OPTIONS);
-  const localQuery = useSWR<ManagedModelServiceStatus>(
-    LOCAL_MODEL_SERVICE_SWR_KEY,
-    fetchLocalStatus,
-    STATUS_SWR_OPTIONS
-  );
   const healthQuery = useSWR<ManagedModelHealthResult[]>(
     FREE_MODEL_HEALTH_SWR_KEY,
     fetchFreeHealthSnapshot,
@@ -175,9 +168,6 @@ export const useFreeModels = () => {
     error: query.error,
     isLoading: query.isLoading,
     mutate: mutateStatus,
-    localStatus: localQuery.data,
-    localError: localQuery.error,
-    isLocalLoading: localQuery.isLoading,
     pendingAction,
     healthResults,
     healthCheckPending,

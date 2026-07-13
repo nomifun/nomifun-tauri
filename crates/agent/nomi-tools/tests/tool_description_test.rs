@@ -54,6 +54,29 @@ fn bash_description_references_dedicated_tools() {
 }
 
 #[test]
+fn bash_description_routes_file_listing_to_glob() {
+    let tool = bash_tool();
+    let desc = tool.description();
+    let lower = desc.to_lowercase();
+    assert!(
+        lower.contains("file listing") || lower.contains("list files"),
+        "Bash description should cover directory file listing, got: {desc}"
+    );
+    assert!(
+        lower.contains("every operating system") || lower.contains("os-agnostic"),
+        "Bash description should make file listing OS-agnostic, got: {desc}"
+    );
+    assert!(
+        desc.contains("Glob"),
+        "Bash description should route file listing to Glob"
+    );
+    assert!(
+        lower.contains("get-childitem") && lower.contains("ls") && lower.contains("dir"),
+        "Bash description should discourage shell listing commands, got: {desc}"
+    );
+}
+
+#[test]
 fn bash_description_contains_timeout_info() {
     let tool = bash_tool();
     let desc = tool.description();
@@ -203,6 +226,29 @@ fn glob_description_mentions_sort_order() {
     assert!(
         lower.contains("modification time") || lower.contains("newest"),
         "Glob description should explain sort order"
+    );
+}
+
+#[test]
+fn glob_description_covers_directory_listing() {
+    let tool = GlobTool::new(test_cwd());
+    let desc = tool.description();
+    let lower = desc.to_lowercase();
+    assert!(
+        lower.contains("list files"),
+        "Glob description should explicitly support listing files, got: {desc}"
+    );
+    assert!(
+        lower.contains("os-agnostic") || lower.contains("every operating system"),
+        "Glob description should present directory listing as OS-agnostic, got: {desc}"
+    );
+    assert!(
+        lower.contains("current directory") || lower.contains("current working directory"),
+        "Glob description should mention current-directory listing, got: {desc}"
+    );
+    assert!(
+        desc.contains("\"*\"") && desc.contains("\"**/*\""),
+        "Glob description should teach top-level and recursive listing patterns, got: {desc}"
     );
 }
 

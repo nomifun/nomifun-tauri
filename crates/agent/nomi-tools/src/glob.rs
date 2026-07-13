@@ -27,12 +27,13 @@ impl Tool for GlobTool {
     }
 
     fn description(&self) -> &str {
-        "Fast file pattern matching tool that works with any codebase size.\n\n\
+        "Fast OS-agnostic file pattern matching tool that works with any codebase size.\n\n\
          - Supports glob patterns like \"**/*.rs\" or \"src/**/*.ts\".\n\
          - Returns matching file paths sorted by modification time (newest first).\n\
          - Returns at most 100 results. Only returns files, not directories.\n\
          - The path parameter defaults to the current working directory.\n\
-         - Use this tool when you need to find files by name or extension patterns."
+         - Use this OS-agnostic tool to list files in the current directory or workspace on every operating system: \"*\" lists top-level files and \"**/*\" lists files recursively.\n\
+         - Use this tool when you need to find files by name or extension patterns, and prefer it over Bash for directory file listings."
     }
 
     fn input_schema(&self) -> JsonSchema {

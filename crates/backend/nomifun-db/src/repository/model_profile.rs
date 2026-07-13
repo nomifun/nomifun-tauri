@@ -19,6 +19,9 @@ pub trait IModelProfileRepository: Send + Sync {
     /// background catalog reconciliation: a concurrent user/catalog upsert must
     /// never be overwritten by a stale "missing profile" observation.
     async fn insert_if_absent(&self, params: &UpsertModelProfileParams<'_>) -> Result<bool, DbError>;
+    /// Insert or refresh a managed-catalog profile, but atomically preserve an
+    /// existing explicit user profile. Returns whether a row changed.
+    async fn upsert_unless_user(&self, params: &UpsertModelProfileParams<'_>) -> Result<bool, DbError>;
     /// Delete one profile; returns whether a row was removed.
     async fn delete(&self, provider_id: &str, model: &str) -> Result<bool, DbError>;
 }

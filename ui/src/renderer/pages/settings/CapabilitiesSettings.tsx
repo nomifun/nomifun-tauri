@@ -5,14 +5,13 @@
  */
 
 /**
- * CapabilitiesSettings — Combined page for Skills Hub and MCP/Tools.
+ * CapabilitiesSettings — Legacy combined page for Skills Hub and MCP.
  *
  * This page merges the previously separate "Skills Hub" (skill packs) and
- * "Tools" (MCP servers + speech-to-text) pages into a single "Capabilities"
- * entry, accessible via /settings/capabilities.
+ * MCP server management pages into a single "Capabilities" entry.
  *
- * Old routes (/settings/skills-hub and /settings/tools) are redirected here
- * with a ?tab= query parameter to select the appropriate tab.
+ * Current top-level routes redirect legacy destinations elsewhere, but this
+ * component remains available for compatibility with older embeddings.
  */
 
 import { Tabs } from '@arco-design/web-react';
@@ -66,7 +65,7 @@ const CapabilitiesSettings: React.FC = () => {
         <Tabs.TabPane key='skills' title={t('settings.capabilitiesTab.skills', { defaultValue: 'Skills' })}>
           <SkillsHubSettings withWrapper={false} />
         </Tabs.TabPane>
-        <Tabs.TabPane key='tools' title={t('settings.capabilitiesTab.tools', { defaultValue: 'MCP & Voice' })}>
+        <Tabs.TabPane key='tools' title={t('settings.capabilitiesTab.tools', { defaultValue: 'MCP' })}>
           <ToolsModalContent />
         </Tabs.TabPane>
       </Tabs>

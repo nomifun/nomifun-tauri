@@ -153,7 +153,7 @@ pub(crate) struct WriteParams {
 impl KnowledgeStdioServer {
     #[tool(
         name = "knowledge_search",
-        description = "Search the knowledge bases mounted into THIS session for relevant documents. Call this FIRST, before answering from memory, when the task touches any topic the bases may cover. Returns ranked results; then open a result with the Read tool."
+        description = "Search the knowledge bases mounted into THIS session for relevant documents. Call this FIRST, before answering from memory, when the task touches any topic the bases may cover. Returns ranked results with an opaque `handle`; read a full result by calling knowledge_read with that exact handle. Copy the handle unchanged and do not rebuild it from the path."
     )]
     async fn knowledge_search(&self, Parameters(params): Parameters<SearchParams>) -> String {
         eprintln!("[mcp-knowledge-stdio] tools/call: knowledge_search");
@@ -235,6 +235,14 @@ mod tests {
         let names: Vec<String> = router.list_all().iter().map(|t| t.name.to_string()).collect();
         assert!(names.contains(&"knowledge_read".to_string()), "got {names:?}");
         assert!(names.contains(&"knowledge_write".to_string()), "got {names:?}");
+        let tools = router.list_all();
+        let search = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == "knowledge_search")
+            .expect("knowledge_search registered");
+        let description = search.description.as_deref().unwrap_or_default();
+        assert!(description.contains("knowledge_read") && description.contains("handle"));
+        assert!(!description.contains("Read tool"));
     }
 
     #[test]

@@ -8,3 +8,34 @@
 - Remaining P0/P1/P2 issues: none.
 
 final result: passed
+
+---
+
+# Local Model Capability Center — Design QA
+
+## Source of truth
+
+- Product brief: `docs/superpowers/specs/2026-07-12-local-model-capability-center-design.md`
+- Selected direction: top-level capability tabs (方案 A)
+- Baseline screenshot: `C:/Users/rika0/Pictures/Snipaste_2026-07-12_17-08-48.png`
+- Implementation capture: `.superpowers/qa/local-model-capability-center-default.png`
+
+## Verification coverage
+
+- Desktop light theme: passed
+- Desktop dark theme: passed
+- 900 px viewport: passed; summaries stack and capability tabs remain horizontally navigable
+- Capability switching: passed for Text Understanding, Image Generation, and OCR
+- Planned capabilities: Speech Recognition and Speech Synthesis are disabled and labeled as planned
+- Disclosure behavior: model details are collapsed by default and expand/collapse correctly
+- State retention: all capability panels remain mounted while inactive
+- Accessibility basics: semantic tablist/tab/tabpanel structure, disabled states, accessible labels, and keyboard-capable disclosure buttons are present
+- Production checks: unit tests, typecheck, i18n contract, theme contract, and UI production build passed
+
+## Findings
+
+No open P0, P1, or P2 findings. The implementation preserves the selected direction's hierarchy: one page header, capability tabs, compact summaries, scannable model cards, and progressive disclosure for secondary metadata.
+
+The browser console showed unrelated local QA-backend failures for `/api/agents`, `/api/cron/jobs`, and WebSocket bootstrap. No errors originated from the local-model capability center.
+
+final result: passed

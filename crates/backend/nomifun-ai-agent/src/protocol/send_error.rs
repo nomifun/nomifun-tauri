@@ -623,12 +623,17 @@ fn classify_provider_api(lower: &str) -> Option<ClassifiedError> {
     if contains_any(
         lower,
         &[
-            "image_url",
             "unknown variant `image_url`",
             "unknown variant 'image_url'",
             "does not support image",
-            "image input",
-            "multimodal",
+            "doesn't support image",
+            "image input is not supported",
+            "image inputs are not supported",
+            "unsupported image input",
+            "does not support multimodal",
+            "doesn't support multimodal",
+            "multimodal input is not supported",
+            "multimodal inputs are not supported",
         ],
     ) {
         return Some(provider_error(
@@ -1228,6 +1233,17 @@ mod tests {
             messages[6]: unknown variant `image_url`, expected `text` at line 1 column 169755";
         let err = AgentSendError::from_app_error(AppError::BadGateway(detail.into()));
         assert_eq!(err.code(), Some(AgentErrorCode::UserLlmProviderImageUnsupported));
+    }
+
+    #[test]
+    fn malformed_or_oversized_images_do_not_disable_vision_support() {
+        for detail in [
+            "invalid_request_error: invalid image_url: payload is too large",
+            "invalid_request_error: malformed multimodal image input",
+        ] {
+            let err = AgentSendError::from_app_error(AppError::BadGateway(detail.into()));
+            assert_eq!(err.code(), Some(AgentErrorCode::UserLlmProviderInvalidRequest));
+        }
     }
 
     #[test]

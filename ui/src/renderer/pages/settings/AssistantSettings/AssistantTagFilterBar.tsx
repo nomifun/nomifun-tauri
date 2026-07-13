@@ -58,7 +58,7 @@ const FilterChip: React.FC<{
             'inline-flex items-center select-none cursor-pointer rounded-[16px] px-12px py-3px text-13px leading-20px',
             'border border-solid transition-all duration-150 whitespace-nowrap',
             active
-              ? 'bg-[var(--color-primary-light-1)] text-[rgb(var(--primary-6))] border-[var(--color-primary-light-3)] font-medium shadow-[0_1px_2px_rgba(var(--primary-6),0.08)]'
+              ? 'bg-[#151515] text-white border-white font-medium'
               : 'bg-[var(--color-fill-2)] text-[var(--color-text-2)] border-[var(--color-border-2)] hover:bg-[var(--color-fill-3)] hover:text-[var(--color-text-1)]',
           ].join(' ')
     }

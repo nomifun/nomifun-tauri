@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use nomi_agent::session::SessionManager;
+use nomi_agent::session::{Session, SessionManager};
 use nomi_config::config::{McpServerConfig, TransportType};
 use nomifun_api_types::{GatewayMcpConfig, NomiBuildExtra, SessionMcpServer, SessionMcpTransport};
 use nomifun_common::AppError;
@@ -16,6 +16,21 @@ use crate::factory::AgentFactoryDeps;
 use crate::factory::context::FactoryContext;
 use crate::manager::nomi::{NomiAgentManager, sanitize_session_messages};
 use crate::types::{BuildTaskOptions, NomiCompatOverrides, NomiResolvedConfig};
+
+fn retarget_resumed_session(session: &mut Session, provider: &str, model: &str) -> bool {
+    let changed = session.provider != provider || session.model != model;
+    session.provider = provider.to_owned();
+    session.model = model.to_owned();
+    changed
+}
+
+fn persist_repaired_session(manager: &SessionManager, session: &Session) -> Result<(), String> {
+    manager.save(session).map_err(|error| error.to_string())?;
+    manager
+        .update_index_for(session)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
@@ -280,15 +295,33 @@ pub(super) async fn build(
                 // some OpenAI-compatible proxies) reject replayed assistants
                 // with `tool_calls != null` and `content == null` when no
                 // matching tool_result follows. See ELECTRON-1HV / ELECTRON-1J6.
-                let dropped = sanitize_session_messages(&mut session.messages);
+                let provider_changed = session.provider != fields.provider;
+                let repair = sanitize_session_messages(&mut session.messages, provider_changed);
                 info!(
                     conversation_id = %ctx.conversation_id,
                     session_id = %session.id,
                     message_count = session.messages.len(),
-                    sanitized_dropped = dropped,
+                    provider_changed,
+                    removed_messages = repair.removed_messages,
+                    removed_tool_calls = repair.removed_tool_calls,
+                    removed_tool_results = repair.removed_tool_results,
+                    removed_images = repair.removed_images,
+                    removed_thinking = repair.removed_thinking,
                     "Loaded existing nomi session for resume"
                 );
-                accept_owned(session)
+                retarget_resumed_session(&mut session, &fields.provider, &fields.model);
+                let accepted = accept_owned(session);
+                if let Some(ref repaired) = accepted
+                    && let Err(error) = persist_repaired_session(&session_mgr, repaired)
+                {
+                    warn!(
+                        conversation_id = %ctx.conversation_id,
+                        session_id = %repaired.id,
+                        error = %error,
+                        "Failed to persist repaired nomi session metadata"
+                    );
+                }
+                accepted
             }
             Err(_) => {
                 // Fallback: old architecture stored sessions inside the workspace
@@ -296,15 +329,34 @@ pub(super) async fn build(
                 let legacy_mgr = SessionManager::new(legacy_dir.clone(), 100);
                 match legacy_mgr.load(&ctx.conversation_id) {
                     Ok(mut session) => {
-                        let dropped = sanitize_session_messages(&mut session.messages);
+                        let provider_changed = session.provider != fields.provider;
+                        let repair =
+                            sanitize_session_messages(&mut session.messages, provider_changed);
                         info!(
                             conversation_id = %ctx.conversation_id,
                             session_id = %session.id,
                             message_count = session.messages.len(),
-                            sanitized_dropped = dropped,
+                            provider_changed,
+                            removed_messages = repair.removed_messages,
+                            removed_tool_calls = repair.removed_tool_calls,
+                            removed_tool_results = repair.removed_tool_results,
+                            removed_images = repair.removed_images,
+                            removed_thinking = repair.removed_thinking,
                             "Loaded legacy nomi session from workspace"
                         );
-                        accept_owned(session)
+                        retarget_resumed_session(&mut session, &fields.provider, &fields.model);
+                        let accepted = accept_owned(session);
+                        if let Some(ref repaired) = accepted
+                            && let Err(error) = persist_repaired_session(&legacy_mgr, repaired)
+                        {
+                            warn!(
+                                conversation_id = %ctx.conversation_id,
+                                session_id = %repaired.id,
+                                error = %error,
+                                "Failed to persist repaired legacy nomi session metadata"
+                            );
+                        }
+                        accepted
                     }
                     Err(e) => {
                         debug!(
@@ -1371,6 +1423,60 @@ fn gateway_mcp_to_config(
 mod tests {
     use super::*;
     use nomifun_api_types::GuideMcpConfig;
+
+    #[test]
+    fn resumed_session_metadata_tracks_each_provider_switch() {
+        let now = chrono::Utc::now();
+        let mut session = Session {
+            id: "provider-switch".into(),
+            created_at: now,
+            updated_at: now,
+            provider: "provider-a".into(),
+            model: "model-a".into(),
+            cwd: "/workspace".into(),
+            total_usage: Default::default(),
+            messages: Vec::new(),
+            owner_token: None,
+        };
+
+        assert!(retarget_resumed_session(
+            &mut session,
+            "provider-b",
+            "model-b"
+        ));
+        assert_eq!(session.provider, "provider-b");
+        assert_eq!(session.model, "model-b");
+        assert!(retarget_resumed_session(
+            &mut session,
+            "provider-a",
+            "model-a2"
+        ));
+        assert_eq!(session.provider, "provider-a");
+        assert_eq!(session.model, "model-a2");
+    }
+
+    #[test]
+    fn resolved_fallback_metadata_is_persisted_to_session_and_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = SessionManager::new(directory.path().to_path_buf(), 10);
+        let mut session = manager
+            .create("deleted-provider", "stale-model", "/workspace", Some("fallback"))
+            .unwrap();
+
+        retarget_resumed_session(&mut session, "resolved-provider", "resolved-fallback-model");
+        persist_repaired_session(&manager, &session).unwrap();
+
+        let reloaded = manager.load("fallback").unwrap();
+        assert_eq!(reloaded.provider, "resolved-provider");
+        assert_eq!(reloaded.model, "resolved-fallback-model");
+        let metadata = manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.id == "fallback")
+            .unwrap();
+        assert_eq!(metadata.model, "resolved-fallback-model");
+    }
 
     // ----- output-language directive (thinking + reply follow system language) -----
 

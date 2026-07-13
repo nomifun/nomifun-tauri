@@ -38,6 +38,7 @@
   "param": {
     "size": "Size",
     "count": "Count",
+    "localSingleImage": "Local Z-Image creates one image per task; use a loop node for batches",
     "quality": "Quality",
     "duration": "Duration",
     "seconds": "s",
@@ -65,7 +66,8 @@
     "run": "Generate",
     "regenerate": "Regenerate",
     "cancel": "Cancel",
-    "noModel": "Select a model first"
+    "noModel": "Select a model first",
+    "localTextToImageOnly": "Local Z-Image currently supports text-to-image only. Remove image inputs, masks, and image references, then try again."
   },
   "result": {
     "continuePlaceholder": "Continue editing — type an instruction, press Enter…",
@@ -73,6 +75,7 @@
     "loading": "Loading…",
     "loadFailed": "Failed to load",
     "toTextNode": "Turn into text node",
-    "batch": "{{count}} images"
+    "batch": "{{count}} images",
+    "localContinueUnavailable": "Local Z-Image currently supports text-to-image only, so continued image editing is unavailable"
   }
 }

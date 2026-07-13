@@ -8,7 +8,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useSearchParams } from 'react-router-dom';
 import classNames from 'classnames';
-import { LinkCloud, Robot, SettingTwo, Platte, Lightning } from '@icon-park/react';
+import { DataServer, HeadsetOne, LinkCloud, Robot, SettingTwo, Platte, Lightning } from '@icon-park/react';
 import ContentSider from '@/renderer/components/layout/ContentSider';
 import SegmentedTabs, { type SegmentedTabItem } from '@/renderer/components/base/SegmentedTabs';
 import { SettingsViewModeProvider } from '@/renderer/components/settings/SettingsModal/settingsViewContext';
@@ -20,11 +20,19 @@ import ModelModalContent from '@/renderer/components/settings/SettingsModal/cont
 import GlobalModelConfig from './GlobalModelConfig';
 import CreationModelsContent from './CreationModelsContent';
 import FreeModelsContent from './FreeModelsContent';
+import LocalModelsContent from './LocalModelsContent';
+import SpeechToTextContent from './SpeechToTextContent';
 
-type Section = 'agents' | 'models' | 'free' | 'creation' | 'global';
+type Section = 'agents' | 'models' | 'free' | 'local' | 'speech' | 'creation' | 'global';
 
 const isSection = (value: string | null): value is Section =>
-  value === 'agents' || value === 'models' || value === 'free' || value === 'creation' || value === 'global';
+  value === 'agents' ||
+  value === 'models' ||
+  value === 'free' ||
+  value === 'local' ||
+  value === 'speech' ||
+  value === 'creation' ||
+  value === 'global';
 
 const MODELHUB_SIDER_STORAGE_KEY = 'nomifun:modelhub-sider-width';
 
@@ -54,7 +62,7 @@ const ModelHubPage: React.FC = () => {
 
   const [section, setSection] = useState<Section>(() => {
     const param = searchParams.get('section');
-    return isSection(param) ? param : 'agents';
+    return isSection(param) ? param : 'models';
   });
 
   useEffect(() => {
@@ -96,9 +104,11 @@ const ModelHubPage: React.FC = () => {
 
   const sections: SectionDef[] = useMemo(
     () => [
-      { key: 'agents', label: t('settings.modelHub.sectionAgents'), icon: <Robot theme='outline' size='16' strokeWidth={3} /> },
       { key: 'models', label: t('settings.modelHub.sectionModels'), icon: <LinkCloud theme='outline' size='16' strokeWidth={3} /> },
       { key: 'free', label: t('settings.modelHub.sectionFree'), icon: <Lightning theme='outline' size='16' strokeWidth={3} /> },
+      { key: 'local', label: t('settings.modelHub.sectionLocal'), icon: <DataServer theme='outline' size='16' strokeWidth={3} /> },
+      { key: 'speech', label: t('settings.modelHub.sectionSpeech'), icon: <HeadsetOne theme='outline' size='16' strokeWidth={3} /> },
+      { key: 'agents', label: t('settings.modelHub.sectionAgents'), icon: <Robot theme='outline' size='16' strokeWidth={3} /> },
       { key: 'creation', label: t('settings.modelHub.sectionCreation'), icon: <Platte theme='outline' size='16' strokeWidth={3} /> },
       { key: 'global', label: t('settings.modelHub.sectionGlobal'), icon: <SettingTwo theme='outline' size='16' strokeWidth={3} /> },
     ],
@@ -110,6 +120,8 @@ const ModelHubPage: React.FC = () => {
       {section === 'agents' && <AgentModalContent />}
       {section === 'models' && <ModelModalContent />}
       {section === 'free' && <FreeModelsContent />}
+      {section === 'local' && <LocalModelsContent />}
+      {section === 'speech' && <SpeechToTextContent />}
       {section === 'creation' && <CreationModelsContent />}
       {section === 'global' && <GlobalModelConfig />}
     </>
@@ -122,7 +134,7 @@ const ModelHubPage: React.FC = () => {
       <SettingsViewModeProvider value='page'>
         <div className='w-full min-h-full box-border overflow-y-auto px-16px py-16px'>
           <div className='text-20px font-600 text-t-primary leading-tight'>{t('settings.modelHub.title')}</div>
-          <div className='mt-4px mb-14px text-12px leading-16px text-t-tertiary'>{t('settings.modelHub.subtitle')}</div>
+          <div className='mt-4px mb-14px text-12px leading-18px text-t-secondary'>{t('settings.modelHub.subtitle')}</div>
           <div className='mb-16px'>
             <SegmentedTabs items={segmentedItems} activeKey={section} onChange={handleSectionChange} size='sm' />
           </div>
@@ -135,7 +147,7 @@ const ModelHubPage: React.FC = () => {
   const siderHeader = (
     <div className='px-16px pt-16px pb-10px'>
       <div className='text-15px font-600 text-t-primary leading-none'>{t('settings.modelHub.title')}</div>
-      <div className='mt-4px text-12px leading-16px text-t-tertiary'>{t('settings.modelHub.subtitle')}</div>
+      <div className='mt-4px text-12px leading-18px text-t-secondary'>{t('settings.modelHub.subtitle')}</div>
     </div>
   );
 

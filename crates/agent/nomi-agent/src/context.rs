@@ -74,7 +74,7 @@ fn tool_usage_guidance() -> String {
 # Using your tools
  - Do NOT use Bash when a dedicated tool is available. Using dedicated tools \
 allows the user to better understand and review your work:
-   - File search: Glob (not find or ls)
+   - File listing/search: Glob on every operating system (not shell-specific listing commands such as ls, dir, Get-ChildItem, or find). When asked what files are in the current directory or workspace, use Glob with \"*\" for top-level files or \"**/*\" recursively before saying there are no files.
    - Content search: Grep (not grep or rg)
    - Read files: Read (not cat, head, or tail)
    - Edit files: Edit (not sed or awk)
@@ -124,8 +124,8 @@ without killing the process.",
     #[cfg(target_os = "windows")]
     {
         s.push_str(
-            "\n - On Windows, the Bash and exec_command tools run commands through PowerShell, \
-not cmd.exe or Unix bash. Use PowerShell syntax: `Get-ChildItem`, `Get-Content`, `Set-Location`, \
+            "\n - On Windows, the Bash and exec_command tools run commands through PowerShell \
+when shell-only work is necessary. They do not use cmd.exe or Unix bash. Use PowerShell syntax: `Get-ChildItem`, `Get-Content`, `Set-Location`, \
 `$env:NAME`, and `;` for sequential commands. If cmd.exe syntax is truly required, wrap it \
 explicitly as `cmd /C \"...\"`.",
         );

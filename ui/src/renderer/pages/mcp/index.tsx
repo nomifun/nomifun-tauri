@@ -15,7 +15,9 @@ const McpPage: React.FC = () => {
   return (
     <HubPageShell
       title={t('settings.mcpHub.title', { defaultValue: 'MCP' })}
-      subtitle={t('settings.mcpHub.subtitle', { defaultValue: 'Manage MCP tool servers and built-in tools.' })}
+      subtitle={t('settings.mcpHub.subtitle', {
+        defaultValue: 'Register, import, and manage MCP server configurations.',
+      })}
       maxWidthClass='md:max-w-1200px'
     >
       <ToolsModalContent />

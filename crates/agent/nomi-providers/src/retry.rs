@@ -8,31 +8,34 @@ use super::ProviderError;
 use super::anthropic_shared::StreamOutcome;
 
 pub const MAX_STREAM_RETRIES: u32 = 2;
-pub const MAX_INITIAL_CONNECT_RETRIES: u32 = 2;
+pub const MAX_INITIAL_REQUEST_RETRIES: u32 = 2;
 const MAX_BACKOFF: Duration = Duration::from_secs(15);
-const INITIAL_CONNECT_BACKOFF: Duration = Duration::from_millis(300);
-const MAX_INITIAL_CONNECT_BACKOFF: Duration = Duration::from_secs(2);
+const INITIAL_REQUEST_BACKOFF: Duration = Duration::from_millis(300);
+const MAX_INITIAL_REQUEST_BACKOFF: Duration = Duration::from_secs(2);
 
-/// Retry initial request failures that occur before an HTTP response exists.
-/// HTTP status errors and rate limits are intentionally not retried here.
-pub async fn with_initial_connect_retry<F, Fut, T>(f: F) -> Result<T, ProviderError>
+/// Retry bounded, side-effect-free initial request failures: connection
+/// failures and transient gateway/service 500/502/503/504 responses. Client
+/// errors and rate limits are surfaced immediately.
+pub async fn with_initial_request_retry<F, Fut, T>(f: F) -> Result<T, ProviderError>
 where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<T, ProviderError>>,
 {
-    let mut backoff = INITIAL_CONNECT_BACKOFF;
-    for attempt in 0..=MAX_INITIAL_CONNECT_RETRIES {
+    let mut backoff = INITIAL_REQUEST_BACKOFF;
+    for attempt in 0..=MAX_INITIAL_REQUEST_RETRIES {
         match f().await {
             Ok(val) => return Ok(val),
-            Err(e) if is_initial_connect_error(&e) && attempt < MAX_INITIAL_CONNECT_RETRIES => {
+            Err(e) if is_retryable_initial_request_error(&e) && attempt < MAX_INITIAL_REQUEST_RETRIES => {
+                let (error_kind, status) = retry_log_classification(&e);
                 tracing::warn!(
                     attempt = attempt + 1,
-                    max_retries = MAX_INITIAL_CONNECT_RETRIES,
-                    error = %e,
-                    "retrying initial provider request after connect failure"
+                    max_retries = MAX_INITIAL_REQUEST_RETRIES,
+                    error_kind,
+                    status = status.unwrap_or_default(),
+                    "retrying transient initial provider request failure"
                 );
                 tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_INITIAL_CONNECT_BACKOFF);
+                backoff = (backoff * 2).min(MAX_INITIAL_REQUEST_BACKOFF);
             }
             Err(e) => return Err(e),
         }
@@ -40,10 +43,20 @@ where
     unreachable!()
 }
 
-fn is_initial_connect_error(error: &ProviderError) -> bool {
+fn retry_log_classification(error: &ProviderError) -> (&'static str, Option<u16>) {
+    match error {
+        ProviderError::Http(_) => ("http_connect", None),
+        ProviderError::Connection(_) => ("connection", None),
+        ProviderError::Api { status, .. } => ("transient_api", Some(*status)),
+        _ => ("other", None),
+    }
+}
+
+fn is_retryable_initial_request_error(error: &ProviderError) -> bool {
     match error {
         ProviderError::Http(err) => err.is_connect(),
         ProviderError::Connection(_) => true,
+        ProviderError::Api { status, .. } => matches!(status, 500 | 502 | 503 | 504),
         _ => false,
     }
 }
@@ -122,7 +135,7 @@ mod tests {
         tokio::time::pause();
 
         let counter = Arc::new(AtomicU32::new(0));
-        let result = with_initial_connect_retry(|| {
+        let result = with_initial_request_retry(|| {
             let counter = Arc::clone(&counter);
             async move {
                 let attempt = counter.fetch_add(1, Ordering::SeqCst);
@@ -142,7 +155,7 @@ mod tests {
     #[tokio::test]
     async fn test_initial_connect_retry_does_not_retry_rate_limit() {
         let counter = Arc::new(AtomicU32::new(0));
-        let result = with_initial_connect_retry(|| {
+        let result = with_initial_request_retry(|| {
             let counter = Arc::clone(&counter);
             async move {
                 counter.fetch_add(1, Ordering::SeqCst);
@@ -161,6 +174,49 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_initial_request_retries_transient_502_then_succeeds() {
+        tokio::time::pause();
+        let counter = Arc::new(AtomicU32::new(0));
+        let result = with_initial_request_retry(|| {
+            let counter = Arc::clone(&counter);
+            async move {
+                let attempt = counter.fetch_add(1, Ordering::SeqCst);
+                if attempt == 0 {
+                    Err(ProviderError::Api {
+                        status: 502,
+                        message: "bad gateway".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_initial_request_does_not_retry_400() {
+        let counter = Arc::new(AtomicU32::new(0));
+        let result = with_initial_request_retry(|| {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(ProviderError::Api {
+                    status: 400,
+                    message: "bad request".into(),
+                })
+            }
+        })
+        .await;
+
+        assert!(matches!(result, Err(ProviderError::Api { status: 400, .. })));
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
