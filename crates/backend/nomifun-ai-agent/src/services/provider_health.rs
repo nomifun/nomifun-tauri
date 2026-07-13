@@ -611,11 +611,12 @@ async fn build_probe_engine(config_extra: NomiResolvedConfig) -> Result<AgentEng
         config.compat.require_reasoning_content = Some(required);
     }
 
-    AgentBootstrap::new(config, workspace, sink)
+    let mut result = AgentBootstrap::new(config, workspace, sink)
         .build()
         .await
-        .map(|result| result.engine)
-        .map_err(|error| AppError::Internal(error.to_string()))
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    result.engine.registry_mut().clear();
+    Ok(result.engine)
 }
 
 fn unhealthy_response(
@@ -710,6 +711,49 @@ pub(crate) fn extract_http_status(message: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_chat_probe_config(session_directory: PathBuf) -> NomiResolvedConfig {
+        NomiResolvedConfig {
+            provider: "openai".to_owned(),
+            api_key: "sk-test".to_owned(),
+            model: "gpt-test".to_owned(),
+            base_url: Some("https://api.openai.com".to_owned()),
+            system_prompt: Some("Reply with exactly OK.".to_owned()),
+            max_tokens: 16,
+            max_turns: Some(1),
+            context_limit: None,
+            compat_overrides: crate::types::NomiCompatOverrides::default(),
+            session_directory,
+            session_mode: None,
+            extra_mcp_servers: HashMap::new(),
+            bedrock_config: None,
+            computer_use: false,
+            browser_use: false,
+            browser_silent: true,
+            browser_source: "managed".to_owned(),
+            browser_full_power: false,
+            browser_persistent_login: false,
+            browser_site_memory: false,
+            browser_takeover: false,
+            browser_unrestricted_approval: false,
+            browser_visual_fallback: false,
+            goal: None,
+            browser_secret_vault: None,
+            owner_token: None,
+            in_process_spawn: false,
+            allowed_tools: Vec::new(),
+            write_root: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_health_probe_engine_has_no_tools() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = build_probe_engine(test_chat_probe_config(temp.path().join("sessions")))
+            .await
+            .unwrap();
+        assert!(engine.tool_names().is_empty());
+    }
 
     #[test]
     fn classify_error_detects_quota_message() {
