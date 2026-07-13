@@ -199,6 +199,7 @@ impl ProviderCompat {
 
 /// Sanitize a JSON Schema for strict providers (e.g., Bedrock).
 /// - Root type must be "object" (wrap if not)
+/// - Remove unsupported root "oneOf", "allOf", and "anyOf" keywords
 /// - Recursively remove "additionalProperties"
 /// - Normalize array types: ["string", "null"] → "string"
 pub fn sanitize_json_schema(schema: &Value) -> Value {
@@ -213,6 +214,12 @@ pub fn sanitize_json_schema(schema: &Value) -> Value {
             },
             "required": ["value"]
         });
+    }
+
+    if let Some(root) = schema.as_object_mut() {
+        for keyword in ["oneOf", "allOf", "anyOf"] {
+            root.remove(keyword);
+        }
     }
 
     strip_additional_properties(&mut schema);
@@ -372,6 +379,26 @@ mod tests {
 
         assert_eq!(sanitized["type"], "object");
         assert_eq!(sanitized["properties"]["cmd"]["type"], "string");
+    }
+
+    #[test]
+    fn test_sanitize_schema_removes_only_root_composition_keywords() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "mode": { "anyOf": [{ "type": "string" }, { "type": "integer" }] }
+            },
+            "required": ["mode"],
+            "oneOf": [{ "required": ["mode"] }],
+            "allOf": [{ "type": "object" }],
+            "anyOf": [{ "type": "object" }]
+        });
+        let sanitized = sanitize_json_schema(&schema);
+        assert!(sanitized.get("oneOf").is_none());
+        assert!(sanitized.get("allOf").is_none());
+        assert!(sanitized.get("anyOf").is_none());
+        assert_eq!(sanitized["required"], json!(["mode"]));
+        assert!(sanitized["properties"]["mode"].get("anyOf").is_some());
     }
 
     #[test]
