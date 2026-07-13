@@ -82,6 +82,25 @@ body[arco-theme='dark'] .open-capabilities-domain-card.is-selected {
   border: 1px solid var(--control-selected-bg, var(--color-primary)) !important;
 }
 
+body[arco-theme='dark'] .open-capabilities-domain-description {
+  color: var(--color-text-2) !important;
+}
+
+body[arco-theme='dark'] .open-capabilities-domain-badge {
+  background-color: var(--color-fill-3) !important;
+  color: var(--color-text-2) !important;
+}
+
+/* Remote capability copy is dense; promote secondary levels in dark themes so
+ * explanatory text, endpoint labels, and token guidance remain comfortable. */
+body[arco-theme='dark'] .open-capabilities-page .text-t-tertiary {
+  color: var(--color-text-2) !important;
+}
+
+body[arco-theme='dark'] .open-capabilities-page .text-t-secondary {
+  color: var(--color-text-1) !important;
+}
+
 .requirements-selection-checkbox .arco-checkbox-mask-icon,
 .preset-skill-selection-checkbox .arco-checkbox-mask-icon,
 .migrate-events-checkbox .arco-checkbox-mask-icon,

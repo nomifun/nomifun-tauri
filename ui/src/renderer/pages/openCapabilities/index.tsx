@@ -240,6 +240,7 @@ const OpenCapabilitiesPage: React.FC = () => {
         defaultValue: '分开管理 WebUI 访问入口，以及 NomiFun Remote MCP / REST 对外开放能力。',
       })}
       maxWidthClass='md:max-w-1180px'
+      className='open-capabilities-page'
     >
       <Tabs
         activeTab={activeOpenCapabilityTab}
@@ -470,9 +471,11 @@ const DomainOptionCard: React.FC<{
       <div className='min-w-0'>
         <div className='flex items-center gap-6px'>
           <span className='text-13px font-600 leading-19px text-t-primary'>{title}</span>
-          <code className='truncate rd-6px bg-fill-0 px-5px py-1px font-mono text-10px text-t-tertiary'>{id}</code>
+          <code className='open-capabilities-domain-badge truncate rd-6px bg-fill-0 px-5px py-1px font-mono text-10px text-t-tertiary'>
+            {id}
+          </code>
         </div>
-        <div className='mt-4px text-12px leading-17px text-t-tertiary'>{description}</div>
+        <div className='open-capabilities-domain-description mt-4px text-12px leading-17px text-t-tertiary'>{description}</div>
       </div>
     </div>
   </label>

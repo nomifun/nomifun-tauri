@@ -12,6 +12,8 @@ import { SettingsViewModeProvider } from '@/renderer/components/settings/Setting
 interface HubPageShellProps {
   title: string;
   subtitle?: string;
+  /** Optional scope hook for page-specific visual contracts. */
+  className?: string;
   /** Tailwind max-width class for the centered content column. */
   maxWidthClass?: string;
   /** Rendered between the header and the body (e.g. a segmented tab bar). */
@@ -30,6 +32,7 @@ interface HubPageShellProps {
 const HubPageShell: React.FC<HubPageShellProps> = ({
   title,
   subtitle,
+  className,
   maxWidthClass = 'md:max-w-1100px',
   toolbar,
   children,
@@ -42,6 +45,7 @@ const HubPageShell: React.FC<HubPageShellProps> = ({
       <div
         className={classNames(
           'w-full min-h-full box-border overflow-y-auto',
+          className,
           isMobile ? 'px-16px py-16px' : 'px-12px md:px-40px py-32px'
         )}
       >
