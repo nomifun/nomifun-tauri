@@ -48,6 +48,14 @@ describe('workspace tool rail dimensions', () => {
     expect(collapse.includes('height: 28px;')).toBe(true);
   });
 
+  test('uses the same readable icon color for the collapse control as the toolbar controls', () => {
+    const item = rule('\\.workspace-tool-rail__item');
+    const collapse = rule('\\.workspace-tool-rail__item--collapse');
+
+    expect(item.includes('color: var(--text-secondary);')).toBe(true);
+    expect(collapse.includes('color: var(--text-secondary);')).toBe(true);
+  });
+
   test('does not change the mobile workspace trigger dimensions', () => {
     const trigger = rule('\\.workspace-tool-rail-mobile-trigger');
 

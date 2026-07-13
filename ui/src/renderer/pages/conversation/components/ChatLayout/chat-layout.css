@@ -185,7 +185,7 @@
   height: 28px;
   font-size: 18px;
   line-height: 1;
-  color: var(--text-tertiary);
+  color: var(--text-secondary);
 }
 
 .workspace-tool-rail__item--collapse::before {

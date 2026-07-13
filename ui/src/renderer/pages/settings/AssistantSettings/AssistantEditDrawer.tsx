@@ -648,7 +648,7 @@ const AssistantEditDrawer: React.FC<AssistantEditDrawerProps> = ({
                         <Checkbox
                           checked={selectedSkills.includes(skill.name)}
                           disabled={!isSkillsEditable}
-                          className='mt-2px cursor-pointer'
+                          className='assistant-skill-selection-checkbox mt-2px cursor-pointer'
                           onChange={() => {
                             if (selectedSkills.includes(skill.name)) {
                               setSelectedSkills(selectedSkills.filter((s) => s !== skill.name));
@@ -689,7 +689,7 @@ const AssistantEditDrawer: React.FC<AssistantEditDrawerProps> = ({
                         <Checkbox
                           checked={selectedSkills.includes(skill.name)}
                           disabled={!isSkillsEditable}
-                          className='mt-2px cursor-pointer'
+                          className='assistant-skill-selection-checkbox mt-2px cursor-pointer'
                           onChange={() => {
                             if (selectedSkills.includes(skill.name)) {
                               setSelectedSkills(selectedSkills.filter((s) => s !== skill.name));
@@ -758,7 +758,7 @@ const AssistantEditDrawer: React.FC<AssistantEditDrawerProps> = ({
                         <div key={skill.name} className='flex items-start gap-8px p-8px hover:bg-fill-1 rounded-4px'>
                           <Checkbox
                             checked={selectedSkills.includes(skill.name)}
-                            className='mt-2px cursor-pointer'
+                            className='assistant-skill-selection-checkbox mt-2px cursor-pointer'
                             onChange={() => {
                               if (selectedSkills.includes(skill.name)) {
                                 setSelectedSkills(selectedSkills.filter((s) => s !== skill.name));
@@ -812,7 +812,7 @@ const AssistantEditDrawer: React.FC<AssistantEditDrawerProps> = ({
                         <div key={skill.name} className='flex items-start gap-8px p-8px hover:bg-fill-1 rounded-4px'>
                           <Checkbox
                             checked={selectedSkills.includes(skill.name)}
-                            className='mt-2px cursor-pointer'
+                            className='assistant-skill-selection-checkbox mt-2px cursor-pointer'
                             onChange={() => {
                               if (selectedSkills.includes(skill.name)) {
                                 setSelectedSkills(selectedSkills.filter((s) => s !== skill.name));
@@ -866,7 +866,7 @@ const AssistantEditDrawer: React.FC<AssistantEditDrawerProps> = ({
                           <Checkbox
                             checked={!disabledBuiltinSkills.includes(skill.name)}
                             disabled={!isSkillsEditable}
-                            className='mt-2px cursor-pointer'
+                            className='assistant-skill-selection-checkbox mt-2px cursor-pointer'
                             onChange={() => {
                               if (disabledBuiltinSkills.includes(skill.name)) {
                                 setDisabledBuiltinSkills(disabledBuiltinSkills.filter((s) => s !== skill.name));
