@@ -183,12 +183,12 @@ const SkillDetailDrawer: React.FC<SkillDetailDrawerProps> = ({
             <div className='mt-18px flex flex-col gap-10px rounded-12px bg-fill-2 p-12px'>
               {renderTagGroup(t('settings.presetTagAudience', { defaultValue: 'Audience' }), audienceTags)}
               {renderTagGroup(t('settings.presetTagScenario', { defaultValue: 'Skill Scenario' }), scenarioTags)}
-              <div className='flex min-w-0 items-start gap-10px border-t border-solid border-[var(--color-border-1)] pt-10px'>
+              <div className='flex min-w-0 items-start gap-10px pt-10px'>
                 <span className='w-72px flex-shrink-0 pt-2px text-11px font-600 uppercase tracking-[0.08em] text-t-tertiary'>
                   {t('settings.skillsHub.detailLocation', { defaultValue: 'Location' })}
                 </span>
-                <div className='flex min-w-0 flex-1 items-start gap-6px'>
-                  <FolderOpen size={13} className='mt-2px flex-shrink-0 text-t-tertiary' />
+                <div className='flex min-w-0 flex-1 items-center gap-6px'>
+                  <FolderOpen size={13} fill='currentColor' className='flex-shrink-0 text-t-tertiary' />
                   <code className='min-w-0 break-all text-11px leading-17px text-t-secondary' title={skill.location}>
                     {skill.location}
                   </code>
