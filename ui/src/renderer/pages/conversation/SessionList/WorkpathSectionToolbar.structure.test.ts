@@ -59,4 +59,12 @@ describe('workpath section toolbar structure', () => {
     expect(createBarSource.includes('onToggleBatchMode')).toBe(true);
     expect(createBarSource.includes('ConversationSiderActions')).toBe(false);
   });
+
+  test('backfills the project registry from existing non-default workpaths', () => {
+    const source = readLocalSource('index.tsx');
+
+    expect(source.includes('migrateProjectWorkpaths')).toBe(true);
+    expect(source.includes("node.key !== DEFAULT_WORKPATH_KEY")).toBe(true);
+    expect(source.includes('setEmptyProjectWorkpaths')).toBe(true);
+  });
 });

@@ -6,7 +6,13 @@
 
 import { describe, expect, test } from 'bun:test';
 
-import { addProjectWorkpath, getProjectWorkpaths, PROJECT_WORKPATHS_STORAGE_KEY, removeProjectWorkpath } from './projectWorkpaths';
+import {
+  addProjectWorkpath,
+  getProjectWorkpaths,
+  migrateProjectWorkpaths,
+  PROJECT_WORKPATHS_STORAGE_KEY,
+  removeProjectWorkpath,
+} from './projectWorkpaths';
 
 const installStorage = () => {
   const store = new Map<string, string>();
@@ -57,5 +63,17 @@ describe('projectWorkpaths', () => {
     removeProjectWorkpath('/Users/a/remove');
 
     expect(getProjectWorkpaths()).toEqual(['/Users/a/keep']);
+  });
+
+  test('migrates existing workpaths only when the project registry has never been created', () => {
+    installStorage();
+
+    expect(migrateProjectWorkpaths(['E:\\nomifun_path\\fun_project\\website\\'])).toEqual([
+      'E:/nomifun_path/fun_project/website',
+    ]);
+    expect(getProjectWorkpaths()).toEqual(['E:/nomifun_path/fun_project/website']);
+
+    removeProjectWorkpath('E:/nomifun_path/fun_project/website');
+    expect(migrateProjectWorkpaths(['E:/nomifun_path/fun_project/website'])).toEqual([]);
   });
 });

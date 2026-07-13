@@ -28,6 +28,31 @@ export const getProjectWorkpaths = (): string[] => {
   return [...unique];
 };
 
+/**
+ * Backfill the project registry for workpaths that predate the registry.
+ *
+ * The presence of the storage key is significant: an existing empty array is
+ * an intentional user state after removing the last project and must not be
+ * repopulated from sessions that still reference the path.
+ */
+export const migrateProjectWorkpaths = (paths: string[]): string[] => {
+  if (typeof window === 'undefined') return [];
+
+  try {
+    if (localStorage.getItem(PROJECT_WORKPATHS_STORAGE_KEY) === null) {
+      const inferred = [...new Set(paths.map((path) => workpathKey(path)).filter((key) => key !== DEFAULT_WORKPATH_KEY))];
+      if (inferred.length > 0) {
+        localStorage.setItem(PROJECT_WORKPATHS_STORAGE_KEY, JSON.stringify(inferred));
+        window.dispatchEvent(new Event(PROJECT_WORKPATHS_CHANGED_EVENT));
+      }
+    }
+  } catch {
+    // ignore storage errors (quota / privacy mode)
+  }
+
+  return getProjectWorkpaths();
+};
+
 export const addProjectWorkpath = (path: string): void => {
   const key = workpathKey(path);
   if (key === DEFAULT_WORKPATH_KEY || typeof window === 'undefined') return;

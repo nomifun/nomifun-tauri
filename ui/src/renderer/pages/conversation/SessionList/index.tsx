@@ -34,7 +34,12 @@ import { useWorkpathUiState } from './hooks/useWorkpathUiState';
 import { toggleBatchSelectionScope, type BatchSelectableScope } from './utils/batchSelectionScopes';
 import { DEFAULT_WORKPATH_KEY } from './utils/workpathKey';
 import { buildWorkpathTree } from './utils/workpathTree';
-import { getProjectWorkpaths, removeProjectWorkpath, subscribeProjectWorkpaths } from './utils/projectWorkpaths';
+import {
+  getProjectWorkpaths,
+  migrateProjectWorkpaths,
+  removeProjectWorkpath,
+  subscribeProjectWorkpaths,
+} from './utils/projectWorkpaths';
 import {
   DEFAULT_SIDEBAR_DISPLAY_PREFERENCES,
   type SidebarDisplayPreferences,
@@ -94,6 +99,22 @@ const WorkpathSessionList: React.FC<WorkpathSessionListProps> = ({
     () => buildWorkpathTree(conversations, terminals, ui.pinnedKeys, emptyProjectWorkpaths),
     [conversations, terminals, ui.pinnedKeys, emptyProjectWorkpaths]
   );
+
+  useEffect(() => {
+    const inferredWorkpaths = tree
+      .filter((node) => node.key !== DEFAULT_WORKPATH_KEY)
+      .map((node) => node.key);
+    if (inferredWorkpaths.length === 0) return;
+
+    const migratedWorkpaths = migrateProjectWorkpaths(inferredWorkpaths);
+    setEmptyProjectWorkpaths((current) => {
+      if (current.length === migratedWorkpaths.length && current.every((path, index) => path === migratedWorkpaths[index])) {
+        return current;
+      }
+      return migratedWorkpaths;
+    });
+  }, [tree]);
+
   const projectWorkpathKeys = useMemo(() => new Set(emptyProjectWorkpaths), [emptyProjectWorkpaths]);
   const branchWorkpaths = useMemo(
     () => tree.filter((node) => node.key !== DEFAULT_WORKPATH_KEY).map((node) => node.key),
