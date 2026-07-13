@@ -459,7 +459,7 @@ const DomainOptionCard: React.FC<{
   onChange: (checked: boolean) => void;
 }> = ({ id, title, description, checked, onChange }) => (
   <label
-    className={`block cursor-pointer rd-10px border px-11px py-10px transition-colors ${
+    className={`open-capabilities-domain-card${checked ? ' is-selected' : ''} block cursor-pointer rd-10px border px-11px py-10px transition-colors ${
       checked
         ? 'border-[rgba(var(--primary-6),0.32)] bg-[rgba(var(--primary-6),0.06)]'
         : 'border-border-2 bg-fill-1 hover:border-border-3 hover:bg-fill-2'

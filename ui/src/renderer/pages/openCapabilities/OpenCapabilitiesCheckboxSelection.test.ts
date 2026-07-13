@@ -13,9 +13,23 @@ const controlCss = readFileSync(new URL('../../styles/theme-control-contract.css
 describe('open capabilities checkbox selection treatment', () => {
   test('uses the enhanced theme-aware checkbox treatment for every capability domain card', () => {
     expect(pageSource.includes("className='open-capabilities-domain-checkbox mt-2px shrink-0'")).toBe(true);
+    expect(pageSource.includes("open-capabilities-domain-card${checked ? ' is-selected' : ''}")).toBe(true);
     expect(controlCss.includes('.open-capabilities-domain-checkbox .arco-checkbox-mask')).toBe(true);
     expect(controlCss.includes('.open-capabilities-domain-checkbox.arco-checkbox-checked .arco-checkbox-mask')).toBe(true);
     expect(controlCss.includes('--enhanced-checkbox-selected-bg')).toBe(true);
     expect(controlCss.includes('transition: transform 160ms ease-out')).toBe(true);
+    expect(controlCss.includes("body[arco-theme='dark'] .open-capabilities-domain-card")).toBe(true);
+    expect(controlCss.includes('background-color: transparent !important')).toBe(true);
+    expect(controlCss.includes("body[arco-theme='dark'] .open-capabilities-domain-card.is-selected")).toBe(true);
+    expect(
+      /body\[arco-theme='dark'\] \.open-capabilities-domain-card \{\n  background-color: transparent !important;\n  border: 1px solid/.test(
+        controlCss
+      )
+    ).toBe(true);
+    expect(
+      /body\[arco-theme='dark'\] \.open-capabilities-domain-card\.is-selected \{\n  background-color: color-mix[\s\S]*?\n  border: 1px solid/.test(
+        controlCss
+      )
+    ).toBe(true);
   });
 });

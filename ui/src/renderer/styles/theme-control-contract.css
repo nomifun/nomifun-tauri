@@ -70,6 +70,18 @@
   border: 1px solid var(--control-idle-border, var(--color-border-3)) !important;
 }
 
+/* Capability cards stay surface-free in dark themes until users select them.
+ * The explicit border maintains card boundaries on very dark backgrounds. */
+body[arco-theme='dark'] .open-capabilities-domain-card {
+  background-color: transparent !important;
+  border: 1px solid var(--control-idle-border, var(--color-border-3)) !important;
+}
+
+body[arco-theme='dark'] .open-capabilities-domain-card.is-selected {
+  background-color: color-mix(in srgb, var(--control-selected-bg, var(--color-primary)) 12%, transparent) !important;
+  border: 1px solid var(--control-selected-bg, var(--color-primary)) !important;
+}
+
 .requirements-selection-checkbox .arco-checkbox-mask-icon,
 .preset-skill-selection-checkbox .arco-checkbox-mask-icon,
 .migrate-events-checkbox .arco-checkbox-mask-icon,
