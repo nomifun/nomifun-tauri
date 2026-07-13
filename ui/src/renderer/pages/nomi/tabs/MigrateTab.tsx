@@ -209,7 +209,11 @@ const MigrateTab: React.FC<Props> = ({ companions }) => {
         <div className='text-14px text-t-primary font-500'>{t('nomi.migrate.memoryTitle')}</div>
         <div className='text-12px text-t-tertiary mt-2px'>{t('nomi.migrate.memoryDesc')}</div>
         <div className='flex items-center gap-16px mt-10px flex-wrap'>
-          <Checkbox checked={includeEvents} onChange={(checked: boolean) => setIncludeEvents(checked)}>
+          <Checkbox
+            checked={includeEvents}
+            className='migrate-events-checkbox'
+            onChange={(checked: boolean) => setIncludeEvents(checked)}
+          >
             <span className='text-13px text-t-secondary'>{t('nomi.migrate.includeEvents')}</span>
           </Checkbox>
           <Button type='primary' loading={exportingMemory} onClick={() => void exportMemory()}>

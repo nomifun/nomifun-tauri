@@ -466,7 +466,7 @@ const DomainOptionCard: React.FC<{
     }`}
   >
     <div className='flex items-start gap-9px'>
-      <Checkbox checked={checked} onChange={onChange} className='mt-2px shrink-0' />
+      <Checkbox checked={checked} onChange={onChange} className='open-capabilities-domain-checkbox mt-2px shrink-0' />
       <div className='min-w-0'>
         <div className='flex items-center gap-6px'>
           <span className='text-13px font-600 leading-19px text-t-primary'>{title}</span>

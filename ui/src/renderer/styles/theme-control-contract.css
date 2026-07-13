@@ -52,7 +52,9 @@
  * inset indicator. This contract is injected after runtime theme CSS, so the
  * selected state stays legible with every preset. */
 .requirements-selection-checkbox .arco-checkbox-mask,
-.preset-skill-selection-checkbox .arco-checkbox-mask {
+.preset-skill-selection-checkbox .arco-checkbox-mask,
+.migrate-events-checkbox .arco-checkbox-mask,
+.open-capabilities-domain-checkbox .arco-checkbox-mask {
   overflow: hidden;
   transition:
     background-color 160ms ease-out,
@@ -60,8 +62,18 @@
     box-shadow 160ms ease-out;
 }
 
+.migrate-events-checkbox .arco-checkbox-mask {
+  border: 1px solid var(--control-idle-border, var(--color-border-3)) !important;
+}
+
+.open-capabilities-domain-checkbox .arco-checkbox-mask {
+  border: 1px solid var(--control-idle-border, var(--color-border-3)) !important;
+}
+
 .requirements-selection-checkbox .arco-checkbox-mask-icon,
-.preset-skill-selection-checkbox .arco-checkbox-mask-icon {
+.preset-skill-selection-checkbox .arco-checkbox-mask-icon,
+.migrate-events-checkbox .arco-checkbox-mask-icon,
+.open-capabilities-domain-checkbox .arco-checkbox-mask-icon {
   position: absolute;
   inset: 0;
   width: 8px;
@@ -81,14 +93,41 @@
   border-color: var(--control-selected-bg, var(--color-primary)) !important;
 }
 
+/* Migration exports are privacy-sensitive. Theme selection tokens preserve
+ * the matching deep/light fill while the border keeps the container defined. */
+.migrate-events-checkbox.arco-checkbox-checked .arco-checkbox-mask,
+.migrate-events-checkbox.arco-checkbox-indeterminate .arco-checkbox-mask,
+.open-capabilities-domain-checkbox.arco-checkbox-checked .arco-checkbox-mask,
+.open-capabilities-domain-checkbox.arco-checkbox-indeterminate .arco-checkbox-mask {
+  background-color: var(--enhanced-checkbox-selected-bg, var(--control-selected-bg, var(--color-primary))) !important;
+  border: 1px solid var(--control-idle-border, var(--color-border-3)) !important;
+}
+
+.migrate-events-checkbox .arco-checkbox-mask-icon,
+.open-capabilities-domain-checkbox .arco-checkbox-mask-icon {
+  color: #ffffff !important;
+}
+
 .requirements-selection-checkbox.arco-checkbox-checked .arco-checkbox-mask-icon,
-.preset-skill-selection-checkbox.arco-checkbox-checked .arco-checkbox-mask-icon {
+.preset-skill-selection-checkbox.arco-checkbox-checked .arco-checkbox-mask-icon,
+.migrate-events-checkbox.arco-checkbox-checked .arco-checkbox-mask-icon,
+.open-capabilities-domain-checkbox.arco-checkbox-checked .arco-checkbox-mask-icon {
   transform: scale(1);
 }
 
 .requirements-selection-checkbox.arco-checkbox-indeterminate .arco-checkbox-mask::after,
 .preset-skill-selection-checkbox.arco-checkbox-indeterminate .arco-checkbox-mask::after {
   background-color: var(--control-selected-fg, var(--color-white)) !important;
+  transition: transform 160ms ease-out;
+}
+
+.migrate-events-checkbox.arco-checkbox-indeterminate .arco-checkbox-mask::after {
+  background-color: #ffffff !important;
+  transition: transform 160ms ease-out;
+}
+
+.open-capabilities-domain-checkbox.arco-checkbox-indeterminate .arco-checkbox-mask::after {
+  background-color: #ffffff !important;
   transition: transform 160ms ease-out;
 }
 
@@ -105,7 +144,13 @@
   .requirements-selection-checkbox.arco-checkbox-indeterminate .arco-checkbox-mask::after,
   .preset-skill-selection-checkbox .arco-checkbox-mask,
   .preset-skill-selection-checkbox .arco-checkbox-mask-icon,
-  .preset-skill-selection-checkbox.arco-checkbox-indeterminate .arco-checkbox-mask::after {
+  .preset-skill-selection-checkbox.arco-checkbox-indeterminate .arco-checkbox-mask::after,
+  .migrate-events-checkbox .arco-checkbox-mask,
+  .migrate-events-checkbox .arco-checkbox-mask-icon,
+  .migrate-events-checkbox.arco-checkbox-indeterminate .arco-checkbox-mask::after,
+  .open-capabilities-domain-checkbox .arco-checkbox-mask,
+  .open-capabilities-domain-checkbox .arco-checkbox-mask-icon,
+  .open-capabilities-domain-checkbox.arco-checkbox-indeterminate .arco-checkbox-mask::after {
     transition: none;
   }
 }

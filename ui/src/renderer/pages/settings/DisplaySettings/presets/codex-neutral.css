@@ -276,6 +276,7 @@ body {
   /* The silver brand primary needs a dark indicator, not Arco's fixed white one. */
   --control-selected-bg: #e5e5e5;
   --control-selected-fg: #171717;
+  --enhanced-checkbox-selected-bg: #000000;
   --control-idle-bg: #1e1e1e;
   --control-idle-border: #737373;
   --control-hover-bg: #2a2a2a;
