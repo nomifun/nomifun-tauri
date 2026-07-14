@@ -209,6 +209,23 @@ describe('buildTurnDisclosureItems', () => {
     expect(disclosure.processItemStates).toEqual({ tool: 'completed' });
   });
 
+  test('settles stale running thinking when a process-only turn closes', () => {
+    const result = buildTurnDisclosureItems(
+      [
+        item('user', 'user', { createdAt: 1000 }),
+        item('thinking', 'process_content', { createdAt: 2000, processState: 'running' }),
+      ],
+      { tailClosed: true }
+    );
+
+    const disclosure = result[1];
+    expect(disclosure.type).toBe('turn_disclosure');
+    if (disclosure.type !== 'turn_disclosure') return;
+    expect(disclosure.state).toBe('completed');
+    expect(disclosure.running).toBe(false);
+    expect(disclosure.processItemStates).toEqual({ thinking: 'completed' });
+  });
+
   test('keeps running assistant text visible after the live disclosure', () => {
     const result = buildTurnDisclosureItems([
       item('user', 'user', { createdAt: 1000 }),

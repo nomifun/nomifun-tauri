@@ -5,6 +5,11 @@ const source = readFileSync(new URL('./MessageThinking.tsx', import.meta.url), '
 const cssSource = readFileSync(new URL('./MessageThinking.module.css', import.meta.url), 'utf8');
 
 describe('MessageThinking expansion', () => {
+  test('allows a closed process to override a stale streaming status', () => {
+    expect(source.includes('completed?: boolean')).toBe(true);
+    expect(source.includes("const isDone = completed === true || status === 'done';")).toBe(true);
+  });
+
   test('collapses completed process thinking by default while keeping live thinking open', () => {
     expect(source.includes("const defaultExpanded = expanded ?? (isProcessVariant ? !isDone : true);")).toBe(true);
     expect(source.includes('useState(() => defaultExpanded)')).toBe(true);

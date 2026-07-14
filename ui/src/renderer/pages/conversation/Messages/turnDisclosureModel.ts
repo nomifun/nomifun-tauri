@@ -73,10 +73,10 @@ const getProcessState = (entry: TurnDisclosureInputItem): TurnDisclosureProcessS
 
 const getEffectiveProcessState = (
   entry: TurnDisclosureInputItem,
-  options: { isClosed: boolean; hasFinalAssistant: boolean }
+  options: { isClosed: boolean }
 ): TurnDisclosureProcessState => {
   const state = getProcessState(entry);
-  if (options.isClosed && options.hasFinalAssistant && (state === 'running' || state === 'waiting')) {
+  if (options.isClosed && (state === 'running' || state === 'waiting')) {
     return 'completed';
   }
   return state;
@@ -88,7 +88,7 @@ const getProcessEndAt = (entry: TurnDisclosureInputItem): number => entry.proces
 
 const resolveDisclosureState = (
   processItems: TurnDisclosureInputItem[],
-  options: { isClosed: boolean; hasFinalAssistant: boolean }
+  options: { isClosed: boolean }
 ): TurnDisclosureProcessState => {
   const states = processItems.map((entry) => getEffectiveProcessState(entry, options));
   if (states.includes('waiting')) return 'waiting';
@@ -148,7 +148,7 @@ function buildSegmentOutput(segment: TurnDisclosureInputItem[], isClosed: boolea
   if (!turnId) return segment.map((entry) => ({ type: 'item', id: entry.id }));
 
   const finalAssistantIndex = segment.findLastIndex((entry) => entry.role === 'assistant');
-  const stateOptions = { isClosed, hasFinalAssistant: finalAssistantIndex !== -1 };
+  const stateOptions = { isClosed };
 
   const processItems = segment.filter((entry, index) => {
     if (entry.role === 'user' || entry.role === 'other') return false;

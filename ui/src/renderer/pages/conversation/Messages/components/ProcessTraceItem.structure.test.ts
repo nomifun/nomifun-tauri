@@ -73,5 +73,6 @@ describe('ProcessTraceItem Codex-style execution rows', () => {
     expect(source.includes('stateOverride?: TurnDisclosureProcessState')).toBe(true);
     expect(source.includes('const state = stateOverride ?? getProcessItemState(item);')).toBe(true);
     expect(source.includes('stateOverride={stateOverride}')).toBe(true);
+    expect(source.includes("completed={state === 'completed'}")).toBe(true);
   });
 });
