@@ -15,7 +15,6 @@
 | 了解 NomiFun 是什么 | [getting-started/introduction.zh.md](getting-started/introduction.zh.md) |
 | 安装或本地运行 | [getting-started/installation.zh.md](getting-started/installation.zh.md) |
 | 快速试用 | [getting-started/quick-start.zh.md](getting-started/quick-start.zh.md) |
-| 配置远程 OpenClaw / 了解 Hermes 支持边界 | [guides/remote-openclaw.zh.md](guides/remote-openclaw.zh.md) |
 | 理解当前架构 | [architecture/overview.zh.md](architecture/overview.zh.md) |
 | 构建或打包项目 | [contributing/building-and-packaging.zh.md](contributing/building-and-packaging.zh.md) |
 | 查询参数、环境变量或 API 分组 | [reference/](reference/) |

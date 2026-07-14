@@ -1182,8 +1182,7 @@
     "installHintUnknown": "（暂无内置安装命令，请帮我查找官方安装方式）",
     "installPrompt": "请帮我在本机安装 **{{name}}** 命令行 Agent。\n\n官方安装文档：{{website}}\n已核验安装命令：{{hint}}\n\n请严格按以下边界操作：\n1. 先检测我的操作系统、shell、CPU 架构、PATH，以及命令所需的基础工具是否可用。\n2. 只使用上面的官方安装命令；不要从第三方文章、旧仓库或搜索结果替换包名/地址。\n3. 如果该命令不适合当前系统，或需要先安装/升级 Node、Homebrew、uv、Git 等前置依赖，请停下来说明原因并等待我确认。\n4. 条件满足时再执行安装，完成后用 `{{binary}} --version` 或该产品官方推荐的等价命令验证。\n5. 如果需要登录、订阅或 API Key，只说明下一步认证方式，不要替我输入凭据。\n\n如果出现权限、PATH 或网络错误，请先给出诊断和最小修复建议，再继续。",
     "remoteSupportedTitle": "支持的远端接入方式",
-    "remoteSupportedDesc": "接入远端 Agent 网关。选择下方协议查看接入文档，或让 Nomi 一步步带你完成接入。",
-    "remoteManualGuide": "查看接入文档",
+    "remoteSupportedDesc": "接入远端 Agent 网关，或让 Nomi 一步步带你完成接入。",
     "remoteOneClickSetup": "让 Nomi 协助接入",
     "remoteSetupConversationName": "接入远端 Agent（{{protocol}}）",
     "remoteSetupPrompt": "请帮我把一个远端 Agent 接入 NomiFun。\n\n我想使用 **{{protocol}}** 协议。请：\n1. 说明远端需要准备什么（网关 / Agent 服务以及如何启动）。\n2. 指导我获取连接 URL 以及认证 Token / 密码。\n3. 明确告诉我在 NomiFun「添加远端 Agent」表单里应填写什么。\n\n请简洁、分步骤说明。"
@@ -1655,7 +1654,6 @@
     "empty": "暂无远程 Agent 配置。点击「添加」以连接远程 Agent 服务。",
     "emptyTitle": "尚未连接远端 Agent",
     "emptyAction": "连接第一个 Agent",
-    "guideAction": "查看配置指南",
     "name": "名称",
     "namePlaceholder": "例如：我的远程 Agent",
     "nameRequired": "请输入名称",

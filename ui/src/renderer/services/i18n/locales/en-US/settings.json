@@ -1181,8 +1181,7 @@
     "installHintUnknown": "(no built-in install command — please look up the official method online)",
     "installPrompt": "Please help me install the **{{name}}** command-line agent on this machine.\n\nOfficial install docs: {{website}}\nVerified install command: {{hint}}\n\nWork within these boundaries:\n1. First detect my OS, shell, CPU architecture, PATH, and whether the command's required base tools are available.\n2. Use only the official install command above; do not replace package names or URLs with third-party articles, stale repositories, or search-result guesses.\n3. If this command does not fit the current OS, or if you need to install/upgrade prerequisites such as Node, Homebrew, uv, or Git first, stop, explain why, and wait for my confirmation.\n4. When the conditions are satisfied, run the install, then verify with `{{binary}} --version` or the product's official equivalent.\n5. If login, a subscription, or an API key is required, explain the next authentication step without entering credentials for me.\n\nIf you hit permission, PATH, or network errors, diagnose first and propose the smallest fix before continuing.",
     "remoteSupportedTitle": "Supported remote connections",
-    "remoteSupportedDesc": "Connect to a remote agent gateway. Pick a protocol to open its setup guide, or let Nomi walk you through it.",
-    "remoteManualGuide": "View setup guide",
+    "remoteSupportedDesc": "Connect to a remote agent gateway, or let Nomi walk you through it.",
     "remoteOneClickSetup": "Set up with Nomi",
     "remoteSetupConversationName": "Connect remote agent ({{protocol}})",
     "remoteSetupPrompt": "Please help me connect a remote agent to NomiFun.\n\nI want to use the **{{protocol}}** protocol. Please:\n1. Explain what I need on the remote side (the gateway/agent service and how to start it).\n2. Walk me through getting the connection URL and any auth token/password.\n3. Tell me exactly what to fill into NomiFun's \"Add Remote Agent\" form.\n\nKeep it concise and step-by-step."
@@ -1654,7 +1653,6 @@
     "empty": "No remote agents configured. Click \"Add\" to connect to a remote agent service.",
     "emptyTitle": "No remote agents connected yet",
     "emptyAction": "Connect your first Agent",
-    "guideAction": "View setup guide",
     "name": "Name",
     "namePlaceholder": "e.g. My Remote Agent",
     "nameRequired": "Name is required",

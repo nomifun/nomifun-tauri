@@ -149,6 +149,13 @@ fn map_chat_event(
             text_state.turn_active = false;
         }
         ChatEventState::Error => {
+            if text_state.accumulated_text.is_empty()
+                && let Some(content) = chat.message.as_ref().and_then(extract_text_from_message)
+                && !content.is_empty()
+            {
+                text_state.accumulated_text = content.clone();
+                events.push(AgentStreamEvent::Text(TextEventData { content }));
+            }
             let msg = chat.error_message.unwrap_or_else(|| "Unknown chat error".into());
             events.push(AgentStreamEvent::Error(ErrorEventData::legacy(msg, None)));
             text_state.turn_active = false;
@@ -518,6 +525,29 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], AgentStreamEvent::Error(d) if d.message == "rate limit"));
+    }
+
+    #[test]
+    fn chat_error_preserves_assistant_error_message_content() {
+        let mut state = TextFallbackState::new();
+        state.reset_for_new_turn();
+
+        let event = make_event(
+            "chat",
+            json!({
+                "state": "error",
+                "errorMessage": "provider unavailable",
+                "message": {
+                    "role": "assistant",
+                    "content": [{ "type": "text", "text": "Configure a provider first." }]
+                }
+            }),
+        );
+        let events = map_openclaw_event(&event, &mut state, None);
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], AgentStreamEvent::Text(d) if d.content == "Configure a provider first."));
+        assert!(matches!(&events[1], AgentStreamEvent::Error(d) if d.message == "provider unavailable"));
     }
 
     #[test]

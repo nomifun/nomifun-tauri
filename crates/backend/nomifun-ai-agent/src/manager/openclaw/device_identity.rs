@@ -418,4 +418,36 @@ mod tests {
         let sig_bytes = URL_SAFE_NO_PAD.decode(&params.signature).unwrap();
         assert_eq!(sig_bytes.len(), 64);
     }
+
+    #[test]
+    fn build_device_auth_params_v3_binds_matching_platform_and_family() {
+        let identity = generate_identity();
+        let params = build_device_auth_params(
+            &identity,
+            Some("nonce-x"),
+            Some("device-token"),
+            "windows",
+            Some("windows"),
+        );
+        let payload = build_auth_payload(
+            &identity.device_id,
+            CLIENT_ID,
+            CLIENT_MODE,
+            "operator",
+            "operator.admin",
+            params.signed_at,
+            Some("device-token"),
+            Some("nonce-x"),
+            "windows",
+            Some("windows"),
+        );
+        let sig_bytes = URL_SAFE_NO_PAD.decode(&params.signature).unwrap();
+        let signature = ed25519_dalek::Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+
+        identity
+            .signing_key
+            .verifying_key()
+            .verify(payload.as_bytes(), &signature)
+            .unwrap();
+    }
 }

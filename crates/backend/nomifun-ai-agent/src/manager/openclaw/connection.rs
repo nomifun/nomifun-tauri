@@ -346,24 +346,16 @@ impl OpenClawConnection {
             device_token: normalize_credential(auth.device_token),
             password: normalize_credential(auth.password),
         });
-        let auth_params = match &normalized_auth {
-            Some(a) if a.token.is_some() || a.device_token.is_some() || a.password.is_some() => Some(AuthParams {
-                token: a.token.clone().or_else(|| a.device_token.clone()),
-                device_token: a.device_token.clone(),
-                password: a.password.clone(),
-            }),
-            _ => None,
-        };
+        let auth_params = build_auth_params(normalized_auth.as_ref());
 
-        // The signed proof binds the configured shared credential. A device
-        // token is a separate pairing credential and must not replace the
-        // shared token in the v3 proof when both are present.
+        // The signed proof binds the same credential the Gateway selects for
+        // signature verification: shared token first, then device token.
         let device_params = build_device_auth_params(
             identity,
             nonce,
             device_proof_token(normalized_auth.as_ref()),
             std::env::consts::OS,
-            None,
+            Some(std::env::consts::OS),
         );
 
         let params = ConnectParams {
@@ -374,6 +366,7 @@ impl OpenClawConnection {
                 display_name: CLIENT_DISPLAY_NAME,
                 version: CLIENT_VERSION,
                 platform: std::env::consts::OS,
+                device_family: Some(std::env::consts::OS),
                 mode: CLIENT_MODE,
             },
             caps: vec!["tool-events"],
@@ -553,8 +546,26 @@ fn normalize_credential(value: Option<String>) -> Option<String> {
     })
 }
 
+fn build_auth_params(auth: Option<&AuthConfig>) -> Option<AuthParams> {
+    match auth {
+        Some(auth)
+            if auth.token.is_some() || auth.device_token.is_some() || auth.password.is_some() =>
+        {
+            Some(AuthParams {
+                // OpenClaw's GatewayClient promotes a device token into the
+                // bearer `token` field and also sends it as `deviceToken`.
+                // Keep the same shape for compatible reconnect behavior.
+                token: auth.token.clone().or_else(|| auth.device_token.clone()),
+                device_token: auth.device_token.clone(),
+                password: auth.password.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
 fn device_proof_token(auth: Option<&AuthConfig>) -> Option<&str> {
-    auth.and_then(|auth| auth.token.as_deref())
+    auth.and_then(|auth| auth.token.as_deref().or(auth.device_token.as_deref()))
 }
 
 fn map_gateway_error(error: super::protocol::ErrorShape) -> AppError {
@@ -632,6 +643,7 @@ mod tests {
                                 "type": "hello-ok",
                                 "protocol": 4,
                                 "server": { "version": "1.0.0", "connId": "test-conn" },
+                                "features": { "methods": [], "events": [] },
                                 "auth": { "role": "operator", "scopes": ["operator.admin"] },
                                 "policy": {
                                     "maxPayload": 26214400,
@@ -701,14 +713,43 @@ mod tests {
     }
 
     #[test]
-    fn device_only_auth_does_not_sign_device_token_as_shared_token() {
+    fn device_only_auth_signs_the_device_token_used_by_gateway_verification() {
         let auth = AuthConfig {
             token: None,
             device_token: Some("device-token".into()),
             password: None,
         };
 
-        assert_eq!(device_proof_token(Some(&auth)), None);
+        assert_eq!(device_proof_token(Some(&auth)), Some("device-token"));
+
+        let json = serde_json::to_value(build_auth_params(Some(&auth)).unwrap()).unwrap();
+        assert_eq!(json["token"], "device-token");
+        assert_eq!(json["deviceToken"], "device-token");
+    }
+
+    #[test]
+    fn backend_client_sends_matching_device_family_metadata() {
+        let params = ConnectParams {
+            min_protocol: OPENCLAW_MIN_PROTOCOL_VERSION,
+            max_protocol: OPENCLAW_MAX_PROTOCOL_VERSION,
+            client: ClientInfo {
+                id: CLIENT_ID,
+                display_name: CLIENT_DISPLAY_NAME,
+                version: CLIENT_VERSION,
+                platform: std::env::consts::OS,
+                device_family: Some(std::env::consts::OS),
+                mode: CLIENT_MODE,
+            },
+            caps: vec!["tool-events"],
+            role: Some("operator".into()),
+            scopes: Some(vec!["operator.admin".into()]),
+            auth: None,
+            device: None,
+        };
+        let json = serde_json::to_value(params).unwrap();
+
+        assert_eq!(json["client"]["platform"], std::env::consts::OS);
+        assert_eq!(json["client"]["deviceFamily"], std::env::consts::OS);
     }
 
     #[tokio::test]
@@ -767,6 +808,7 @@ mod tests {
                         "type": "hello-ok",
                         "protocol": 4,
                         "server": { "version": "1.0.0", "connId": "test-conn" },
+                        "features": { "methods": [], "events": [] },
                         "auth": { "role": "operator", "scopes": ["operator.admin"] },
                         "policy": { "maxPayload": 26214400, "tickIntervalMs": 30000 }
                     }
@@ -878,6 +920,7 @@ mod tests {
                             "type": "hello-ok",
                             "protocol": 4,
                             "server": { "version": "1.0.0", "connId": "test-conn" },
+                            "features": { "methods": [], "events": [] },
                             "auth": { "role": "operator", "scopes": ["operator.admin"] },
                             "policy": { "maxPayload": 26214400, "tickIntervalMs": 30000 }
                         }
@@ -929,5 +972,162 @@ mod tests {
             .await
             .map(|(c, _)| c);
         assert!(result.is_err());
+    }
+
+    /// Manual real-Gateway smoke test. Start an OpenClaw Gateway first, then:
+    /// `NOMIFUN_OPENCLAW_TEST_URL=ws://127.0.0.1:18789 cargo test
+    /// -p nomifun-ai-agent real_gateway_handshake -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "requires a locally running OpenClaw Gateway"]
+    async fn real_gateway_handshake() {
+        let url = real_gateway_url();
+        let auth = real_gateway_auth();
+
+        let (connection, hello) = OpenClawConnection::connect(&url, auth, &generate_identity())
+            .await
+            .unwrap();
+        eprintln!(
+            "connected: protocol={} server={} scopes={:?}",
+            hello.protocol, hello.server.version, hello.auth.scopes
+        );
+        connection.close().await;
+    }
+
+    /// Real protocol-path smoke test that covers the methods used before a
+    /// remote turn starts. It intentionally does not require a configured
+    /// model provider.
+    #[tokio::test]
+    #[ignore = "requires a locally running OpenClaw Gateway"]
+    async fn real_gateway_session_methods() {
+        let url = real_gateway_url();
+        let auth = real_gateway_auth();
+        let identity = generate_identity();
+        let (connection, hello) = OpenClawConnection::connect(&url, auth, &identity)
+            .await
+            .unwrap();
+        let device_token = hello.auth.device_token.clone();
+        let requested_key = format!("nomifun-real-smoke-{}", uuid::Uuid::new_v4());
+
+        let reset: super::super::protocol::SessionsResetResponse = connection
+            .request(
+                "sessions.reset",
+                json!({ "key": requested_key, "reason": "new" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reset.ok, Some(true));
+        let resolved_key = reset.key.clone().expect("sessions.reset must return key");
+
+        let resolved: super::super::protocol::SessionsResolveResponse = connection
+            .request("sessions.resolve", json!({ "key": resolved_key }))
+            .await
+            .unwrap();
+        assert_eq!(resolved.ok, Some(true));
+        assert_eq!(resolved.key.as_deref(), Some(resolved_key.as_str()));
+
+        let aborted: Value = connection
+            .request(
+                "chat.abort",
+                json!({ "sessionKey": resolved.key.expect("resolved key") }),
+            )
+            .await
+            .unwrap();
+        eprintln!("session methods ok; chat.abort={aborted}");
+        connection.close().await;
+
+        if let Some(device_token) = device_token {
+            let (reconnected, hello) = OpenClawConnection::connect(
+                &url,
+                Some(AuthConfig {
+                    token: None,
+                    device_token: Some(device_token),
+                    password: None,
+                }),
+                &identity,
+            )
+            .await
+            .unwrap();
+            assert!(hello.auth.scopes.iter().any(|scope| scope == "operator.admin"));
+            eprintln!("device-token reconnect ok");
+            reconnected.close().await;
+        }
+    }
+
+    /// Exercises `chat.send` against a real Gateway. A provider is not required:
+    /// an unconfigured Gateway should still acknowledge the run and emit a
+    /// terminal chat error, which validates NomiFun's request/event contract.
+    #[tokio::test]
+    #[ignore = "requires a locally running OpenClaw Gateway"]
+    async fn real_gateway_chat_send_contract() {
+        let url = real_gateway_url();
+        let auth = real_gateway_auth();
+        let (connection, _) = OpenClawConnection::connect(&url, auth, &generate_identity())
+            .await
+            .unwrap();
+        let reset: super::super::protocol::SessionsResetResponse = connection
+            .request(
+                "sessions.reset",
+                json!({
+                    "key": format!("nomifun-real-chat-{}", uuid::Uuid::new_v4()),
+                    "reason": "new"
+                }),
+            )
+            .await
+            .unwrap();
+        let session_key = reset.key.expect("sessions.reset must return key");
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let mut events = connection.subscribe_events();
+        let ack: Value = connection
+            .request(
+                "chat.send",
+                json!({
+                    "sessionKey": session_key,
+                    "message": "Reply with exactly NOMIFUN_REMOTE_OK",
+                    "idempotencyKey": run_id
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ack.get("runId").and_then(Value::as_str), Some(run_id.as_str()));
+
+        let terminal = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let event = events.recv().await.expect("event channel closed");
+                if event.event != "chat" {
+                    continue;
+                }
+                let Some(payload) = event.payload.as_ref() else {
+                    continue;
+                };
+                if payload.get("runId").and_then(Value::as_str) != Some(run_id.as_str()) {
+                    continue;
+                }
+                if matches!(
+                    payload.get("state").and_then(Value::as_str),
+                    Some("final" | "aborted" | "error")
+                ) {
+                    break payload.clone();
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for terminal chat event");
+        eprintln!("chat.send terminal={terminal}");
+        connection.close().await;
+    }
+
+    fn real_gateway_auth() -> Option<AuthConfig> {
+        let token = std::env::var("NOMIFUN_OPENCLAW_TEST_TOKEN").ok();
+        let password = std::env::var("NOMIFUN_OPENCLAW_TEST_PASSWORD").ok();
+        (token.is_some() || password.is_some()).then_some(AuthConfig {
+            token,
+            device_token: None,
+            password,
+        })
+    }
+
+    fn real_gateway_url() -> String {
+        std::env::var("NOMIFUN_OPENCLAW_TEST_URL")
+            .expect("set NOMIFUN_OPENCLAW_TEST_URL to run real OpenClaw Gateway tests")
     }
 }

@@ -89,6 +89,8 @@ pub struct ClientInfo {
     pub display_name: &'static str,
     pub version: &'static str,
     pub platform: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_family: Option<&'static str>,
     pub mode: &'static str,
 }
 
@@ -120,8 +122,17 @@ pub struct HelloOk {
     pub type_: Option<String>,
     pub protocol: u32,
     pub server: ServerInfo,
+    pub features: HelloFeatures,
     pub policy: PolicyInfo,
     pub auth: HelloAuthInfo,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HelloFeatures {
+    pub methods: Vec<String>,
+    pub events: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -433,6 +444,7 @@ mod tests {
                 display_name: CLIENT_DISPLAY_NAME,
                 version: CLIENT_VERSION,
                 platform: "darwin",
+                device_family: Some("darwin"),
                 mode: CLIENT_MODE,
             },
             caps: vec!["tool-events"],
@@ -445,6 +457,7 @@ mod tests {
         assert_eq!(json["minProtocol"], 4);
         assert_eq!(json["maxProtocol"], 4);
         assert_eq!(json["client"]["id"], "gateway-client");
+        assert_eq!(json["client"]["deviceFamily"], "darwin");
         assert_eq!(json["caps"][0], "tool-events");
     }
 
@@ -474,6 +487,11 @@ mod tests {
             "type": "hello-ok",
             "protocol": 4,
             "server": { "version": "1.2.0", "connId": "conn-1" },
+            "features": {
+                "methods": ["chat.send"],
+                "events": ["chat"],
+                "capabilities": ["chat.send.routing"]
+            },
             "policy": { "maxPayload": 26214400, "tickIntervalMs": 30000 },
             "auth": {
                 "deviceToken": "tok123",
@@ -485,6 +503,17 @@ mod tests {
         assert_eq!(hello.protocol, 4);
         assert_eq!(hello.policy.tick_interval_ms, 30000);
         assert_eq!(hello.auth.device_token.as_deref(), Some("tok123"));
+        assert_eq!(hello.features.methods, ["chat.send"]);
+        assert_eq!(hello.features.events, ["chat"]);
+        assert_eq!(
+            hello
+                .features
+                .capabilities
+                .as_ref()
+                .and_then(|values| values.first())
+                .map(String::as_str),
+            Some("chat.send.routing")
+        );
     }
 
     #[test]
