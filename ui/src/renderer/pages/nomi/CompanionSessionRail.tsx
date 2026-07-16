@@ -23,7 +23,7 @@ interface Props {
   companions: ICompanionWithStatus[];
   selectedId: CompanionId | null;
   onSelect: (id: CompanionId) => void;
-  onCreated: (profile: ICompanionProfile) => void;
+  onCreated: (profile: ICompanionProfile) => void | Promise<void>;
   /** Called after a companion is deleted (quick-delete) so the page reselects. */
   onDeleted: (companionId: CompanionId) => void;
   className?: string;
@@ -80,8 +80,15 @@ const CompanionSessionRail: React.FC<Props> = ({
         });
       }
       setModalVisible(false);
+      try {
+        await onCreated(profile);
+      } catch (refreshError) {
+        Message.warning(
+          `${t('nomi.companions.created', { companionName: profile.name })}: ${String(refreshError)}`
+        );
+        return;
+      }
       Message.success(t('nomi.companions.created', { companionName: profile.name }));
-      onCreated(profile);
     } catch (e) {
       Message.error(String(e));
     } finally {

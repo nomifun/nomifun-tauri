@@ -53,6 +53,8 @@ RUN if [ -n "$CARGO_REGISTRY_MIRROR" ]; then \
     fi
 
 COPY . .
+# Pair the Rust host build with the exact UI artifact produced by the UI stage.
+COPY --from=ui /app/ui/dist/nomifun-build.json /src/ui/dist/nomifun-build.json
 # BuildKit cache mounts persist the cargo registry + compiled artifacts across
 # rebuilds, so a one-line source change recompiles in seconds, not minutes. The
 # binary is copied OUT of the (ephemeral) target cache mount into a real layer.

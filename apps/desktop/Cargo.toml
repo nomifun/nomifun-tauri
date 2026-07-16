@@ -11,6 +11,7 @@ license.workspace = true
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+serde_json.workspace = true
 
 [dependencies]
 # The unified backend, linked in-process (no spawned binary, no bundled-nomicore).

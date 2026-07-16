@@ -8,6 +8,13 @@ license.workspace = true
 name = "nomifun-web"
 path = "src/main.rs"
 
+[features]
+default = []
+static-webui = []
+
+[build-dependencies]
+serde_json.workspace = true
+
 [dependencies]
 # The unified backend, consumed in-process as a library (no spawned binary).
 # P2 will expose nomifun_app's boot entry (init_environment / data layer /

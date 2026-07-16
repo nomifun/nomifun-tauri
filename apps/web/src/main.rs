@@ -62,6 +62,11 @@ struct Args {
     /// Directory containing the built SPA (ui/dist).
     #[arg(long, env = "NOMIFUN_WEB_DIST", default_value = "../../ui/dist")]
     dist: PathBuf,
+    /// Serve only the backend/API surface. Intended for the Vite-proxied WebUI
+    /// development loop, where mounting ui/dist would expose a stale bundle on
+    /// the backend port.
+    #[arg(long)]
+    api_only: bool,
     /// DANGER: run the backend in local mode — authentication is fully DISABLED
     /// and every client acts as a privileged user with shell/file/agent access.
     /// Only for a host reachable solely over loopback or a trusted private
@@ -93,6 +98,31 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn validate_static_dist(args: &Args) -> Result<Option<nomifun_app::bootstrap::UiBuildManifest>> {
+    validate_static_dist_with_build_id(args, option_env!("NOMIFUN_FRONTEND_BUILD_ID"))
+}
+
+fn validate_static_dist_with_build_id(
+    args: &Args,
+    expected_build_id: Option<&str>,
+) -> Result<Option<nomifun_app::bootstrap::UiBuildManifest>> {
+    if args.api_only {
+        return Ok(None);
+    }
+
+    let expected_build_id = expected_build_id.context(
+        "this nomifun-web binary has no exact frontend build identity and cannot serve static assets; run `bun run serve:web` (or build with `--features static-webui`) after `bun run build:ui`",
+    )?;
+
+    nomifun_app::bootstrap::validate_webui_dist(
+        &args.dist,
+        env!("CARGO_PKG_VERSION"),
+        Some(expected_build_id),
+    )
+    .map(Some)
+    .with_context(|| format!("refusing to serve incompatible WebUI assets from {}", args.dist.display()))
+}
+
 fn main() -> Result<ExitCode> {
     // If an ACP agent CLI spawned this binary as an MCP stdio bridge
     // (`current_exe() mcp-requirement-stdio` etc.), run that helper and exit
@@ -105,6 +135,9 @@ fn main() -> Result<ExitCode> {
     }
 
     let args = Args::parse();
+    // Fail before runtime, database, and auth initialization. API-only mode is
+    // the explicit Vite-development bypass and never mounts the static bundle.
+    let _static_manifest = validate_static_dist(&args)?;
 
     // Authentication is ON by default; `--insecure-no-auth` (or the env var)
     // opts into the desktop-style no-auth local mode. The env is read manually
@@ -176,20 +209,22 @@ async fn serve(cli: nomifun_app::cli::Cli, merged_path: String, args: Args) -> R
         );
     }
 
-    let api = nomifun_app::create_router(&services).await;
-    let app = api
-        .fallback_service(
+    let mut app = nomifun_app::create_router(&services).await;
+    if !args.api_only {
+        app = app.fallback_service(
             ServeDir::new(&args.dist)
                 .append_index_html_on_directories(true)
                 .fallback(ServeFile::new(args.dist.join("index.html"))),
-        )
-        .layer(TraceLayer::new_for_http());
+        );
+    }
+    let app = app.layer(TraceLayer::new_for_http());
 
     let addr = SocketAddr::new(ip, args.port);
     tracing::info!(
         requested = %addr,
         auth = if cli.local { "disabled (insecure-no-auth)" } else { "required" },
-        dist = ?args.dist,
+        static_mode = if args.api_only { "api-only" } else { "spa" },
+        dist = ?if args.api_only { None } else { Some(&args.dist) },
         "nomifun-web: embedded backend + SPA on one port"
     );
     // Port failover: if `args.port` is taken, bind a bounded-scan neighbour (or
@@ -210,4 +245,77 @@ async fn serve(cli: nomifun_app::cli::Cli, merged_path: String, args: Args) -> R
     services.database.close().await;
     drop(env);
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_only_flag_disables_static_spa_mode() {
+        let args = Args::try_parse_from(["nomifun-web", "--api-only"]).expect("parse --api-only");
+
+        assert!(args.api_only);
+    }
+
+    #[test]
+    fn api_only_mode_does_not_require_a_static_distribution() {
+        let args = Args::try_parse_from([
+            "nomifun-web",
+            "--api-only",
+            "--dist",
+            "/definitely/missing/nomifun-ui-dist",
+        ])
+        .expect("parse API-only args");
+
+        assert!(validate_static_dist(&args).expect("API-only mode should bypass static validation").is_none());
+    }
+
+    #[test]
+    fn static_mode_rejects_a_missing_distribution_before_server_boot() {
+        let args = Args::try_parse_from([
+            "nomifun-web",
+            "--dist",
+            "/definitely/missing/nomifun-ui-dist",
+        ])
+        .expect("parse static args");
+
+        let error = validate_static_dist_with_build_id(&args, Some("paired-test-build"))
+            .expect_err("static mode must reject a missing distribution");
+        let error_text = format!("{error:#}");
+        assert!(error_text.contains("index.html"), "unexpected error: {error_text}");
+    }
+
+    #[test]
+    fn static_mode_rejects_a_host_without_an_exact_embedded_build_id() {
+        let args = Args::try_parse_from(["nomifun-web", "--dist", "ui/dist"])
+            .expect("parse static args");
+
+        let error = validate_static_dist_with_build_id(&args, None)
+            .expect_err("an API-only host binary must never serve static assets");
+        let error_text = format!("{error:#}");
+        assert!(error_text.contains("exact frontend build identity"), "unexpected error: {error_text}");
+        assert!(error_text.contains("serve:web"), "unexpected error: {error_text}");
+    }
+
+    #[cfg(feature = "static-webui")]
+    #[test]
+    fn static_webui_feature_accepts_only_its_paired_distribution() {
+        let dist = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../ui/dist");
+        let args = Args::try_parse_from([
+            "nomifun-web",
+            "--dist",
+            dist.to_str().expect("workspace path must be UTF-8"),
+        ])
+        .expect("parse paired static args");
+
+        let manifest = validate_static_dist(&args)
+            .expect("the freshly built static host and UI must be paired")
+            .expect("static mode must return its manifest");
+        assert_eq!(
+            manifest.frontend_build_id,
+            option_env!("NOMIFUN_FRONTEND_BUILD_ID")
+                .expect("static-webui builds must embed an exact frontend build ID")
+        );
+    }
 }

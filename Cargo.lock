@@ -6206,6 +6206,7 @@ dependencies = [
  "clap",
  "nomifun-app",
  "nomifun-runtime",
+ "serde_json",
  "tokio",
  "tower-http",
  "tracing",

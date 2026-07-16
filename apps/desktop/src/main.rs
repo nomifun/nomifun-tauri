@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use anyhow::Context;
 use clap::Parser;
 use nomifun_app::{DesktopServer, WebUiStatus};
 use tauri::menu::{Menu, MenuItem};
@@ -104,11 +105,41 @@ pub(crate) fn webui_init_script(port: u16, trust_secret: &str) -> String {
 /// resource-dir layouts (production bundle), then dev-tree relatives. A
 /// candidate must contain `index.html` to be accepted; `None` means remote
 /// browsers get the API only (logged as a warning).
-fn resolve_webui_spa_dir(app: &tauri::App) -> Option<PathBuf> {
+fn validate_webui_spa_candidate(path: &std::path::Path, production: bool) -> anyhow::Result<bool> {
+    validate_webui_spa_candidate_with_build_id(
+        path,
+        production,
+        option_env!("NOMIFUN_FRONTEND_BUILD_ID"),
+    )
+}
+
+fn validate_webui_spa_candidate_with_build_id(
+    path: &std::path::Path,
+    production: bool,
+    expected_build_id: Option<&str>,
+) -> anyhow::Result<bool> {
+    if !path.join("index.html").is_file() {
+        return Ok(false);
+    }
+    if production {
+        let expected_build_id = expected_build_id.context(
+            "this production desktop host has no exact frontend build identity; run `bun run build:ui` and rebuild the desktop application",
+        )?;
+        nomifun_app::bootstrap::validate_webui_dist(
+            path,
+            env!("CARGO_PKG_VERSION"),
+            Some(expected_build_id),
+        )?;
+    }
+    Ok(true)
+}
+
+fn resolve_webui_spa_dir(app: &tauri::App) -> anyhow::Result<Option<PathBuf>> {
+    let production = !tauri::is_dev();
     if let Some(p) = std::env::var_os("NOMIFUN_WEBUI_DIST") {
         let p = PathBuf::from(p);
-        if p.join("index.html").is_file() {
-            return Some(p);
+        if validate_webui_spa_candidate(&p, production)? {
+            return Ok(Some(p));
         }
     }
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -122,7 +153,12 @@ fn resolve_webui_spa_dir(app: &tauri::App) -> Option<PathBuf> {
     candidates.push(PathBuf::from("ui/dist"));
     candidates.push(PathBuf::from("../../ui/dist"));
     candidates.push(PathBuf::from("../ui/dist"));
-    candidates.into_iter().find(|c| c.join("index.html").is_file())
+    for candidate in candidates {
+        if validate_webui_spa_candidate(&candidate, production)? {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
 }
 
 /// Data root resolution, in priority order:
@@ -592,7 +628,7 @@ fn main() -> std::process::ExitCode {
             // Resolve the bundled SPA dir for serving the app shell to remote
             // browsers over the LAN listener (loopback webview loads via the
             // Tauri asset protocol and does not need this).
-            let spa_dir = resolve_webui_spa_dir(app);
+            let spa_dir = resolve_webui_spa_dir(app)?;
             // In dev, the desktop webview loads the live vite dev server; serving
             // the (stale) bundled `ui/dist` to remote browsers would desync them
             // from the desktop. So in dev the LAN listener proxies the SPA to vite
@@ -854,6 +890,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -864,6 +901,30 @@ mod tests {
     #[test]
     fn macos_reopen_surfaces_main_window_even_when_companion_window_is_visible() {
         assert!(should_show_main_window_for_macos_reopen(true));
+    }
+
+    #[test]
+    fn production_spa_candidate_rejects_a_manifestless_bundle() {
+        let dist = tempfile::tempdir().expect("create dist fixture");
+        fs::write(dist.path().join("index.html"), "<!doctype html>").expect("write index");
+
+        let error = validate_webui_spa_candidate_with_build_id(
+            dist.path(),
+            true,
+            Some("paired-test-build"),
+        )
+            .expect_err("production candidate must require a matching build manifest");
+        assert!(format!("{error:#}").contains("nomifun-build.json"));
+    }
+
+    #[test]
+    fn production_spa_candidate_rejects_a_host_without_an_exact_build_id() {
+        let dist = tempfile::tempdir().expect("create dist fixture");
+        fs::write(dist.path().join("index.html"), "<!doctype html>").expect("write index");
+
+        let error = validate_webui_spa_candidate_with_build_id(dist.path(), true, None)
+            .expect_err("an unpaired desktop host must never serve production assets");
+        assert!(format!("{error:#}").contains("exact frontend build identity"));
     }
 
     #[tokio::test]

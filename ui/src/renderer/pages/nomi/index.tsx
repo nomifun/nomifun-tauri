@@ -145,8 +145,8 @@ const NomiConfigPage: React.FC = () => {
   );
 
   const handleCreated = useCallback(
-    (profile: { id: CompanionId }) => {
-      void companionsApi.refresh();
+    async (profile: { id: CompanionId }) => {
+      await companionsApi.refresh();
       void shared.refresh();
       // 新建后落到 总览(overview)：新伙伴尚未配置模型，先在管理中心引导配置，配置后再从
       // 「打开聊天」或会话侧边栏的桌面伙伴分组进入对话。One atomic update: two sequential

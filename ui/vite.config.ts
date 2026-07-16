@@ -1,8 +1,29 @@
-import { defineConfig } from 'vite';
+import { defineConfig, type Plugin } from 'vite';
+import { readFileSync } from 'node:fs';
 import { resolve } from 'path';
 import react from '@vitejs/plugin-react';
 import UnoCSS from 'unocss/vite';
 import unoConfig from './uno.config.ts';
+import { createUiBuildManifest } from '../scripts/ui-build-manifest';
+
+const uiPackage = JSON.parse(readFileSync(resolve(__dirname, 'package.json'), 'utf8')) as { version: string };
+
+function uiBuildManifestPlugin(): Plugin {
+  const rawApiContractVersion = readFileSync(resolve(__dirname, '../ui-api-contract-version.txt'), 'utf8').trim();
+  const manifest = createUiBuildManifest(uiPackage.version, rawApiContractVersion);
+
+  return {
+    name: 'nomifun-ui-build-manifest',
+    apply: 'build' as const,
+    generateBundle() {
+      this.emitFile({
+        type: 'asset',
+        fileName: 'nomifun-build.json',
+        source: `${JSON.stringify(manifest, null, 2)}\n`,
+      });
+    },
+  };
+}
 
 // Ported from the original electron.vite.config.ts: rewrites named imports from
 // '@icon-park/react' into HOC-wrapped components (replaces the old webpack loader).
@@ -74,7 +95,7 @@ export default defineConfig(({ mode }) => {
       host: '127.0.0.1',
       proxy,
     },
-    plugins: [iconParkPlugin(), react(), UnoCSS({ ...unoConfig })],
+    plugins: [iconParkPlugin(), react(), UnoCSS({ ...unoConfig }), uiBuildManifestPlugin()],
     resolve: {
       alias: {
         '@': src,
