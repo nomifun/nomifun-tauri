@@ -2247,7 +2247,10 @@ export const terminal = {
     (items) => items.map(fromApiTerminalSession),
   ),
   get: withResponseMap(
-    httpGet<ITerminalSession, { id: TerminalId }>((p) => `/api/terminals/${p.id}`),
+    httpGet<ITerminalSession, { id: TerminalId }>(
+      (p) => `/api/terminals/${p.id}`,
+      { timeoutMs: 10_000 }
+    ),
     fromApiTerminalSession,
   ),
   create: withResponseMap(
@@ -2276,7 +2279,10 @@ export const terminal = {
   ),
   resize: httpPost<void, { id: TerminalId; cols: number; rows: number }>(
     (p) => `/api/terminals/${p.id}/resize`,
-    (p) => ({ cols: p.cols, rows: p.rows })
+    (p) => ({ cols: p.cols, rows: p.rows }),
+    // Deferred activation is serialized and resize is idempotent, so a client
+    // deadline can safely turn a hung request into the Xterm retry/error path.
+    { timeoutMs: 6_000 }
   ),
   kill: httpPost<void, { id: TerminalId }>((p) => `/api/terminals/${p.id}/kill`),
   relaunch: withResponseMap(

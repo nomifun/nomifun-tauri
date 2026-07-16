@@ -7,6 +7,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
   AUTH_EXPIRED_EVENT,
+  httpPost,
   httpRequest,
   isAuthExpiredHttpError,
   isBackendHttpError,
@@ -70,6 +71,29 @@ describe('httpRequest client deadline + network-failure diagnosis', () => {
       expect(message.toLowerCase().includes('timed out')).toBe(true);
       // A client-side timeout is NOT an HTTP status error.
       expect(isHttp).toBe(false);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  test('httpPost forwards a deadline for idempotent timed mutations', async () => {
+    globalThis.fetch = ((_url: string, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+      })) as unknown as typeof fetch;
+    try {
+      const resize = httpPost<void, { cols: number; rows: number }>(
+        '/api/terminals/test/resize',
+        (size) => size,
+        { timeoutMs: 10 }
+      );
+      let message = '';
+      try {
+        await resize.invoke({ cols: 100, rows: 30 });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message.toLowerCase().includes('timed out')).toBe(true);
     } finally {
       globalThis.fetch = realFetch;
     }

@@ -6,13 +6,11 @@
 
 import React, { useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import { Message } from '@arco-design/web-react';
 import SendBox from '@renderer/components/chat/SendBox';
 import type { SlashCommandItem } from '@/common/chat/slash/types';
-import { ipcBridge } from '@/common';
-import type { TerminalId } from '@/common/types/ids';
 import { useAddEventListener } from '@/renderer/utils/emitter';
 import type { FileOrFolderItem } from '@/renderer/utils/file/fileTypes';
-import { encodeStringToBase64 } from './terminalEncoding';
 import type { XtermViewHandle } from './XtermView';
 import './terminalSendBox.css';
 
@@ -38,7 +36,6 @@ import './terminalSendBox.css';
  */
 
 interface TerminalSendBoxProps {
-  sessionId: TerminalId;
   /** Clear the visible terminal (delegated to the xterm view). */
   onClearView?: () => void;
   /** Handle to the xterm view — used to detect bracketed paste mode on submit. */
@@ -46,7 +43,7 @@ interface TerminalSendBoxProps {
   disabled?: boolean;
 }
 
-const TerminalSendBox: React.FC<TerminalSendBoxProps> = ({ sessionId, onClearView, terminalApi, disabled }) => {
+const TerminalSendBox: React.FC<TerminalSendBoxProps> = ({ onClearView, terminalApi, disabled }) => {
   const { t } = useTranslation();
   const [input, setInput] = useState('');
 
@@ -98,8 +95,11 @@ const TerminalSendBox: React.FC<TerminalSendBoxProps> = ({ sessionId, onClearVie
     [t]
   );
 
-  const writeToPty = (text: string) =>
-    ipcBridge.terminal.input.invoke({ id: sessionId, data_b64: encodeStringToBase64(text) });
+  const writeToPty = async (text: string): Promise<void> => {
+    const api = terminalApi?.current;
+    if (!api) throw new Error('Terminal is still initializing');
+    await api.writeToPty(text);
+  };
 
   const handleSend = async (message: string) => {
     // Drop only trailing whitespace; preserve internal structure.
@@ -113,10 +113,16 @@ const TerminalSendBox: React.FC<TerminalSendBoxProps> = ({ sessionId, onClearVie
     // submits it once. Sent as a single write so the wrapper and the CR cannot
     // arrive out of order. When bracketed paste is off we fall back to the plain
     // CR stream — the program cannot distinguish a paste in that mode anyway.
-    if (body.includes('\r') && terminalApi?.current?.isBracketedPaste()) {
-      await writeToPty(`\x1b[200~${body}\x1b[201~\r`);
-    } else {
-      await writeToPty(`${body}\r`);
+    try {
+      if (body.includes('\r') && terminalApi?.current?.isBracketedPaste()) {
+        await writeToPty(`\x1b[200~${body}\x1b[201~\r`);
+      } else {
+        await writeToPty(`${body}\r`);
+      }
+    } catch (error) {
+      setInput(message);
+      Message.error(t('terminal.inputFailed', { defaultValue: 'Failed to send terminal input.' }));
+      throw error;
     }
   };
 
@@ -126,7 +132,9 @@ const TerminalSendBox: React.FC<TerminalSendBoxProps> = ({ sessionId, onClearVie
       setInput('');
     } else if (name === 'interrupt') {
       // Send Ctrl-C (ETX) to the PTY.
-      void writeToPty('\x03');
+      void writeToPty('\x03').catch(() => {
+        Message.error(t('terminal.inputFailed', { defaultValue: 'Failed to send terminal input.' }));
+      });
     }
   };
 

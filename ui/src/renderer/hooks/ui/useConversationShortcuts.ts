@@ -1,9 +1,10 @@
-import { parseConversationId, type ConversationId } from '@/common/types/ids';
+import type { ConversationId } from '@/common/types/ids';
 import { useEffect } from 'react';
 import type { NavigateFunction } from 'react-router-dom';
 import { useLocation } from 'react-router-dom';
 import { useVisibleConversationIds } from '@/renderer/pages/conversation/SessionList/hooks/useVisibleConversationIds';
 import { isDesktopShell } from '@/renderer/utils/platform';
+import { parseSessionRoute } from '@/renderer/utils/routes/sessionRoute';
 
 type UseConversationShortcutsParams = {
   navigate: NavigateFunction;
@@ -51,9 +52,8 @@ export const useConversationShortcuts = ({ navigate }: UseConversationShortcutsP
 
       if (isConversationTabShortcut(event)) {
         event.preventDefault();
-        const matchedId = location.pathname.match(/^\/conversation\/([^/]+)/)?.[1];
-        // Route params are canonical conversation IDs.
-        const currentConversationId = matchedId != null ? parseConversationId(matchedId) : null;
+        const activeSession = parseSessionRoute(location.pathname);
+        const currentConversationId = activeSession?.kind === 'conversation' ? activeSession.id : null;
         const targetConversationId = getCycledConversationId(
           visibleConversationIds,
           currentConversationId,

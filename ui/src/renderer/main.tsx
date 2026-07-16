@@ -53,7 +53,9 @@ import { DETECTED_AGENTS_SWR_KEY, fetchDetectedAgents } from './utils/model/agen
 import { repairAllCronJobTimeZonesOnce } from '@renderer/pages/cron/repairCronJobTimeZone';
 
 // Components and utilities
+import AppLoader from './components/layout/AppLoader';
 import Layout from './components/layout/Layout';
+import RouteErrorBoundary from './components/layout/RouteErrorBoundary';
 import Router from './components/layout/Router';
 import Sider from './components/layout/Sider';
 import { useAuth } from './hooks/context/AuthContext';
@@ -84,14 +86,16 @@ const Config: React.FC<PropsWithChildren> = ({ children }) => {
 const Main = () => {
   const { ready } = useAuth();
   const [configReady, setConfigReady] = useState(false);
+  const [configError, setConfigError] = useState<Error | null>(null);
 
   useEffect(() => {
     if (!ready) return;
+    let active = true;
     // Prefetch `/api/agents` in parallel with configService.initialize() and
     // seed the shared SWR cache so the Guid page's model/mode selectors can
     // read `handshake.available_models` on the very first render — without
     // waiting for a session to be created.
-    Promise.all([
+    void Promise.all([
       application.systemInfo
         .invoke()
         .then((info) => setBrowserStorageGeneration(info.storageGeneration))
@@ -107,7 +111,18 @@ const Main = () => {
         .catch((err) => {
           console.error('Failed to prefetch agents:', err);
         }),
-    ]).finally(() => setConfigReady(true));
+    ])
+      .then(() => {
+        if (active) setConfigReady(true);
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        setConfigError(error instanceof Error ? error : new Error(String(error)));
+      });
+
+    return () => {
+      active = false;
+    };
   }, [ready]);
 
   useEffect(() => {
@@ -115,8 +130,12 @@ const Main = () => {
     void repairAllCronJobTimeZonesOnce();
   }, [ready]);
 
+  if (configError) {
+    throw configError;
+  }
+
   if (!ready || !configReady) {
-    return null;
+    return <AppLoader />;
   }
 
   return (
@@ -136,7 +155,9 @@ void registerPwa();
 
 const root = createRoot(document.getElementById('root')!);
 root.render(
-  <AppProviders>
-    <App />
-  </AppProviders>
+  <RouteErrorBoundary scope='application'>
+    <AppProviders>
+      <App />
+    </AppProviders>
+  </RouteErrorBoundary>
 );

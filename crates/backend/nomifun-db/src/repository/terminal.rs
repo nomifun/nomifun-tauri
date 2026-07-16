@@ -86,6 +86,20 @@ pub trait ITerminalRepository: Send + Sync {
         backend: Option<&str>,
     ) -> Result<(), DbError>;
 
+    /// Atomically rewrite launch identity and mark the row running immediately
+    /// before an in-place shell replacement. Keeping these fields in one DB
+    /// statement prevents a cancelled/failed preflight from exposing a shell
+    /// identity with the old agent status (or vice versa).
+    async fn update_launch_state(
+        &self,
+        id: &str,
+        command: &str,
+        args: &str,
+        backend: Option<&str>,
+        last_status: &str,
+        exit_code: Option<i64>,
+    ) -> Result<(), DbError>;
+
     /// Writes (or clears with `None`) the AutoWork config JSON blob for a session.
     /// Returns `DbError::NotFound` if absent.
     async fn update_autowork(&self, id: &str, autowork: Option<&str>) -> Result<(), DbError>;

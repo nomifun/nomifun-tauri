@@ -140,6 +140,32 @@ fn is_utf8_lc_all(value: &std::ffi::OsStr) -> bool {
 /// (a process that exits flushes its final scrollback immediately via `on_exit`).
 const SCROLLBACK_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Windows ConPTY ultimately stores both dimensions in a signed 16-bit
+/// `COORD`. Keeping the same limit on every platform makes persisted terminal
+/// sizes portable and prevents a later Windows relaunch from wrapping them.
+const MAX_PTY_DIMENSION: u16 = i16::MAX as u16;
+
+#[derive(Debug, Clone)]
+enum TerminalLifecycleState {
+    /// The persisted session has not spawned its first PTY yet.
+    Pending,
+    /// The first PTY was spawned successfully. The slot is intentionally kept
+    /// so resize/delete/relaunch continue to serialize against that activation.
+    Ready,
+    /// The first spawn failed. All concurrent/future resize callers receive the
+    /// same stable spawn failure instead of an intermittent `NotFound`.
+    Failed(Arc<str>),
+    /// A delete/shutdown won the lifecycle race. Waiters must not spawn.
+    Cancelled,
+}
+
+enum DeferredSpawnFailure {
+    /// Repository/preflight failures are retryable and leave the slot pending.
+    Preflight(TerminalError),
+    /// The PTY spawn itself failed and must become a stable terminal error state.
+    Spawn(TerminalError),
+}
+
 /// Hook the IDMM layer registers so a user-driven terminal session (re)arms
 /// intelligent-decision supervision on activity. Defined here (the lower crate)
 /// so `nomifun-terminal` need not depend on `nomifun-idmm`; `IdmmManager`
@@ -179,12 +205,16 @@ pub struct TerminalService {
     /// generation. The exit callback, kill/delete/relaunch, and final service
     /// drop all revoke deterministically.
     live_capability_leases: Arc<DashMap<String, (u64, LoopbackCapabilityLeaseSet)>>,
-    /// Sessions created with `defer_spawn` that have not spawned their PTY yet.
-    /// The first `resize` (carrying the real fitted size) consumes the marker and
-    /// spawns the PTY at that size, so a full-screen TUI never draws at the 80×24
-    /// default first. In-memory only: a deferred row that is never resized (e.g.
-    /// an app crash before the client mounts) is healed by `reconcile_on_boot`.
-    pending_spawn: Arc<DashMap<String, ()>>,
+    /// Every session owns one lifecycle slot. `Pending` is used for initial or
+    /// replacement activation; `Ready` also covers a PTY that has since exited.
+    /// Keeping the slot for the full row lifetime serializes resize/kill/delete/
+    /// relaunch for deferred and non-deferred sessions alike.
+    lifecycle_slots: Arc<DashMap<String, Arc<tokio::sync::Mutex<TerminalLifecycleState>>>>,
+    /// Global read/write gate between ordinary terminal operations and final
+    /// shutdown cleanup. The atomic rejects operations that arrive after quit
+    /// begins; the write lock waits for already-admitted operations to finish.
+    shutdown_gate: Arc<tokio::sync::RwLock<()>>,
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
     /// Late-wired knowledge service (assembly order: knowledge comes up after
     /// the terminal singleton, mirroring `ConversationService`). `None` means
     /// knowledge features are silently skipped (best-effort contract).
@@ -248,7 +278,9 @@ impl TerminalService {
             work_dir,
             live: Arc::new(DashMap::new()),
             live_capability_leases: Arc::new(DashMap::new()),
-            pending_spawn: Arc::new(DashMap::new()),
+            lifecycle_slots: Arc::new(DashMap::new()),
+            shutdown_gate: Arc::new(tokio::sync::RwLock::new(())),
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             knowledge: Arc::new(std::sync::RwLock::new(None)),
             delete_hooks: Arc::new(std::sync::RwLock::new(Vec::new())),
             supervision_hook: Arc::new(std::sync::RwLock::new(None)),
@@ -264,6 +296,28 @@ impl TerminalService {
             titled: Arc::new(DashMap::new()),
             first_input: Arc::new(DashMap::new()),
         }
+    }
+
+    async fn enter_operation(
+        &self,
+    ) -> Result<tokio::sync::OwnedRwLockReadGuard<()>, TerminalError> {
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(TerminalError::ShuttingDown);
+        }
+        let guard = self.shutdown_gate.clone().read_owned().await;
+        // Shutdown publishes the flag before waiting for the write lock. Check
+        // again after admission so a late reader cannot start behind cleanup.
+        if self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            drop(guard);
+            return Err(TerminalError::ShuttingDown);
+        }
+        Ok(guard)
     }
 
     /// Register a hook notified after a terminal session is deleted.
@@ -497,6 +551,22 @@ impl TerminalService {
         user_id: &str,
         req: CreateTerminalRequest,
     ) -> Result<TerminalSessionResponse, TerminalError> {
+        let service = self.clone();
+        let user_id = user_id.to_owned();
+        tokio::spawn(async move { service.create_coordinated(user_id, req).await })
+            .await
+            .map_err(|error| {
+                TerminalError::Spawn(format!("terminal create coordinator failed: {error}"))
+            })?
+    }
+
+    async fn create_coordinated(
+        &self,
+        user_id: String,
+        req: CreateTerminalRequest,
+    ) -> Result<TerminalSessionResponse, TerminalError> {
+        let _shutdown_guard = self.enter_operation().await?;
+        validate_pty_size(req.cols, req.rows)?;
         let name = req
             .name
             .clone()
@@ -505,7 +575,7 @@ impl TerminalService {
         let args_json = serde_json::to_string(&req.args)?;
         let env_json = req.env.as_ref().map(serde_json::to_string).transpose()?;
         let id = TerminalId::new();
-        let user_id = UserId::parse(user_id)
+        let user_id = UserId::parse(&user_id)
             .map_err(|error| TerminalError::InvalidInput(format!("invalid user_id: {error}")))?;
         // Entity identity is application-minted before persistence; clients
         // cannot supply or influence it.
@@ -526,6 +596,12 @@ impl TerminalService {
             })
             .await?;
         let id = row.id.clone();
+        let lifecycle_slot = Arc::new(tokio::sync::Mutex::new(TerminalLifecycleState::Pending));
+        let mut lifecycle = lifecycle_slot
+            .try_lock()
+            .expect("a new terminal lifecycle slot is uncontended");
+        self.lifecycle_slots
+            .insert(id.to_string(), lifecycle_slot.clone());
 
         // Knowledge integration —strictly best-effort: persist the
         // create-time binding, mount the bound bases into the workspace and
@@ -547,7 +623,6 @@ impl TerminalService {
             // mirroring `relaunch`). The row is already 'running'; the spawn is
             // imminent (the client fits-and-resizes on mount) and a crash before
             // it is healed by `reconcile_on_boot`.
-            self.pending_spawn.insert(id.to_string(), ());
             let resp = row_to_response(&row, None, &self.work_dir);
             self.emitter.emit_created(user_id.as_str(), &resp);
             info!(
@@ -561,7 +636,7 @@ impl TerminalService {
             .sync_knowledge_workspace(id.as_str(), &req.cwd, &req.command, &req.args)
             .await;
 
-        self.spawn_pty(
+        if let Err(error) = self.spawn_pty(
             user_id.as_str(),
             id.as_str(),
             &req.command,
@@ -572,7 +647,14 @@ impl TerminalService {
             req.rows,
             kb_ids,
             req.backend.as_deref(),
-        )?;
+        ) {
+            // The row is intentionally retained so the failed launch remains
+            // diagnosable/relaunchable, but it must never masquerade as running.
+            *lifecycle = TerminalLifecycleState::Failed(terminal_failure_message(&error));
+            self.persist_terminal_failure(id.as_str(), false).await;
+            return Err(error);
+        }
+        *lifecycle = TerminalLifecycleState::Ready;
 
         let resp = row_to_response(&row, None, &self.work_dir);
         self.emitter.emit_created(user_id.as_str(), &resp);
@@ -659,6 +741,7 @@ impl TerminalService {
         let exit_owner_id = owner_id.to_owned();
         let repo_exit = self.repo.clone();
         let live_exit = self.live.clone();
+        let lifecycle_slots_exit = self.lifecycle_slots.clone();
         let capability_leases_exit = self.live_capability_leases.clone();
         // Capture the runtime handle now (we're on the async create path); the
         // exit callback runs on the PTY reader's OS thread, which has no
@@ -668,24 +751,34 @@ impl TerminalService {
             capability_leases_exit.remove_if(exit_terminal_id.as_str(), |_, (lease_epoch, _)| {
                 *lease_epoch == epoch
             });
-            // Tear down ONLY if this PTY is still the live one for the id. A
-            // relaunch removes the old handle, kills it, then immediately
-            // inserts a fresh higher-epoch handle under the same id; the killed
-            // child's exit callback fires later (after EXIT_DRAIN_GRACE). An
-            // unconditional teardown here would then remove the FRESH handle and
-            // mark the session exited —turning "restart" into "close". The
-            // epoch guard makes the stale callback a no-op (also covers delete:
-            // the row/handle are already gone, so we skip a doomed status write).
-            if live_exit
-                .remove_if(exit_terminal_id.as_str(), |_, h| h.epoch() == epoch)
-                .is_none()
-            {
+            // Serialize exit with resize/delete/relaunch. An epoch check on this
+            // OS thread alone is insufficient: an old process may exit during
+            // relaunch's async preflight and queue `status=exited` before the
+            // replacement is inserted, only for that DB write to land later.
+            let Some(lifecycle_slot) = lifecycle_slots_exit
+                .get(exit_terminal_id.as_str())
+                .map(|entry| Arc::clone(entry.value()))
+            else {
                 return;
-            }
-            emitter_exit.emit_exit(&exit_owner_id, &exit_terminal_id, code);
-            // Persist the terminal status off the reader thread, onto the runtime.
-            let repo = repo_exit.clone();
+            };
+            let repo = repo_exit;
             rt.spawn(async move {
+                let lifecycle = lifecycle_slot.lock_owned().await;
+                if matches!(*lifecycle, TerminalLifecycleState::Cancelled) {
+                    return;
+                }
+                // Re-check after acquiring the lifecycle slot. A relaunch may
+                // have installed a higher-epoch PTY while this callback waited.
+                if live_exit
+                    .remove_if(exit_terminal_id.as_str(), |_, handle| {
+                        handle.epoch() == epoch
+                    })
+                    .is_none()
+                {
+                    return;
+                }
+
+                emitter_exit.emit_exit(&exit_owner_id, &exit_terminal_id, code);
                 if let Err(e) = repo
                     .update_status(exit_terminal_id.as_str(), "exited", code.map(i64::from))
                     .await
@@ -698,6 +791,10 @@ impl TerminalService {
                 if let Err(e) = repo.save_scrollback(exit_terminal_id.as_str(), &scrollback).await {
                     warn!(terminal_id = %exit_terminal_id, error = %e, "failed to persist final terminal scrollback");
                 }
+                // Retain the slot through final scrollback persistence. A
+                // relaunch clears predecessor output; this prevents a late exit
+                // write from restoring stale scrollback afterwards.
+                drop(lifecycle);
             });
         };
 
@@ -1279,16 +1376,68 @@ impl TerminalService {
         }
     }
 
-    /// Resize the PTY and persist the new dimensions.
-    pub async fn resize(&self, id: &str, cols: u16, rows: u16) -> Result<(), TerminalError> {
-        // Deferred-spawn sessions spawn their PTY on the FIRST resize, at the
-        // real fitted size —so a full-screen TUI (claude) draws correctly from
-        // frame one instead of at 80×24 then jumping. `remove` is atomic, so when
-        // two near-simultaneous resizes race (rAF + ResizeObserver), exactly one
-        // wins the spawn; the loser falls through to the live-handle resize below.
-        if self.pending_spawn.remove(id).is_some() {
-            return self.spawn_deferred(id, cols, rows).await;
+    fn existing_lifecycle_slot(
+        &self,
+        id: &str,
+    ) -> Option<Arc<tokio::sync::Mutex<TerminalLifecycleState>>> {
+        self.lifecycle_slots
+            .get(id)
+            .map(|entry| Arc::clone(entry.value()))
+    }
+
+    /// Return the shared slot for a row already proven to exist. Callers must
+    /// never use this as an existence probe: creating slots for arbitrary ids
+    /// lets repeated NotFound requests grow the map without bound.
+    fn lifecycle_slot_for_known_row(
+        &self,
+        id: &str,
+    ) -> Arc<tokio::sync::Mutex<TerminalLifecycleState>> {
+        Arc::clone(
+            self.lifecycle_slots
+                .entry(id.to_owned())
+                // Rows restored after a process restart have no live PTY and
+                // must not auto-spawn on resize, so their lazy state is Ready.
+                .or_insert_with(|| {
+                    Arc::new(tokio::sync::Mutex::new(TerminalLifecycleState::Ready))
+                })
+                .value(),
+        )
+    }
+
+    #[cfg(test)]
+    fn lifecycle_slot(&self, id: &str) -> Arc<tokio::sync::Mutex<TerminalLifecycleState>> {
+        self.existing_lifecycle_slot(id)
+            .expect("test session must already own a lifecycle slot")
+    }
+
+    /// Locate a lifecycle slot without allocating for an unknown row. Rows
+    /// restored after a process restart legitimately have no in-memory slot, so
+    /// one is created only after a repository existence check. The coordinator
+    /// re-reads the row while holding the returned slot to close the validation
+    /// race with delete.
+    async fn lifecycle_slot_for_existing_row(
+        &self,
+        id: &str,
+    ) -> Result<Arc<tokio::sync::Mutex<TerminalLifecycleState>>, TerminalError> {
+        if let Some(slot) = self.existing_lifecycle_slot(id) {
+            return Ok(slot);
         }
+        if self.repo.get_by_id(id).await?.is_none() {
+            return Err(TerminalError::NotFound(id.to_owned()));
+        }
+        Ok(self.lifecycle_slot_for_known_row(id))
+    }
+
+    fn remove_lifecycle_slot_if_same(
+        &self,
+        id: &str,
+        slot: &Arc<tokio::sync::Mutex<TerminalLifecycleState>>,
+    ) {
+        self.lifecycle_slots
+            .remove_if(id, |_, current| Arc::ptr_eq(current, slot));
+    }
+
+    async fn resize_live(&self, id: &str, cols: u16, rows: u16) -> Result<(), TerminalError> {
         {
             let handle = self
                 .live
@@ -1300,16 +1449,92 @@ impl TerminalService {
         Ok(())
     }
 
+    /// Persist a terminal lifecycle failure without deleting the row. Deferred sessions have
+    /// already emitted `terminal.created`, so they also emit `terminal.updated`
+    /// here to let an already-mounted UI expose its relaunch recovery action.
+    async fn persist_terminal_failure(&self, id: &str, emit_updated: bool) {
+        if let Err(error) = self.repo.update_status(id, "error", None).await {
+            warn!(terminal_id = id, error = %error, "failed to persist terminal failure status");
+            return;
+        }
+        if !emit_updated {
+            return;
+        }
+        match self.repo.get_by_id(id).await {
+            Ok(Some(row)) => {
+                let response = row_to_response(&row, None, &self.work_dir);
+                self.emitter
+                    .emit_updated(row.user_id.as_str(), &response);
+            }
+            Ok(None) => {
+                warn!(terminal_id = id, "terminal disappeared while broadcasting failure status");
+            }
+            Err(error) => {
+                warn!(terminal_id = id, error = %error, "failed to reload terminal failure status");
+            }
+        }
+    }
+
+    /// Resize the PTY and persist the new dimensions. Deferred sessions retain a
+    /// per-id mutex for their whole lifetime: the first caller performs the spawn
+    /// while every concurrent resize/delete/relaunch waits for the same outcome.
+    pub async fn resize(&self, id: &str, cols: u16, rows: u16) -> Result<(), TerminalError> {
+        let _shutdown_guard = self.enter_operation().await?;
+        validate_pty_size(cols, rows)?;
+
+        let slot = self
+            .existing_lifecycle_slot(id)
+            .ok_or_else(|| TerminalError::NotFound(id.to_owned()))?;
+        let mut state = slot.lock().await;
+        match state.clone() {
+            TerminalLifecycleState::Pending => {
+                // A cancelled request can drop its future immediately after
+                // `spawn_pty` inserted the handle but before it updated the state.
+                // Recover that completed activation instead of spawning twice.
+                if self.live.contains_key(id) {
+                    *state = TerminalLifecycleState::Ready;
+                    return self.resize_live(id, cols, rows).await;
+                }
+
+                match self.spawn_deferred(id, cols, rows).await {
+                    Ok(()) => {
+                        *state = TerminalLifecycleState::Ready;
+                        Ok(())
+                    }
+                    Err(DeferredSpawnFailure::Preflight(error)) => Err(error),
+                    Err(DeferredSpawnFailure::Spawn(error)) => {
+                        *state = TerminalLifecycleState::Failed(terminal_failure_message(&error));
+                        self.persist_terminal_failure(id, true).await;
+                        Err(error)
+                    }
+                }
+            }
+            TerminalLifecycleState::Ready => self.resize_live(id, cols, rows).await,
+            TerminalLifecycleState::Failed(message) => {
+                Err(TerminalError::Spawn(message.to_string()))
+            }
+            TerminalLifecycleState::Cancelled => Err(TerminalError::NotFound(id.to_string())),
+        }
+    }
+
     /// Spawn the PTY for a deferred-create session at the given (real) size,
     /// reading its command/cwd/env from the persisted row and re-syncing
     /// knowledge mounts (mirrors `relaunch` —the documented moment a binding
     /// takes effect). Persists the real size and arms IDMM supervision.
-    async fn spawn_deferred(&self, id: &str, cols: u16, rows: u16) -> Result<(), TerminalError> {
+    async fn spawn_deferred(
+        &self,
+        id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), DeferredSpawnFailure> {
         let row = self
             .repo
             .get_by_id(id)
-            .await?
-            .ok_or_else(|| TerminalError::NotFound(id.to_string()))?;
+            .await
+            .map_err(|error| DeferredSpawnFailure::Preflight(error.into()))?
+            .ok_or_else(|| {
+                DeferredSpawnFailure::Preflight(TerminalError::NotFound(id.to_string()))
+            })?;
         let args = crate::types::parse_args(&row.args);
         let env: Option<HashMap<String, String>> = row
             .env
@@ -1318,6 +1543,21 @@ impl TerminalService {
         let kb_ids = self
             .sync_knowledge_workspace(id, &row.cwd, &row.command, &args)
             .await;
+        // Persist every fallible async preflight before the synchronous spawn.
+        // Once a live handle is inserted there is no later await at which request
+        // cancellation could leave the slot stuck in `Pending`.
+        self.repo
+            .update_size(id, cols as i64, rows as i64)
+            .await
+            .map_err(|error| DeferredSpawnFailure::Preflight(error.into()))?;
+        // A Pending slot may also be a cancellation-recovery path from an
+        // explicit relaunch of a previously Failed session. Restore the durable
+        // status before inserting the live handle so Ready can never pair with a
+        // stale `error` row.
+        self.repo
+            .update_status(id, "running", None)
+            .await
+            .map_err(|error| DeferredSpawnFailure::Preflight(error.into()))?;
         self.spawn_pty(
             &row.user_id,
             id,
@@ -1329,8 +1569,8 @@ impl TerminalService {
             rows,
             kb_ids,
             row.backend.as_deref(),
-        )?;
-        self.repo.update_size(id, cols as i64, rows as i64).await?;
+        )
+        .map_err(DeferredSpawnFailure::Spawn)?;
         self.arm_supervision(id);
         info!(
             terminal_id = id,
@@ -1341,6 +1581,14 @@ impl TerminalService {
 
     /// Kill the child process (session row remains, status flips to exited via on_exit).
     pub async fn kill(&self, id: &str) -> Result<(), TerminalError> {
+        let _shutdown_guard = self.enter_operation().await?;
+        let lifecycle_slot = self
+            .existing_lifecycle_slot(id)
+            .ok_or_else(|| TerminalError::NotFound(id.to_owned()))?;
+        let lifecycle = lifecycle_slot.lock().await;
+        if matches!(*lifecycle, TerminalLifecycleState::Cancelled) {
+            return Err(TerminalError::NotFound(id.to_string()));
+        }
         self.live_capability_leases.remove(id);
         let handle = self
             .live
@@ -1351,32 +1599,62 @@ impl TerminalService {
 
     /// Kill (if live) and delete the session row.
     pub async fn delete(&self, id: &str) -> Result<(), TerminalError> {
-        let terminal_id = TerminalId::parse(id)
+        let service = self.clone();
+        let id = id.to_owned();
+        tokio::spawn(async move { service.delete_coordinated(id).await })
+            .await
+            .map_err(|error| {
+                TerminalError::Spawn(format!("terminal delete coordinator failed: {error}"))
+            })?
+    }
+
+    /// Runs independently of the HTTP caller so a dropped request cannot leave
+    /// an unknown DB-commit result without performing the synchronous PTY half
+    /// of the delete. The session lock is owned by this coordinator task.
+    async fn delete_coordinated(&self, id: String) -> Result<(), TerminalError> {
+        let shutdown_guard = self.enter_operation().await?;
+        let terminal_id = TerminalId::parse(&id)
             .map_err(|error| TerminalError::InvalidInput(format!("invalid terminal id: {error}")))?;
+        let lifecycle_slot = self.lifecycle_slot_for_existing_row(&id).await?;
+        let mut lifecycle = lifecycle_slot.clone().lock_owned().await;
+        if matches!(*lifecycle, TerminalLifecycleState::Cancelled) {
+            return Err(TerminalError::NotFound(id));
+        }
         // Resolve the authoritative owner before deletion. The row is gone by
         // the time `terminal.removed` is emitted, so the audience cannot be
         // reconstructed afterwards.
-        let owner_id = self
-            .repo
-            .get_by_id(id)
-            .await?
-            .ok_or_else(|| TerminalError::NotFound(id.to_string()))?
-            .user_id;
-        // Drop any pending deferred-spawn marker so a never-resized session does
-        // not leak (and cannot later spawn against a deleted row).
-        self.pending_spawn.remove(id);
-        // Drop per-session auto-title bookkeeping.
-        self.titled.remove(id);
-        self.first_input.remove(id);
-        self.live_capability_leases.remove(id);
-        if let Some((_, handle)) = self.live.remove(id) {
-            let _ = handle.kill();
+        let owner_id = match self.repo.get_by_id(&id).await? {
+            Some(row) => row.user_id,
+            None => {
+                *lifecycle = TerminalLifecycleState::Cancelled;
+                self.remove_lifecycle_slot_if_same(&id, &lifecycle_slot);
+                return Err(TerminalError::NotFound(id));
+            }
+        };
+
+        // COMMIT ORDER: keep state + live PTY untouched until the durable delete
+        // succeeds. After this await returns, finish the in-memory half without
+        // another yield so cancellation cannot expose a deleted row with a live
+        // process (the outer caller may be gone; this task still continues).
+        self.repo.delete(&id).await?;
+        *lifecycle = TerminalLifecycleState::Cancelled;
+        self.titled.remove(&id);
+        self.first_input.remove(&id);
+        self.live_capability_leases.remove(&id);
+        if let Some((_, handle)) = self.live.remove(&id) {
+            if let Err(error) = handle.kill() {
+                warn!(terminal_id = id, error = %error, "failed to kill PTY after durable terminal delete");
+            }
         }
-        self.repo.delete(id).await?;
+        self.remove_lifecycle_slot_if_same(&id, &lifecycle_slot);
+        // Waiters retain their cloned Arc and therefore still observe Cancelled;
+        // release them before invoking arbitrary async delete hooks.
+        drop(lifecycle);
         // Best-effort cleanup of the per-terminal private MCP config dir so
         // `terminal-mcp/<id>/` doesn't accumulate forever. Ignore errors: the
         // dir may not exist for shell terminals that never got enhancement.
-        let _ = std::fs::remove_dir_all(self.session_mcp_dir(id));
+        let _ = std::fs::remove_dir_all(self.session_mcp_dir(&id));
+        drop(shutdown_guard);
         // Snapshot the hook list under the read lock, then drop the guard before
         // awaiting —`RwLockReadGuard` is not `Send` (mirrors ConversationService).
         let hooks: Vec<Arc<dyn OnTerminalDelete>> = self
@@ -1397,22 +1675,34 @@ impl TerminalService {
     /// process is replaced. A PTY child cannot be resumed once it exits, so a
     /// new process is unavoidable; reusing the id keeps continuity for the user.
     pub async fn relaunch(&self, id: &str) -> Result<TerminalSessionResponse, TerminalError> {
-        let row = self
-            .repo
-            .get_by_id(id)
-            .await?
-            .ok_or_else(|| TerminalError::NotFound(id.to_string()))?;
+        let service = self.clone();
+        let id = id.to_owned();
+        tokio::spawn(async move { service.relaunch_coordinated(id).await })
+            .await
+            .map_err(|error| {
+                TerminalError::Spawn(format!("terminal relaunch coordinator failed: {error}"))
+            })?
+    }
 
-        // Tear down any still-running PTY for this id first.
-        self.live_capability_leases.remove(id);
-        if let Some((_, handle)) = self.live.remove(id) {
-            let _ = handle.kill();
+    async fn relaunch_coordinated(
+        &self,
+        id: String,
+    ) -> Result<TerminalSessionResponse, TerminalError> {
+        let _shutdown_guard = self.enter_operation().await?;
+        let lifecycle_slot = self.lifecycle_slot_for_existing_row(&id).await?;
+        let mut lifecycle = lifecycle_slot.clone().lock_owned().await;
+        if matches!(*lifecycle, TerminalLifecycleState::Cancelled) {
+            return Err(TerminalError::NotFound(id));
         }
-        // A relaunch spawns fresh now, so a pending deferred-spawn marker (if the
-        // session was never resized) is obsolete —clear it to avoid a later
-        // resize spawning a second PTY for the same id.
-        self.pending_spawn.remove(id);
-
+        let row = match self.repo.get_by_id(&id).await? {
+            Some(row) => row,
+            None => {
+                *lifecycle = TerminalLifecycleState::Cancelled;
+                self.remove_lifecycle_slot_if_same(&id, &lifecycle_slot);
+                return Err(TerminalError::NotFound(id));
+            }
+        };
+        let (cols, rows) = validate_stored_pty_size(row.cols, row.rows)?;
         let args = crate::types::parse_args(&row.args);
         let env: Option<HashMap<String, String>> = row
             .env
@@ -1422,51 +1712,67 @@ impl TerminalService {
         // documented moment a binding change (via KnowledgeControl) takes
         // effect for a terminal session.
         let kb_ids = self
-            .sync_knowledge_workspace(id, &row.cwd, &row.command, &args)
+            .sync_knowledge_workspace(&id, &row.cwd, &row.command, &args)
             .await;
+
+        // All fallible async preflight happens while the previous PTY and state
+        // remain untouched. This is deliberately the LAST await before the
+        // synchronous kill+spawn+state commit below.
+        self.repo.update_status(&id, "running", None).await?;
+
+        let previous_state = lifecycle.clone();
+        *lifecycle = TerminalLifecycleState::Pending;
+        if let Some(handle) = self.live.get(&id)
+            && let Err(error) = handle.kill()
+        {
+            *lifecycle = previous_state;
+            return Err(error);
+        }
+        self.live_capability_leases.remove(&id);
+        self.live.remove(&id);
+
         if let Err(e) = self.spawn_pty(
             &row.user_id,
-            id,
+            &id,
             &row.command,
             &args,
             &row.cwd,
             env,
-            row.cols as u16,
-            row.rows as u16,
+            cols,
+            rows,
             kb_ids,
             row.backend.as_deref(),
         ) {
             // The old PTY is already removed + killed; if the fresh spawn fails
-            // the session has no process. Record it as exited deterministically —
-            // the predecessor's exit callback is epoch-guarded now and will NOT
-            // flip the status for us, so without this a failed relaunch would
-            // leave a ghost "running" row (only healed at the next boot).
-            let _ = self.repo.update_status(id, "exited", None).await;
+            // the session has no process. Record a stable error because the
+            // predecessor's epoch-guarded exit callback will not do it for us.
+            *lifecycle = TerminalLifecycleState::Failed(terminal_failure_message(&e));
+            self.persist_terminal_failure(&id, true).await;
             return Err(e);
         }
+        *lifecycle = TerminalLifecycleState::Ready;
 
         // The fresh process starts with empty scrollback —drop the persisted
         // snapshot so a later restart does not replay the *previous* process's
         // output as this one's history. Best-effort: the new handle's flushes
         // repopulate it. (Common path — relaunch of an already-exited session —
         // has no pending exit callback to re-persist the old snapshot.)
-        if let Err(e) = self.repo.clear_scrollback(id).await {
-            warn!(terminal_id = id, error = %e, "failed to clear persisted scrollback on relaunch");
+        if let Err(e) = self.repo.clear_scrollback(&id).await {
+            warn!(terminal_id = %id, error = %e, "failed to clear persisted scrollback on relaunch");
         }
 
-        // Reset status to running and broadcast the refreshed session.
-        self.repo.update_status(id, "running", None).await?;
+        // Broadcast the refreshed session (status was committed pre-spawn).
         let updated = self
             .repo
-            .get_by_id(id)
+            .get_by_id(&id)
             .await?
-            .ok_or_else(|| TerminalError::NotFound(id.to_string()))?;
+            .ok_or_else(|| TerminalError::NotFound(id.clone()))?;
         let resp = row_to_response(&updated, None, &self.work_dir);
         self.emitter.emit_updated(&updated.user_id, &resp);
-        info!(terminal_id = id, "terminal session relaunched in place");
+        info!(terminal_id = %id, "terminal session relaunched in place");
         // Re-arm IDMM supervision for the fresh PTY (the old supervisor stood
         // down when the previous PTY exited).
-        self.arm_supervision(id);
+        self.arm_supervision(&id);
         Ok(resp)
     }
 
@@ -1485,65 +1791,117 @@ impl TerminalService {
         &self,
         id: &str,
     ) -> Result<TerminalSessionResponse, TerminalError> {
-        let row = self
-            .repo
-            .get_by_id(id)
-            .await?
-            .ok_or_else(|| TerminalError::NotFound(id.to_string()))?;
+        let service = self.clone();
+        let id = id.to_owned();
+        tokio::spawn(async move { service.relaunch_as_shell_coordinated(id).await })
+            .await
+            .map_err(|error| {
+                TerminalError::Spawn(format!(
+                    "terminal shell-relaunch coordinator failed: {error}"
+                ))
+            })?
+    }
 
-        // Tear down any still-running (or wedged) PTY for this id first.
-        self.live_capability_leases.remove(id);
-        if let Some((_, handle)) = self.live.remove(id) {
-            let _ = handle.kill();
+    async fn relaunch_as_shell_coordinated(
+        &self,
+        id: String,
+    ) -> Result<TerminalSessionResponse, TerminalError> {
+        let _shutdown_guard = self.enter_operation().await?;
+        let lifecycle_slot = self.lifecycle_slot_for_existing_row(&id).await?;
+        let mut lifecycle = lifecycle_slot.clone().lock_owned().await;
+        if matches!(*lifecycle, TerminalLifecycleState::Cancelled) {
+            return Err(TerminalError::NotFound(id));
         }
-        self.pending_spawn.remove(id);
-
-        // Persist the shell identity BEFORE spawning so a crash mid-relaunch (or a
-        // later boot-reconcile) still relaunches a shell, never the dead agent CLI.
-        self.repo
-            .update_command(id, crate::types::SHELL_SENTINEL, "[]", None)
-            .await?;
+        let row = match self.repo.get_by_id(&id).await? {
+            Some(row) => row,
+            None => {
+                *lifecycle = TerminalLifecycleState::Cancelled;
+                self.remove_lifecycle_slot_if_same(&id, &lifecycle_slot);
+                return Err(TerminalError::NotFound(id));
+            }
+        };
+        let (cols, rows) = validate_stored_pty_size(row.cols, row.rows)?;
 
         // Re-sync knowledge mounts for the cwd (same contract as `relaunch`); a
         // shell never gets MCP/tool injection (apply_enhancement no-ops for it).
         let kb_ids = self
-            .sync_knowledge_workspace(id, &row.cwd, crate::types::SHELL_SENTINEL, &[])
+            .sync_knowledge_workspace(&id, &row.cwd, crate::types::SHELL_SENTINEL, &[])
             .await;
+
+        // One atomic durable preflight is the LAST await before process swap: an
+        // observer can never see shell identity and agent status as two separate
+        // commits. The detached coordinator completes the swap even if the HTTP
+        // caller is cancelled after SQLite commits.
+        self.repo
+            .update_launch_state(
+                &id,
+                crate::types::SHELL_SENTINEL,
+                "[]",
+                None,
+                "running",
+                None,
+            )
+            .await?;
+
+        let previous_state = lifecycle.clone();
+        *lifecycle = TerminalLifecycleState::Pending;
+        if let Some(handle) = self.live.get(&id)
+            && let Err(kill_error) = handle.kill()
+        {
+            *lifecycle = previous_state;
+            // The old PTY is still live. Restore its durable launch identity
+            // before returning so a failed fallback remains internally honest.
+            self.repo
+                .update_launch_state(
+                    &id,
+                    &row.command,
+                    &row.args,
+                    row.backend.as_deref(),
+                    &row.last_status,
+                    row.exit_code,
+                )
+                .await?;
+            return Err(kill_error);
+        }
+        self.live_capability_leases.remove(&id);
+        self.live.remove(&id);
+
         if let Err(e) = self.spawn_pty(
             &row.user_id,
-            id,
+            &id,
             crate::types::SHELL_SENTINEL,
             &[],
             &row.cwd,
             None,
-            row.cols as u16,
-            row.rows as u16,
+            cols,
+            rows,
             kb_ids,
             None,
         ) {
-            let _ = self.repo.update_status(id, "exited", None).await;
+            *lifecycle = TerminalLifecycleState::Failed(terminal_failure_message(&e));
+            self.persist_terminal_failure(&id, true).await;
             return Err(e);
         }
+        *lifecycle = TerminalLifecycleState::Ready;
 
         // Fresh process → drop the previous (agent) scrollback so a later restart
         // doesn't replay it as this shell's history.
-        if let Err(e) = self.repo.clear_scrollback(id).await {
-            warn!(terminal_id = id, error = %e, "failed to clear persisted scrollback on shell fallback");
+        if let Err(e) = self.repo.clear_scrollback(&id).await {
+            warn!(terminal_id = %id, error = %e, "failed to clear persisted scrollback on shell fallback");
         }
 
-        self.repo.update_status(id, "running", None).await?;
         let updated = self
             .repo
-            .get_by_id(id)
+            .get_by_id(&id)
             .await?
-            .ok_or_else(|| TerminalError::NotFound(id.to_string()))?;
+            .ok_or_else(|| TerminalError::NotFound(id.clone()))?;
         let resp = row_to_response(&updated, None, &self.work_dir);
         self.emitter.emit_updated(&updated.user_id, &resp);
         info!(
-            terminal_id = id,
+            terminal_id = %id,
             "terminal session fell back to a clean shell in place"
         );
-        self.arm_supervision(id);
+        self.arm_supervision(&id);
         Ok(resp)
     }
 
@@ -1575,16 +1933,48 @@ impl TerminalService {
     /// of rows deleted. Best-effort on the PTY kills (a failed kill only warns; the
     /// OS reaps the tree on process exit anyway).
     pub async fn shutdown_cleanup(&self) -> Result<u64, TerminalError> {
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _shutdown_guard = self.shutdown_gate.clone().write_owned().await;
+        // A concurrent cleanup may have reset the flag after its own DB failure
+        // while this caller waited for the writer. Re-publish our intent now.
+        self.shutting_down
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        let mut lifecycle_slots: Vec<_> = self
+            .lifecycle_slots
+            .iter()
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect();
+        lifecycle_slots.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut lifecycle_guards = Vec::with_capacity(lifecycle_slots.len());
+        for (_, slot) in lifecycle_slots {
+            lifecycle_guards.push(slot.lock_owned().await);
+        }
+
+        // Keep live processes and lifecycle states intact until the durable
+        // delete-all succeeds. On failure the service is reopened unchanged.
+        let n = match self.repo.delete_all().await {
+            Ok(n) => n,
+            Err(error) => {
+                self.shutting_down
+                    .store(false, std::sync::atomic::Ordering::Release);
+                return Err(error.into());
+            }
+        };
+        for state in &mut lifecycle_guards {
+            **state = TerminalLifecycleState::Cancelled;
+        }
         for entry in self.live.iter() {
             if let Err(e) = entry.value().kill() {
                 warn!(terminal_id = *entry.key(), error = %e, "failed to kill PTY during shutdown cleanup");
             }
         }
         self.live.clear();
-        self.pending_spawn.clear();
+        self.live_capability_leases.clear();
+        self.lifecycle_slots.clear();
         self.titled.clear();
         self.first_input.clear();
-        let n = self.repo.delete_all().await?;
         info!(
             deleted = n,
             "terminal shutdown cleanup: all sessions killed and removed"
@@ -1656,6 +2046,38 @@ impl TerminalDriver for TerminalService {
         // takes priority over the trait method, so this is unambiguous.
         TerminalService::subscribe_lifecycle(self, id)
     }
+}
+
+fn terminal_failure_message(error: &TerminalError) -> Arc<str> {
+    match error {
+        TerminalError::Spawn(message) => Arc::from(message.as_str()),
+        other => Arc::from(other.to_string()),
+    }
+}
+
+fn validate_pty_size(cols: u16, rows: u16) -> Result<(), TerminalError> {
+    if cols == 0 || rows == 0 {
+        return Err(TerminalError::InvalidInput(
+            "terminal dimensions must be greater than zero".to_owned(),
+        ));
+    }
+    if cols > MAX_PTY_DIMENSION || rows > MAX_PTY_DIMENSION {
+        return Err(TerminalError::InvalidInput(format!(
+            "terminal dimensions must not exceed {MAX_PTY_DIMENSION}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_stored_pty_size(cols: i64, rows: i64) -> Result<(u16, u16), TerminalError> {
+    let cols = u16::try_from(cols).map_err(|_| {
+        TerminalError::InvalidInput(format!("persisted terminal columns are invalid: {cols}"))
+    })?;
+    let rows = u16::try_from(rows).map_err(|_| {
+        TerminalError::InvalidInput(format!("persisted terminal rows are invalid: {rows}"))
+    })?;
+    validate_pty_size(cols, rows)?;
+    Ok((cols, rows))
 }
 
 fn default_name(command: &str, backend: Option<&str>) -> String {
@@ -2022,9 +2444,32 @@ mod tests {
     // --- In-memory repo --------------------------------------------------
 
     #[derive(Default)]
+    struct GetByIdGate {
+        reached: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[derive(Default)]
+    struct CommitGate {
+        committed: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[derive(Default)]
     struct MemRepo {
         rows: Mutex<HashMap<String, nomifun_db::TerminalSessionRow>>,
         scrollback: Mutex<HashMap<String, Vec<u8>>>,
+        /// One-shot gate used to deterministically hold the first activation in
+        /// repository preflight while a second resize reaches the service.
+        get_by_id_gate: Mutex<Option<Arc<GetByIdGate>>>,
+        fail_next_update_command: std::sync::atomic::AtomicBool,
+        fail_next_update_status: std::sync::atomic::AtomicBool,
+        fail_next_delete: std::sync::atomic::AtomicBool,
+        fail_next_delete_all: std::sync::atomic::AtomicBool,
+        create_commit_gate: Mutex<Option<Arc<CommitGate>>>,
+        delete_commit_gate: Mutex<Option<Arc<CommitGate>>>,
+        launch_state_commit_gate: Mutex<Option<Arc<CommitGate>>>,
+        running_status_commit_gate: Mutex<Option<Arc<CommitGate>>>,
     }
 
     #[async_trait::async_trait]
@@ -2058,6 +2503,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(row.id.to_string(), row.clone());
+            let gate = self.create_commit_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.committed.notify_one();
+                gate.release.notified().await;
+            }
             Ok(row)
         }
 
@@ -2065,6 +2515,11 @@ mod tests {
             &self,
             id: &str,
         ) -> Result<Option<nomifun_db::TerminalSessionRow>, nomifun_db::DbError> {
+            let gate = self.get_by_id_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.reached.notify_one();
+                gate.release.notified().await;
+            }
             Ok(self.rows.lock().unwrap().get(id).cloned())
         }
 
@@ -2088,12 +2543,29 @@ mod tests {
             status: &str,
             exit_code: Option<i64>,
         ) -> Result<(), nomifun_db::DbError> {
-            let mut rows = self.rows.lock().unwrap();
-            let row = rows
-                .get_mut(id)
-                .ok_or_else(|| nomifun_db::DbError::NotFound(id.to_string()))?;
-            row.last_status = status.to_owned();
-            row.exit_code = exit_code;
+            if self
+                .fail_next_update_status
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(nomifun_db::DbError::Init(
+                    "injected update_status failure".to_owned(),
+                ));
+            }
+            {
+                let mut rows = self.rows.lock().unwrap();
+                let row = rows
+                    .get_mut(id)
+                    .ok_or_else(|| nomifun_db::DbError::NotFound(id.to_string()))?;
+                row.last_status = status.to_owned();
+                row.exit_code = exit_code;
+            }
+            if status == "running" {
+                let gate = self.running_status_commit_gate.lock().unwrap().take();
+                if let Some(gate) = gate {
+                    gate.committed.notify_one();
+                    gate.release.notified().await;
+                }
+            }
             Ok(())
         }
 
@@ -2133,15 +2605,37 @@ mod tests {
         }
 
         async fn delete(&self, id: &str) -> Result<(), nomifun_db::DbError> {
+            if self
+                .fail_next_delete
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(nomifun_db::DbError::Init(
+                    "injected terminal delete failure".to_owned(),
+                ));
+            }
             self.rows
                 .lock()
                 .unwrap()
                 .remove(id)
                 .map(|_| ())
-                .ok_or_else(|| nomifun_db::DbError::NotFound(id.to_string()))
+                .ok_or_else(|| nomifun_db::DbError::NotFound(id.to_string()))?;
+            let gate = self.delete_commit_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.committed.notify_one();
+                gate.release.notified().await;
+            }
+            Ok(())
         }
 
         async fn delete_all(&self) -> Result<u64, nomifun_db::DbError> {
+            if self
+                .fail_next_delete_all
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(nomifun_db::DbError::Init(
+                    "injected terminal delete_all failure".to_owned(),
+                ));
+            }
             let mut rows = self.rows.lock().unwrap();
             let count = rows.len() as u64;
             rows.clear();
@@ -2156,6 +2650,14 @@ mod tests {
             args: &str,
             backend: Option<&str>,
         ) -> Result<(), nomifun_db::DbError> {
+            if self
+                .fail_next_update_command
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(nomifun_db::DbError::Init(
+                    "injected update_command failure".to_owned(),
+                ));
+            }
             let mut rows = self.rows.lock().unwrap();
             let row = rows
                 .get_mut(id)
@@ -2163,6 +2665,42 @@ mod tests {
             row.command = command.to_owned();
             row.args = args.to_owned();
             row.backend = backend.map(str::to_owned);
+            Ok(())
+        }
+
+        async fn update_launch_state(
+            &self,
+            id: &str,
+            command: &str,
+            args: &str,
+            backend: Option<&str>,
+            last_status: &str,
+            exit_code: Option<i64>,
+        ) -> Result<(), nomifun_db::DbError> {
+            if self
+                .fail_next_update_command
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(nomifun_db::DbError::Init(
+                    "injected update_launch_state failure".to_owned(),
+                ));
+            }
+            {
+                let mut rows = self.rows.lock().unwrap();
+                let row = rows
+                    .get_mut(id)
+                    .ok_or_else(|| nomifun_db::DbError::NotFound(id.to_string()))?;
+                row.command = command.to_owned();
+                row.args = args.to_owned();
+                row.backend = backend.map(str::to_owned);
+                row.last_status = last_status.to_owned();
+                row.exit_code = exit_code;
+            }
+            let gate = self.launch_state_commit_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.committed.notify_one();
+                gate.release.notified().await;
+            }
             Ok(())
         }
 
@@ -2273,12 +2811,18 @@ mod tests {
         }
     }
 
-    fn service() -> (TerminalService, CapturingBroadcaster) {
+    fn service_with_repo() -> (TerminalService, CapturingBroadcaster, Arc<MemRepo>) {
         let bc = CapturingBroadcaster::default();
         let emitter = TerminalEventEmitter::new(Arc::new(bc.clone()));
         // work_dir == temp_dir, the same dir `req()` uses as cwd, so create/get
         // responses flag these sessions as default-workpath.
-        let svc = TerminalService::new(Arc::new(MemRepo::default()), emitter, std::env::temp_dir());
+        let repo = Arc::new(MemRepo::default());
+        let svc = TerminalService::new(repo.clone(), emitter, std::env::temp_dir());
+        (svc, bc, repo)
+    }
+
+    fn service() -> (TerminalService, CapturingBroadcaster) {
+        let (svc, bc, _repo) = service_with_repo();
         (svc, bc)
     }
 
@@ -3181,6 +3725,444 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_first_resizes_share_one_activation_result() {
+        let (svc, _bc, repo) = service_with_repo();
+        let mut r = req("cat", &[]);
+        r.defer_spawn = true;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+
+        // Hold the first resize after it owns the activation slot but before it
+        // can spawn. This deterministically reproduces the old marker-removal
+        // window in which the second resize returned NotFound.
+        let gate = Arc::new(GetByIdGate::default());
+        *repo.get_by_id_gate.lock().unwrap() = Some(gate.clone());
+        let epoch_before = svc.next_epoch.load(std::sync::atomic::Ordering::SeqCst);
+
+        let first_svc = svc.clone();
+        let first_id = id.clone();
+        let first = tokio::spawn(async move { first_svc.resize(&first_id, 120, 40).await });
+        gate.reached.notified().await;
+
+        let second_svc = svc.clone();
+        let second_id = id.clone();
+        let second = tokio::spawn(async move { second_svc.resize(&second_id, 120, 40).await });
+        tokio::task::yield_now().await;
+        gate.release.notify_one();
+
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(
+            svc.next_epoch.load(std::sync::atomic::Ordering::SeqCst),
+            epoch_before + 1,
+            "concurrent first resizes must spawn exactly one PTY"
+        );
+        let slot = svc.lifecycle_slot(&id);
+        assert!(matches!(
+            *slot.lock().await,
+            TerminalLifecycleState::Ready
+        ));
+        assert_eq!((svc.get(&id).await.unwrap().cols, svc.get(&id).await.unwrap().rows), (120, 40));
+        svc.kill(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_deferred_spawn_is_stable_broadcast_and_relaunchable() {
+        const CALLERS: usize = 8;
+        let (svc, bc) = service();
+        let mut r = req("nomifun-command-that-does-not-exist-2c5f4d", &[]);
+        r.defer_spawn = true;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        bc.events.lock().unwrap().clear();
+
+        let epoch_before = svc.next_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS));
+        let mut calls = Vec::with_capacity(CALLERS);
+        for _ in 0..CALLERS {
+            let call_svc = svc.clone();
+            let call_id = id.clone();
+            let barrier = barrier.clone();
+            calls.push(tokio::spawn(async move {
+                barrier.wait().await;
+                call_svc.resize(&call_id, 100, 30).await
+            }));
+        }
+
+        let mut messages = Vec::with_capacity(CALLERS);
+        for call in calls {
+            match call.await.unwrap().unwrap_err() {
+                TerminalError::Spawn(message) => messages.push(message),
+                other => panic!("every waiter must receive Spawn, got {other:?}"),
+            }
+        }
+        assert!(messages.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(
+            svc.next_epoch.load(std::sync::atomic::Ordering::SeqCst),
+            epoch_before + 1,
+            "a failed activation must still attempt spawn only once"
+        );
+        assert_eq!(svc.get(&id).await.unwrap().last_status, "error");
+        assert!(!svc.live.contains_key(id.as_str()));
+        assert!(bc
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.name == "terminal.updated"));
+
+        match svc.resize(&id, 100, 30).await.unwrap_err() {
+            TerminalError::Spawn(message) => assert_eq!(message, messages[0]),
+            other => panic!("failed slot must replay Spawn, got {other:?}"),
+        }
+
+        // Explicit recovery resets Failed -> Pending and publishes Ready as soon
+        // as the replacement shell has been inserted into the live map.
+        assert_eq!(
+            svc.relaunch_as_shell(&id).await.unwrap().last_status,
+            "running"
+        );
+        let slot = svc.lifecycle_slot(&id);
+        assert!(matches!(
+            *slot.lock().await,
+            TerminalLifecycleState::Ready
+        ));
+        svc.resize(&id, 101, 31).await.unwrap();
+        svc.kill(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shell_relaunch_preflight_failure_preserves_live_session_and_can_retry() {
+        let (svc, bc, repo) = service_with_repo();
+        let id = svc
+            .create(TEST_USER_ID, req("cat", &[]))
+            .await
+            .unwrap()
+            .id;
+        let old_epoch = svc.live.get(id.as_str()).unwrap().epoch();
+        bc.events.lock().unwrap().clear();
+        repo.fail_next_update_command
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(matches!(
+            svc.relaunch_as_shell(&id).await.unwrap_err(),
+            TerminalError::Database(_)
+        ));
+        let unchanged = svc.get(&id).await.unwrap();
+        assert_eq!(unchanged.last_status, "running");
+        assert_eq!(unchanged.command, "cat");
+        assert_eq!(svc.live.get(id.as_str()).unwrap().epoch(), old_epoch);
+        let slot = svc.lifecycle_slot(&id);
+        assert!(matches!(
+            *slot.lock().await,
+            TerminalLifecycleState::Ready
+        ));
+        assert!(!bc
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event.name == "terminal.updated"));
+
+        assert_eq!(
+            svc.relaunch_as_shell(&id).await.unwrap().last_status,
+            "running"
+        );
+        let slot = svc.lifecycle_slot(&id);
+        assert!(matches!(
+            *slot.lock().await,
+            TerminalLifecycleState::Ready
+        ));
+        svc.kill(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relaunch_status_preflight_failure_preserves_non_deferred_live_session() {
+        let (svc, _bc, repo) = service_with_repo();
+        let id = svc
+            .create(TEST_USER_ID, req("cat", &[]))
+            .await
+            .unwrap()
+            .id;
+        let old_epoch = svc.live.get(id.as_str()).unwrap().epoch();
+        repo.fail_next_update_status
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(matches!(
+            svc.relaunch(&id).await.unwrap_err(),
+            TerminalError::Database(_)
+        ));
+        assert_eq!(svc.live.get(id.as_str()).unwrap().epoch(), old_epoch);
+        assert_eq!(svc.get(&id).await.unwrap().last_status, "running");
+        let slot = svc.lifecycle_slot(&id);
+        assert!(matches!(
+            *slot.lock().await,
+            TerminalLifecycleState::Ready
+        ));
+        svc.kill(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_db_failure_preserves_non_deferred_live_session() {
+        let (svc, _bc, repo) = service_with_repo();
+        let id = svc
+            .create(TEST_USER_ID, req("cat", &[]))
+            .await
+            .unwrap()
+            .id;
+        let old_epoch = svc.live.get(id.as_str()).unwrap().epoch();
+        repo.fail_next_delete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(matches!(
+            svc.delete(&id).await.unwrap_err(),
+            TerminalError::Database(_)
+        ));
+        assert_eq!(svc.live.get(id.as_str()).unwrap().epoch(), old_epoch);
+        assert_eq!(svc.get(&id).await.unwrap().last_status, "running");
+        let slot = svc.lifecycle_slot(&id);
+        assert!(matches!(
+            *slot.lock().await,
+            TerminalLifecycleState::Ready
+        ));
+        svc.input(&id, &BASE64.encode("still-alive\n"))
+            .await
+            .unwrap();
+        svc.kill(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn aborted_delete_caller_still_finishes_post_commit_cleanup() {
+        let (svc, _bc, repo) = service_with_repo();
+        let id = svc
+            .create(TEST_USER_ID, req("cat", &[]))
+            .await
+            .unwrap()
+            .id;
+        let gate = Arc::new(CommitGate::default());
+        *repo.delete_commit_gate.lock().unwrap() = Some(gate.clone());
+
+        let caller_svc = svc.clone();
+        let caller_id = id.clone();
+        let caller = tokio::spawn(async move { caller_svc.delete(&caller_id).await });
+        tokio::time::timeout(Duration::from_secs(2), gate.committed.notified())
+            .await
+            .expect("delete should commit");
+        assert!(repo.get_by_id(id.as_str()).await.unwrap().is_none());
+        assert!(svc.live.contains_key(id.as_str()));
+
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while svc.live.contains_key(id.as_str())
+                || svc.lifecycle_slots.contains_key(id.as_str())
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached delete coordinator should finish cleanup");
+    }
+
+    #[tokio::test]
+    async fn aborted_create_caller_still_finishes_committed_activation() {
+        let (svc, _bc, repo) = service_with_repo();
+        let gate = Arc::new(CommitGate::default());
+        *repo.create_commit_gate.lock().unwrap() = Some(gate.clone());
+
+        let caller_svc = svc.clone();
+        let caller = tokio::spawn(async move {
+            caller_svc
+                .create(TEST_USER_ID, req("cat", &[]))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), gate.committed.notified())
+            .await
+            .expect("terminal create should commit");
+        let rows = repo.list_by_user(TEST_USER_ID).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let id = rows[0].id.clone();
+
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !svc.live.contains_key(id.as_str()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached create coordinator should finish activation");
+        let slot = svc.lifecycle_slot(id.as_str());
+        assert!(matches!(
+            *slot.lock().await,
+            TerminalLifecycleState::Ready
+        ));
+        svc.kill(id.as_str()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn aborted_shell_relaunch_caller_still_finishes_committed_swap() {
+        let (svc, _bc, repo) = service_with_repo();
+        let id = svc
+            .create(TEST_USER_ID, req("cat", &[]))
+            .await
+            .unwrap()
+            .id;
+        let old_epoch = svc.live.get(id.as_str()).unwrap().epoch();
+        let gate = Arc::new(CommitGate::default());
+        *repo.launch_state_commit_gate.lock().unwrap() = Some(gate.clone());
+
+        let caller_svc = svc.clone();
+        let caller_id = id.clone();
+        let caller = tokio::spawn(async move { caller_svc.relaunch_as_shell(&caller_id).await });
+        tokio::time::timeout(Duration::from_secs(2), gate.committed.notified())
+            .await
+            .expect("shell launch state should commit");
+        let committed = repo.get_by_id(id.as_str()).await.unwrap().unwrap();
+        assert_eq!(committed.command, crate::types::SHELL_SENTINEL);
+        assert_eq!(committed.last_status, "running");
+        assert_eq!(svc.live.get(id.as_str()).unwrap().epoch(), old_epoch);
+
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        gate.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let replaced = svc
+                    .live
+                    .get(id.as_str())
+                    .map(|handle| handle.epoch() != old_epoch)
+                    .unwrap_or(false);
+                if replaced {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached shell coordinator should finish PTY replacement");
+        let slot = svc.lifecycle_slot(&id);
+        assert!(matches!(
+            *slot.lock().await,
+            TerminalLifecycleState::Ready
+        ));
+        svc.kill(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_dimensions_never_consume_deferred_activation() {
+        let (svc, _bc) = service();
+        let mut invalid_create = req("cat", &[]);
+        invalid_create.cols = 0;
+        assert!(matches!(
+            svc.create(TEST_USER_ID, invalid_create).await.unwrap_err(),
+            TerminalError::InvalidInput(_)
+        ));
+        assert!(svc.list(TEST_USER_ID).await.unwrap().is_empty());
+
+        let mut r = req("cat", &[]);
+        r.defer_spawn = true;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        let epoch_before = svc.next_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        for (cols, rows) in [
+            (0, 24),
+            (80, 0),
+            (MAX_PTY_DIMENSION.saturating_add(1), 24),
+        ] {
+            assert!(matches!(
+                svc.resize(&id, cols, rows).await.unwrap_err(),
+                TerminalError::InvalidInput(_)
+            ));
+        }
+        assert_eq!(
+            svc.next_epoch.load(std::sync::atomic::Ordering::SeqCst),
+            epoch_before
+        );
+        let slot = svc.lifecycle_slot(&id);
+        assert!(matches!(
+            *slot.lock().await,
+            TerminalLifecycleState::Pending
+        ));
+
+        svc.resize(&id, 90, 28).await.unwrap();
+        assert_eq!(
+            svc.next_epoch.load(std::sync::atomic::Ordering::SeqCst),
+            epoch_before + 1
+        );
+        svc.kill(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_serializes_with_inflight_deferred_activation() {
+        let (svc, _bc, repo) = service_with_repo();
+        let mut r = req("cat", &[]);
+        r.defer_spawn = true;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+
+        let gate = Arc::new(GetByIdGate::default());
+        *repo.get_by_id_gate.lock().unwrap() = Some(gate.clone());
+        let resize_svc = svc.clone();
+        let resize_id = id.clone();
+        let resize = tokio::spawn(async move { resize_svc.resize(&resize_id, 120, 40).await });
+        gate.reached.notified().await;
+
+        let delete_svc = svc.clone();
+        let delete_id = id.clone();
+        let delete = tokio::spawn(async move { delete_svc.delete(&delete_id).await });
+        tokio::task::yield_now().await;
+        gate.release.notify_one();
+
+        resize.await.unwrap().unwrap();
+        delete.await.unwrap().unwrap();
+        assert!(matches!(
+            svc.get(&id).await.unwrap_err(),
+            TerminalError::NotFound(_)
+        ));
+        assert!(!svc.live.contains_key(id.as_str()));
+        assert!(!svc.lifecycle_slots.contains_key(id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn non_deferred_resize_waits_for_committing_delete_slot() {
+        let (svc, _bc, repo) = service_with_repo();
+        let id = svc
+            .create(TEST_USER_ID, req("cat", &[]))
+            .await
+            .unwrap()
+            .id;
+        let gate = Arc::new(CommitGate::default());
+        *repo.delete_commit_gate.lock().unwrap() = Some(gate.clone());
+
+        let delete_svc = svc.clone();
+        let delete_id = id.clone();
+        let delete = tokio::spawn(async move { delete_svc.delete(&delete_id).await });
+        tokio::time::timeout(Duration::from_secs(2), gate.committed.notified())
+            .await
+            .expect("delete should commit while retaining the lifecycle slot");
+
+        let resize_svc = svc.clone();
+        let resize_id = id.clone();
+        let mut resize =
+            tokio::spawn(async move { resize_svc.resize(&resize_id, 120, 40).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut resize)
+                .await
+                .is_err(),
+            "resize must wait behind the non-deferred session's delete lock"
+        );
+        assert!(svc.live.contains_key(id.as_str()));
+
+        gate.release.notify_one();
+        delete.await.unwrap().unwrap();
+        assert!(matches!(
+            resize.await.unwrap().unwrap_err(),
+            TerminalError::NotFound(_)
+        ));
+        assert!(!svc.live.contains_key(id.as_str()));
+        assert!(!svc.lifecycle_slots.contains_key(id.as_str()));
+    }
+
+    #[tokio::test]
     async fn non_deferred_create_spawns_immediately() {
         let (svc, _bc) = service();
         // `req` defaults `defer_spawn = false` —headless/cron behaviour unchanged.
@@ -3188,6 +4170,24 @@ mod tests {
         // Live without any resize: input succeeds immediately.
         svc.input(&id, &BASE64.encode("hi\n")).await.unwrap();
         svc.kill(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_deferred_spawn_failure_never_leaves_running_row() {
+        let (svc, _bc) = service();
+        assert!(matches!(
+            svc.create(
+                TEST_USER_ID,
+                req("nomifun-command-that-does-not-exist-0c54db", &[])
+            )
+            .await
+            .unwrap_err(),
+            TerminalError::Spawn(_)
+        ));
+        let rows = svc.list(TEST_USER_ID).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].last_status, "error");
+        assert!(svc.live.is_empty());
     }
 
     #[tokio::test]
@@ -3239,6 +4239,78 @@ mod tests {
         assert!(svc.list(TEST_USER_ID).await.unwrap().is_empty());
         // Idempotent on an already-empty service.
         assert_eq!(svc.shutdown_cleanup().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_gate_waits_for_activation_and_rejects_late_create() {
+        let (svc, _bc, repo) = service_with_repo();
+        let mut r = req("cat", &[]);
+        r.defer_spawn = true;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        let gate = Arc::new(GetByIdGate::default());
+        *repo.get_by_id_gate.lock().unwrap() = Some(gate.clone());
+
+        let resize_svc = svc.clone();
+        let resize_id = id.clone();
+        let resize = tokio::spawn(async move { resize_svc.resize(&resize_id, 120, 40).await });
+        tokio::time::timeout(Duration::from_secs(2), gate.reached.notified())
+            .await
+            .expect("activation should enter repository preflight");
+
+        let shutdown_svc = svc.clone();
+        let mut shutdown = tokio::spawn(async move { shutdown_svc.shutdown_cleanup().await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !svc
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown should publish its gate");
+        assert!(matches!(
+            svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap_err(),
+            TerminalError::ShuttingDown
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown must wait for the admitted activation read guard"
+        );
+
+        gate.release.notify_one();
+        resize.await.unwrap().unwrap();
+        assert_eq!(shutdown.await.unwrap().unwrap(), 1);
+        assert!(svc.live.is_empty());
+        assert!(svc.lifecycle_slots.is_empty());
+        assert!(svc.list(TEST_USER_ID).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shutdown_db_failure_preserves_live_sessions_and_reopens_gate() {
+        let (svc, _bc, repo) = service_with_repo();
+        let id = svc
+            .create(TEST_USER_ID, req("cat", &[]))
+            .await
+            .unwrap()
+            .id;
+        let old_epoch = svc.live.get(id.as_str()).unwrap().epoch();
+        repo.fail_next_delete_all
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(matches!(
+            svc.shutdown_cleanup().await.unwrap_err(),
+            TerminalError::Database(_)
+        ));
+        assert!(!svc.shutting_down.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(svc.live.get(id.as_str()).unwrap().epoch(), old_epoch);
+        assert!(svc.get(&id).await.is_ok());
+
+        let second = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        assert!(svc.live.contains_key(second.as_str()));
+        assert_eq!(svc.shutdown_cleanup().await.unwrap(), 2);
     }
 
     async fn wait_for_name(svc: &TerminalService, id: &str, expected: &str, ms: u64) -> bool {
@@ -3376,9 +4448,29 @@ mod tests {
             TerminalError::NotFound(_)
         ));
         assert!(matches!(
+            svc.resize(missing, 80, 24).await.unwrap_err(),
+            TerminalError::NotFound(_)
+        ));
+        assert!(matches!(
+            svc.kill(missing).await.unwrap_err(),
+            TerminalError::NotFound(_)
+        ));
+        assert!(matches!(
+            svc.relaunch(missing).await.unwrap_err(),
+            TerminalError::NotFound(_)
+        ));
+        assert!(matches!(
+            svc.relaunch_as_shell(missing).await.unwrap_err(),
+            TerminalError::NotFound(_)
+        ));
+        assert!(matches!(
             svc.delete(missing).await.unwrap_err(),
             TerminalError::NotFound(_)
         ));
+        assert!(
+            svc.lifecycle_slots.is_empty(),
+            "NotFound requests must not allocate lifecycle slots"
+        );
     }
 
     #[tokio::test]
@@ -3531,6 +4623,64 @@ mod tests {
         );
 
         svc.delete(&id).await.ok();
+    }
+
+    /// An old process can die naturally while relaunch is still awaiting its DB
+    /// preflight. Its exit callback must wait for the same lifecycle slot and
+    /// then reject the stale epoch; otherwise a late `status=exited` write can
+    /// overwrite the replacement's already-committed `running` state.
+    #[tokio::test]
+    async fn exit_during_relaunch_preflight_cannot_overwrite_replacement_status() {
+        let (svc, _bc, repo) = service_with_repo();
+        let id = svc
+            .create(TEST_USER_ID, req("cat", &[]))
+            .await
+            .unwrap()
+            .id;
+        let old_epoch = svc.live.get(id.as_str()).unwrap().epoch();
+        let gate = Arc::new(CommitGate::default());
+        *repo.running_status_commit_gate.lock().unwrap() = Some(gate.clone());
+
+        let relaunch_svc = svc.clone();
+        let relaunch_id = id.clone();
+        let relaunch =
+            tokio::spawn(async move { relaunch_svc.relaunch(&relaunch_id).await });
+        tokio::time::timeout(Duration::from_secs(2), gate.committed.notified())
+            .await
+            .expect("relaunch should commit running status and pause in preflight");
+
+        let old_handle = {
+            let handle = svc.live.get(id.as_str()).expect("old PTY remains live");
+            Arc::clone(handle.value())
+        };
+        old_handle.kill().unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            svc.live.get(id.as_str()).unwrap().epoch(),
+            old_epoch,
+            "exit callback must wait behind relaunch's lifecycle lock"
+        );
+
+        gate.release.notify_one();
+        let relaunched = tokio::time::timeout(Duration::from_secs(2), relaunch)
+            .await
+            .expect("relaunch should finish")
+            .unwrap()
+            .unwrap();
+        assert_eq!(relaunched.last_status, "running");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_ne!(
+            svc.live.get(id.as_str()).unwrap().epoch(),
+            old_epoch,
+            "replacement must own a fresh PTY epoch"
+        );
+        assert_eq!(
+            svc.get(&id).await.unwrap().last_status,
+            "running",
+            "predecessor exit must not overwrite replacement status"
+        );
+        svc.delete(&id).await.unwrap();
     }
 
     #[tokio::test]

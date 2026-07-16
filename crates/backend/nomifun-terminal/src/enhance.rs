@@ -262,15 +262,19 @@ fn claude_lifecycle_argv(
 }
 
 /// Render lifecycle hook commands for codex: appends `-c hooks.*` TOML overrides
-/// + `--dangerously-bypass-hook-trust` + env. Coexists with Plan 1 MCP `-c`
-/// overrides (codex handles multiple `-c` flags additively).
+/// plus the lifecycle env. Coexists with Plan 1 MCP `-c` overrides (codex
+/// handles multiple `-c` flags additively).
+///
+/// Do not inject the retired `--dangerously-bypass-hook-trust` switch. Current
+/// Codex releases reject it during argument parsing (exit code 2) before any
+/// hook or interactive UI can start.
 fn codex_lifecycle_argv(lc: &LifecycleHookWiring) -> (Vec<String>, Vec<(String, String)>) {
     let quoted_bin = shell_quote_arg(&lc.binary_path);
     let cmd_turn_end = format!("{} terminal-hook --event turn_end", quoted_bin);
     let cmd_tool_use = format!("{} terminal-hook --event tool_use", quoted_bin);
     let cmd_session_start = format!("{} terminal-hook --event session_start", quoted_bin);
 
-    let mut argv = vec!["--dangerously-bypass-hook-trust".to_owned()];
+    let mut argv = Vec::new();
     // Stop
     argv.push("-c".to_owned());
     argv.push(format!(
@@ -577,9 +581,10 @@ mod tests {
         assert!(doc["hooks"]["PostToolUse"][0]["hooks"][0]["command"].as_str().unwrap().contains("terminal-hook --event tool_use"));
         assert!(doc["hooks"]["Notification"][0]["hooks"][0]["command"].as_str().unwrap().contains("terminal-hook --event notification"));
 
-        // codex: hook overrides + bypass-trust + same env
+        // codex: hook overrides + same env; obsolete CLI flags must never be
+        // injected because argument parsing happens before the TUI starts.
         let (cargs, cenv) = apply_enhancement("codex", vec![], &enh, dir.path(), None);
-        assert!(cargs.iter().any(|a| a == "--dangerously-bypass-hook-trust"));
+        assert!(!cargs.iter().any(|a| a == "--dangerously-bypass-hook-trust"));
         let cenv_map: HashMap<String, String> = cenv.into_iter().collect();
         assert_eq!(cenv_map.get("NOMI_TERM_HOOK_PORT").map(String::as_str), Some("5151"));
         assert_eq!(cenv_map.get("NOMI_TERM_HOOK_TOKEN").map(String::as_str), Some("htok"));

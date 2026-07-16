@@ -382,9 +382,9 @@ export type HttpRequestOptions = {
    * aborted after this long and a legible [`BackendRequestError`] (`timeout`)
    * is thrown instead of hanging until the platform's own network timeout.
    *
-   * Apply ONLY to bounded read endpoints. Long-running mutations (knowledge
-   * autogen, URL snapshot fetch, imports) legitimately take minutes and MUST
-   * NOT set this, or they will be killed mid-flight.
+   * Apply only where the caller can safely recover from a client-side abort.
+   * A mutation may continue on the server after the browser stops waiting, so
+   * timed mutations must be idempotent or serialized by the backend.
    */
   timeoutMs?: number;
 };
@@ -456,7 +456,7 @@ export async function httpRequest<T>(
     if (controller?.signal.aborted) {
       throw new BackendRequestError(
         'timeout',
-        `Backend ${method} ${path} timed out after ${options?.timeoutMs}ms — the backend may be busy or a knowledge-base root is on a slow/offline drive`
+        `Backend ${method} ${path} timed out after ${options?.timeoutMs}ms; the backend may be busy or unreachable`
       );
     }
     const detail = e instanceof Error ? e.message : String(e);
@@ -553,14 +553,15 @@ export function httpGet<Data, Params = undefined>(
 
 export function httpPost<Data, Params = undefined>(
   path: string | ((params: Params) => string),
-  mapBody?: (params: Params) => unknown
+  mapBody?: (params: Params) => unknown,
+  options?: HttpRequestOptions
 ): ProviderLike<Data, Params> {
   return {
     provider: () => {},
     invoke: (async (params?: Params) => {
       const resolvedPath = typeof path === 'function' ? path(params!) : path;
       const body = mapBody ? mapBody(params!) : params;
-      return httpRequest<Data>('POST', resolvedPath, body);
+      return httpRequest<Data>('POST', resolvedPath, body, options);
     }) as ProviderLike<Data, Params>['invoke'],
   };
 }

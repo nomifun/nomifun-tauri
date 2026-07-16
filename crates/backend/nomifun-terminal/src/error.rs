@@ -11,6 +11,9 @@ pub enum TerminalError {
     #[error("Invalid terminal input: {0}")]
     InvalidInput(String),
 
+    #[error("Terminal service is shutting down")]
+    ShuttingDown,
+
     #[error("Terminal I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -26,6 +29,9 @@ impl From<TerminalError> for AppError {
         match err {
             TerminalError::NotFound(msg) => AppError::NotFound(msg),
             TerminalError::InvalidInput(msg) => AppError::BadRequest(msg),
+            TerminalError::ShuttingDown => {
+                AppError::Conflict("terminal service is shutting down".to_owned())
+            }
             TerminalError::Spawn(msg) => AppError::Internal(msg),
             TerminalError::Io(e) => AppError::Internal(format!("terminal io: {e}")),
             TerminalError::Database(db_err) => AppError::from(db_err),
@@ -57,5 +63,11 @@ mod tests {
     fn spawn_maps_to_internal() {
         let app: AppError = TerminalError::Spawn("nope".into()).into();
         assert!(matches!(app, AppError::Internal(_)));
+    }
+
+    #[test]
+    fn shutting_down_maps_to_conflict() {
+        let app: AppError = TerminalError::ShuttingDown.into();
+        assert!(matches!(app, AppError::Conflict(_)));
     }
 }

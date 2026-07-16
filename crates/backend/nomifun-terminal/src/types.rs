@@ -45,7 +45,19 @@ fn resolve_program(program: &str) -> String {
 pub fn default_login_shell() -> String {
     #[cfg(windows)]
     {
-        std::env::var("ComSpec").unwrap_or_else(|_| "powershell.exe".to_owned())
+        // Prefer PowerShell profiles for newly-created interactive sessions.
+        // `%ComSpec%` is normally `cmd.exe`; using it first makes common
+        // cross-platform commands such as `pwd` and `ls` fail even though the
+        // PTY itself is healthy.  Resolve an absolute executable up front so
+        // Store/MSI installations and npm-style PATH entries are handled by
+        // the same runtime resolver as explicit terminal commands.
+        for candidate in ["pwsh.exe", "powershell.exe"] {
+            if let Some(path) = nomifun_runtime::resolve_command_path(candidate) {
+                return path.to_string_lossy().into_owned();
+            }
+        }
+
+        std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_owned())
     }
     #[cfg(not(windows))]
     {
@@ -130,6 +142,24 @@ mod tests {
         assert_ne!(program, SHELL_SENTINEL);
         assert!(!program.is_empty());
         assert_eq!(args, vec!["-l".to_owned()]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn default_shell_prefers_the_first_available_powershell() {
+        let expected = ["pwsh.exe", "powershell.exe"]
+            .into_iter()
+            .find_map(nomifun_runtime::resolve_command_path)
+            .map(|path| path.to_string_lossy().into_owned());
+
+        if let Some(expected) = expected {
+            assert_eq!(default_login_shell(), expected);
+        } else {
+            assert_eq!(
+                default_login_shell(),
+                std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_owned())
+            );
+        }
     }
 
     #[test]

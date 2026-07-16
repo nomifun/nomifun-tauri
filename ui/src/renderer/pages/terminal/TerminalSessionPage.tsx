@@ -6,12 +6,12 @@
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
-import { Button, Input, Message } from '@arco-design/web-react';
+import { Button, Input, Message, Spin } from '@arco-design/web-react';
 import { Refresh, EditOne, Terminal } from '@icon-park/react';
 import { useTranslation } from 'react-i18next';
 import { ipcBridge } from '@/common';
 import type { ITerminalSession } from '@/common/adapter/ipcBridge';
-import { parseTerminalId, terminalTarget } from '@/common/types/ids';
+import { parseTerminalId, terminalTarget, type TerminalId } from '@/common/types/ids';
 import AutoWorkControl from '@/renderer/pages/conversation/components/AutoWorkControl';
 import IdmmControl from '@/renderer/pages/conversation/components/IdmmControl';
 import KnowledgeControl from '@/renderer/pages/conversation/components/KnowledgeControl';
@@ -43,6 +43,8 @@ const TERMINAL_WORKSPACE_MAX_PX = 560;
 
 /** Preview column minimum width (px) so it never collapses to nothing. */
 const TERMINAL_PREVIEW_MIN_PX = 260;
+
+type TerminalLoadError = 'not-found' | 'request-failed';
 
 /**
  * TerminalRightRegion — the right side of the terminal page (preview + rail).
@@ -225,10 +227,13 @@ const TerminalRightRegion: React.FC<{ session: ITerminalSession }> = ({ session 
   );
 };
 
-const TerminalSessionPage: React.FC = () => {
-  const { id } = useParams<{ id: string }>();
+const TerminalSessionContent: React.FC<{ sessionId: TerminalId }> = ({ sessionId }) => {
   const { t } = useTranslation();
   const [session, setSession] = useState<ITerminalSession | null>(null);
+  const [loadError, setLoadError] = useState<TerminalLoadError | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const [terminalError, setTerminalError] = useState<Error | null>(null);
+  const [xtermAttempt, setXtermAttempt] = useState(0);
   const [relaunching, setRelaunching] = useState(false);
   const [fallingBack, setFallingBack] = useState(false);
   const fallingBackRef = useRef(false);
@@ -241,16 +246,23 @@ const TerminalSessionPage: React.FC = () => {
   const skipBlurSaveRef = useRef(false);
 
   useEffect(() => {
-    if (!id) return;
-    const sessionId = parseTerminalId(id);
     let active = true;
+    setSession(null);
+    setLoadError(null);
     void ipcBridge.terminal.get
       .invoke({ id: sessionId })
       .then((s) => {
-        if (active) setSession(s);
+        if (!active) return;
+        if (s) {
+          setSession(s);
+          return;
+        }
+        setLoadError('not-found');
       })
-      .catch(() => {
-        /* removed */
+      .catch((error: unknown) => {
+        if (!active) return;
+        console.error('[TerminalSessionPage] Failed to load terminal session:', error);
+        setLoadError('request-failed');
       });
 
     const offExit = ipcBridge.terminal.onExit.on((evt) => {
@@ -258,14 +270,18 @@ const TerminalSessionPage: React.FC = () => {
         setSession((prev) => (prev ? { ...prev, last_status: 'exited', exit_code: evt.exit_code } : prev));
     });
     const offUpdated = ipcBridge.terminal.onUpdated.on((s) => {
-      if (s.id === sessionId) setSession(s);
+      if (s.id === sessionId) {
+        setLoadError(null);
+        if (s.last_status === 'running') setTerminalError(null);
+        setSession(s);
+      }
     });
     return () => {
       active = false;
       offExit();
       offUpdated();
     };
-  }, [id]);
+  }, [loadAttempt, sessionId]);
 
   const handleRelaunch = useCallback(async () => {
     if (!session) return;
@@ -282,6 +298,8 @@ const TerminalSessionPage: React.FC = () => {
       xtermApi.current?.clear();
       xtermApi.current?.focus();
       setSession(updated);
+      setTerminalError(null);
+      setXtermAttempt((attempt) => attempt + 1);
     } catch (err) {
       Message.error(err instanceof Error ? err.message : String(err));
     } finally {
@@ -303,6 +321,8 @@ const TerminalSessionPage: React.FC = () => {
       xtermApi.current?.reset();
       xtermApi.current?.focus();
       setSession(updated);
+      setTerminalError(null);
+      setXtermAttempt((attempt) => attempt + 1);
       Message.success(t('terminal.fallbackShellDone'));
     } catch (err) {
       Message.error(err instanceof Error ? err.message : String(err));
@@ -361,11 +381,28 @@ const TerminalSessionPage: React.FC = () => {
     setEditingName(false);
   }, []);
 
-  if (!id) return null;
+  if (!session) {
+    return (
+      <div className='flex h-full w-full items-center justify-center bg-fill-1 px-24px'>
+        {loadError ? (
+          <div role='alert' className='flex max-w-560px flex-col items-center gap-12px text-center'>
+            <div className='text-14px text-t-primary'>
+              {loadError === 'not-found'
+                ? t('terminal.loadNotFound', { defaultValue: 'Terminal session not found.' })
+                : t('terminal.loadFailed', { defaultValue: 'Failed to load terminal session.' })}
+            </div>
+            <Button type='primary' onClick={() => setLoadAttempt((attempt) => attempt + 1)}>
+              {t('common.retry', { defaultValue: 'Retry' })}
+            </Button>
+          </div>
+        ) : (
+          <Spin />
+        )}
+      </div>
+    );
+  }
 
-  const sessionId = parseTerminalId(id);
-
-  const isExited = session?.last_status && session.last_status !== 'running';
+  const isExited = session.last_status !== 'running';
 
   // AutoWork is only meaningful for agent-CLI terminals running in the foreground.
   // Capability is resolved from the launch command/args/backend the SAME way the
@@ -391,7 +428,7 @@ const TerminalSessionPage: React.FC = () => {
     // false keeps agent-driven global preview.open out of the terminal; the
     // The terminal id is part of the namespace so separate terminal sessions
     // never restore or overwrite each other's preview tabs.
-    <PreviewProvider key={`terminal:${id}`} persistNamespace={`terminal:${id}`} subscribeGlobalOpen={false}>
+    <PreviewProvider persistNamespace={`terminal:${sessionId}`} subscribeGlobalOpen={false}>
     <div className='relative flex flex-row h-full min-h-0 bg-fill-1 overflow-hidden'>
       {/* Terminal column: header + xterm + composer. flex-1 with a floor so it
           never collapses when the preview / rail columns open. */}
@@ -489,20 +526,46 @@ const TerminalSessionPage: React.FC = () => {
 
         {/* Terminal output */}
         <div className='flex-1 min-h-0 px-12px pt-12px'>
-          <XtermView
-            sessionId={sessionId}
-            apiRef={xtermApi}
-            className='h-full'
-            onEscalateShell={isAgentCli ? handleFallbackShell : undefined}
-          />
+          {terminalError ? (
+            <div role='alert' className={`${styles.card} flex h-full items-center justify-center px-24px`}>
+              <div className='flex max-w-560px flex-col items-center gap-12px text-center'>
+                <div className='text-14px text-t-primary'>
+                  {t('terminal.activationFailed', { defaultValue: 'Failed to activate terminal.' })}
+                </div>
+                <div className='max-w-full select-text break-all text-12px text-t-tertiary'>
+                  {terminalError.message}
+                </div>
+                <Button
+                  type='primary'
+                  onClick={() => {
+                    setTerminalError(null);
+                    setXtermAttempt((attempt) => attempt + 1);
+                  }}
+                >
+                  {t('common.retry', { defaultValue: 'Retry' })}
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <XtermView
+              key={`${sessionId}:${xtermAttempt}`}
+              sessionId={sessionId}
+              isRunning={!isExited}
+              apiRef={xtermApi}
+              className='h-full'
+              onEscalateShell={isAgentCli ? handleFallbackShell : undefined}
+              onResizeFailure={(error: unknown) =>
+                setTerminalError(error instanceof Error ? error : new Error(String(error)))
+              }
+            />
+          )}
         </div>
 
         {/* Enhanced composer */}
         <div className='px-12px pt-8px pb-12px'>
           <TerminalSendBox
-            sessionId={sessionId}
             terminalApi={xtermApi}
-            disabled={!!isExited}
+            disabled={isExited || terminalError !== null}
             onClearView={() => xtermApi.current?.clear()}
           />
         </div>
@@ -515,6 +578,17 @@ const TerminalSessionPage: React.FC = () => {
     </div>
     </PreviewProvider>
   );
+};
+
+const TerminalSessionPage: React.FC = () => {
+  const { id } = useParams<{ id: string }>();
+  if (!id) return null;
+
+  const sessionId = parseTerminalId(id);
+  // React Router reuses the same route element when only `:id` changes. Keying
+  // the stateful page content prevents session A's loaded metadata, edit state,
+  // or in-flight actions from being rendered against terminal B.
+  return <TerminalSessionContent key={sessionId} sessionId={sessionId} />;
 };
 
 export default TerminalSessionPage;

@@ -14,6 +14,9 @@ describe('companion memory pagination bridge', () => {
     expect(source.includes('export interface ICompanionMemoryPage')).toBe(true);
     expect(source.includes('items: ICompanionMemory[];')).toBe(true);
     expect(source.includes('total: number;')).toBe(true);
-    expect(/listMemories: httpGet<\s*ICompanionMemoryPage,/.test(source)).toBe(true);
+    expect(source.includes('listMemories: withResponseMap(')).toBe(true);
+    expect(/listMemories: withResponseMap\(\s*httpGet<\s*\{ items: unknown\[\]; total: number \}/.test(source)).toBe(true);
+    expect(source.includes('(raw): ICompanionMemoryPage')).toBe(true);
+    expect(source.includes('raw.items.map(fromApiCompanionMemory)')).toBe(true);
   });
 });
