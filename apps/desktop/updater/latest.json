@@ -1,11 +1,19 @@
 {
   "version": "0.2.21",
   "notes": "新增独立 Skills 能力中的 Skill Market：支持受控的 ClawHub 与 SkillHub 排名同步、标签与搜索筛选、本地化技能描述，以及经审核的安装草稿交接给 Nomi。",
-  "pub_date": "2026-07-16T06:27:27.204Z",
+  "pub_date": "2026-07-16T07:34:54.507Z",
   "platforms": {
     "windows-x86_64": {
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODgrNzA2TDlET01yQ3RCNjloV250bGY0QWZ1SmpBMkhkT1grR0ovUkVNaXpySmxUNUpMYkxpRGQ0YlA1a3NYZmdUMFRYUzBqZm4rem5LbnVKQkU2RUFnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0MTgyOTI4CWZpbGU6Tm9taUZ1bl8wLjIuMjFfeDY0LXNldHVwLmV4ZQpnNTg2L2h6SUJOUWh5R3lmeUs4YXVlc3VmbnFkck5KRjNMdEhpMkJkdktoaDZNcW1nTHlMUE1yQkVibmVFVXJDVWVsYjYwQm1DeHF1RU11YXNlRnVDdz09Cg==",
       "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.21/NomiFun_0.2.21_x64-setup.exe"
+    },
+    "darwin-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODdCSzZLZWlQZXpBaDRleHlSckNMdmlFZ09JNWhlSTQvd3laTk02YWRsVUdZM1lhRldjbm0rM0FyNVd2cGRobnJ6Tnh3SGtVd1RFcENqQzE1MjArVGc4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0MTg2OTM5CWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6CnFFcDBiaWdiWXVaZmp6TU4rdnl6RzdRZy9KZ25IOGc5UzRzMVlaMVRjbGNWK0FYWlVJamlpa2tiT0x6eTFSSUdtc3gxVkFQS1FSRHIvaGZSaGdpM0JBPT0K",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.21/NomiFun.app.tar.gz"
+    },
+    "darwin-aarch64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODdCSzZLZWlQZXpBaDRleHlSckNMdmlFZ09JNWhlSTQvd3laTk02YWRsVUdZM1lhRldjbm0rM0FyNVd2cGRobnJ6Tnh3SGtVd1RFcENqQzE1MjArVGc4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0MTg2OTM5CWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6CnFFcDBiaWdiWXVaZmp6TU4rdnl6RzdRZy9KZ25IOGc5UzRzMVlaMVRjbGNWK0FYWlVJamlpa2tiT0x6eTFSSUdtc3gxVkFQS1FSRHIvaGZSaGdpM0JBPT0K",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.21/NomiFun.app.tar.gz"
     }
   }
 }
