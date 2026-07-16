@@ -92,6 +92,6 @@ describe('Nomi sendbox control layout', () => {
 
     expect(source.includes("data-testid='collaboration-policy-control'")).toBe(true);
     expect(source.includes("shape={compact ? 'circle' : 'round'}")).toBe(true);
-    expect(/\{compact && active &&\s*<span className='size-5px/.test(source)).toBe(true);
+    expect(/\{compact && active &&\s*<span className=\{styles\.triggerStatus\}/.test(source)).toBe(true);
   });
 });
