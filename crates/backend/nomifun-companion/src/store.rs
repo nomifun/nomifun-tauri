@@ -9,8 +9,9 @@
 use std::path::{Path, PathBuf};
 
 use nomifun_common::{
-    AppError, CompanionId, CompanionMemoryId, CompanionSessionWindowId,
-    CompanionSuggestionId, ConversationId, TimestampMs, now_ms,
+    AppError, CompanionId, CompanionLearnRunId, CompanionMemoryId,
+    CompanionSessionWindowId, CompanionSuggestionId, ConversationId, TimestampMs,
+    now_ms,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -477,7 +478,74 @@ async fn init_schema(pool: &SqlitePool) -> Result<(), AppError> {
     } else {
         apply_migrations_on(&mut conn).await?;
     }
+    // TEMPORARY COMPATIBILITY SHIM — remove, do not generalize.
+    //
+    // TODO(id-v2-learn-run-cleanup): Delete this startup purge together with
+    // `row_to_learn_run`'s invalid-row filter after the minimum supported
+    // upgrade path can no longer originate from a short-ID build (the affected
+    // v0.2.20-v0.2.22 upgrade window has ended). New entity migrations must use
+    // the normal versioned migration/object-graph machinery instead of adding
+    // more ad-hoc startup sweeps here.
+    //
+    // Temporary upgrade guard for the short-ID -> canonical UUIDv7 cut-over.
+    // Old learn-run rows are history-only and have no foreign-key consumers, so
+    // delete only the rows that the current typed ID rejects. This deliberately
+    // does not bump STORE_VERSION or touch any other companion data. A cleanup
+    // failure must not make CompanionService fall back to an empty in-memory
+    // store; read paths independently filter any invalid row that survives.
+    match purge_legacy_learn_runs(&mut conn).await {
+        Ok(0) => {}
+        Ok(deleted) => tracing::warn!(deleted, "deleted legacy companion learn-run history"),
+        Err(error) => tracing::error!(
+            %error,
+            "legacy companion learn-run cleanup failed; continuing with read-boundary filtering"
+        ),
+    }
     Ok(())
+}
+
+/// Delete pre-ID-v2 learn-run history without retaining a quarantine copy.
+///
+/// This is intentionally content-driven instead of version-driven: affected
+/// stores may already be stamped v6. Exact primary-key deletes preserve every
+/// canonical run in a mixed old/new database, and the transaction makes the
+/// operation idempotent and all-or-nothing.
+async fn purge_legacy_learn_runs(conn: &mut SqliteConnection) -> Result<u64, AppError> {
+    let ids = sqlx::query_scalar::<_, String>("SELECT id FROM companion_learn_runs")
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    let invalid: Vec<String> = ids
+        .into_iter()
+        .filter(|id| CompanionLearnRunId::try_from(id.as_str()).is_err())
+        .collect();
+    if invalid.is_empty() {
+        return Ok(0);
+    }
+
+    sqlx::raw_sql("BEGIN IMMEDIATE")
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    let mut deleted = 0;
+    for id in invalid {
+        match sqlx::query("DELETE FROM companion_learn_runs WHERE id = ?")
+            .bind(id)
+            .execute(&mut *conn)
+            .await
+        {
+            Ok(result) => deleted += result.rows_affected(),
+            Err(error) => {
+                let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await;
+                return Err(db_err(error));
+            }
+        }
+    }
+    if let Err(error) = sqlx::raw_sql("COMMIT").execute(&mut *conn).await {
+        let _ = sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await;
+        return Err(db_err(error));
+    }
+    Ok(deleted)
 }
 
 /// Versioned migration ladder for databases created before the current
@@ -1082,9 +1150,18 @@ fn row_to_companion_thread(row: &sqlx::sqlite::SqliteRow) -> Result<CompanionThr
     })
 }
 
-fn row_to_learn_run(row: &sqlx::sqlite::SqliteRow) -> CompanionLearnRun {
-    CompanionLearnRun {
-        id: row.get("id"),
+fn row_to_learn_run(row: &sqlx::sqlite::SqliteRow) -> Option<CompanionLearnRun> {
+    let id: String = row.get("id");
+    if let Err(error) = CompanionLearnRunId::try_from(id.as_str()) {
+        // Temporary second barrier for the startup shim above. Remove this
+        // branch at the same time as `purge_legacy_learn_runs`; keeping only
+        // one half would either hide future storage defects or re-expose the
+        // retired short-ID rows on a cleanup failure.
+        tracing::warn!(id, %error, "ignoring non-canonical companion learn-run row");
+        return None;
+    }
+    Some(CompanionLearnRun {
+        id,
         started_at: row.get("started_at"),
         finished_at: row.get("finished_at"),
         status: row.get("status"),
@@ -1093,7 +1170,7 @@ fn row_to_learn_run(row: &sqlx::sqlite::SqliteRow) -> CompanionLearnRun {
         suggestions_added: row.get("suggestions_added"),
         error: row.get("error"),
         summary: row.get("summary"),
-    }
+    })
 }
 
 fn row_to_suggestion(row: &sqlx::sqlite::SqliteRow) -> CompanionSuggestion {
@@ -2016,6 +2093,8 @@ impl CompanionStore {
     // ----- learn runs -----
 
     pub async fn insert_learn_run(&self, run: &CompanionLearnRun) -> Result<(), AppError> {
+        CompanionLearnRunId::try_from(run.id.as_str())
+            .map_err(|error| AppError::BadRequest(format!("invalid companion learn-run id: {error}")))?;
         sqlx::query(
             "INSERT INTO companion_learn_runs(id, started_at, finished_at, status, events_processed, memories_added, suggestions_added, error, summary)
              VALUES(?,?,?,?,?,?,?,?,?)",
@@ -2041,20 +2120,7 @@ impl CompanionStore {
             .fetch_all(&self.pool)
             .await
             .map_err(db_err)?;
-        Ok(rows
-            .iter()
-            .map(|row| CompanionLearnRun {
-                id: row.get("id"),
-                started_at: row.get("started_at"),
-                finished_at: row.get("finished_at"),
-                status: row.get("status"),
-                events_processed: row.get("events_processed"),
-                memories_added: row.get("memories_added"),
-                suggestions_added: row.get("suggestions_added"),
-                error: row.get("error"),
-                summary: row.get("summary"),
-            })
-            .collect())
+        Ok(rows.iter().filter_map(row_to_learn_run).collect())
     }
 
     // ----- export/import support (spec §4.8) -----
@@ -2096,7 +2162,7 @@ impl CompanionStore {
                 .map_err(db_err)?;
             let Some(last) = rows.last() else { break };
             cursor = last.get("id");
-            out.extend(rows.iter().map(row_to_learn_run));
+            out.extend(rows.iter().filter_map(row_to_learn_run));
         }
         Ok(out)
     }
@@ -3944,6 +4010,77 @@ mod tests {
         assert_eq!(dump[0].id, run_id);
         assert_eq!(dump[0].finished_at, Some(20));
         assert_eq!(dump[0].summary.as_deref(), Some("学到了"));
+    }
+
+    #[tokio::test]
+    async fn startup_deletes_only_legacy_learn_runs_and_reads_stay_guarded() {
+        const LEGACY_RUN_ID: &str = "plr_0fh3k9abcde12345";
+
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_run_id = CompanionLearnRunId::new().into_string();
+        {
+            let store = CompanionStore::open(dir.path()).await.unwrap();
+            store
+                .insert_learn_run(&CompanionLearnRun {
+                    id: canonical_run_id.clone(),
+                    started_at: 10,
+                    finished_at: Some(20),
+                    status: "ok".into(),
+                    events_processed: 5,
+                    memories_added: 2,
+                    suggestions_added: 1,
+                    error: None,
+                    summary: Some("canonical".into()),
+                })
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO companion_learn_runs(id, started_at, status) VALUES(?, 1, 'legacy')",
+            )
+            .bind(LEGACY_RUN_ID)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+            store.pool.close().await;
+        }
+
+        // Reopening runs the temporary cleanup even though this file is already
+        // stamped at STORE_VERSION. The canonical row survives unchanged.
+        let store = CompanionStore::open(dir.path()).await.unwrap();
+        assert!(!store.learn_run_exists(LEGACY_RUN_ID).await.unwrap());
+        assert!(store.learn_run_exists(&canonical_run_id).await.unwrap());
+        let listed = store.list_learn_runs(30).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, canonical_run_id);
+
+        // Content-driven cleanup is idempotent and never needs a schema-version
+        // rung. A residual invalid row is still hidden at every read boundary.
+        let mut conn = store.pool.acquire().await.unwrap();
+        assert_eq!(purge_legacy_learn_runs(&mut conn).await.unwrap(), 0);
+        drop(conn);
+        sqlx::query(
+            "INSERT INTO companion_learn_runs(id, started_at, status) VALUES(?, 1, 'legacy')",
+        )
+        .bind(LEGACY_RUN_ID)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(store.list_learn_runs(30).await.unwrap().len(), 1);
+        assert_eq!(store.dump_learn_runs_all().await.unwrap().len(), 1);
+
+        // Normal write APIs cannot reintroduce the legacy representation.
+        let invalid = CompanionLearnRun {
+            id: LEGACY_RUN_ID.into(),
+            started_at: 1,
+            finished_at: None,
+            status: "legacy".into(),
+            events_processed: 0,
+            memories_added: 0,
+            suggestions_added: 0,
+            error: None,
+            summary: None,
+        };
+        assert!(matches!(store.insert_learn_run(&invalid).await, Err(AppError::BadRequest(_))));
     }
 
     #[tokio::test]
