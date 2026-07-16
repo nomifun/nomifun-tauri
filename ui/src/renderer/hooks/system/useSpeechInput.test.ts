@@ -10,6 +10,23 @@ import { readFileSync } from 'node:fs';
 const readSource = (url: URL): string => readFileSync(url, 'utf8');
 
 describe('speech input local-format handling', () => {
+  test('keeps the microphone button dedicated to live recording', () => {
+    const button = readSource(
+      new URL('../../components/chat/SpeechInputButton.tsx', import.meta.url)
+    );
+
+    expect(button.includes("type='file'")).toBe(false);
+    expect(button.includes('fileInputRef')).toBe(false);
+    expect(button.includes('transcribeFile')).toBe(false);
+  });
+
+  test('declares the macOS microphone privacy reason required by the desktop WebView', () => {
+    const plist = readSource(new URL('../../../../../apps/desktop/Info.plist', import.meta.url));
+
+    expect(plist.includes('<key>NSMicrophoneUsageDescription</key>')).toBe(true);
+    expect(plist.includes('voice input')).toBe(true);
+  });
+
   test('does not upload an unsupported original recording when WAV normalization fails', () => {
     const hook = readSource(new URL('./useSpeechInput.ts', import.meta.url));
 

@@ -421,7 +421,7 @@
       "networkError": "Network error while transcribing audio",
       "notConfigured": "Speech-to-text is not configured yet",
       "permissionDenied": "Microphone permission was denied",
-      "recordingUnsupported": "Live recording is not supported here. Please upload an audio file instead",
+      "recordingUnsupported": "Live recording is not supported here. Check microphone permission or use a secure connection",
       "transcriptionFailed": "Audio transcription failed",
       "genericError": "Voice input failed. Please try again"
     },

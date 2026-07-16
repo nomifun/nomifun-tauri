@@ -6,7 +6,7 @@
 
 import { ipcBridge } from '@/common';
 import { Message, Button, Tooltip } from '@arco-design/web-react';
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   useSpeechInput,
@@ -43,14 +43,9 @@ const SpeechStopIcon = () => (
 const SpeechLoaderIcon = () => <span className='speech-loader-spinner' aria-hidden='true' />;
 
 const getAvailabilityMessageKey = (availability: SpeechInputAvailability) => {
-  switch (availability) {
-    case 'file':
-      return 'conversation.chat.speech.pickFileTooltip';
-    case 'unsupported':
-      return 'conversation.chat.speech.unsupported';
-    default:
-      return 'conversation.chat.speech.recordTooltip';
-  }
+  return availability === 'record'
+    ? 'conversation.chat.speech.recordTooltip'
+    : 'conversation.chat.speech.unsupported';
 };
 
 const getErrorMessageKey = (errorCode: SpeechInputErrorCode) => {
@@ -103,7 +98,6 @@ const getTooltipKey = (availability: SpeechInputAvailability, isListening: boole
 
 const SpeechInputButton: React.FC<SpeechInputButtonProps> = ({ disabled, locale, onTranscript }) => {
   const { t } = useTranslation();
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [isSpeechInputEnabled, setIsSpeechInputEnabled] = useState(false);
   const [isConfigLoaded, setIsConfigLoaded] = useState(false);
   const { data: providers } = useProvidersQuery();
@@ -117,7 +111,6 @@ const SpeechInputButton: React.FC<SpeechInputButtonProps> = ({ disabled, locale,
     startRecording,
     status,
     stopRecording,
-    transcribeFile,
   } = useSpeechInput({
     locale,
     onTranscript,
@@ -231,21 +224,7 @@ const SpeechInputButton: React.FC<SpeechInputButtonProps> = ({ disabled, locale,
       return;
     }
 
-    if (availability === 'file') {
-      fileInputRef.current?.click();
-      return;
-    }
-
     void startRecording();
-  };
-
-  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    event.target.value = '';
-    if (!file) {
-      return;
-    }
-    void transcribeFile(file);
   };
 
   if (!isConfigLoaded || !isSpeechInputEnabled) {
@@ -257,55 +236,45 @@ const SpeechInputButton: React.FC<SpeechInputButtonProps> = ({ disabled, locale,
   const icon = isRecording ? <SpeechStopIcon /> : isProcessing ? <SpeechLoaderIcon /> : <SpeechMicIcon />;
 
   return (
-    <>
-      <input
-        ref={fileInputRef}
-        type='file'
-        accept='audio/*'
-        capture='user'
-        className='hidden'
-        onChange={handleFileChange}
-      />
-      <div className={`speech-input-control ${showSpeechFeedback ? 'speech-input-control--active' : ''}`}>
-        {showSpeechFeedback && (
-          <div
-            className={`speech-input-feedback ${isProcessing ? 'speech-input-feedback--processing' : ''}`}
-            role='status'
-            aria-live='polite'
-          >
-            <div className='speech-input-feedback__waveform' aria-hidden='true'>
-              {displayedWaveformLevels.map((level, index) => (
-                <span
-                  key={`speech-wave-${index}`}
-                  className='speech-input-feedback__bar'
-                  style={{
-                    height: `${Math.max(1.5, 1 + level * 18)}px`,
-                    animationDelay: `${index * 40}ms`,
-                  }}
-                />
-              ))}
-            </div>
-            <span className='speech-input-feedback__label'>
-              {isProcessing
-                ? t('conversation.chat.speech.transcribingShort')
-                : formatSpeechDuration(recordingDurationMs)}
-            </span>
+    <div className={`speech-input-control ${showSpeechFeedback ? 'speech-input-control--active' : ''}`}>
+      {showSpeechFeedback && (
+        <div
+          className={`speech-input-feedback ${isProcessing ? 'speech-input-feedback--processing' : ''}`}
+          role='status'
+          aria-live='polite'
+        >
+          <div className='speech-input-feedback__waveform' aria-hidden='true'>
+            {displayedWaveformLevels.map((level, index) => (
+              <span
+                key={`speech-wave-${index}`}
+                className='speech-input-feedback__bar'
+                style={{
+                  height: `${Math.max(1.5, 1 + level * 18)}px`,
+                  animationDelay: `${index * 40}ms`,
+                }}
+              />
+            ))}
           </div>
-        )}
-        <Tooltip content={ariaLabel} mini>
-          <Button
-            type='text'
-            size='small'
-            shape='circle'
-            className={`speech-input-button ${isRecording ? 'speech-input-button--listening' : ''} ${isProcessing ? 'speech-input-button--processing' : ''}`}
-            disabled={disabled || isProcessing}
-            onClick={handleClick}
-            aria-label={ariaLabel}
-            icon={icon}
-          />
-        </Tooltip>
-      </div>
-    </>
+          <span className='speech-input-feedback__label'>
+            {isProcessing
+              ? t('conversation.chat.speech.transcribingShort')
+              : formatSpeechDuration(recordingDurationMs)}
+          </span>
+        </div>
+      )}
+      <Tooltip content={ariaLabel} mini>
+        <Button
+          type='text'
+          size='small'
+          shape='circle'
+          className={`speech-input-button ${isRecording ? 'speech-input-button--listening' : ''} ${isProcessing ? 'speech-input-button--processing' : ''}`}
+          disabled={disabled || isProcessing}
+          onClick={handleClick}
+          aria-label={ariaLabel}
+          icon={icon}
+        />
+      </Tooltip>
+    </div>
   );
 };
 

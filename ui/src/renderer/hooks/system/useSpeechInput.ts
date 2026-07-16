@@ -9,8 +9,12 @@ import { useLatestRef } from '@/renderer/hooks/ui/useLatestRef';
 import { convertRecordedAudioToWav } from '@/renderer/services/RecordedAudioWav';
 import { transcribeAudioBlob } from '@/renderer/services/SpeechToTextService';
 import { isDesktopShell } from '@/renderer/utils/platform';
+import {
+  getSpeechInputAvailabilityForEnvironment,
+  type SpeechInputEnvironment,
+} from './speechInputAvailability';
 
-export type SpeechInputAvailability = 'record' | 'file' | 'unsupported';
+export type { SpeechInputAvailability } from './speechInputAvailability';
 export type SpeechInputStatus = 'idle' | 'recording' | 'transcribing' | 'error';
 export type SpeechInputErrorCode =
   | 'aborted'
@@ -25,21 +29,11 @@ export type SpeechInputErrorCode =
   | 'transcription-failed'
   | 'unknown';
 
-type SpeechInputEnvironment = {
-  hasFileInput: boolean;
-  hasMediaDevices: boolean;
-  hasMediaRecorder: boolean;
-  hostname: string;
-  isDesktopShell: boolean;
-  isSecureContext: boolean;
-};
-
 type UseSpeechInputOptions = {
   locale?: string;
   onTranscript: (transcript: string) => void;
 };
 
-const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1']);
 const RECORDING_MIME_TYPES = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'];
 const SPEECH_WAVEFORM_SAMPLE_COUNT = 40;
 const SPEECH_WAVEFORM_MIN_LEVEL = 0.015;
@@ -74,7 +68,6 @@ export const appendSpeechTranscript = (base: string, transcript: string): string
 const getSpeechInputEnvironment = (): SpeechInputEnvironment => {
   if (typeof window === 'undefined' || typeof document === 'undefined') {
     return {
-      hasFileInput: false,
       hasMediaDevices: false,
       hasMediaRecorder: false,
       hostname: '',
@@ -84,7 +77,6 @@ const getSpeechInputEnvironment = (): SpeechInputEnvironment => {
   }
 
   return {
-    hasFileInput: typeof document.createElement === 'function',
     hasMediaDevices: typeof navigator !== 'undefined' && Boolean(navigator.mediaDevices?.getUserMedia),
     hasMediaRecorder: typeof MediaRecorder !== 'undefined',
     hostname: window.location.hostname,
@@ -93,26 +85,7 @@ const getSpeechInputEnvironment = (): SpeechInputEnvironment => {
   };
 };
 
-export const getSpeechInputAvailabilityForEnvironment = (
-  environment: SpeechInputEnvironment
-): SpeechInputAvailability => {
-  const canUseLiveRecording =
-    environment.hasMediaDevices &&
-    environment.hasMediaRecorder &&
-    (environment.isDesktopShell || environment.isSecureContext || LOCAL_HOSTNAMES.has(environment.hostname));
-
-  if (canUseLiveRecording) {
-    return 'record';
-  }
-
-  if (environment.hasFileInput) {
-    return 'file';
-  }
-
-  return 'unsupported';
-};
-
-export const getSpeechInputAvailability = (): SpeechInputAvailability => {
+export const getSpeechInputAvailability = () => {
   return getSpeechInputAvailabilityForEnvironment(getSpeechInputEnvironment());
 };
 
@@ -420,13 +393,6 @@ export const useSpeechInput = ({ locale, onTranscript }: UseSpeechInputOptions) 
     recorder.stop();
   }, [status]);
 
-  const transcribeFile = useCallback(
-    async (file: Blob) => {
-      await transcribeBlob(file);
-    },
-    [transcribeBlob]
-  );
-
   useEffect(() => {
     return () => {
       const recorder = recorderRef.current;
@@ -456,6 +422,5 @@ export const useSpeechInput = ({ locale, onTranscript }: UseSpeechInputOptions) 
     startRecording,
     status,
     stopRecording,
-    transcribeFile,
   };
 };
