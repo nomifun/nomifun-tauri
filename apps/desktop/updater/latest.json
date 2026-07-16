@@ -1,23 +1,11 @@
 {
-  "version": "0.2.22",
-  "notes": "Windows 首发：默认 Rhythm Dark 主题；侧边栏展示可用更新；优化模型供应商排序与本地化；调整设置页执行引擎入口；浏览器默认使用可见系统浏览器；修复输入框高亮和协作策略控件。",
-  "pub_date": "2026-07-16T10:35:57.909Z",
+  "version": "0.2.23",
+  "notes": "Windows 首发：清理 companion 历史 learn-run 标识；加固 agent 工具调用边界；优化 Skill picker 抽屉与复选框控件；新增需求可读编号展示；修复麦克风语音输入、StepFun ASR 404 和本地 ASR 安装状态显示。",
+  "pub_date": "2026-07-16T15:14:30.396Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODZsN3c2OHMzUnNzQnpTOWpweXNNaE54Ny9HRFprQmRRQllpOVF4VExhVjErbUlUQ1RmOG16di9LaHdoZmVLVHJGRjNzeGxhM2pvVE5JbnZ1V3hTREFzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0MTk2MjE2CWZpbGU6Tm9taUZ1bl8wLjIuMjJfeDY0LXNldHVwLmV4ZQptYVh0RDFzQ2JFUjZ5bFJCZGMxZzAwTm82eWtvTWI5ZWROV1NOTEdVSU9QdVVHMFhhS0xtcUt3aHdNQW5EZWZmVEZqajYwckNySFZsby9xNVlBS01Bdz09Cg==",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.22/NomiFun_0.2.22_x64-setup.exe"
-    },
-    "linux-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxOHdqZ2FSZUg1VlpTK2dCbHNlYVczUHEyVFhCeUpHUEVRaWU4VzZuMFJ0dDZIMkVzYWZoWHFEbEtLZ2g5Wk5rM04rWmd5a0x3cEJQeTI4MVByRTliMHdVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0MTk2OTE2CWZpbGU6Tm9taUZ1bl8wLjIuMjJfYW1kNjQuQXBwSW1hZ2UKcmIzeG5lK2FHdHkzVGNBMWwrV2tBeHlCUFQ5c2x5VUk3N3E2Nlp4TEVxRnZLVnMrdmI4enhpSU0vWWNZbVk2cXRxYk05L0Y4cVZtMjQxZWJ5Z3dVQ2c9PQo=",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.22/NomiFun_0.2.22_amd64.AppImage"
-    },
-    "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODNqTWFzcjhjRUc3eUsrM3g1Q2F6ZjZwTzNyY3I3MUprTlBuTGhacmJBV2t5SHkwbm45M2lyNkx6ZXJ5YTRCNXZmOElvMXlyWG5lM000NU0xVXkyZlFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0MTk4MDIyCWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6Cmo3VmxwUFZiN05iTDhPQnh0R0h1RG96b1VXek1yemN4ZkNZdUNma1BqWTdMWEtnNnFQMFdybjRjSDVhTHh3eERIVzJTb1dCbXhIYnZ3Q3IxcEhMMURnPT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.22/NomiFun.app.tar.gz"
-    },
-    "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODNqTWFzcjhjRUc3eUsrM3g1Q2F6ZjZwTzNyY3I3MUprTlBuTGhacmJBV2t5SHkwbm45M2lyNkx6ZXJ5YTRCNXZmOElvMXlyWG5lM000NU0xVXkyZlFNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0MTk4MDIyCWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6Cmo3VmxwUFZiN05iTDhPQnh0R0h1RG96b1VXek1yemN4ZkNZdUNma1BqWTdMWEtnNnFQMFdybjRjSDVhTHh3eERIVzJTb1dCbXhIYnZ3Q3IxcEhMMURnPT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.22/NomiFun.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODNIVGVPc1c4V2YzMGZJTFJrSGVRKzVyMTV3bFQ3a3pieTROOUdJQ0NoTUd0OURQM2U3c0NtZUdDakJRMTNwMFErNU1jY3hXV3h5MmZhT2pYMnBjM2c4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0MjE0ODY5CWZpbGU6Tm9taUZ1bl8wLjIuMjNfeDY0LXNldHVwLmV4ZQpwYUE5OWk5c0tYa2NWenBZMXpBUzhNa3hNcnlML1ltN0hBUFpMdkh3MUFWL1hSSzQ0aXJCbE1UanlSTll6alUydURyelJDVTZCSEhTT2taZXpGclpBdz09Cg==",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.23/NomiFun_0.2.23_x64-setup.exe"
     }
   }
 }
