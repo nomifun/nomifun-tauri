@@ -2,25 +2,20 @@
  * 暗夜霓虹 Neon Night  (id: neon-rainbow —— 历史 id，保持稳定不动)
  * ------------------------------------------------------------
  * 暗色是本体：近黑石墨底（#0b0b10 → #14141c → #1d1d28 → #262633），
- * 像没开灯的录音棚。签名是一圈霓虹彩虹光管——只描在「边框」上，绝不在
- * 框内画浮线：聊天主输入框常亮一圈全光谱彩虹边，普通输入框聚焦时整圈点亮，
- * 像点起的霓虹灯带。其余点缀仍是克制的单色紫辉光（主按钮紫罗兰渐变 + hover
- * 辉光、侧栏一束竖直紫光、弹层细紫描边）。全部靠 border-image / box-shadow
- * 实现，静态、零重绘、无动画。
+ * 像没开灯的录音棚。霓虹感保留在克制的单色紫辉光点缀上（主按钮紫罗兰
+ * 渐变 + hover 辉光、侧栏一束竖直紫光、弹层细紫描边）。输入框与聊天发送
+ * 面板使用组件默认边框和聚焦反馈，避免用矩形霓虹描边干扰文字输入。
  * 亮色是开灯的录音棚：近白底保持同一套点缀，切换不破。
  *
  * Dark is the soul: a near-black graphite studio (#0b0b10 / #14141c
- * / #1d1d28 / #262633), lights off. The signature is a ring of neon
- * tubing drawn ONLY on the border — never a filament floating inside
- * the box: the chat composer (.sendbox-panel) carries a permanent
- * full-spectrum rainbow edge, and plain inputs light their whole
- * border on focus, like a neon strip switching on. Everything else
- * keeps a single restrained violet glow (violet-gradient primary
- * buttons with a hover bloom, a vertical violet shaft on the sider,
- * thin violet popover outlines). All via border-image / box-shadow —
- * static, zero repaint, no animation. Light mode is the lights-on
- * studio: a near-white ground keeping the same accents so a switch
- * never breaks.
+ * / #1d1d28 / #262633), lights off. The neon character stays in
+ * restrained violet accents:
+ * violet-gradient primary buttons with a hover bloom, a vertical
+ * violet shaft on the sider, and thin violet popover outlines. Inputs
+ * and the chat composer keep the shared component borders and focus
+ * treatment so text entry is not surrounded by a distracting neon
+ * rectangle. Light mode is the lights-on studio: a near-white ground
+ * keeping the same accents so a switch never breaks.
  * ============================================================ */
 
 /* ===== Light / 开灯的录音棚 ===== */
@@ -305,100 +300,10 @@ body {
 }
 
 /* ============================================================
- * 签名点缀 / Signature touches —— 霓虹彩虹边框（只描边，绝不画浮线）
- * 教训：装饰线不能"横"在框内——浮在输入框中段的下划线既丑又像故障，
- * 而且当时同时打在 wrapper 与内层 input 上，于是框里横了两道线。
- * 改为只点在「边框」：盒子自己的轮廓亮成一圈霓虹彩虹光管。聊天主输入框
- * 常亮、普通输入框聚焦时点亮；其余仍走单色紫辉光（按钮、侧栏、弹层）。
- * 全部靠 border-image / box-shadow，不新建定位元素、不改尺寸、无动画、零重绘。
- *
- * Lesson: a decorative line must never cut ACROSS the box — a mid-box
- * underline read as ugly and glitchy, and it was painted on both the
- * wrapper and the inner input, so two lines stacked inside the field.
- * Now the accent lives ONLY on the border: the box's own outline lights
- * up as a ring of neon-rainbow tubing. The chat composer glows always,
- * plain inputs light their border on focus; the rest keeps a single
- * violet glow (buttons, sider, popovers). All via border-image /
- * box-shadow — no positioned elements, no size changes, no animation.
+ * 签名点缀 / Signature touches
  * ============================================================ */
 
-/* 1. 普通 Arco 输入框：静息只有 token 边框（干净），聚焦时整圈边框点亮成
-      霓虹彩虹光管（全光谱渐变描边，圆角保留）+ 一层紫辉光。彩虹只描在边框上，
-      框内不画任何横线，因此不会再出现"框中段两道横线"。 */
-.arco-input,
-.arco-input-inner,
-.arco-textarea,
-.arco-input-wrapper,
-.arco-textarea-wrapper {
-  border-radius: 8px;
-  transition: box-shadow 0.25s ease, border-color 0.25s ease;
-}
-
-.arco-input:focus,
-.arco-input-inner:focus,
-.arco-textarea:focus,
-.arco-input-wrapper.arco-input-focus,
-.arco-textarea-wrapper.arco-textarea-focus {
-  box-shadow: 0 0 11px rgba(177, 75, 255, 0.3);
-}
-
-/* 彩虹只描在「有边框的 wrapper」上：透明边 + 双层背景(实底 padding-box + 彩虹
-   border-box) + background-clip，既得整圈彩虹边、又保住 8px 圆角。内层 input 透明
-   无边、不参与描边，所以绝不会再出现"框内两道横线"。 */
-.arco-input-wrapper.arco-input-focus,
-.arco-textarea-wrapper.arco-textarea-focus {
-  border: 1px solid transparent;
-  border-radius: 8px;
-  background-image: linear-gradient(var(--color-bg-2), var(--color-bg-2)),
-    linear-gradient(
-      100deg,
-      #ff3b6b,
-      #ff8a3b,
-      #ffd93b,
-      #3bff8a,
-      #2bd4e8,
-      #6a7bff,
-      #b14bff,
-      #ff3bd4,
-      #ff3b6b
-    );
-  background-origin: border-box;
-  background-clip: padding-box, border-box;
-}
-
-/* 2. 聊天主输入框 .sendbox-panel：常亮一圈霓虹彩虹光管（3px 边，与 border-3
-      对齐；双层背景 + background-clip 保住 20px 圆角，静态如点亮的灯带）；
-      聚焦/输入态再叠一层紫辉光。框内不画任何横线。 */
-.sendbox-panel {
-  border: 3px solid transparent;
-  border-radius: 20px;
-  background-image: linear-gradient(var(--dialog-fill-0), var(--dialog-fill-0)),
-    linear-gradient(
-      100deg,
-      #ff3b6b,
-      #ff8a3b,
-      #ffd93b,
-      #3bff8a,
-      #2bd4e8,
-      #6a7bff,
-      #b14bff,
-      #ff3bd4,
-      #ff3b6b
-    );
-  background-origin: border-box;
-  background-clip: padding-box, border-box;
-  transition: box-shadow 0.3s ease;
-}
-
-[data-theme='dark'] .sendbox-panel {
-  box-shadow: 0 0 18px rgba(177, 75, 255, 0.16);
-}
-
-.sendbox-panel:focus-within {
-  box-shadow: 0 0 22px rgba(177, 75, 255, 0.3);
-}
-
-/* 3. 主按钮：霓虹紫罗兰渐变 + hover 辉光（亮色压深保白字 ≥4.5:1，暗色提亮发光）；
+/* 1. 主按钮：霓虹紫罗兰渐变 + hover 辉光（亮色压深保白字 ≥4.5:1，暗色提亮发光）；
       :not() 排除语义状态按钮，避免 danger/warning/success 被染紫 */
 .arco-btn-primary:not(.arco-btn-disabled):not(.arco-btn-status-danger):not(.arco-btn-status-warning):not(
     .arco-btn-status-success
@@ -422,7 +327,7 @@ body {
   background-image: linear-gradient(135deg, #c36dff 0%, #9a2ff0 100%);
 }
 
-/* 4. 侧栏：一束竖直霓虹紫流光（顶部辉光 → 中段淡出 → 底部微辉，background-image，
+/* 2. 侧栏：一束竖直霓虹紫流光（顶部辉光 → 中段淡出 → 底部微辉，background-image，
       静态，不占布局）+ 紫色右缘细线。暗色明显、亮色克制。 */
 [data-theme='dark'] .layout-sider {
   background-image: linear-gradient(
@@ -444,7 +349,7 @@ body {
   box-shadow: inset -1px 0 0 rgba(143, 45, 214, 0.12);
 }
 
-/* 5. 暗色弹层/对话框：细紫描边 + 深投影，从近黑底浮起 */
+/* 3. 暗色弹层/对话框：细紫描边 + 深投影，从近黑底浮起 */
 [data-theme='dark'] .arco-select-popup,
 [data-theme='dark'] .arco-dropdown-menu,
 [data-theme='dark'] .arco-popover-content,
@@ -453,13 +358,13 @@ body {
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.62);
 }
 
-/* 6. 选中文本：霓虹紫高亮 */
+/* 4. 选中文本：霓虹紫高亮 */
 [data-theme='dark'] ::selection {
   background: rgba(177, 75, 255, 0.32);
   color: #ffffff;
 }
 
-/* 7. 滚动条：暗色一条半透明霓虹紫，hover 提亮 */
+/* 5. 滚动条：暗色一条半透明霓虹紫，hover 提亮 */
 [data-theme='dark'] ::-webkit-scrollbar-thumb {
   background: rgba(177, 75, 255, 0.28);
   border-radius: 6px;

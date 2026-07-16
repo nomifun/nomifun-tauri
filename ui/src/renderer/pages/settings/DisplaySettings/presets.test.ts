@@ -74,4 +74,11 @@ describe('display theme presets', () => {
       'My Rhythm Copy'
     );
   });
+
+  test('keeps Neon Night form controls on the shared component treatment', () => {
+    const neonNightCss = PRESET_THEMES.find((theme) => theme.id === 'neon-rainbow')?.css;
+
+    expect(neonNightCss).toBeDefined();
+    expect(/\.sendbox-panel|\.arco-(?:input|textarea)/.test(neonNightCss ?? '')).toBe(false);
+  });
 });
