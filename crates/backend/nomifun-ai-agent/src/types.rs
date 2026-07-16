@@ -126,14 +126,14 @@ pub struct NomiResolvedConfig {
     pub computer_use: bool,
     /// Enable the Browser tool (CDP automation).
     pub browser_use: bool,
-    /// **静默浏览器 LIVE 值**（「浏览器模式」的可见性维度）。`true`（**产品默认 ON**）→
-    /// 引擎 headless（无可见窗口）；`false` → 弹出可见窗口。工厂经 `read_bool_pref` LIVE 读
-    /// `agent.browserUse.silent`（host_default=**true**）。映射到 `config.tools.browser.headless`
+    /// **静默浏览器 LIVE 值**（「浏览器模式」的可见性维度）。`true` → 引擎 headless
+    /// （无可见窗口）；`false`（产品默认）→ 弹出可见窗口。工厂经 `read_bool_pref` LIVE 读
+    /// `agent.browserUse.silent`（host_default=**false**）。映射到 `config.tools.browser.headless`
     /// （silent→headless），facade 由 `!headless` 得 headful。无显示器时引擎本就强制 headless。
     pub browser_silent: bool,
-    /// **浏览器来源 LIVE 值**（「浏览器模式」的来源维度，与 silent 正交）。`"managed"`（默认）=
-    /// 内置/下载 CfT；`"system"` = 系统 Chrome/Edge 本体优先（未探到回退 managed）。工厂经
-    /// `read_string_pref` LIVE 读 `agent.browserUse.source`（host_default=`"managed"`）。映射到
+    /// **浏览器来源 LIVE 值**（「浏览器模式」的来源维度，与 silent 正交）。`"managed"` =
+    /// 内置/下载 CfT；`"system"`（默认）= 系统 Chrome/Edge 本体优先（未探到回退 managed）。工厂经
+    /// `read_string_pref` LIVE 读 `agent.browserUse.source`（host_default=`"system"`）。映射到
     /// `config.tools.browser.source`，facade 解析为 `ChromeSource`。红线不变：专属 user-data-dir。
     pub browser_source: String,
     /// **F1-sec: browser-use evaluate「全权模式」LIVE 值**（裁决⑨，default-deny）。`true` 当且仅当

@@ -451,12 +451,11 @@ pub(super) async fn build(
     )
     .await;
     // browser-use has a cargo-feature gate (`browser-use`, desktop builds); on those
-    // builds it now defaults **ON** (user decision) — the native CDP engine launches its
-    // managed Chromium **lazily on first use**, so enabling it costs nothing until the agent
-    // actually drives a page, and it runs **silent (headless) by default** (see
-    // `agent.browserUse.silent`, host_default=true) so there is no pop-up window. The master
-    // toggle just lets the user turn it off. Builds without the feature register no browser
-    // tool regardless. `NOMIFUN_BROWSER_USE` env forces it on for feature-less parity/testing.
+    // builds it defaults **ON** (user decision). The native CDP engine launches the user's
+    // system Chrome / Edge in a visible, isolated-profile window by default, and falls back
+    // to managed Chromium when no supported system browser is found. The master toggle just
+    // lets the user turn it off. Builds without the feature register no browser tool
+    // regardless. `NOMIFUN_BROWSER_USE` env forces it on for feature-less parity/testing.
     let browser_use_default = read_bool_pref(
         &deps,
         PREF_BROWSER_USE,
@@ -490,11 +489,11 @@ pub(super) async fn build(
     // 成本，须用户在 System Settings 显式 opt-in。
     let browser_visual_fallback_default =
         read_bool_pref(&deps, PREF_BROWSER_VISUAL_FALLBACK, false).await;
-    // 静默浏览器 LIVE 值（「浏览器模式」可见性维度）。host_default=**true**（产品默认静默）——
-    // 直接消除桌面弹窗困扰；用户可在 System Settings 关闭以弹出可见窗口。映射到 headless。
-    let browser_silent_default = read_bool_pref(&deps, PREF_BROWSER_SILENT, true).await;
-    // 浏览器来源 LIVE 值（与 silent 正交）。host_default="managed"（内置/下载 CfT）；"system" =
-    // 用户系统 Chrome/Edge 本体优先。红线不变：专属 user-data-dir 起独立托管实例。
+    // 静默浏览器 LIVE 值（「浏览器模式」可见性维度）。host_default=false（产品默认可见）；
+    // 用户仍可在 System Settings 开启静默运行。映射到 headless。
+    let browser_silent_default = read_bool_pref(&deps, PREF_BROWSER_SILENT, false).await;
+    // 浏览器来源 LIVE 值（与 silent 正交）。host_default="system"，优先使用用户系统安装的
+    // Chrome/Edge；未探测到时回退 managed。红线不变：专属 user-data-dir 起独立托管实例。
     let browser_source_default =
         read_string_pref(&deps, PREF_BROWSER_SOURCE, BROWSER_SOURCE_DEFAULT).await;
 
@@ -551,9 +550,9 @@ pub(super) async fn build(
         bedrock_config: fields.bedrock_config,
         computer_use: overrides.computer_use.unwrap_or(computer_use_default),
         browser_use: browser_use_enabled,
-        // 静默浏览器 LIVE 值（产品默认 ON=headless；无 per-session override，纯全局开关）。
+        // 静默浏览器 LIVE 值（产品默认 OFF=可见；无 per-session override，纯全局开关）。
         browser_silent: browser_silent_default,
-        // 浏览器来源 LIVE 值（默认 "managed"；"system"=系统 Chrome/Edge 本体优先）。
+        // 浏览器来源 LIVE 值（默认 "system"；未探测到系统浏览器时回退 managed）。
         browser_source: browser_source_default,
         // F1-sec: 全权模式 LIVE 值（无 per-session override，纯 client_preferences 全局开关）。
         browser_full_power: browser_full_power_default,
@@ -723,14 +722,15 @@ const PREF_BROWSER_UNRESTRICTED_APPROVAL: &str = "agent.browserUse.unrestrictedA
 /// **P7B**: browser-use 视觉兜底点击（opt-in，有 token 成本）。`true` → DOM/aria 锚定失败时截图交视觉
 /// 模型定位再点；缺/`false`（host_default）→ OFF（不注入 locator、零行为变化）。前端 System Settings 写。
 const PREF_BROWSER_VISUAL_FALLBACK: &str = "agent.browserUse.visualFallback";
-/// **静默浏览器开关**（「浏览器模式」可见性维度）。`true`（**产品默认 ON**，host_default=true）→
-/// 引擎 headless（无可见窗口，解决弹窗困扰）；`false` → 弹出可见窗口。映射到 headless。前端写。
+/// **静默浏览器开关**（「浏览器模式」可见性维度）。`true` → 引擎 headless（无可见窗口）；
+/// `false`（产品默认，host_default=false）→ 弹出可见窗口。映射到 headless。前端写。
 const PREF_BROWSER_SILENT: &str = "agent.browserUse.silent";
-/// **浏览器来源**（「浏览器模式」来源维度，与 silent 正交）。`"managed"`（默认）= 内置/下载 CfT；
-/// `"system"` = 系统 Chrome/Edge 本体优先（未探到回退）。红线不变：专属 user-data-dir。前端写。
+/// **浏览器来源**（「浏览器模式」来源维度，与 silent 正交）。`"managed"` = 内置/下载 CfT；
+/// `"system"`（默认）= 系统 Chrome/Edge 本体优先（未探到回退 managed）。红线不变：专属
+/// user-data-dir。前端写。
 const PREF_BROWSER_SOURCE: &str = "agent.browserUse.source";
-/// 浏览器来源 host default（无设置行/无 client_prefs 时）：内置/下载的 Chrome for Testing。
-const BROWSER_SOURCE_DEFAULT: &str = "managed";
+/// 浏览器来源 host default（无设置行/无 client_prefs 时）：用户系统安装的 Chrome / Edge。
+const BROWSER_SOURCE_DEFAULT: &str = "system";
 
 /// Read a boolean `client_preferences` toggle live, falling back to
 /// `host_default` when there is no setting row (fresh install) or no

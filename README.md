@@ -176,8 +176,8 @@ Self-built, **in-process Rust** — no Playwright, no Node, no third-party autom
 
 - **Computer use** — accessibility tree + Set-of-Marks overlay + OCR, steering the model to act on real UI elements instead of guessing pixels. macOS (AXUIElement + Vision OCR) and Windows (UI Automation) are complete; Linux (AT-SPI2) is partial.
 - **Browser use** — an in-process Chromium CDP engine with ARIA observation, an egress **firewall** with out-of-band approval, and an origin-bound secret vault so credentials never reach the LLM.
-- **Modes that match the job** — desktop builds default to silent browser runs in the bundled Chromium, but you can switch to your own system Chrome / Edge when site compatibility matters.
-- **One-click login reuse** — open a visible "Log into my browser" window once, then later silent agent runs reuse that authenticated state from a shared profile with encrypted backup.
+- **Modes that match the job** — desktop builds default to visible browser runs in your system Chrome / Edge (using an isolated profile), with managed Chromium and silent runs still available.
+- **One-click login reuse** — open a visible "Log into my browser" window once, then later agent runs reuse that authenticated state from a shared profile with encrypted backup.
 - **Approval with visual context** — silent-mode high-risk browser approvals can include a current-page screenshot, so you do not have to approve blindly from text alone.
 - **Guarded by design** — every action carries a danger × surface approval matrix; irreversible actions wait for explicit confirmation.
 

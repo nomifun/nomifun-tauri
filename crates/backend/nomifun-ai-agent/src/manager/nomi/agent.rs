@@ -343,7 +343,7 @@ impl NomiAgentManager {
         config.tools.browser.visual_fallback = config_extra.browser_visual_fallback;
         config.tools.browser.unrestricted_approval = config_extra.browser_unrestricted_approval;
         // 「浏览器模式」两开关（与上面的 opt-in 开关正交，每会话 LIVE）：
-        // - 静默：silent(默认 true) → headless。facade 由 !headless 得 headful；无显示器时引擎本就强制 headless。
+        // - 静默：silent(默认 false) → headless。facade 由 !headless 得 headful；无显示器时引擎本就强制 headless。
         // - 来源：source("managed"/"system") → facade 解析为 ChromeSource（system=系统 Chrome/Edge 优先，
         //   未探到回退 managed）。红线不变：两种来源都用专属 user-data-dir。
         config.tools.browser.headless = config_extra.browser_silent;

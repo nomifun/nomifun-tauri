@@ -22,8 +22,8 @@ const BrowserUseSettingsContent: React.FC = () => {
   const viewMode = useSettingsViewMode();
   const isPageMode = viewMode === 'page';
   const [browserUse, setBrowserUse] = useState(false);
-  const [silent, setSilent] = useState(true);
-  const [source, setSource] = useState<BrowserSource>('managed');
+  const [silent, setSilent] = useState(false);
+  const [source, setSource] = useState<BrowserSource>('system');
   const [persistentLogin, setPersistentLogin] = useState(true);
   const [fullPower, setFullPower] = useState(false);
   const [siteMemory, setSiteMemory] = useState(false);
@@ -39,9 +39,9 @@ const BrowserUseSettingsContent: React.FC = () => {
     const storedFullPower = configService.get('agent.browserUse.fullPower') ?? false;
 
     setBrowserUse(configService.get('agent.browserUse') ?? true);
-    // 「浏览器模式」两开关：默认静默(ON)、来源默认内置(managed)。
-    setSilent(configService.get('agent.browserUse.silent') ?? true);
-    setSource((configService.get('agent.browserUse.source') as BrowserSource) ?? 'managed');
+    // 「浏览器模式」两开关：默认可见(silent OFF)、来源默认用户浏览器(system)。
+    setSilent(configService.get('agent.browserUse.silent') ?? false);
+    setSource((configService.get('agent.browserUse.source') as BrowserSource) ?? 'system');
     setPersistentLogin(storedPersistentLogin);
     setFullPower(storedPersistentLogin ? false : storedFullPower);
     setSiteMemory(configService.get('agent.browserUse.siteMemory') ?? false);
