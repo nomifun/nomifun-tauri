@@ -6,18 +6,19 @@
 
 import { ipcBridge } from '@/common';
 import type { TChatConversation } from '@/common/config/storage';
-import { parseConversationId, type ConversationId } from '@/common/types/ids';
+import type { ConversationId } from '@/common/types/ids';
 import { refreshConversationCache } from '@/renderer/pages/conversation/utils/conversationCache';
 import { emitter } from '@/renderer/utils/emitter';
 import { blockMobileInputFocus, blurActiveElement } from '@/renderer/utils/ui/focus';
 import { Message, Modal } from '@arco-design/web-react';
 import { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 
 import { isConversationPinned } from '../utils/conversationPinned';
 
 type UseConversationActionsParams = {
+  activeConversationId: ConversationId | null;
   batchMode: boolean;
   onSessionClick?: () => void;
   onBatchModeChange?: (value: boolean) => void;
@@ -28,6 +29,7 @@ type UseConversationActionsParams = {
 };
 
 export const useConversationActions = ({
+  activeConversationId,
   batchMode,
   onSessionClick,
   onBatchModeChange,
@@ -41,8 +43,6 @@ export const useConversationActions = ({
   const [renameModalId, setRenameModalId] = useState<ConversationId | null>(null);
   const [renameLoading, setRenameLoading] = useState(false);
   const [dropdownVisibleId, setDropdownVisibleId] = useState<ConversationId | null>(null);
-  const { id: routeIdParam } = useParams();
-  const activeConversationId = routeIdParam != null ? parseConversationId(routeIdParam) : null;
   const { t } = useTranslation();
   const navigate = useNavigate();
 

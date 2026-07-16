@@ -14,7 +14,10 @@ describe('companion suggestion pagination bridge', () => {
     expect(source.includes('export interface ICompanionSuggestionPage')).toBe(true);
     expect(source.includes('items: ICompanionSuggestion[];')).toBe(true);
     expect(source.includes('total: number;')).toBe(true);
-    expect(/listSuggestions: httpGet<\s*ICompanionSuggestionPage,/.test(source)).toBe(true);
+    expect(source.includes('listSuggestions: withResponseMap(')).toBe(true);
+    expect(/listSuggestions: withResponseMap\(\s*httpGet<\{ items: unknown\[\]; total: number \}/.test(source)).toBe(true);
+    expect(source.includes('(raw): ICompanionSuggestionPage')).toBe(true);
+    expect(source.includes('raw.items.map(fromApiCompanionSuggestion)')).toBe(true);
     expect(source.includes('offset?: number')).toBe(true);
   });
 });

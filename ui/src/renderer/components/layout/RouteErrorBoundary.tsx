@@ -8,6 +8,10 @@ import React from 'react';
 
 interface RouteErrorBoundaryProps {
   children: React.ReactNode;
+  /** Clears a captured route error when navigation changes the rendered target. */
+  resetKey?: string;
+  /** Root failures need an application reload; route failures can retry in place. */
+  scope?: 'route' | 'application';
 }
 
 interface RouteErrorBoundaryState {
@@ -26,8 +30,8 @@ interface RouteErrorBoundaryState {
  * (titlebar, primary sidebar) stays alive, and the error text is selectable so
  * it can be copied for diagnosis.
  *
- * Each route gets its own boundary instance (the element is remounted on
- * navigation), so moving to another route clears the error automatically.
+ * React Router can reuse a boundary instance when only a route parameter
+ * changes. `resetKey` therefore clears stale failures explicitly on navigation.
  */
 class RouteErrorBoundary extends React.Component<RouteErrorBoundaryProps, RouteErrorBoundaryState> {
   state: RouteErrorBoundaryState = { error: null, componentStack: null };
@@ -40,17 +44,32 @@ class RouteErrorBoundary extends React.Component<RouteErrorBoundaryProps, RouteE
     // Surface to the console too (devtools, if available) — keep the on-screen
     // panel as the primary channel since release builds may not expose devtools.
     // eslint-disable-next-line no-console
-    console.error('[RouteErrorBoundary] route crashed:', error, info.componentStack);
+    console.error(
+      `[RouteErrorBoundary] ${this.props.scope === 'application' ? 'application' : 'route'} crashed:`,
+      error,
+      info.componentStack
+    );
     this.setState({ componentStack: info.componentStack ?? null });
+  }
+
+  componentDidUpdate(previousProps: RouteErrorBoundaryProps): void {
+    if (previousProps.resetKey !== this.props.resetKey && this.state.error) {
+      this.setState({ error: null, componentStack: null });
+    }
   }
 
   private handleReset = (): void => {
     this.setState({ error: null, componentStack: null });
   };
 
+  private handleApplicationReload = (): void => {
+    window.location.reload();
+  };
+
   render(): React.ReactNode {
     const { error, componentStack } = this.state;
     if (!error) return this.props.children;
+    const isApplicationFailure = this.props.scope === 'application';
 
     return (
       <div
@@ -69,14 +88,16 @@ class RouteErrorBoundary extends React.Component<RouteErrorBoundaryProps, RouteE
         }}
       >
         <div style={{ fontSize: '15px', fontWeight: 700, color: '#ff6b6b', marginBottom: '12px' }}>
-          页面渲染出错（已被路由错误边界捕获，未影响其它页面）
+          {isApplicationFailure
+            ? '应用渲染出错（已捕获，未显示空白窗口）'
+            : '页面渲染出错（已被路由错误边界捕获，未影响其它页面）'}
         </div>
         <div style={{ fontWeight: 700, marginBottom: '8px', userSelect: 'text' }}>
           {error.name}: {error.message}
         </div>
         <button
           type='button'
-          onClick={this.handleReset}
+          onClick={isApplicationFailure ? this.handleApplicationReload : this.handleReset}
           style={{
             marginBottom: '16px',
             padding: '4px 12px',
@@ -87,7 +108,7 @@ class RouteErrorBoundary extends React.Component<RouteErrorBoundaryProps, RouteE
             cursor: 'pointer',
           }}
         >
-          重试
+          {isApplicationFailure ? '重新加载应用' : '重试'}
         </button>
         {error.stack ? (
           <>

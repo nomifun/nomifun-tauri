@@ -37,10 +37,11 @@ import styles from './XtermView.module.css';
  */
 
 const TERMINAL_FONT = '"SFMono-Regular", "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace';
+const MAX_QUEUED_INPUT_BYTES = 1024 * 1024;
 
 export interface XtermViewHandle {
   /** Write text to the PTY (used by the composer SendBox). */
-  writeToPty: (text: string) => void;
+  writeToPty: (text: string) => Promise<void>;
   /**
    * Whether the running program currently has bracketed paste mode enabled
    * (DECSET 2004). The composer uses this to decide whether a multi-line submit
@@ -61,6 +62,11 @@ export interface XtermViewHandle {
 
 interface XtermViewProps {
   sessionId: TerminalId;
+  /**
+   * Exited sessions still mount xterm to replay persisted scrollback, but must
+   * not call the live PTY resize/input endpoints (which correctly return 404).
+   */
+  isRunning?: boolean;
   className?: string;
   apiRef?: React.MutableRefObject<XtermViewHandle | null>;
   /**
@@ -68,13 +74,24 @@ interface XtermViewProps {
    * escape a wedged TUI. The page wires this to the shell-fallback action.
    */
   onEscalateShell?: () => void;
+  /** Called after bounded resize/activation retries are exhausted. */
+  onResizeFailure?: (error: unknown) => void;
 }
 
-const XtermView: React.FC<XtermViewProps> = ({ sessionId, className, apiRef, onEscalateShell }) => {
+const XtermView: React.FC<XtermViewProps> = ({
+  sessionId,
+  isRunning = true,
+  className,
+  apiRef,
+  onEscalateShell,
+  onResizeFailure,
+}) => {
   const containerRef = useRef<HTMLDivElement>(null);
   // Keep the latest escalation callback without re-running the mount effect.
   const onEscalateShellRef = useRef(onEscalateShell);
   onEscalateShellRef.current = onEscalateShell;
+  const onResizeFailureRef = useRef(onResizeFailure);
+  onResizeFailureRef.current = onResizeFailure;
 
   useEffect(() => {
     const container = containerRef.current;
@@ -114,6 +131,178 @@ const XtermView: React.FC<XtermViewProps> = ({ sessionId, className, apiRef, onE
     let disposed = false;
     let lastCols = 0;
     let lastRows = 0;
+    let desiredResize: { cols: number; rows: number } | null = null;
+    let resizeInFlight = false;
+    let resizeFailureCount = 0;
+    let resizeRetryTimer: ReturnType<typeof setTimeout> | null = null;
+    let activationReady = false;
+    let inputDrainRunning = false;
+    let queuedInputBytes = 0;
+    let inputPipelineError: Error | null = null;
+    type QueuedInput = {
+      text: string;
+      byteLength: number;
+      resolve: () => void;
+      reject: (error: Error) => void;
+    };
+    let inputQueue: QueuedInput[] = [];
+    let activeInputItem: QueuedInput | null = null;
+
+    const failInputPipeline = (error: Error, notify = true): void => {
+      if (inputPipelineError) return;
+      inputPipelineError = error;
+      const queued = inputQueue;
+      inputQueue = [];
+      queuedInputBytes = 0;
+      for (const item of queued) item.reject(error);
+      if (notify && !disposed) onResizeFailureRef.current?.(error);
+    };
+
+    // Users can type as soon as xterm receives focus, while the first resize is
+    // still activating the deferred PTY. Preserve that input until activation
+    // is acknowledged instead of racing the backend and losing it to a 404.
+    const drainInputQueue = async (): Promise<void> => {
+      if (disposed || !activationReady || inputDrainRunning || inputPipelineError) return;
+      inputDrainRunning = true;
+      while (!disposed && !inputPipelineError && inputQueue.length > 0) {
+        const item = inputQueue.shift()!;
+        activeInputItem = item;
+        queuedInputBytes -= item.byteLength;
+        try {
+          await ipcBridge.terminal.input.invoke({
+            id: sessionId,
+            data_b64: encodeStringToBase64(item.text),
+          });
+          item.resolve();
+        } catch (caught: unknown) {
+          const error = caught instanceof Error ? caught : new Error(String(caught));
+          item.reject(error);
+          console.error('[XtermView] Failed to write terminal input:', error);
+          failInputPipeline(error);
+        } finally {
+          if (activeInputItem === item) activeInputItem = null;
+        }
+      }
+      inputDrainRunning = false;
+    };
+
+    const sendInput = (text: string): Promise<void> => {
+      if (disposed) return Promise.reject(new Error('Terminal view has been disposed'));
+      if (!isRunning) return Promise.reject(new Error('Terminal process is not running'));
+      if (inputPipelineError) return Promise.reject(inputPipelineError);
+
+      const byteLength = new TextEncoder().encode(text).byteLength;
+      if (queuedInputBytes + byteLength > MAX_QUEUED_INPUT_BYTES) {
+        const error = new Error('Terminal input queue limit exceeded before the backend acknowledged it');
+        console.error('[XtermView] Refusing oversized queued terminal input:', error);
+        // Reject and clear the entire prefix: executing only part of a command
+        // would be more dangerous than dropping the oversized submission.
+        failInputPipeline(error);
+        return Promise.reject(error);
+      }
+
+      return new Promise<void>((resolve, reject) => {
+        inputQueue.push({ text, byteLength, resolve, reject });
+        queuedInputBytes += byteLength;
+        if (activationReady) void drainInputQueue();
+      });
+    };
+
+    const coalescePreActivationInput = (): void => {
+      if (inputQueue.length < 2) return;
+      const queued = inputQueue;
+      inputQueue = [
+        {
+          text: queued.map((item) => item.text).join(''),
+          byteLength: queued.reduce((total, item) => total + item.byteLength, 0),
+          resolve: () => {
+            for (const item of queued) item.resolve();
+          },
+          reject: (error) => {
+            for (const item of queued) item.reject(error);
+          },
+        },
+      ];
+    };
+
+    const markActivationReady = (): void => {
+      if (activationReady || inputPipelineError) return;
+      // Raw keys collected during a slow activation are one ordered byte stream;
+      // flush them in a single POST instead of issuing one HTTP request per key.
+      coalescePreActivationInput();
+      activationReady = true;
+      void drainInputQueue();
+    };
+
+    // The first resize also activates a deferred PTY. Treat it as an acknowledged
+    // state transition rather than fire-and-forget: only cache dimensions after
+    // the backend accepts them, coalesce concurrent layout notifications, and
+    // retry short transient failures without creating unhandled rejections.
+    const flushResize = async (): Promise<void> => {
+      if (disposed || resizeInFlight || !desiredResize) return;
+
+      const next = desiredResize;
+      if (next.cols === lastCols && next.rows === lastRows) return;
+
+      resizeInFlight = true;
+      try {
+        await ipcBridge.terminal.resize.invoke({ id: sessionId, cols: next.cols, rows: next.rows });
+        if (!disposed) {
+          markActivationReady();
+          lastCols = next.cols;
+          lastRows = next.rows;
+          resizeFailureCount = 0;
+        }
+      } catch (error) {
+        if (!disposed) {
+          const failedSizeIsStillDesired =
+            desiredResize?.cols === next.cols && desiredResize?.rows === next.rows;
+          if (!failedSizeIsStillDesired) {
+            // A newer measurement superseded this failed request. Flush that
+            // value immediately instead of backing off an obsolete size.
+            resizeFailureCount = 0;
+          } else {
+            resizeFailureCount += 1;
+            if (resizeFailureCount <= 2) {
+              const delayMs = Math.min(1000, 100 * 2 ** (resizeFailureCount - 1));
+              resizeRetryTimer = setTimeout(() => {
+                resizeRetryTimer = null;
+                void flushResize();
+              }, delayMs);
+            } else {
+              // A persistent failure is surfaced in diagnostics but cannot create
+              // an infinite request/log loop. A later real layout change retries.
+              console.error('[XtermView] Failed to resize terminal after retries:', error);
+              desiredResize = null;
+              resizeFailureCount = 0;
+              onResizeFailureRef.current?.(error);
+            }
+          }
+        }
+      } finally {
+        resizeInFlight = false;
+        const desiredIsAcknowledged =
+          desiredResize?.cols === lastCols && desiredResize?.rows === lastRows;
+        if (!disposed && desiredResize && !desiredIsAcknowledged && !resizeRetryTimer) {
+          void flushResize();
+        }
+      }
+    };
+
+    const requestResize = (cols: number, rows: number): void => {
+      // Always record the newest measurement, including a return to the last
+      // acknowledged size while an older failed size is waiting in backoff.
+      desiredResize = { cols, rows };
+      if (cols === lastCols && rows === lastRows) {
+        if (resizeRetryTimer) {
+          clearTimeout(resizeRetryTimer);
+          resizeRetryTimer = null;
+        }
+        resizeFailureCount = 0;
+        return;
+      }
+      if (!resizeRetryTimer) void flushResize();
+    };
 
     // Fit only when the container is actually laid out, and only push a resize
     // to the PTY when the dimensions actually changed (avoids resize spam).
@@ -126,30 +315,36 @@ const XtermView: React.FC<XtermViewProps> = ({ sessionId, className, apiRef, onE
       } catch {
         return;
       }
+      // An exited session is a read-only scrollback viewer. Resizing a missing
+      // PTY returns 404 and used to be misreported as an activation failure.
+      if (!isRunning) return;
       if (term.cols !== lastCols || term.rows !== lastRows) {
-        lastCols = term.cols;
-        lastRows = term.rows;
-        void ipcBridge.terminal.resize.invoke({ id: sessionId, cols: term.cols, rows: term.rows });
+        requestResize(term.cols, term.rows);
       }
     };
 
     // Initial fit: defer past layout with a double rAF, and refit once the
     // monospace webfont is ready (font metrics change the cell size).
-    requestAnimationFrame(() => requestAnimationFrame(doFit));
+    let initialFitRaf = requestAnimationFrame(() => {
+      if (disposed) return;
+      initialFitRaf = requestAnimationFrame(doFit);
+    });
     if (typeof document !== 'undefined' && 'fonts' in document) {
       void (document as Document & { fonts: FontFaceSet }).fonts.ready.then(() => doFit());
     }
-
-    const sendInput = (text: string) => {
-      void ipcBridge.terminal.input.invoke({ id: sessionId, data_b64: encodeStringToBase64(text) });
-    };
 
     // Raw keystrokes → PTY. Also watch for a Ctrl+C burst: when a TUI wedges the
     // terminal, mashing Ctrl+C is the user's escape instinct, so a rapid burst
     // triggers the shell-fallback affordance (the single Ctrl+C is still sent).
     let ctrlCState: CtrlCState = createCtrlCState();
+    const queueRawInput = (data: string): void => {
+      // Pipeline failures already report once and switch the page to its visible
+      // recovery state; consume the per-keystroke rejection here.
+      void sendInput(data).catch(() => {});
+    };
     const dataDisposable = term.onData((data) => {
-      sendInput(data);
+      if (!isRunning) return;
+      queueRawInput(data);
       if (isCtrlC(data)) {
         const r = bumpCtrlC(ctrlCState, Date.now(), 1500, 3);
         ctrlCState = r.state;
@@ -173,16 +368,21 @@ const XtermView: React.FC<XtermViewProps> = ({ sessionId, className, apiRef, onE
         !e.altKey &&
         !e.metaKey
       ) {
-        sendInput('\n');
+        queueRawInput('\n');
         return false;
       }
       return true;
     });
 
     // Focus the terminal so it captures keystrokes immediately, and on click.
-    const focusTerminal = () => term.focus();
+    const focusTerminal = () => {
+      if (!disposed) term.focus();
+    };
     container.addEventListener('mousedown', focusTerminal);
-    requestAnimationFrame(() => requestAnimationFrame(focusTerminal));
+    let initialFocusRaf = requestAnimationFrame(() => {
+      if (disposed) return;
+      initialFocusRaf = requestAnimationFrame(focusTerminal);
+    });
 
     if (apiRef) {
       apiRef.current = {
@@ -256,7 +456,14 @@ const XtermView: React.FC<XtermViewProps> = ({ sessionId, className, apiRef, onE
 
     return () => {
       disposed = true;
+      const disposeError = new Error('Terminal view was disposed before queued input was written');
+      activeInputItem?.reject(disposeError);
+      activeInputItem = null;
+      failInputPipeline(disposeError, false);
       if (rafId) cancelAnimationFrame(rafId);
+      cancelAnimationFrame(initialFitRaf);
+      cancelAnimationFrame(initialFocusRaf);
+      if (resizeRetryTimer) clearTimeout(resizeRetryTimer);
       container.removeEventListener('mousedown', focusTerminal);
       document.removeEventListener('visibilitychange', onVisibility);
       dataDisposable.dispose();
@@ -267,7 +474,7 @@ const XtermView: React.FC<XtermViewProps> = ({ sessionId, className, apiRef, onE
       term.dispose();
       if (apiRef) apiRef.current = null;
     };
-  }, [sessionId, apiRef]);
+  }, [sessionId, apiRef, isRunning]);
 
   return <div ref={containerRef} className={`${styles.card} ${className ?? ''}`} style={{ overflow: 'hidden' }} />;
 };

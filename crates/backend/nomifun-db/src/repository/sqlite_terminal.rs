@@ -212,6 +212,36 @@ impl ITerminalRepository for SqliteTerminalRepository {
         Ok(())
     }
 
+    async fn update_launch_state(
+        &self,
+        id: &str,
+        command: &str,
+        args: &str,
+        backend: Option<&str>,
+        last_status: &str,
+        exit_code: Option<i64>,
+    ) -> Result<(), DbError> {
+        let result = sqlx::query(
+            "UPDATE terminal_sessions \
+             SET command = ?, args = ?, backend = ?, last_status = ?, \
+                 exit_code = ?, updated_at = ? \
+             WHERE id = ?",
+        )
+        .bind(command)
+        .bind(args)
+        .bind(backend)
+        .bind(last_status)
+        .bind(exit_code)
+        .bind(now_ms())
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("terminal session '{id}'")));
+        }
+        Ok(())
+    }
+
     async fn update_autowork(&self, id: &str, autowork: Option<&str>) -> Result<(), DbError> {
         let result = sqlx::query("UPDATE terminal_sessions SET autowork = ?, updated_at = ? WHERE id = ?")
             .bind(autowork)

@@ -5,11 +5,8 @@ import { useTranslation } from 'react-i18next';
 import { useLocation, useNavigate } from 'react-router-dom';
 
 import { ipcBridge } from '@/common';
-import { parseConversationId } from '@/common/types/ids';
 import {
-  conversationTarget,
   isSameSessionTarget,
-  terminalTarget,
   type SessionTarget,
 } from '@/common/types/ids';
 import InstantHoverTooltip from '@renderer/components/base/InstantHoverTooltip';
@@ -26,6 +23,7 @@ import type { SessionSiderStateDetail } from '@renderer/utils/workspace/sessionS
 import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
 import { useNavigationHistory } from '@/renderer/hooks/context/NavigationHistoryContext';
 import { isDesktopShell, isMacOS } from '@/renderer/utils/platform';
+import { parseSessionRoute } from '@/renderer/utils/routes/sessionRoute';
 import './titlebar.css';
 
 interface TitlebarProps {
@@ -85,14 +83,10 @@ const Titlebar: React.FC<TitlebarProps> = ({ workspaceAvailable }) => {
   const toolbarRef = useRef<HTMLDivElement | null>(null);
   const lastNonSettingsPathRef = useRef('/guid');
   const activeWorkspaceTarget = useMemo<SessionTarget | null>(() => {
-    const match = location.pathname.match(/^\/(conversation|terminal)\/([^/?#]+)/);
-    if (!match) return null;
-    try {
-      return match[1] === 'conversation' ? conversationTarget(match[2]) : terminalTarget(match[2]);
-    } catch {
-      return null;
-    }
+    return parseSessionRoute(location.pathname);
   }, [location.pathname]);
+  const activeConversationId =
+    activeWorkspaceTarget?.kind === 'conversation' ? activeWorkspaceTarget.id : null;
 
   // 监听工作空间折叠状态，保持按钮图标一致 / Sync workspace collapsed state for toggle button
   useEffect(() => {
@@ -237,16 +231,14 @@ const Titlebar: React.FC<TitlebarProps> = ({ workspaceAvailable }) => {
     }
 
     // Single agent mode: show conversation name
-    const match = location.pathname.match(/^\/conversation\/([^/]+)/);
-    const conversation_id = match?.[1];
-    if (!conversation_id) {
+    if (!activeConversationId) {
       setMobileCenterTitle(appTitle);
       return;
     }
 
     let cancelled = false;
     void ipcBridge.conversation.get
-      .invoke({ id: parseConversationId(conversation_id) })
+      .invoke({ id: activeConversationId })
       .then((conversation) => {
         if (cancelled) return;
         setMobileCenterTitle(conversation?.name || appTitle);
@@ -259,7 +251,7 @@ const Titlebar: React.FC<TitlebarProps> = ({ workspaceAvailable }) => {
     return () => {
       cancelled = true;
     };
-  }, [appTitle, layout?.isMobile, location.pathname]);
+  }, [activeConversationId, appTitle, layout?.isMobile]);
 
   useEffect(() => {
     if (!layout?.isMobile) {
@@ -399,10 +391,8 @@ const Titlebar: React.FC<TitlebarProps> = ({ workspaceAvailable }) => {
       >
         {layout?.isMobile &&
           (() => {
-            const conversationMatch = location.pathname.match(/^\/conversation\/([^/]+)/);
-            const conversation_id = conversationMatch?.[1];
-            if (conversation_id) {
-              return <MobileConversationBrand conversation_id={parseConversationId(conversation_id)} fallbackTitle={mobileCenterTitle} />;
+            if (activeConversationId) {
+              return <MobileConversationBrand conversation_id={activeConversationId} fallbackTitle={mobileCenterTitle} />;
             }
             return (
               <span className='app-titlebar__brand-mobile'>

@@ -38,16 +38,17 @@ const installSessionStorage = () => {
 describe('consumeQrLoginResume', () => {
   test('returns and removes a fresh QR login user', () => {
     const { store, restore } = installSessionStorage();
+    const userId = 'user_0190f5fe-7c00-7a00-8000-000000000001';
     try {
       store.set(
         QR_LOGIN_RESUME_KEY,
         JSON.stringify({
           at: 1_000,
-          user: { id: 'user_1', username: 'admin' },
+          user: { id: userId, username: 'admin' },
         })
       );
 
-      expect(consumeQrLoginResume(2_000)).toEqual({ id: 'user_1', username: 'admin' });
+      expect(consumeQrLoginResume(2_000)).toEqual({ id: userId, username: 'admin' });
       expect(store.has(QR_LOGIN_RESUME_KEY)).toBe(false);
     } finally {
       restore();
@@ -56,12 +57,13 @@ describe('consumeQrLoginResume', () => {
 
   test('ignores expired QR login resume data', () => {
     const { store, restore } = installSessionStorage();
+    const userId = 'user_0190f5fe-7c00-7a00-8000-000000000001';
     try {
       store.set(
         QR_LOGIN_RESUME_KEY,
         JSON.stringify({
           at: 1_000,
-          user: { id: 'user_1', username: 'admin' },
+          user: { id: userId, username: 'admin' },
         })
       );
 

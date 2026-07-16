@@ -37,6 +37,10 @@
   "fallbackShell": "Fall back to Shell",
   "fallbackShellTip": "Kill a stuck Claude / Codex and drop back to a clean shell in place (mashing Ctrl+C also triggers this)",
   "fallbackShellDone": "Fell back to a shell",
+  "loadNotFound": "Terminal session not found.",
+  "loadFailed": "Failed to load the terminal session.",
+  "activationFailed": "Failed to activate the terminal. Retry or relaunch the session.",
+  "inputFailed": "Failed to send terminal input.",
   "statusExited": "exited ({{code}})",
   "composerPlaceholder": "Type a command, then Send to run it in the terminal",
   "quickCommand": {

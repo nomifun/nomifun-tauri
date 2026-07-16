@@ -37,13 +37,35 @@ const CompanionPage = React.lazy(() => import('@renderer/pages/companion'));
 const MemoryPanelPage = React.lazy(() => import('@renderer/pages/memoryPanel'));
 const ConversationShell = React.lazy(() => import('@renderer/pages/conversation/components/ConversationShell'));
 
+const RouteFallback: React.FC<{ Component: React.LazyExoticComponent<React.ComponentType> }> = ({ Component }) => {
+  const location = useLocation();
+  const resetKey = `${location.pathname}${location.search}${location.hash}`;
+
+  return (
+    <RouteErrorBoundary resetKey={resetKey}>
+      <Suspense fallback={<AppLoader />}>
+        <Component />
+      </Suspense>
+    </RouteErrorBoundary>
+  );
+};
+
 const withRouteFallback = (Component: React.LazyExoticComponent<React.ComponentType>) => (
-  <RouteErrorBoundary>
-    <Suspense fallback={<AppLoader />}>
-      <Component />
-    </Suspense>
-  </RouteErrorBoundary>
+  <RouteFallback Component={Component} />
 );
+
+const SessionShellRoute: React.FC = () => {
+  const location = useLocation();
+  const resetKey = `${location.pathname}${location.search}${location.hash}`;
+
+  return (
+    <RouteErrorBoundary resetKey={resetKey}>
+      <Suspense fallback={<AppLoader />}>
+        <ConversationShell />
+      </Suspense>
+    </RouteErrorBoundary>
+  );
+};
 
 const withSearch = (path: string, searchParams: URLSearchParams) => {
   const search = searchParams.toString();
@@ -174,13 +196,7 @@ const PanelRoute: React.FC<{ layout: React.ReactElement }> = ({ layout }) => {
           <Route path='/presets' element={withRouteFallback(PresetSettings)} />
           <Route path='/skills' element={withRouteFallback(SkillsSettingsPage)} />
           {/* Session section — the secondary sidebar (ContentSider) persists across these routes */}
-          <Route
-            element={
-              <Suspense fallback={<AppLoader />}>
-                <ConversationShell />
-              </Suspense>
-            }
-          >
+          <Route element={<SessionShellRoute />}>
             <Route path='/guid' element={withRouteFallback(Guid)} />
             <Route path='/conversation/:id' element={withRouteFallback(Conversation)} />
             <Route path='/terminal-new' element={withRouteFallback(TerminalCreatePage)} />

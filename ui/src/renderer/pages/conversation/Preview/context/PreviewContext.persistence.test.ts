@@ -31,8 +31,8 @@ describe('preview persistence entity isolation', () => {
     expect(chatLayout.includes('key={previewScope}')).toBe(true);
     expect(chatLayout.includes("props.conversation_id ?? 'pending'")).toBe(false);
     expect(chatLayout.includes('conversation-pending:${uuid()}')).toBe(true);
-    expect(terminal.includes('persistNamespace={`terminal:${id}`}')).toBe(true);
-    expect(terminal.includes('key={`terminal:${id}`}')).toBe(true);
+    expect(terminal.includes('persistNamespace={`terminal:${sessionId}`}')).toBe(true);
+    expect(terminal.includes('<TerminalSessionContent key={sessionId} sessionId={sessionId} />')).toBe(true);
     expect(transcript.includes('conversation.execution_attempt_id ?? conversation.execution_step_id')).toBe(true);
     expect(transcript.includes('persistNamespace={`execution-transcript:${transcriptEntityId}`}')).toBe(true);
   });

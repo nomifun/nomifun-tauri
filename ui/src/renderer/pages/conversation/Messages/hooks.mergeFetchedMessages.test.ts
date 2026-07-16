@@ -326,7 +326,13 @@ describe('normalizeDbMessage', () => {
           knowledge_writeback: {
             status: 'written',
             updated_at: 20,
-            written: [{ kb_id: 'kb-1', rel_path: '_inbox/1/patterns/final.md', staged: true }],
+            written: [
+              {
+                kb_id: 'kb_0190f5fe-7c00-7a00-8000-000000000001',
+                rel_path: '_inbox/1/patterns/final.md',
+                staged: true,
+              },
+            ],
           },
         }) as any,
       })

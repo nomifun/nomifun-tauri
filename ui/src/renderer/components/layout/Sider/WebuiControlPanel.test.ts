@@ -31,11 +31,16 @@ describe('Open Capabilities WebUI entry', () => {
   test('moves the full WebUI control out of the crowded footer into the Open Capabilities page', () => {
     const footerSource = readSource(new URL('./SiderFooter.tsx', import.meta.url));
     const pageSource = readSource(new URL('../../../pages/openCapabilities/index.tsx', import.meta.url));
+    const webuiTabStart = pageSource.indexOf("<Tabs.TabPane key='webui'");
+    const mcpTabStart = pageSource.indexOf("<Tabs.TabPane key='mcp'");
+    const webuiTabSource = pageSource.slice(webuiTabStart, mcpTabStart);
 
     expect(footerSource.includes('SiderWebuiControl')).toBe(false);
-    expect(pageSource.includes("<WebuiControlPanel mode='page' />")).toBe(true);
-    expect(pageSource.includes('RegisterKnowledgeButton')).toBe(false);
-    expect(pageSource.includes('projectRegisterTitle')).toBe(false);
+    expect(webuiTabStart).toBeGreaterThan(-1);
+    expect(mcpTabStart).toBeGreaterThan(webuiTabStart);
+    expect(webuiTabSource.includes("<WebuiControlPanel mode='page' />")).toBe(true);
+    expect(webuiTabSource.includes('RegisterKnowledgeButton')).toBe(false);
+    expect(webuiTabSource.includes('projectRegisterTitle')).toBe(false);
   });
 
   test('splits WebUI and MCP into subtabs instead of coupling both surfaces on one page', () => {

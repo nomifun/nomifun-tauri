@@ -6,13 +6,14 @@
 
 import { ipcBridge } from '@/common';
 import type { TChatConversation } from '@/common/config/storage';
-import { parseConversationId, parseTerminalId, type ConversationId, type TerminalId } from '@/common/types/ids';
+import type { ConversationId, TerminalId } from '@/common/types/ids';
 import BatchActionBar from '@/renderer/components/base/BatchActionBar';
 import DirectorySelectionModal from '@/renderer/components/settings/DirectorySelectionModal';
 import { useConversationHistoryContext } from '@/renderer/hooks/context/ConversationHistoryContext';
 import { useCronJobsMap } from '@/renderer/pages/cron';
 import { useTerminalSessions } from '@/renderer/pages/terminal/useTerminalSessions';
 import { emitter } from '@/renderer/utils/emitter';
+import { parseSessionRoute } from '@/renderer/utils/routes/sessionRoute';
 import { scrollSidebarItemIntoView } from '@/renderer/utils/ui/scrollIntoView';
 import { cleanupSiderTooltips } from '@/renderer/utils/ui/siderTooltip';
 import { Empty, Input, Message, Modal } from '@arco-design/web-react';
@@ -124,12 +125,9 @@ const WorkpathSessionList: React.FC<WorkpathSessionListProps> = ({
   const workpathBranches = useWorkpathBranches(branchWorkpaths, displayPreferences.showGitBranch && !collapsed);
 
   // Active session from the route — used for row selected state and drawer expansion.
-  const routeMatch = pathname.match(/^\/(conversation|terminal)\/([^/?#]+)/);
-  const activeRouteKind = routeMatch ? routeMatch[1] : null;
-  const activeConversationId =
-    activeRouteKind === 'conversation' && routeMatch ? parseConversationId(routeMatch[2]) : null;
-  const activeTerminalId =
-    activeRouteKind === 'terminal' && routeMatch ? parseTerminalId(routeMatch[2]) : null;
+  const activeRoute = useMemo(() => parseSessionRoute(pathname), [pathname]);
+  const activeConversationId = activeRoute?.kind === 'conversation' ? activeRoute.id : null;
+  const activeTerminalId = activeRoute?.kind === 'terminal' ? activeRoute.id : null;
   const activeSessionId: ConversationId | TerminalId | null = activeConversationId ?? activeTerminalId;
 
   // Sync active-conversation bookkeeping + scroll it into view on route change
@@ -224,6 +222,7 @@ const WorkpathSessionList: React.FC<WorkpathSessionListProps> = ({
     handleMenuVisibleChange,
     handleOpenMenu,
   } = useConversationActions({
+    activeConversationId,
     batchMode,
     onSessionClick,
     onBatchModeChange,

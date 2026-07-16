@@ -74,10 +74,11 @@ describe('buildWorkpathTree', () => {
   });
   test('DB 顶层 pinned 列与 extra 冲突时列优先（经 fromApiConversation 镜像后入树）', () => {
     // 列说置顶（extra 说没置顶）→ 置顶；pinned_at 取列值
-    const colPinned = fromApiConversation({ ...(conv({ id: 'col-pin', modified_at: 10, extra: { workspace: '/p', custom_workspace: true, pinned: false, pinned_at: 999 } }) as Record<string, unknown>), pinned: true, pinned_at: 500 });
+    const colPinnedId = 'conv_0190f5fe-7c00-7a00-8000-000000000001';
+    const colPinned = fromApiConversation({ ...(conv({ id: colPinnedId, modified_at: 10, extra: { workspace: '/p', custom_workspace: true, pinned: false, pinned_at: 999 } }) as Record<string, unknown>), pinned: true, pinned_at: 500 });
     const plain = conv({ id: 'plain', modified_at: 90, extra: { workspace: '/p', custom_workspace: true } });
     const node = buildWorkpathTree([plain, colPinned as never], [], []).find((n) => n.key === '/p')!;
-    expect(node.interactive.map((s) => s.id)).toEqual(['col-pin', 'plain']);
+    expect(node.interactive.map((s) => s.id)).toEqual([colPinnedId, 'plain']);
     expect(node.interactive[0].pinnedAt).toBe(500);
   });
 });
