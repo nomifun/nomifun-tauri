@@ -69,6 +69,8 @@ pub struct OpenAISpeechToTextConfig {
     pub api_key: String,
     #[serde(default)]
     pub base_url: Option<String>,
+    #[serde(default)]
+    pub is_full_url: bool,
     pub model: String,
     #[serde(default)]
     pub language: Option<String>,

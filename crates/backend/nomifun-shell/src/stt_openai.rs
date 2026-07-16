@@ -1,4 +1,7 @@
-use nomifun_api_types::{OpenAISpeechToTextConfig, SpeechToTextProvider, SpeechToTextResult};
+use nomifun_api_types::{
+    ModelTask, OpenAISpeechToTextConfig, SpeechToTextProvider, SpeechToTextResult,
+    resolve_dispatch_target,
+};
 use reqwest::Client;
 
 use crate::error::SttError;
@@ -22,7 +25,14 @@ pub async fn transcribe(
         .as_deref()
         .unwrap_or(DEFAULT_BASE_URL)
         .trim_end_matches('/');
-    let url = format!("{base_url}/v1/audio/transcriptions");
+    let url = resolve_dispatch_target(
+        "openai-compatible",
+        base_url,
+        config.is_full_url,
+        ModelTask::SpeechRecognition,
+        &serde_json::Value::Null,
+    )
+    .url;
 
     let file_part = reqwest::multipart::Part::bytes(audio_data)
         .file_name(file_name.to_owned())
@@ -31,7 +41,10 @@ pub async fn transcribe(
 
     let mut form = reqwest::multipart::Form::new()
         .part("file", file_part)
-        .text("model", config.model.clone());
+        .text("model", config.model.clone())
+        // OpenAI defaults this to JSON, but StepFun's `step-asr` contract
+        // requires the field explicitly.
+        .text("response_format", "json");
 
     let language = language_hint.or(config.language.as_deref()).filter(|s| !s.is_empty());
     if let Some(lang) = language {
@@ -52,18 +65,18 @@ pub async fn transcribe(
         .multipart(form)
         .send()
         .await
-        .map_err(|e| SttError::RequestFailed(format!("OpenAI request error: {e}")))?;
+        .map_err(|e| SttError::RequestFailed(format!("speech recognition request error: {e}")))?;
 
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_else(|_| "<unreadable>".to_owned());
-        return Err(SttError::RequestFailed(format!("OpenAI API returned {status}: {body}")));
+        return Err(SttError::RequestFailed(format!("speech recognition API returned {status}: {body}")));
     }
 
     let body: serde_json::Value = response
         .json()
         .await
-        .map_err(|e| SttError::RequestFailed(format!("failed to parse OpenAI response: {e}")))?;
+        .map_err(|e| SttError::RequestFailed(format!("failed to parse speech recognition response: {e}")))?;
 
     let text = body["text"].as_str().unwrap_or("").to_owned();
 
@@ -89,6 +102,7 @@ mod tests {
         let config = OpenAISpeechToTextConfig {
             api_key: String::new(),
             base_url: None,
+            is_full_url: false,
             model: "whisper-1".into(),
             language: None,
             prompt: None,
@@ -96,5 +110,29 @@ mod tests {
         };
         let result = transcribe(&Client::new(), &config, vec![0u8; 10], "test.wav", "audio/wav", None).await;
         assert!(matches!(result, Err(SttError::OpenaiNotConfigured)));
+    }
+
+    #[test]
+    fn versioned_base_url_is_normalized_once() {
+        let target = resolve_dispatch_target(
+            "stepfun",
+            "https://api.stepfun.com/v1",
+            false,
+            ModelTask::SpeechRecognition,
+            &serde_json::Value::Null,
+        );
+        assert_eq!(target.url, "https://api.stepfun.com/v1/audio/transcriptions");
+    }
+
+    #[test]
+    fn full_transcription_url_is_preserved() {
+        let target = resolve_dispatch_target(
+            "custom",
+            "https://gateway.example/custom/transcribe",
+            true,
+            ModelTask::SpeechRecognition,
+            &serde_json::Value::Null,
+        );
+        assert_eq!(target.url, "https://gateway.example/custom/transcribe");
     }
 }

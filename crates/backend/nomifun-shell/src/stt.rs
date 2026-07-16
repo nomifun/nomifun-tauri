@@ -93,6 +93,7 @@ mod tests {
             openai: Some(OpenAISpeechToTextConfig {
                 api_key: api_key.to_owned(),
                 base_url: None,
+                is_full_url: false,
                 model: "whisper-1".into(),
                 language: None,
                 prompt: None,

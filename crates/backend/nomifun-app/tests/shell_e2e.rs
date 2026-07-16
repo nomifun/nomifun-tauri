@@ -4,7 +4,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
 use tower::ServiceExt;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{body_json, build_app_with_noop_opener, json_with_token, setup_and_login};
@@ -643,6 +643,60 @@ async fn st11_configured_provider_is_resolved_by_id() {
     let body = body_json(resp).await;
     assert_eq!(body["data"]["text"], "provider reference works");
     assert_eq!(body["data"]["model"], "whisper-1");
+}
+
+#[tokio::test]
+async fn st12_stepfun_provider_uses_single_version_prefix_and_required_form_fields() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .and(header("Authorization", "Bearer sk-stepfun-provider"))
+        .and(body_string_contains("name=\"model\""))
+        .and(body_string_contains("step-asr"))
+        .and(body_string_contains("name=\"response_format\""))
+        .and(body_string_contains("json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "text": "阶跃端到端转写成功" })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let (mut app, services) = build_app_with_noop_opener().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let provider_id = create_provider(
+        &mut app,
+        &token,
+        &csrf,
+        "StepFun",
+        &format!("{}/v1", mock_server.uri()),
+        "sk-stepfun-provider",
+        &["step-asr"],
+    )
+    .await;
+    set_stt_config(
+        &mut app,
+        &token,
+        &csrf,
+        json!({
+            "enabled": true,
+            "provider": "openai",
+            "provider_id": provider_id,
+            "model": "step-asr"
+        }),
+    )
+    .await;
+
+    let (content_type, body) = MultipartBuilder::new()
+        .add_file("file", "speech.wav", "audio/wav", b"fake stepfun audio")
+        .add_text("fileName", "speech.wav")
+        .add_text("mimeType", "audio/wav")
+        .build();
+
+    let req = multipart_request("/api/stt", &content_type, body, &token, &csrf);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["data"]["text"], "阶跃端到端转写成功");
+    assert_eq!(body["data"]["model"], "step-asr");
 }
 
 // ST-10: languageHint passed through

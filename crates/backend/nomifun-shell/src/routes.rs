@@ -341,6 +341,7 @@ fn speech_to_text_config_from_preferences(prefs: &ClientPreferencesResponse) -> 
             openai: Some(OpenAISpeechToTextConfig {
                 api_key: provider.api_key,
                 base_url: Some(provider.base_url),
+                is_full_url: provider.is_full_url,
                 model,
                 language: language.clone(),
                 prompt: None,

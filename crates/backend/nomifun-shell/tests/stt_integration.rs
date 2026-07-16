@@ -2,7 +2,7 @@ use nomifun_api_types::{
     DeepgramSpeechToTextConfig, OpenAISpeechToTextConfig, SpeechToTextConfig, SpeechToTextProvider,
 };
 use nomifun_shell::{SttError, SttService};
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn dummy_audio() -> Vec<u8> {
@@ -41,6 +41,7 @@ async fn st1_openai_transcribe_success() {
         openai: Some(OpenAISpeechToTextConfig {
             api_key: "sk-test-key".into(),
             base_url: Some(mock_server.uri()),
+            is_full_url: false,
             model: "whisper-1".into(),
             language: None,
             prompt: None,
@@ -57,6 +58,53 @@ async fn st1_openai_transcribe_success() {
     assert_eq!(result.text, "hello world");
     assert_eq!(result.model, "whisper-1");
     assert_eq!(result.provider, SpeechToTextProvider::Openai);
+}
+
+// ---------------------------------------------------------------------------
+// ST-1b: StepFun versioned base — no duplicated /v1 + required response format
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn st1b_stepfun_versioned_base_uses_the_real_transcription_endpoint() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .and(header("Authorization", "Bearer sk-stepfun-key"))
+        .and(body_string_contains("name=\"model\""))
+        .and(body_string_contains("step-asr"))
+        .and(body_string_contains("name=\"response_format\""))
+        .and(body_string_contains("json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "text": "阶跃转写成功" })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = SpeechToTextConfig {
+        enabled: true,
+        provider: SpeechToTextProvider::Openai,
+        provider_id: None,
+        model: Some("step-asr".into()),
+        language: None,
+        auto_send: None,
+        openai: Some(OpenAISpeechToTextConfig {
+            api_key: "sk-stepfun-key".into(),
+            base_url: Some(format!("{}/v1", mock_server.uri())),
+            is_full_url: false,
+            model: "step-asr".into(),
+            language: None,
+            prompt: None,
+            temperature: None,
+        }),
+        deepgram: None,
+    };
+
+    let result = stt_service()
+        .transcribe(dummy_audio(), "speech.wav", "audio/wav", None, &config)
+        .await
+        .unwrap();
+
+    assert_eq!(result.text, "阶跃转写成功");
+    assert_eq!(result.model, "step-asr");
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +213,7 @@ async fn st5_openai_empty_api_key() {
         openai: Some(OpenAISpeechToTextConfig {
             api_key: String::new(),
             base_url: None,
+            is_full_url: false,
             model: "whisper-1".into(),
             language: None,
             prompt: None,
@@ -279,6 +328,7 @@ async fn st7_openai_upstream_failure() {
         openai: Some(OpenAISpeechToTextConfig {
             api_key: "sk-invalid".into(),
             base_url: Some(mock_server.uri()),
+            is_full_url: false,
             model: "whisper-1".into(),
             language: None,
             prompt: None,
@@ -366,6 +416,7 @@ async fn st10_openai_language_hint_passed() {
         openai: Some(OpenAISpeechToTextConfig {
             api_key: "sk-test".into(),
             base_url: Some(mock_server.uri()),
+            is_full_url: false,
             model: "whisper-1".into(),
             language: Some("en".into()),
             prompt: None,
@@ -455,6 +506,7 @@ async fn openai_with_all_optional_params() {
         openai: Some(OpenAISpeechToTextConfig {
             api_key: "sk-full".into(),
             base_url: Some(mock_server.uri()),
+            is_full_url: false,
             model: "whisper-1".into(),
             language: Some("en".into()),
             prompt: Some("technical terms".into()),
