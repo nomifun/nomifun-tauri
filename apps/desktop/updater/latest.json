@@ -1,23 +1,11 @@
 {
-  "version": "0.2.26",
-  "notes": "macOS 首发：修复托管免费模型流式响应兼容；优化需求看板布局。",
-  "pub_date": "2026-07-17T16:26:35.388Z",
+  "version": "0.2.27",
+  "notes": "Windows 首发：优化需求看板卡片元数据布局，并补充需求看板视觉回归覆盖。",
+  "pub_date": "2026-07-17T17:31:05.251Z",
   "platforms": {
-    "darwin-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxOCtKR0RyZ0c4Y2Rac2dWQllibkpPNURxNkxNNzBEUVl2Z3hoM0llY28xdnBEUGNPdno5MDFyaWFNTVZWa0ttNEQ4SkpEVWw3SHRSdW41NzFNSXhUL2dZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0MzAxNjU4CWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6Ckd5QzBibTc4VnFRS2luUWpCaGN2S3JGVlViYzAzd1doNzBuK0U2VDlZRnl5WjJqVFYrWStEZG56ekl1VWc5WXJpaDB5aVd3aFRHYWZCQnJRVlFHZUFnPT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.26/NomiFun.app.tar.gz"
-    },
-    "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxOCtKR0RyZ0c4Y2Rac2dWQllibkpPNURxNkxNNzBEUVl2Z3hoM0llY28xdnBEUGNPdno5MDFyaWFNTVZWa0ttNEQ4SkpEVWw3SHRSdW41NzFNSXhUL2dZPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0MzAxNjU4CWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6Ckd5QzBibTc4VnFRS2luUWpCaGN2S3JGVlViYzAzd1doNzBuK0U2VDlZRnl5WjJqVFYrWStEZG56ekl1VWc5WXJpaDB5aVd3aFRHYWZCQnJRVlFHZUFnPT0K",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.26/NomiFun.app.tar.gz"
-    },
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODNaTnBMTFJYWmhhTzI5S3dydnY3S0IzVnVQd3BCRytVbmRRd1RjY1paa2JTb2IzeHRLampSVVN6cUE4ZWh0MERid2RydncrMUZSVjRNaENVRFArckE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0MzAzMTU0CWZpbGU6Tm9taUZ1bl8wLjIuMjZfeDY0LXNldHVwLmV4ZQpBY2VHdC9BRDBLRFVXcGxUSGRYM01EdkllOFpkRGE2NnFvcjFPVTd5aFpYNk1kRHpvRSs2RzJmeS80NVZkbGYvWDc1QnFaS0xnN2pXWVk2ekJBVUxDQT09Cg==",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.26/NomiFun_0.2.26_x64-setup.exe"
-    },
-    "linux-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODZWa3I3aWdHMEtFTm83M2hRWDVKcE9RbXBBd2tYdUNPYUEveVgyNmFSY2ZQbDBpUTZyQzVSaVA5bkdWVVhQVnpLVGh0bWFnWXgxa0ZqbUJVMVV5c2djPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0MzA1NTY5CWZpbGU6Tm9taUZ1bl8wLjIuMjZfYW1kNjQuQXBwSW1hZ2UKQ2NkVVJMQXNYc1ArbVVVRlZaY0FBVHBTSlBGSzNRUnZTL3IxdnpoMUw1d0Z0VWxFZnRrU3o4aWtCcnFwM3ErS1lUSVlnWUFUdjh6dkZUMktXa2lSQVE9PQo=",
-      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.26/NomiFun_0.2.26_amd64.AppImage"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxOHdLN092M2tJQlVmbU9reW1yQXZnZmxIOFZvQ2NMTVVtZHpiSUViVFlRb2pwbmttRmhnZDhvQ0dTc0ZvaGxFU3AxYlR6UkxuUG1GRGdraFdIL1E4NlFFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0MzA5NDYzCWZpbGU6Tm9taUZ1bl8wLjIuMjdfeDY0LXNldHVwLmV4ZQpJYXd6dm4veFZUQVZwMVNWalBvVi9mViszWTBLSTNHT0FiL1RmMElqRlIxelYyM082WmJFbU1GaVE5SENwOUxkVytrWkRWQldHWTdvWEFVVUJvTGNEdz09Cg==",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.27/NomiFun_0.2.27_x64-setup.exe"
     }
   }
 }
