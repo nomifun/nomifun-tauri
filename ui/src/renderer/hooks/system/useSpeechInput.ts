@@ -6,7 +6,6 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLatestRef } from '@/renderer/hooks/ui/useLatestRef';
-import { convertRecordedAudioToWav } from '@/renderer/services/RecordedAudioWav';
 import { transcribeAudioBlob } from '@/renderer/services/SpeechToTextService';
 import { isDesktopShell } from '@/renderer/utils/platform';
 import {
@@ -19,7 +18,6 @@ export type SpeechInputStatus = 'idle' | 'recording' | 'transcribing' | 'error';
 export type SpeechInputErrorCode =
   | 'aborted'
   | 'audio-capture'
-  | 'audio-normalization'
   | 'empty-transcript'
   | 'file-too-large'
   | 'network'
@@ -313,24 +311,9 @@ export const useSpeechInput = ({ locale, onTranscript }: UseSpeechInputOptions) 
 
   const transcribeRecordedBlob = useCallback(
     async (blob: Blob) => {
-      let normalizedBlob: Blob;
-      try {
-        normalizedBlob = await convertRecordedAudioToWav(blob);
-      } catch (error) {
-        // Local whisper.cpp intentionally accepts only WAV/MP3/OGG/FLAC.
-        // Uploading the original WebM/MP4 recording after normalization fails
-        // would be routed to an active local model and fail opaquely, without a
-        // safe way for the client to know whether cloud fallback is configured.
-        console.warn('[speech-input] Failed to normalize recording to WAV', error);
-        setErrorCode('audio-normalization');
-        setErrorMessage(null);
-        setStatus('error');
-        resetSpeechVisualizer();
-        return;
-      }
-      await transcribeBlob(normalizedBlob);
+      await transcribeBlob(blob);
     },
-    [resetSpeechVisualizer, transcribeBlob]
+    [transcribeBlob]
   );
 
   const startRecording = useCallback(async () => {

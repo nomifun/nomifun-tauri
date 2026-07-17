@@ -9,7 +9,7 @@ import { readFileSync } from 'node:fs';
 
 const readSource = (url: URL): string => readFileSync(url, 'utf8');
 
-describe('speech input local-format handling', () => {
+describe('speech input recording handling', () => {
   test('keeps the microphone button dedicated to live recording', () => {
     const button = readSource(
       new URL('../../components/chat/SpeechInputButton.tsx', import.meta.url)
@@ -27,13 +27,11 @@ describe('speech input local-format handling', () => {
     expect(plist.includes('voice input')).toBe(true);
   });
 
-  test('does not upload an unsupported original recording when WAV normalization fails', () => {
+  test('submits the browser recording to the configured cloud service', () => {
     const hook = readSource(new URL('./useSpeechInput.ts', import.meta.url));
 
-    expect(hook.includes("setErrorCode('audio-normalization')")).toBe(true);
-    expect(hook.includes('using original audio')).toBe(false);
-    expect(hook.includes('normalizedBlob = await convertRecordedAudioToWav(blob)')).toBe(true);
-    expect(hook.includes('await transcribeBlob(normalizedBlob)')).toBe(true);
+    expect(hook.includes('await transcribeBlob(blob)')).toBe(true);
+    expect(hook.includes('convertRecordedAudioToWav')).toBe(false);
   });
 
   test('uses the shared speech-to-text configuration event constant', () => {
@@ -50,14 +48,13 @@ describe('speech input local-format handling', () => {
     ).toBe(false);
   });
 
-  test('does not expose a stale cloud or local speech selection', () => {
+  test('does not expose a stale cloud speech selection', () => {
     const button = readSource(
       new URL('../../components/chat/SpeechInputButton.tsx', import.meta.url)
     );
 
     expect(button.includes('selectedCloudProvider.models.includes(config.model)')).toBe(true);
     expect(button.includes('selectedCloudProvider.model_enabled?.[config.model] !== false')).toBe(true);
-    expect(button.includes('config.model === status.activeModelId')).toBe(true);
   });
 
   test('does not opt the desktop multipart request into credentialed CORS', () => {

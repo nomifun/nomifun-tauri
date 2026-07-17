@@ -37,9 +37,7 @@ describe('model-owned tool configuration placement', () => {
 
     expect(hubSource.includes("key: 'speech'")).toBe(true);
     expect(hubSource.includes('<SpeechToTextContent />')).toBe(true);
-    expect(speechSource.includes("localAsr.status?.activeModelId")).toBe(true);
     expect(speechSource.includes('useProvidersQuery()')).toBe(true);
-    expect(speechSource.includes("navigate('/models?section=local&capability=speech_recognition')")).toBe(true);
     expect(creationSource.includes('ImageGenerationToolSettings')).toBe(false);
     expect(providerSource.includes('SpeechToTextCloudSettings')).toBe(false);
   });

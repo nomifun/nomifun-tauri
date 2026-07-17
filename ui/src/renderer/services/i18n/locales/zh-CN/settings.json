@@ -1195,11 +1195,10 @@
   },
   "modelHub": {
     "title": "模型管理",
-    "subtitle": "按使用方式选择免费、本地或供应商模型。",
+    "subtitle": "按使用方式选择免费模型或供应商模型。",
     "railTitle": "模型管理",
     "sectionModels": "供应商模型",
     "sectionFree": "免费模型",
-    "sectionLocal": "本地模型",
     "sectionCreation": "创作能力",
     "sectionGlobal": "全局模型设置",
     "globalConfigTip": "IDMM、旁路模型、记忆总结、伙伴对话等全局默认模型对话配置入口。",
@@ -1288,223 +1287,6 @@
         "failed": "模型可用性检测失败，请稍后重试"
       }
     },
-    "local": {
-      "title": "本地模型",
-      "providerId": "由 NomiFun 自动下载安装，无需另装 Ollama。",
-      "capabilityCenter": {
-        "subtitle": "本地隐私运行，仅在你选择时下载",
-        "tabs": {
-          "text": "文本理解",
-          "image": "图片生成",
-          "speechRecognition": "语音识别",
-          "speechSynthesis": "语音合成"
-        },
-        "planned": "规划中",
-        "plannedHint": "该本地能力正在规划中，当前版本暂不可用。",
-        "availableModels": "{{count}} 个可用模型",
-        "installedModels": "已安装 {{count}} 个",
-        "runtimeReady": "运行环境已就绪",
-        "runtimeOnDemand": "使用时启动",
-        "details": "模型详情",
-        "collapseDetails": "收起详情",
-        "backgroundRunning": "正在后台下载",
-        "needsAttention": "需要处理"
-      },
-      "privacyTitle": "对话数据留在本机",
-      "privacyNotice": "提示词和回复只在此设备处理；首次使用时需要联网下载模型和运行组件。",
-      "scopeNotice": "适合日常问答和轻量任务；复杂推理、长任务或高可靠工具调用，建议使用供应商模型。",
-      "refresh": "刷新状态",
-      "refreshHint": "重新检查已下载模型和本地运行状态",
-      "loading": "正在检查本地模型",
-      "loadFailed": "暂时无法使用本地模型",
-      "loadFailedHint": "本地服务可能仍在启动，或当前设备暂不支持。请稍后重试。",
-      "empty": "暂时没有可安装的模型",
-      "emptyHint": "当前内置目录为空，请更新 NomiFun 后重试。",
-      "catalogTitle": "选择要安装的模型",
-      "singleModelHint": "建议先选推荐型号；一次只启用一个模型，切换时会自动停止当前模型。",
-      "modelCount": "{{count}} 个模型",
-      "recommended": "推荐",
-      "active": "当前使用",
-      "activeModel": "当前：{{model}}",
-      "actionFailed": "操作失败，请稍后重试",
-      "installSuccess": "已开始下载，完成后会自动启用并出现在模型选择器中",
-      "resumeSuccess": "已继续下载",
-      "cancelSuccess": "下载已暂停，断点将被保留",
-      "activateSuccess": "本地模型已启用",
-      "deactivateSuccess": "本地模型已停止",
-      "deleteSuccess": "本地模型文件已删除",
-      "deleteConfirmTitle": "删除本地模型？",
-      "deleteConfirmContent": "将删除 {{model}} 的本地文件；以后仍可重新下载。",
-      "deleteModelLabel": "删除 {{model}}",
-      "phase": {
-        "notInstalled": "未安装",
-        "downloading": "下载中",
-        "verifying": "校验中",
-        "installed": "已安装",
-        "paused": "已暂停",
-        "failed": "安装失败"
-      },
-      "runtime": {
-        "title": "本地运行引擎",
-        "auto": "自动适配设备",
-        "onDemand": "首次使用时下载",
-        "checking": "检查中",
-        "stopped": "未运行",
-        "starting": "启动中",
-        "ready": "运行中",
-        "stopping": "停止中",
-        "failed": "运行异常"
-      },
-      "action": {
-        "install": "下载安装",
-        "cancel": "暂停下载",
-        "resume": "继续下载",
-        "retry": "重试",
-        "activate": "启用",
-        "deactivate": "停止",
-        "delete": "删除"
-      },
-      "metadata": {
-        "download": "模型文件 {{size}}",
-        "memory": "建议可用内存 {{size}}",
-        "context": "上下文上限 {{tokens}} tokens",
-        "source": "模型来源：{{source}}"
-      },
-      "capability": {
-        "chat": "支持对话",
-        "functionCalling": "工具调用",
-        "vision": "看图与图片理解"
-      },
-      "progress": {
-        "runtime": "正在准备推理运行时",
-        "model": "正在下载模型",
-        "asrAuxiliary": "正在下载语音切分组件",
-        "visionProjector": "正在下载图片理解组件",
-        "preparing": "准备中",
-        "verifyingHint": "正在校验文件完整性，请勿退出 NomiFun。"
-      },
-      "error": {
-        "network": "网络连接失败，可保留断点后重试",
-        "insufficientSpace": "磁盘可用空间不足",
-        "checksumMismatch": "文件校验失败，请重新下载",
-        "unsupportedPlatform": "当前系统或处理器暂不受支持",
-        "runtimeUnavailable": "本地推理运行时不可用",
-        "busy": "另一个本地模型操作正在进行",
-        "notFound": "模型或本地文件不存在",
-        "unknown": "本地模型操作失败"
-      },
-      "image": {
-        "title": "本地图片生成",
-        "subtitle": "在 NomiFun 内下载 Z-Image Turbo，图片生成全程在本机完成。",
-        "refresh": "刷新状态",
-        "refreshHint": "重新检查图片模型文件、完整性与运行状态",
-        "onDemandTitle": "由你决定何时下载。",
-        "onDemandNotice": "只有点击“下载安装”后，才会实时下载约 6 GB 的完整组件包；不会预装或静默下载。暂停会保留已完成文件和下载断点。",
-        "loading": "正在检查本地图片生成能力",
-        "loadFailed": "无法读取本地图片模型状态",
-        "loadFailedHint": "本地服务可能仍在启动，请稍后刷新。",
-        "empty": "暂时没有可安装的图片模型",
-        "emptyHint": "请更新 NomiFun 以获取内置图片模型目录。",
-        "recommended": "推荐",
-        "catalogDescription": "面向民用电脑的 Z-Image Turbo 轻量组合，使用 Q3_K 扩散模型与 Qwen3 4B 文本编码器，适合快速本地文生图。",
-        "actionFailed": "图片模型操作失败，请稍后重试",
-        "installSuccess": "已开始下载；安装完成后会自动出现在“创作模型”中",
-        "pauseSuccess": "下载已暂停，已完成文件和断点均已保留",
-        "resumeSuccess": "已从保留的断点继续下载",
-        "deleteSuccess": "本地图片模型文件已删除",
-        "deleteConfirmTitle": "删除本地图片模型？",
-        "deleteConfirmContent": "将删除 {{model}} 的运行时、三个模型组件及下载断点；以后仍可重新下载。",
-        "deleteModelLabel": "删除 {{model}}",
-        "readiness": {
-          "artifacts": "安装组件包",
-          "artifactsReady": "运行时与三个模型组件均已完整安装",
-          "artifactsMissing": "下载或安装尚未完成",
-          "installed": "已安装",
-          "notInstalled": "未就绪",
-          "runtime": "创作就绪状态",
-          "unsupportedHint": "当前平台没有可用的图片运行时安装包。本版本支持 Windows / Linux x64 与 Apple 芯片 Mac；此设备不会开始下载。",
-          "runtimeFailedHint": "已安装的运行时无法使用，请重新安装；若仍然失败，当前设备或显卡驱动可能不支持这个运行时安装包。",
-          "integrityPendingHint": "已经安装并加入“创作模型”。本次启动首次生成前，NomiFun 会执行完整的 SHA-256 校验，通过后才启动推理；此过程不会重新下载组件包。",
-          "generatingHint": "正在生成本地图片。重型本地 AI 任务一次只运行一个。",
-          "creationReadyHint": "完整性校验已通过，可在“创作模型”中选择 Z-Image Turbo 进行本地生成。"
-        },
-        "phase": {
-          "notInstalled": "未安装",
-          "downloading": "下载中",
-          "verifying": "校验中",
-          "extracting": "正在安装运行时",
-          "installed": "已安装",
-          "paused": "已暂停",
-          "failed": "安装失败"
-        },
-        "runtime": {
-          "checking": "检查中",
-          "onDemand": "使用时启动",
-          "integrityPending": "待首次使用校验",
-          "ready": "完整性已校验",
-          "busy": "正在生成",
-          "failed": "运行异常",
-          "unsupported": "当前平台不支持"
-        },
-        "component": {
-          "runtime": "stable-diffusion.cpp 运行时",
-          "diffusionModel": "Z-Image 扩散模型",
-          "textEncoder": "Qwen3 4B 文本编码器",
-          "vae": "VAE 图片解码器"
-        },
-        "action": {
-          "install": "下载安装",
-          "pause": "暂停下载",
-          "resume": "继续下载",
-          "retry": "重新安装",
-          "delete": "删除"
-        },
-        "metadata": {
-          "downloadApprox": "约 6 GB（当前平台 {{size}}）",
-          "memory": "建议可用内存 {{size}}",
-          "license": "许可证：{{license}}",
-          "source": "来源：{{source}}"
-        },
-        "progress": {
-          "bundle": "运行时 + 3 个模型组件",
-          "preparing": "准备中"
-        },
-        "notice": {
-          "title": "第三方组件声明",
-          "vae": "扩散模型和文本编码器采用 Apache-2.0，运行时采用 MIT。固定 VAE 来自 Comfy-Org/z_image_turbo，其仓库卡未声明许可证；再分发前必须保留并复核上游声明。"
-        },
-        "error": {
-          "network": "网络连接失败，可从保留的断点继续",
-          "insufficientSpace": "磁盘空间不足，需容纳约 6 GB 组件包及安装预留空间",
-          "checksumMismatch": "组件未通过 SHA-256 校验，请重新安装",
-          "unsupportedPlatform": "当前系统或处理器没有受支持的图片运行时",
-          "runtimeUnavailable": "本地图片生成运行时不可用",
-          "busy": "另一个本地 AI 任务正在占用运行时",
-          "notFound": "图片模型或本地文件不存在",
-          "unknown": "本地图片模型操作失败"
-        }
-      },
-      "asr": {
-        "title": "本地语音识别",
-        "subtitle": "下载后即可在 NomiFun 输入框中离线录音转文字；中文优先推荐 Paraformer，通用多语言仍可选择 Whisper。",
-        "chineseRecommended": "中文推荐",
-        "catalogTitle": "选择语音识别模型",
-        "loading": "正在检查本地语音识别能力",
-        "loadFailed": "无法读取本地语音识别模型状态",
-        "loadFailedHint": "本地服务可能仍在启动，请稍后刷新。",
-        "empty": "暂时没有可安装的语音识别模型",
-        "emptyHint": "请更新 NomiFun 以获取内置语音识别模型目录。",
-        "actionFailed": "语音识别模型操作失败，请稍后重试",
-        "installSuccess": "已开始下载；安装完成后会自动启用输入框语音转文字",
-        "resumeSuccess": "已继续下载语音识别模型",
-        "cancelSuccess": "下载已暂停，断点将被保留",
-        "activateSuccess": "本地语音识别已启用，输入框会显示麦克风按钮",
-        "deactivateSuccess": "本地语音识别已停止",
-        "deleteSuccess": "本地语音识别模型文件已删除",
-        "deleteConfirmTitle": "删除本地语音识别模型？",
-        "deleteConfirmContent": "将删除 {{model}} 的本地文件；以后仍可重新下载。"
-      }
-    },
     "creation": {
       "title": "创作能力",
       "note": "创意工坊按模型名自动识别图像/视频生成能力,作为建议默认值。若某平台模型未被识别,可在下方将整个平台标记为对应能力。",
@@ -1523,15 +1305,13 @@
     "sectionSpeech": "语音转文字",
     "speech": {
       "title": "语音转文字",
-      "subtitle": "选择一个已就绪的本地 ASR 模型或已录入的云端语音模型。",
-      "local": "本地模型",
+      "subtitle": "选择一个已录入的云端语音模型。",
       "cloud": "云端供应商",
       "source": "默认转写模型",
       "defaultLanguage": "默认语言",
       "languagePlaceholder": "留空则自动识别，例如 zh、en",
       "enabled": "在输入框中启用语音转文字",
-      "noSources": "暂无可用的语音转文字模型。请先启用本地 ASR，或在供应商中录入语音识别模型。",
-      "manageLocal": "管理本地 ASR",
+      "noSources": "暂无可用的语音转文字模型，请先在供应商中录入语音识别模型。",
       "manageProviders": "管理供应商模型"
     }
   },

@@ -25,7 +25,7 @@ export interface ResultViewProps {
   mode: GenMode;
   resultAssetIds: AssetId[];
   batch?: WorkshopGeneratorBatch;
-  onContinueEdit?: (instruction: string) => void;
+  onContinueEdit: (instruction: string) => void;
   onToTextNode: (content: string) => void;
 }
 
@@ -163,15 +163,7 @@ const ResultView: React.FC<ResultViewProps> = ({ mode, resultAssetIds, batch, on
           </span>
         )}
       </div>
-      {onContinueEdit ? (
-        <ContinueBox onSubmit={onContinueEdit} />
-      ) : (
-        <div className='rounded-8px bg-[var(--color-fill-1)] px-9px py-6px text-11px leading-17px text-[var(--color-text-2)]'>
-          {t('workshopGeneration.result.localContinueUnavailable', {
-            defaultValue: '本地 Z-Image 当前仅支持文生图，暂不支持继续编辑图片',
-          })}
-        </div>
-      )}
+      <ContinueBox onSubmit={onContinueEdit} />
     </div>
   );
 };

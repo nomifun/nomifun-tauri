@@ -5,7 +5,7 @@
  */
 
 import { Button, Empty, Form, Input, Switch } from '@arco-design/web-react';
-import { DataServer, HeadsetOne, LinkCloud } from '@icon-park/react';
+import { HeadsetOne, LinkCloud } from '@icon-park/react';
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
@@ -22,7 +22,6 @@ import {
   SPEECH_TO_TEXT_CONFIG_CHANGED_EVENT,
 } from '@/renderer/services/speechToTextConfig';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
-import { useLocalAsrModels } from './useLocalAsrModels';
 import type { ProviderId } from '@/common/types/ids';
 import { useModelSelectorProviderLabel } from '@/renderer/hooks/agent/useModelSelectorProviderLabel';
 
@@ -34,7 +33,7 @@ type SpeechSourceOption = {
   model: string;
 };
 
-const inferCloudSpeechService = (provider: IProvider, model: string): Exclude<SpeechToTextProvider, 'local'> => {
+const inferCloudSpeechService = (provider: IProvider, model: string): SpeechToTextProvider => {
   const identity = `${provider.platform} ${provider.name} ${provider.base_url} ${model}`.toLowerCase();
   return identity.includes('deepgram') || identity.includes('nova-2') || identity.includes('nova-3')
     ? 'deepgram'
@@ -48,7 +47,6 @@ const SpeechToTextContent: React.FC = () => {
   const [config, setConfig] = useState<SpeechToTextConfig>(DEFAULT_SPEECH_TO_TEXT_CONFIG);
   const { data: providers } = useProvidersQuery();
   const { profiles } = useModelProfiles();
-  const localAsr = useLocalAsrModels();
   const providerLabel = useModelSelectorProviderLabel();
 
   useEffect(() => {
@@ -57,18 +55,6 @@ const SpeechToTextContent: React.FC = () => {
     window.addEventListener(SPEECH_TO_TEXT_CONFIG_CHANGED_EVENT, syncConfig);
     return () => window.removeEventListener(SPEECH_TO_TEXT_CONFIG_CHANGED_EVENT, syncConfig);
   }, []);
-
-  const localOption = useMemo<SpeechSourceOption | null>(() => {
-    const activeModelId = localAsr.status?.activeModelId;
-    if (!localAsr.status?.ready || !activeModelId) return null;
-    const catalogEntry = localAsr.catalog?.find((entry) => entry.id === activeModelId);
-    return {
-      value: `local\u0000${activeModelId}`,
-      label: `${t('settings.modelHub.speech.local')} · ${catalogEntry?.name ?? activeModelId}`,
-      provider: 'local',
-      model: activeModelId,
-    };
-  }, [localAsr.catalog, localAsr.status?.activeModelId, localAsr.status?.ready, t]);
 
   const cloudOptions = useMemo<SpeechSourceOption[]>(() => {
     const profileKeys = new Set(
@@ -104,19 +90,13 @@ const SpeechToTextContent: React.FC = () => {
       );
   }, [profiles, providers, providerLabel]);
 
-  const sourceOptions = useMemo(
-    () => (localOption ? [localOption, ...cloudOptions] : cloudOptions),
-    [cloudOptions, localOption]
-  );
+  const sourceOptions = cloudOptions;
 
   const selectedSource = useMemo(() => {
-    if (config.provider === 'local') {
-      return localOption?.value;
-    }
     return cloudOptions.find(
       (option) => option.providerId === config.provider_id && option.model === config.model
     )?.value;
-  }, [cloudOptions, config.model, config.provider, config.provider_id, localOption?.value]);
+  }, [cloudOptions, config.model, config.provider_id]);
 
   const persist = useCallback(
     (next: SpeechToTextConfig) => {
@@ -170,12 +150,6 @@ const SpeechToTextContent: React.FC = () => {
             description={t('settings.modelHub.speech.noSources')}
           />
           <div className='mt-14px flex items-center justify-center gap-8px flex-wrap'>
-            <Button
-              icon={<DataServer theme='outline' size='14' />}
-              onClick={() => navigate('/models?section=local&capability=speech_recognition')}
-            >
-              {t('settings.modelHub.speech.manageLocal')}
-            </Button>
             <Button icon={<LinkCloud theme='outline' size='14' />} onClick={() => navigate('/models?section=models')}>
               {t('settings.modelHub.speech.manageProviders')}
             </Button>
@@ -186,11 +160,6 @@ const SpeechToTextContent: React.FC = () => {
           <Form layout='vertical' className='mt-18px'>
             <Form.Item label={t('settings.modelHub.speech.source')}>
               <NomiSelect value={selectedSource} onChange={selectSource}>
-                {localOption && (
-                  <NomiSelect.OptGroup label={t('settings.modelHub.speech.local')}>
-                    <NomiSelect.Option value={localOption.value}>{localOption.label}</NomiSelect.Option>
-                  </NomiSelect.OptGroup>
-                )}
                 {cloudOptions.length > 0 && (
                   <NomiSelect.OptGroup label={t('settings.modelHub.speech.cloud')}>
                     {cloudOptions.map((option) => (
@@ -220,14 +189,6 @@ const SpeechToTextContent: React.FC = () => {
           </Form>
 
           <div className='mt-6px flex items-center gap-8px flex-wrap'>
-            <Button
-              type='text'
-              size='small'
-              icon={<DataServer theme='outline' size='14' />}
-              onClick={() => navigate('/models?section=local&capability=speech_recognition')}
-            >
-              {t('settings.modelHub.speech.manageLocal')}
-            </Button>
             <Button
               type='text'
               size='small'

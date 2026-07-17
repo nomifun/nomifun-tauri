@@ -148,15 +148,28 @@ Read the logs (`docker compose logs nomifun`). The most common causes are:
 
 Confirm the port mapping (`docker compose ps`). The default compose file publishes `8787:8787`; if you put Caddy in front, it should be `expose: ["8787"]` instead. Connecting to the wrong port is the usual culprit.
 
-### Build is slow or fails behind a corporate proxy
+### Build is slow or fails on a constrained network
 
-Pass a cargo registry mirror at build time:
+Identify the stage that failed first:
+
+- `load metadata for docker.io/...` / `TLS handshake timeout`: no base image
+  was pulled. Configure a Docker daemon registry mirror, or set `BUN_IMAGE`,
+  `RUST_IMAGE`, and `RUNTIME_IMAGE` to trusted compatible image references.
+- `apt-get` / `bun install` / `Updating crates.io index`: set `APT_MIRROR`,
+  `BUN_REGISTRY`, or `CARGO_REGISTRY_MIRROR`, respectively.
+
+Compose accepts all package-layer settings together:
 
 ```bash
-docker build --build-arg CARGO_REGISTRY_MIRROR=https://rsproxy.cn/index/ -t nomifun-web:local .
+APT_MIRROR=<trusted-debian-mirror> \
+CARGO_REGISTRY_MIRROR=<trusted-sparse-cargo-index> \
+BUN_REGISTRY=<trusted-npm-registry> \
+docker compose up -d --build
 ```
 
-(Or whichever mirror your environment uses.)
+The Dockerfile retries apt and Cargo downloads and uses the smaller Rust slim
+base image; all mirror values must still be trusted and reachable by the
+operator.
 
 ## Logging
 

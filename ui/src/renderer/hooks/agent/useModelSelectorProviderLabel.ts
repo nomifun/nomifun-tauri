@@ -1,7 +1,4 @@
-import {
-  NOMIFUN_FREE_MODEL_PLATFORM,
-  NOMIFUN_LOCAL_MODEL_PLATFORM,
-} from '@/common/types/provider/managedModelService';
+import { NOMIFUN_FREE_MODEL_PLATFORM } from '@/common/types/provider/managedModelService';
 import { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 
@@ -12,7 +9,6 @@ type ModelSelectorProvider = {
 
 type ManagedModelProviderLabels = {
   free: string;
-  local: string;
 };
 
 export const formatModelSelectorProviderLabel = (
@@ -20,7 +16,6 @@ export const formatModelSelectorProviderLabel = (
   labels: ManagedModelProviderLabels,
 ): string => {
   if (provider.platform === NOMIFUN_FREE_MODEL_PLATFORM) return labels.free;
-  if (provider.platform === NOMIFUN_LOCAL_MODEL_PLATFORM) return labels.local;
   return provider.name?.trim() || provider.platform?.trim() || '';
 };
 
@@ -28,10 +23,9 @@ export const formatModelSelectorProviderLabel = (
 export const useModelSelectorProviderLabel = () => {
   const { t } = useTranslation();
   const free = t('settings.modelHub.free.title');
-  const local = t('settings.modelHub.local.title');
 
   return useCallback(
-    (provider: ModelSelectorProvider) => formatModelSelectorProviderLabel(provider, { free, local }),
-    [free, local],
+    (provider: ModelSelectorProvider) => formatModelSelectorProviderLabel(provider, { free }),
+    [free],
   );
 };

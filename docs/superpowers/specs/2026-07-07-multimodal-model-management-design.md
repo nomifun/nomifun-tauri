@@ -111,7 +111,7 @@ CREATE TABLE model_profiles (
     tasks       TEXT    NOT NULL DEFAULT '[]',   -- JSON: ModelTask[]
     traits      TEXT    NOT NULL DEFAULT '[]',   -- JSON: ModelTrait[]
     params      TEXT    NOT NULL DEFAULT '{}',   -- JSON: 服务配置(见 §3.8)
-    source      TEXT    NOT NULL DEFAULT 'inferred', -- inferred|user|catalog 溯源
+    source      TEXT    NOT NULL DEFAULT 'inferred', -- inferred|user 溯源
     updated_at  INTEGER NOT NULL,
     PRIMARY KEY (provider_id, model),
     FOREIGN KEY (provider_id) REFERENCES providers(id) ON DELETE CASCADE
@@ -120,7 +120,7 @@ CREATE TABLE model_profiles (
 
 - **名字启发式降级**为"一次性回填种子 + 新模型默认建议",**不再是运行时权威**。
 - 迁移时用现有启发式**回填全部存量模型**,老聊天/图像模型行为不回归。
-- `source` 溯源:`user`(手改,最高权威)> `catalog`(本地 AI 目录)> `inferred`(自动猜)。用户手改后启发式不再覆盖。
+- `source` 溯源:`user`(手改,最高权威)> `inferred`(自动猜)。用户手改后启发式不再覆盖。
 - 迁移由 `sqlx::migrate!()` 自动发现(`crates/backend/nomifun-db/src/database.rs:28`),无需注册列表;本分支无硬编码迁移计数常量需 bump。
 
 ### 3.3 「任务→端点/请求体」解析器(404 根治 + 长尾可扩展)

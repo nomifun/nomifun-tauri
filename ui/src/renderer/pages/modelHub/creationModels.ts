@@ -95,8 +95,8 @@ const profileKey = (providerId: ProviderId, model: string): string => JSON.strin
 
 /**
  * Index authoritative per-model profiles by `(providerId, model)`. User edits
- * and NomiFun's pinned local catalog are authoritative; name-inferred rows are
- * skipped so automatic guesses retain the legacy heuristic behavior.
+ * are authoritative; name-inferred rows are skipped so automatic guesses retain
+ * the legacy heuristic behavior.
  */
 const buildAuthoritativeProfileIndex = (
   profiles: ModelProfile[] | undefined
@@ -112,7 +112,7 @@ const buildAuthoritativeProfileIndex = (
 
 /**
  * Resolve whether a specific model has a creation capability. Precedence:
- *   1. authoritative user/catalog profile (`profileCaps`) — sole authority
+ *   1. authoritative user profile (`profileCaps`) — sole authority
  *      when present, both positively and negatively;
  *   2. provider-level user override (`capabilities` + `is_user_selected`);
  *   3. the model-name heuristic.

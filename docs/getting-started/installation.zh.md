@@ -231,15 +231,24 @@ environment:
   NOMIFUN_HTTPS: "true"   # 仅当部署在 TLS 反向代理之后时
 ```
 
-### 加速 Rust 构建
+### 网络受限环境
 
 Rust 阶段使用了 BuildKit cache mounts（`/usr/local/cargo/registry` 与
-`/src/target`），所以一行源代码改动只需几秒就能重新编译。如需为 cargo
-注册表配置镜像（例如在网络较慢时）：
+`/src/target`），所以一行源代码改动只需几秒就能重新编译。首次安装还会
+访问 Docker Hub、npm、Debian apt 与 crates.io；任一网络源超时都可能让构建
+失败。Compose 已透传各层的镜像参数，例如：
 
 ```bash
-docker build --build-arg CARGO_REGISTRY_MIRROR=https://rsproxy.cn/index/ .
+APT_MIRROR=http://mirrors.aliyun.com \
+CARGO_REGISTRY_MIRROR=https://rsproxy.cn/index/ \
+BUN_REGISTRY=<可用的-npm-镜像地址> \
+docker compose up -d --build
 ```
+
+若错误发生在 `load metadata for docker.io/...`，构建尚未进入 apt/cargo
+阶段。请配置 Docker daemon 的 registry mirror，或通过 `BUN_IMAGE`、
+`RUST_IMAGE`、`RUNTIME_IMAGE` 指向你所信任的兼容镜像。默认 Rust 构建层使用
+更小的 `rust:1-slim-bookworm`，apt/cargo 下载也已启用重试与长超时。
 
 完整的部署指南（TLS、反向代理模式、systemd unit、安全注意事项）请参见
 [`../guides/web-server-deployment.md`](../guides/web-server-deployment.md)。

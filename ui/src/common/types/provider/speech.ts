@@ -6,7 +6,7 @@
 
 import type { ProviderId } from '@/common/types/ids';
 
-export type SpeechToTextProvider = 'local' | 'openai' | 'deepgram';
+export type SpeechToTextProvider = 'openai' | 'deepgram';
 
 export type OpenAISpeechToTextConfig = {
   api_key: string;

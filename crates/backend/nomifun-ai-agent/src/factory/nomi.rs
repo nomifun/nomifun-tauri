@@ -262,7 +262,7 @@ pub(super) async fn build(
         overrides.delegation_policy,
     );
 
-    // Every nomi (local-model) session — regular desktop chat, companion, IM
+    // Every native Nomi session — regular desktop chat, companion, IM
     // Channel Agent, and 对外伙伴 (public agent) — must think AND reply in the
     // app's UI language, not a hardcoded one. The persona prompt no longer forces
     // a language, so it is decided HERE from the live system setting and appended

@@ -380,7 +380,7 @@ mod tests {
         let (svc, _db) = setup().await;
         let err = svc
             .fetch_models_anonymous(&FetchModelsAnonymousRequest {
-                platform: crate::managed_model::LOCAL_MODEL_PLATFORM.into(),
+                platform: crate::managed_model::FREE_MODEL_PLATFORM.into(),
                 base_url: "https://example.com".into(),
                 api_key: "secret".into(),
                 bedrock_config: None,

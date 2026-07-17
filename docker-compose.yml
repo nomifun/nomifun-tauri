@@ -14,11 +14,15 @@ services:
     build:
       context: .
       args:
-        # Optional mirror acceleration (e.g. in CN). Empty by default so non-CN
-        # builds hit upstream registries unchanged. Set via env / a local `.env`
-        # before building, e.g.:
+        # Every network source can be overridden via env / a local `.env`.
+        # The image args are useful with a Docker Hub proxy; the package args
+        # cover Bun, Debian apt, and Cargo independently. For example:
         #   APT_MIRROR=http://mirrors.aliyun.com \
         #   CARGO_REGISTRY_MIRROR=https://rsproxy.cn/index/ docker compose build
+        BUN_IMAGE: ${BUN_IMAGE:-oven/bun:1}
+        RUST_IMAGE: ${RUST_IMAGE:-rust:1-slim-bookworm}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE:-debian:bookworm-slim}
+        BUN_REGISTRY: ${BUN_REGISTRY:-}
         APT_MIRROR: ${APT_MIRROR:-}
         CARGO_REGISTRY_MIRROR: ${CARGO_REGISTRY_MIRROR:-}
     image: nomifun-web:local

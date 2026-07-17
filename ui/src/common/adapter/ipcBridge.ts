@@ -101,23 +101,6 @@ import type {
   SetManagedModelEnabledRequest,
   SetManagedModelServiceEnabledRequest,
 } from '../types/provider/managedModelService';
-import type {
-  LocalModelCatalogEntry,
-  LocalModelIdRequest,
-  LocalModelServiceStatus,
-  SetLocalModelActiveRequest,
-} from '../types/provider/localModelService';
-import type {
-  ImageModelCatalogEntry,
-  ImageModelIdRequest,
-  ImageModelServiceStatus,
-} from '../types/provider/imageModelService';
-import type {
-  AsrModelCatalogEntry,
-  AsrModelIdRequest,
-  AsrModelServiceStatus,
-  SetAsrModelActiveRequest,
-} from '../types/provider/asrModelService';
 import type { SpeechToTextRequest, SpeechToTextResult } from '../types/provider/speech';
 import type {
   TAdoptExecutionStepOutput,
@@ -1252,11 +1235,6 @@ const normalizeManagedModelStatus = (
   providerId: status.providerId == null ? null : parseProviderId(status.providerId),
 });
 
-const normalizeLocalModelStatus = (status: LocalModelServiceStatus): LocalModelServiceStatus => ({
-  ...status,
-  providerId: status.providerId == null ? null : parseProviderId(status.providerId),
-});
-
 export const mode = {
   listProviders: withResponseMap(httpGet<IProvider[], void>('/api/providers'), (providers) =>
     providers.map(normalizeProvider)
@@ -1288,7 +1266,7 @@ export const mode = {
 };
 
 // ---------------------------------------------------------------------------
-// NomiFun-managed model services — stable provider layer for free/local models
+// NomiFun-managed free-model service
 // ---------------------------------------------------------------------------
 
 export const managedModelService = {
@@ -1321,66 +1299,6 @@ export const managedModelService = {
       (p) => `/api/model-services/free/models/${encodeURIComponent(p.id)}/health`,
       () => undefined
     ),
-  },
-  local: {
-    catalog: httpGet<LocalModelCatalogEntry[], void>('/api/model-services/local/catalog'),
-    status: withResponseMap(
-      httpGet<LocalModelServiceStatus, void>('/api/model-services/local/status'),
-      normalizeLocalModelStatus
-    ),
-    install: httpPost<LocalModelServiceStatus, LocalModelIdRequest>(
-      (p) => `/api/model-services/local/models/${encodeURIComponent(p.id)}/install`,
-      () => undefined
-    ),
-    cancel: httpPost<LocalModelServiceStatus, LocalModelIdRequest>(
-      (p) => `/api/model-services/local/models/${encodeURIComponent(p.id)}/cancel`,
-      () => undefined
-    ),
-    remove: httpDelete<LocalModelServiceStatus, LocalModelIdRequest>((p) =>
-      `/api/model-services/local/models/${encodeURIComponent(p.id)}`
-    ),
-    setActive: httpPost<LocalModelServiceStatus, SetLocalModelActiveRequest>(
-      (p) => `/api/model-services/local/models/${encodeURIComponent(p.id)}/activate`,
-      (p) => ({ enabled: p.enabled })
-    ),
-    image: {
-      catalog: httpGet<ImageModelCatalogEntry[], void>('/api/model-services/local/image/catalog'),
-      status: httpGet<ImageModelServiceStatus, void>('/api/model-services/local/image/status'),
-      install: httpPost<ImageModelServiceStatus, ImageModelIdRequest>(
-        (p) => `/api/model-services/local/image/models/${encodeURIComponent(p.id)}/install`,
-        () => undefined
-      ),
-      pause: httpPost<ImageModelServiceStatus, ImageModelIdRequest>(
-        (p) => `/api/model-services/local/image/models/${encodeURIComponent(p.id)}/pause`,
-        () => undefined
-      ),
-      resume: httpPost<ImageModelServiceStatus, ImageModelIdRequest>(
-        (p) => `/api/model-services/local/image/models/${encodeURIComponent(p.id)}/resume`,
-        () => undefined
-      ),
-      remove: httpDelete<ImageModelServiceStatus, ImageModelIdRequest>((p) =>
-        `/api/model-services/local/image/models/${encodeURIComponent(p.id)}`
-      ),
-    },
-    asr: {
-      catalog: httpGet<AsrModelCatalogEntry[], void>('/api/model-services/local/asr/catalog'),
-      status: httpGet<AsrModelServiceStatus, void>('/api/model-services/local/asr/status'),
-      install: httpPost<AsrModelServiceStatus, AsrModelIdRequest>(
-        (p) => `/api/model-services/local/asr/models/${encodeURIComponent(p.id)}/install`,
-        () => undefined
-      ),
-      cancel: httpPost<AsrModelServiceStatus, AsrModelIdRequest>(
-        (p) => `/api/model-services/local/asr/models/${encodeURIComponent(p.id)}/cancel`,
-        () => undefined
-      ),
-      remove: httpDelete<AsrModelServiceStatus, AsrModelIdRequest>((p) =>
-        `/api/model-services/local/asr/models/${encodeURIComponent(p.id)}`
-      ),
-      setActive: httpPost<AsrModelServiceStatus, SetAsrModelActiveRequest>(
-        (p) => `/api/model-services/local/asr/models/${encodeURIComponent(p.id)}/activate`,
-        (p) => ({ enabled: p.enabled })
-      ),
-    },
   },
 };
 

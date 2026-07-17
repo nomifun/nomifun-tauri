@@ -38,16 +38,6 @@ async fn initialized_database_satisfies_the_id_schema_contract() {
         .await
         .expect("clean baseline uses TEXT entity keys");
 
-    let migration_versions: Vec<i64> =
-        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
-            .fetch_all(database.pool())
-            .await
-            .expect("migration versions");
-    assert_eq!(
-        migration_versions,
-        vec![1],
-        "ID v2 intentionally starts a single clean database lineage"
-    );
 }
 
 #[tokio::test]

@@ -57,7 +57,7 @@ pub enum ModelTrait {
     WebSearch,
 }
 
-/// Provenance of a [`ModelProfile`]. Higher authority wins: `User` > `Catalog` > `Inferred`.
+/// Provenance of a [`ModelProfile`]. User-authored profiles override inferred values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ProfileSource {
@@ -66,8 +66,6 @@ pub enum ProfileSource {
     Inferred,
     /// Explicitly set by the user in the UI (authoritative).
     User,
-    /// Populated from a managed catalog (e.g. local AI).
-    Catalog,
 }
 
 /// The authoritative per-model capability record. Identity is `(provider_id, model)`.

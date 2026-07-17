@@ -25,11 +25,11 @@ export const getWatchBackupValidationErrorKey = (
 ): IdmmBackupValidationKey | null => {
   if (!watch.enabled || watch.tier !== 'rule_plus_model') return null;
 
-  const hasLocalProvider = watch.bypass_model.provider_id != null;
-  const hasLocalModel = hasText(watch.bypass_model.model);
+  const hasBackupProvider = watch.bypass_model.provider_id != null;
+  const hasBackupModel = hasText(watch.bypass_model.model);
 
-  if (hasLocalProvider !== hasLocalModel) return 'idmm.backupModelIncomplete';
-  if (!hasLocalProvider && !globalBackupResolved) return 'idmm.backupRequired';
+  if (hasBackupProvider !== hasBackupModel) return 'idmm.backupModelIncomplete';
+  if (!hasBackupProvider && !globalBackupResolved) return 'idmm.backupRequired';
   return null;
 };
 

@@ -503,7 +503,7 @@ mod tests {
         assert!(reject_managed_create(&by_id).is_ok());
 
         let by_platform = CreateProviderRequest {
-            platform: crate::managed_model::LOCAL_MODEL_PLATFORM.into(),
+            platform: crate::managed_model::FREE_MODEL_PLATFORM.into(),
             ..sample_create_request()
         };
         assert!(matches!(

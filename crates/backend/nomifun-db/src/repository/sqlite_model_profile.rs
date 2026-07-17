@@ -97,30 +97,6 @@ impl IModelProfileRepository for SqliteModelProfileRepository {
         Ok(result.rows_affected() > 0)
     }
 
-    async fn upsert_unless_user(&self, params: &UpsertModelProfileParams<'_>) -> Result<bool, DbError> {
-        let result = sqlx::query(
-            "INSERT INTO model_profiles (provider_id, model, tasks, traits, params, source, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(provider_id, model) DO UPDATE SET \
-                tasks = excluded.tasks, \
-                traits = excluded.traits, \
-                params = excluded.params, \
-                source = excluded.source, \
-                updated_at = excluded.updated_at \
-             WHERE model_profiles.source <> 'user'",
-        )
-        .bind(params.provider_id)
-        .bind(params.model)
-        .bind(params.tasks)
-        .bind(params.traits)
-        .bind(params.params)
-        .bind(params.source)
-        .bind(now_ms())
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
-    }
-
     async fn delete(&self, provider_id: &str, model: &str) -> Result<bool, DbError> {
         let result = sqlx::query("DELETE FROM model_profiles WHERE provider_id = ? AND model = ?")
             .bind(provider_id)
@@ -285,63 +261,4 @@ mod tests {
         assert_eq!(stored.params, r#"{"owner":"user"}"#);
     }
 
-    #[tokio::test]
-    async fn catalog_upsert_replaces_inferred_but_preserves_user() {
-        let db = init_database_memory().await.unwrap();
-        seed_provider(db.pool(), "p1").await;
-        let r = SqliteModelProfileRepository::new(db.pool().clone());
-
-        r.upsert(&UpsertModelProfileParams {
-            provider_id: "p1",
-            model: "inferred-model",
-            tasks: r#"["chat"]"#,
-            traits: r#"["reasoning"]"#,
-            params: "{}",
-            source: "inferred",
-        })
-        .await
-        .unwrap();
-        assert!(
-            r.upsert_unless_user(&UpsertModelProfileParams {
-                provider_id: "p1",
-                model: "inferred-model",
-                tasks: r#"["chat"]"#,
-                traits: "[]",
-                params: r#"{"contextWindow":4096}"#,
-                source: "catalog",
-            })
-            .await
-            .unwrap()
-        );
-        assert_eq!(
-            r.get("p1", "inferred-model").await.unwrap().unwrap().source,
-            "catalog"
-        );
-
-        r.upsert(&UpsertModelProfileParams {
-            provider_id: "p1",
-            model: "user-model",
-            tasks: r#"["chat"]"#,
-            traits: r#"["function_calling"]"#,
-            params: r#"{"owner":"user"}"#,
-            source: "user",
-        })
-        .await
-        .unwrap();
-        assert!(
-            !r.upsert_unless_user(&UpsertModelProfileParams {
-                provider_id: "p1",
-                model: "user-model",
-                tasks: r#"["chat"]"#,
-                traits: "[]",
-                params: "{}",
-                source: "catalog",
-            })
-            .await
-            .unwrap()
-        );
-        let user = r.get("p1", "user-model").await.unwrap().unwrap();
-        assert_eq!(user.source, "user");
-        assert_eq!(user.params, r#"{"owner":"user"}"#);
-    }
 }

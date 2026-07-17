@@ -250,15 +250,26 @@ environment:
   NOMIFUN_HTTPS: "true"   # only when behind a TLS proxy
 ```
 
-### Speeding up Rust builds
+### Constrained networks
 
 The Rust stage uses BuildKit cache mounts (`/usr/local/cargo/registry` and
-`/src/target`), so a one-line source change recompiles in seconds. To use a
-mirror for the cargo registry (e.g. on slow links):
+`/src/target`), so a one-line source change recompiles in seconds. A first
+install still reaches Docker Hub, npm, Debian apt, and crates.io; a timeout at
+any one of those sources can fail the build. Compose forwards a separate mirror
+setting for each package layer, for example:
 
 ```bash
-docker build --build-arg CARGO_REGISTRY_MIRROR=https://rsproxy.cn/index/ .
+APT_MIRROR=<trusted-debian-mirror> \
+CARGO_REGISTRY_MIRROR=<trusted-sparse-cargo-index> \
+BUN_REGISTRY=<trusted-npm-registry> \
+docker compose up -d --build
 ```
+
+If the error occurs at `load metadata for docker.io/...`, the build has not
+reached apt or Cargo yet. Configure a Docker daemon registry mirror, or point
+`BUN_IMAGE`, `RUST_IMAGE`, and `RUNTIME_IMAGE` at trusted compatible images.
+The default Rust build stage now uses the smaller `rust:1-slim-bookworm`, and
+apt/Cargo downloads have retries and extended timeouts.
 
 For the long-form deployment guide (TLS, reverse-proxy patterns, systemd
 unit, security caveats) see

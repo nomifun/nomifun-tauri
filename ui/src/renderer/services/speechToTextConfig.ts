@@ -12,7 +12,7 @@ export const SPEECH_TO_TEXT_CONFIG_CHANGED_EVENT = 'nomifun:speech-to-text-confi
 
 export const DEFAULT_SPEECH_TO_TEXT_CONFIG: SpeechToTextConfig = {
   enabled: false,
-  provider: 'local',
+  provider: 'openai',
   language: '',
 };
 
@@ -21,7 +21,7 @@ export const normalizeSpeechToTextConfig = (config?: SpeechToTextConfig): Speech
 
   return {
     ...config,
-    provider: config.provider ?? 'local',
+    provider: config.provider ?? 'openai',
     language:
       config.language ??
       (config.provider === 'openai' ? config.openai?.language : config.provider === 'deepgram' ? config.deepgram?.language : '') ??

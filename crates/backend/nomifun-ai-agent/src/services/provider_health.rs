@@ -28,8 +28,6 @@ const OPENAI_MODEL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com";
 const HEALTH_CHECK_PROMPT: &str = "Reply with exactly OK.";
 const HEALTH_CHECK_MSG_ID: &str = "provider-health-check";
-const LOCAL_MODEL_PLATFORM: &str = "nomifun-local-model";
-const LOCAL_Z_IMAGE_MODEL: &str = "z-image-turbo-q3-k";
 
 pub struct ProviderHealthCheckService {
     provider_repo: Arc<dyn IProviderRepository>,
@@ -77,27 +75,6 @@ impl ProviderHealthCheckService {
                 row.id
             ))
         })?;
-
-        // Z-Image is served by CreationService's in-process sd-cli adapter,
-        // not by the local provider's OpenAI facade. Probing
-        // `/v1/images/generations` would therefore be a guaranteed false
-        // negative. Its install/runtime readiness remains authoritative in
-        // the Local Models image status endpoint.
-        if is_in_process_local_image(&row.platform, model) {
-            return Ok(ProviderHealthCheckResponse {
-                provider_id: row.id,
-                platform: row.platform,
-                model: model.to_owned(),
-                status: HealthStatus::Unknown,
-                elapsed_ms: 0,
-                message: Some(
-                    "Local image readiness is reported by the Local Models service.".into(),
-                ),
-                error_kind: None,
-                http_status: None,
-                timeout_stage: None,
-            });
-        }
 
         // Determine which task to probe. Authority order: explicit request >
         // stored profile primary task > name/platform heuristic > Chat. This is
@@ -206,11 +183,6 @@ impl ProviderHealthCheckService {
             write_root: None,
 })
     }
-}
-
-fn is_in_process_local_image(platform: &str, model: &str) -> bool {
-    platform.eq_ignore_ascii_case(LOCAL_MODEL_PLATFORM)
-        && model.eq_ignore_ascii_case(LOCAL_Z_IMAGE_MODEL)
 }
 
 fn should_use_openai_model_probe(_platform: &str, config: &NomiResolvedConfig) -> bool {
@@ -992,19 +964,4 @@ mod tests {
         assert_eq!(body["text_mode"], true);
     }
 
-    #[test]
-    fn local_z_image_skips_the_openai_modality_probe() {
-        assert!(is_in_process_local_image(
-            "nomifun-local-model",
-            "z-image-turbo-q3-k"
-        ));
-        assert!(!is_in_process_local_image(
-            "nomifun-local-model",
-            "qwen3-5-4b-q4-k-m"
-        ));
-        assert!(!is_in_process_local_image(
-            "openai",
-            "z-image-turbo-q3-k"
-        ));
-    }
 }

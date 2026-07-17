@@ -39,6 +39,7 @@ import './styles/themes/index.css';
 // authoritative settings from the backend instead of the empty cache.
 import { configService } from '@/common/config/configService';
 import { application } from '@/common/adapter/ipcBridge';
+import { isHandledAuthExpiredHttpError } from '@/common/adapter/httpBridge';
 import { setBrowserStorageGeneration } from '@/common/utils/browserStorageKey';
 configService.initialize().catch((err) => {
   console.error('Failed to initialize config:', err);
@@ -84,13 +85,24 @@ const Config: React.FC<PropsWithChildren> = ({ children }) => {
 };
 
 const Main = () => {
-  const { ready } = useAuth();
+  const { ready, status } = useAuth();
   const [configReady, setConfigReady] = useState(false);
   const [configError, setConfigError] = useState<Error | null>(null);
 
   useEffect(() => {
-    if (!ready) return;
+    // Browser sessions must pass the auth probe before any protected startup
+    // request runs. In particular, `/api/system/info` returns 403 for an
+    // expired session; starting it while unauthenticated would turn the normal
+    // login transition into an application-level render failure.
+    if (!ready || status !== 'authenticated') {
+      setConfigReady(false);
+      setConfigError(null);
+      return;
+    }
+
     let active = true;
+    setConfigReady(false);
+    setConfigError(null);
     // Prefetch `/api/agents` in parallel with configService.initialize() and
     // seed the shared SWR cache so the Guid page's model/mode selectors can
     // read `handshake.available_models` on the very first render — without
@@ -116,29 +128,24 @@ const Main = () => {
         if (active) setConfigReady(true);
       })
       .catch((error: unknown) => {
-        if (!active) return;
+        // httpBridge already cleared the expired browser session and notified
+        // AuthProvider. Let the auth state render `/login`; never latch this
+        // expected transition into the root error boundary.
+        if (!active || isHandledAuthExpiredHttpError(error)) return;
         setConfigError(error instanceof Error ? error : new Error(String(error)));
       });
 
     return () => {
       active = false;
     };
-  }, [ready]);
+  }, [ready, status]);
 
   useEffect(() => {
-    if (!ready) return;
+    if (!ready || status !== 'authenticated') return;
     void repairAllCronJobTimeZonesOnce();
-  }, [ready]);
+  }, [ready, status]);
 
-  if (configError) {
-    throw configError;
-  }
-
-  if (!ready || !configReady) {
-    return <AppLoader />;
-  }
-
-  return (
+  const router = (
     <Router
       layout={
         <ConversationHistoryProvider>
@@ -147,6 +154,26 @@ const Main = () => {
       }
     />
   );
+
+  if (!ready) {
+    return <AppLoader />;
+  }
+
+  // The login route is intentionally independent from authenticated startup
+  // data. This also makes an in-flight session expiry recover immediately.
+  if (status !== 'authenticated') {
+    return router;
+  }
+
+  if (configError) {
+    throw configError;
+  }
+
+  if (!configReady) {
+    return <AppLoader />;
+  }
+
+  return router;
 };
 
 const App = HOC.Wrapper(Config)(Main);

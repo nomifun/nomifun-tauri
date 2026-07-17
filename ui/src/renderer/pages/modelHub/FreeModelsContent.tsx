@@ -116,9 +116,7 @@ const FreeModelsContent: React.FC = () => {
         ? t('settings.modelHub.free.statusUnverified')
       : t('settings.modelHub.free.statusDegraded');
 
-  const serviceAvailability: ManagedModelServiceAvailability = !status?.enabled
-    ? 'planned'
-    : (status.availability ?? 'degraded');
+  const serviceAvailability: ManagedModelServiceAvailability = status?.availability ?? 'degraded';
   const hasUpstreamWarning =
     Boolean(status?.enabled) &&
     (Boolean(status?.lastError) ||

@@ -17,10 +17,8 @@ mod exposure;
 mod extension;
 mod file;
 mod idmm;
-mod image_model;
 mod knowledge;
 mod lifecycle;
-mod local_model;
 mod managed_model;
 mod mcp;
 pub mod dispatch_target;
@@ -147,13 +145,6 @@ pub use idmm::{
     IdmmTargetKind, InterventionRecord, ModelFailoverConfig, OpenQuestionRule, OptionRule,
     PermissionRule, ScanScope, SetIdmmRequest, Tendency, WakeStrategy, WatchBase, WatchTier,
 };
-pub use image_model::{
-    CancelImageModelInstallRequest, CancelImageModelInstallResponse, DeleteImageModelRequest,
-    DeleteImageModelResponse, ImageModelCatalogEntry, ImageModelComponent,
-    ImageModelComponentProgress, ImageModelInstallPhase, ImageModelRuntimePhase,
-    ImageModelServiceStatus, ImageModelState, InstallImageModelRequest,
-    InstallImageModelResponse, ResumeImageModelInstallRequest, ResumeImageModelInstallResponse,
-};
 pub use knowledge::{
     ConnectorCredentialSummary, ConnectorSyncState, CreateKnowledgeTagRequest, KnowledgeMountInfo,
     KnowledgeSource, KnowledgeSourceEntry, KnowledgeSourceMode, KnowledgeTag,
@@ -163,17 +154,10 @@ pub use lifecycle::{
     GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult,
     UpdateReleaseInfo, UpdateWorkDirRequest,
 };
-pub use local_model::{
-    AsrCapability, AsrEngine, AsrModelCatalogEntry, AsrModelServiceStatus,
-    LocalModelCatalogEntry, LocalModelErrorKind, LocalModelInstallPhase,
-    LocalModelProgressComponent, LocalModelRuntimeBackend, LocalModelRuntimePhase,
-    LocalModelServiceStatus, LocalModelState, LocalModelTransferProgress, LocalRuntimeStatus,
-    SetLocalModelActiveRequest,
-};
 pub use managed_model::{
     ManagedModel, ManagedModelHealthBatchResult, ManagedModelHealthErrorKind,
     ManagedModelHealthResult, ManagedModelHealthStatus, ManagedModelServiceAvailability,
-    ManagedModelServiceKind, ManagedModelServiceStatus, SetManagedModelEnabledRequest,
+    ManagedModelServiceStatus, SetManagedModelEnabledRequest,
     SetManagedModelServiceEnabledRequest,
 };
 pub use mcp::{

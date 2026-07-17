@@ -14,7 +14,7 @@
 
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import type { GenMode, ModelOption } from './genTypes';
+import type { GenMode } from './genTypes';
 import {
   IMAGE_COUNT_MAX,
   IMAGE_COUNT_MIN,
@@ -27,15 +27,6 @@ import {
   readImageParams,
   readVideoParams,
 } from './genConstants';
-import {
-  isLocalZImageModel,
-  localZImageSizePresets,
-  LOCAL_Z_IMAGE_DIMENSION_MAX,
-  LOCAL_Z_IMAGE_DIMENSION_MIN,
-  LOCAL_Z_IMAGE_DIMENSION_STEP,
-  normalizeImageParamsForModel,
-  normalizeLocalZImageDimension,
-} from './localZImage';
 
 // ─── Reusable compact widgets ───────────────────────────────────────────────────
 
@@ -133,24 +124,14 @@ const Toggle: React.FC<{ label: string; checked: boolean; onChange: (v: boolean)
 
 const NumberBox: React.FC<{
   value: number;
-  min?: number;
-  max?: number;
-  step?: number;
-  normalize?: (value: number) => number;
   onChange: (v: number) => void;
-}> = ({ value, min, max, step, normalize, onChange }) => (
+}> = ({ value, onChange }) => (
   <input
     type='number'
     value={value}
-    min={min}
-    max={max}
-    step={step}
     onChange={(e) => {
       const n = Number(e.target.value);
       if (Number.isFinite(n)) onChange(Math.round(n));
-    }}
-    onBlur={() => {
-      if (normalize) onChange(normalize(value));
     }}
     onKeyDown={(e) => e.stopPropagation()}
     className='nodrag w-full min-w-0 box-border rounded-7px border border-solid border-[var(--color-border-2)] bg-[var(--color-fill-1)] px-8px py-5px text-12px text-[var(--color-text-1)] outline-none focus:border-[rgb(var(--primary-6))]'
@@ -161,21 +142,18 @@ const NumberBox: React.FC<{
 
 export interface ParamControlsProps {
   mode: GenMode;
-  model?: ModelOption | null;
   params: Record<string, unknown>;
   onChange: (patch: Record<string, unknown>) => void;
 }
 
-const ParamControls: React.FC<ParamControlsProps> = ({ mode, model, params, onChange }) => {
+const ParamControls: React.FC<ParamControlsProps> = ({ mode, params, onChange }) => {
   const { t } = useTranslation();
 
   if (mode === 'text') return null;
 
   if (mode === 'image') {
-    const localZImage = isLocalZImageModel(model);
-    const effectiveParams = normalizeImageParamsForModel(model, params);
-    const p = readImageParams(effectiveParams);
-    const sizePresets = localZImage ? localZImageSizePresets() : IMAGE_SIZE_PRESETS;
+    const p = readImageParams(params);
+    const sizePresets = IMAGE_SIZE_PRESETS;
     const presetOptions: PillOption[] = sizePresets.map((s) => ({
       key: s.key,
       label: t(`workshopGeneration.size.${s.labelKey}`, { defaultValue: s.key }),
@@ -199,35 +177,21 @@ const ParamControls: React.FC<ParamControlsProps> = ({ mode, model, params, onCh
           <div className='grid w-full grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-6px'>
             <NumberBox
               value={p.width}
-              min={localZImage ? LOCAL_Z_IMAGE_DIMENSION_MIN : undefined}
-              max={localZImage ? LOCAL_Z_IMAGE_DIMENSION_MAX : undefined}
-              step={localZImage ? LOCAL_Z_IMAGE_DIMENSION_STEP : undefined}
-              normalize={localZImage ? normalizeLocalZImageDimension : undefined}
               onChange={(v) => onChange({ width: v, preset: 'custom' })}
             />
             <span className='text-11px text-[var(--color-text-3)]'>×</span>
             <NumberBox
               value={p.height}
-              min={localZImage ? LOCAL_Z_IMAGE_DIMENSION_MIN : undefined}
-              max={localZImage ? LOCAL_Z_IMAGE_DIMENSION_MAX : undefined}
-              step={localZImage ? LOCAL_Z_IMAGE_DIMENSION_STEP : undefined}
-              normalize={localZImage ? normalizeLocalZImageDimension : undefined}
               onChange={(v) => onChange({ height: v, preset: 'custom' })}
             />
           </div>
         </FieldRow>
 
-        {localZImage ? (
-          <div className='rounded-8px bg-[var(--color-fill-1)] px-9px py-6px text-11px leading-17px text-[var(--color-text-2)]'>
-            {t('workshopGeneration.param.localSingleImage', { defaultValue: '本地模型每次生成 1 张图片' })}
-          </div>
-        ) : (
-          <div className='flex items-end justify-between gap-12px'>
-            <FieldRow label={t('workshopGeneration.param.count', { defaultValue: '数量' })}>
-              <Stepper value={p.count} min={IMAGE_COUNT_MIN} max={IMAGE_COUNT_MAX} onChange={(v) => onChange({ count: v })} />
-            </FieldRow>
-          </div>
-        )}
+        <div className='flex items-end justify-between gap-12px'>
+          <FieldRow label={t('workshopGeneration.param.count', { defaultValue: '数量' })}>
+            <Stepper value={p.count} min={IMAGE_COUNT_MIN} max={IMAGE_COUNT_MAX} onChange={(v) => onChange({ count: v })} />
+          </FieldRow>
+        </div>
 
         <FieldRow label={t('workshopGeneration.param.quality', { defaultValue: '质量' })}>
           <PillGroup options={qualityOptions} value={p.quality} fill onSelect={(key) => onChange({ quality: key })} />

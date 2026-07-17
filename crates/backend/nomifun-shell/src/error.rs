@@ -43,9 +43,6 @@ pub enum SttError {
     #[error("STT is not enabled")]
     Disabled,
 
-    #[error("Local STT is selected but no active local ASR model is ready")]
-    LocalNotConfigured,
-
     #[error("OpenAI STT is not configured: missing API key")]
     OpenaiNotConfigured,
 
@@ -63,7 +60,6 @@ impl SttError {
     pub fn error_code(&self) -> &'static str {
         match self {
             Self::Disabled => "STT_DISABLED",
-            Self::LocalNotConfigured => "STT_LOCAL_NOT_CONFIGURED",
             Self::OpenaiNotConfigured => "STT_OPENAI_NOT_CONFIGURED",
             Self::DeepgramNotConfigured => "STT_DEEPGRAM_NOT_CONFIGURED",
             Self::RequestFailed(_) => "STT_REQUEST_FAILED",
@@ -74,7 +70,6 @@ impl SttError {
     pub fn status_code(&self) -> u16 {
         match self {
             Self::Disabled
-            | Self::LocalNotConfigured
             | Self::OpenaiNotConfigured
             | Self::DeepgramNotConfigured => 400,
             Self::RequestFailed(_) => 502,
@@ -87,7 +82,6 @@ impl From<SttError> for AppError {
     fn from(err: SttError) -> Self {
         match &err {
             SttError::Disabled
-            | SttError::LocalNotConfigured
             | SttError::OpenaiNotConfigured
             | SttError::DeepgramNotConfigured => {
                 AppError::BadRequest(err.to_string())
@@ -173,12 +167,6 @@ mod tests {
     }
 
     #[test]
-    fn stt_local_not_configured_maps_to_bad_request() {
-        let err: AppError = SttError::LocalNotConfigured.into();
-        assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("local ASR")));
-    }
-
-    #[test]
     fn stt_deepgram_not_configured_maps_to_bad_request() {
         let err: AppError = SttError::DeepgramNotConfigured.into();
         assert!(matches!(err, AppError::BadRequest(msg) if msg.contains("Deepgram")));
@@ -199,10 +187,6 @@ mod tests {
     #[test]
     fn stt_error_codes() {
         assert_eq!(SttError::Disabled.error_code(), "STT_DISABLED");
-        assert_eq!(
-            SttError::LocalNotConfigured.error_code(),
-            "STT_LOCAL_NOT_CONFIGURED"
-        );
         assert_eq!(SttError::OpenaiNotConfigured.error_code(), "STT_OPENAI_NOT_CONFIGURED");
         assert_eq!(
             SttError::DeepgramNotConfigured.error_code(),
@@ -215,7 +199,6 @@ mod tests {
     #[test]
     fn stt_status_codes() {
         assert_eq!(SttError::Disabled.status_code(), 400);
-        assert_eq!(SttError::LocalNotConfigured.status_code(), 400);
         assert_eq!(SttError::OpenaiNotConfigured.status_code(), 400);
         assert_eq!(SttError::DeepgramNotConfigured.status_code(), 400);
         assert_eq!(SttError::RequestFailed("x".into()).status_code(), 502);
@@ -225,10 +208,6 @@ mod tests {
     #[test]
     fn stt_error_display_messages() {
         assert_eq!(SttError::Disabled.to_string(), "STT is not enabled");
-        assert_eq!(
-            SttError::LocalNotConfigured.to_string(),
-            "Local STT is selected but no active local ASR model is ready"
-        );
         assert_eq!(
             SttError::OpenaiNotConfigured.to_string(),
             "OpenAI STT is not configured: missing API key"

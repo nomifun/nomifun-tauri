@@ -192,7 +192,6 @@ export interface CreateTaskBody {
   node_id?: WorkshopNodeId;
   provider_id: ProviderId;
   /** Client-only platform discriminator; stripped before the HTTP request. */
-  provider_platform?: string;
   model: string;
   capability: MediaCapability;
   params: Record<string, unknown>;

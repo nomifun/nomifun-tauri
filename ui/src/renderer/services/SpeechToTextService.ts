@@ -66,9 +66,7 @@ export async function transcribeAudioBlob(blob: Blob, languageHint?: string): Pr
 
   const formData = new FormData();
   // The backend's multipart contract uses `file`, `fileName`, `mimeType` and
-  // `languageHint`. Keep this path for both Tauri and WebUI: local ASR can
-  // consume the recorded bytes directly, while cloud providers continue to
-  // use the same endpoint as before.
+  // `languageHint` for both Tauri and WebUI.
   formData.append('file', blob, file_name);
   formData.append('fileName', file_name);
   formData.append('mimeType', mimeType);

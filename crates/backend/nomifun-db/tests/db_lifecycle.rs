@@ -81,6 +81,7 @@ async fn idempotent_reinit_preserves_data() {
     .execute(db.pool())
     .await
     .unwrap();
+
     db.close().await;
 
     // Second init — data should persist
@@ -106,6 +107,145 @@ async fn migrations_applied() {
         .unwrap();
 
     assert!(count.0 >= 1, "at least one migration should be applied");
+}
+
+#[tokio::test]
+async fn local_model_decommission_removes_persisted_product_state() {
+    const LOCAL_PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000101";
+    const CLOUD_PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000102";
+
+    let db = init_database_memory().await.unwrap();
+    let owner = installation_owner_id(db.pool()).await.unwrap();
+
+    for (id, platform) in [
+        (LOCAL_PROVIDER_ID, "nomifun-local-model"),
+        (CLOUD_PROVIDER_ID, "openai"),
+    ] {
+        sqlx::query(
+            "INSERT INTO providers (\
+                id, platform, name, base_url, api_key_encrypted, models, enabled, \
+                capabilities, created_at, updated_at\
+             ) VALUES (?, ?, ?, 'https://example.invalid', 'encrypted', '[]', 1, '[]', 1, 1)",
+        )
+        .bind(id)
+        .bind(platform)
+        .bind(platform)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+
+    sqlx::query(
+        "INSERT INTO conversations (\
+            id, user_id, name, type, model, created_at, updated_at\
+         ) VALUES (\
+            'conv_0190f5fe-7c00-7a00-8000-000000000101', ?, 'local chat', 'nomi', ?, 1, 1\
+         )",
+    )
+    .bind(&owner)
+    .bind(format!(
+        r#"{{"provider_id":"{LOCAL_PROVIDER_ID}","model":"local-model"}}"#
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO creation_tasks (\
+            id, provider_id, model, capability, params, status, submitted_at\
+         ) VALUES ('creationtask_0190f5fe-7c00-7a00-8000-000000000101', ?, \
+                   'local-image', 'image_generation', '{}', 'completed', 1)",
+    )
+    .bind(LOCAL_PROVIDER_ID)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    for (provider_id, model) in [
+        (LOCAL_PROVIDER_ID, "local-image"),
+        (CLOUD_PROVIDER_ID, "cloud-image"),
+    ] {
+        sqlx::query(
+            "INSERT INTO model_profiles (\
+                provider_id, model, tasks, traits, params, source, updated_at\
+             ) VALUES (?, ?, '[\"image_generation\"]', '[]', '{}', 'catalog', 1)",
+        )
+        .bind(provider_id)
+        .bind(model)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+
+    sqlx::query(
+        "INSERT INTO client_preferences (key, value, updated_at) VALUES (\
+            'tools.imageGenerationModel', ?, 1\
+         )",
+    )
+    .bind(format!(
+        r#"{{"provider_id":"{LOCAL_PROVIDER_ID}","model":"local-image"}}"#
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO client_preferences (key, value, updated_at) VALUES (\
+            'tools.speechToText', '{\"enabled\":true,\"provider\":\"local\",\"model\":\"retired-asr\"}', 1\
+         )",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(include_str!(
+        "../migrations/003_remove_local_model_support.sql"
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let local_provider_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM providers WHERE platform = 'nomifun-local-model'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(local_provider_count.0, 0);
+
+    let conversation_model: (Option<String>,) = sqlx::query_as(
+        "SELECT model FROM conversations \
+         WHERE id = 'conv_0190f5fe-7c00-7a00-8000-000000000101'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(conversation_model.0, None);
+
+    let creation_task_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM creation_tasks WHERE provider_id = ?")
+            .bind(LOCAL_PROVIDER_ID)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(creation_task_count.0, 0);
+
+    let stale_preference_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM client_preferences \
+         WHERE key IN ('tools.imageGenerationModel', 'tools.speechToText')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(stale_preference_count.0, 0);
+
+    let cloud_profile_source: (String,) = sqlx::query_as(
+        "SELECT source FROM model_profiles WHERE provider_id = ? AND model = 'cloud-image'",
+    )
+    .bind(CLOUD_PROVIDER_ID)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(cloud_profile_source.0, "inferred");
 }
 
 #[test]

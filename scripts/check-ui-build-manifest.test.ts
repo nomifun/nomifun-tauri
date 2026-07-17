@@ -80,4 +80,28 @@ describe('production UI build manifest', () => {
       'COPY --from=ui /app/ui/dist/nomifun-build.json /src/ui/dist/nomifun-build.json'
     );
   });
+
+  test('the Docker install path stays resilient on constrained networks', () => {
+    const dockerfile = readFileSync(join(root, 'Dockerfile'), 'utf8');
+    const compose = readFileSync(join(root, 'docker-compose.yml'), 'utf8');
+
+    expect(dockerfile).toContain('ARG RUST_IMAGE="rust:1-slim-bookworm"');
+    expect(dockerfile).toContain('FROM ${RUST_IMAGE} AS rust');
+    expect(dockerfile).toContain('ARG BUN_REGISTRY=""');
+    expect(dockerfile).toContain('Acquire::Retries=5');
+    expect(dockerfile).toContain('CARGO_NET_RETRY=10');
+    expect(dockerfile).toContain('CARGO_HTTP_TIMEOUT=600');
+    expect(dockerfile).toContain('zlib1g-dev liblzma-dev');
+
+    for (const buildArg of [
+      'BUN_IMAGE',
+      'RUST_IMAGE',
+      'RUNTIME_IMAGE',
+      'BUN_REGISTRY',
+      'APT_MIRROR',
+      'CARGO_REGISTRY_MIRROR',
+    ]) {
+      expect(compose).toContain(`${buildArg}: \${${buildArg}:-`);
+    }
+  });
 });

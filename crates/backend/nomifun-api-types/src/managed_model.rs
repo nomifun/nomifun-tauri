@@ -1,22 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-/// Stable kind discriminator for a NomiFun-managed model supply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ManagedModelServiceKind {
-    Free,
-    Local,
-}
-
 /// Coarse readiness exposed to the model hub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ManagedModelServiceAvailability {
-    /// A catalog is available locally, but live inference has not been verified.
+    /// A seed catalog is loaded, but live inference has not been verified.
     Unverified,
     Ready,
     Degraded,
-    Planned,
 }
 
 /// A model projected by a managed model service.
@@ -77,11 +68,10 @@ pub struct ManagedModelHealthBatchResult {
     pub unknown: usize,
 }
 
-/// Status returned by `/api/model-services/{kind}/status` and mutations.
+/// Status returned by the managed free-model service and its mutations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedModelServiceStatus {
-    pub kind: ManagedModelServiceKind,
     pub protocol_version: String,
     pub provider_id: Option<String>,
     pub enabled: bool,
@@ -121,7 +111,6 @@ mod tests {
     fn status_uses_camel_case_wire_contract() {
         let provider_id = nomifun_common::ProviderId::new().into_string();
         let status = ManagedModelServiceStatus {
-            kind: ManagedModelServiceKind::Free,
             protocol_version: "1".into(),
             provider_id: Some(provider_id.clone()),
             enabled: true,

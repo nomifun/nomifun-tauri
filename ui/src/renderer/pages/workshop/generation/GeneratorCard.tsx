@@ -32,7 +32,6 @@ import PromptField from './PromptField';
 import ParamControls from './ParamControls';
 import InputSummary from './InputSummary';
 import ResultView from './ResultView';
-import { isLocalZImageModel } from './localZImage';
 import { parseCanvasId } from '@/common/types/ids';
 import type { WorkshopNodeId } from '@/common/types/ids';
 
@@ -82,7 +81,6 @@ const GeneratorCard: React.FC<GeneratorCardProps> = ({ id, data }) => {
     const explicit = models.flat.find((m) => m.providerId === data.providerId && m.model === data.model);
     return explicit ?? models.flat[0] ?? null;
   }, [models.flat, data.providerId, data.model]);
-  const localZImage = isLocalZImageModel(effectiveModel);
 
   const { run, cancel } = useGenerationRun({
     nodeId,
@@ -227,13 +225,13 @@ const GeneratorCard: React.FC<GeneratorCardProps> = ({ id, data }) => {
             mode={mode}
             resultAssetIds={results}
             batch={data.batch}
-            onContinueEdit={localZImage ? undefined : continueEdit}
+            onContinueEdit={continueEdit}
             onToTextNode={toTextNode}
           />
         )}
         <PromptField value={prompt} mode={mode} selfId={nodeId} onChange={setPrompt} onAddMention={addMention} />
         <InputSummary selfId={nodeId} mentions={mentions} onRemoveMention={removeMention} />
-        <ParamControls mode={mode} model={effectiveModel} params={params} onChange={setParams} />
+        <ParamControls mode={mode} params={params} onChange={setParams} />
       </div>
 
       {/* Footer */}

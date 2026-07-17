@@ -14,7 +14,6 @@
 
 import { useCallback, useEffect, useRef } from 'react';
 import { useReactFlow } from '@xyflow/react';
-import { useTranslation } from 'react-i18next';
 import { cancelTask, createTask, getTask } from '../api';
 import type { WorkshopFlowEdge, WorkshopFlowNode } from '../canvas/model';
 import type { CreationTask, CreationTaskStatus, WorkshopGeneratorNodeData, WorkshopGeneratorStatus } from '../types';
@@ -22,7 +21,6 @@ import { buildTaskParams } from './genConstants';
 import type { ModelOption } from './genTypes';
 import { buildRunPlan } from './pipeline';
 import { spawnResultNodes } from './spawn';
-import { normalizeImageParamsForModel, validateLocalZImageRun } from './localZImage';
 import type { CreationTaskId, WorkshopNodeId } from '@/common/types/ids';
 
 const POLL_INTERVAL_MS = 2000;
@@ -63,7 +61,6 @@ export interface GenerationRun {
 export function useGenerationRun(args: UseGenerationRunArgs): GenerationRun {
   const { nodeId, canvasId } = args;
   const rf = useReactFlow<WorkshopFlowNode, WorkshopFlowEdge>();
-  const { t } = useTranslation();
 
   // Latest-value refs so the imperative loop never reads stale props.
   const dataRef = useRef(args.data);
@@ -175,20 +172,7 @@ export function useGenerationRun(args: UseGenerationRunArgs): GenerationRun {
       return;
     }
 
-    const issue = validateLocalZImageRun(model, plan.capability, plan.inputs);
-    if (issue) {
-      patch({
-        status: 'error',
-        taskId: null,
-        errorMessage: t('workshopGeneration.run.localTextToImageOnly', {
-          defaultValue: '本地 Z-Image 当前仅支持纯文字生成图片，请移除图片输入、蒙版和图片引用后重试。',
-        }),
-      });
-      return;
-    }
-
-    const storedParams = d.mode === 'image' ? normalizeImageParamsForModel(model, d.params ?? {}) : (d.params ?? {});
-    const params = buildTaskParams(d.mode, storedParams, plan.prompt);
+    const params = buildTaskParams(d.mode, d.params ?? {}, plan.prompt);
     patch({
       status: 'queued',
       providerId: model.providerId,
@@ -203,7 +187,6 @@ export function useGenerationRun(args: UseGenerationRunArgs): GenerationRun {
         canvas_id: canvasId,
         node_id: nodeId,
         provider_id: model.providerId,
-        provider_platform: model.platform,
         model: model.model,
         capability: plan.capability,
         params,
@@ -216,7 +199,7 @@ export function useGenerationRun(args: UseGenerationRunArgs): GenerationRun {
     } catch (e) {
       if (mountedRef.current) patch({ status: 'error', errorMessage: e instanceof Error ? e.message : String(e) });
     }
-  }, [rf, nodeId, canvasId, patch, finalize, startPolling, t]);
+  }, [rf, nodeId, canvasId, patch, finalize, startPolling]);
 
   const cancel = useCallback(() => {
     const taskId = activeTaskRef.current ?? dataRef.current.taskId ?? null;

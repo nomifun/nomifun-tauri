@@ -415,7 +415,6 @@
       "stopShort": "停止",
       "transcribingShort": "...",
       "audioCaptureError": "未检测到可用麦克风",
-      "audioNormalizationError": "无法将本次录音转换为本地语音识别所需的格式。请重新录音，或上传 WAV、MP3、OGG 或 FLAC 文件",
       "emptyTranscript": "未识别到语音内容",
       "fileTooLarge": "音频文件过大",
       "networkError": "音频转写时网络异常",

@@ -43,7 +43,6 @@ impl SttService {
 
         let client = self.client();
         match config.provider {
-            SpeechToTextProvider::Local => Err(SttError::LocalNotConfigured),
             SpeechToTextProvider::Openai => {
                 let openai_config = config.openai.as_ref().ok_or(SttError::OpenaiNotConfigured)?;
                 stt_openai::transcribe(
@@ -131,25 +130,6 @@ mod tests {
             .transcribe(vec![0u8; 10], "test.wav", "audio/wav", None, &make_disabled_config())
             .await;
         assert!(matches!(result, Err(SttError::Disabled)));
-    }
-
-    #[tokio::test]
-    async fn local_provider_requires_the_local_asr_route() {
-        let svc = SttService::new(Client::new());
-        let config = SpeechToTextConfig {
-            enabled: true,
-            provider: SpeechToTextProvider::Local,
-            provider_id: None,
-            model: None,
-            language: None,
-            auto_send: None,
-            openai: None,
-            deepgram: None,
-        };
-        let result = svc
-            .transcribe(vec![0u8; 10], "test.wav", "audio/wav", None, &config)
-            .await;
-        assert!(matches!(result, Err(SttError::LocalNotConfigured)));
     }
 
     #[tokio::test]

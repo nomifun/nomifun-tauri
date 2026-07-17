@@ -415,7 +415,6 @@
       "stopShort": "Stop",
       "transcribingShort": "...",
       "audioCaptureError": "No microphone was detected",
-      "audioNormalizationError": "This recording format could not be prepared for local speech recognition. Please record again or upload a WAV, MP3, OGG, or FLAC file",
       "emptyTranscript": "No speech was detected",
       "fileTooLarge": "Audio file is too large",
       "networkError": "Network error while transcribing audio",

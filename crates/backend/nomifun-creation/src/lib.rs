@@ -13,8 +13,7 @@
 //! Live adapters ([`default_adapters`]): `openai_images` (sync images),
 //! `gemini_image` (`:generateContent`), `openai_video` (async submit→poll).
 //! `ark` / `modelscope` are P1 stubs. Capability → adapter routing lives in
-//! [`route_adapter_id`]. [`default_adapters_with_local_image`] adds an explicitly
-//! provisioned Z-Image `sd-cli` backend; this crate never downloads it on its own.
+//! [`route_adapter_id`].
 
 mod adapters;
 mod dto;
@@ -25,15 +24,7 @@ pub mod routes;
 pub mod service;
 pub mod state;
 
-pub use adapters::{default_adapters, default_adapters_with_local_image, route_adapter_id};
-pub use adapters::local_image::{
-    LOCAL_IMAGE_ADAPTER_ID, LOCAL_Z_IMAGE_TURBO_MODEL_ID, LocalImageAdapter,
-    LocalImageBackend, LocalImageRequest, SD_CPP_RUNTIME_ARTIFACTS, SD_CPP_RUNTIME_VERSION,
-    SdCliZImageBackend, SdCliZImageConfig, SdCppRuntimeArtifactSpec,
-    Z_IMAGE_TURBO_ARTIFACTS, Z_IMAGE_TURBO_CFG_SCALE, Z_IMAGE_TURBO_DOWNLOAD_SIZE,
-    Z_IMAGE_TURBO_STEPS, ZImageArtifactRole, ZImageArtifactSpec,
-    current_sd_cpp_runtime_artifact,
-};
+pub use adapters::{default_adapters, route_adapter_id};
 pub use dto::CreationTask;
 pub use provider::{
     InputAsset, MediaProvider, PollResult, ProducedAsset, ProducedData, ResolvedProvider, SubmitAck,

@@ -526,7 +526,7 @@ export type ModelTask =
 
 export type ModelTrait = 'vision_input' | 'function_calling' | 'reasoning' | 'web_search';
 
-export type ProfileSource = 'inferred' | 'user' | 'catalog';
+export type ProfileSource = 'inferred' | 'user';
 
 /** 权威 per-model 能力档案（键 (provider_id, model)）。 */
 export interface ModelProfile {

@@ -313,10 +313,6 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
             services.model_profile_repo.clone(),
         ),
         managed_model_service: Some(services.managed_model_service.clone()),
-        local_model_service: None,
-        image_model_service: None,
-        asr_model_service: None,
-        lazy_local_model_runtime: Some(services.lazy_local_model_runtime.clone()),
         protocol_detection_service: ProtocolDetectionService::new_dynamic(),
         version_check_service: VersionCheckService::new_dynamic(env!("CARGO_PKG_VERSION").to_owned()),
         data_dir: services.data_dir.clone(),
@@ -1337,7 +1333,6 @@ pub fn build_shell_state(services: &AppServices) -> ShellRouterState {
         stt_service: Arc::new(nomifun_shell::SttService::new_dynamic()),
         client_pref_service,
         provider_service: Some(ProviderService::new(provider_repo, services.encryption_key)),
-        lazy_local_model_runtime: Some(services.lazy_local_model_runtime.clone()),
     }
 }
 

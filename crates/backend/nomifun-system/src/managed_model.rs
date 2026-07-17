@@ -15,7 +15,7 @@ use axum::{Json, Router};
 use nomifun_api_types::{
     ManagedModel, ManagedModelHealthBatchResult, ManagedModelHealthErrorKind,
     ManagedModelHealthResult, ManagedModelHealthStatus, ManagedModelServiceAvailability,
-    ManagedModelServiceKind, ManagedModelServiceStatus,
+    ManagedModelServiceStatus,
 };
 use nomifun_common::{AppError, ProviderId, encrypt_string, now_ms};
 use nomifun_db::{
@@ -31,7 +31,6 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 pub const FREE_MODEL_PLATFORM: &str = "nomifun-free-model";
-pub const LOCAL_MODEL_PLATFORM: &str = "nomifun-local-model";
 pub const MANAGED_MODEL_PROTOCOL_VERSION: &str = "1";
 
 const FREE_MODEL_PROVIDER_NAME: &str = "NomiFun Free Model";
@@ -42,8 +41,6 @@ const FREE_PRIVACY_NOTICE: &str = concat!(
     "Prompts and model responses are processed by an external free-model service. ",
     "Do not send sensitive information."
 );
-const LOCAL_PRIVACY_NOTICE: &str =
-    "Local-model support is reserved for a future one-click download and deployment capability.";
 const FREE_LAST_REFRESH_PREF: &str = "managedModel.free.lastRefresh";
 const FREE_LAST_ERROR_PREF: &str = "managedModel.free.lastError";
 pub const DEFAULT_FREE_REFRESH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -69,7 +66,6 @@ const FREE_SEED_MODELS: &[&str] = &[
 fn is_managed_provider(value: &str) -> bool {
     let value = value.trim();
     value.eq_ignore_ascii_case(FREE_MODEL_PLATFORM)
-        || value.eq_ignore_ascii_case(LOCAL_MODEL_PLATFORM)
 }
 
 /// Return true when a provider platform belongs to a protected managed supply.
@@ -246,25 +242,6 @@ impl ManagedModelService {
     pub async fn free_status(&self) -> ManagedModelServiceStatus {
         let state = self.free.read().await;
         status_from_free_state(&state, &self.provider_id)
-    }
-
-    pub fn local_status(&self) -> ManagedModelServiceStatus {
-        ManagedModelServiceStatus {
-            kind: ManagedModelServiceKind::Local,
-            protocol_version: MANAGED_MODEL_PROTOCOL_VERSION.into(),
-            provider_id: None,
-            enabled: false,
-            ready: false,
-            upstream: "NomiFun Local Model".into(),
-            models: Vec::new(),
-            last_refresh: None,
-            automatic_refresh: false,
-            refresh_interval_ms: 0,
-            next_refresh: None,
-            last_error: None,
-            privacy_notice: LOCAL_PRIVACY_NOTICE.into(),
-            availability: ManagedModelServiceAvailability::Planned,
-        }
     }
 
     pub async fn free_models(&self) -> Vec<ManagedModel> {
@@ -1585,12 +1562,11 @@ fn status_from_free_state(state: &FreeState, provider_id: &str) -> ManagedModelS
             source: PUBLIC_SOURCE_ALIAS.into(),
         })
         .collect::<Vec<_>>();
-    // `ready` means the local loopback supply has an enabled catalog entry. The
+    // `ready` means the in-process loopback supply has an enabled catalog entry. The
     // separate availability enum stays `Unverified` until a live discovery has
     // succeeded; even then it deliberately does not promise a third-party SLA.
     let ready = state.enabled && models.iter().any(|model| model.enabled);
     ManagedModelServiceStatus {
-        kind: ManagedModelServiceKind::Free,
         protocol_version: MANAGED_MODEL_PROTOCOL_VERSION.into(),
         provider_id: Some(provider_id.to_owned()),
         enabled: state.enabled,
@@ -1949,43 +1925,6 @@ mod tests {
         assert!(
             repo.list().await.unwrap().iter().all(|row| row.platform != FREE_MODEL_PLATFORM)
         );
-    }
-
-    #[tokio::test]
-    async fn free_provision_allows_canonical_local_provider_to_coexist() {
-        let db = init_database_memory().await.unwrap();
-        let repo: Arc<dyn IProviderRepository> =
-            Arc::new(SqliteProviderRepository::new(db.pool().clone()));
-        let encrypted = encrypt_string("local-token", &TEST_KEY).unwrap();
-        let local_provider_id = ProviderId::new().into_string();
-        repo.create(CreateProviderParams {
-            id: Some(&local_provider_id),
-            platform: LOCAL_MODEL_PLATFORM,
-            name: "NomiFun Local Model",
-            base_url: "http://127.0.0.1:12346/v1",
-            api_key_encrypted: &encrypted,
-            models: "[]",
-            enabled: false,
-            capabilities: "[]",
-            context_limit: None,
-            model_context_limits: None,
-            model_protocols: None,
-            model_descriptions: None,
-            model_enabled: None,
-            model_health: None,
-            bedrock_config: None,
-            is_full_url: false,
-            sort_order: None,
-        })
-        .await
-        .unwrap();
-
-        let (service, mut server) =
-            start_and_provision_free_model(repo.clone(), TEST_KEY).await.unwrap();
-        let free_provider_id = service.free_status().await.provider_id.unwrap();
-        assert!(repo.find_by_id(&free_provider_id).await.unwrap().is_some());
-        assert!(repo.find_by_id(&local_provider_id).await.unwrap().is_some());
-        server.stop();
     }
 
     #[tokio::test]
