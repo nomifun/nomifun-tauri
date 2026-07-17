@@ -10,8 +10,9 @@ import ExecutionPlanEditor, { type ExecutionModelPoolSelection } from './Executi
 import ExecutionAdjustBox from './ExecutionAdjustBox';
 import { ExecutionControls } from './ExecutionControls';
 import { useExecution } from './ExecutionContext';
+import type { OpenStepPayload } from './DagCanvas';
 import { isTerminalExecutionStatus } from './executionStatusMeta';
-import { stepStatusMeta } from './nodes/StepNode';
+import ParticipantProfilePanel from './ParticipantProfilePanel';
 import { useExecutionModelPool } from './useExecutionModelPool';
 import styles from './executionTopPanel.module.css';
 
@@ -20,17 +21,24 @@ const CANVAS_WIDTH_KEY = 'nomifun:execution-canvas-width';
 const MIN_WIDTH = 320;
 const MAX_WIDTH = 860;
 const DEFAULT_WIDTH = 480;
+const MIN_CHAT_WIDTH = 360;
+
+function availableMaxWidth(containerWidth?: number): number {
+  if (typeof window === 'undefined' || window.matchMedia('(max-width: 768px)').matches) return MAX_WIDTH;
+  const layoutWidth = containerWidth && containerWidth > 0 ? containerWidth : window.innerWidth;
+  return Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, layoutWidth - MIN_CHAT_WIDTH));
+}
 
 function initialWidth(): number {
   try {
     const persisted = Number(localStorage.getItem(CANVAS_WIDTH_KEY));
     if (Number.isFinite(persisted) && persisted >= MIN_WIDTH && persisted <= MAX_WIDTH) {
-      return persisted;
+      return Math.min(persisted, availableMaxWidth());
     }
   } catch {
     // localStorage may be unavailable in embedded surfaces.
   }
-  return DEFAULT_WIDTH;
+  return Math.min(DEFAULT_WIDTH, availableMaxWidth());
 }
 
 const ExecutionTopPanel: React.FC = () => {
@@ -39,6 +47,7 @@ const ExecutionTopPanel: React.FC = () => {
   const execution = useExecution();
   const { buildModelPool } = useExecutionModelPool();
   const [width, setWidth] = useState(initialWidth);
+  const panelRef = useRef<HTMLDivElement | null>(null);
   const dragState = useRef<{ startX: number; startWidth: number } | null>(null);
   const [replanOpen, setReplanOpen] = useState(false);
   const [replanGoal, setReplanGoal] = useState('');
@@ -59,6 +68,7 @@ const ExecutionTopPanel: React.FC = () => {
     projectedStepId,
     returnToMain,
     canvasOpen,
+    setCanvasOpen,
   } = execution;
 
   useEffect(() => {
@@ -68,6 +78,24 @@ const ExecutionTopPanel: React.FC = () => {
       // Ignore unavailable storage.
     }
   }, [width]);
+
+  const getAvailableMaxWidth = useCallback(
+    () => availableMaxWidth(panelRef.current?.parentElement?.getBoundingClientRect().width),
+    [],
+  );
+
+  useEffect(() => {
+    const clampWidth = () => setWidth((current) => Math.min(current, getAvailableMaxWidth()));
+    clampWidth();
+    const parent = panelRef.current?.parentElement;
+    const observer = parent && typeof ResizeObserver !== 'undefined' ? new ResizeObserver(clampWidth) : null;
+    if (parent) observer?.observe(parent);
+    window.addEventListener('resize', clampWidth);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', clampWidth);
+    };
+  }, [getAvailableMaxWidth]);
 
   const onResizeStart = useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
@@ -82,8 +110,25 @@ const ExecutionTopPanel: React.FC = () => {
   const onResizeMove = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     if (!dragState.current) return;
     const next = dragState.current.startWidth + dragState.current.startX - event.clientX;
-    setWidth(Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, next)));
-  }, []);
+    setWidth(Math.min(getAvailableMaxWidth(), Math.max(MIN_WIDTH, next)));
+  }, [getAvailableMaxWidth]);
+
+  const onResizeKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    const step = event.shiftKey ? 64 : 24;
+    if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      setWidth((current) => Math.min(getAvailableMaxWidth(), current + step));
+    } else if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      setWidth((current) => Math.max(MIN_WIDTH, current - step));
+    } else if (event.key === 'Home') {
+      event.preventDefault();
+      setWidth(MIN_WIDTH);
+    } else if (event.key === 'End') {
+      event.preventDefault();
+      setWidth(getAvailableMaxWidth());
+    }
+  }, [getAvailableMaxWidth]);
 
   const onResizeEnd = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
     dragState.current = null;
@@ -148,6 +193,14 @@ const ExecutionTopPanel: React.FC = () => {
     [detail?.attempts, detail?.steps],
   );
 
+  const openStep = useCallback(
+    (payload: OpenStepPayload) => {
+      projectStep(payload);
+      if (window.matchMedia('(max-width: 768px)').matches) setCanvasOpen(false);
+    },
+    [projectStep, setCanvasOpen],
+  );
+
   if (!executionId || !canvasOpen) return null;
 
   const status = detail?.execution.status ?? '';
@@ -155,17 +208,25 @@ const ExecutionTopPanel: React.FC = () => {
   const steps = (detail?.steps ?? []).filter((step) => step.superseded_in_revision == null);
   const runningCount = steps.filter((step) => step.status === 'running').length;
   const completedCount = steps.filter((step) => step.status === 'completed').length;
+  const failedCount = steps.filter((step) => step.status === 'failed').length;
+  const completionPercent = steps.length > 0 ? Math.round((completedCount / steps.length) * 100) : 0;
+  const offersReusableProfiles = status === 'completed' || status === 'completed_with_failures';
   const waitingSteps = steps.filter(
     (step) => step.status === 'waiting_input' && Boolean(latestAttemptByStep.get(step.id)?.question?.trim()),
   );
+  const maxPanelWidth = getAvailableMaxWidth();
 
   return (
-    <div className={`${styles.panel} shrink-0 flex flex-col`} style={{ width }}>
+    <div ref={panelRef} className={`${styles.panel} shrink-0 flex flex-col`} style={{ width: Math.min(width, maxPanelWidth) }}>
       {messageContext}
       <div
         className={styles.resizeHandle}
         role='separator'
+        tabIndex={0}
         aria-orientation='vertical'
+        aria-valuemin={MIN_WIDTH}
+        aria-valuemax={maxPanelWidth}
+        aria-valuenow={Math.min(width, maxPanelWidth)}
         aria-label={t('agentExecution.panel.resize', {
           defaultValue: '调整协作面板宽度',
         })}
@@ -173,6 +234,7 @@ const ExecutionTopPanel: React.FC = () => {
         onPointerMove={onResizeMove}
         onPointerUp={onResizeEnd}
         onPointerCancel={onResizeEnd}
+        onKeyDown={onResizeKeyDown}
       />
 
       {(showControls || leadThinking.active) && (
@@ -201,7 +263,6 @@ const ExecutionTopPanel: React.FC = () => {
         <div className={styles.canvasProgress} data-testid='execution-canvas-progress'>
           <div className={styles.canvasProgressHeader}>
             <EveryUser theme='outline' size='14' className={styles.canvasProgressIcon} />
-            <span className={styles.canvasProgressTitle}>{t('agentExecution.progress.title', { defaultValue: '协作进度' })}</span>
             <span className={styles.canvasProgressText}>
               {t('agentExecution.progress.summary', {
                 defaultValue: '{{done}}/{{total}} 个任务已完成',
@@ -209,6 +270,27 @@ const ExecutionTopPanel: React.FC = () => {
                 total: steps.length,
               })}
             </span>
+            {runningCount > 0 && (
+              <span className={styles.progressMetric} data-tone='active'>
+                {t('agentExecution.progress.running', { count: runningCount })}
+              </span>
+            )}
+            {failedCount > 0 && (
+              <span className={styles.progressMetric} data-tone='danger'>
+                {t('agentExecution.progress.failed', { count: failedCount })}
+              </span>
+            )}
+            <span
+              className={styles.progressTrack}
+              role='progressbar'
+              aria-label={t('agentExecution.progress.title', { defaultValue: '协作进度' })}
+              aria-valuemin={0}
+              aria-valuemax={steps.length}
+              aria-valuenow={completedCount}
+            >
+              <span className={styles.progressBar} style={{ width: `${completionPercent}%` }} />
+            </span>
+            {offersReusableProfiles && detail && <ParticipantProfilePanel detail={detail} />}
           </div>
 
           {waitingSteps.map((step) => {
@@ -222,7 +304,7 @@ const ExecutionTopPanel: React.FC = () => {
                   const participant = step.assigned_participant_id
                     ? detail?.participants.find((item) => item.id === step.assigned_participant_id)
                     : undefined;
-                  projectStep({
+                  openStep({
                     step,
                     participant,
                     participants: detail?.participants ?? [],
@@ -245,37 +327,6 @@ const ExecutionTopPanel: React.FC = () => {
               </button>
             );
           })}
-
-          <div className={`${styles.chips} nomi-roster-scroll`}>
-            {steps.map((step) => {
-              const meta = stepStatusMeta(step.status);
-              return (
-                <button
-                  key={step.id}
-                  type='button'
-                  className={styles.chip}
-                  data-active={projectedStepId === step.id ? 'true' : undefined}
-                  title={`${step.title} · ${step.status}`}
-                  onClick={() => {
-                    const participant = step.assigned_participant_id
-                      ? detail?.participants.find((item) => item.id === step.assigned_participant_id)
-                      : undefined;
-                    projectStep({
-                      step,
-                      participant,
-                      participants: detail?.participants ?? [],
-                      attempt: latestAttemptByStep.get(step.id),
-                      executionId,
-                      refetch,
-                    });
-                  }}
-                >
-                  <span className={`${styles.chipDot} ${meta.pulse ? styles.chipDotPulse : ''}`} style={{ background: meta.color }} />
-                  <span className={styles.chipTitle}>{step.title}</span>
-                </button>
-              );
-            })}
-          </div>
         </div>
       )}
 
@@ -286,7 +337,7 @@ const ExecutionTopPanel: React.FC = () => {
             detail={detail}
             loading={loading}
             refetch={refetch}
-            onOpenStep={projectStep}
+            onOpenStep={openStep}
             leadThinking={leadThinking}
             activeStepId={projectedStepId}
           />

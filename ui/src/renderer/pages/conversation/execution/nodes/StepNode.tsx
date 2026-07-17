@@ -4,9 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { Popover } from '@arco-design/web-react';
 import React from 'react';
-import { Handle, Position, type Node, type NodeProps } from '@xyflow/react';
-import { Branch, CheckOne, CloseOne, Gavel, Help, Lightning, Lock, Merge, Refresh, Shield, Trophy } from '@icon-park/react';
+import { Handle, Position, useStore, type Node, type NodeProps } from '@xyflow/react';
+import { Branch, CheckOne, CloseOne, Gavel, Help, Lightning, Merge, Refresh, Shield, Trophy } from '@icon-park/react';
 
 /** Task status → theme-var color + a slow-pulse hint for the running state. */
 export interface StepStatusMeta {
@@ -138,6 +139,9 @@ export interface LoopState {
 /** The data payload DagCanvas attaches to each task node. */
 export interface StepNodeData extends Record<string, unknown> {
   title: string;
+  spec?: string;
+  outputSummary?: string;
+  errorSummary?: string;
   status: string;
   statusLabel: string;
   /** Task kind or synthesis display mode. Unknown values render without a badge. */
@@ -175,9 +179,6 @@ export interface StepNodeData extends Record<string, unknown> {
   /** Fan-out group label parsed from `pattern_config` (`{"group":"<label>"}`).
    * Present only for sibling tasks the planner fanned out in parallel. */
   groupLabel?: string;
-  /** Per-group hue (HSL degrees) so every sibling in a fan-out group shares one
-   * tint — a calm, deterministic color derived from the group label. */
-  groupHue?: number;
   /** Localized "fan-out: {{label}}" text for the group chip. */
   groupChipLabel?: string;
   /** Assigned execution participant id, used only for the chip tooltip. */
@@ -186,6 +187,8 @@ export interface StepNodeData extends Record<string, unknown> {
   chipLabel?: string;
   /** Logo url for the assigned participant, if any. */
   participantLogo?: string | null;
+  roleLabel?: string;
+  modelLabel?: string;
   attempt: number;
   /** Whether this assignment is locked (pinned against auto-routing). */
   locked?: boolean;
@@ -198,6 +201,19 @@ export interface StepNodeData extends Record<string, unknown> {
   pendingQuestion?: string;
   /** Localized "待作答" text for the question badge (computed in DagCanvas). */
   questionLabel?: string;
+  relationState?: 'idle' | 'focus' | 'related' | 'muted';
+  upstreamLabels: string[];
+  downstreamLabels: string[];
+  quickLookLabels: {
+    result: string;
+    upstream: string;
+    downstream: string;
+    model: string;
+    role: string;
+    attempts: string;
+    inspect: string;
+  };
+  onHoverChange?: (active: boolean) => void;
   /** Click handler — opens the task inspector / transcript panel. */
   onOpen: () => void;
 }
@@ -205,273 +221,203 @@ export interface StepNodeData extends Record<string, unknown> {
 /** Strongly-typed node alias so NodeProps narrows `data` for us. */
 export type StepFlowNode = Node<StepNodeData, 'step'>;
 
-/** Shared pill class（meta 行小胶囊的公共原子类，样式差异走内联主题色）。 */
-const PILL_CLASS = 'inline-flex shrink-0 items-center gap-3px rd-100px px-6px py-2px text-10px font-600 leading-none';
+type SemanticResult = { text: string; tone: string; icon?: React.ReactNode };
 
-/** Tinted pill style（统一「主题色 14% 底 + 32% 描边」公式，全部主题变量）。 */
-function tintedPill(tone: string): React.CSSProperties {
-  return {
-    color: tone,
-    background: `color-mix(in srgb, ${tone} 14%, transparent)`,
-    border: `1px solid color-mix(in srgb, ${tone} 32%, transparent)`,
-  };
-}
-
-/** Neutral pill style（未定态：verifying…/judging…/iterating…）。 */
-const NEUTRAL_PILL: React.CSSProperties = {
-  color: 'var(--text-secondary)',
-  background: 'var(--color-fill-1)',
-  border: '1px solid var(--border-light)',
-};
-
-/**
- * StepNode — a custom React Flow node rendering one execution task as an on-brand
- * card（需求2 精美化）: a status accent strip + shimmer while running, a title
- * row (pulsing status dot + title + kind badge), a meta row (status label +
- * verdict/winner/loop pills + assignment chip + retry badge + fan-out chip +
- * token chip), and — in approval mode — a prominent question badge. Hover lift
- * / press / selection ring / running glow all live in `dag-canvas.css` keyed by
- * data attributes; the node only feeds `--node-accent` and state flags. Theme
- * variables only (no hardcoded hex); source/target handles anchor the edges.
- */
 function StepNodeImpl({ data, selected }: NodeProps<StepFlowNode>) {
   const meta = stepStatusMeta(data.status);
+  const zoom = useStore((state) => state.transform[2]);
+  const density = zoom < 0.55 ? 'minimal' : zoom < 0.82 ? 'compact' : 'full';
   const kind = normalizeStepKind(data.kind);
-  const isSynthesis = kind === 'synthesis';
-  const isVerify = kind === 'verify';
-  const isJudge = kind === 'judge';
-  const isLoop = kind === 'loop';
   const hasQuestion = Boolean(data.pendingQuestion);
-  // A fan-out group needs a label AND a resolved hue; either missing → no group
-  // affordance (defensive against half-parsed config).
-  const inGroup = data.groupLabel != null && data.groupHue != null;
-  const groupColor = inGroup ? `hsl(${data.groupHue}, 62%, 55%)` : null;
+  const [quickLookOpen, setQuickLookOpen] = React.useState(false);
 
-  return (
-    <div
-      role='button'
-      tabIndex={0}
-      aria-label={`${data.title} · ${data.statusLabel}`}
-      onClick={data.onOpen}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          data.onOpen();
-        }
-      }}
-      className='nomi-dag-card nomi-dag-enter group relative flex w-220px cursor-pointer select-none flex-col gap-8px rd-12px px-14px pb-12px pt-14px outline-none'
-      data-status={data.status}
-      data-selected={selected ? 'true' : undefined}
-      data-question={hasQuestion ? 'true' : undefined}
-      data-grouped={inGroup ? 'true' : undefined}
-      style={
-        {
-          '--node-accent': meta.color,
-          '--group-accent': groupColor ?? 'transparent',
-          '--dag-i': data.enterIndex ?? 0,
-        } as React.CSSProperties
-      }
-    >
-      {/* 顶部状态条纹：常态 2px 主题色；running 时叠加 shimmer 进度光带。 */}
-      <span className='nomi-dag-accent' aria-hidden='true'>
-        {meta.pulse && <span className='nomi-dag-shimmer' />}
-      </span>
+  let semanticResult: SemanticResult | undefined;
+  if (kind === 'verify' && data.verifyVerdict) {
+    const { pass, tally } = data.verifyVerdict;
+    semanticResult = {
+      text:
+        pass === true
+          ? `${data.verifyVerdictLabels?.pass ?? ''}${tally ? ` ${tally}` : ''}`
+          : pass === false
+            ? `${data.verifyVerdictLabels?.fail ?? ''}${tally ? ` ${tally}` : ''}`
+            : (data.verifyVerdictLabels?.pending ?? ''),
+      tone: pass === true ? 'var(--success)' : pass === false ? 'var(--danger)' : 'var(--text-secondary)',
+      icon:
+        pass === true ? (
+          <CheckOne theme='outline' size='10' strokeWidth={4} />
+        ) : pass === false ? (
+          <CloseOne theme='outline' size='10' strokeWidth={4} />
+        ) : undefined,
+    };
+  } else if (kind === 'judge' && data.judgeWinner) {
+    const { winner, judges } = data.judgeWinner;
+    semanticResult = {
+      text:
+        winner == null
+          ? (data.judgeWinnerLabels?.pending ?? data.judgeWinnerLabels?.none ?? '')
+          : `${data.judgeWinnerLabels?.winner ?? ''} #${winner + 1}${judges ? ` · ${judges}` : ''}`,
+      tone: winner == null ? 'var(--text-secondary)' : 'var(--success)',
+      icon: winner == null ? undefined : <Trophy theme='outline' size='10' strokeWidth={4} />,
+    };
+  } else if (kind === 'loop' && data.loopState) {
+    const { state, iterations, maxIter } = data.loopState;
+    semanticResult = {
+      text:
+        state === 'done'
+          ? `${data.loopStateLabels?.done ?? ''}${iterations != null && maxIter != null ? ` ${iterations}/${maxIter}` : ''}`
+          : state === 'failed'
+            ? (data.loopStateLabels?.failed ?? '')
+            : (data.loopStateLabels?.iterating ?? ''),
+      tone: state === 'done' ? 'var(--success)' : state === 'failed' ? 'var(--danger)' : 'var(--text-secondary)',
+      icon:
+        state === 'done' ? (
+          <CheckOne theme='outline' size='10' strokeWidth={4} />
+        ) : state === 'failed' ? (
+          <CloseOne theme='outline' size='10' strokeWidth={4} />
+        ) : (
+          <Refresh theme='outline' size='10' strokeWidth={4} />
+        ),
+    };
+  }
 
-      {/* Incoming-dependency anchor (top) */}
-      <Handle
-        type='target'
-        position={Position.Top}
-        isConnectable={false}
-        style={{
-          width: 7,
-          height: 7,
-          background: 'var(--bg-5)',
-          border: 'none',
-        }}
-      />
+  const summary = hasQuestion
+    ? `${data.questionLabel ?? ''}${data.pendingQuestion ? ` · ${data.pendingQuestion}` : ''}`
+    : data.errorSummary || semanticResult?.text || data.outputSummary || data.spec || data.statusLabel;
 
-      {/* Title row: status dot + task title (+ kind badge, right-aligned) */}
-      <div className='flex items-start gap-8px'>
-        <span
-          className={`mt-4px size-9px shrink-0 rd-full ${meta.pulse ? 'nomi-dag-pulse' : ''}`}
-          style={{
-            background: meta.color,
-            boxShadow: `0 0 0 3px color-mix(in srgb, ${meta.color} 20%, transparent)`,
-          }}
-        />
-        <span className='min-w-0 flex-1 text-13px font-600 leading-18px text-t-primary line-clamp-2'>{data.title}</span>
-        {isSynthesis && (
-          <span className={`nomi-dag-kind-badge ${PILL_CLASS}`} style={tintedPill(SYNTH_ACCENT)} title={data.synthesisLabel}>
-            <Merge theme='outline' size='10' strokeWidth={4} className='line-height-0' />
-            {data.synthesisLabel}
-          </span>
-        )}
-        {isVerify && (
-          <span className={`nomi-dag-kind-badge ${PILL_CLASS}`} style={tintedPill(VERIFY_ACCENT)} title={data.verifyLabel}>
-            <Shield theme='outline' size='10' strokeWidth={4} className='line-height-0' />
-            {data.verifyLabel}
-          </span>
-        )}
-        {isJudge && (
-          <span className={`nomi-dag-kind-badge ${PILL_CLASS}`} style={tintedPill(JUDGE_ACCENT)} title={data.judgeLabel}>
-            <Gavel theme='outline' size='10' strokeWidth={4} className='line-height-0' />
-            {data.judgeLabel}
-          </span>
-        )}
-        {isLoop && (
-          <span className={`nomi-dag-kind-badge ${PILL_CLASS}`} style={tintedPill(LOOP_ACCENT)} title={data.loopLabel}>
-            <Refresh theme='outline' size='10' strokeWidth={4} className='line-height-0' />
-            {data.loopLabel}
-          </span>
-        )}
+  const kindBadge =
+    kind === 'synthesis'
+      ? { label: data.synthesisLabel, tone: SYNTH_ACCENT, icon: <Merge theme='outline' size='11' strokeWidth={4} /> }
+      : kind === 'verify'
+        ? { label: data.verifyLabel, tone: VERIFY_ACCENT, icon: <Shield theme='outline' size='11' strokeWidth={4} /> }
+        : kind === 'judge'
+          ? { label: data.judgeLabel, tone: JUDGE_ACCENT, icon: <Gavel theme='outline' size='11' strokeWidth={4} /> }
+          : kind === 'loop'
+            ? { label: data.loopLabel, tone: LOOP_ACCENT, icon: <Refresh theme='outline' size='11' strokeWidth={4} /> }
+            : null;
+
+  const quickLook = (
+    <div className='nomi-dag-quick-look'>
+      <div className='nomi-dag-quick-look-header'>
+        <span className='nomi-dag-quick-look-dot' style={{ background: meta.color }} />
+        <strong>{data.title}</strong>
+        <span style={{ color: meta.color }}>{data.statusLabel}</span>
       </div>
-
-      {/* Meta row: status label + verdict pill + assignment chip + retry badge + fan-out group chip */}
-      <div className='flex flex-wrap items-center gap-6px'>
-        <span className='text-11px font-500 leading-none' style={{ color: meta.color }}>
-          {data.statusLabel}
-        </span>
-        {isVerify &&
-          data.verifyVerdict &&
-          (() => {
-            const { pass, tally } = data.verifyVerdict;
-            const labels = data.verifyVerdictLabels;
-            // pass===true → success · pass===false → danger · pass===null → neutral.
-            const tone = pass === true ? 'var(--success)' : pass === false ? 'var(--danger)' : null;
-            const text =
-              pass === true
-                ? `${labels?.pass ?? ''}${tally ? ` ${tally}` : ''}`
-                : pass === false
-                  ? `${labels?.fail ?? ''}${tally ? ` ${tally}` : ''}`
-                  : (labels?.pending ?? '');
-            return (
-              <span className={PILL_CLASS} style={tone ? tintedPill(tone) : NEUTRAL_PILL} title={text}>
-                {pass === true && <CheckOne theme='outline' size='10' strokeWidth={4} className='shrink-0 line-height-0' />}
-                {pass === false && <CloseOne theme='outline' size='10' strokeWidth={4} className='shrink-0 line-height-0' />}
-                <span className='truncate'>{text}</span>
-              </span>
-            );
-          })()}
-        {isJudge &&
-          data.judgeWinner &&
-          (() => {
-            const { winner, judges } = data.judgeWinner;
-            const labels = data.judgeWinnerLabels;
-            const hasWinner = winner !== null;
-            const text = hasWinner
-              ? `${labels?.winner ?? ''} #${winner}${judges ? ` · ${judges}` : ''}`
-              : (labels?.none ?? labels?.pending ?? '');
-            return (
-              <span className={PILL_CLASS} style={hasWinner ? tintedPill('var(--success)') : NEUTRAL_PILL} title={text}>
-                {hasWinner && <Trophy theme='outline' size='10' strokeWidth={4} className='shrink-0 line-height-0' />}
-                <span className='truncate'>{text}</span>
-              </span>
-            );
-          })()}
-        {isLoop &&
-          data.loopState &&
-          (() => {
-            const { state, reason, iterations, maxIter } = data.loopState;
-            const labels = data.loopStateLabels;
-            const tone = state === 'done' ? 'var(--success)' : state === 'failed' ? 'var(--danger)' : null;
-            // DONE shows the iteration tally (N/M) + reason; FAILED shows the reason;
-            // null shows the neutral "iterating…" label. Reason is best-effort extra.
-            const reasonSuffix = reason ? ` · ${reason}` : '';
-            const text =
-              state === 'done'
-                ? `${labels?.done ?? ''}${iterations != null && maxIter != null ? ` ${iterations}/${maxIter}` : ''}${reasonSuffix}`
-                : state === 'failed'
-                  ? `${labels?.failed ?? ''}${reasonSuffix}`
-                  : (labels?.iterating ?? '');
-            return (
-              <span className={PILL_CLASS} style={tone ? tintedPill(tone) : NEUTRAL_PILL} title={text}>
-                {state === 'done' && <CheckOne theme='outline' size='10' strokeWidth={4} className='shrink-0 line-height-0' />}
-                {state === 'failed' && <CloseOne theme='outline' size='10' strokeWidth={4} className='shrink-0 line-height-0' />}
-                {state === null && <Refresh theme='outline' size='10' strokeWidth={4} className='shrink-0 line-height-0' />}
-                <span className='truncate'>{text}</span>
-              </span>
-            );
-          })()}
-        {data.chipLabel && (
-          <span
-            className='inline-flex max-w-[150px] items-center gap-3px rd-100px px-6px py-2px text-10px leading-none text-t-secondary'
-            style={{
-              background: 'var(--fill-0)',
-              border: '1px solid var(--border-light)',
-            }}
-            title={data.participantId}
-          >
-            {data.participantLogo ? (
-              <img src={data.participantLogo} alt='' className='size-10px shrink-0 object-contain' />
-            ) : (
-              <span className='size-5px shrink-0 rd-full' style={{ background: 'rgb(var(--primary-6))' }} />
-            )}
-            <span className='truncate'>{data.chipLabel}</span>
-            {data.locked && <Lock theme='outline' size='9' strokeWidth={4} className='shrink-0 text-t-tertiary' />}
+      {data.spec && <p className='nomi-dag-quick-look-spec'>{data.spec}</p>}
+      {(data.outputSummary || data.errorSummary) && (
+        <div className='nomi-dag-quick-look-result'>
+          <span>{data.quickLookLabels.result}</span>
+          <p>{data.errorSummary || data.outputSummary}</p>
+        </div>
+      )}
+      <div className='nomi-dag-quick-look-meta'>
+        {(data.roleLabel || data.chipLabel) && (
+          <span>
+            {data.quickLookLabels.role} · {data.roleLabel || data.chipLabel}
+          </span>
+        )}
+        {data.modelLabel && (
+          <span>
+            {data.quickLookLabels.model} · {data.modelLabel}
           </span>
         )}
         {data.attempt > 1 && (
-          <span
-            className='inline-flex items-center rd-100px px-6px py-2px text-10px leading-none'
-            style={{
-              background: 'color-mix(in srgb, var(--warning) 16%, transparent)',
-              color: 'var(--warning)',
-            }}
-          >
-            ×{data.attempt}
-          </span>
-        )}
-        {inGroup && groupColor && (
-          <span
-            className='inline-flex max-w-[150px] items-center gap-3px rd-100px px-6px py-2px text-10px font-500 leading-none'
-            style={tintedPill(groupColor)}
-            title={data.groupChipLabel}
-          >
-            <Branch theme='outline' size='10' strokeWidth={4} className='shrink-0 line-height-0' />
-            <span className='truncate'>{data.groupChipLabel}</span>
+          <span>
+            {data.quickLookLabels.attempts} · {data.attempt}
           </span>
         )}
         {typeof data.tokens === 'number' && data.tokens > 0 && (
-          <span
-            className='inline-flex shrink-0 items-center gap-3px rd-100px px-6px py-2px text-10px leading-none tabular-nums text-t-tertiary'
-            style={{
-              background: 'var(--fill-0)',
-              border: '1px solid var(--border-light)',
-            }}
-            title={`${data.tokens.toLocaleString()} ${data.tokensLabel ?? ''}`.trim()}
-          >
-            <Lightning theme='outline' size='10' strokeWidth={4} className='shrink-0 line-height-0' />
-            <span className='truncate'>{data.tokens.toLocaleString()}</span>
+          <span className='tabular-nums'>
+            <Lightning theme='outline' size='11' strokeWidth={4} /> {data.tokens.toLocaleString()} {data.tokensLabel}
           </span>
         )}
       </div>
-
-      {/* Pending decision question; select the card to answer in the participant transcript. */}
-      {hasQuestion && (
-        <div className='nomi-dag-question flex items-start gap-6px rd-8px px-8px py-6px' title={data.pendingQuestion}>
-          <span className='nomi-dag-question-pulse mt-1px shrink-0 line-height-0' style={{ color: 'var(--warning)' }}>
-            <Help theme='filled' size='13' />
-          </span>
-          <span className='min-w-0 flex-1 text-11px leading-15px line-clamp-2' style={{ color: 'var(--warning)' }}>
-            {data.questionLabel && <b className='mr-4px'>{data.questionLabel}</b>}
-            {data.pendingQuestion}
-          </span>
+      <div className='nomi-dag-quick-look-relations'>
+        <div>
+          <b>{data.quickLookLabels.upstream}</b>
+          <span>{data.upstreamLabels.length > 0 ? data.upstreamLabels.join(' · ') : '—'}</span>
         </div>
-      )}
-
-      {/* Outgoing-dependency anchor (bottom) */}
-      <Handle
-        type='source'
-        position={Position.Bottom}
-        isConnectable={false}
-        style={{
-          width: 7,
-          height: 7,
-          background: 'var(--bg-5)',
-          border: 'none',
-        }}
-      />
+        <div>
+          <b>{data.quickLookLabels.downstream}</b>
+          <span>{data.downstreamLabels.length > 0 ? data.downstreamLabels.join(' · ') : '—'}</span>
+        </div>
+      </div>
+      <div className='nomi-dag-quick-look-hint'>{data.quickLookLabels.inspect}</div>
     </div>
+  );
+
+  const setRelationFocus = (active: boolean) => data.onHoverChange?.(active);
+
+  return (
+    <Popover
+      trigger='hover'
+      position='top'
+      popupVisible={quickLookOpen}
+      onVisibleChange={setQuickLookOpen}
+      triggerProps={{ mouseEnterDelay: 260 }}
+      getPopupContainer={() => document.body}
+      className='nomi-dag-quick-look-popover'
+      content={quickLook}
+      unmountOnExit
+    >
+      <div
+        className='nomi-dag-node-shell nomi-dag-enter'
+        onMouseEnter={() => setRelationFocus(true)}
+        onMouseLeave={() => setRelationFocus(false)}
+        style={{ '--dag-i': data.enterIndex ?? 0 } as React.CSSProperties}
+      >
+        <Handle type='target' position={Position.Top} isConnectable={false} />
+        <button
+          type='button'
+          aria-label={`${data.title} · ${data.statusLabel} · ${data.quickLookLabels.upstream} ${data.upstreamLabels.length} · ${data.quickLookLabels.downstream} ${data.downstreamLabels.length}`}
+          onClick={data.onOpen}
+          onFocus={() => {
+            setQuickLookOpen(true);
+            setRelationFocus(true);
+          }}
+          onBlur={() => {
+            setQuickLookOpen(false);
+            setRelationFocus(false);
+          }}
+          className='nomi-dag-card'
+          data-status={data.status}
+          data-selected={selected ? 'true' : undefined}
+          data-question={hasQuestion ? 'true' : undefined}
+          data-relation={data.relationState ?? 'idle'}
+          data-density={density}
+          style={{ '--node-accent': meta.color } as React.CSSProperties}
+        >
+          <span
+            className={`nomi-dag-status-dot ${meta.pulse ? 'nomi-dag-pulse' : ''}`}
+            style={{ background: meta.color }}
+          />
+          <span className='nomi-dag-node-copy'>
+            <span className='nomi-dag-node-title'>{data.title}</span>
+            <span className='nomi-dag-node-summary' style={{ color: hasQuestion ? 'var(--warning)' : undefined }}>
+              {hasQuestion && <Help theme='filled' size='10' />}
+              {semanticResult?.icon && !hasQuestion && <span style={{ color: semanticResult.tone }}>{semanticResult.icon}</span>}
+              <span>{summary}</span>
+            </span>
+          </span>
+          <span className='nomi-dag-node-aside'>
+            {kindBadge && (
+              <span
+                className='nomi-dag-kind-icon'
+                title={kindBadge.label}
+                style={{ color: kindBadge.tone, background: `color-mix(in srgb, ${kindBadge.tone} 11%, transparent)` }}
+              >
+                {kindBadge.icon}
+              </span>
+            )}
+            {data.groupLabel && <Branch theme='outline' size='11' title={data.groupChipLabel} />}
+            <span className='nomi-dag-relation-counts' aria-hidden='true'>
+              <span>↑{data.upstreamLabels.length}</span>
+              <span>↓{data.downstreamLabels.length}</span>
+            </span>
+          </span>
+        </button>
+        <Handle type='source' position={Position.Bottom} isConnectable={false} />
+      </div>
+    </Popover>
   );
 }
 

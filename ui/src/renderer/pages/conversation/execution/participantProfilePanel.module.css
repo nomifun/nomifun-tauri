@@ -1,0 +1,214 @@
+.entry {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 5px;
+  height: 27px;
+  padding: 0 8px 0 6px;
+  border: 1px solid color-mix(in srgb, rgb(var(--primary-6)) 24%, var(--border-light));
+  border-radius: 8px;
+  background: color-mix(in srgb, rgb(var(--primary-6)) 6%, var(--bg-2));
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition:
+    color 0.15s ease,
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+
+.entry:hover {
+  border-color: color-mix(in srgb, rgb(var(--primary-6)) 45%, var(--border-light));
+  background: color-mix(in srgb, rgb(var(--primary-6)) 10%, var(--bg-2));
+  color: rgb(var(--primary-6));
+}
+
+.entry:focus-visible {
+  outline: 2px solid color-mix(in srgb, rgb(var(--primary-6)) 40%, transparent);
+  outline-offset: 1px;
+}
+
+.entryIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+  color: rgb(var(--primary-6));
+}
+
+.entryLabel {
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.entryCount {
+  display: inline-flex;
+  min-width: 17px;
+  height: 17px;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, rgb(var(--primary-6)) 12%, transparent);
+  color: rgb(var(--primary-6));
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.drawerIntro {
+  padding: 13px 18px;
+  border-bottom: 1px solid var(--border-light);
+  background: var(--fill-0);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px;
+}
+
+.candidate {
+  overflow: hidden;
+  border: 1px solid var(--border-light);
+  border-radius: 11px;
+  background: var(--bg-2);
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+.candidate:hover,
+.candidate[data-expanded='true'] {
+  border-color: color-mix(in srgb, rgb(var(--primary-6)) 25%, var(--border-light));
+}
+
+.candidateRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 68px;
+  padding: 8px 10px 8px 8px;
+}
+
+.candidateToggle {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.candidateToggle:focus-visible {
+  outline: 2px solid color-mix(in srgb, rgb(var(--primary-6)) 36%, transparent);
+  outline-offset: 3px;
+  border-radius: 6px;
+}
+
+.chevron {
+  display: inline-flex;
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  margin-top: 1px;
+  color: var(--text-tertiary);
+}
+
+.candidateCopy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.candidateCopy strong {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 18px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.candidateCopy > span {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.candidateCopy small {
+  color: var(--text-tertiary);
+  font-size: 10px;
+  line-height: 14px;
+}
+
+.candidateDetails {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 11px 13px 13px 33px;
+  border-top: 1px solid var(--border-light);
+  background: var(--fill-0);
+}
+
+.candidateDetails p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 17px;
+  white-space: pre-wrap;
+}
+
+.detailGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.detailGroup b {
+  color: var(--text-tertiary);
+  font-size: 10px;
+}
+
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.tags > span {
+  padding: 3px 7px;
+  border: 1px solid var(--border-light);
+  border-radius: 999px;
+  background: var(--bg-2);
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 14px;
+}
+
+@media (max-width: 420px) {
+  .entryLabel {
+    display: none;
+  }
+}
+
+@container (max-width: 390px) {
+  .entryLabel {
+    display: none;
+  }
+}

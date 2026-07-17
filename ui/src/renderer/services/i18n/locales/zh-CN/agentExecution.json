@@ -65,7 +65,21 @@
   "progress": {
     "title": "协作进度",
     "summary": "已完成 {{done}} / {{total}} 项任务",
+    "running": "{{count}} 项进行中",
+    "failed": "{{count}} 项失败",
     "question": "任务「{{title}}」需要你的决定"
+  },
+  "canvas": {
+    "fit": "适应视图",
+    "showOverview": "显示概览",
+    "hideOverview": "收起概览",
+    "result": "结果摘要",
+    "upstream": "上游",
+    "downstream": "下游",
+    "model": "模型",
+    "role": "角色",
+    "attempts": "尝试",
+    "inspect": "点击查看完整执行记录"
   },
   "thinking": {
     "title": "正在准备协作计划",
@@ -176,6 +190,10 @@
   "profile": {
     "title": "沉淀为设定",
     "subtitle": "本次协作中有 {{count}} 个角色可保存复用",
+    "entry": "可复用设定",
+    "open": "查看 {{count}} 个可复用设定",
+    "drawerHint": "本次协作识别出 {{count}} 个可复用角色。展开可核对模型与技能，保存后可继续用于协作步骤。",
+    "candidateSummary": "{{tasks}} 项任务 · {{models}} 个模型 · {{skills}} 项技能",
     "modelsLabel": "模型",
     "skillsLabel": "{{count}} 项技能",
     "saveAsPreset": "保存为设定",

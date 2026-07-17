@@ -4,7 +4,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { NormalizedToolCall } from '@/common/chat/normalizeToolCall';
+import {
+  formatToolDisplayName,
+  type NormalizedToolCall,
+  type NormalizedToolNotExecutedReason,
+} from '@/common/chat/normalizeToolCall';
 import type { TurnDisclosureProcessState } from '../turnDisclosureModel';
 import { mergeProcessStates } from '../turnProcessState';
 
@@ -30,6 +34,7 @@ export interface ToolReceiptSummaryPart {
   state: TurnDisclosureProcessState;
   target?: string;
   skipped?: boolean;
+  notExecutedReason?: NormalizedToolNotExecutedReason;
 }
 
 export interface ToolReceiptDetailRow {
@@ -42,6 +47,7 @@ export interface ToolReceiptDetailRow {
   output?: string;
   truncated?: boolean;
   skipped?: boolean;
+  notExecutedReason?: NormalizedToolNotExecutedReason;
 }
 
 const toolReceiptIconByAction: Record<ToolReceiptAction, ToolReceiptIcon> = {
@@ -80,9 +86,10 @@ const compactToolText = (value?: unknown): string => {
 const formatToolTarget = (tool: NormalizedToolCall): string => {
   if (classifyToolForReceipt(tool) === 'run_commands') return getCommandTarget(tool);
 
-  const name = compactToolText(tool.name);
+  const rawName = compactToolText(tool.name);
+  const name = compactToolText(formatToolDisplayName(rawName));
   const description = compactToolText(tool.description);
-  if (name && description && description !== name) return `${name} ${description}`;
+  if (name && description && description !== name && description !== rawName) return `${name} ${description}`;
   return name || description || tool.key;
 };
 
@@ -163,15 +170,17 @@ const extractFileTargetFromText = (value?: string): string | undefined => {
 
 const getCommandTarget = (tool: NormalizedToolCall): string => {
   const description = compactToolText(tool.description);
-  const name = compactToolText(tool.name);
-  if (description && description !== name) return description;
+  const rawName = compactToolText(tool.name);
+  const name = compactToolText(formatToolDisplayName(rawName));
+  if (description && description !== name && description !== rawName) return description;
   return extractCommandFromText(tool.input) || description || name || tool.key;
 };
 
 const getFileTarget = (tool: NormalizedToolCall): string | undefined => {
   const description = compactToolText(tool.description);
-  const name = compactToolText(tool.name);
-  if (description && description !== name) return description;
+  const rawName = compactToolText(tool.name);
+  const name = compactToolText(formatToolDisplayName(rawName));
+  if (description && description !== name && description !== rawName) return description;
   return extractFileTargetFromText(tool.input);
 };
 
@@ -316,17 +325,22 @@ const getToolReceiptTarget = (tool: NormalizedToolCall, action: ToolReceiptActio
 
 const getToolReceiptDetailTarget = (tool: NormalizedToolCall, action: ToolReceiptAction): string | undefined => {
   const description = compactToolText(tool.description);
-  const name = compactToolText(tool.name);
+  const rawName = compactToolText(tool.name);
+  const name = compactToolText(formatToolDisplayName(rawName));
 
   if (action === 'generic') return formatToolTarget(tool);
   if (action === 'read_files' || action === 'edit_files') return getFileTarget(tool);
-  if (description && description !== name) return description;
+  if (description && description !== name && description !== rawName) return description;
   if (action === 'run_commands') return getCommandTarget(tool);
   return undefined;
 };
 
 const getToolProcessState = (tool: NormalizedToolCall): TurnDisclosureProcessState => {
   if (tool.status === 'running' || tool.status === 'pending') return 'running';
+  // Receipt state controls color and turn health. The dedicated copy carries
+  // the "not executed" meaning without presenting a local preflight rejection
+  // as a user-visible task failure/cancellation.
+  if (tool.notExecutedReason) return 'completed';
   if (tool.nonFatalFailure) return 'completed';
   if (tool.status === 'error') return 'failed';
   if (tool.status === 'canceled') return 'canceled';
@@ -338,27 +352,45 @@ export const buildToolReceiptSummaryParts = (
   _state: TurnDisclosureProcessState
 ): ToolReceiptSummaryPart[] => {
   const grouped = new Map<
-    ToolReceiptAction,
-    { count: number; skippedCount: number; targets: string[]; states: TurnDisclosureProcessState[] }
+    string,
+    {
+      action: ToolReceiptAction;
+      count: number;
+      skippedCount: number;
+      targets: string[];
+      states: TurnDisclosureProcessState[];
+      notExecutedReason?: NormalizedToolNotExecutedReason;
+    }
   >();
 
   tools.forEach((tool) => {
     const action = classifyToolForReceipt(tool);
     const target = getToolReceiptTarget(tool, action);
-    const current = grouped.get(action) ?? { count: 0, skippedCount: 0, targets: [], states: [] };
+    // A pre-dispatch rejection is a different receipt outcome from a tool that
+    // actually ran. Keep them separate even when their semantic action matches.
+    const groupKey = `${action}:${tool.notExecutedReason ?? 'executed'}`;
+    const current = grouped.get(groupKey) ?? {
+      action,
+      count: 0,
+      skippedCount: 0,
+      targets: [],
+      states: [],
+      ...(tool.notExecutedReason ? { notExecutedReason: tool.notExecutedReason } : {}),
+    };
     current.count += 1;
     if (tool.skipped) current.skippedCount += 1;
     current.states.push(getToolProcessState(tool));
     if (target) current.targets.push(target);
-    grouped.set(action, current);
+    grouped.set(groupKey, current);
   });
 
-  return Array.from(grouped.entries()).map(([action, value]) => ({
-    action,
+  return Array.from(grouped.values()).map((value) => ({
+    action: value.action,
     count: value.count,
     state: mergeProcessStates(value.states),
     ...(value.targets.length ? { target: Array.from(new Set(value.targets)).join(', ') } : {}),
     ...(value.skippedCount === value.count ? { skipped: true } : {}),
+    ...(value.notExecutedReason ? { notExecutedReason: value.notExecutedReason } : {}),
   }));
 };
 
@@ -373,7 +405,7 @@ export const getToolReceiptIconFromSummaryParts = (parts: ToolReceiptSummaryPart
 export const buildToolReceiptDetailRows = (tools: NormalizedToolCall[]): ToolReceiptDetailRow[] =>
   tools.map((tool) => {
     const action = classifyToolForReceipt(tool);
-    const title = compactToolText(tool.name) || tool.key;
+    const title = compactToolText(formatToolDisplayName(tool.name)) || tool.key;
     const target = getToolReceiptDetailTarget(tool, action);
     return {
       key: tool.key,
@@ -385,6 +417,7 @@ export const buildToolReceiptDetailRows = (tools: NormalizedToolCall[]): ToolRec
       ...(tool.output ? { output: tool.output } : {}),
       ...(tool.truncated ? { truncated: tool.truncated } : {}),
       ...(tool.skipped ? { skipped: true } : {}),
+      ...(tool.notExecutedReason ? { notExecutedReason: tool.notExecutedReason } : {}),
     };
   });
 

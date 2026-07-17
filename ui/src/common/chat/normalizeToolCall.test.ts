@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { parseConversationId } from '@/common/types/ids';
-import { normalizeAcpToolCall, normalizeToolCall, normalizeToolGroup } from './normalizeToolCall';
+import {
+  formatToolDisplayName,
+  normalizeAcpToolCall,
+  normalizeToolCall,
+  normalizeToolGroup,
+} from './normalizeToolCall';
 
 const CONVERSATION_ID = parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000001');
 
@@ -51,6 +56,70 @@ describe('normalizeToolCall', () => {
     expect(result?.status).toBe('canceled');
     expect(result?.skipped).toBe(true);
     expect(result?.nonFatalFailure).toBeUndefined();
+  });
+
+  it('classifies standardized local invalid-argument rejections as not executed', () => {
+    const name = 'mcp__nomifun-desktop__nomi_delegate__anxmvqfkcuzfi4mq';
+    const result = normalizeToolCall({
+      type: 'tool_call',
+      content: {
+        call_id: 'call-invalid-arguments',
+        name,
+        status: 'error',
+        args: null,
+        output:
+          `Invalid arguments for tool '${name}': JSON Schema validation failed: at $: ` +
+          '{"max_parallel":"4"} is not valid. Correct the arguments and retry; the tool was not executed.',
+      },
+    } as any);
+
+    expect(result?.status).toBe('canceled');
+    expect(result?.notExecutedReason).toBe('invalid_arguments');
+    expect(result?.skipped).toBeUndefined();
+    expect(result?.nonFatalFailure).toBeUndefined();
+    expect(result?.input).toBeUndefined();
+  });
+
+  it('keeps remote failures fatal even when their arguments are null', () => {
+    const result = normalizeToolCall({
+      type: 'tool_call',
+      content: {
+        call_id: 'call-remote-error',
+        name: 'mcp__server__remote_action__abcdefghijklmnop',
+        status: 'error',
+        args: null,
+        output: 'Remote service rejected the request: invalid arguments',
+      },
+    } as any);
+
+    expect(result?.status).toBe('error');
+    expect(result?.notExecutedReason).toBeUndefined();
+  });
+
+  it('does not accept a standardized rejection that names a different tool', () => {
+    const result = normalizeToolCall({
+      type: 'tool_call',
+      content: {
+        call_id: 'call-mismatched-tool',
+        name: 'mcp__server__actual__abcdefghijklmnop',
+        status: 'error',
+        args: null,
+        output:
+          "Invalid arguments for tool 'mcp__server__other__bcdefghijklmnopq': expected a JSON object. " +
+          'Correct the arguments and retry; the tool was not executed.',
+      },
+    } as any);
+
+    expect(result?.status).toBe('error');
+    expect(result?.notExecutedReason).toBeUndefined();
+  });
+
+  it('formats canonical MCP aliases as stable server/tool labels', () => {
+    expect(formatToolDisplayName('mcp__nomifun-desktop__nomi_delegate__anxmvqfkcuzfi4mq')).toBe(
+      'nomifun-desktop/nomi_delegate'
+    );
+    expect(formatToolDisplayName('mcp__server__read_file')).toBe('server/read_file');
+    expect(formatToolDisplayName('Bash')).toBe('Bash');
   });
 
   const infrastructureFailures = [

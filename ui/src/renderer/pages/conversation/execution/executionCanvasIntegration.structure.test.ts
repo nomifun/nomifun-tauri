@@ -14,6 +14,10 @@ describe('conversation execution canvas integration', () => {
     const chatSource = readSource(new URL('../components/ChatConversation.tsx', import.meta.url));
     const layoutSource = readSource(new URL('./ExecutionConversationLayout.tsx', import.meta.url));
     const panelSource = readSource(new URL('./ExecutionTopPanel.tsx', import.meta.url));
+    const canvasSource = readSource(new URL('./DagCanvas.tsx', import.meta.url));
+    const nodeSource = readSource(new URL('./nodes/StepNode.tsx', import.meta.url));
+    const canvasCss = readSource(new URL('./dag-canvas.css', import.meta.url));
+    const profileSource = readSource(new URL('./ParticipantProfilePanel.tsx', import.meta.url));
 
     expect(chatSource.includes('<ExecutionProvider')).toBe(true);
     expect(chatSource.includes('<ExecutionConversationLayout')).toBe(true);
@@ -21,12 +25,29 @@ describe('conversation execution canvas integration', () => {
     expect(layoutSource.includes("className='flex-1 min-w-0 min-h-0 flex flex-col'")).toBe(true);
 
     expect(panelSource.includes("data-testid='execution-canvas-progress'")).toBe(true);
-    expect(panelSource.includes('stepStatusMeta(step.status)')).toBe(true);
-    expect(panelSource.includes('projectStep({')).toBe(true);
+    expect(nodeSource.includes('stepStatusMeta(data.status)')).toBe(true);
+    expect(panelSource.includes('openStep({')).toBe(true);
     expect(panelSource.includes('agentExecution.panel.title')).toBe(false);
     expect(panelSource.includes('agentExecution.panel.collapse')).toBe(false);
     expect(panelSource.includes('agentExecution.status.execution.')).toBe(false);
     expect(panelSource.includes('(showControls || leadThinking.active) &&')).toBe(true);
+    expect(panelSource.includes('styles.chips')).toBe(false);
+    expect(panelSource.includes('<ParticipantProfilePanel')).toBe(true);
+    expect(canvasSource.includes('<ParticipantProfilePanel')).toBe(false);
+    expect(canvasSource.includes('overviewOpen && (')).toBe(true);
+    expect(canvasSource.includes("type: 'smoothstep'")).toBe(true);
+    expect(canvasSource.includes('MarkerType.ArrowClosed')).toBe(true);
+    expect(canvasSource.includes('nodesDraggable={false}')).toBe(true);
+    expect(canvasSource.includes('nodesFocusable={false}')).toBe(true);
+    expect(canvasSource.includes('edgesFocusable={false}')).toBe(true);
+    expect(canvasSource.includes("style: { pointerEvents: 'all' }")).toBe(true);
+    expect(nodeSource.includes("trigger='hover'")).toBe(true);
+    expect(nodeSource.includes('data-relation=')).toBe(true);
+    expect(nodeSource.includes('data.tokens.toLocaleString()')).toBe(true);
+    expect(canvasCss.includes('.react-flow__node-step')).toBe(true);
+    expect(canvasCss.includes('@media (prefers-reduced-motion: reduce)')).toBe(true);
+    expect(profileSource.includes("targets: ['conversation', 'execution_step']")).toBe(true);
+    expect(profileSource.includes('<Drawer')).toBe(true);
   });
 
   test('renders only the current plan revision while retaining history in the detail model', () => {

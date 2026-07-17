@@ -7,9 +7,66 @@
 import type { TExecutionStep, TExecutionStepDependency } from '@/common/types/agentExecution/agentExecutionTypes';
 
 /** Horizontal step between sibling tasks within the same dependency layer. */
-const COL_STEP = 260;
+const COL_STEP = 216;
 /** Vertical step between dependency layers (depth → row). */
-const ROW_STEP = 140;
+const ROW_STEP = 112;
+
+export function executionDagEdgeId(source: string, target: string): string {
+  return `${source}->${target}`;
+}
+
+export interface ExecutionDagFocus {
+  stepIds: Set<string>;
+  edgeIds: Set<string>;
+}
+
+/**
+ * Collect every ancestor and descendant of one step so the canvas can reveal
+ * its causal path without permanently adding labels or extra chrome.
+ */
+export function collectExecutionDagFocus(
+  stepId: string,
+  dependencies: TExecutionStepDependency[],
+): ExecutionDagFocus {
+  const inbound = new Map<string, TExecutionStepDependency[]>();
+  const outbound = new Map<string, TExecutionStepDependency[]>();
+  for (const dependency of dependencies) {
+    const incoming = inbound.get(dependency.blocked_step_id);
+    if (incoming) incoming.push(dependency);
+    else inbound.set(dependency.blocked_step_id, [dependency]);
+
+    const outgoing = outbound.get(dependency.blocker_step_id);
+    if (outgoing) outgoing.push(dependency);
+    else outbound.set(dependency.blocker_step_id, [dependency]);
+  }
+
+  const stepIds = new Set<string>([stepId]);
+  const edgeIds = new Set<string>();
+  const walk = (
+    adjacency: Map<string, TExecutionStepDependency[]>,
+    nextStep: (dependency: TExecutionStepDependency) => string,
+  ) => {
+    const visited = new Set<string>([stepId]);
+    const queue = [stepId];
+    while (queue.length > 0) {
+      const current = queue.shift();
+      if (!current) continue;
+      for (const dependency of adjacency.get(current) ?? []) {
+        edgeIds.add(executionDagEdgeId(dependency.blocker_step_id, dependency.blocked_step_id));
+        const next = nextStep(dependency);
+        stepIds.add(next);
+        if (!visited.has(next)) {
+          visited.add(next);
+          queue.push(next);
+        }
+      }
+    }
+  };
+
+  walk(inbound, (dependency) => dependency.blocker_step_id);
+  walk(outbound, (dependency) => dependency.blocked_step_id);
+  return { stepIds, edgeIds };
+}
 
 /**
  * Compute simple topological-layered positions for an execution task DAG.
@@ -62,12 +119,36 @@ export function layoutExecutionDag(
     else layers.set(d, [step.id]);
   }
 
+  // Order each layer by the average position of its already-placed blockers.
+  // This small barycentric pass removes most avoidable fan-in/fan-out crossings
+  // while retaining the planner's original order as a deterministic fallback.
+  const originalOrder = new Map<string, number>(steps.map((step, index) => [step.id, index]));
+  const blockerIds = new Map<string, string[]>();
+  for (const edge of edges) {
+    const blockers = blockerIds.get(edge.blocked_step_id);
+    if (blockers) blockers.push(edge.blocker_step_id);
+    else blockerIds.set(edge.blocked_step_id, [edge.blocker_step_id]);
+  }
+  const placedOrder = new Map<string, number>();
+
   // Place each layer as a centered horizontal row so the graph reads top-down.
-  for (const [d, ids] of layers) {
+  for (const [d, ids] of [...layers.entries()].sort(([left], [right]) => left - right)) {
+    ids.sort((left, right) => {
+      const barycenter = (id: string) => {
+        const upstream = (blockerIds.get(id) ?? [])
+          .map((blockerId) => placedOrder.get(blockerId))
+          .filter((value): value is number => value != null);
+        return upstream.length > 0
+          ? upstream.reduce((sum, value) => sum + value, 0) / upstream.length
+          : (originalOrder.get(id) ?? 0);
+      };
+      return barycenter(left) - barycenter(right) || (originalOrder.get(left) ?? 0) - (originalOrder.get(right) ?? 0);
+    });
     const rowWidth = (ids.length - 1) * COL_STEP;
     const startX = -rowWidth / 2;
     ids.forEach((id, col) => {
       positions[id] = { x: startX + col * COL_STEP, y: d * ROW_STEP };
+      placedOrder.set(id, col);
     });
   }
 

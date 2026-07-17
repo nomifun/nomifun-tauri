@@ -251,9 +251,13 @@ pub enum ParallelDelegationStrategy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ParallelDelegationRequest {
+    /// Exactly `parallel`. Parallel requests never include planned aggregate
+    /// settings such as `work_dir`, `model_pool`, or `max_parallel`.
     pub strategy: ParallelDelegationStrategy,
+    /// A native JSON array of independent Agent task objects, never a JSON string.
     #[schemars(length(min = 1, max = 16))]
     pub tasks: Vec<AgentDelegationTask>,
+    /// Whether to add one synthesis step after every task completes.
     #[serde(default)]
     pub synthesize: bool,
 }

@@ -1164,9 +1164,6 @@ impl AgentEngine {
                                 "provider stream protocol violation: tool '{name}' ({id}) arguments are not a JSON object"
                             )));
                         }
-                        // Preserve the provider's object exactly. JSON Schema
-                        // is the only input contract; no compatibility coercion
-                        // may silently change the call before approval/dispatch.
                         debug_assert!(input.is_object());
                         tracing::debug!(
                             target: "nomi_agent",
@@ -1174,23 +1171,40 @@ impl AgentEngine {
                             tool = %name,
                             "provider tool call received"
                         );
-                        // Validate the completed payload now, but do not publish
-                        // a Running lifecycle until Done commits the whole
-                        // provider turn and terminal reconciliation succeeds.
-                        // The execution boundary repeats this cached-validator
-                        // check before approval, hooks, or dispatch and returns a
-                        // paired local ToolResult when invalid.
-                        if !tool_authority.is_deferred(&name) {
-                            if let Err(error) = self.tools.validate_input(&name, &input) {
-                                tracing::warn!(
-                                    target: "nomi_agent",
-                                    tool_use_id = %id,
-                                    tool = %name,
-                                    error = %error,
-                                    "provider tool call failed local schema validation and will remain unpublished"
-                                );
+                        // Recover only schema-directed nested values that a
+                        // provider stringified, then keep that validated value as
+                        // the canonical call seen by lifecycle output, approval,
+                        // hooks, and dispatch. Whole-object strings were rejected
+                        // above; unknown fields and invalid union branches remain
+                        // strict validation failures.
+                        let input = if tool_authority.is_deferred(&name) {
+                            input
+                        } else {
+                            let original = input;
+                            match self.tools.prepare_input(&name, original.clone()) {
+                                Ok(prepared) => {
+                                    if prepared != original {
+                                        tracing::debug!(
+                                            target: "nomi_agent",
+                                            tool_use_id = %id,
+                                            tool = %name,
+                                            "provider tool call arguments normalized against schema"
+                                        );
+                                    }
+                                    prepared
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        target: "nomi_agent",
+                                        tool_use_id = %id,
+                                        tool = %name,
+                                        error = %error,
+                                        "provider tool call failed local schema validation and will remain unpublished"
+                                    );
+                                    original
+                                }
                             }
-                        }
+                        };
                         tool_calls.push(ContentBlock::ToolUse {
                             id,
                             name,
@@ -2058,14 +2072,18 @@ mod set_config_tests {
     struct ToolLifecycleRecordingOutput {
         tool_calls: std::sync::atomic::AtomicUsize,
         tool_results: std::sync::atomic::AtomicUsize,
+        tool_inputs: Mutex<Vec<Value>>,
     }
 
     impl OutputSink for ToolLifecycleRecordingOutput {
         fn emit_text_delta(&self, _: &str, _: &str) {}
         fn emit_thinking(&self, _: &str, _: &str) {}
-        fn emit_tool_call(&self, _: &str, _: &str, _: &str) {
+        fn emit_tool_call(&self, _: &str, _: &str, input: &str) {
             self.tool_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Ok(input) = serde_json::from_str(input) {
+                self.tool_inputs.lock().unwrap().push(input);
+            }
         }
         fn emit_tool_result(&self, _: &str, _: &str, _: bool, _: &str) {
             self.tool_results
@@ -2470,6 +2488,78 @@ mod set_config_tests {
 
     struct RequiredKbIdTool {
         calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct StringifiedNestedArgsTool {
+        seen_inputs: Arc<Mutex<Vec<Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for StringifiedNestedArgsTool {
+        fn name(&self) -> &str {
+            "delegate_proxy"
+        }
+
+        fn description(&self) -> &str {
+            "root union schema fixture matching a dynamic delegation proxy"
+        }
+
+        fn input_schema(&self) -> Value {
+            serde_json::json!({
+                "$defs": {
+                    "Planned": {
+                        "type": "object",
+                        "properties": {
+                            "strategy": {"type": "string", "const": "planned"},
+                            "goal": {"type": "string"}
+                        },
+                        "required": ["strategy", "goal"],
+                        "additionalProperties": false
+                    },
+                    "Parallel": {
+                        "type": "object",
+                        "properties": {
+                            "strategy": {"type": "string", "const": "parallel"},
+                            "tasks": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "name": {"type": "string"},
+                                        "prompt": {"type": "string"}
+                                    },
+                                    "required": ["name", "prompt"],
+                                    "additionalProperties": false
+                                }
+                            },
+                            "synthesize": {"type": "boolean"}
+                        },
+                        "required": ["strategy", "tasks"],
+                        "additionalProperties": false
+                    }
+                },
+                "type": "object",
+                "properties": {},
+                "anyOf": [
+                    {"$ref": "#/$defs/Planned"},
+                    {"$ref": "#/$defs/Parallel"}
+                ]
+            })
+        }
+
+        fn is_concurrency_safe(&self, _input: &Value) -> bool {
+            false
+        }
+
+        fn category(&self) -> ToolCategory {
+            ToolCategory::Exec
+        }
+
+        async fn execute(&self, input: Value) -> ToolResult {
+            self.seen_inputs.lock().unwrap().push(input);
+            ToolResult::text("accepted")
+        }
     }
 
     #[async_trait::async_trait]
@@ -3439,6 +3529,52 @@ mod set_config_tests {
             0,
             "a deferred discovery stub must not enter the Running preview lifecycle"
         );
+    }
+
+    #[tokio::test]
+    async fn nested_stringified_tool_fields_are_canonical_before_running_and_dispatch() {
+        let output = Arc::new(ToolLifecycleRecordingOutput::default());
+        let seen_inputs = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = make_engine("stringified-nested-fields-model");
+        engine.output = output.clone();
+        engine.provider = Arc::new(InputLoopProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            tool_turns: 1,
+            tool_name: "delegate_proxy",
+            input: serde_json::json!({
+                "strategy": "parallel",
+                "tasks": "[{\"name\":\"research\",\"prompt\":\"inspect\"}]",
+                "synthesize": "True"
+            }),
+        });
+        assert!(engine.tools.register(Box::new(StringifiedNestedArgsTool {
+            seen_inputs: seen_inputs.clone(),
+        })));
+
+        engine
+            .execute_turn("delegate work", "msg-stringified-nested-fields")
+            .await
+            .expect("schema-directed nested normalization should let the call execute");
+
+        assert_eq!(
+            output.tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the validated canonical call must enter the Running lifecycle once"
+        );
+        assert_eq!(
+            output.tool_results.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let published = output.tool_inputs.lock().unwrap();
+        assert_eq!(published.len(), 1);
+        assert!(published[0]["tasks"].is_array());
+        assert_eq!(published[0]["synthesize"], true);
+        drop(published);
+
+        let dispatched = seen_inputs.lock().unwrap();
+        assert_eq!(dispatched.len(), 1);
+        assert!(dispatched[0]["tasks"].is_array());
+        assert_eq!(dispatched[0]["synthesize"], true);
     }
 
     #[tokio::test]

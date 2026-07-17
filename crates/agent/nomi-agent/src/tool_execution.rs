@@ -85,8 +85,15 @@ pub async fn execute_tool_calls(
     let mut results = Vec::new();
     let mut modifiers = Vec::new();
     let mut halt_after_error = false;
+    // Engine-produced calls are already canonical. Preparing again here keeps
+    // direct/internal execution paths on the same boundary and guarantees that
+    // confirmation, hooks, category checks, and dispatch all receive one value.
+    let prepared_tool_calls = tool_calls
+        .iter()
+        .map(|call| prepare_call_for_execution(registry, call, authority))
+        .collect::<Vec<_>>();
 
-    for batch in partition(registry, tool_calls, authority) {
+    for batch in partition(registry, &prepared_tool_calls, authority) {
         if halt_after_error {
             for call in &batch.calls {
                 results.push(skipped_after_prior_error(call));
@@ -210,6 +217,34 @@ pub async fn execute_tool_calls(
     }
 
     Ok(ToolCallOutcome { results, modifiers })
+}
+
+fn prepare_call_for_execution(
+    registry: &ToolRegistry,
+    call: &ContentBlock,
+    authority: &ProviderToolAuthority,
+) -> ContentBlock {
+    let ContentBlock::ToolUse {
+        id,
+        name,
+        input,
+        extra,
+    } = call
+    else {
+        return call.clone();
+    };
+    if !authority.advertises(name) || authority.is_deferred(name) || !input.is_object() {
+        return call.clone();
+    }
+    let Ok(input) = registry.prepare_input(name, input.clone()) else {
+        return call.clone();
+    };
+    ContentBlock::ToolUse {
+        id: id.clone(),
+        name: name.clone(),
+        input,
+        extra: extra.clone(),
+    }
 }
 
 /// Signal that the user wants to abort
@@ -538,6 +573,14 @@ pub async fn execute_tool_calls_with_approval(
     let mut results = Vec::new();
     let mut modifiers = Vec::new();
     let mut halt_after_error = false;
+    // Keep direct protocol callers on the same canonical boundary as the
+    // engine and REPL path. Every later decision, approval payload, hook, and
+    // dispatch below observes this one schema-validated value.
+    let prepared_tool_calls = tool_calls
+        .iter()
+        .map(|call| prepare_call_for_execution(registry, call, authority))
+        .collect::<Vec<_>>();
+    let tool_calls = prepared_tool_calls.as_slice();
 
     // Decide which calls can run concurrently (concurrency-safe AND needing no
     // interactive approval); the rest keep their serial approval+execution flow.
@@ -1148,6 +1191,7 @@ mod tests {
     struct SchemaValidatedKnowledgeTool {
         dispatches: Arc<std::sync::atomic::AtomicUsize>,
         policy_calls: Arc<std::sync::atomic::AtomicUsize>,
+        seen_inputs: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     }
 
     #[async_trait::async_trait]
@@ -1199,9 +1243,10 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             true
         }
-        async fn execute(&self, _input: serde_json::Value) -> nomi_types::tool::ToolResult {
+        async fn execute(&self, input: serde_json::Value) -> nomi_types::tool::ToolResult {
             self.dispatches
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.seen_inputs.lock().unwrap().push(input);
             nomi_types::tool::ToolResult::text("knowledge result")
         }
         fn category(&self) -> nomi_protocol::events::ToolCategory {
@@ -1213,15 +1258,18 @@ mod tests {
         ToolRegistry,
         Arc<std::sync::atomic::AtomicUsize>,
         Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     ) {
         let dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let policy_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen_inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut registry = ToolRegistry::new();
         assert!(registry.register(Box::new(SchemaValidatedKnowledgeTool {
             dispatches: dispatches.clone(),
             policy_calls: policy_calls.clone(),
+            seen_inputs: seen_inputs.clone(),
         })));
-        (registry, dispatches, policy_calls)
+        (registry, dispatches, policy_calls, seen_inputs)
     }
 
     #[derive(Default)]
@@ -1275,7 +1323,8 @@ mod tests {
 
     #[tokio::test]
     async fn missing_kb_id_fails_before_approval_running_policy_or_dispatch() {
-        let (registry, dispatches, policy_calls) = schema_validated_knowledge_registry();
+        let (registry, dispatches, policy_calls, _seen_inputs) =
+            schema_validated_knowledge_registry();
         let calls = vec![ContentBlock::ToolUse {
             id: "missing-kb-id".into(),
             name: "mcp__knowledge__search__schemafixture".into(),
@@ -1324,8 +1373,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn protocol_approval_and_dispatch_share_prepared_nested_input() {
+        let (registry, dispatches, _policy_calls, seen_inputs) =
+            schema_validated_knowledge_registry();
+        let calls = vec![ContentBlock::ToolUse {
+            id: "stringified-options".into(),
+            name: "mcp__knowledge__search__schemafixture".into(),
+            input: json!({
+                "kb_id": "kb-1",
+                "options": "{\"limit\":5,\"mode\":\"semantic\"}",
+                "scope": {"document_id": "doc-1"}
+            }),
+            extra: None,
+        }];
+        let authority = ProviderToolAuthority::from_request_tools(&registry.to_tool_defs());
+        let approval_manager = Arc::new(nomi_protocol::ToolApprovalManager::new());
+        let writer_capture = Arc::new(CapturingEmitter::default());
+        let writer: Arc<dyn nomi_protocol::writer::ProtocolEmitter> = writer_capture.clone();
+        let resolver_manager = approval_manager.clone();
+        let resolver_writer = writer_capture.clone();
+        let resolver = tokio::spawn(async move {
+            loop {
+                if resolver_writer.has_tool_request() {
+                    resolver_manager.resolve(
+                        "stringified-options",
+                        nomi_protocol::ToolApprovalResult::Approved,
+                    );
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        });
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            execute_tool_calls_with_approval(
+                &registry,
+                &calls,
+                &authority,
+                &approval_manager,
+                &writer,
+                "msg-stringified-options",
+                false,
+                &[],
+                None,
+                nomi_compact::CompactionLevel::Off,
+                false,
+            ),
+        )
+        .await
+        .expect("prepared input should reach approval without blocking")
+        .unwrap();
+        resolver.await.unwrap();
+
+        assert!(matches!(
+            &outcome.results[0],
+            ContentBlock::ToolResult { content, is_error: false, .. }
+                if content == "knowledge result"
+        ));
+        let approval_event = writer_capture
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|event| event.contains(r#""type":"tool_request""#))
+            .cloned()
+            .expect("approval event");
+        let approval_event: serde_json::Value = serde_json::from_str(&approval_event).unwrap();
+        assert_eq!(
+            approval_event["tool"]["args"]["options"],
+            json!({"limit": 5, "mode": "semantic"})
+        );
+        assert_eq!(dispatches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let seen_inputs = seen_inputs.lock().unwrap();
+        assert_eq!(seen_inputs.len(), 1);
+        assert_eq!(
+            seen_inputs[0]["options"],
+            json!({"limit": 5, "mode": "semantic"})
+        );
+    }
+
+    #[tokio::test]
     async fn nested_type_enum_and_one_of_errors_are_local_and_valid_input_dispatches() {
-        let (registry, dispatches, policy_calls) = schema_validated_knowledge_registry();
+        let (registry, dispatches, policy_calls, _seen_inputs) =
+            schema_validated_knowledge_registry();
         let authority = ProviderToolAuthority::from_request_tools(&registry.to_tool_defs());
         let confirmer = Arc::new(Mutex::new(ToolConfirmer::new(true, vec![])));
         let invalid = vec![ContentBlock::ToolUse {

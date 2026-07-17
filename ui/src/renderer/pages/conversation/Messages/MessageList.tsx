@@ -253,6 +253,13 @@ const formatToolReceiptPart = (
     });
   }
 
+  if (part.notExecutedReason === 'invalid_arguments') {
+    return t('messages.toolSummary.invalidArguments', {
+      target: displayTarget ?? t('messages.processReceipt.tool', { defaultValue: 'tool' }),
+      defaultValue: 'Arguments did not pass validation; {{target}} was not run',
+    });
+  }
+
   if ((part.state === 'failed' || part.state === 'canceled') && displayTarget) {
     return t(`messages.toolSummary.${part.state}`, {
       target: displayTarget,

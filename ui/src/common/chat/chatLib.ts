@@ -244,10 +244,15 @@ export type IMessageToolCall = IMessage<
   {
     call_id: string;
     name: string;
-    args: Record<string, any>;
+    /**
+     * Provider arguments when they were decoded as a JSON object. Local
+     * pre-execution validation failures can legitimately persist `null` here
+     * because no valid argument object reached the tool.
+     */
+    args?: Record<string, unknown> | null;
     error?: string;
     status?: 'running' | 'completed' | 'error';
-    input?: Record<string, any>;
+    input?: Record<string, unknown>;
     output?: string;
     description?: string;
   }

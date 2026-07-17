@@ -3,6 +3,7 @@ import type { ConversationId } from '../types/ids';
 import { toDisplayText } from './displayText';
 
 export type NormalizedToolStatus = 'pending' | 'running' | 'completed' | 'error' | 'canceled';
+export type NormalizedToolNotExecutedReason = 'invalid_arguments';
 
 export interface NormalizedToolCall {
   key: string;
@@ -14,6 +15,8 @@ export interface NormalizedToolCall {
   nonFatalFailure?: boolean;
   /** Tool was not executed because an earlier call in the same assistant turn failed. */
   skipped?: boolean;
+  /** The runtime rejected the call before dispatching it to the tool. */
+  notExecutedReason?: NormalizedToolNotExecutedReason;
   description?: string;
   input?: string;
   output?: string;
@@ -23,6 +26,28 @@ export interface NormalizedToolCall {
 }
 
 const formatValue = (value: unknown): string => toDisplayText(value);
+
+const canonicalMcpOriginHash = /^[a-z2-7]{16}$/;
+
+/**
+ * Turn provider-facing MCP routing aliases back into a stable receipt label.
+ * The origin hash remains available in the raw diagnostic output, but it is
+ * implementation metadata and must not become the user-facing tool title.
+ */
+export const formatToolDisplayName = (value: unknown): string => {
+  const fullName = toDisplayText(value).trim();
+  if (!fullName.startsWith('mcp__')) return fullName;
+
+  const segments = fullName.split('__');
+  if (segments.length < 3) return fullName;
+  if (segments.length >= 4 && canonicalMcpOriginHash.test(segments.at(-1) ?? '')) {
+    segments.pop();
+  }
+
+  const serverName = segments[1]?.trim();
+  const toolName = segments.slice(2).join('__').trim();
+  return serverName && toolName ? `${serverName}/${toolName}` : fullName;
+};
 
 // ===== tool_group → NormalizedToolCall[] =====
 
@@ -306,6 +331,25 @@ const skippedAfterPriorErrorPrefix = 'Skipped because a previous tool call in th
 const isSkippedAfterPriorError = (status: unknown, output: unknown): boolean =>
   status === 'error' && toDisplayText(output).trimStart().startsWith(skippedAfterPriorErrorPrefix);
 
+const invalidArgumentsNotExecutedSuffix =
+  'Correct the arguments and retry; the tool was not executed.';
+
+/**
+ * Match only the local runtime's standardized pre-dispatch rejection. A null
+ * `args` value alone is not sufficient: remote tools can fail without echoing
+ * their input, and those failures must remain fatal.
+ */
+const isInvalidArgumentsNotExecuted = (name: unknown, status: unknown, output: unknown): boolean => {
+  if (status !== 'error') return false;
+
+  const toolName = toDisplayText(name).trim();
+  const text = toDisplayText(output).trim();
+  if (!toolName || !text.startsWith(`Invalid arguments for tool '${toolName}':`)) return false;
+  if (!text.endsWith(invalidArgumentsNotExecutedSuffix)) return false;
+
+  return text.includes('JSON Schema validation failed:') || text.includes('expected a JSON object.');
+};
+
 export function normalizeToolCall(message: IMessageToolCall): NormalizedToolCall | undefined {
   const { call_id, name, status, input, output, args, description } = message.content;
   if (!call_id) return undefined;
@@ -316,12 +360,14 @@ export function normalizeToolCall(message: IMessageToolCall): NormalizedToolCall
       ? formatValue(args)
       : undefined;
   const skipped = isSkippedAfterPriorError(status, output);
+  const invalidArgumentsNotExecuted = isInvalidArgumentsNotExecuted(name, status, output);
 
   return {
     key: toDisplayText(call_id),
     name: toDisplayText(name, 'Tool'),
-    status: skipped ? 'canceled' : normalizeToolCallStatus(status),
+    status: skipped || invalidArgumentsNotExecuted ? 'canceled' : normalizeToolCallStatus(status),
     ...(skipped ? { skipped: true } : {}),
+    ...(invalidArgumentsNotExecuted ? { notExecutedReason: 'invalid_arguments' as const } : {}),
     ...(isOrdinaryShellExit(name, status, output) || isOrdinaryDirectProbeFailure(name, status, output)
       ? { nonFatalFailure: true }
       : {}),

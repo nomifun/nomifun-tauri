@@ -521,35 +521,36 @@ impl ToolRegistry {
                 "Unknown or unauthorized tool '{name}'; the tool was not executed."
             ));
         };
-        let mut validation_errors = contract.validator.iter_errors(input);
-        let Some(first) = validation_errors.next() else {
-            return Ok(());
+        validate_input_contract(name, contract, input)
+    }
+
+    /// Canonicalize a provider payload and validate the exact value that
+    /// approval, hooks, lifecycle output, and dispatch will observe.
+    ///
+    /// Some OpenAI-compatible providers stringify nested JSON values even when
+    /// the advertised schema requires an object, array, number, or boolean.
+    /// Recover only those schema-directed fields, and accept the recovery only
+    /// when the complete cached validator succeeds. Unknown fields, invalid
+    /// enum values, mixed union branches, and whole-object strings stay invalid;
+    /// no field is removed or guessed.
+    pub fn prepare_input(&self, name: &str, input: Value) -> Result<Value, String> {
+        let Some(contract) = self.input_contracts.get(name) else {
+            return Err(format!(
+                "Unknown or unauthorized tool '{name}'; the tool was not executed."
+            ));
         };
 
-        let mut messages = Vec::with_capacity(MAX_INPUT_VALIDATION_ERRORS);
-        messages.push(format_validation_error(&first));
-        for error in validation_errors
-            .by_ref()
-            .take(MAX_INPUT_VALIDATION_ERRORS - 1)
-        {
-            messages.push(format_validation_error(&error));
-        }
-        let more = validation_errors.next().is_some();
-        let suffix = if more {
-            format!(
-                "; additional validation errors omitted after {MAX_INPUT_VALIDATION_ERRORS} issues"
-            )
-        } else {
-            String::new()
+        let original_error = match validate_input_contract(name, contract, &input) {
+            Ok(()) => return Ok(input),
+            Err(error) => error,
         };
-        let message = format!(
-            "Invalid arguments for tool '{name}': JSON Schema validation failed: {}{suffix}. Correct the arguments and retry; the tool was not executed.",
-            messages.join("; ")
-        );
-        Err(truncate_error_text(
-            message,
-            MAX_INPUT_VALIDATION_MESSAGE_BYTES,
-        ))
+
+        let candidate = coerce_object_fields_to_schema(&contract.schema, input.clone());
+        if candidate != input && validate_input_contract(name, contract, &candidate).is_ok() {
+            return Ok(candidate);
+        }
+
+        Err(original_error)
     }
 
     /// Get all registered tool names
@@ -655,6 +656,178 @@ impl ToolRegistry {
             .retain(|name, _| retained_names.contains(name));
         self.deferred_state.retain_definitions(&retained_names);
     }
+}
+
+fn validate_input_contract(
+    name: &str,
+    contract: &ToolInputContract,
+    input: &Value,
+) -> Result<(), String> {
+    let mut validation_errors = contract.validator.iter_errors(input);
+    let Some(first) = validation_errors.next() else {
+        return Ok(());
+    };
+
+    let mut messages = Vec::with_capacity(MAX_INPUT_VALIDATION_ERRORS);
+    messages.push(format_validation_error(&first));
+    for error in validation_errors
+        .by_ref()
+        .take(MAX_INPUT_VALIDATION_ERRORS - 1)
+    {
+        messages.push(format_validation_error(&error));
+    }
+    let more = validation_errors.next().is_some();
+    let suffix = if more {
+        format!(
+            "; additional validation errors omitted after {MAX_INPUT_VALIDATION_ERRORS} issues"
+        )
+    } else {
+        String::new()
+    };
+    let message = format!(
+        "Invalid arguments for tool '{name}': JSON Schema validation failed: {}{suffix}. Correct the arguments and retry; the tool was not executed.",
+        messages.join("; ")
+    );
+    Err(truncate_error_text(
+        message,
+        MAX_INPUT_VALIDATION_MESSAGE_BYTES,
+    ))
+}
+
+fn coerce_object_fields_to_schema(schema: &Value, mut input: Value) -> Value {
+    let Some(object) = input.as_object_mut() else {
+        return input;
+    };
+
+    // Schemars represents tagged and untagged request enums with root-level
+    // oneOf/anyOf branches, often through local $defs references. Walk every
+    // branch that defines a supplied property instead of relying on the root
+    // `properties`, which may intentionally be empty.
+    let keys = object.keys().cloned().collect::<Vec<_>>();
+    for key in keys {
+        let mut property_schemas = Vec::new();
+        collect_property_schemas(schema, schema, &key, &mut property_schemas, 0);
+        let mut expected = Vec::new();
+        for property_schema in property_schemas {
+            collect_schema_type_names(schema, property_schema, &mut expected, 0);
+        }
+        // A union that genuinely permits a string is ambiguous. Preserve the
+        // provider value and let the complete validator choose the branch.
+        if expected.contains(&"string") {
+            continue;
+        }
+        let Some(raw) = object.get(&key).and_then(Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        if let Some(coerced) = coerce_string_to_types(&raw, &expected) {
+            object.insert(key, coerced);
+        }
+    }
+
+    input
+}
+
+fn collect_property_schemas<'a>(
+    root: &'a Value,
+    schema: &'a Value,
+    key: &str,
+    out: &mut Vec<&'a Value>,
+    depth: usize,
+) {
+    if depth > 32 {
+        return;
+    }
+    if let Some(resolved) = resolve_local_schema_ref(root, schema) {
+        collect_property_schemas(root, resolved, key, out, depth + 1);
+        return;
+    }
+    if let Some(property) = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(key))
+    {
+        out.push(property);
+    }
+    for branch_key in ["oneOf", "anyOf", "allOf"] {
+        if let Some(branches) = schema.get(branch_key).and_then(Value::as_array) {
+            for branch in branches {
+                collect_property_schemas(root, branch, key, out, depth + 1);
+            }
+        }
+    }
+}
+
+fn collect_schema_type_names<'a>(
+    root: &'a Value,
+    schema: &'a Value,
+    out: &mut Vec<&'a str>,
+    depth: usize,
+) {
+    if depth > 32 {
+        return;
+    }
+    if let Some(resolved) = resolve_local_schema_ref(root, schema) {
+        collect_schema_type_names(root, resolved, out, depth + 1);
+        return;
+    }
+    match schema.get("type") {
+        Some(Value::String(kind)) => out.push(kind),
+        Some(Value::Array(kinds)) => {
+            for kind in kinds {
+                if let Some(kind) = kind.as_str() {
+                    out.push(kind);
+                }
+            }
+        }
+        _ => {}
+    }
+    for branch_key in ["oneOf", "anyOf", "allOf"] {
+        if let Some(branches) = schema.get(branch_key).and_then(Value::as_array) {
+            for branch in branches {
+                collect_schema_type_names(root, branch, out, depth + 1);
+            }
+        }
+    }
+}
+
+fn resolve_local_schema_ref<'a>(root: &'a Value, schema: &Value) -> Option<&'a Value> {
+    let reference = schema.get("$ref")?.as_str()?;
+    let pointer = reference.strip_prefix('#')?;
+    root.pointer(pointer)
+}
+
+fn coerce_string_to_types(raw: &str, expected: &[&str]) -> Option<Value> {
+    if (expected.contains(&"array") || expected.contains(&"object"))
+        && let Ok(parsed) = serde_json::from_str::<Value>(raw)
+        && ((expected.contains(&"array") && parsed.is_array())
+            || (expected.contains(&"object") && parsed.is_object()))
+    {
+        return Some(parsed);
+    }
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if expected.contains(&"integer")
+        && let Ok(number) = trimmed.parse::<i64>()
+    {
+        return Some(Value::Number(number.into()));
+    }
+    if expected.contains(&"number")
+        && let Ok(number) = trimmed.parse::<f64>()
+    {
+        return serde_json::Number::from_f64(number).map(Value::Number);
+    }
+    if expected.contains(&"boolean") {
+        if trimmed.eq_ignore_ascii_case("true") {
+            return Some(Value::Bool(true));
+        }
+        if trimmed.eq_ignore_ascii_case("false") {
+            return Some(Value::Bool(false));
+        }
+    }
+    None
 }
 
 fn compile_input_validator(tool_name: &str, schema: &Value) -> Result<Validator, String> {
@@ -938,6 +1111,146 @@ mod tests {
             .validate_input("knowledge_search", &serde_json::json!({}))
             .unwrap_err()
             .contains("kb_id"));
+    }
+
+    fn delegate_union_schema() -> Value {
+        serde_json::json!({
+            "$defs": {
+                "Planned": {
+                    "type": "object",
+                    "properties": {
+                        "strategy": {"type": "string", "const": "planned"},
+                        "goal": {"type": "string"},
+                        "work_dir": {"type": ["string", "null"]},
+                        "model_pool": {
+                            "anyOf": [
+                                {"$ref": "#/$defs/ModelPool"},
+                                {"type": "null"}
+                            ]
+                        },
+                        "max_parallel": {"type": ["integer", "null"]}
+                    },
+                    "required": ["strategy", "goal"],
+                    "additionalProperties": false
+                },
+                "Parallel": {
+                    "type": "object",
+                    "properties": {
+                        "strategy": {"type": "string", "const": "parallel"},
+                        "tasks": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 16,
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "prompt": {"type": "string"}
+                                },
+                                "required": ["name", "prompt"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "synthesize": {"type": "boolean"}
+                    },
+                    "required": ["strategy", "tasks"],
+                    "additionalProperties": false
+                },
+                "ModelPool": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {"mode": {"type": "string", "const": "automatic"}},
+                            "required": ["mode"],
+                            "additionalProperties": false
+                        },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "mode": {"type": "string", "const": "range"},
+                                "models": {"type": "array"}
+                            },
+                            "required": ["mode", "models"],
+                            "additionalProperties": false
+                        }
+                    ]
+                }
+            },
+            "type": "object",
+            "properties": {},
+            "anyOf": [
+                {"$ref": "#/$defs/Planned"},
+                {"$ref": "#/$defs/Parallel"}
+            ]
+        })
+    }
+
+    fn delegate_union_registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        assert!(registry.register(schema_tool("nomi_delegate", delegate_union_schema())));
+        registry
+    }
+
+    #[test]
+    fn prepare_input_recovers_planned_union_fields_through_defs() {
+        let registry = delegate_union_registry();
+        let raw = serde_json::json!({
+            "strategy": "planned",
+            "goal": "{keep this as a real string}",
+            "work_dir": "/tmp/work",
+            "model_pool": "{\"mode\":\"automatic\"}",
+            "max_parallel": "4"
+        });
+        assert!(registry.validate_input("nomi_delegate", &raw).is_err());
+
+        let prepared = registry.prepare_input("nomi_delegate", raw).unwrap();
+        assert_eq!(prepared["strategy"], "planned");
+        assert_eq!(prepared["goal"], "{keep this as a real string}");
+        assert_eq!(prepared["work_dir"], "/tmp/work");
+        assert_eq!(prepared["model_pool"], serde_json::json!({"mode": "automatic"}));
+        assert_eq!(prepared["max_parallel"], 4);
+        assert!(registry.validate_input("nomi_delegate", &prepared).is_ok());
+    }
+
+    #[test]
+    fn prepare_input_recovers_parallel_array_and_boolean_strings() {
+        let registry = delegate_union_registry();
+        let raw = serde_json::json!({
+            "strategy": "parallel",
+            "tasks": "[{\"name\":\"research\",\"prompt\":\"inspect\"}]",
+            "synthesize": "True"
+        });
+
+        let prepared = registry.prepare_input("nomi_delegate", raw).unwrap();
+        assert_eq!(prepared["tasks"][0]["name"], "research");
+        assert_eq!(prepared["synthesize"], true);
+        assert!(registry.validate_input("nomi_delegate", &prepared).is_ok());
+    }
+
+    #[test]
+    fn prepare_input_keeps_strict_union_and_root_object_boundaries() {
+        let registry = delegate_union_registry();
+        for invalid in [
+            serde_json::json!({
+                "strategy": "planned",
+                "goal": "inspect",
+                "synthesize": "True"
+            }),
+            serde_json::json!({
+                "strategy": "parallel",
+                "tasks": "{\"name\":\"wrong shape\"}"
+            }),
+            serde_json::json!({
+                "strategy": "parallel",
+                "tasks": "[]",
+                "unknown": "must not be dropped"
+            }),
+            Value::String(
+                "{\"strategy\":\"planned\",\"goal\":\"whole object string\"}".to_owned(),
+            ),
+        ] {
+            assert!(registry.prepare_input("nomi_delegate", invalid).is_err());
+        }
     }
 
     #[test]

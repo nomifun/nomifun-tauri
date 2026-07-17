@@ -65,7 +65,21 @@
   "progress": {
     "title": "Collaboration progress",
     "summary": "{{done}} of {{total}} tasks completed",
+    "running": "{{count}} active",
+    "failed": "{{count}} failed",
     "question": "Task “{{title}}” needs your decision"
+  },
+  "canvas": {
+    "fit": "Fit view",
+    "showOverview": "Show overview",
+    "hideOverview": "Hide overview",
+    "result": "Result summary",
+    "upstream": "Upstream",
+    "downstream": "Downstream",
+    "model": "Model",
+    "role": "Role",
+    "attempts": "Attempts",
+    "inspect": "Click to view the full execution record"
   },
   "thinking": {
     "title": "Preparing the collaboration plan",
@@ -176,6 +190,10 @@
   "profile": {
     "title": "Save as preset",
     "subtitle": "{{count}} role(s) from this collaboration can be saved for reuse",
+    "entry": "Reusable presets",
+    "open": "View {{count}} reusable presets",
+    "drawerHint": "This collaboration produced {{count}} reusable roles. Expand one to review its models and skills, then save it for future collaboration steps.",
+    "candidateSummary": "{{tasks}} task(s) · {{models}} model(s) · {{skills}} skill(s)",
     "modelsLabel": "Models",
     "skillsLabel": "{{count}} skill(s)",
     "saveAsPreset": "Save as preset",

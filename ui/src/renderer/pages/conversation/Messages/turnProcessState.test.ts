@@ -62,6 +62,36 @@ describe('turn process state', () => {
     expect(getToolMessagesProcessState([failedKnowledgeRead, skipped])).toBe('failed');
   });
 
+  test('maps local invalid-argument rejection to not executed while keeping real failures failed', () => {
+    const name = 'mcp__nomifun-desktop__nomi_delegate__anxmvqfkcuzfi4mq';
+    const rejected = {
+      type: 'tool_call',
+      content: {
+        call_id: 'call-invalid',
+        name,
+        status: 'error',
+        args: null,
+        output:
+          `Invalid arguments for tool '${name}': JSON Schema validation failed: bad value. ` +
+          'Correct the arguments and retry; the tool was not executed.',
+      },
+    } as any;
+    const remoteFailure = {
+      type: 'tool_call',
+      content: {
+        call_id: 'call-remote',
+        name,
+        status: 'error',
+        args: null,
+        output: 'Remote tool failed after dispatch',
+      },
+    } as any;
+
+    expect(getToolMessagesProcessState([rejected])).toBe('completed');
+    expect(getToolMessagesProcessState([remoteFailure])).toBe('failed');
+    expect(getToolMessagesProcessState([rejected, remoteFailure])).toBe('failed');
+  });
+
   test('does not let non-fatal ACP shell command exits fail the whole process receipt', () => {
     expect(
       getToolMessagesProcessState([

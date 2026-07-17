@@ -10,9 +10,11 @@
     "completed": "Ran {{target}}",
     "failed": "Failed {{target}}",
     "canceled": "Canceled {{target}}",
-    "skipped": "Skipped {{target}}"
+    "skipped": "Skipped {{target}}",
+    "invalidArguments": "Arguments did not pass validation; {{target}} was not run"
   },
   "processReceipt": {
+    "tool": "tool",
     "tools": "{{count}} tools",
     "readFiles": "Read {{count}} files",
     "readingFiles": "Reading {{count}} files",

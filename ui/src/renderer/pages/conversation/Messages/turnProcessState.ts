@@ -39,6 +39,7 @@ export const getToolMessagesProcessState = (messages: ToolProcessMessage[]): Tur
 
   const normalizedStates = normalizeToolMessages(messages).map((tool): TurnDisclosureProcessState => {
     if (tool.status === 'running' || tool.status === 'pending') return 'running';
+    if (tool.notExecutedReason) return 'completed';
     if (tool.nonFatalFailure) return 'completed';
     if (tool.status === 'error') return 'failed';
     if (tool.status === 'canceled') return 'canceled';

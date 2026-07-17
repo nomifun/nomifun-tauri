@@ -101,6 +101,11 @@ describe('MessageList turn completion disclosure structure', () => {
     expect(source.includes('messages.toolSummary.skipped')).toBe(true);
   });
 
+  test('renders pre-dispatch argument rejection with dedicated neutral copy', () => {
+    expect(source.includes("part.notExecutedReason === 'invalid_arguments'")).toBe(true);
+    expect(source.includes('messages.toolSummary.invalidArguments')).toBe(true);
+  });
+
   test('uses plan events as hard boundaries between tool receipt groups', () => {
     const planBoundary = source.match(/if \(message\.type === 'plan'\) \{[\s\S]*?continue;[\s\S]*?\}/)?.[0] ?? '';
 

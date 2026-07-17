@@ -72,11 +72,11 @@ describe('buildToolReceiptSummaryParts', () => {
       { title: 'read_file', action: 'read_files' },
       { title: 'write_file', action: 'edit_files' },
       { title: 'list_directory', action: 'list_files' },
-      { title: 'mcp__server__read_file', action: 'read_files' },
-      { title: 'mcp__server__write_file', action: 'edit_files' },
-      { title: 'mcp__server__list_directory', action: 'list_files' },
+      { title: 'server/read_file', action: 'read_files' },
+      { title: 'server/write_file', action: 'edit_files' },
+      { title: 'server/list_directory', action: 'list_files' },
       {
-        title: 'mcp__server__read_file__abcdefghijklmnop',
+        title: 'server/read_file',
         action: 'read_files',
       },
     ]);
@@ -92,7 +92,7 @@ describe('buildToolReceiptSummaryParts', () => {
 
     expect(rows.map(({ title, action }) => ({ title, action }))).toEqual([
       {
-        title: 'mcp__gateway__nomi_knowledge_update_base__abcdefghijklmnop',
+        title: 'gateway/nomi_knowledge_update_base',
         action: 'generic',
       },
     ]);
@@ -107,10 +107,10 @@ describe('buildToolReceiptSummaryParts', () => {
     ]);
 
     expect(rows.map(({ title, action }) => ({ title, action }))).toEqual([
-      { title: 'mcp__web__search__abcdefghijklmnop', action: 'generic' },
-      { title: 'mcp__knowledge__read__bcdefghijklmnopq', action: 'generic' },
-      { title: 'mcp__workflow__run__cdefghijklmnopqr', action: 'generic' },
-      { title: 'mcp__domain__list__defghijklmnopqrs', action: 'generic' },
+      { title: 'web/search', action: 'generic' },
+      { title: 'knowledge/read', action: 'generic' },
+      { title: 'workflow/run', action: 'generic' },
+      { title: 'domain/list', action: 'generic' },
     ]);
   });
 
@@ -275,6 +275,41 @@ describe('buildToolReceiptSummaryParts', () => {
     ]);
   });
 
+  test('keeps invalid-argument rejections separate from tools that actually ran', () => {
+    const parts = buildToolReceiptSummaryParts(
+      [
+        tool({
+          key: 'delegate-invalid',
+          name: 'mcp__nomifun-desktop__nomi_delegate__anxmvqfkcuzfi4mq',
+          status: 'canceled',
+          notExecutedReason: 'invalid_arguments',
+        }),
+        tool({
+          key: 'delegate-success',
+          name: 'mcp__nomifun-desktop__nomi_delegate__anxmvqfkcuzfi4mq',
+          status: 'completed',
+        }),
+      ],
+      'completed'
+    );
+
+    expect(parts).toEqual([
+      {
+        action: 'generic',
+        count: 1,
+        state: 'completed',
+        target: 'nomifun-desktop/nomi_delegate',
+        notExecutedReason: 'invalid_arguments',
+      },
+      {
+        action: 'generic',
+        count: 1,
+        state: 'completed',
+        target: 'nomifun-desktop/nomi_delegate',
+      },
+    ]);
+  });
+
   test('handles structured tool descriptions without throwing during receipt rendering', () => {
     const parts = buildToolReceiptSummaryParts(
       [
@@ -296,6 +331,25 @@ describe('buildToolReceiptSummaryParts', () => {
         target: '{ "command": "codex --version" }',
       },
     ]);
+  });
+
+  test('does not reintroduce a raw MCP routing name through description', () => {
+    const rawName = 'mcp__nomifun-desktop__nomi_delegate__anxmvqfkcuzfi4mq';
+    const parts = buildToolReceiptSummaryParts(
+      [
+        tool({
+          key: 'delegate-invalid',
+          name: rawName,
+          description: rawName,
+          status: 'canceled',
+          notExecutedReason: 'invalid_arguments',
+        }),
+      ],
+      'completed'
+    );
+
+    expect(parts[0]?.target).toBe('nomifun-desktop/nomi_delegate');
+    expect(parts[0]?.target?.includes('anxmvqfkcuzfi4mq')).toBe(false);
   });
 });
 
@@ -478,6 +532,33 @@ describe('buildToolReceiptDetailRows', () => {
         target: 'find /workspace -maxdepth 2 -type d',
         input: '{"command":"find /workspace -maxdepth 2 -type d"}',
         skipped: true,
+      },
+    ]);
+  });
+
+  test('keeps local validation diagnostics inspectable under a stable MCP title', () => {
+    const output =
+      "Invalid arguments for tool 'mcp__nomifun-desktop__nomi_delegate__anxmvqfkcuzfi4mq': " +
+      'JSON Schema validation failed. Correct the arguments and retry; the tool was not executed.';
+    const rows = buildToolReceiptDetailRows([
+      tool({
+        key: 'delegate-invalid',
+        name: 'mcp__nomifun-desktop__nomi_delegate__anxmvqfkcuzfi4mq',
+        status: 'canceled',
+        notExecutedReason: 'invalid_arguments',
+        output,
+      }),
+    ]);
+
+    expect(rows).toEqual([
+      {
+        key: 'delegate-invalid',
+        action: 'generic',
+        state: 'completed',
+        title: 'nomifun-desktop/nomi_delegate',
+        target: 'nomifun-desktop/nomi_delegate',
+        output,
+        notExecutedReason: 'invalid_arguments',
       },
     ]);
   });

@@ -149,17 +149,25 @@ enum PlannedDelegationStrategy {
 #[derive(Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct PlannedDelegationRequest {
+    /// Exactly `planned`. Planned requests never include `tasks` or
+    /// `synthesize`; those fields belong only to `strategy=parallel`.
     #[serde(rename = "strategy")]
     _strategy: PlannedDelegationStrategy,
+    /// Complete objective for the lead Agent to decompose into a dependency DAG.
     goal: String,
+    /// Optional execution directory. Omit to inherit the conversation workspace.
     #[serde(default)]
     work_dir: Option<String>,
+    /// Optional model authority as a native JSON object, never a JSON string.
     #[serde(default)]
     model_pool: Option<ModelPoolParam>,
+    /// Optional planning approval policy.
     #[serde(default)]
     plan_gate: Option<PlanGateParam>,
+    /// Optional fixed/adaptive replanning policy.
     #[serde(default)]
     adaptation_policy: Option<AdaptationPolicyParam>,
+    /// Optional integer concurrency limit.
     #[serde(default)]
     max_parallel: Option<i64>,
 }
@@ -1328,7 +1336,7 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
         CapabilityMeta::new(
             "nomi_delegate",
             "agent_execution",
-            "Delegate work into one Agent Execution. At a top-level Conversation this creates an execution; inside an active Attempt it atomically appends Steps to that same execution and returns immediately, so end the current turn without polling. strategy=planned turns one goal into a typed DAG and may narrow aggregate settings. strategy=parallel accepts exactly 1-16 shared tasks plus optional synthesis and inherits aggregate settings. Returns the canonical execution_id/status/message receipt and, for append, step_ids.",
+            "Delegate work into one Agent Execution. Choose exactly one native-JSON shape. planned: strategy='planned' plus goal and optional work_dir/model_pool(object)/plan_gate/adaptation_policy/max_parallel(integer); never send tasks or synthesize. parallel: strategy='parallel' plus tasks(array of 1-16 objects) and optional synthesize(boolean); never send planned aggregate settings. At a top-level Conversation this creates an execution; inside an active Attempt it atomically appends Steps and returns immediately, so end the turn without polling. Returns the canonical execution receipt.",
             DangerTier::Write,
         ),
         |deps, ctx, params| delegate(deps, ctx, params),

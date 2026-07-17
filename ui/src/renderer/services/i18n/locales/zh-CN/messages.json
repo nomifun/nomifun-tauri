@@ -10,9 +10,11 @@
     "completed": "已运行 {{target}}",
     "failed": "运行失败 {{target}}",
     "canceled": "已取消 {{target}}",
-    "skipped": "已跳过 {{target}}"
+    "skipped": "已跳过 {{target}}",
+    "invalidArguments": "参数未通过校验，未执行 {{target}}"
   },
   "processReceipt": {
+    "tool": "工具",
     "tools": "{{count}} 个工具",
     "readFiles": "已读取 {{count}} 个文件",
     "readingFiles": "正在读取 {{count}} 个文件",

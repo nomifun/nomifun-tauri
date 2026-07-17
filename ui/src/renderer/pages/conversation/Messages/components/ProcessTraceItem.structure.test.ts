@@ -46,6 +46,13 @@ describe('ProcessTraceItem Codex-style execution rows', () => {
     expect(source.includes('messages.toolSummary.skipped')).toBe(true);
   });
 
+  test('renders invalid arguments as not executed while retaining expandable diagnostics', () => {
+    expect(source.includes("row.notExecutedReason === 'invalid_arguments'")).toBe(true);
+    expect(source.includes('messages.toolSummary.invalidArguments')).toBe(true);
+    expect(source.includes('value={row.output}')).toBe(true);
+    expect(source.includes('stateOverride && !row.notExecutedReason')).toBe(true);
+  });
+
   test('renders read and edit steps with expandable file lists', () => {
     expect(source.includes('ToolFileListDetail')).toBe(true);
     expect(source.includes('ToolFileGroupTraceRow')).toBe(true);

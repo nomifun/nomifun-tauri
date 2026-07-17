@@ -149,6 +149,13 @@ const formatToolReceiptDetailLabel = (
     });
   }
 
+  if (row.notExecutedReason === 'invalid_arguments') {
+    return t('messages.toolSummary.invalidArguments', {
+      target: displayTarget ?? row.title,
+      defaultValue: 'Arguments did not pass validation; {{target}} was not run',
+    });
+  }
+
   if ((row.state === 'failed' || row.state === 'canceled') && displayTarget) {
     return t(`messages.toolSummary.${row.state}`, {
       target: displayTarget,
@@ -479,7 +486,10 @@ const ToolProcessTraceRows: React.FC<{
   const rows = useMemo(
     () =>
       buildToolReceiptDetailRows(tools).map((row) => {
-        const effectiveRow = stateOverride ? { ...row, state: stateOverride } : row;
+        // A group can contain both a genuine failure and a local pre-dispatch
+        // rejection. Preserve the latter's neutral row state instead of
+        // inheriting the failed group override.
+        const effectiveRow = stateOverride && !row.notExecutedReason ? { ...row, state: stateOverride } : row;
         return {
           row: effectiveRow,
           label: formatToolReceiptDetailLabel(effectiveRow, t, workspaceRoots),
