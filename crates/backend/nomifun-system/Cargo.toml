@@ -17,6 +17,7 @@ tracing.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 getrandom.workspace = true
+futures.workspace = true
 aws-config.workspace = true
 aws-sdk-bedrock.workspace = true
 semver.workspace = true

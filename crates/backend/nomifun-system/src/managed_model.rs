@@ -6,12 +6,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures::{StreamExt, future, stream};
 use nomifun_api_types::{
     ManagedModel, ManagedModelHealthBatchResult, ManagedModelHealthErrorKind,
     ManagedModelHealthResult, ManagedModelHealthStatus, ManagedModelServiceAvailability,
@@ -1355,8 +1356,29 @@ async fn proxy_upstream_response(response: reqwest::Response) -> Response {
         HeaderValue::from_static("no"),
     );
 
+    let normalized_stream = response
+        .bytes_stream()
+        .map(Some)
+        .chain(stream::once(async { None }))
+        .scan(
+            ManagedFreeSseNormalizer::default(),
+            |normalizer, chunk| {
+                future::ready(Some(match chunk {
+                    Some(Ok(bytes)) => Ok(Bytes::from(normalizer.push(&bytes))),
+                    Some(Err(error)) => Err(std::io::Error::other(error)),
+                    None => Ok(Bytes::from(normalizer.finish())),
+                }))
+            },
+        )
+        .filter_map(|item| {
+            future::ready(match &item {
+                Ok(bytes) if bytes.is_empty() => None,
+                _ => Some(item),
+            })
+        });
+
     builder
-        .body(Body::from_stream(response.bytes_stream()))
+        .body(Body::from_stream(normalized_stream))
         .unwrap_or_else(|_| {
             openai_error(
                 StatusCode::BAD_GATEWAY,
@@ -1364,6 +1386,212 @@ async fn proxy_upstream_response(response: reqwest::Response) -> Response {
                 "upstream_error",
             )
         })
+}
+
+/// Canonicalizes the fixed managed free-model gateway's OpenAI-compatible SSE
+/// tail without weakening the provider parser used for user-configured APIs.
+///
+/// The gateway can emit a terminal choice twice (the second copy carrying
+/// usage), private cost metadata before or after `[DONE]`, or a normalized-cost
+/// frame instead of an OpenAI usage-only frame. Benign terminal echoes are
+/// rewritten to `choices: [] + usage`; private accounting frames are either
+/// converted or dropped. Any post-finish content, reasoning, or tool delta is
+/// deliberately preserved so the strict downstream parser still rejects it.
+#[derive(Default)]
+struct ManagedFreeSseNormalizer {
+    buffer: Vec<u8>,
+    search_from: usize,
+    finish_reason: Option<String>,
+    saw_usage: bool,
+    done: bool,
+}
+
+impl ManagedFreeSseNormalizer {
+    fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
+        if self.done {
+            return Vec::new();
+        }
+        self.buffer.extend_from_slice(bytes);
+        let mut output = Vec::with_capacity(bytes.len());
+        loop {
+            let Some(relative_line_end) = self.buffer[self.search_from..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+            else {
+                self.search_from = self.buffer.len();
+                break;
+            };
+            let line_end = self.search_from + relative_line_end;
+            let line = self.buffer.drain(..=line_end).collect::<Vec<_>>();
+            self.search_from = 0;
+            self.normalize_line(&line, &mut output);
+            if self.done {
+                self.buffer.clear();
+                break;
+            }
+        }
+        output
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        if self.done || self.buffer.is_empty() {
+            self.buffer.clear();
+            self.search_from = 0;
+            return Vec::new();
+        }
+        let line = std::mem::take(&mut self.buffer);
+        self.search_from = 0;
+        let mut output = Vec::with_capacity(line.len());
+        self.normalize_line(&line, &mut output);
+        output
+    }
+
+    fn normalize_line(&mut self, raw_line: &[u8], output: &mut Vec<u8>) {
+        if self.done {
+            return;
+        }
+
+        let (line, newline) = if let Some(line) = raw_line.strip_suffix(b"\r\n") {
+            (line, b"\r\n".as_slice())
+        } else if let Some(line) = raw_line.strip_suffix(b"\n") {
+            (line, b"\n".as_slice())
+        } else {
+            (raw_line, b"".as_slice())
+        };
+        let Some(data) = line
+            .strip_prefix(b"data: ")
+            .or_else(|| line.strip_prefix(b"data:"))
+        else {
+            output.extend_from_slice(raw_line);
+            return;
+        };
+        let data = data.strip_prefix(b" ").unwrap_or(data);
+
+        if data == b"[DONE]" {
+            output.extend_from_slice(b"data: [DONE]");
+            output.extend_from_slice(newline);
+            self.done = true;
+            return;
+        }
+
+        let Ok(mut json) = serde_json::from_slice::<Value>(data) else {
+            output.extend_from_slice(raw_line);
+            return;
+        };
+        let usage_is_object = json.get("usage").is_some_and(Value::is_object);
+        if usage_is_object {
+            self.saw_usage = true;
+        }
+        let choices = json.get("choices").and_then(Value::as_array);
+
+        if self.finish_reason.is_none() {
+            if let Some(reason) = choices
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("finish_reason"))
+                .and_then(Value::as_str)
+            {
+                self.finish_reason = Some(reason.to_owned());
+            }
+            output.extend_from_slice(raw_line);
+            return;
+        }
+
+        if choices.is_some_and(Vec::is_empty) {
+            if usage_is_object {
+                output.extend_from_slice(raw_line);
+            } else if !self.saw_usage
+                && let Some(usage) = normalized_cost_usage(&json)
+            {
+                json["choices"] = Value::Array(Vec::new());
+                json["usage"] = usage;
+                if let Some(object) = json.as_object_mut() {
+                    object.remove("cost");
+                    object.remove("normalizedUsage");
+                    object.remove("x-opencode-type");
+                }
+                self.saw_usage = true;
+                write_sse_json_line(&json, newline, output);
+            } else if !is_managed_cost_metadata(&json) {
+                // Preserve unknown post-finish frames. The strict provider
+                // parser must decide whether they are safe, rather than this
+                // adapter silently discarding potentially semantic data.
+                output.extend_from_slice(raw_line);
+            }
+            return;
+        }
+
+        let benign_terminal_echo = choices
+            .and_then(|choices| choices.first())
+            .is_some_and(|choice| {
+                choice.get("finish_reason").and_then(Value::as_str)
+                    == self.finish_reason.as_deref()
+                    && choice
+                        .get("delta")
+                        .and_then(Value::as_object)
+                        .is_some_and(delta_has_no_semantic_data)
+            });
+        if benign_terminal_echo {
+            if usage_is_object {
+                json["choices"] = Value::Array(Vec::new());
+                write_sse_json_line(&json, newline, output);
+            }
+            return;
+        }
+
+        // Keep non-benign data intact. In particular, a late content or tool
+        // delta must reach the provider parser and poison the turn.
+        output.extend_from_slice(raw_line);
+    }
+}
+
+fn delta_has_no_semantic_data(delta: &serde_json::Map<String, Value>) -> bool {
+    delta.iter().all(|(field, value)| match field.as_str() {
+        "role" => value.is_null() || value.as_str() == Some("assistant"),
+        "content" | "reasoning" | "reasoning_content" => {
+            value.is_null() || value.as_str() == Some("")
+        }
+        "reasoning_details" | "tool_calls" => {
+            value.is_null() || value.as_array().is_some_and(Vec::is_empty)
+        }
+        _ => value.is_null(),
+    })
+}
+
+fn is_managed_cost_metadata(json: &Value) -> bool {
+    json.get("cost").is_some()
+        || json.get("normalizedUsage").is_some()
+        || json.get("x-opencode-type").and_then(Value::as_str) == Some("inference-cost")
+}
+
+fn normalized_cost_usage(json: &Value) -> Option<Value> {
+    let normalized = json.get("normalizedUsage")?.as_object()?;
+    let input_tokens = normalized.get("inputTokens")?.as_u64()?;
+    let output_tokens = normalized.get("outputTokens")?.as_u64()?;
+    let cache_read_tokens = normalized
+        .get("cacheReadTokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let reasoning_tokens = normalized
+        .get("reasoningTokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    Some(json!({
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": input_tokens
+            .saturating_add(cache_read_tokens)
+            .saturating_add(output_tokens),
+        "prompt_cache_hit_tokens": cache_read_tokens,
+        "completion_tokens_details": {
+            "reasoning_tokens": reasoning_tokens
+        }
+    }))
+}
+
+fn write_sse_json_line(json: &Value, newline: &[u8], output: &mut Vec<u8>) {
+    output.extend_from_slice(b"data: ");
+    output.extend_from_slice(json.to_string().as_bytes());
+    output.extend_from_slice(newline);
 }
 
 fn authorized(headers: &HeaderMap, token: &str) -> bool {
@@ -1725,8 +1953,153 @@ mod tests {
         IClientPreferenceRepository, SqliteClientPreferenceRepository,
         SqliteProviderRepository, init_database_memory,
     };
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const TEST_KEY: [u8; 32] = [0x42; 32];
+
+    fn normalize_managed_sse(input: &str, chunk_size: usize) -> String {
+        let mut normalizer = ManagedFreeSseNormalizer::default();
+        let mut output = Vec::new();
+        for chunk in input.as_bytes().chunks(chunk_size) {
+            output.extend(normalizer.push(chunk));
+        }
+        output.extend(normalizer.finish());
+        String::from_utf8(output).unwrap()
+    }
+
+    fn json_data_lines(output: &str) -> Vec<Value> {
+        output
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn managed_sse_normalizes_duplicate_terminal_usage_and_discards_post_done_cost() {
+        let input = concat!(
+            ": OPENROUTER PROCESSING\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"role\":\"assistant\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+            "data: {\"choices\":[],\"cost\":\"0\"}\n\n",
+        );
+
+        let output = normalize_managed_sse(input, 11);
+        let data = json_data_lines(&output);
+
+        assert!(output.contains(": OPENROUTER PROCESSING"));
+        assert_eq!(output.matches("data: [DONE]").count(), 1);
+        assert!(!output.contains("\"cost\""));
+        assert_eq!(
+            data.iter()
+                .filter(|chunk| chunk["choices"][0]["finish_reason"] == "stop")
+                .count(),
+            1
+        );
+        let usage = data
+            .iter()
+            .find(|chunk| chunk["choices"].as_array().is_some_and(Vec::is_empty))
+            .expect("duplicate terminal usage should become an OpenAI usage-only chunk");
+        assert_eq!(usage["usage"]["prompt_tokens"], 20);
+        assert_eq!(usage["usage"]["completion_tokens"], 3);
+    }
+
+    #[test]
+    fn managed_sse_drops_private_cost_metadata_after_terminal_with_usage() {
+        let input = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":1}}\n\n",
+            "data: {\"choices\":[],\"x-opencode-type\":\"inference-cost\",\"cost\":\"0\",\"normalizedUsage\":{\"inputTokens\":8,\"outputTokens\":1}}\n\n",
+            "data: [DONE]\n\n",
+            "data: {\"choices\":[],\"cost\":\"0\"}\n\n",
+        );
+
+        let output = normalize_managed_sse(input, 7);
+
+        assert!(!output.contains("x-opencode-type"));
+        assert!(!output.contains("normalizedUsage"));
+        assert!(!output.contains("\"cost\""));
+        assert_eq!(output.matches("\"usage\"").count(), 1);
+        assert_eq!(output.matches("data: [DONE]").count(), 1);
+    }
+
+    #[test]
+    fn managed_sse_converts_normalized_cost_when_standard_usage_is_missing() {
+        let input = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: {\"choices\":[],\"x-opencode-type\":\"inference-cost\",\"cost\":\"0\",\"normalizedUsage\":{\"inputTokens\":60,\"outputTokens\":8,\"reasoningTokens\":7,\"cacheReadTokens\":192}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let output = normalize_managed_sse(input, 13);
+        let data = json_data_lines(&output);
+        let usage = data
+            .iter()
+            .find(|chunk| chunk["choices"].as_array().is_some_and(Vec::is_empty))
+            .expect("private normalized usage should become OpenAI usage metadata");
+
+        assert_eq!(usage["usage"]["prompt_tokens"], 60);
+        assert_eq!(usage["usage"]["completion_tokens"], 8);
+        assert_eq!(usage["usage"]["prompt_cache_hit_tokens"], 192);
+        assert_eq!(usage["usage"]["total_tokens"], 260);
+        assert!(usage.get("cost").is_none());
+        assert!(usage.get("normalizedUsage").is_none());
+        assert!(usage.get("x-opencode-type").is_none());
+        assert_eq!(
+            usage["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            7
+        );
+    }
+
+    #[test]
+    fn managed_sse_preserves_semantic_data_after_finish_for_strict_rejection() {
+        let input = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late text\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let output = normalize_managed_sse(input, 17);
+
+        assert!(output.contains("late text"));
+        assert!(output.contains("tool_calls"));
+        assert_eq!(output.matches("\"finish_reason\":\"tool_calls\"").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn proxy_upstream_response_applies_managed_sse_normalization() {
+        let server = MockServer::start().await;
+        let input = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n",
+            "data: {\"choices\":[],\"cost\":\"0\"}\n\n",
+        );
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(input, "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let upstream = reqwest::get(server.uri()).await.unwrap();
+
+        let response = proxy_upstream_response(upstream).await;
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let output = String::from_utf8(body.to_vec()).unwrap();
+        let data = json_data_lines(&output);
+
+        assert_eq!(output.matches("data: [DONE]").count(), 1);
+        assert!(!output.contains("\"cost\""));
+        assert!(data.iter().any(|chunk| {
+            chunk["choices"].as_array().is_some_and(Vec::is_empty)
+                && chunk["usage"]["prompt_tokens"] == 1
+        }));
+    }
 
     #[test]
     fn free_filter_matches_opencode_contract() {
