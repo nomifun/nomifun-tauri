@@ -1,7 +1,7 @@
 {
   "version": "0.2.25",
   "notes": "macOS 首发：修复 WebUI 会话过期启动回登录；优化受限网络安装与消息展示；移除本地模型支持。",
-  "pub_date": "2026-07-17T11:18:07.913Z",
+  "pub_date": "2026-07-17T11:22:22.119Z",
   "platforms": {
     "darwin-x86_64": {
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxOCtTLy83VVdkUWdkTTZsVndSY0g3UGY4cmFqMUNHb1k0Sm9odlJaZTM0T1ZEcHZVdGorUzRDc3RXbFp0UXRBQVhFNkJGaXRpK3R1U1A2QlIwYXVCNUFrPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0Mjg2MDIxCWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6CmFPL2R6SkZQbjFkWVJQa1FVWWdVQitneEtiNFA3VW9jZGxlK0QwT1hvY2h1YlROOG10bVF0enVuY3ZrczBDOEdKVWVUa2UzczhwS05YVFlCZlErMUR3PT0K",
@@ -14,6 +14,10 @@
     "linux-x86_64": {
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODdZcmdHNTU5TS9zd245NXhZdXYzMkNZVkV3dUhyenM3VForN2FHZU94Q0VpZGRmRExyV0V5VEVtczZVc0Q1WnlRSFQxL3lkR2YyUi9LWkZDTDhldmdnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0Mjg3MDg3CWZpbGU6Tm9taUZ1bl8wLjIuMjVfYW1kNjQuQXBwSW1hZ2UKQU8wcVl0YU45ZVBYZlFYWnI2OW1WQVM5Wm5PV2Fwdmh0eWVOdHdlZ1ptdUdwQkswQWYzUXFuRUZmRTZVRUVZeDRxMkpIa2toTk0wWVBOa1I3dGZQQWc9PQo=",
       "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.25/NomiFun_0.2.25_amd64.AppImage"
+    },
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODhUZ2FoUzFkNGMydnYxcU95LzVuemJUY2NpUDZ1eUw2K0p0RHhkSzB3OURDeEFFZ3JVM3VhRjlFMmNwSGk0RXFtOStlMWNPRlBza0xsVDlsNk0wWXdRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0Mjg3MzMxCWZpbGU6Tm9taUZ1bl8wLjIuMjVfeDY0LXNldHVwLmV4ZQppNjIrS1ZNVkpzVFRXS3E5algwcFV6Ui9MZnltK3M4TTFndGVUSHN2VXFubHBMUWZMeFNFa1ZhOUgvMTBhVkZpVU1yWjQxbmNkUk02VEhUeThQVy9BQT09Cg==",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.25/NomiFun_0.2.25_x64-setup.exe"
     }
   }
 }
