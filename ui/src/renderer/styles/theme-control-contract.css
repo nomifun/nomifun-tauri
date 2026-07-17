@@ -64,6 +64,48 @@
   color: var(--color-text-2) !important;
 }
 
+/* Requirements board: keep the column as a quiet staging surface and lift
+ * individual requirements above it. This restores the intended nesting in
+ * light themes (soft gray column, bright cards) without making dark columns
+ * muddy; dark cards step up to bg-3 and a stronger border for clear scanning. */
+.requirements-board-column {
+  background-color: var(--color-fill-1) !important;
+}
+
+.requirements-board-card {
+  background-color: var(--color-bg-white) !important;
+  border-color: var(--color-border-2) !important;
+}
+
+[data-theme='dark'] .requirements-board-card,
+body[arco-theme='dark'] .requirements-board-card {
+  background-color: var(--color-bg-3) !important;
+  border-color: var(--color-border-3) !important;
+}
+
+/* Let the native scrollbar live in the column's right padding rather than
+ * taking width from cards. A thin, quiet thumb still signals that the column
+ * can scroll, while stable gutter sizing keeps short and long columns aligned. */
+.requirements-board-card-list {
+  margin-right: -8px;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--color-text-3) 52%, transparent) transparent;
+}
+
+.requirements-board-card-list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.requirements-board-card-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.requirements-board-card-list::-webkit-scrollbar-thumb {
+  background-color: color-mix(in srgb, var(--color-text-3) 52%, transparent);
+  border-radius: 999px;
+}
+
 .migrate-events-checkbox .arco-checkbox-mask {
   border: 1px solid var(--control-idle-border, var(--color-border-3)) !important;
 }

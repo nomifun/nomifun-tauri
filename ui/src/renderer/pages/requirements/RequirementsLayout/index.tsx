@@ -148,7 +148,7 @@ const RequirementsLayout: React.FC = () => {
         </div>
       </ContentSider>
       <div className='flex-1 min-w-0 min-h-0 overflow-y-auto' role='tabpanel' aria-label={t('requirements.title')} ref={paneRef}>
-        <div className={classNames('mx-auto w-full max-w-1100px box-border py-32px', panePadX)}>
+        <div className={classNames('mx-auto w-full max-w-1100px box-border h-full pt-32px pb-4px', panePadX)}>
           <Outlet />
         </div>
       </div>

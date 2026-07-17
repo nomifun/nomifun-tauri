@@ -272,7 +272,7 @@ const WorkspacePage: React.FC = () => {
   );
 
   return (
-    <div className='flex flex-col'>
+    <div className='flex h-full min-h-0 flex-col'>
       {messageCtx}
 
       {/* Header row: view toggle (left) + 新建 (right) */}
@@ -320,7 +320,7 @@ const WorkspacePage: React.FC = () => {
       </div>
 
       {/* The view */}
-      <div className='mt-10px'>
+      <div className={view === 'board' ? 'mt-10px flex flex-1 min-h-0' : 'mt-10px'}>
         {view === 'board' ? (
           <RequirementBoardView items={items} onOpenDetail={openDetail} onStatusChange={handleRowStatusChange} />
         ) : (

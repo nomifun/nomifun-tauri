@@ -7,7 +7,7 @@
 /**
  * RequirementBoardCard — a compact, draggable card for the workspace board.
  *
- * Mirrors PresetCard's surface language (rounded-16px bordered surface on
+ * Mirrors PresetCard's surface language (compact rounded bordered surface on
  * bg-2, soft lift on hover) but stripped down for a Kanban column: a title,
  * an order-key chip, a tag chip, and — when the requirement is bound to an
  * executing session — a small session marker.
@@ -57,7 +57,7 @@ const RequirementBoardCard: React.FC<RequirementBoardCardProps> = ({ item, onOpe
         onDragStart(item.id);
       }}
       className={[
-        'group relative flex flex-col rounded-16px border border-solid p-12px cursor-grab active:cursor-grabbing select-none outline-none',
+        'requirements-board-card group relative flex flex-col rounded-10px border border-solid p-12px cursor-grab active:cursor-grabbing select-none outline-none',
         'border-[var(--color-border-2)] bg-[var(--color-bg-2)] transition-all duration-180',
         'hover:border-[var(--color-primary-light-4)] hover:shadow-[0_4px_16px_rgba(0,0,0,0.06)]',
         'focus-visible:border-[rgb(var(--primary-5))] focus-visible:shadow-[0_0_0_3px_rgba(var(--primary-6),0.12)]',

@@ -90,9 +90,10 @@ const RequirementBoardView: React.FC<RequirementBoardViewProps> = ({ items, onOp
   };
 
   return (
-    <div className='flex w-full gap-12px overflow-x-auto pb-8px'>
+    <div className='flex w-full flex-1 min-h-0 items-start gap-12px overflow-x-auto pb-4px'>
       {COLUMNS.map((status) => {
         const colItems = grouped[status];
+        const hasItems = colItems.length > 0;
         const isDropTarget = dropTarget === status;
         const accent = STATUS_ACCENT[status];
         return (
@@ -111,7 +112,8 @@ const RequirementBoardView: React.FC<RequirementBoardViewProps> = ({ items, onOp
             }}
             onDrop={(e) => handleDrop(e, status)}
             className={[
-              'flex min-w-260px flex-1 flex-col gap-8px rounded-16px p-8px box-border transition-colors duration-180',
+              'requirements-board-column flex min-w-260px flex-1 flex-col gap-8px rounded-12px p-8px box-border transition-colors duration-180',
+              hasItems ? 'self-stretch' : '',
               isDropTarget
                 ? 'bg-[var(--color-fill-2)] border border-dashed border-[var(--color-primary-light-4)]'
                 : 'bg-[var(--color-fill-1)] border border-solid border-transparent',
@@ -134,8 +136,13 @@ const RequirementBoardView: React.FC<RequirementBoardViewProps> = ({ items, onOp
             </div>
 
             {/* Card column — scrolls independently when tall. */}
-            <div className='flex flex-col gap-8px overflow-y-auto pr-2px max-h-[calc(100vh-260px)] min-h-60px'>
-              {colItems.length === 0 ? (
+            <div
+              className={[
+                'requirements-board-card-list flex flex-col gap-4px overflow-y-auto min-h-60px',
+                hasItems ? 'flex-1 min-h-0' : '',
+              ].join(' ')}
+            >
+              {!hasItems ? (
                 <div className='flex flex-1 items-center justify-center py-16px text-12px text-[var(--color-text-3)] select-none'>
                   {t('requirements.kanban.emptyColumn')}
                 </div>
