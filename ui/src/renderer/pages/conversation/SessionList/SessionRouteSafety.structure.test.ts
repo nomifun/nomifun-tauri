@@ -38,4 +38,11 @@ describe('shared session shell route safety', () => {
     expect(mainSource.includes('.finally(() => setConfigReady(true))')).toBe(false);
     expect(boundarySource.includes("window.location.reload()")).toBe(true);
   });
+
+  test('expired WebUI auth returns to login without tripping the application boundary', () => {
+    expect(mainSource.includes('const { ready, status } = useAuth()')).toBe(true);
+    expect(mainSource.includes("if (!ready || status !== 'authenticated') {")).toBe(true);
+    expect(mainSource.includes('if (!active || isHandledAuthExpiredHttpError(error)) return;')).toBe(true);
+    expect(mainSource.includes("if (status !== 'authenticated') {\n    return router;")).toBe(true);
+  });
 });
