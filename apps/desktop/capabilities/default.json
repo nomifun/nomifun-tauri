@@ -19,7 +19,6 @@
     "core:window:allow-set-size",
     "core:window:allow-set-focus",
     "core:window:allow-outer-position",
-    "core:window:allow-cursor-position",
     "core:window:allow-set-ignore-cursor-events",
     "core:webview:default",
     "core:webview:allow-set-webview-zoom",

@@ -50,6 +50,24 @@ serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSResponder",
+    "NSView",
+    "NSWindow",
+] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", features = ["v3_24"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 

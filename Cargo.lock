@@ -5815,11 +5815,14 @@ version = "0.2.28"
 dependencies = [
  "anyhow",
  "clap",
+ "gtk",
  "junction",
  "keepawake",
  "nomifun-app",
  "nomifun-common",
  "nomifun-runtime",
+ "objc2",
+ "objc2-app-kit",
  "serde",
  "serde_json",
  "tauri",
@@ -5834,6 +5837,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "windows 0.61.3",
 ]
 
 [[package]]

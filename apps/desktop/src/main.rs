@@ -29,6 +29,7 @@ use tauri::{Emitter, Manager};
 use tauri_plugin_deep_link::DeepLinkExt;
 
 mod memory_panel_window;
+mod companion_pointer;
 mod relocate;
 mod updater_install_context;
 
@@ -546,11 +547,12 @@ fn reconcile_companion_windows(
         // self-heals on the next sync.
         match builder.build() {
             Ok(window) => {
-                // 创建即默认整窗穿透（安全侧）：JS 点击穿透轮询(useCompanionClickThrough)
-                // 还没起、或 stale/dev 下 outerPosition 抛错卡死时，透明窗也不挡底层点击。
-                // 命中立绘时由轮询切回 false。
-                if let Err(e) = window.set_ignore_cursor_events(true) {
-                    tracing::warn!(error = %e, label = %label, "failed to set ignore-cursor on companion window");
+                // 只有能在整窗穿透后重新查询本地光标的后端才允许启动为穿透态。
+                // native Wayland 无全局指针查询，必须默认捕获，避免伙伴永久不可操作。
+                if companion_pointer::supports_initial_pointer_passthrough(&window) {
+                    if let Err(e) = window.set_ignore_cursor_events(true) {
+                        tracing::warn!(error = %e, label = %label, "failed to set startup companion click-through");
+                    }
                 }
                 if let Err(e) = window.show() {
                     tracing::warn!(error = %e, label = %label, "failed to show created companion window");
@@ -839,6 +841,7 @@ fn main() -> std::process::ExitCode {
         .manage(memory_panel_window::MemoryPanelWindowState::default())
         .invoke_handler(tauri::generate_handler![
             check_for_updates,
+            companion_pointer::get_companion_local_pointer,
             updater_install_context::get_updater_install_context,
             sync_companion_windows,
             memory_panel_window::prepare_companion_memory_panel,
