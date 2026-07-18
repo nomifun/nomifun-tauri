@@ -1,11 +1,19 @@
 {
   "version": "0.2.28",
   "notes": "Windows 首发：提升 OpenAI 兼容流式响应韧性，改善兼容模型流中断与错误传递处理。",
-  "pub_date": "2026-07-17T18:21:39.842Z",
+  "pub_date": "2026-07-18T00:51:33.922Z",
   "platforms": {
     "windows-x86_64": {
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODNIUUIxdEt4TjZiSGt0ZDJ1dmMybkR4S3lzK1JMMzMvTnNTaUwzMGIzK05oQWFJMTZiaVc0RHozTjlDd24rU2FKd0IxV05nb2luMXp0dlJqRndnb0EwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0MzEyNDk4CWZpbGU6Tm9taUZ1bl8wLjIuMjhfeDY0LXNldHVwLmV4ZQpyL2ZqNFZBdDNWd1VUeFdsbFQzMHQwVDAvekNwcFVDdjU2Ky8wcVZESURjSEpqdWlLalIwaUdvRmtLOXZ2cXBpcnZCWDF6dUFqMFpzT2M0VFdjYVhBZz09Cg==",
       "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.28/NomiFun_0.2.28_x64-setup.exe"
+    },
+    "darwin-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxOHg2aUNjdFBGQXQ5WnhBZEhCeTJqeDVRMysxRjB3Z0RLa0Z3RWpsZi9WQU9YVjdkOGJsd1YvbTZoeTFJOWZTUFRab3h0MEdXQVFObDRtZDdPR2VCSXdRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0MzM1NzU4CWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6CjlXY01nekJRa3RscU1VemRSSFF3cXY2MkcvRS9MWnl3OXgyQTVKTkw1THNzNy8yOEhaQ3lxS2tWMktJYkoyY2xFdkRZYkc4Yno4dkR2eWJrbnNjSkRnPT0K",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.28/NomiFun.app.tar.gz"
+    },
+    "darwin-aarch64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxOHg2aUNjdFBGQXQ5WnhBZEhCeTJqeDVRMysxRjB3Z0RLa0Z3RWpsZi9WQU9YVjdkOGJsd1YvbTZoeTFJOWZTUFRab3h0MEdXQVFObDRtZDdPR2VCSXdRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0MzM1NzU4CWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6CjlXY01nekJRa3RscU1VemRSSFF3cXY2MkcvRS9MWnl3OXgyQTVKTkw1THNzNy8yOEhaQ3lxS2tWMktJYkoyY2xFdkRZYkc4Yno4dkR2eWJrbnNjSkRnPT0K",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.28/NomiFun.app.tar.gz"
     }
   }
 }
