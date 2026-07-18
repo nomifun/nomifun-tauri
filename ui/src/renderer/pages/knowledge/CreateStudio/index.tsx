@@ -328,6 +328,10 @@ const CreateStudio: React.FC<CreateStudioProps> = ({
 
   const modalClassName = isMobile ? 'create-studio-modal--mobile' : '';
 
+  const studioViewportHeight = isMobile
+    ? 'calc(100dvh - 48px)'
+    : 'min(760px, calc(100dvh - 80px))';
+
   // ─── Render ───────────────────────────────────────────────────────────────
 
   return (
@@ -344,9 +348,12 @@ const CreateStudio: React.FC<CreateStudioProps> = ({
       className={modalClassName}
       maskClosable
     >
-      <div className='flex flex-col overflow-hidden' style={{ maxHeight: isMobile ? '100vh' : 'calc(100vh - 80px)' }}>
+      <div
+        className='flex min-h-0 flex-col overflow-hidden'
+        style={{ height: studioViewportHeight, maxHeight: studioViewportHeight }}
+      >
         {/* ─── Header ──────────────────────────────────────────────────────── */}
-        <div className='flex items-start justify-between gap-16px border-b border-b-[var(--color-border)] px-24px pb-16px pt-20px'>
+        <div className='flex shrink-0 items-start justify-between gap-16px border-b border-b-[var(--color-border)] px-24px pb-16px pt-20px'>
           <div>
             <h2 className='m-0 text-19px font-700 text-[var(--color-text-1)]'>
               {t('knowledge.studio.title', { defaultValue: '新建知识库' })}
@@ -366,13 +373,17 @@ const CreateStudio: React.FC<CreateStudioProps> = ({
         {/* ─── Body: Rail + Config ─────────────────────────────────────────── */}
         <div
           className={`flex min-h-0 flex-1 ${isMobile ? 'flex-col' : ''}`}
-          style={!isMobile ? { display: 'grid', gridTemplateColumns: '236px 1fr' } : undefined}
+          style={!isMobile ? {
+            display: 'grid',
+            gridTemplateColumns: '236px minmax(0, 1fr)',
+            gridTemplateRows: 'minmax(0, 1fr)',
+          } : undefined}
         >
           {/* Left rail */}
           <TypeRail value={sourceType} onChange={setSourceType} />
 
           {/* Right config area */}
-          <div className='knowledge-studio-config-panel flex-1 overflow-y-auto bg-[var(--color-fill-1)] p-22px'>
+          <div className='knowledge-studio-config-panel min-h-0 flex-1 overflow-y-auto bg-[var(--color-fill-1)] p-22px'>
             {/* ─── Basic Info Section ──────────────────────────────────────── */}
             <div className='knowledge-studio-basic-card mb-14px rounded-16px bg-[var(--color-bg-2)] p-16px shadow-[0_10px_30px_rgba(15,23,42,0.04)]'>
               <div className='mb-14px flex items-start justify-between gap-12px'>
@@ -502,7 +513,7 @@ const CreateStudio: React.FC<CreateStudioProps> = ({
         </div>
 
         {/* ─── Footer ──────────────────────────────────────────────────────── */}
-        <div className='flex items-center justify-between gap-12px border-t border-t-[var(--color-border)] bg-[var(--color-bg-1)] px-24px py-14px'>
+        <div className='flex shrink-0 items-center justify-between gap-12px border-t border-t-[var(--color-border)] bg-[var(--color-bg-1)] px-24px py-14px'>
           {/* Left hint */}
           <div className='flex items-center gap-7px text-12px text-[var(--color-text-3)]'>
             <span className='rounded-6px bg-[var(--color-success-light-1)] px-7px py-2px text-10px font-600 text-[rgb(var(--success-6))]'>

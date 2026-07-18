@@ -7,7 +7,7 @@ use fs2::FileExt;
 use sqlx::migrate::Migrator;
 use sqlx::pool::PoolOptions;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
-use sqlx::{Row, Sqlite, SqlitePool};
+use sqlx::{Connection, Row, Sqlite, SqlitePool};
 use tracing::{info, warn};
 
 use crate::error::DbError;
@@ -442,10 +442,10 @@ fn require_quick_check_ok(rows: Vec<String>) -> Result<(), DbError> {
     )))
 }
 
-/// Run sqlx migrations with one retry on `_sqlx_migrations` UNIQUE conflict.
+/// Run sqlx migrations with bounded retries for known recoverable failures.
 ///
-/// The advisory file lock above already serialises well-behaved processes,
-/// but a UNIQUE conflict can still leak through when:
+/// The advisory file lock above already serialises well-behaved processes, but
+/// a `_sqlx_migrations` UNIQUE conflict can still leak through when:
 /// - flock() failed (network FS, sandbox restrictions) and we proceeded.
 /// - Two processes that both bypassed the lock raced.
 ///
@@ -453,14 +453,38 @@ fn require_quick_check_ok(rows: Vec<String>) -> Result<(), DbError> {
 /// rolled back, so re-running `sqlx::migrate!().run` is safe: the second
 /// pass sees the row that the winner committed, checksum matches (same
 /// shipped binary), and the migration is treated as already applied.
+///
+/// Migration 003 also has one narrowly detected compatibility retry for the
+/// disabled-foreign-key behavior documented by
+/// [`prepare_pending_local_model_decommission`].
 async fn run_migrations_with_retry(conn: &mut sqlx::SqliteConnection) -> Result<(), DbError> {
-    match DB_MIGRATOR.run(&mut *conn).await {
-        Ok(()) => Ok(()),
-        Err(e) if is_migrations_table_unique_conflict(&e) => {
-            warn!("Concurrent migrator detected (UNIQUE conflict on _sqlx_migrations); retrying");
-            DB_MIGRATOR.run(&mut *conn).await.map_err(DbError::Migration)
+    let mut retried_unique_conflict = false;
+    let mut retried_local_model_cleanup = false;
+
+    loop {
+        match DB_MIGRATOR.run(&mut *conn).await {
+            Ok(()) => return Ok(()),
+            Err(e)
+                if !retried_unique_conflict && is_migrations_table_unique_conflict(&e) =>
+            {
+                retried_unique_conflict = true;
+                warn!(
+                    "Concurrent migrator detected (UNIQUE conflict on _sqlx_migrations); retrying"
+                );
+            }
+            Err(e)
+                if !retried_local_model_cleanup
+                    && is_local_model_decommission_compatibility_conflict(&e)
+                    && prepare_pending_local_model_decommission(conn).await? =>
+            {
+                retried_local_model_cleanup = true;
+                warn!(
+                    "Migration 003 encountered a retired local-model template binding; \
+                     removed the retired live configuration and retrying"
+                );
+            }
+            Err(e) => return Err(DbError::Migration(e)),
         }
-        Err(e) => Err(DbError::Migration(e)),
     }
 }
 
@@ -472,6 +496,98 @@ async fn run_migrations_with_retry(conn: &mut sqlx::SqliteConnection) -> Result<
 fn is_migrations_table_unique_conflict(err: &sqlx::migrate::MigrateError) -> bool {
     let msg = err.to_string();
     msg.contains("UNIQUE constraint failed: _sqlx_migrations.version")
+}
+
+fn is_local_model_decommission_compatibility_conflict(
+    err: &sqlx::migrate::MigrateError,
+) -> bool {
+    let message = err.to_string();
+    message.contains("provider is still referenced by an executable Agent binding")
+        || message.contains(
+            "Conversation execution template must be executable, owner-scoped, and contain the lead model",
+        )
+}
+
+/// Migration 003 deletes local-model templates before deleting their provider.
+/// With foreign keys disabled, template participants do not cascade away and
+/// conversation template references are not set to NULL. Existing integrity
+/// triggers can therefore abort the migration before it reaches its final
+/// foreign-key check. This compatibility path runs only after one of those
+/// exact trigger failures and only while 003 is still pending, then lets the
+/// immutable shipped migration retry normally.
+async fn prepare_pending_local_model_decommission(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<bool, DbError> {
+    let migration_applied: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 3 AND success = 1")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(DbError::Query)?;
+    if migration_applied != 0 {
+        return Ok(false);
+    }
+
+    let local_provider_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM providers WHERE platform = 'nomifun-local-model'")
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(DbError::Query)?;
+    if local_provider_count == 0 {
+        return Ok(false);
+    }
+
+    let mut transaction = conn.begin().await.map_err(DbError::Query)?;
+    sqlx::query(
+        "CREATE TEMP TABLE pending_local_model_templates (id TEXT PRIMARY KEY NOT NULL)",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    sqlx::query(
+        "INSERT INTO pending_local_model_templates (id) \
+         SELECT DISTINCT participant.template_id \
+         FROM agent_execution_template_participants participant \
+         JOIN providers provider ON provider.id = participant.provider_id \
+         WHERE provider.platform = 'nomifun-local-model'",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    sqlx::query(
+        "UPDATE conversations SET execution_template_id = NULL \
+         WHERE execution_template_id IN (SELECT id FROM pending_local_model_templates)",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    sqlx::query(
+        "DELETE FROM agent_execution_template_participants \
+         WHERE template_id IN (SELECT id FROM pending_local_model_templates)",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    sqlx::query(
+        "DELETE FROM agent_execution_templates \
+         WHERE id IN (SELECT id FROM pending_local_model_templates)",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    sqlx::query(
+        "DELETE FROM model_profiles WHERE provider_id IN (\
+             SELECT id FROM providers WHERE platform = 'nomifun-local-model'\
+         )",
+    )
+    .execute(&mut *transaction)
+    .await
+    .map_err(DbError::Query)?;
+    sqlx::query("DROP TABLE pending_local_model_templates")
+        .execute(&mut *transaction)
+        .await
+        .map_err(DbError::Query)?;
+    transaction.commit().await.map_err(DbError::Query)?;
+    Ok(true)
 }
 
 /// RAII guard that holds an exclusive file lock for the lifetime of the

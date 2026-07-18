@@ -198,12 +198,25 @@ async fn local_model_decommission_removes_persisted_product_state() {
     .await
     .unwrap();
 
-    sqlx::raw_sql(include_str!(
-        "../migrations/003_remove_local_model_support.sql"
-    ))
-    .execute(db.pool())
-    .await
-    .unwrap();
+    // Production migrations run with foreign keys disabled so table rebuilds
+    // cannot trigger cascades. Exercise the decommission and its repair under
+    // that same connection-level setting.
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../migrations/003_remove_local_model_support.sql"))
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../migrations/004_repair_disabled_fk_cascades.sql"))
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(db.pool())
+        .await
+        .unwrap();
 
     let local_provider_count: (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM providers WHERE platform = 'nomifun-local-model'")
@@ -246,6 +259,200 @@ async fn local_model_decommission_removes_persisted_product_state() {
     .await
     .unwrap();
     assert_eq!(cloud_profile_source.0, "inferred");
+
+    let local_profile_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM model_profiles WHERE provider_id = ?")
+            .bind(LOCAL_PROVIDER_ID)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(local_profile_count.0, 0);
+
+    let foreign_key_errors: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(foreign_key_errors.0, 0);
+}
+
+#[tokio::test]
+async fn upgrade_repairs_model_profiles_orphaned_by_applied_migration_003() {
+    const LOCAL_PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000111";
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nomifun-backend.db");
+    let db = init_database(&path).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (\
+            id, platform, name, base_url, api_key_encrypted, models, enabled, \
+            capabilities, created_at, updated_at\
+         ) VALUES (?, 'nomifun-local-model', 'Local model', '', '', '[]', 1, '[]', 1, 1)",
+    )
+    .bind(LOCAL_PROVIDER_ID)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO model_profiles (\
+            provider_id, model, tasks, traits, params, source, updated_at\
+         ) VALUES (?, 'local-model', '[]', '[]', '{}', 'catalog', 1)",
+    )
+    .bind(LOCAL_PROVIDER_ID)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let mut conn = db.pool().acquire().await.unwrap();
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM providers WHERE id = ?")
+        .bind(LOCAL_PROVIDER_ID)
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version >= 4")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    let violation_before = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(violation_before.get::<String, _>("table"), "model_profiles");
+    assert_eq!(violation_before.get::<String, _>("parent"), "providers");
+    drop(conn);
+    db.close().await;
+
+    let repaired = init_database(&path).await.unwrap();
+    let orphaned_profiles: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM model_profiles profile \
+         WHERE NOT EXISTS (SELECT 1 FROM providers provider WHERE provider.id = profile.provider_id)",
+    )
+    .fetch_one(repaired.pool())
+    .await
+    .unwrap();
+    assert_eq!(orphaned_profiles.0, 0);
+    let migration_applied: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 4 AND success = 1")
+            .fetch_one(repaired.pool())
+            .await
+            .unwrap();
+    assert_eq!(migration_applied.0, 1);
+    repaired.close().await;
+}
+
+#[tokio::test]
+async fn upgrade_retries_pending_migration_003_with_local_model_template_bindings() {
+    const LOCAL_PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000121";
+    const TEMPLATE_ID: &str = "aetpl_0190f5fe-7c00-7a00-8000-000000000121";
+    const PARTICIPANT_ID: &str = "participant-local";
+    const CONVERSATION_ID: &str = "conv_0190f5fe-7c00-7a00-8000-000000000121";
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nomifun-backend.db");
+    let db = init_database(&path).await.unwrap();
+    let owner = installation_owner_id(db.pool()).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (\
+            id, platform, name, base_url, api_key_encrypted, models, enabled, \
+            capabilities, created_at, updated_at\
+         ) VALUES (?, 'nomifun-local-model', 'Local model', '', '', '[]', 1, '[]', 1, 1)",
+    )
+    .bind(LOCAL_PROVIDER_ID)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let mut transaction = db.pool().begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO agent_execution_templates (\
+            id, user_id, name, primary_participant_id, created_at, updated_at\
+         ) VALUES (?, ?, 'Local template', ?, 1, 1)",
+    )
+    .bind(TEMPLATE_ID)
+    .bind(&owner)
+    .bind(PARTICIPANT_ID)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO agent_execution_template_participants (\
+            id, template_id, source_agent_id, provider_id, model, created_at, updated_at\
+         ) VALUES (?, ?, 'agent_builtin_nomi', ?, 'local-model', 1, 1)",
+    )
+    .bind(PARTICIPANT_ID)
+    .bind(TEMPLATE_ID)
+    .bind(LOCAL_PROVIDER_ID)
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    sqlx::query(
+        "INSERT INTO conversations (\
+            id, user_id, name, type, model, execution_template_id, created_at, updated_at\
+         ) VALUES (?, ?, 'Template conversation', 'nomi', ?, ?, 1, 1)",
+    )
+    .bind(CONVERSATION_ID)
+    .bind(&owner)
+    .bind(format!(
+        r#"{{"provider_id":"{LOCAL_PROVIDER_ID}","model":"local-model"}}"#
+    ))
+    .bind(TEMPLATE_ID)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO model_profiles (\
+            provider_id, model, tasks, traits, params, source, updated_at\
+         ) VALUES (?, 'local-model', '[]', '[]', '{}', 'catalog', 1)",
+    )
+    .bind(LOCAL_PROVIDER_ID)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version >= 3")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    db.close().await;
+
+    let upgraded = init_database(&path).await.unwrap();
+    for (table, where_clause) in [
+        ("providers", format!("id = '{LOCAL_PROVIDER_ID}'")),
+        ("agent_execution_templates", format!("id = '{TEMPLATE_ID}'")),
+        (
+            "agent_execution_template_participants",
+            format!("template_id = '{TEMPLATE_ID}'"),
+        ),
+        ("model_profiles", format!("provider_id = '{LOCAL_PROVIDER_ID}'")),
+    ] {
+        let count: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table} WHERE {where_clause}"))
+            .fetch_one(upgraded.pool())
+            .await
+            .unwrap();
+        assert_eq!(count.0, 0, "retired rows should be removed from {table}");
+    }
+    let template_reference: (Option<String>,) =
+        sqlx::query_as("SELECT execution_template_id FROM conversations WHERE id = ?")
+            .bind(CONVERSATION_ID)
+            .fetch_one(upgraded.pool())
+            .await
+            .unwrap();
+    assert_eq!(template_reference.0, None);
+    let foreign_key_errors: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(upgraded.pool())
+            .await
+            .unwrap();
+    assert_eq!(foreign_key_errors.0, 0);
+    upgraded.close().await;
 }
 
 #[test]
