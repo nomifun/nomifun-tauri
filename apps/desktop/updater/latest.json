@@ -1,7 +1,7 @@
 {
   "version": "0.2.29",
   "notes": "## Highlights\n\n- Fixed conversation reliability issues so cancellations and completion states recover more consistently.\n- Repaired knowledge create-studio scrolling and disabled foreign-key cascade behavior.\n- Improved companion pointer routing for multi-monitor Windows setups.\n- Refined scheduled-task pagination and requirements list row layout.\n\n## Upgrade notes\n\n- No known manual configuration change is required for this release.\n- This Windows-first release includes the Windows x64 installer and signed Tauri updater assets. macOS and Linux packages can be appended later from their native build machines.\n- The Windows installer is protected by the Tauri updater signature but is not Authenticode-signed, so manual downloads may show a SmartScreen or unknown-publisher warning.",
-  "pub_date": "2026-07-18T12:14:01.939Z",
+  "pub_date": "2026-07-18T12:26:13.155Z",
   "platforms": {
     "windows-x86_64": {
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxOHlGU3dGb0VlMEtac241cm5XU3RUWlZPZEMyTWZhaE9zYXNsVEZVK1dBSW9aNFV1aG4yZDNTN3B3VDgrcWVjaGl4T2dlaTF2aHpSVWkrUzVOMzkyeXc4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0Mzc1ODg0CWZpbGU6Tm9taUZ1bl8wLjIuMjlfeDY0LXNldHVwLmV4ZQpzQjNtWUR4Mk9velBUaGVZRTJncVFoMjFyRmRWSlNTSVhqbEt6SFlKaFlSK3lNd0lYdjc5ZXRuL3RtNEdyKzM5Uy9DY0FtSVNxM3l6S2dzdWI2R2pDUT09Cg==",
@@ -10,6 +10,14 @@
     "linux-x86_64": {
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxOC9ySzUvaXpYRFYvUkxrMWFEbk5WWUsraHdSaWwrOURSMUJaSURPUUpRUjdaZWFFbkhaMzZCSHRkY1ArMnJqL1M3SG51Ly9IcTNGeFAyWGZWSW90L0FRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0Mzc2ODQxCWZpbGU6Tm9taUZ1bl8wLjIuMjlfYW1kNjQuQXBwSW1hZ2UKbmxsVnMxcHdUVHFVdGRkSTJMekR1U0YrVFh6MGNtenlLM0llaWJ0OEtxUlpTMDJ2Z0R5VDZuZjMyWXg5RS90dTJtZUllaU1kclJoVzQ0VkF3VmpYREE9PQo=",
       "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.29/NomiFun_0.2.29_amd64.AppImage"
+    },
+    "darwin-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODNKYW42NVNjNDVEekwyUXZRM0J4TXNBOWdub0tZV1drN1pTbEdaNjlMQ0lCdWRGL2FCUG1JT3BYS29HUnJyZXY5am9qcm9kRHNxcHVETEFXTjBxOEFJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0Mzc3NDI0CWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6CkJkck9NRjF2TllWdG4yQ1A3STR6MEtROUZGRnEzT3lqSlo1Y2RRV1BhNEoxZCsyb3k2U1F3ZEZCeCtEZmlBcStCQk1VQ2U0bXlSNTJBWW9mTnBPSUJRPT0K",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.29/NomiFun.app.tar.gz"
+    },
+    "darwin-aarch64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVSU2VhcGdMaWVxODNKYW42NVNjNDVEekwyUXZRM0J4TXNBOWdub0tZV1drN1pTbEdaNjlMQ0lCdWRGL2FCUG1JT3BYS29HUnJyZXY5am9qcm9kRHNxcHVETEFXTjBxOEFJPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0Mzc3NDI0CWZpbGU6Tm9taUZ1bi5hcHAudGFyLmd6CkJkck9NRjF2TllWdG4yQ1A3STR6MEtROUZGRnEzT3lqSlo1Y2RRV1BhNEoxZCsyb3k2U1F3ZEZCeCtEZmlBcStCQk1VQ2U0bXlSNTJBWW9mTnBPSUJRPT0K",
+      "url": "https://github.com/nomifun/nomifun-tauri/releases/download/v0.2.29/NomiFun.app.tar.gz"
     }
   }
 }
