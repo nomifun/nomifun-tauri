@@ -11,7 +11,7 @@ use crate::manager::acp::{
 use crate::manager::process_registry::{register_session_process, unregister_agent_process};
 use crate::protocol::acp::AcpProtocol;
 use crate::protocol::error::{AcpError, CloseReason};
-use crate::protocol::events::{AgentStreamEvent, FinishEventData, TurnStopReason};
+use crate::protocol::events::{AgentStreamEvent, TurnStopReason};
 use crate::protocol::send_error::AgentSendError;
 use crate::registry::CatalogSender;
 use crate::session::{ModeId, ModelId, SessionId as DomainSessionId};
@@ -729,19 +729,13 @@ impl crate::runtime_handle::AgentRuntimeControl for AcpAgentManager {
             session.record_close_reason(Some(CloseReason::UserCancel));
         }
 
-        // Force status to Finished and emit unconditionally, bypassing the
-        // absorbing-state guard. This ensures StreamRelay always receives
-        // its terminal event regardless of prior state. The Finish carries
+        // Finish carries
         // stop_reason=Cancelled so downstream consumers (AutoWork, IDMM) see
         // a deliberate user stop, NOT a clean completion — emitting `None`
         // here historically made AutoWork finalize a user-aborted requirement
         // as done and immediately claim the next one.
-        self.runtime.reset_for_new_turn(ConversationStatus::Finished);
         self.runtime
-            .emit(AgentStreamEvent::Finish(FinishEventData {
-                session_id: None,
-                stop_reason: Some(TurnStopReason::Cancelled),
-            }));
+            .emit_finish_with_reason(None, Some(TurnStopReason::Cancelled));
 
         Ok(())
     }
@@ -790,15 +784,23 @@ impl crate::runtime_handle::AgentRuntimeControl for AcpAgentManager {
         self.permission_router.cancel_all();
         self.params.loopback_capability_leases.revoke_all();
 
-        // m1 fix: emit error with the kill reason so the status goes to
-        // Finished and subscribers see a terminal event. Idempotent.
-        // Source of truth for the toast text is `CloseReason::Killed`.
-        let close_reason = CloseReason::Killed { reason };
+        // A user stop is a clean cancelled terminal, while lifecycle/crash
+        // teardown remains an Error. Both paths are idempotent and wake relay.
+        let close_reason = if reason == Some(AgentKillReason::UserCancelled) {
+            CloseReason::UserCancel
+        } else {
+            CloseReason::Killed { reason }
+        };
         let message = close_reason.user_facing_message();
         if let Ok(mut session) = self.session.try_write() {
             session.record_close_reason(Some(close_reason));
         }
-        self.runtime.emit_error(message);
+        if reason == Some(AgentKillReason::UserCancelled) {
+            self.runtime
+                .emit_finish_with_reason(None, Some(TurnStopReason::Cancelled));
+        } else {
+            self.runtime.emit_error(message);
+        }
 
         Ok(())
     }

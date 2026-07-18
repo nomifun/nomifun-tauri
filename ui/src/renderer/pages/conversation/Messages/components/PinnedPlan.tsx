@@ -18,8 +18,9 @@ import { derivePinnedPlan, type PinnedPlanData } from './pinnedPlanModel';
  * queue. It shows the checklist on desktop hover or keyboard focus, and after
  * explicit activation on mobile. Renders nothing when there is no active plan.
  */
-const PinnedPlan: React.FC<{ plan?: PinnedPlanData | null; className?: string }> = ({
+const PinnedPlan: React.FC<{ plan?: PinnedPlanData | null; active?: boolean; className?: string }> = ({
   plan: suppliedPlan,
+  active: suppliedActive,
   className = 'w-fit max-w-[calc(100vw-32px)]',
 }) => {
   const { t } = useTranslation();
@@ -36,6 +37,7 @@ const PinnedPlan: React.FC<{ plan?: PinnedPlanData | null; className?: string }>
   if (!plan) return null;
 
   const { entries, done, total } = plan;
+  const active = suppliedActive ?? plan.active;
   const handleSummaryClick = () => {
     if (!isMobile) return;
     setExpanded((value) => !value);
@@ -79,7 +81,7 @@ const PinnedPlan: React.FC<{ plan?: PinnedPlanData | null; className?: string }>
         onClick={handleSummaryClick}
         onKeyDown={handleSummaryKeyDown}
       >
-        {done < total && (
+        {active && done < total && (
           <Loading
             aria-hidden='true'
             data-testid='pinned-plan-progress-indicator'

@@ -11,7 +11,7 @@ use nomifun_common::CommandSpec;
 use crate::runtime_state::AgentRuntimeState;
 use crate::capability::cli_process::CliAgentProcess;
 use crate::manager::process_registry::register_session_process;
-use crate::protocol::events::AgentStreamEvent;
+use crate::protocol::events::{AgentStreamEvent, TurnStopReason};
 use crate::protocol::send_error::AgentSendError;
 use crate::types::SendMessageData;
 use std::path::PathBuf;
@@ -104,7 +104,26 @@ impl NanobotAgentManager {
         };
 
         loop {
-            match raw_rx.recv().await {
+            let raw_event = tokio::select! {
+                event = raw_rx.recv() => Some(event),
+                status = self.process.wait_for_exit() => {
+                    if self.runtime.status() == Some(ConversationStatus::Running) {
+                        let detail = status
+                            .map(|status| format!(" ({status})"))
+                            .unwrap_or_default();
+                        self.runtime.emit_stream_broken(format!(
+                            "Nanobot process exited before the turn completed{detail}"
+                        ));
+                    } else {
+                        self.runtime.mark_transport_broken();
+                    }
+                    None
+                }
+            };
+            let Some(raw_event) = raw_event else {
+                break;
+            };
+            match raw_event {
                 Ok(raw_json) => {
                     self.runtime.bump_activity();
                     self.handle_raw_event(raw_json).await;
@@ -115,22 +134,28 @@ impl NanobotAgentManager {
                         lagged = n,
                         "Nanobot event relay lagged"
                     );
+                    self.runtime.emit_stream_broken(format!(
+                        "Nanobot event relay lost {n} buffered event(s)"
+                    ));
+                    break;
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     debug!(
                         conversation_id = %self.runtime.conversation_id(),
                         "Nanobot CLI event channel closed"
                     );
+                    if self.runtime.status() == Some(ConversationStatus::Running) {
+                        self.runtime.emit_stream_broken(
+                            "Nanobot event channel closed before the turn completed",
+                        );
+                    } else {
+                        self.runtime.mark_transport_broken();
+                    }
                     break;
                 }
             }
         }
 
-        // Channel closed without a Finish/Error event from the subprocess;
-        // ensure the status reaches a terminal state.
-        if self.runtime.status() == Some(ConversationStatus::Running) {
-            self.runtime.transition_to(ConversationStatus::Finished);
-        }
     }
 
     async fn handle_raw_event(&self, raw: Value) {
@@ -145,19 +170,16 @@ impl NanobotAgentManager {
             }
         };
 
-        self.update_state_from_event(&stream_event);
-        self.runtime.emit(stream_event);
-    }
-
-    fn update_state_from_event(&self, event: &AgentStreamEvent) {
-        match event {
-            AgentStreamEvent::Start(_) => {
+        match stream_event {
+            event @ AgentStreamEvent::Start(_) => {
                 self.runtime.transition_to(ConversationStatus::Running);
+                self.runtime.emit(event);
             }
-            AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_) => {
-                self.runtime.transition_to(ConversationStatus::Finished);
+            AgentStreamEvent::Finish(data) => {
+                self.runtime.emit_finish_with_reason(data.session_id, data.stop_reason);
             }
-            _ => {}
+            AgentStreamEvent::Error(data) => self.runtime.emit_error_data(data),
+            event => self.runtime.emit(event),
         }
     }
 }
@@ -180,6 +202,10 @@ impl crate::runtime_handle::AgentRuntimeControl for NanobotAgentManager {
         self.runtime.status()
     }
 
+    fn is_transport_healthy(&self) -> bool {
+        self.runtime.is_transport_healthy()
+    }
+
     fn last_activity_at(&self) -> TimestampMs {
         self.runtime.last_activity_at()
     }
@@ -190,12 +216,24 @@ impl crate::runtime_handle::AgentRuntimeControl for NanobotAgentManager {
 
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
         self.runtime.bump_activity();
+        if !self.runtime.is_transport_healthy() {
+            return Err(AgentSendError::stream_broken(
+                "Nanobot's process/event relay is no longer running",
+            ));
+        }
 
         {
             let mut state = self.state.write().await;
             state.has_messages = true;
         }
-        self.runtime.transition_to(ConversationStatus::Running);
+        self.runtime.reset_for_new_turn(ConversationStatus::Running);
+        if !self.runtime.is_transport_healthy() {
+            let error = AgentSendError::stream_broken(
+                "Nanobot's process/event relay stopped during turn admission",
+            );
+            self.runtime.emit_error_data(error.stream_error().clone());
+            return Err(error);
+        }
 
         // Nanobot uses fire-and-forget: send the message, CLI blocks until complete
         let payload = json!({
@@ -223,7 +261,10 @@ impl crate::runtime_handle::AgentRuntimeControl for NanobotAgentManager {
 
     async fn cancel(&self) -> Result<(), AppError> {
         let payload = json!({ "type": "stop.stream", "data": {} });
-        self.process.send(&payload).await
+        self.process.send(&payload).await?;
+        self.runtime
+            .emit_finish_with_reason(None, Some(TurnStopReason::Cancelled));
+        Ok(())
     }
 
     fn kill(&self, reason: Option<AgentKillReason>) -> Result<(), AppError> {
@@ -240,6 +281,13 @@ impl crate::runtime_handle::AgentRuntimeControl for NanobotAgentManager {
                 error!(error = %ErrorChain(&e), "Failed to kill Nanobot process");
             }
         });
+
+        if reason == Some(AgentKillReason::UserCancelled) {
+            self.runtime
+                .emit_finish_with_reason(None, Some(TurnStopReason::Cancelled));
+        } else if self.runtime.status() == Some(ConversationStatus::Running) {
+            self.runtime.emit_error(format!("Nanobot agent was terminated ({reason:?})"));
+        }
 
         Ok(())
     }

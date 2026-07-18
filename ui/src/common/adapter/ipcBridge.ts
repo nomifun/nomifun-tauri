@@ -639,6 +639,7 @@ export const conversation = {
     };
     return {
       conversation_id: parseConversationId(r.conversation_id),
+      turn_id: r.turn_id == null ? undefined : parseMessageId(r.turn_id),
       status: (r.status ?? 'finished') as IConversationTurnCompletedEvent['status'],
       state: (r.state ??
         (r.status === 'finished' ? 'ai_waiting_input' : 'unknown')) as IConversationTurnCompletedEvent['state'],
@@ -2384,6 +2385,7 @@ export type IWorkspaceFlatFile = {
 export interface IResponseMessage {
   type: string;
   data: unknown;
+  status?: 'finish' | 'pending' | 'error' | 'work';
   /** messages.id stays TEXT (`msg_…`). */
   msg_id: MessageId;
   /** Canonical owning conversation entity ID. */
@@ -2532,6 +2534,9 @@ export interface IConversationTurnStartedEvent {
 
 export interface IConversationTurnCompletedEvent {
   conversation_id: ConversationId;
+  /** Stable turn correlation id. Older servers may omit it; consumers must
+   * retain a runtime-state fallback for backward compatibility. */
+  turn_id?: MessageId;
   status: 'pending' | 'running' | 'finished';
   state:
     | 'ai_generating'

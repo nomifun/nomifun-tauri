@@ -1,8 +1,17 @@
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use regex::Regex;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
+
+const MAX_CRON_COMMANDS_PER_RESPONSE: usize = 16;
+const CRON_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(not(test))]
+const CRON_PIPELINE_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const CRON_PIPELINE_TIMEOUT: Duration = Duration::from_millis(120);
 
 // ---------------------------------------------------------------------------
 // Think-tag cleaning
@@ -69,6 +78,13 @@ pub struct CronUpdateParams {
 
 /// Detect all cron commands embedded in the text.
 pub fn detect_cron_commands(text: &str) -> Vec<CronCommand> {
+    detect_cron_commands_bounded(text, usize::MAX)
+}
+
+/// Detect at most `limit` commands. The middleware asks for `MAX + 1` so it
+/// can report overflow without first allocating/scanning an attacker-sized
+/// command vector in a single non-preemptible poll.
+fn detect_cron_commands_bounded(text: &str, limit: usize) -> Vec<CronCommand> {
     let mut commands = Vec::new();
 
     for cap in CRON_CREATE_RE.captures_iter(text) {
@@ -76,6 +92,9 @@ pub fn detect_cron_commands(text: &str) -> Vec<CronCommand> {
             && let Some(params) = parse_cron_create_body(body.as_str())
         {
             commands.push(CronCommand::Create(params));
+            if commands.len() >= limit {
+                return commands;
+            }
         }
     }
 
@@ -84,11 +103,17 @@ pub fn detect_cron_commands(text: &str) -> Vec<CronCommand> {
             && let Some(params) = parse_cron_update_body(job_id_match.as_str().trim(), body.as_str())
         {
             commands.push(CronCommand::Update(params));
+            if commands.len() >= limit {
+                return commands;
+            }
         }
     }
 
     if CRON_LIST_RE.is_match(text) {
         commands.push(CronCommand::List);
+        if commands.len() >= limit {
+            return commands;
+        }
     }
 
     for cap in CRON_DELETE_RE.captures_iter(text) {
@@ -96,6 +121,9 @@ pub fn detect_cron_commands(text: &str) -> Vec<CronCommand> {
             let id = id_match.as_str().trim().to_string();
             if !id.is_empty() {
                 commands.push(CronCommand::Delete(id));
+                if commands.len() >= limit {
+                    return commands;
+                }
             }
         }
     }
@@ -256,6 +284,17 @@ impl MessageMiddleware {
 
     /// Process a completed agent message through the middleware pipeline.
     pub async fn process(&self, message: &str, user_id: &str, conversation_id: &str) -> MiddlewareResult {
+        self.process_with_cancellation(message, user_id, conversation_id, None)
+            .await
+    }
+
+    pub async fn process_with_cancellation(
+        &self,
+        message: &str,
+        user_id: &str,
+        conversation_id: &str,
+        cancellation: Option<&CancellationToken>,
+    ) -> MiddlewareResult {
         // Step 1: Strip think tags
         let cleaned = strip_think_tags(message);
 
@@ -268,11 +307,16 @@ impl MessageMiddleware {
             };
         }
 
-        let commands = detect_cron_commands(&cleaned);
+        let commands = detect_cron_commands_bounded(
+            &cleaned,
+            MAX_CRON_COMMANDS_PER_RESPONSE.saturating_add(1),
+        );
         let display_message = strip_cron_commands(&cleaned);
 
         // Step 3: Execute cron commands
-        let system_responses = self.execute_cron_commands(user_id, conversation_id, &commands).await;
+        let system_responses = self
+            .execute_cron_commands(user_id, conversation_id, &commands, cancellation)
+            .await;
 
         MiddlewareResult {
             message: display_message.clone(),
@@ -287,6 +331,7 @@ impl MessageMiddleware {
         user_id: &str,
         conversation_id: &str,
         commands: &[CronCommand],
+        cancellation: Option<&CancellationToken>,
     ) -> Vec<String> {
         let Some(cron_service) = &self.cron_service else {
             debug!("Cron commands detected but no cron service configured");
@@ -294,14 +339,59 @@ impl MessageMiddleware {
         };
 
         let mut responses = Vec::new();
+        let deadline = tokio::time::Instant::now() + CRON_PIPELINE_TIMEOUT;
 
-        for command in commands {
-            let result = match command {
-                CronCommand::Create(params) => cron_service.create_job(user_id, conversation_id, params).await,
-                CronCommand::Update(params) => cron_service.update_job(user_id, conversation_id, params).await,
-                CronCommand::List => cron_service.list_jobs(user_id, conversation_id).await,
-                CronCommand::Delete(id) => cron_service.delete_job(user_id, id).await,
+        for command in commands.iter().take(MAX_CRON_COMMANDS_PER_RESPONSE) {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                responses.push(
+                    "[System Error: Cron command pipeline exceeded its total time budget]"
+                        .to_owned(),
+                );
+                break;
+            }
+            let operation = async {
+                match command {
+                    CronCommand::Create(params) => {
+                        cron_service.create_job(user_id, conversation_id, params).await
+                    }
+                    CronCommand::Update(params) => {
+                        cron_service.update_job(user_id, conversation_id, params).await
+                    }
+                    CronCommand::List => cron_service.list_jobs(user_id, conversation_id).await,
+                    CronCommand::Delete(id) => cron_service.delete_job(user_id, id).await,
+                }
             };
+            let result = if let Some(cancellation) = cancellation {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => break,
+                    result = tokio::time::timeout(CRON_COMMAND_TIMEOUT.min(remaining), operation) => {
+                        match result {
+                            Ok(result) => result,
+                            Err(_) => CronCommandResult {
+                                success: false,
+                                message: "Cron command timed out".to_owned(),
+                            },
+                        }
+                    }
+                }
+            } else {
+                match tokio::time::timeout(CRON_COMMAND_TIMEOUT.min(remaining), operation).await {
+                    Ok(result) => result,
+                    Err(_) => CronCommandResult {
+                        success: false,
+                        message: "Cron command timed out".to_owned(),
+                    },
+                }
+            };
+
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                break;
+            }
 
             if result.success {
                 responses.push(format!("[System: {}]", result.message));
@@ -315,6 +405,18 @@ impl MessageMiddleware {
             }
         }
 
+        if commands.len() > MAX_CRON_COMMANDS_PER_RESPONSE {
+            responses.push(format!(
+                "[System Error: Cron command limit exceeded; at most {MAX_CRON_COMMANDS_PER_RESPONSE} commands are allowed per response]"
+            ));
+        } else if tokio::time::Instant::now() >= deadline
+            && !responses.iter().any(|response| response.contains("total time budget"))
+        {
+            responses.push(
+                "[System Error: Cron command pipeline exceeded its total time budget]".to_owned(),
+            );
+        }
+
         responses
     }
 }
@@ -325,6 +427,11 @@ impl MessageMiddleware {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
 
     // -----------------------------------------------------------------------
@@ -603,6 +710,47 @@ mod tests {
         }
     }
 
+    struct CountingCronService {
+        calls: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl ICronService for CountingCronService {
+        async fn create_job(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _params: &CronCreateParams,
+        ) -> CronCommandResult {
+            unreachable!("test only sends deletes")
+        }
+
+        async fn update_job(
+            &self,
+            _user_id: &str,
+            _conversation_id: &str,
+            _params: &CronUpdateParams,
+        ) -> CronCommandResult {
+            unreachable!("test only sends deletes")
+        }
+
+        async fn list_jobs(&self, _user_id: &str, _conversation_id: &str) -> CronCommandResult {
+            unreachable!("test only sends deletes")
+        }
+
+        async fn delete_job(&self, _user_id: &str, _job_id: &str) -> CronCommandResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            CronCommandResult {
+                success: true,
+                message: "deleted".to_owned(),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn middleware_strips_think_tags() {
         let mw = MessageMiddleware::new(None);
@@ -663,5 +811,53 @@ mod tests {
         assert_eq!(result.message, "Just a normal response.");
         assert!(result.display_message.is_none());
         assert!(result.system_responses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn middleware_caps_command_detection_and_execution_at_admission() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mw = MessageMiddleware::new(Some(Box::new(CountingCronService {
+            calls: Arc::clone(&calls),
+            delay: Duration::ZERO,
+        })));
+        let input = (0..1_000)
+            .map(|index| format!("[CRON_DELETE: job-{index}]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let result = mw.process(&input, "user1", "conv1").await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_CRON_COMMANDS_PER_RESPONSE);
+        assert!(
+            result
+                .system_responses
+                .iter()
+                .any(|response| response.contains("command limit exceeded"))
+        );
+    }
+
+    #[tokio::test]
+    async fn middleware_uses_one_total_deadline_for_slow_commands() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mw = MessageMiddleware::new(Some(Box::new(CountingCronService {
+            calls: Arc::clone(&calls),
+            delay: Duration::from_millis(50),
+        })));
+        let input = (0..10)
+            .map(|index| format!("[CRON_DELETE: slow-{index}]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let started = tokio::time::Instant::now();
+
+        let result = mw.process(&input, "user1", "conv1").await;
+
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert!(calls.load(Ordering::SeqCst) < 10);
+        assert!(
+            result
+                .system_responses
+                .iter()
+                .any(|response| response.contains("time budget") || response.contains("timed out"))
+        );
     }
 }

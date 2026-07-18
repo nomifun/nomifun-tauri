@@ -54,6 +54,7 @@ impl CloseReason {
         match self {
             CloseReason::UserCancel => "Conversation cancelled".to_owned(),
             CloseReason::Killed { reason } => match reason {
+                Some(AgentKillReason::UserCancelled) => "Conversation cancelled".to_owned(),
                 Some(AgentKillReason::IdleTimeout) => "Agent killed: idle timeout".to_owned(),
                 Some(AgentKillReason::AgentErrorRecovery) => "Agent killed: error recovery".to_owned(),
                 Some(AgentKillReason::KnowledgeBindingChanged) => "Agent killed: knowledge binding changed".to_owned(),

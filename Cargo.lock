@@ -5720,6 +5720,7 @@ version = "0.2.28"
 dependencies = [
  "async-trait",
  "axum",
+ "futures-util",
  "nomifun-ai-agent",
  "nomifun-api-types",
  "nomifun-auth",
@@ -5736,6 +5737,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

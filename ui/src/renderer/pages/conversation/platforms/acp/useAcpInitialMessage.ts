@@ -22,6 +22,7 @@ type UseAcpInitialMessageParams = {
   workspacePath?: string;
   enabled?: boolean;
   setAiProcessing: (value: boolean) => void;
+  markTurnAccepted: () => void;
   checkAndUpdateTitle: (conversation_id: ConversationId, input: string) => void;
   addOrUpdateMessage: (message: TMessage, prepend?: boolean) => void;
 };
@@ -36,6 +37,7 @@ export const useAcpInitialMessage = ({
   workspacePath,
   enabled = true,
   setAiProcessing,
+  markTurnAccepted,
   checkAndUpdateTitle,
   addOrUpdateMessage,
 }: UseAcpInitialMessageParams): void => {
@@ -73,6 +75,7 @@ export const useAcpInitialMessage = ({
           conversation_id: conversation_id,
           files,
         });
+        markTurnAccepted();
 
         // Use add=false (compose mode) so composeMessageWithIndex can de-dup
         // by msg_id — this prevents a duplicate bubble if useMessageLstCache
@@ -119,5 +122,15 @@ export const useAcpInitialMessage = ({
     sendInitialMessage().catch((error) => {
       console.error('Failed to send initial message:', error);
     });
-  }, [addOrUpdateMessage, backend, checkAndUpdateTitle, conversation_id, enabled, setAiProcessing, t, workspacePath]);
+  }, [
+    addOrUpdateMessage,
+    backend,
+    checkAndUpdateTitle,
+    conversation_id,
+    enabled,
+    markTurnAccepted,
+    setAiProcessing,
+    t,
+    workspacePath,
+  ]);
 };

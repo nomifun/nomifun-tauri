@@ -7,12 +7,12 @@
 //! object, and makes the invariant `emit_finish` = (status ← Finished
 //! AND broadcast Finish) enforceable in a single place.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::{Notify, broadcast};
 
-use nomifun_api_types::AgentStreamErrorData;
+use nomifun_api_types::{AgentErrorCode, AgentStreamErrorData};
 use nomifun_common::{ConversationStatus, TimestampMs, now_ms};
 
 use crate::protocol::events::{AgentStreamEvent, ErrorEventData, FinishEventData, TurnStopReason};
@@ -25,6 +25,10 @@ pub struct AgentRuntimeState {
     last_activity: Arc<AtomicI64>,
     event_tx: broadcast::Sender<AgentStreamEvent>,
     finished_notify: Arc<Notify>,
+    /// False once a manager's permanent process/connection relay exits or
+    /// loses buffered events. Unlike turn status this is not resettable: a
+    /// cached runtime without its sole relay must be evicted and rebuilt.
+    transport_healthy: Arc<AtomicBool>,
 }
 
 impl AgentRuntimeState {
@@ -40,6 +44,7 @@ impl AgentRuntimeState {
             last_activity: Arc::new(AtomicI64::new(now_ms())),
             event_tx,
             finished_notify: Arc::new(Notify::new()),
+            transport_healthy: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -63,6 +68,14 @@ impl AgentRuntimeState {
 
     pub fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
         self.event_tx.subscribe()
+    }
+
+    pub fn is_transport_healthy(&self) -> bool {
+        self.transport_healthy.load(Ordering::Acquire)
+    }
+
+    pub fn mark_transport_broken(&self) {
+        self.transport_healthy.store(false, Ordering::Release);
     }
 
     /// Wait until a running turn has completed, bounded by `timeout`.
@@ -163,6 +176,19 @@ impl AgentRuntimeState {
         self.emit_error_data(ErrorEventData::legacy(message, None));
     }
 
+    /// Publish an unrecoverable event-transport integrity failure. Managers
+    /// use this only when their permanent relay exits or loses buffered events,
+    /// never for provider/API errors that may be retried on the same runtime.
+    /// The conversation service recognizes this exact code and evicts the dead
+    /// runtime before releasing turn admission.
+    pub fn emit_stream_broken(&self, message: impl Into<String>) {
+        self.mark_transport_broken();
+        self.emit_error_data(ErrorEventData::legacy(
+            message,
+            Some(AgentErrorCode::NomifunStreamBroken),
+        ));
+    }
+
     /// Atomic: set status ← Finished AND broadcast the structured error payload.
     /// Idempotent in the Finished absorbing state (no-op).
     pub fn emit_error_data(&self, data: AgentStreamErrorData) {
@@ -239,6 +265,20 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn stream_broken_error_is_structured_for_runtime_eviction() {
+        let rt = runtime();
+        let mut rx = rt.subscribe();
+        rt.emit_stream_broken("event relay lost its terminal boundary");
+
+        let event = rx.recv().await.expect("stream-broken error event");
+        let AgentStreamEvent::Error(data) = event else {
+            panic!("expected structured stream-broken error");
+        };
+        assert_eq!(data.code, Some(AgentErrorCode::NomifunStreamBroken));
+        assert_eq!(rt.status(), Some(ConversationStatus::Finished));
     }
 
     #[tokio::test]

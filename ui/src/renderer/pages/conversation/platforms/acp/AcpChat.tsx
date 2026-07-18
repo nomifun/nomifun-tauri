@@ -65,6 +65,7 @@ const AcpChat: React.FC<{
     workspacePath: workspace,
     enabled: !readOnly,
     setAiProcessing: messageState.setAiProcessing,
+    markTurnAccepted: messageState.markTurnAccepted,
     checkAndUpdateTitle,
     addOrUpdateMessage,
   });

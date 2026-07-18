@@ -54,6 +54,14 @@ pub trait AgentRuntimeControl: Send + Sync {
     /// transitioned into a known status yet.
     fn status(&self) -> Option<ConversationStatus>;
 
+    /// Whether the runtime still has a functioning permanent event transport.
+    /// Managers without a permanent relay keep the default. Relay-backed
+    /// managers override it so the registry never hands a dead cached runtime
+    /// to a subsequent turn.
+    fn is_transport_healthy(&self) -> bool {
+        true
+    }
+
     /// Timestamp (ms) of the last activity (message send, event received).
     fn last_activity_at(&self) -> TimestampMs;
 
@@ -223,6 +231,10 @@ impl AgentRuntimeHandle {
     /// Current conversation status.
     pub fn status(&self) -> Option<ConversationStatus> {
         self.as_runtime().status()
+    }
+
+    pub fn is_transport_healthy(&self) -> bool {
+        self.as_runtime().is_transport_healthy()
     }
 
     /// Timestamp (ms) of the last activity.

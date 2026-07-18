@@ -8,6 +8,8 @@ import type { IMessagePlan, TMessage } from '@/common/chat/chatLib';
 
 export interface PinnedPlanData {
   entries: IMessagePlan['content']['entries'];
+  /** Whether the plan's owning turn is still active. */
+  active: boolean;
   /** Number of entries with status === 'completed'. */
   done: number;
   /** Total number of entries. */
@@ -29,7 +31,12 @@ export function derivePinnedPlan(list: TMessage[]): PinnedPlanData | null {
     const entries = message.content.entries ?? [];
     if (entries.length === 0) return null;
     const done = entries.filter((entry) => entry.status === 'completed').length;
-    return { entries, done, total: entries.length };
+    return {
+      entries,
+      active: message.status !== 'finish' && message.status !== 'error',
+      done,
+      total: entries.length,
+    };
   }
   return null;
 }

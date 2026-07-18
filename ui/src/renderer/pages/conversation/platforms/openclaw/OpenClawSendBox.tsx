@@ -24,8 +24,15 @@ import { useAddOrUpdateMessage, useRemoveMessageByMsgId } from '@/renderer/pages
 import {
   shouldEnqueueConversationCommand,
   useConversationCommandQueue,
+  type ConversationCommandQueueExecution,
   type ConversationCommandQueueItem,
 } from '@/renderer/pages/conversation/platforms/useConversationCommandQueue';
+import { stopConversationAndConfirmRelease } from '@/renderer/pages/conversation/platforms/requestConversationStop';
+import { useAuthoritativeTurnLifecycle } from '@/renderer/pages/conversation/platforms/useAuthoritativeTurnLifecycle';
+import {
+  shouldReleaseStopInteraction,
+  useConversationStopAttemptGuard,
+} from '@/renderer/pages/conversation/platforms/useConversationStopAttemptGuard';
 import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conversationCache';
 import { getConversationRuntimeWorkspaceErrorMessage } from '@/renderer/pages/conversation/utils/conversationCreateError';
 import { isConversationProcessing } from '@/renderer/pages/conversation/utils/conversationRuntime';
@@ -64,7 +71,9 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
   const { setSendBoxHandler } = usePreviewContext();
 
   const [aiProcessing, setAiProcessing] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
   const [hasHydratedRunningState, setHasHydratedRunningState] = useState(false);
+  const isBusy = aiProcessing || isStopping;
 
   // Use ref to sync state for immediate access in event handlers
   // 使用 ref 同步状态，以便在事件处理程序中立即访问
@@ -73,6 +82,35 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
   // Track whether current turn has content output
   // Only reset aiProcessing when finish arrives after content (not after tool calls)
   const hasContentInTurnRef = useRef(false);
+
+  const {
+    beginLocalTurn,
+    markLocalTurnAccepted,
+    cancelLocalTurn,
+    stopOptimistically,
+    confirmStopped,
+    restoreAfterStopFailure,
+    acceptsStreamActivity,
+    reconcileAfterStreamTerminal,
+    getTurnStartGeneration,
+    getTurnCompletionGeneration,
+    getTurnLifecycleGeneration,
+  } = useAuthoritativeTurnLifecycle(conversation_id, {
+    onTurnStarted: () => {
+      setAiProcessing(true);
+      aiProcessingRef.current = true;
+    },
+    onTurnCompleted: () => {
+      setAiProcessing(false);
+      aiProcessingRef.current = false;
+      hasContentInTurnRef.current = false;
+    },
+  });
+  const { beginStopAttempt, getStopAttemptStatus } = useConversationStopAttemptGuard(
+    conversation_id,
+    getTurnStartGeneration,
+    getTurnCompletionGeneration
+  );
 
   // Track whether the current turn was triggered by a Star Office install request
   const starOfficeInstallInFlightRef = useRef(false);
@@ -112,8 +150,10 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
   // Reset state when conversation changes and restore actual running status
   useEffect(() => {
     let cancelled = false;
+    const hydrationGeneration = getTurnLifecycleGeneration();
 
     setAiProcessing(false);
+    setIsStopping(false);
     aiProcessingRef.current = false;
     setHasHydratedRunningState(false);
     hasContentInTurnRef.current = false;
@@ -123,6 +163,10 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
     // 先获取后端状态再重置 aiProcessing，避免切换到运行中的会话时闪烁
     void getConversationOrNull(conversation_id).then((res) => {
       if (cancelled) {
+        return;
+      }
+      if (getTurnLifecycleGeneration() !== hydrationGeneration) {
+        setHasHydratedRunningState(true);
         return;
       }
 
@@ -141,7 +185,7 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
     return () => {
       cancelled = true;
     };
-  }, [conversation_id]);
+  }, [conversation_id, getTurnLifecycleGeneration]);
 
   useEffect(() => {
     const handler = (text: string) => {
@@ -168,29 +212,26 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
 
       switch (message.type) {
         case 'thought':
-          // Auto-recover aiProcessing state if thought arrives after finish
-          // 如果 thought 在 finish 后到达，自动恢复 aiProcessing 状态
-          if (!aiProcessingRef.current) {
+          if (acceptsStreamActivity() && !aiProcessingRef.current) {
             setAiProcessing(true);
             aiProcessingRef.current = true;
           }
           break;
         case 'finish':
-          {
-            // Immediate state reset (notification is handled by centralized hook)
-            // 立即重置状态（通知由集中化 hook 处理）
-            setAiProcessing(false);
-            aiProcessingRef.current = false;
-            // Notify StarOfficeMonitorCard to re-detect and auto-open panel
-            if (starOfficeInstallInFlightRef.current) {
-              starOfficeInstallInFlightRef.current = false;
-              emitter.emit('staroffice.install.finished', { conversation_id });
-            }
-            hasContentInTurnRef.current = false;
+          // Stream completion can precede release of the backend turn handle.
+          if (starOfficeInstallInFlightRef.current) {
+            starOfficeInstallInFlightRef.current = false;
+            emitter.emit('staroffice.install.finished', { conversation_id });
           }
+          hasContentInTurnRef.current = false;
+          reconcileAfterStreamTerminal();
+          break;
+        case 'error':
+          reconcileAfterStreamTerminal();
           break;
         case 'content':
         case 'acp_permission': {
+          if (!acceptsStreamActivity()) break;
           // Mark that current turn has content output
           hasContentInTurnRef.current = true;
           // Auto-recover aiProcessing state if content arrives after finish
@@ -204,7 +245,7 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
           break;
       }
     });
-  }, [conversation_id]);
+  }, [acceptsStreamActivity, conversation_id, reconcileAfterStreamTerminal]);
 
   useEffect(() => {
     void getConversationOrNull(conversation_id).then((res) => {
@@ -218,6 +259,7 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
     ({ conversation_id: eventConversationId, text }) => {
       if (eventConversationId !== conversation_id) return;
       // Show the simplified prompt to user, inject star-office-helper skill via main process
+      beginLocalTurn();
       setAiProcessing(true);
       aiProcessingRef.current = true;
       starOfficeInstallInFlightRef.current = true;
@@ -228,6 +270,7 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
         .invoke({ input: text, conversation_id, inject_skills: ['star-office-helper'] })
         .then((res) => {
           const { msg_id } = res;
+          markLocalTurnAccepted();
           const userMessage: TMessage = {
             id: msg_id,
             msg_id,
@@ -243,12 +286,20 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
           emitter.emit('chat.history.refresh');
         })
         .catch(() => {
+          cancelLocalTurn();
           setAiProcessing(false);
           aiProcessingRef.current = false;
           starOfficeInstallInFlightRef.current = false;
         });
     },
-    [conversation_id, addOrUpdateMessage, checkAndUpdateTitle]
+    [
+      addOrUpdateMessage,
+      beginLocalTurn,
+      cancelLocalTurn,
+      checkAndUpdateTitle,
+      conversation_id,
+      markLocalTurnAccepted,
+    ]
   );
 
   const handleFilesAdded = useCallback(
@@ -275,9 +326,13 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
   });
 
   const executeCommand = useCallback(
-    async ({ input, files }: Pick<ConversationCommandQueueItem, 'input' | 'files'>) => {
+    async (
+      { input, files }: Pick<ConversationCommandQueueItem, 'input' | 'files'>,
+      execution?: ConversationCommandQueueExecution
+    ) => {
       const displayMessage = buildDisplayMessage(input, files, workspacePath);
 
+      beginLocalTurn();
       setAiProcessing(true);
       aiProcessingRef.current = true;
       let msg_id: MessageId | null = null;
@@ -292,7 +347,9 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
           conversation_id,
           files,
         });
+        if (execution && !execution.isCurrent()) return;
         msg_id = res.msg_id;
+        markLocalTurnAccepted();
         const userMessage: TMessage = {
           id: msg_id,
           msg_id,
@@ -307,14 +364,26 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
         addOrUpdateMessage(userMessage);
         emitter.emit('chat.history.refresh');
       } catch (error) {
+        if (execution && !execution.isCurrent()) return;
         if (msg_id) removeMessageByMsgId(msg_id);
+        cancelLocalTurn();
         setAiProcessing(false);
         aiProcessingRef.current = false;
         Message.error(getConversationRuntimeWorkspaceErrorMessage(error, t));
         throw error;
       }
     },
-    [addOrUpdateMessage, checkAndUpdateTitle, conversation_id, removeMessageByMsgId, t, workspacePath]
+    [
+      addOrUpdateMessage,
+      beginLocalTurn,
+      cancelLocalTurn,
+      checkAndUpdateTitle,
+      conversation_id,
+      markLocalTurnAccepted,
+      removeMessageByMsgId,
+      t,
+      workspacePath,
+    ]
   );
 
   const {
@@ -334,7 +403,7 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
   } = useConversationCommandQueue({
     conversation_id: conversation_id,
     enabled: true,
-    isBusy: aiProcessing,
+    isBusy,
     isHydrated: hasHydratedRunningState,
     onExecute: executeCommand,
   });
@@ -348,7 +417,7 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
     if (
       shouldEnqueueConversationCommand({
         enabled: true,
-        isBusy: aiProcessing,
+        isBusy,
         hasPendingCommands,
       })
     ) {
@@ -404,6 +473,7 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
 
       try {
         sessionStorage.setItem(processedKey, 'true');
+        beginLocalTurn();
         setAiProcessing(true);
         aiProcessingRef.current = true;
         const { input, files = [] } = JSON.parse(stored) as { input: string; files?: string[] };
@@ -420,6 +490,7 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
           loading_id,
         });
         const { msg_id } = sendResult;
+        markLocalTurnAccepted();
 
         const userMessage: TMessage = {
           id: msg_id,
@@ -438,6 +509,7 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
         sessionStorage.removeItem(storageKey);
       } catch (error) {
         sessionStorage.removeItem(processedKey);
+        cancelLocalTurn();
         setAiProcessing(false);
         aiProcessingRef.current = false;
         Message.error(getConversationRuntimeWorkspaceErrorMessage(error, t));
@@ -453,21 +525,51 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
     return () => {
       clearTimeout(timer);
     };
-  }, [conversation_id, hasHydratedRunningState, addOrUpdateMessage]);
+  }, [
+    addOrUpdateMessage,
+    beginLocalTurn,
+    cancelLocalTurn,
+    checkAndUpdateTitle,
+    conversation_id,
+    hasHydratedRunningState,
+    markLocalTurnAccepted,
+    t,
+    workspacePath,
+  ]);
 
   const handleStop = async (): Promise<void> => {
-    // Best-effort cancel: swallow rejections so they don't bubble up as
-    // unhandled rejections. UI state is still reset via finally.
-    try {
-      await ipcBridge.conversation.stop.invoke({ conversation_id });
-    } catch (error) {
-      console.warn('[OpenClawSendBox] stop request failed', error);
-    } finally {
-      setAiProcessing(false);
-      aiProcessingRef.current = false;
-      hasContentInTurnRef.current = false;
-      resetActiveExecution('stop');
+    if (isStopping) return;
+    const stopAttempt = beginStopAttempt();
+    setIsStopping(true);
+    stopOptimistically();
+    setAiProcessing(false);
+    aiProcessingRef.current = false;
+    hasContentInTurnRef.current = false;
+    pause();
+    resetActiveExecution('stop');
+
+    const result = await stopConversationAndConfirmRelease(conversation_id);
+    const stopAttemptStatus = getStopAttemptStatus(stopAttempt);
+    if (stopAttemptStatus !== 'current') {
+      if (shouldReleaseStopInteraction(stopAttemptStatus)) setIsStopping(false);
+      return;
     }
+    if (result.status === 'released' || result.status === 'deleted') {
+      confirmStopped();
+      setIsStopping(false);
+      resetActiveExecution('external-reset');
+      return;
+    }
+
+    console.warn('[OpenClawSendBox] stop request could not be confirmed', result);
+    restoreAfterStopFailure();
+    setAiProcessing(true);
+    aiProcessingRef.current = true;
+    setIsStopping(false);
+    Message.error({
+      content: t('conversation.stop.failed', { defaultValue: 'Failed to stop the current task. Please try again.' }),
+      closable: true,
+    });
   };
 
   // Clear conversation context (release model context); keeps message records.
@@ -504,6 +606,7 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
         onClear={clear}
       />
       <SendBox
+        key={conversation_id}
         showPinnedPlan
         value={content}
         onChange={handleContentChange}
@@ -512,11 +615,11 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
           emitter.emit('openclaw-gateway.selected.file', nextSelectedItems);
           setAtPath(nextSelectedItems);
         }}
-        loading={aiProcessing}
+        loading={isBusy}
         disabled={false}
         className='z-10'
         placeholder={
-          aiProcessing
+          isBusy
             ? t('conversation.chat.processing')
             : t('acp.sendbox.placeholder', {
                 backend: 'OpenClaw',

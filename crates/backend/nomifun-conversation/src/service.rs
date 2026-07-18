@@ -1,11 +1,20 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+use std::time::Duration;
 
 use nomifun_ai_agent::types::{AgentRuntimeBuildOptions, SendMessageData};
-use nomifun_ai_agent::{AgentRuntimeHandle, AgentRuntimeRegistry};
+use nomifun_ai_agent::{AgentRuntimeHandle, AgentRuntimeRegistry, TurnStopReason};
+use futures_util::FutureExt;
+use std::panic::AssertUnwindSafe;
 
 use crate::response_middleware::ICronService;
-use crate::runtime_state::ConversationRuntimeStateService;
+use crate::runtime_state::{
+    AgentTurnHandle, ConversationDeletionGuard, ConversationRuntimeStateService,
+    InMemoryCancelAuthority, RuntimeBuildLease, TurnWireContext,
+};
 use crate::ExecutionConversationBoundary;
 use nomifun_api_types::{
     ApprovalCheckResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
@@ -32,6 +41,7 @@ use nomifun_realtime::UserEventSink;
 use nomifun_runtime::resolve_command_path;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::convert::{
@@ -45,6 +55,22 @@ use std::sync::RwLock;
 
 const MAX_CRON_CONTINUATIONS_PER_TURN: usize = 4;
 const TEMP_WORKSPACE_ID_EXTRA_KEY: &str = "temp_workspace_id";
+const RECEIPT_FOREGROUND_BUDGET: Duration = Duration::from_secs(2);
+/// Stop waits for relay/receipt cleanup, then generation-safely releases the
+/// exact cancelled turn so the endpoint itself always remains bounded.
+const CANCEL_RELEASE_GRACE: Duration = Duration::from_secs(3);
+const CANCEL_TEARDOWN_GRACE: Duration = Duration::from_secs(7);
+const CANCEL_COMPLETION_GRACE: Duration = Duration::from_secs(2);
+const CANCEL_HANDLER_GRACE: Duration = Duration::from_secs(11);
+const CANCEL_AUTH_PREFLIGHT_GRACE: Duration = Duration::from_secs(2);
+const TURN_WRITEBACK_GRACE: Duration = Duration::from_secs(5);
+/// One relay terminal may trigger session persistence, failover/image rebuild,
+/// and ACP eviction. They share one deadline so several individually bounded
+/// operations cannot add up to an apparently permanent Running turn.
+const POST_TERMINAL_TRANSITION_GRACE: Duration = Duration::from_secs(10);
+const DELETE_CORE_GRACE: Duration = Duration::from_secs(5);
+const DELETE_CLEANUP_ITEM_GRACE: Duration = Duration::from_secs(5);
+const DELETE_STOP_GRACE: Duration = Duration::from_secs(30);
 
 /// Remove state that identifies or resumes the source conversation instance.
 ///
@@ -92,6 +118,79 @@ pub struct IdempotentMessageDelivery {
     pub result_ok: Option<bool>,
     pub result_text: Option<String>,
     pub result_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DurableOperationLease {
+    message_id: String,
+    generation: u64,
+}
+
+type DurableOperationGuards =
+    Arc<std::sync::Mutex<std::collections::HashMap<String, DurableOperationLease>>>;
+
+/// Ownership token passed from the synchronous idempotent admission path into
+/// whichever path is responsible for completing the durable receipt.  The
+/// explicit handoff prevents an outer `Err` handler from opening redelivery
+/// while a bounded receipt retry was already detached in the background.
+#[derive(Debug, Clone)]
+struct DurableDeliveryLease {
+    operation_id: String,
+    message_id: String,
+    guard_key: String,
+    guard_generation: u64,
+    receipt_handed_off: Arc<AtomicBool>,
+}
+
+impl DurableDeliveryLease {
+    fn handoff_receipt(&self) {
+        self.receipt_handed_off.store(true, Ordering::Release);
+    }
+
+    fn receipt_was_handed_off(&self) -> bool {
+        self.receipt_handed_off.load(Ordering::Acquire)
+    }
+}
+
+/// Abort-safe owner for a durable delivery receipt. Dropping a Tokio
+/// JoinHandle does not cancel its task, but an explicit AbortHandle does; in
+/// that case no async epilogue runs. This guard transfers receipt completion to
+/// the existing idempotent compensation loop so a cancelled/panicked owner
+/// cannot leave the operation lease pending forever.
+struct OwnerReceiptGuard {
+    repo: Arc<dyn IConversationRepository>,
+    user_id: String,
+    conversation_id: String,
+    operation_id: Option<String>,
+    operation_guard: Option<(DurableOperationGuards, String, u64)>,
+    armed: bool,
+}
+
+impl OwnerReceiptGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OwnerReceiptGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(operation_id) = self.operation_id.clone() else {
+            return;
+        };
+        ConversationService::continue_delivery_receipt_in_background(
+            Arc::clone(&self.repo),
+            self.user_id.clone(),
+            self.conversation_id.clone(),
+            operation_id,
+            false,
+            None,
+            Some("Agent turn owner exited before completing its delivery receipt".to_owned()),
+            self.operation_guard.clone(),
+        );
+    }
 }
 
 /// Validate the canonical Conversation entity ID at an input boundary.
@@ -250,6 +349,12 @@ pub struct ConversationService {
     /// every agent type. In-memory only; bounded by the number of
     /// conversations a user ever cancels in one process lifetime.
     user_cancel_stamps: Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
+    /// Process-local ownership for pending durable turn receipts. Interactive
+    /// cancellation may release the UI turn while receipt compensation retries;
+    /// this guard prevents a concurrent redelivery from invoking the model/tool
+    /// side effects again in the same live process.
+    durable_operations_in_flight: DurableOperationGuards,
+    next_durable_operation_generation: Arc<AtomicU64>,
 
     // Repos for conversation, acp_session and agent_metadata access.
     conversation_repo: Arc<dyn IConversationRepository>,
@@ -277,10 +382,116 @@ pub struct ConversationService {
 // ── Construction & Dependency Injection ──────────────────────────────
 
 impl ConversationService {
-    /// A durable internal turn must not release its in-process ownership until
-    /// the receiver receipt is committed. Otherwise a transient SQLite error
-    /// after model/tool side effects would let an at-least-once replay start
-    /// the same turn again.
+    async fn try_complete_delivery_receipt(
+        repo: &Arc<dyn IConversationRepository>,
+        user_id: &str,
+        conversation_id: &str,
+        operation_id: &str,
+        result_ok: bool,
+        result_text: Option<&str>,
+        result_error: Option<&str>,
+    ) -> bool {
+        match repo
+            .complete_delivery_receipt(
+                user_id,
+                conversation_id,
+                operation_id,
+                result_ok,
+                result_text,
+                result_error,
+                now_ms(),
+            )
+            .await
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                if matches!(repo.get(conversation_id).await, Ok(None)) {
+                    // The only legal receipt deletion is an owning account or
+                    // Conversation cascade. With no addressable receiver,
+                    // replay is impossible and compensation is unnecessary.
+                    return true;
+                }
+                error!(
+                    conversation_id,
+                    operation_id,
+                    "Durable Conversation delivery receipt was not acknowledged; retrying"
+                );
+                false
+            }
+            Err(receipt_error) => {
+                error!(
+                    conversation_id,
+                    operation_id,
+                    error = %ErrorChain(&receipt_error),
+                    "Failed to persist durable Conversation delivery receipt; retrying"
+                );
+                false
+            }
+        }
+    }
+
+    fn durable_operation_key(user_id: &str, conversation_id: &str, operation_id: &str) -> String {
+        format!("{user_id}\0{conversation_id}\0{operation_id}")
+    }
+
+    fn release_durable_operation_guard(
+        guard: &DurableOperationGuards,
+        key: &str,
+        generation: u64,
+    ) {
+        if let Ok(mut operations) = guard.lock() {
+            if operations
+                .get(key)
+                .is_some_and(|lease| lease.generation == generation)
+            {
+                operations.remove(key);
+            }
+        }
+    }
+
+    fn continue_delivery_receipt_in_background(
+        repo: Arc<dyn IConversationRepository>,
+        user_id: String,
+        conversation_id: String,
+        operation_id: String,
+        result_ok: bool,
+        result_text: Option<String>,
+        result_error: Option<String>,
+        operation_guard: Option<(
+            DurableOperationGuards,
+            String,
+            u64,
+        )>,
+    ) {
+        tokio::spawn(async move {
+            let mut retry_delay_ms = 100_u64;
+            loop {
+                if Self::try_complete_delivery_receipt(
+                    &repo,
+                    &user_id,
+                    &conversation_id,
+                    &operation_id,
+                    result_ok,
+                    result_text.as_deref(),
+                    result_error.as_deref(),
+                )
+                .await
+                {
+                    if let Some((guard, key, generation)) = operation_guard.as_ref() {
+                        Self::release_durable_operation_guard(guard, key, *generation);
+                    }
+                    info!(conversation_id, operation_id, "Durable delivery receipt compensation completed");
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+                retry_delay_ms = (retry_delay_ms * 2).min(2_000);
+            }
+        });
+    }
+
+    /// Give the receipt a bounded foreground window, then release the
+    /// interactive turn while a process-local operation guard prevents a
+    /// concurrent redelivery from repeating side effects during compensation.
     async fn complete_delivery_receipt_before_release(
         repo: &Arc<dyn IConversationRepository>,
         user_id: &str,
@@ -289,47 +500,94 @@ impl ConversationService {
         result_ok: bool,
         result_text: Option<&str>,
         result_error: Option<&str>,
+        cancellation: &CancellationToken,
+        operation_guard: Option<(
+            &DurableOperationGuards,
+            &str,
+            u64,
+        )>,
     ) {
         let Some(operation_id) = operation_id else {
             return;
         };
+        let deadline = tokio::time::Instant::now() + RECEIPT_FOREGROUND_BUDGET;
         let mut retry_delay_ms = 25_u64;
         loop {
-            match repo
-                .complete_delivery_receipt(
-                    user_id,
-                    conversation_id,
-                    operation_id,
+            if cancellation.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                Self::continue_delivery_receipt_in_background(
+                    Arc::clone(repo),
+                    user_id.to_owned(),
+                    conversation_id.to_owned(),
+                    operation_id.to_owned(),
                     result_ok,
-                    result_text,
-                    result_error,
-                    now_ms(),
-                )
-                .await
-            {
-                Ok(true) => return,
-                Ok(false) => {
-                    if matches!(repo.get(conversation_id).await, Ok(None)) {
-                        // The only legal receipt deletion is an owning account
-                        // or Conversation cascade. With no addressable receiver,
-                        // replay is impossible and retaining the turn would leak
-                        // a background task forever.
-                        return;
-                    }
-                    error!(
-                        conversation_id,
-                        operation_id,
-                        "Durable Conversation delivery receipt was not acknowledged; retaining turn ownership"
-                    );
-                }
-                Err(receipt_error) => error!(
-                    conversation_id,
-                    operation_id,
-                    error = %ErrorChain(&receipt_error),
-                    "Failed to persist durable Conversation delivery receipt; retaining turn ownership"
-                ),
+                    result_text.map(str::to_owned),
+                    result_error.map(str::to_owned),
+                    operation_guard
+                        .map(|(guard, key, generation)| (Arc::clone(guard), key.to_owned(), generation)),
+                );
+                return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
+
+            let attempt = Self::try_complete_delivery_receipt(
+                repo,
+                user_id,
+                conversation_id,
+                operation_id,
+                result_ok,
+                result_text,
+                result_error,
+            );
+            let completed = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => None,
+                _ = tokio::time::sleep_until(deadline) => None,
+                result = attempt => Some(result),
+            };
+            match completed {
+                Some(true) => {
+                    if let Some((guard, key, generation)) = operation_guard {
+                        Self::release_durable_operation_guard(guard, key, generation);
+                    }
+                    return;
+                }
+                Some(false) => {}
+                None => {
+                    Self::continue_delivery_receipt_in_background(
+                        Arc::clone(repo),
+                        user_id.to_owned(),
+                        conversation_id.to_owned(),
+                        operation_id.to_owned(),
+                        result_ok,
+                        result_text.map(str::to_owned),
+                        result_error.map(str::to_owned),
+                        operation_guard
+                            .map(|(guard, key, generation)| (Arc::clone(guard), key.to_owned(), generation)),
+                    );
+                    return;
+                }
+            }
+
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    Self::continue_delivery_receipt_in_background(
+                        Arc::clone(repo),
+                        user_id.to_owned(),
+                        conversation_id.to_owned(),
+                        operation_id.to_owned(),
+                        result_ok,
+                        result_text.map(str::to_owned),
+                        result_error.map(str::to_owned),
+                        operation_guard
+                            .map(|(guard, key, generation)| (Arc::clone(guard), key.to_owned(), generation)),
+                    );
+                    return;
+                }
+                _ = tokio::time::sleep(
+                    Duration::from_millis(retry_delay_ms)
+                        .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+                ) => {}
+            }
             retry_delay_ms = (retry_delay_ms * 2).min(2_000);
         }
     }
@@ -359,6 +617,8 @@ impl ConversationService {
             preset_service: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
             user_cancel_stamps: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            durable_operations_in_flight: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            next_durable_operation_generation: Arc::new(AtomicU64::new(0)),
 
             conversation_repo,
             agent_metadata_repo,
@@ -583,21 +843,43 @@ impl ConversationService {
             .summary_from_parts(conversation_id, runtime_status, has_runtime, pending_confirmations)
     }
 
+    pub fn begin_runtime_build(&self, conversation_id: &str) -> Result<RuntimeBuildLease, AppError> {
+        self.runtime_state.begin_runtime_build(conversation_id)
+    }
+
+    pub fn begin_public_runtime_build(
+        &self,
+        conversation_id: &str,
+        requester_user_id: &str,
+    ) -> Result<RuntimeBuildLease, AppError> {
+        self.runtime_state.begin_runtime_build_for_requester(
+            conversation_id,
+            Some(requester_user_id.to_owned()),
+            true,
+        )
+    }
+
     pub async fn complete_turn_with_companion_context(
         &self,
         user_id: &str,
         conversation_id: &str,
+        turn_id: &str,
         companion: bool,
         companion_id: Option<CompanionId>,
         origin: Option<String>,
         channel_platform: Option<String>,
     ) {
-        let runtime = self.runtime_summary_for(conversation_id).await;
+        // Completion may deliberately hold an admission-only completion fence.
+        // GET must remain busy until the event is published, while the event
+        // itself must carry the post-fence authoritative idle state so clients
+        // can release their queue immediately after receiving it.
+        let runtime = self.final_completion_runtime(conversation_id);
         StreamRelay::complete_conversation_with_context(
             &self.conversation_repo,
             &self.user_events,
             user_id,
             conversation_id,
+            Some(turn_id.to_owned()),
             Some(runtime),
             companion,
             companion_id,
@@ -605,6 +887,93 @@ impl ConversationService {
             channel_platform,
         )
         .await;
+    }
+
+    fn final_completion_runtime(&self, conversation_id: &str) -> ConversationRuntimeSummary {
+        let agent = self.runtime_registry.get_runtime(conversation_id);
+        ConversationRuntimeSummary {
+            state: nomifun_api_types::ConversationRuntimeStateKind::Idle,
+            can_send_message: true,
+            has_runtime: agent.is_some(),
+            runtime_status: agent.as_ref().and_then(|agent| agent.status()),
+            is_processing: false,
+            pending_confirmations: 0,
+            processing_started_at: None,
+        }
+    }
+
+    async fn release_and_complete_turn(
+        &self,
+        turn_handle: &mut AgentTurnHandle,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        companion: bool,
+        companion_id: Option<CompanionId>,
+        origin: Option<String>,
+        channel_platform: Option<String>,
+    ) {
+        // Keep admission fenced across exact release -> persisted finished ->
+        // turn.completed. Without this narrow fence a replacement turn could
+        // start in between and be overwritten by the old turn's completion.
+        let completion_fence = self
+            .runtime_state
+            .begin_turn_completion(conversation_id, turn_handle.turn_id());
+        let completion_fence = match completion_fence {
+            Ok(Some(guard)) => Some(guard),
+            Ok(None) => {
+                // A stop/delete won the shared admission ordering. Release is
+                // allowed to signal owner quiescence, but that worker owns the
+                // only terminal completion from here.
+                let _ = turn_handle.release();
+                return;
+            }
+            Err(error) => {
+                warn!(
+                    conversation_id,
+                    error = %ErrorChain(&error),
+                    "Failed to acquire completion admission fence"
+                );
+                None
+            }
+        };
+        if !turn_handle.release() {
+            return;
+        }
+        StreamRelay::persist_conversation_finished(&self.conversation_repo, conversation_id).await;
+        let allowed_completion_owners = usize::from(completion_fence.is_some());
+        let user_events = Arc::clone(&self.user_events);
+        let runtime = self.final_completion_runtime(conversation_id);
+        let completion_published = self
+            .runtime_state
+            .linearize_cleanup_event(
+                conversation_id,
+                0,
+                allowed_completion_owners,
+                CANCEL_TEARDOWN_GRACE,
+                move || {
+                    StreamRelay::broadcast_turn_completed_with_context(
+                        &user_events,
+                        user_id,
+                        conversation_id,
+                        Some(turn_id.to_owned()),
+                        Some(runtime),
+                        companion,
+                        companion_id,
+                        origin,
+                        channel_platform,
+                    );
+                    drop(completion_fence);
+                },
+            )
+            .await;
+        if !completion_published {
+            warn!(
+                conversation_id,
+                turn_id,
+                "Completion event withheld because another cleanup fence remained active"
+            );
+        }
     }
 
     async fn broadcast_turn_started_with_context(
@@ -1757,6 +2126,217 @@ impl ConversationService {
         Ok(())
     }
 
+    fn spawn_conversation_delete_owner(
+        &self,
+        mut deletion_guard: ConversationDeletionGuard,
+        user_id: String,
+        conversation_id: String,
+        source: Option<ConversationSource>,
+        managed_temp_workspace: Option<PathBuf>,
+    ) -> oneshot::Receiver<Result<(), AppError>> {
+        let (result_tx, result_rx) = oneshot::channel();
+        let service = self.clone();
+        let hooks: Vec<Arc<dyn OnConversationDelete>> =
+            self.delete_hooks.read().map(|guard| guard.clone()).unwrap_or_default();
+        tokio::spawn(async move {
+            // The detached coordinator owns deletion from stop-join through
+            // core persistence. Request cancellation/timeout therefore cannot
+            // drop the guard and reopen admission halfway through cleanup.
+            let stop_rx = service.spawn_turn_stop_cleanup(
+                user_id.clone(),
+                conversation_id.clone(),
+                Arc::clone(&service.runtime_registry),
+                false,
+                true,
+            );
+            match tokio::time::timeout(DELETE_STOP_GRACE, stop_rx).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => warn!(
+                    conversation_id,
+                    error = %ErrorChain(&error),
+                    "Conversation delete stop coordinator reported an error; waiting for its fences"
+                ),
+                Ok(Err(_)) => warn!(
+                    conversation_id,
+                    "Conversation delete stop coordinator exited without a result; waiting for its fences"
+                ),
+                Err(_) => warn!(
+                    conversation_id,
+                    "Conversation delete stop coordinator exceeded its receive bound; waiting for its fences"
+                ),
+            }
+            if !service
+                .runtime_state
+                .wait_for_cleanup_fences(&conversation_id, DELETE_STOP_GRACE)
+                .await
+            {
+                let _ = result_tx.send(Err(AppError::Timeout(
+                    "conversation delete could not establish quiescence within its hard bound"
+                        .to_owned(),
+                )));
+                return;
+            }
+            // A deletion-owned stop may have joined a normal-completion fence
+            // before that completion left an intentionally reusable idle
+            // runtime. Definitive deletion must evict that slot/process and
+            // clear registry governor state even when the first stop was only
+            // a follower.
+            if tokio::time::timeout(
+                CANCEL_TEARDOWN_GRACE,
+                service.runtime_registry.terminate_and_wait(
+                    &conversation_id,
+                    Some(AgentKillReason::ConversationDeleted),
+                ),
+            )
+            .await
+            .is_err()
+            {
+                warn!(
+                    conversation_id,
+                    "Conversation-deleted runtime teardown exceeded its hard bound; deletion remains fenced"
+                );
+            }
+
+            let delete_timed_out = match tokio::time::timeout(
+                DELETE_CORE_GRACE,
+                service.conversation_repo.delete(&conversation_id),
+            )
+            .await
+            {
+                Ok(Ok(())) => false,
+                Ok(Err(error)) => {
+                    let _ = result_tx.send(Err(error.into()));
+                    return;
+                }
+                Err(_) => {
+                    warn!(
+                        conversation_id,
+                        "Core conversation delete timed out; verifying the serialized result in background"
+                    );
+                    true
+                }
+            };
+
+            if delete_timed_out {
+                // SQLite may already have queued a command whose response
+                // future timed out. Keep the deletion tombstone owned until a
+                // later read, serialized behind that command, establishes
+                // whether deletion committed. This prevents a late delete from
+                // racing a newly admitted turn.
+                let mut retry_delay = Duration::from_millis(100);
+                loop {
+                    match tokio::time::timeout(
+                        DELETE_CLEANUP_ITEM_GRACE,
+                        service.conversation_repo.get(&conversation_id),
+                    )
+                    .await
+                    {
+                        Ok(Ok(None)) => break,
+                        Ok(Ok(Some(_))) => {
+                            let _ = result_tx.send(Err(AppError::Timeout(
+                                "conversation delete timed out without deleting the row".to_owned(),
+                            )));
+                            return;
+                        }
+                        Ok(Err(error)) => warn!(
+                            conversation_id,
+                            error = %ErrorChain(&error),
+                            "Failed to verify timed-out conversation delete"
+                        ),
+                        Err(_) => warn!(
+                            conversation_id,
+                            "Timed out verifying timed-out conversation delete; retaining the deletion fence and retrying"
+                        ),
+                    }
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(2));
+                }
+            }
+
+            deletion_guard.commit();
+            service.runtime_state.clear_knowledge_signature(&conversation_id);
+            service.runtime_state.clear_turn_tokens(&conversation_id);
+            info!(conversation_id, "Conversation deleted");
+            service.broadcast_list_changed(
+                &user_id,
+                &conversation_id,
+                "deleted",
+                source.as_ref(),
+            );
+            // Report authoritative core success before optional cascade work.
+            // If the HTTP waiter timed out/disconnected, this send simply
+            // fails while the committed tombstone and cleanup remain owned by
+            // this detached task.
+            let _ = result_tx.send(Ok(()));
+
+            match tokio::time::timeout(
+                DELETE_CLEANUP_ITEM_GRACE,
+                service.acp_session_repo.delete(&conversation_id),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => warn!(
+                    conversation_id,
+                    error = %ErrorChain(&err),
+                    "Failed to delete acp_session row on conversation delete"
+                ),
+                Err(_) => warn!(
+                    conversation_id,
+                    "Timed out deleting acp_session row on conversation delete"
+                ),
+            }
+
+            for hook in hooks {
+                if tokio::time::timeout(
+                    DELETE_CLEANUP_ITEM_GRACE,
+                    hook.on_conversation_deleted(&user_id, &conversation_id),
+                )
+                .await
+                .is_err()
+                {
+                    warn!(conversation_id, "Conversation delete hook exceeded its hard bound");
+                }
+            }
+
+            if let Some(path) = managed_temp_workspace {
+                let display_path = path.display().to_string();
+                match tokio::time::timeout(
+                    DELETE_CLEANUP_ITEM_GRACE,
+                    tokio::task::spawn_blocking(move || {
+                        if path.exists() {
+                            std::fs::remove_dir_all(path)
+                        } else {
+                            Ok(())
+                        }
+                    }),
+                )
+                .await
+                {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(err))) => warn!(
+                        conversation_id,
+                        workspace = %display_path,
+                        error = %ErrorChain(&err),
+                        "Failed to remove managed temp workspace on conversation delete"
+                    ),
+                    Ok(Err(err)) => warn!(
+                        conversation_id,
+                        workspace = %display_path,
+                        error = %ErrorChain(&err),
+                        "Managed temp workspace cleanup task failed"
+                    ),
+                    Err(_) => warn!(
+                        conversation_id,
+                        workspace = %display_path,
+                        "Managed temp workspace cleanup exceeded its hard bound"
+                    ),
+                }
+            }
+        });
+        result_rx
+    }
+
     /// Delete a conversation (messages cascade via FK).
     ///
     /// Broadcasts `conversation.listChanged(deleted)`.
@@ -1781,6 +2361,14 @@ impl ConversationService {
             ));
         }
 
+        // Deletion is stronger than a stop: block all future admissions in
+        // the same synchronous boundary used by turn acquisition, then tear
+        // down/force-release the exact current generation before deleting any
+        // persisted rows. An uncommitted guard rolls back if deletion fails.
+        let deletion_guard = self
+            .runtime_state
+            .begin_conversation_deletion(id)?;
+
         let source: Option<ConversationSource> = existing
             .source
             .as_deref()
@@ -1788,49 +2376,38 @@ impl ConversationService {
         let managed_temp_workspace =
             managed_temp_workspace_path_from_row(&self.workspace_root, &existing);
 
-        self.conversation_repo.delete(conv_id).await?;
-        // No FK / CASCADE on `acp_session`: clean it up here so non-ACP
-        // conversations that used to be ACP (shouldn't happen but is
-        // cheap to cover) still drop their orphaned session row.
-        if let Err(err) = self.acp_session_repo.delete(conv_id).await {
-            warn!(
-                error = %ErrorChain(&err),
-                "Failed to delete acp_session row on conversation delete"
-            );
+        let delete_rx = self.spawn_conversation_delete_owner(
+            deletion_guard,
+            user_id.to_owned(),
+            id.to_owned(),
+            source,
+            managed_temp_workspace,
+        );
+        match tokio::time::timeout(DELETE_CORE_GRACE, delete_rx).await {
+            Ok(Ok(result)) => result?,
+            Ok(Err(_)) => {
+                return Err(AppError::Internal(
+                    "conversation delete owner exited unexpectedly".to_owned(),
+                ));
+            }
+            Err(_) => {
+                return Err(AppError::Timeout(
+                    "conversation deletion continues in the background; the deleted event is the authoritative success signal"
+                        .to_owned(),
+                ));
+            }
         }
 
         // Snapshot the hook list under the read lock, then drop the guard
         // before awaiting — `RwLockReadGuard` is not `Send`, so holding it
         // across `.await` would make this future non-`Send`.
-        let hooks: Vec<Arc<dyn OnConversationDelete>> =
-            self.delete_hooks.read().map(|guard| guard.clone()).unwrap_or_default();
-        for hook in hooks {
-            hook.on_conversation_deleted(user_id, conv_id).await;
-        }
-
-        if let Some(path) = managed_temp_workspace
-            && path.exists()
-            && let Err(err) = std::fs::remove_dir_all(&path)
-        {
-            warn!(
-                conversation_id = conv_id,
-                workspace = %path.display(),
-                error = %ErrorChain(&err),
-                "Failed to remove managed temp workspace on conversation delete"
-            );
-        }
 
         // Drop the in-memory knowledge signature so the map does not retain
         // entries for deleted conversations across a long-lived process.
-        self.runtime_state.clear_knowledge_signature(&conv_id.to_string());
         // Likewise drop any accumulated token total — an execution-attempt
         // conversation that errored before the attempt consumed it would otherwise
         // linger here until process restart (a small in-memory leak). No-op for the
         // common chat/companion conversation (which never records a token total).
-        self.runtime_state.clear_turn_tokens(&conv_id.to_string());
-
-        info!("Conversation deleted");
-        self.broadcast_list_changed(user_id, id, "deleted", source.as_ref());
 
         Ok(())
     }
@@ -2083,7 +2660,6 @@ impl ConversationService {
             .await?
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
-
         let mut items = self
             .conversation_repo
             .list_artifacts(parse_conv_id(conversation_id)?)
@@ -2289,8 +2865,35 @@ impl ConversationService {
         req: SendMessageRequest,
         runtime_registry: &Arc<dyn AgentRuntimeRegistry>,
     ) -> Result<String, AppError> {
-        self.send_message_inner(user_id, conversation_id, req, runtime_registry, None)
-            .await
+        let lease = self.begin_public_runtime_build(conversation_id, user_id)?;
+        self.send_message_inner(
+            user_id,
+            conversation_id,
+            req,
+            runtime_registry,
+            None,
+            Some(lease),
+        )
+        .await
+    }
+
+    pub async fn send_message_with_runtime_build_lease(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        req: SendMessageRequest,
+        runtime_registry: &Arc<dyn AgentRuntimeRegistry>,
+        lease: RuntimeBuildLease,
+    ) -> Result<String, AppError> {
+        self.send_message_inner(
+            user_id,
+            conversation_id,
+            req,
+            runtime_registry,
+            None,
+            Some(lease),
+        )
+        .await
     }
 
     /// Trusted at-least-once delivery boundary for durable internal effects.
@@ -2313,6 +2916,7 @@ impl ConversationService {
             ));
         }
         let conversation_key = parse_conv_id(conversation_id)?;
+        let runtime_build_lease = self.runtime_state.begin_runtime_build(conversation_key)?;
         let request_payload = serde_json::json!({
             "content": &req.content,
             "files": &req.files,
@@ -2343,14 +2947,82 @@ impl ConversationService {
                 result_error: receipt.result_error,
             });
         }
-        let accepted_message_id = self.send_message_inner(
-            user_id,
-            conversation_id,
-            req,
-            runtime_registry,
-            Some((operation_id, message_id.as_str())),
-        )
-        .await?;
+        let operation_guard_key = Self::durable_operation_key(user_id, conversation_key, operation_id);
+        let guard_generation = self
+            .next_durable_operation_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        {
+            let mut operations = self.durable_operations_in_flight.lock().map_err(|_| {
+                AppError::Internal("durable operation guard lock poisoned".to_owned())
+            })?;
+            if let Some(in_flight) = operations.get(&operation_guard_key).cloned() {
+                return Ok(IdempotentMessageDelivery {
+                    message_id: in_flight.message_id,
+                    completed: false,
+                    result_ok: None,
+                    result_text: None,
+                    result_error: None,
+                });
+            }
+            operations.insert(
+                operation_guard_key.clone(),
+                DurableOperationLease {
+                    message_id: message_id.clone(),
+                    generation: guard_generation,
+                },
+            );
+        }
+
+        let delivery_lease = DurableDeliveryLease {
+            operation_id: operation_id.to_owned(),
+            message_id: message_id.clone(),
+            guard_key: operation_guard_key.clone(),
+            guard_generation,
+            receipt_handed_off: Arc::new(AtomicBool::new(false)),
+        };
+
+        let accepted_message_id = match self
+            .send_message_inner(
+                user_id,
+                conversation_id,
+                req,
+                runtime_registry,
+                Some(delivery_lease.clone()),
+                Some(runtime_build_lease),
+            )
+            .await
+        {
+            Ok(message_id) => {
+                // A path that only observed an already-running delivery did
+                // not take ownership of receipt completion. Do not retain an
+                // unowned guard forever; the actual owner already has its own
+                // generation-scoped guard (or a later replay may recover it).
+                if !delivery_lease.receipt_was_handed_off() {
+                    Self::release_durable_operation_guard(
+                        &self.durable_operations_in_flight,
+                        &operation_guard_key,
+                        guard_generation,
+                    );
+                }
+                message_id
+            }
+            Err(error) => {
+                // Once the inner path has attempted or detached durable
+                // receipt completion, it exclusively owns this lease.  An
+                // unconditional remove here used to reopen redelivery while
+                // compensation was still running, duplicating model/tool side
+                // effects and creating irreconcilable competing results.
+                if !delivery_lease.receipt_was_handed_off() {
+                    Self::release_durable_operation_guard(
+                        &self.durable_operations_in_flight,
+                        &operation_guard_key,
+                        guard_generation,
+                    );
+                }
+                return Err(error);
+            }
+        };
         Ok(IdempotentMessageDelivery {
             message_id: accepted_message_id,
             completed: false,
@@ -2494,9 +3166,23 @@ impl ConversationService {
         conversation_id: &str,
         req: SendMessageRequest,
         runtime_registry: &Arc<dyn AgentRuntimeRegistry>,
-        durable_delivery: Option<(&str, &str)>,
+        durable_delivery: Option<DurableDeliveryLease>,
+        mut runtime_build_lease: Option<RuntimeBuildLease>,
     ) -> Result<String, AppError> {
-        let durable_operation_id = durable_delivery.map(|(operation_id, _)| operation_id);
+        let public_cancellable = durable_delivery.is_none();
+        // Snapshot before the first await. A stop racing this request advances
+        // the epoch even if no turn handle exists yet; admission later fails
+        // instead of starting work after stop already returned success.
+        let send_cancellation_epoch = runtime_build_lease
+            .as_ref()
+            .map(RuntimeBuildLease::expected_cancellation_epoch)
+            .unwrap_or_else(|| self.runtime_state.cancellation_epoch(conversation_id));
+        if let Some(lease) = runtime_build_lease.as_ref() {
+            lease.ensure_active()?;
+        }
+        let durable_operation_id = durable_delivery
+            .as_ref()
+            .map(|delivery| delivery.operation_id.as_str());
         if req.content.trim().is_empty() {
             return Err(AppError::BadRequest("Message content must not be empty".into()));
         }
@@ -2510,6 +3196,9 @@ impl ConversationService {
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
         let conversation_key = row.id.clone();
+        if let Some(lease) = runtime_build_lease.as_ref() {
+            lease.ensure_active()?;
+        }
 
         if !self.execution_authority(user_id).controls_host() {
             if row.r#type != AgentType::Nomi.serde_name() {
@@ -2554,7 +3243,8 @@ impl ConversationService {
             .await?;
 
         let user_msg_id = durable_delivery
-            .map(|(_, message_id)| message_id.to_owned())
+            .as_ref()
+            .map(|delivery| delivery.message_id.clone())
             .unwrap_or_else(Self::mint_msg_id);
         let existing_user_message = self
             .conversation_repo
@@ -2578,7 +3268,101 @@ impl ConversationService {
             }
         }
 
-        let mut turn_handle = self.runtime_state.try_acquire_turn(conversation_id)?;
+        let durable_guard = durable_delivery
+            .as_ref()
+            .map(|delivery| (delivery.guard_key.clone(), delivery.guard_generation));
+
+        // Resolve every fallible/awaiting preflight before turn admission. A
+        // stop racing this work advances the epoch, and the admission check
+        // below rejects that stale send instead of stranding a turn handle.
+        let (companion, companion_id, extra_channel_platform) =
+            companion_context_from_extra(&row.extra)?;
+        let channel_platform = req
+            .channel_platform
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or(extra_channel_platform);
+        let origin = req
+            .origin
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+
+        let mut runtime_options = match self.build_runtime_options(&row) {
+            Ok(opts) => opts,
+            Err(err) => {
+                error!(
+                    error_code = err.error_code(),
+                    error = %ErrorChain(&err),
+                    "Failed to build runtime options for message send"
+                );
+                let _ = self.persist_send_failure_tip(conversation_id, &err).await;
+                let receipt_error = format!("{}", ErrorChain(&err));
+                if let Some(delivery) = durable_delivery.as_ref() {
+                    delivery.handoff_receipt();
+                }
+                Self::complete_delivery_receipt_before_release(
+                    &self.conversation_repo,
+                    user_id,
+                    &conversation_key,
+                    durable_operation_id,
+                    false,
+                    None,
+                    Some(&receipt_error),
+                    &CancellationToken::new(),
+                    durable_guard.as_ref().map(|(key, generation)| {
+                        (&self.durable_operations_in_flight, key.as_str(), *generation)
+                    }),
+                )
+                .await;
+                return Err(err);
+            }
+        };
+        self.ensure_auto_workspace_skill_links(&row, &runtime_options)
+            .await?;
+        if let Some(lease) = runtime_build_lease.as_ref() {
+            lease.ensure_active()?;
+        }
+        let preparation_token = runtime_build_lease
+            .as_ref()
+            .map(RuntimeBuildLease::cancellation_token);
+        self.apply_knowledge_mounts(
+            &row,
+            &mut runtime_options,
+            preparation_token.as_ref(),
+        )
+        .await;
+        if let Some(lease) = runtime_build_lease.as_ref() {
+            lease.ensure_active()?;
+        }
+        let stored_workspace = runtime_options.workspace.clone();
+
+        let first_turn_msg_id = Self::mint_msg_id();
+        let mut turn_handle = self
+            .runtime_state
+            .try_acquire_turn_with_wire_context_at_epoch_and_owner(
+                conversation_id,
+                Some(first_turn_msg_id.clone()),
+                TurnWireContext {
+                    companion,
+                    companion_id: companion_id.clone(),
+                    origin: origin.clone(),
+                    channel_platform: channel_platform.clone(),
+                },
+                Some(send_cancellation_epoch),
+                Some(user_id.to_owned()),
+                public_cancellable,
+                preparation_token.as_ref(),
+            )?;
+        // Exact turn admission takes over cancellation/runtime ownership. A
+        // stop either cancelled the preparation lease before this point or now
+        // captures the active generation; no unowned build gap remains.
+        drop(runtime_build_lease.take());
+        let turn_cancellation = turn_handle.turn_cancellation();
+        let turn_token = turn_handle.cancellation_token();
 
         // Store user message. `msg_id` is server-generated so the WebSocket
         // stream, DB row, and client-side message index all agree on the same
@@ -2604,37 +3388,12 @@ impl ConversationService {
             info!(msg_id = %user_msg_id, "User message persisted");
         }
 
-        // Companion wire markers (see `companion_context_from_extra`): stamped on
-        // every broadcast of this turn so the companion collector can classify the
-        // conversation without a local registry lookup.
-        let (companion, companion_id, extra_channel_platform) =
-            companion_context_from_extra(&row.extra)?;
-        // A per-turn `channel_platform` (an IM-channel turn routed into the
-        // companion's shared single session) takes precedence over the
-        // conversation's static `extra.channel_platform`. The shared companion
-        // session carries no `channel_platform` of its own, so this is how an IM
-        // turn is tagged for the floating window's remote-turn rendering while a
-        // desktop/owner turn (no per-turn marker) stays a local turn.
-        let channel_platform = req
-            .channel_platform
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .or(extra_channel_platform);
-
-        // Normalized origin marker (companion/cron/autowork/idmm; None = the human
-        // owner). Stamped on message.userCreated AND, via the relay, on every
-        // message.stream / turn.completed of this turn — agent-driven turns
-        // must be recognizable end to end, or their assistant replies would
-        // still be distilled as the owner's work (the indirect feedback loop).
-        let origin = req
-            .origin
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
-
+        // Turn admission is the ownership transfer point for durable
+        // delivery. From here either the normal background task or the stop
+        // race compensation path owns the receipt lease.
+        if let Some(delivery) = durable_delivery.as_ref() {
+            delivery.handoff_receipt();
+        }
         if existing_user_message.is_none() {
             self.user_events.send_to_user(
                 user_id,
@@ -2657,36 +3416,25 @@ impl ConversationService {
             );
         }
 
-        // Build runtime options from conversation row
-        let mut runtime_options = match self.build_runtime_options(&row) {
-            Ok(opts) => opts,
-            Err(err) => {
-                error!(
-                    error_code = err.error_code(),
-                    error = %ErrorChain(&err),
-                    "Failed to build runtime options for message send"
-                );
-                let _ = self.persist_send_failure_tip(conversation_id, &err).await;
-                let receipt_error = format!("{}", ErrorChain(&err));
-                Self::complete_delivery_receipt_before_release(
-                    &self.conversation_repo,
-                    user_id,
-                    &conversation_key,
-                    durable_operation_id,
-                    false,
-                    None,
-                    Some(&receipt_error),
-                )
-                .await;
-                turn_handle.release();
-                return Err(err);
-            }
-        };
-        self.ensure_auto_workspace_skill_links(&row, &runtime_options).await?;
-        self.apply_knowledge_mounts(&row, &mut runtime_options).await;
-        let stored_workspace = runtime_options.workspace.clone();
+        if turn_token.is_cancelled() {
+            Self::complete_delivery_receipt_before_release(
+                &self.conversation_repo,
+                user_id,
+                &conversation_key,
+                durable_operation_id,
+                false,
+                None,
+                Some("Agent turn cancelled during admission"),
+                &turn_token,
+                durable_guard.as_ref().map(|(key, generation)| {
+                    (&self.durable_operations_in_flight, key.as_str(), *generation)
+                }),
+            )
+            .await;
+            let _ = turn_handle.release();
+            return Ok(user_msg_id);
+        }
 
-        let first_turn_msg_id = Self::mint_msg_id();
         self.broadcast_turn_started_with_context(
             user_id,
             conversation_id,
@@ -2697,6 +3445,28 @@ impl ConversationService {
             channel_platform.clone(),
         )
         .await;
+
+        // A stop may arrive while the asynchronous started-event boundary is
+        // yielding. Never start a runtime after the stop worker has already
+        // published the cancelled terminal/completion for this generation.
+        if turn_token.is_cancelled() {
+            Self::complete_delivery_receipt_before_release(
+                &self.conversation_repo,
+                user_id,
+                &conversation_key,
+                durable_operation_id,
+                false,
+                None,
+                Some("Agent turn cancelled before runtime startup"),
+                &turn_token,
+                durable_guard.as_ref().map(|(key, generation)| {
+                    (&self.durable_operations_in_flight, key.as_str(), *generation)
+                }),
+            )
+            .await;
+            let _ = turn_handle.release();
+            return Ok(user_msg_id);
+        }
 
         let conv_id = conversation_id.to_owned();
         let repo = Arc::clone(&self.conversation_repo);
@@ -2726,23 +3496,63 @@ impl ConversationService {
         // correlation id so DB row, WebSocket stream events, and
         // agent-internal tracing all share one identifier per turn.
         let user_msg_id_ret = user_msg_id.clone();
-        tokio::spawn(async move {
+        let stable_turn_id = first_turn_msg_id.clone();
+        let owner_turn_generation = turn_handle.turn_id();
+        let owner_conversation_id = conversation_key.clone();
+        let owner_task = tokio::spawn(async move {
             let mut turn_handle = turn_handle;
+            let panic_user_id = user_id_owned.clone();
+            let panic_conversation_id = conv_id.clone();
+            let panic_stable_turn_id = stable_turn_id.clone();
+            let panic_runtime_registry = Arc::clone(&runtime_registry);
+            let panic_wire_context = TurnWireContext {
+                companion,
+                companion_id: companion_id.clone(),
+                origin: origin.clone(),
+                channel_platform: channel_platform.clone(),
+            };
+            let mut owner_receipt_guard = OwnerReceiptGuard {
+                repo: Arc::clone(&repo),
+                user_id: user_id_owned.clone(),
+                conversation_id: conversation_key.clone(),
+                operation_id: durable_operation_id.clone(),
+                operation_guard: durable_guard.as_ref().map(|(key, generation)| {
+                    (
+                        Arc::clone(&service.durable_operations_in_flight),
+                        key.clone(),
+                        *generation,
+                    )
+                }),
+                armed: true,
+            };
+            let owner_result = AssertUnwindSafe(async {
+            let mut turn_cancellation = turn_cancellation;
             let build_started_at = now_ms();
             info!(conversation_id = %conv_id, "Agent runtime build started");
             let knowledge_extra = runtime_options.extra.clone();
-            let mut agent = match runtime_registry.get_or_create_runtime(&conv_id, runtime_options).await {
+            let mut agent = match runtime_registry
+                .get_or_create_runtime_for_turn(
+                    &conv_id,
+                    turn_cancellation.turn_id(),
+                    turn_token.clone(),
+                    runtime_options,
+                )
+                .await
+            {
                 Ok(agent) => agent,
                 Err(err) => {
-                    error!(
-                        conversation_id = %conv_id,
-                        error_code = err.error_code(),
-                        error = %ErrorChain(&err),
-                        "Agent runtime build failed"
-                    );
-                    service
-                        .persist_and_broadcast_send_failure_tip(&user_id_owned, &conv_id, &err)
-                        .await;
+                    let cancelled = turn_token.is_cancelled();
+                    if !cancelled {
+                        error!(
+                            conversation_id = %conv_id,
+                            error_code = err.error_code(),
+                            error = %ErrorChain(&err),
+                            "Agent runtime build failed"
+                        );
+                        service
+                            .persist_and_broadcast_send_failure_tip(&user_id_owned, &conv_id, &err)
+                            .await;
+                    }
                     let receipt_error = format!("{}", ErrorChain(&err));
                     Self::complete_delivery_receipt_before_release(
                         &repo,
@@ -2752,13 +3562,18 @@ impl ConversationService {
                         false,
                         None,
                         Some(&receipt_error),
+                        &turn_token,
+                        durable_guard.as_ref().map(|(key, generation)| {
+                            (&service.durable_operations_in_flight, key.as_str(), *generation)
+                        }),
                     )
                     .await;
-                    turn_handle.release();
                     service
-                        .complete_turn_with_companion_context(
+                        .release_and_complete_turn(
+                            &mut turn_handle,
                             &user_id_owned,
                             &conv_id,
+                            &stable_turn_id,
                             companion,
                             companion_id.clone(),
                             origin.clone(),
@@ -2768,6 +3583,25 @@ impl ConversationService {
                     return;
                 }
             };
+
+            if turn_token.is_cancelled() {
+                Self::complete_delivery_receipt_before_release(
+                    &repo,
+                    &user_id_owned,
+                    &conversation_key,
+                    durable_operation_id.as_deref(),
+                    false,
+                    None,
+                    Some("Agent turn cancelled during runtime startup"),
+                    &turn_token,
+                    durable_guard.as_ref().map(|(key, generation)| {
+                        (&service.durable_operations_in_flight, key.as_str(), *generation)
+                    }),
+                )
+                .await;
+                let _ = turn_handle.release();
+                return;
+            }
 
             // Arm IDMM supervision now that the Agent runtime exists (so the
             // probe's `observe` attaches to THIS turn's event stream). The
@@ -2801,15 +3635,20 @@ impl ConversationService {
                     &conversation_key,
                     durable_operation_id.as_deref(),
                     false,
-                    None,
-                    Some(&receipt_error),
-                )
-                .await;
-                turn_handle.release();
+                        None,
+                        Some(&receipt_error),
+                        &turn_token,
+                        durable_guard.as_ref().map(|(key, generation)| {
+                            (&service.durable_operations_in_flight, key.as_str(), *generation)
+                        }),
+                    )
+                    .await;
                 service
-                    .complete_turn_with_companion_context(
+                    .release_and_complete_turn(
+                        &mut turn_handle,
                         &user_id_owned,
                         &conv_id,
+                        &stable_turn_id,
                         companion,
                         companion_id.clone(),
                         origin.clone(),
@@ -2872,6 +3711,28 @@ impl ConversationService {
             };
 
             while let Some((current_send, msg_id)) = pending_send.take() {
+                if turn_token.is_cancelled() {
+                    durable_completion = Some((
+                        false,
+                        None,
+                        Some("Agent turn was cancelled before send".to_owned()),
+                    ));
+                    break;
+                }
+                if turn_cancellation.terminal_msg_id() != Some(msg_id.as_str()) {
+                    match turn_handle.begin_wire_segment(msg_id.clone()) {
+                        Ok(segment) => turn_cancellation = segment,
+                        Err(_) => {
+                            durable_completion = Some((
+                                false,
+                                None,
+                                Some("Agent turn was cancelled before continuation admission".to_owned()),
+                            ));
+                            final_turn_writeback = None;
+                            break;
+                        }
+                    }
+                }
                 if continuation_count >= MAX_CRON_CONTINUATIONS_PER_TURN {
                     warn!(
                         conversation_id = %conv_id,
@@ -2891,6 +3752,7 @@ impl ConversationService {
                     cron_service.clone(),
                 )
                 .with_turn_completion(false)
+                .with_cancellation(turn_cancellation.clone())
                 .with_companion_context(companion, companion_id.clone())
                 .with_origin(origin.clone())
                 .with_channel_platform(channel_platform.clone());
@@ -2925,22 +3787,96 @@ impl ConversationService {
                 let rx = agent.subscribe();
                 let send_agent = agent.clone();
                 let conv_id_send = conv_id.clone();
+                let send_cancellation = turn_token.clone();
                 // Phase 3: keep a copy of this turn's send so a pre-response
                 // provider fault can resend the SAME content to the next model.
                 let resend_payload = current_send.clone();
                 let (send_error_tx, send_error_rx) = oneshot::channel();
                 // 1. Send the message to the agent and concurrently run the relay to stream events.
                 tokio::spawn(async move {
-                    if let Err(e) = send_agent.send_message(current_send).await {
-                        error!(conversation_id = %conv_id_send, error = %ErrorChain(&e), "Agent send_message failed");
-                        let _ = send_error_tx.send(e);
+                    if send_cancellation.is_cancelled() {
+                        let _ = send_error_tx.send(Ok(()));
+                        return;
                     }
+                    let send_result = send_agent.send_message(current_send).await;
+                    if let Err(e) = send_result.as_ref() {
+                        error!(conversation_id = %conv_id_send, error = %ErrorChain(e), "Agent send_message failed");
+                    }
+                    // Explicit success matters: a dropped sender now denotes
+                    // panic/abort and is converted by StreamRelay into a
+                    // terminal Error instead of waiting forever.
+                    let _ = send_error_tx.send(send_result);
                 });
                 // 2. Wait for the agent to process the message and complete the turn, while the relay streams events in real time.
                 let outcome = relay.consume_with_send_error(rx, send_error_rx).await;
+                let post_terminal_deadline =
+                    tokio::time::Instant::now() + POST_TERMINAL_TRANSITION_GRACE;
+
+                if turn_token.is_cancelled() || outcome.stop_reason == Some(TurnStopReason::Cancelled) {
+                    durable_completion = Some((
+                        false,
+                        outcome.final_text.clone(),
+                        Some("Agent turn was cancelled".to_owned()),
+                    ));
+                    final_turn_writeback = None;
+                    break;
+                }
+
+                if outcome.terminal.code()
+                    == Some(nomifun_api_types::AgentErrorCode::NomifunStreamBroken)
+                {
+                    // A permanent manager relay may have exited, or a lagged
+                    // broadcast may have skipped the real terminal while the
+                    // producer is still running. Remove and await the cached
+                    // runtime before releasing exact-turn admission; ordinary
+                    // provider errors intentionally do not enter this branch.
+                    if tokio::time::timeout(
+                        CANCEL_TEARDOWN_GRACE,
+                        runtime_registry.terminate_and_wait(
+                            &conv_id,
+                            Some(AgentKillReason::AgentErrorRecovery),
+                        ),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        warn!(conversation_id = %conv_id, "Broken event-stream runtime teardown exceeded its hard bound");
+                    }
+                    durable_completion = Some((
+                        false,
+                        outcome.final_text.clone(),
+                        Some("Agent event stream integrity was lost".to_owned()),
+                    ));
+                    final_turn_writeback = None;
+                    break;
+                }
 
                 if let Some(session_key) = agent.get_session_key() {
-                    persist_session_key(&repo, &conv_id, &session_key).await;
+                    if tokio::time::timeout_at(
+                        post_terminal_deadline,
+                        persist_session_key(&repo, &conv_id, &session_key),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        warn!(conversation_id = %conv_id, "Post-terminal session persistence exceeded the shared hard bound");
+                        durable_completion = Some((
+                            false,
+                            outcome.final_text.clone(),
+                            Some("Post-terminal transition timed out during session persistence".to_owned()),
+                        ));
+                        final_turn_writeback = None;
+                        break;
+                    }
+                }
+                if turn_token.is_cancelled() {
+                    durable_completion = Some((
+                        false,
+                        outcome.final_text.clone(),
+                        Some("Agent turn was cancelled during session persistence".to_owned()),
+                    ));
+                    final_turn_writeback = None;
+                    break;
                 }
 
                 // Phase 3 (plan D3): model failover. Only fires on a pre-response
@@ -2951,8 +3887,9 @@ impl ConversationService {
                 // ACP-eviction + error-surfacing path unchanged. This runs BEFORE
                 // `evict_acp_task_after_terminal_error` (which only acts on ACP),
                 // so a successful nomi failover short-circuits via `continue`.
-                if let Some(switch) = service
-                    .maybe_failover_in_send_loop(
+                let failover_switch = match tokio::time::timeout_at(
+                    post_terminal_deadline,
+                    service.maybe_failover_in_send_loop(
                         &conv_id,
                         agent.agent_type(),
                         &outcome,
@@ -2960,9 +3897,37 @@ impl ConversationService {
                         &failover_tried,
                         &failover_extra_json,
                         &runtime_registry,
-                    )
-                    .await
+                        turn_cancellation.turn_id(),
+                        &turn_token,
+                    ),
+                )
+                .await
                 {
+                    Ok(switch) => switch,
+                    Err(_) => {
+                        warn!(conversation_id = %conv_id, "Post-terminal model failover exceeded the shared hard bound");
+                        durable_completion = Some((
+                            false,
+                            outcome.final_text.clone(),
+                            Some("Post-terminal transition timed out during model failover".to_owned()),
+                        ));
+                        final_turn_writeback = None;
+                        break;
+                    }
+                };
+                if turn_token.is_cancelled() {
+                    // Any runtime constructed by failover belongs to the same
+                    // still-blocked generation; the stop worker has already
+                    // tombstoned it, so never schedule a resend.
+                    durable_completion = Some((
+                        false,
+                        outcome.final_text.clone(),
+                        Some("Agent turn was cancelled during model failover".to_owned()),
+                    ));
+                    final_turn_writeback = None;
+                    break;
+                }
+                if let Some(switch) = failover_switch {
                     failover_switches_done += 1;
                     failover_tried.push(switch.picked.clone());
                     info!(
@@ -2995,11 +3960,59 @@ impl ConversationService {
                     && outcome.terminal.code()
                         == Some(nomifun_api_types::AgentErrorCode::UserLlmProviderImageUnsupported)
                 {
-                    if let Some(rebuilt) = service
-                        .strip_images_and_rebuild(&conv_id, &runtime_registry)
-                        .await
+                    let rebuilt = match tokio::time::timeout_at(
+                        post_terminal_deadline,
+                        service.strip_images_and_rebuild(
+                            &conv_id,
+                            &runtime_registry,
+                            turn_cancellation.turn_id(),
+                            &turn_token,
+                        ),
+                    )
+                    .await
                     {
-                        service.persist_images_stripped_tip(&conv_id).await;
+                        Ok(rebuilt) => rebuilt,
+                        Err(_) => {
+                            warn!(conversation_id = %conv_id, "Post-terminal image fallback exceeded the shared hard bound");
+                            durable_completion = Some((
+                                false,
+                                outcome.final_text.clone(),
+                                Some("Post-terminal transition timed out during image fallback".to_owned()),
+                            ));
+                            final_turn_writeback = None;
+                            break;
+                        }
+                    };
+                    if let Some(rebuilt) = rebuilt {
+                        if turn_token.is_cancelled() {
+                            let _ = runtime_registry.cancel_runtime_turn(
+                                &conv_id,
+                                turn_cancellation.turn_id(),
+                                Some(AgentKillReason::UserCancelled),
+                            );
+                            durable_completion = Some((
+                                false,
+                                outcome.final_text.clone(),
+                                Some("Agent turn was cancelled during image fallback".to_owned()),
+                            ));
+                            break;
+                        }
+                        if tokio::time::timeout_at(
+                            post_terminal_deadline,
+                            service.persist_images_stripped_tip(&conv_id),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            warn!(conversation_id = %conv_id, "Post-terminal image fallback tip persistence exceeded the shared hard bound");
+                            durable_completion = Some((
+                                false,
+                                outcome.final_text.clone(),
+                                Some("Post-terminal transition timed out after image fallback".to_owned()),
+                            ));
+                            final_turn_writeback = None;
+                            break;
+                        }
                         info!(
                             conversation_id = %conv_id,
                             "Model rejected images; stripped images and resending same model"
@@ -3018,6 +4031,16 @@ impl ConversationService {
                     }
                 }
 
+                if turn_token.is_cancelled() {
+                    durable_completion = Some((
+                        false,
+                        outcome.final_text.clone(),
+                        Some("Agent turn was cancelled during fallback evaluation".to_owned()),
+                    ));
+                    final_turn_writeback = None;
+                    break;
+                }
+
                 // review #1/#5: the relay SUPPRESSED a pre-response provider error
                 // expecting a failover, but the failover did NOT fire above (picker
                 // exhausted at runtime / disabled / rebuild failed). Re-surface the
@@ -3026,7 +4049,7 @@ impl ConversationService {
                 if let Some(suppressed) = outcome.suppressed_error.as_ref() {
                     let surface_relay = StreamRelay::new(
                         conv_id.clone(),
-                        Self::mint_msg_id(),
+                        turn_msg_id.clone(),
                         user_id_owned.clone(),
                         Arc::clone(&repo),
                         Arc::clone(&user_events),
@@ -3035,7 +4058,22 @@ impl ConversationService {
                     .with_companion_context(companion, companion_id.clone())
                     .with_origin(origin.clone())
                     .with_channel_platform(channel_platform.clone());
-                    surface_relay.surface_terminal_error(suppressed).await;
+                    if tokio::time::timeout_at(
+                        post_terminal_deadline,
+                        surface_relay.surface_terminal_error(suppressed, &turn_cancellation),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        warn!(conversation_id = %conv_id, "Post-terminal error surfacing exceeded the shared hard bound");
+                        durable_completion = Some((
+                            false,
+                            outcome.final_text.clone(),
+                            Some("Post-terminal transition timed out while surfacing the terminal error".to_owned()),
+                        ));
+                        final_turn_writeback = None;
+                        break;
+                    }
                 }
 
                 let result_ok = matches!(outcome.terminal, RelayTerminal::Finish)
@@ -3050,10 +4088,41 @@ impl ConversationService {
                         .then(|| format!("{:?}", outcome.terminal)),
                 ));
 
-                if service
-                    .evict_acp_task_after_terminal_error(&conv_id, agent.agent_type(), &outcome, &runtime_registry)
-                    .await
+                let acp_evicted = match tokio::time::timeout_at(
+                    post_terminal_deadline,
+                    service.evict_acp_task_after_terminal_error(
+                        &conv_id,
+                        agent.agent_type(),
+                        &outcome,
+                        &runtime_registry,
+                        turn_cancellation.turn_id(),
+                        &turn_token,
+                    ),
+                )
+                .await
                 {
+                    Ok(evicted) => evicted,
+                    Err(_) => {
+                        warn!(conversation_id = %conv_id, "Post-terminal ACP eviction exceeded the shared hard bound");
+                        durable_completion = Some((
+                            false,
+                            outcome.final_text.clone(),
+                            Some("Post-terminal transition timed out during ACP cleanup".to_owned()),
+                        ));
+                        final_turn_writeback = None;
+                        break;
+                    }
+                };
+                if acp_evicted {
+                    break;
+                }
+                if turn_token.is_cancelled() {
+                    durable_completion = Some((
+                        false,
+                        outcome.final_text.clone(),
+                        Some("Agent turn was cancelled during terminal cleanup".to_owned()),
+                    ));
+                    final_turn_writeback = None;
                     break;
                 }
 
@@ -3074,6 +4143,15 @@ impl ConversationService {
                     {
                         final_turn_writeback = Some((knowledge_service, request, final_text_msg_id, final_text));
                     }
+                    break;
+                }
+                if turn_token.is_cancelled() {
+                    durable_completion = Some((
+                        false,
+                        outcome.final_text.clone(),
+                        Some("Agent turn was cancelled before continuation".to_owned()),
+                    ));
+                    final_turn_writeback = None;
                     break;
                 }
                 continuation_count += 1;
@@ -3108,34 +4186,148 @@ impl ConversationService {
                 ok,
                 text.as_deref(),
                 error.as_deref(),
+                &turn_token,
+                durable_guard.as_ref().map(|(key, generation)| {
+                    (&service.durable_operations_in_flight, key.as_str(), *generation)
+                }),
             )
             .await;
 
-            turn_handle.release();
+            // The model turn is finished at this point. Release the exact turn
+            // and publish authoritative idle before optional knowledge
+            // write-back: post-processing must never keep the conversation
+            // visibly busy or block the next user turn.
             service
-                .complete_turn_with_companion_context(
+                .release_and_complete_turn(
+                    &mut turn_handle,
                     &user_id_owned,
                     &conv_id,
+                    &stable_turn_id,
                     companion,
                     companion_id,
                     origin,
                     channel_platform,
                 )
                 .await;
-            if let Some((knowledge_service, request, msg_id, final_text)) = final_turn_writeback {
-                run_turn_writeback_report(
+
+            if !turn_token.is_cancelled()
+                && let Some((knowledge_service, request, msg_id, final_text)) = final_turn_writeback
+            {
+                let writeback = AssertUnwindSafe(run_turn_writeback_report(
                     knowledge_service,
                     request,
                     Arc::clone(&repo),
                     Arc::clone(&user_events),
+                    // The helper owns Strings because progress callbacks may
+                    // outlive individual knowledge-service awaits.
+                    // Cloning here keeps the exact turn owner in charge until
+                    // the bounded report returns or is cancelled.
                     user_id_owned.clone(),
                     conv_id.clone(),
                     msg_id,
                     final_text,
+                ))
+                .catch_unwind();
+                tokio::select! {
+                    biased;
+                    _ = turn_token.cancelled() => {
+                        info!(conversation_id = %conv_id, "Post-turn write-back cancelled");
+                    }
+                    result = tokio::time::timeout(TURN_WRITEBACK_GRACE, writeback) => {
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) => {
+                                warn!(conversation_id = %conv_id, "Post-turn write-back panicked");
+                            }
+                            Err(_) => {
+                                warn!(conversation_id = %conv_id, "Turn write-back exceeded the hard bound");
+                            }
+                        }
+                    }
+                }
+            }
+            })
+            .catch_unwind()
+            .await;
+
+            if owner_result.is_ok() {
+                owner_receipt_guard.disarm();
+            } else if turn_handle.is_cancelled() {
+                // Explicit AbortHandle cancellation drops this whole outer
+                // future and never reaches here. This branch covers a panic
+                // racing a user stop; the stop worker owns Cancelled terminal,
+                // exact release, and completion.
+                warn!(conversation_id = %panic_conversation_id, "Turn owner panicked while cancellation was already active");
+            } else {
+                error!(conversation_id = %panic_conversation_id, "Turn owner task panicked; running bounded failure finalizer");
+                let panic_cancellation = turn_handle.turn_cancellation();
+                let terminal_msg_id = panic_cancellation
+                    .terminal_msg_id()
+                    .or(panic_cancellation.wire_turn_id())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| panic_stable_turn_id.clone());
+                let panic_event = nomifun_ai_agent::AgentStreamEvent::Error(
+                    nomifun_ai_agent::protocol::events::ErrorEventData::legacy(
+                        "Agent turn task exited unexpectedly",
+                        None,
+                    ),
+                );
+                let relay = StreamRelay::new(
+                    panic_conversation_id.clone(),
+                    terminal_msg_id,
+                    panic_user_id.clone(),
+                    Arc::clone(&service.conversation_repo),
+                    Arc::clone(&service.user_events),
+                    None,
                 )
-                .await;
+                .with_companion_context(
+                    panic_wire_context.companion,
+                    panic_wire_context.companion_id.clone(),
+                )
+                .with_origin(panic_wire_context.origin.clone())
+                .with_channel_platform(panic_wire_context.channel_platform.clone());
+                relay
+                    .surface_terminal_error(&panic_event, &panic_cancellation)
+                    .await;
+
+                let _ = panic_runtime_registry.cancel_runtime_turn(
+                    &panic_conversation_id,
+                    panic_cancellation.turn_id(),
+                    Some(AgentKillReason::AgentErrorRecovery),
+                );
+                if tokio::time::timeout(
+                    CANCEL_TEARDOWN_GRACE,
+                    panic_runtime_registry.terminate_and_wait(
+                        &panic_conversation_id,
+                        Some(AgentKillReason::AgentErrorRecovery),
+                    ),
+                )
+                .await
+                .is_err()
+                {
+                    warn!(conversation_id = %panic_conversation_id, "Panicked turn runtime teardown exceeded its hard bound");
+                }
+                service
+                    .release_and_complete_turn(
+                        &mut turn_handle,
+                        &panic_user_id,
+                        &panic_conversation_id,
+                        &panic_stable_turn_id,
+                        panic_wire_context.companion,
+                        panic_wire_context.companion_id,
+                        panic_wire_context.origin,
+                        panic_wire_context.channel_platform,
+                    )
+                    .await;
             }
         });
+        let owner_abort_handle = owner_task.abort_handle();
+        drop(owner_task);
+        self.runtime_state.register_turn_owner_abort_handle(
+            &owner_conversation_id,
+            owner_turn_generation,
+            owner_abort_handle,
+        );
 
         info!(
             msg_id = %user_msg_id_ret,
@@ -3314,6 +4506,7 @@ impl ConversationService {
             return Err(AppError::BadRequest("Message content must not be empty".into()));
         }
         let conv_id = parse_conv_id(conversation_id)?;
+        let runtime_build_lease = self.begin_public_runtime_build(conv_id, user_id)?;
 
         // Verify conversation exists and belongs to user.
         let row = self
@@ -3322,16 +4515,34 @@ impl ConversationService {
             .await?
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+        runtime_build_lease.ensure_active()?;
 
         self.ensure_not_retained_execution_attempt(user_id, conv_id)
             .await?;
+        runtime_build_lease.ensure_active()?;
 
         // No live turn → nothing to steer; send normally (new turn).
         let Some(instance) = runtime_registry.get_runtime(conversation_id) else {
-            return self.send_message(user_id, conversation_id, req, runtime_registry).await;
+            return self
+                .send_message_with_runtime_build_lease(
+                    user_id,
+                    conversation_id,
+                    req,
+                    runtime_registry,
+                    runtime_build_lease,
+                )
+                .await;
         };
         if instance.status() != Some(ConversationStatus::Running) {
-            return self.send_message(user_id, conversation_id, req, runtime_registry).await;
+            return self
+                .send_message_with_runtime_build_lease(
+                    user_id,
+                    conversation_id,
+                    req,
+                    runtime_registry,
+                    runtime_build_lease,
+                )
+                .await;
         }
 
         // The steering inbox is text-only. Silently dropping attachments here
@@ -3356,7 +4567,15 @@ impl ConversationService {
         match instance.steer(req.content.clone()) {
             Ok(true) => {}
             Ok(false) => {
-                return self.send_message(user_id, conversation_id, req, runtime_registry).await;
+                return self
+                    .send_message_with_runtime_build_lease(
+                        user_id,
+                        conversation_id,
+                        req,
+                        runtime_registry,
+                        runtime_build_lease,
+                    )
+                    .await;
             }
             Err(e) => return Err(e),
         }
@@ -3460,6 +4679,7 @@ impl ConversationService {
         }
         let conv_id = parse_conv_id(conversation_id)?;
         let message_id = parse_message_id(message_id)?;
+        let runtime_build_lease = self.begin_public_runtime_build(conv_id, user_id)?;
 
         // 1. 归属校验
         let row = self
@@ -3468,9 +4688,11 @@ impl ConversationService {
             .await?
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+        runtime_build_lease.ensure_active()?;
 
         self.ensure_not_retained_execution_attempt(user_id, conv_id)
             .await?;
+        runtime_build_lease.ensure_active()?;
 
         // 2. 仅 Nomi
         if row.r#type != "nomi" {
@@ -3482,6 +4704,7 @@ impl ConversationService {
         // 3. 目标必须是最近一条用户(right/text)消息（保证引擎"回退最后一个 turn"
         //    与 DB"删除该条及其后"对齐）。
         let recent = self.conversation_repo.get_messages_keyset(conv_id, None, 50).await?;
+        runtime_build_lease.ensure_active()?;
         let latest_user = recent
             .items
             .iter()
@@ -3499,14 +4722,23 @@ impl ConversationService {
         // 4. 取在飞 agent 并回退最后一个 turn（内部会先停掉在飞 turn）。
         let agent = self.runtime_handle(conversation_id)?;
         agent.rewind_last_turn().await?;
+        runtime_build_lease.ensure_active()?;
 
         // 5. 截断 DB：删除目标(含)及其后所有消息。
         self.conversation_repo
             .delete_messages_from(conv_id, from_created_at, &from_id)
             .await?;
+        runtime_build_lease.ensure_active()?;
 
         // 6. 复用正常发送：重新插入用户消息行 + 起新 turn。
-        self.send_message(user_id, conversation_id, req, runtime_registry).await
+        self.send_message_with_runtime_build_lease(
+            user_id,
+            conversation_id,
+            req,
+            runtime_registry,
+            runtime_build_lease,
+        )
+        .await
     }
 
     /// Stop the current streaming response for a conversation.
@@ -3543,6 +4775,308 @@ impl ConversationService {
         .await
     }
 
+    /// Start an independent, generation-scoped stop worker. Once spawned it
+    /// continues even if the HTTP request future is disconnected/dropped.
+    /// Admission remains closed until the captured runtime's teardown has
+    /// completed or hit the hard bound, then the exact turn generation is
+    /// released and (for an ordinary stop) completed on the wire.
+    fn spawn_turn_stop_cleanup(
+        &self,
+        user_id: String,
+        conversation_id: String,
+        runtime_registry: Arc<dyn AgentRuntimeRegistry>,
+        publish_completion: bool,
+        deletion_owned: bool,
+    ) -> oneshot::Receiver<Result<(), AppError>> {
+        let (result_tx, result_rx) = oneshot::channel();
+        let stop_admission = if deletion_owned {
+            self.runtime_state
+                .begin_conversation_stop_for_deletion(&conversation_id)
+        } else {
+            self.runtime_state.begin_conversation_stop(&conversation_id)
+        };
+        let stop_guard = match stop_admission {
+            Ok(Some(guard)) => guard,
+            Ok(None) => {
+                // Either normal completion or the single-flight stop leader
+                // already owns release -> finished -> completed
+                // linearization. Followers only join; they never add another
+                // fence owner, repeat teardown, or compete to publish idle.
+                let runtime_state = Arc::clone(&self.runtime_state);
+                tokio::spawn(async move {
+                    let completed = runtime_state
+                        .wait_for_cleanup_fences(&conversation_id, CANCEL_TEARDOWN_GRACE)
+                        .await;
+                    let result = if completed {
+                        Ok(())
+                    } else {
+                        Err(AppError::Timeout(
+                            "conversation completion did not finish within the stop join window"
+                                .to_owned(),
+                        ))
+                    };
+                    let _ = result_tx.send(result);
+                });
+                return result_rx;
+            }
+            Err(err) => {
+                let _ = result_tx.send(Err(err));
+                return result_rx;
+            }
+        };
+        let cancelled_build_ids = stop_guard.cancelled_build_ids().to_vec();
+        let turn_cancellation = self.runtime_state.begin_turn_cancellation(&conversation_id);
+        // Capture before removing the registry slot. This is the exact old
+        // process whose teardown must be awaited before admission reopens.
+        let captured_agent = runtime_registry.get_runtime(&conversation_id);
+        let service = self.clone();
+
+        tokio::spawn(async move {
+            // Keep admission closed for the worker's entire lifecycle,
+            // including idle-runtime teardown where no turn release gate exists.
+            let mut stop_guard = Some(stop_guard);
+            let mut completion_to_publish: Option<(Option<String>, TurnWireContext)> = None;
+            let result = async {
+                if let Some(turn_cancellation) = turn_cancellation {
+                    let mut exact_release_guard = service
+                        .runtime_state
+                        .arm_cancelled_turn_release(turn_cancellation.clone());
+                    // Tombstone/remove the old runtime slot before signalling
+                    // the turn token. No later conversation-ID termination is
+                    // allowed after exact ownership is released.
+                    if let Err(err) = runtime_registry.cancel_runtime_turn(
+                        &conversation_id,
+                        turn_cancellation.turn_id(),
+                        Some(AgentKillReason::UserCancelled),
+                    ) {
+                        warn!(
+                            conversation_id,
+                            turn_id = turn_cancellation.turn_id(),
+                            error = %ErrorChain(&err),
+                            "Failed to initiate cancelled runtime teardown"
+                        );
+                    }
+                    turn_cancellation.cancel();
+
+                    let build_cleanup = async {
+                        if !service
+                            .runtime_state
+                            .wait_for_runtime_builds(
+                                &conversation_id,
+                                &cancelled_build_ids,
+                                CANCEL_TEARDOWN_GRACE,
+                            )
+                            .await
+                        {
+                            warn!(conversation_id, "Cancelled runtime preparation leases exceeded the hard bound");
+                        }
+                        service.runtime_state.forget_cancelled_runtime_builds(
+                            &conversation_id,
+                            &cancelled_build_ids,
+                        );
+                    };
+
+                    let terminal_wait = turn_cancellation
+                        .wait_for_terminal_observed(CANCEL_RELEASE_GRACE);
+                    let owner_wait = turn_cancellation
+                        .wait_for_owner_quiesced(CANCEL_TEARDOWN_GRACE);
+                    let registry_barrier = runtime_registry.terminate_and_wait(
+                        &conversation_id,
+                        Some(AgentKillReason::UserCancelled),
+                    );
+                    let captured_teardown = async {
+                        if let Some(agent) = captured_agent {
+                            agent
+                                .kill_and_wait(Some(AgentKillReason::UserCancelled))
+                                .await;
+                        }
+                    };
+                    let teardown = async {
+                        tokio::join!(registry_barrier, captured_teardown);
+                    };
+                    let (_, terminal_seen, owner_quiesced, teardown_result) = tokio::join!(
+                        build_cleanup,
+                        terminal_wait,
+                        owner_wait,
+                        tokio::time::timeout(CANCEL_TEARDOWN_GRACE, teardown),
+                    );
+                    if teardown_result.is_err() {
+                        warn!(
+                            conversation_id,
+                            turn_id = turn_cancellation.turn_id(),
+                            "Cancelled runtime teardown exceeded the hard bound; force-kill was already triggered"
+                        );
+                    }
+                    if !owner_quiesced {
+                        warn!(
+                            conversation_id,
+                            turn_id = turn_cancellation.turn_id(),
+                            "Cancelled turn owner did not quiesce; aborting the exact owner task"
+                        );
+                        turn_cancellation.abort_owner_task();
+                        if !turn_cancellation
+                            .wait_for_owner_quiesced(CANCEL_COMPLETION_GRACE)
+                            .await
+                        {
+                            warn!(
+                                conversation_id,
+                                turn_id = turn_cancellation.turn_id(),
+                                "Cancelled turn owner did not drop after exact-task abort"
+                            );
+                        }
+                    }
+
+                    let wire_turn_id = turn_cancellation.wire_turn_id().map(str::to_owned);
+                    let terminal_msg_id = turn_cancellation.terminal_msg_id().map(str::to_owned);
+                    let wire_context = turn_cancellation.wire_context().clone();
+                    if !terminal_seen
+                        && let Some(terminal_msg_id) = terminal_msg_id.as_ref()
+                    {
+                        let relay = StreamRelay::new(
+                            conversation_id.clone(),
+                            terminal_msg_id.clone(),
+                            user_id.clone(),
+                            Arc::clone(&service.conversation_repo),
+                            Arc::clone(&service.user_events),
+                            None,
+                        )
+                        .with_companion_context(
+                            wire_context.companion,
+                            wire_context.companion_id.clone(),
+                        )
+                        .with_origin(wire_context.origin.clone())
+                        .with_channel_platform(wire_context.channel_platform.clone());
+                        relay.surface_cancelled_turn(&turn_cancellation);
+                    }
+
+                    let released = service
+                        .runtime_state
+                        .force_release_cancelled_turn(&turn_cancellation);
+                    exact_release_guard.disarm();
+                    if released
+                        && publish_completion
+                        && let Some(wire_turn_id) = wire_turn_id.as_deref()
+                    {
+                        StreamRelay::persist_conversation_finished(
+                            &service.conversation_repo,
+                            &conversation_id,
+                        )
+                        .await;
+                        completion_to_publish =
+                            Some((Some(wire_turn_id.to_owned()), wire_context));
+                    }
+                } else {
+                    // Idle runtime stop is still a real teardown. Removing the
+                    // slot first also clears any uninitialized slot left by a
+                    // construction that raced without an admitted turn.
+                    let _ = runtime_registry.terminate(
+                        &conversation_id,
+                        Some(AgentKillReason::UserCancelled),
+                    );
+                    let build_cleanup = async {
+                        if !service
+                            .runtime_state
+                            .wait_for_runtime_builds(
+                                &conversation_id,
+                                &cancelled_build_ids,
+                                CANCEL_TEARDOWN_GRACE,
+                            )
+                            .await
+                        {
+                            warn!(conversation_id, "Cancelled runtime preparation leases exceeded the hard bound");
+                        }
+                        service.runtime_state.forget_cancelled_runtime_builds(
+                            &conversation_id,
+                            &cancelled_build_ids,
+                        );
+                    };
+                    let registry_barrier = runtime_registry.terminate_and_wait(
+                        &conversation_id,
+                        Some(AgentKillReason::UserCancelled),
+                    );
+                    let captured_teardown = async {
+                        if let Some(agent) = captured_agent {
+                            agent
+                                .kill_and_wait(Some(AgentKillReason::UserCancelled))
+                                .await;
+                        }
+                    };
+                    let (_, teardown_result) = tokio::join!(
+                        build_cleanup,
+                        tokio::time::timeout(CANCEL_TEARDOWN_GRACE, async {
+                            tokio::join!(registry_barrier, captured_teardown);
+                        }),
+                    );
+                    if teardown_result.is_err()
+                    {
+                        warn!(
+                            conversation_id,
+                            "Idle runtime teardown exceeded the hard bound"
+                        );
+                    }
+                    if publish_completion {
+                        // A stop can legitimately find no active turn while a
+                        // stale/half-built runtime slot still reports Running.
+                        // Other clients still need an authoritative idle
+                        // transition; completion-fence conflicts were rejected
+                        // by stop admission, so this cannot overwrite a live
+                        // normal completion.
+                        StreamRelay::persist_conversation_finished(
+                            &service.conversation_repo,
+                            &conversation_id,
+                        )
+                        .await;
+                        completion_to_publish = Some((None, TurnWireContext::default()));
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            if result.is_ok()
+                && let Some((wire_turn_id, wire_context)) = completion_to_publish
+            {
+                let user_events = Arc::clone(&service.user_events);
+                let runtime = service.final_completion_runtime(&conversation_id);
+                let owned_stop_guard = stop_guard.take();
+                let event_user_id = user_id.clone();
+                let event_conversation_id = conversation_id.clone();
+                if !service
+                    .runtime_state
+                    .linearize_cleanup_event(
+                        &conversation_id,
+                        1,
+                        0,
+                        CANCEL_TEARDOWN_GRACE,
+                        move || {
+                            StreamRelay::broadcast_turn_completed_with_context(
+                                &user_events,
+                                &event_user_id,
+                                &event_conversation_id,
+                                wire_turn_id,
+                                Some(runtime),
+                                wire_context.companion,
+                                wire_context.companion_id,
+                                wire_context.origin,
+                                wire_context.channel_platform,
+                            );
+                            drop(owned_stop_guard);
+                        },
+                    )
+                    .await
+                {
+                    warn!(conversation_id, "Cancelled completion event withheld while another cleanup fence remained active");
+                }
+            }
+            // `send_to_user` above is synchronous enqueue. Drop the exact stop
+            // fence immediately afterward so a client reacting to the event
+            // cannot race a still-held admission block.
+            drop(stop_guard);
+            let _ = result_tx.send(result);
+        });
+
+        result_rx
+    }
+
     async fn cancel_with_origin(
         &self,
         user_id: &str,
@@ -3550,20 +5084,71 @@ impl ConversationService {
         runtime_registry: &Arc<dyn AgentRuntimeRegistry>,
         origin: CancelOrigin,
     ) -> Result<(), AppError> {
-        // Verify conversation exists and belongs to user
-        let conversation = self
-            .conversation_repo
-            .get(parse_conv_id(conversation_id)?)
-            .await?
-            .filter(|r| r.user_id == user_id)
+        let conversation_key = parse_conv_id(conversation_id)?;
+        let mut user_cancel_preflight = None;
+        let in_memory_authority = if origin == CancelOrigin::User {
+            let authorization = self
+                .runtime_state
+                .authorize_in_memory_user_cancel(conversation_id, user_id)?;
+            user_cancel_preflight = authorization.preflight_guard;
+            authorization.authority
+        } else if self
+            .runtime_state
+            .active_turn_allows_cancel(conversation_id, user_id, false)
+        {
+            InMemoryCancelAuthority::ActiveTurn
+        } else {
+            InMemoryCancelAuthority::None
+        };
+
+        if let InMemoryCancelAuthority::PublicBuilds(cancelled_build_ids) =
+            &in_memory_authority
+        {
+                // This authority is intentionally narrower than a conversation
+                // stop: an unverified public preparation may cancel only work
+                // initiated by the same authenticated requester, never a
+                // private/durable build or an unrelated idle runtime.
+                self.note_user_cancel(conversation_id);
+                self.runtime_state.forget_cancelled_runtime_builds(
+                    conversation_id,
+                    cancelled_build_ids,
+                );
+                return Ok(());
+        }
+
+        if in_memory_authority != InMemoryCancelAuthority::ActiveTurn {
+            // Idle/cold-runtime stops still need repository authorization, but
+            // it is hard-bounded. A live turn takes the secure cached-owner
+            // fast path above, so a wedged DB actor cannot make its stop button
+            // ineffective.
+            let conversation = tokio::time::timeout(
+                CANCEL_AUTH_PREFLIGHT_GRACE,
+                self.conversation_repo.get(conversation_key),
+            )
+            .await
+            .map_err(|_| {
+                AppError::Timeout(
+                    "conversation stop authorization exceeded its hard bound".to_owned(),
+                )
+            })??
+            .filter(|row| row.user_id == user_id)
             .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
 
-        // A user stops or decides Attempt work through Agent Execution. The
-        // internal cleanup path keeps using AgentExecution origin and must be
-        // able to cancel live runtimes during pause/replan/recovery.
-        if origin == CancelOrigin::User {
-            self.ensure_not_retained_execution_attempt(user_id, &conversation.id)
-                .await?;
+            // A user stops or decides Attempt work through Agent Execution.
+            // The internal cleanup path keeps using AgentExecution origin and
+            // may cancel retained attempt runtimes.
+            if origin == CancelOrigin::User {
+                tokio::time::timeout(
+                    CANCEL_AUTH_PREFLIGHT_GRACE,
+                    self.ensure_not_retained_execution_attempt(user_id, &conversation.id),
+                )
+                .await
+                .map_err(|_| {
+                    AppError::Timeout(
+                        "conversation stop retention check exceeded its hard bound".to_owned(),
+                    )
+                })??;
+            }
         }
 
         // Record the user's intent BEFORE touching the agent: even when no
@@ -3573,17 +5158,34 @@ impl ConversationService {
             self.note_user_cancel(conversation_id);
         }
 
-        let Some(agent) = runtime_registry.get_runtime(conversation_id) else {
-            info!("No active agent to cancel; treating as idempotent success");
-            return Ok(());
+        let result_rx = self.spawn_turn_stop_cleanup(
+            user_id.to_owned(),
+            conversation_id.to_owned(),
+            Arc::clone(runtime_registry),
+            true,
+            false,
+        );
+        // `spawn_turn_stop_cleanup` synchronously establishes the stronger
+        // conversation stop tombstone before returning. Releasing the
+        // requester-scoped preflight here is therefore an atomic fence handoff:
+        // same-user public builds saw either the preflight or the stop, never a
+        // gap between them.
+        drop(user_cancel_preflight);
+        let stop_result = match tokio::time::timeout(CANCEL_HANDLER_GRACE, result_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(AppError::Internal(
+                "conversation stop worker exited before reporting completion".to_owned(),
+            )),
+            Err(_) => {
+                // Admission is already fenced and the detached owner has hard
+                // bounds for every teardown phase. Treat the stop as accepted
+                // instead of making the UI believe manual termination failed
+                // merely because cleanup outlived the HTTP window.
+                warn!(conversation_id, "Conversation stop accepted; bounded cleanup continues in the background");
+                Ok(())
+            }
         };
-
-        if let Err(e) = agent.cancel().await {
-            warn!(error = %ErrorChain(&e), "Failed to cancel agent");
-            return Err(e);
-        }
-
-        info!("Stream canceled");
+        stop_result?;
         Ok(())
     }
 
@@ -3718,25 +5320,50 @@ impl ConversationService {
         conversation_id: &str,
         runtime_registry: &Arc<dyn AgentRuntimeRegistry>,
     ) -> Result<(), AppError> {
+        let lease = self.begin_public_runtime_build(conversation_id, user_id)?;
+        let preparation_token = lease.cancellation_token();
         let row = self
             .conversation_repo
             .get(parse_conv_id(conversation_id)?)
             .await?
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+        lease.ensure_active()?;
 
         self.ensure_not_retained_execution_attempt(user_id, &row.id)
             .await?;
+        lease.ensure_active()?;
 
         let mut runtime_options = self.build_runtime_options(&row)?;
         self.ensure_auto_workspace_skill_links(&row, &runtime_options).await?;
-        self.apply_knowledge_mounts(&row, &mut runtime_options).await;
+        lease.ensure_active()?;
+        self.apply_knowledge_mounts(
+            &row,
+            &mut runtime_options,
+            Some(&preparation_token),
+        )
+        .await;
+        lease.ensure_active()?;
         let stored_workspace = runtime_options.workspace.clone();
-        let agent = runtime_registry.get_or_create_runtime(conversation_id, runtime_options).await?;
+        let agent = runtime_registry
+            .get_or_create_runtime_for_turn(
+                conversation_id,
+                lease.id(),
+                preparation_token.clone(),
+                runtime_options,
+            )
+            .await?;
+        if lease.is_cancelled() {
+            let _ = agent.kill(Some(AgentKillReason::UserCancelled));
+            return Err(AppError::Conflict(format!(
+                "conversation {conversation_id} warmup was cancelled"
+            )));
+        }
 
         // Persist auto-resolved workspace if factory picked a different path.
         self.maybe_persist_workspace(conversation_id, &stored_workspace, agent.workspace())
             .await?;
+        lease.ensure_active()?;
 
         debug!("Agent warmed up");
         Ok(())
@@ -3917,7 +5544,15 @@ impl ConversationService {
     /// whose `extra.companion_id` is a non-blank string mounts the companion-level
     /// binding `('companion', companion_id)`; everything else keeps the per-conversation
     /// binding `('conversation', conversation_id)`. No merge between the two.
-    async fn apply_knowledge_mounts(&self, row: &ConversationRow, runtime_options: &mut AgentRuntimeBuildOptions) {
+    async fn apply_knowledge_mounts(
+        &self,
+        row: &ConversationRow,
+        runtime_options: &mut AgentRuntimeBuildOptions,
+        cancellation: Option<&CancellationToken>,
+    ) {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
         // Knowledge roots are installation-owned filesystem resources.  A
         // model-only user must never reach workpath/companion binding lookup or
         // create a physical mount before the Agent factory applies its own
@@ -3971,6 +5606,9 @@ impl ConversationService {
                 .ensure_mounts_for_target(target_kind, &target_id, &workspace)
                 .await
         };
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
 
         // Recycle the cached agent when the resolved knowledge context changed
         // since it was last built. The agent bakes the retrieval-protocol
@@ -4001,6 +5639,9 @@ impl ConversationService {
                     );
                 }
                 Some(_) => {
+                    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                        return;
+                    }
                     info!(
                         conversation_id = %conversation_id,
                         "knowledge binding changed; recycling cached agent so the new mounts take effect on the next message"

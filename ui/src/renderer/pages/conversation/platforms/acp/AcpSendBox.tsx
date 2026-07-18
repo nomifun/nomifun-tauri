@@ -30,8 +30,14 @@ import { useAddOrUpdateMessage } from '@/renderer/pages/conversation/Messages/ho
 import {
   shouldEnqueueConversationCommand,
   useConversationCommandQueue,
+  type ConversationCommandQueueExecution,
   type ConversationCommandQueueItem,
 } from '@/renderer/pages/conversation/platforms/useConversationCommandQueue';
+import { stopConversationAndConfirmRelease } from '@/renderer/pages/conversation/platforms/requestConversationStop';
+import {
+  shouldReleaseStopInteraction,
+  useConversationStopAttemptGuard,
+} from '@/renderer/pages/conversation/platforms/useConversationStopAttemptGuard';
 import { usePreviewContext } from '@/renderer/pages/conversation/Preview';
 import { getConversationRuntimeWorkspaceErrorMessage } from '@/renderer/pages/conversation/utils/conversationCreateError';
 import { warmupConversation } from '@/renderer/pages/conversation/utils/warmupConversation';
@@ -103,7 +109,12 @@ const AcpSendBox: React.FC<{
     hasHydratedRunningState,
     aiProcessing,
     setAiProcessing,
+    markTurnAccepted,
     resetState,
+    confirmStopped,
+    restoreRunningAfterStopFailure,
+    getTurnStartGeneration,
+    getTurnCompletionGeneration,
     slashCommands,
   } = messageState;
   const { t } = useTranslation();
@@ -201,7 +212,17 @@ const AcpSendBox: React.FC<{
     setAtPath,
     setUploadFile,
   });
-  const isBusy = running || aiProcessing;
+  const [isStopping, setIsStopping] = useState(false);
+  const isBusy = running || aiProcessing || isStopping;
+  const { beginStopAttempt, getStopAttemptStatus } = useConversationStopAttemptGuard(
+    conversation_id,
+    getTurnStartGeneration,
+    getTurnCompletionGeneration
+  );
+
+  useEffect(() => {
+    setIsStopping(false);
+  }, [conversation_id]);
 
   // Register handler for adding text from preview panel to sendbox
   useEffect(() => {
@@ -224,7 +245,10 @@ const AcpSendBox: React.FC<{
   );
 
   const executeCommand = useCallback(
-    async ({ input, files }: Pick<ConversationCommandQueueItem, 'input' | 'files'>) => {
+    async (
+      { input, files }: Pick<ConversationCommandQueueItem, 'input' | 'files'>,
+      execution?: ConversationCommandQueueExecution
+    ) => {
       const displayMessage = buildDisplayMessage(input, files, workspacePath || '');
 
       setAiProcessing(true);
@@ -240,6 +264,8 @@ const AcpSendBox: React.FC<{
           conversation_id,
           files,
         });
+        if (execution && !execution.isCurrent()) return;
+        markTurnAccepted();
         // Use add=false (compose mode) so composeMessageWithIndex can de-dup
         // by msg_id — this prevents a duplicate bubble if useMessageLstCache
         // already inserted the DB row for this same msg_id.
@@ -254,6 +280,7 @@ const AcpSendBox: React.FC<{
         });
         emitter.emit('chat.history.refresh');
       } catch (error: unknown) {
+        if (execution && !execution.isCurrent()) return;
         const errorMsg =
           getConversationRuntimeWorkspaceErrorMessage(error, t) || parseError(error) || t('common.unknownError');
 
@@ -324,7 +351,7 @@ Please check your local CLI tool authentication status`,
         emitter.emit('acp.workspace.refresh');
       }
     },
-    [backend, checkAndUpdateTitle, conversation_id, setAiProcessing, t, workspacePath]
+    [backend, checkAndUpdateTitle, conversation_id, markTurnAccepted, setAiProcessing, t, workspacePath]
   );
 
   const {
@@ -530,17 +557,33 @@ Please check your local CLI tool authentication status`,
 
   // Stop conversation handler
   const handleStop = async (): Promise<void> => {
-    // Cancelling is best-effort: swallow errors (e.g. backend WS not yet
-    // connected → 409) so they don't bubble up as unhandled rejections.
-    // UI state is still reset via finally.
-    try {
-      await ipcBridge.conversation.stop.invoke({ conversation_id });
-    } catch (error) {
-      console.warn('[AcpSendBox] stop request failed', error);
-    } finally {
-      resetState();
-      resetActiveExecution('stop');
+    if (isStopping) return;
+    const stopAttempt = beginStopAttempt();
+    setIsStopping(true);
+    resetState();
+    pause();
+    resetActiveExecution('stop');
+
+    const result = await stopConversationAndConfirmRelease(conversation_id);
+    const stopAttemptStatus = getStopAttemptStatus(stopAttempt);
+    if (stopAttemptStatus !== 'current') {
+      if (shouldReleaseStopInteraction(stopAttemptStatus)) setIsStopping(false);
+      return;
     }
+    if (result.status === 'released' || result.status === 'deleted') {
+      confirmStopped();
+      setIsStopping(false);
+      resetActiveExecution('external-reset');
+      return;
+    }
+
+    console.warn('[AcpSendBox] stop request could not be confirmed', result);
+    restoreRunningAfterStopFailure();
+    setIsStopping(false);
+    Message.error({
+      content: t('conversation.stop.failed', { defaultValue: 'Failed to stop the current task. Please try again.' }),
+      closable: true,
+    });
   };
 
   // Clear conversation context (release model context); keeps message records.
@@ -577,6 +620,7 @@ Please check your local CLI tool authentication status`,
         onClear={clear}
       />
       <SendBox
+        key={conversation_id}
         showPinnedPlan
         onMobilePlusClick={isMobile ? () => setIsMobileSheetOpen(true) : undefined}
         value={content}

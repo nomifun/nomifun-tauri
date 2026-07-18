@@ -195,6 +195,10 @@ pub enum RemoteAgentStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentKillReason {
+    /// The user (or an owning execution controller) explicitly stopped the
+    /// active turn. External runtimes are recycled so a transport that ignores
+    /// its cooperative cancel request cannot keep the conversation wedged.
+    UserCancelled,
     IdleTimeout,
     /// The ACP session ended a turn with a terminal error. The conversation is
     /// preserved; only the in-memory Agent runtime is recycled before the next send

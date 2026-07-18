@@ -255,6 +255,8 @@ const SendBox: React.FC<{
   const conversationContext = useConversationContextSafe();
   const { t, i18n } = useTranslation();
   const [isLoading, setIsLoading] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
+  const isStoppingRef = useRef(false);
   const [isSingleLine, setIsSingleLine] = useState(!effectiveDefaultMultiLine);
   const [isInputFocused, setIsInputFocused] = useState(false);
   const isInputActive = isInputFocused;
@@ -1292,7 +1294,7 @@ const SendBox: React.FC<{
   };
 
   const sendMessageHandler = () => {
-    if (isUploading) return;
+    if (isUploading || isStopping) return;
     // 编辑模式：提交走截断重跑而非普通发送。
     if (editingMsgId && onEditResubmit) {
       if (!input.trim()) return;
@@ -1376,7 +1378,7 @@ const SendBox: React.FC<{
   };
 
   const steerMessageHandler = () => {
-    if (!onSteer || isUploading) return;
+    if (!onSteer || isUploading || isStopping) return;
     const finalMessage = composeAndClear();
     if (finalMessage == null) return;
     setIsLoading(true);
@@ -1388,10 +1390,14 @@ const SendBox: React.FC<{
   };
 
   const stopHandler = async () => {
-    if (!onStop) return;
+    if (!onStop || isStoppingRef.current) return;
+    isStoppingRef.current = true;
+    setIsStopping(true);
     try {
       await onStop();
     } finally {
+      isStoppingRef.current = false;
+      setIsStopping(false);
       setIsLoading(false);
     }
   };
@@ -1408,7 +1414,7 @@ const SendBox: React.FC<{
   const hasDraftToSend = input.trim().length > 0 || domSnippets.length > 0;
 
   // Calculate button disabled state
-  const isButtonDisabled = disabled || isUploading || (!input.trim() && domSnippets.length === 0);
+  const isButtonDisabled = disabled || isUploading || isStopping || (!input.trim() && domSnippets.length === 0);
 
   // Reusable send button component
   const sendButton = (
@@ -1429,9 +1435,12 @@ const SendBox: React.FC<{
     <Button
       shape='circle'
       type='secondary'
+      disabled={isStopping}
+      loading={isStopping}
       className='bg-animate sendbox-stop-button'
       icon={<div className='mx-auto size-12px bg-6'></div>}
       onClick={stopHandler}
+      data-testid='sendbox-stop-btn'
     ></Button>
   );
 
@@ -1453,6 +1462,7 @@ const SendBox: React.FC<{
   );
 
   const renderActionButtons = () => {
+    if (isStopping) return stopButton;
     if (allowSendWhileLoading && (isLoading || loading)) {
       // Keep a single action slot while processing: show stop when the draft is empty,
       // and only switch back to send once the user has prepared a queued message.
@@ -1552,7 +1562,7 @@ const SendBox: React.FC<{
           className='absolute left-1/2 bottom-[calc(100%+8px)] -translate-x-1/2 z-30'
           data-testid='sendbox-plan-anchor'
         >
-          <PinnedPlan plan={pinnedPlan} />
+          <PinnedPlan plan={pinnedPlan} active={Boolean(loading || isLoading)} />
         </div>
       )}
       <div

@@ -11,12 +11,13 @@ import { derivePinnedPlan } from './pinnedPlanModel';
 
 type PlanEntry = IMessagePlan['content']['entries'][number];
 
-function planMsg(entries: PlanEntry[], id = 'p1'): IMessagePlan {
+function planMsg(entries: PlanEntry[], id = 'p1', status?: IMessagePlan['status']): IMessagePlan {
   return {
     id,
     type: 'plan',
     conversation_id: parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000006'),
     content: { session_id: 's1', entries },
+    status,
   };
 }
 
@@ -55,6 +56,7 @@ describe('derivePinnedPlan', () => {
     expect(result!.total).toBe(4);
     expect(result!.done).toBe(2);
     expect(result!.entries).toHaveLength(4);
+    expect(result!.active).toBe(true);
   });
 
   test('uses the last (latest) plan when several exist', () => {
@@ -73,5 +75,23 @@ describe('derivePinnedPlan', () => {
     expect(result!.total).toBe(2);
     expect(result!.done).toBe(1);
     expect(result!.entries[0].content).toBe('new1');
+  });
+
+  test('keeps an incomplete terminal plan visible but marks it inactive', () => {
+    const result = derivePinnedPlan([
+      planMsg(
+        [
+          { content: 'done', status: 'completed' },
+          { content: 'cancelled remainder', status: 'in_progress' },
+        ],
+        'p-terminal',
+        'error'
+      ),
+    ]);
+
+    expect(result).not.toBeNull();
+    expect(result!.done).toBe(1);
+    expect(result!.total).toBe(2);
+    expect(result!.active).toBe(false);
   });
 });

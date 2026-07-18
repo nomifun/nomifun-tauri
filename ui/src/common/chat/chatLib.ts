@@ -22,6 +22,7 @@ import {
 } from '../types/ids';
 import { uuid } from '../utils';
 import { optionalDisplayText, toDisplayText } from './displayText';
+import { normalizeToolGroupStatus } from './toolGroupStatus';
 
 declare const confirmationCorrelationBrand: unique symbol;
 
@@ -723,20 +724,6 @@ const normalizeThinkingStatus = (value: unknown): IMessageThinking['content']['s
 const finiteNumber = (value: unknown): number | undefined =>
   typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 
-const normalizeToolGroupStatus = (value: unknown): IMessageToolGroup['content'][number]['status'] => {
-  switch (value) {
-    case 'Success':
-    case 'Error':
-    case 'Canceled':
-    case 'Pending':
-    case 'Confirming':
-    case 'Executing':
-      return value;
-    default:
-      return 'Executing';
-  }
-};
-
 const normalizeToolGroupResultDisplay = (
   value: unknown
 ): IMessageToolGroup['content'][number]['result_display'] | undefined => {
@@ -1105,6 +1092,7 @@ export const transformMessage = (message: IResponseMessage): TMessage | undefine
         position: 'left',
         conversation_id: message.conversation_id,
         created_at,
+        status: message.status,
         content: message.data as any,
       };
     }

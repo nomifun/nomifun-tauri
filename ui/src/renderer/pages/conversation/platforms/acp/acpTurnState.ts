@@ -19,6 +19,7 @@ export type AcpTurnEvent =
   | { type: 'submit'; turnId?: string; startedAt?: number }
   | { type: 'hydrate'; isRunning: boolean; processingStartedAt?: number }
   | { type: 'turnStarted'; turnId?: string; processingStartedAt?: number }
+  | { type: 'rawStreamStarted' }
   | { type: 'activity' }
   | { type: 'thinking' }
   | { type: 'content' }
@@ -59,7 +60,9 @@ export function acpTurnReducer(state: AcpTurnState, event: AcpTurnEvent): AcpTur
     case 'submit':
       return {
         phase: 'waiting_first_output',
-        turnId: event.turnId ?? state.turnId,
+        // A locally submitted turn is a new generation. Never retain the prior
+        // turn id while waiting for the backend's turn.started correlation id.
+        turnId: event.turnId,
         processingStartedAt: event.startedAt ?? state.processingStartedAt ?? Date.now(),
       };
 
@@ -79,6 +82,11 @@ export function acpTurnReducer(state: AcpTurnState, event: AcpTurnEvent): AcpTur
         turnId: event.turnId ?? state.turnId,
         ...withStartedAt(state, event.processingStartedAt),
       };
+
+    // ACP responseStream start is a transport/rendering boundary, not the
+    // conversation turn authority. It must not resurrect a confirmed stop.
+    case 'rawStreamStarted':
+      return state;
 
     case 'activity':
       return {

@@ -233,6 +233,10 @@ impl OpenClawAgentManager {
                             lagged = n,
                             "OpenClaw event relay lagged"
                         );
+                        self.runtime.emit_stream_broken(format!(
+                            "OpenClaw event relay lost {n} buffered event(s)"
+                        ));
+                        break;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
@@ -241,7 +245,9 @@ impl OpenClawAgentManager {
         }
 
         if self.runtime.status() == Some(ConversationStatus::Running) {
-            self.runtime.emit_error("OpenClaw connection closed");
+            self.runtime.emit_stream_broken("OpenClaw connection closed");
+        } else {
+            self.runtime.mark_transport_broken();
         }
     }
 
@@ -453,6 +459,10 @@ impl crate::runtime_handle::AgentRuntimeControl for OpenClawAgentManager {
         self.runtime.status()
     }
 
+    fn is_transport_healthy(&self) -> bool {
+        self.runtime.is_transport_healthy()
+    }
+
     fn last_activity_at(&self) -> TimestampMs {
         self.runtime.last_activity_at()
     }
@@ -463,6 +473,11 @@ impl crate::runtime_handle::AgentRuntimeControl for OpenClawAgentManager {
 
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
         self.runtime.bump_activity();
+        if !self.runtime.is_transport_healthy() {
+            return Err(AgentSendError::stream_broken(
+                "OpenClaw's permanent connection relay is no longer running",
+            ));
+        }
 
         let is_first = {
             let mut state = self.state.write().await;
@@ -473,6 +488,13 @@ impl crate::runtime_handle::AgentRuntimeControl for OpenClawAgentManager {
             first
         };
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
+        if !self.runtime.is_transport_healthy() {
+            let error = AgentSendError::stream_broken(
+                "OpenClaw's connection relay stopped during turn admission",
+            );
+            self.runtime.emit_error_data(error.stream_error().clone());
+            return Err(error);
+        }
 
         {
             let mut text_state = self.text_state.lock().await;
@@ -564,6 +586,15 @@ impl crate::runtime_handle::AgentRuntimeControl for OpenClawAgentManager {
                     error!(error = %ErrorChain(&e), "Failed to kill OpenClaw gateway process");
                 }
             });
+        }
+
+        if reason == Some(AgentKillReason::UserCancelled) {
+            self.runtime.emit_finish_with_reason(
+                None,
+                Some(crate::protocol::events::TurnStopReason::Cancelled),
+            );
+        } else if self.runtime.status() == Some(ConversationStatus::Running) {
+            self.runtime.emit_error(format!("OpenClaw agent was terminated ({reason:?})"));
         }
 
         Ok(())

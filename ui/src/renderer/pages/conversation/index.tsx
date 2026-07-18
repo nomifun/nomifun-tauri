@@ -9,6 +9,7 @@ import MessageListSkeleton from './Messages/components/MessageListSkeleton';
 import { useAutoTitle } from '@/renderer/hooks/chat/useAutoTitle';
 import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conversationCache';
 import { parseConversationId } from '@/common/types/ids';
+import { emitter } from '@/renderer/utils/emitter';
 
 const ChatConversationIndex: React.FC = () => {
   const { id } = useParams();
@@ -19,6 +20,7 @@ const ChatConversationIndex: React.FC = () => {
   const navigate = useNavigate();
   const { syncTitleFromHistory } = useAutoTitle();
   const notFoundHandledIdRef = useRef<string | undefined>(undefined);
+  const deletedHandledIdRef = useRef<string | undefined>(undefined);
   const defaultConversationTitle = t('conversation.welcome.newConversation');
 
   const { data, isLoading, mutate } = useSWR(id ? `conversation/${id}` : null, () => {
@@ -29,13 +31,34 @@ const ChatConversationIndex: React.FC = () => {
     if (!id) return;
 
     return ipcBridge.conversation.listChanged.on((event) => {
-      if (event.conversation_id !== conversationId || (event.action !== 'updated' && event.action !== 'created')) {
+      if (event.conversation_id !== conversationId) {
+        return;
+      }
+
+      if (event.action === 'deleted') {
+        if (deletedHandledIdRef.current === id) {
+          return;
+        }
+        deletedHandledIdRef.current = id;
+
+        // The backend publishes `deleted` only after the persistent row is
+        // authoritatively gone. This is also the success path for a delete
+        // request whose HTTP waiter timed out while its detached coordinator
+        // kept working. Reuse the local deletion channel so command queues and
+        // other per-conversation state are cleared before the route unmounts.
+        emitter.emit('conversation.deleted', conversationId);
+        void mutate(undefined, { revalidate: false });
+        void navigate('/guid', { replace: true });
+        return;
+      }
+
+      if (event.action !== 'updated' && event.action !== 'created') {
         return;
       }
 
       void mutate();
     });
-  }, [id, conversationId, mutate]);
+  }, [id, conversationId, mutate, navigate]);
 
   useEffect(() => {
     if (!data || data.name !== defaultConversationTitle) {

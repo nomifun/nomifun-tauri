@@ -1,12 +1,28 @@
+import { ipcBridge } from '@/common';
 import type { ConversationId } from '@/common/types/ids';
 import { conversationTarget } from '@/common/types/ids';
 import { sessionStorageKey } from '@/common/utils/browserStorageKey';
 import { uuid } from '@/common/utils';
+import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conversationCache';
+import { isConversationProcessing } from '@/renderer/pages/conversation/utils/conversationRuntime';
 import { useAddEventListener } from '@/renderer/utils/emitter';
 import { Message } from '@arco-design/web-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import useSWR from 'swr';
+import {
+  getCommandQueueReconcileDelayMs,
+  IDLE_EXECUTION_GATE,
+  isCommandQueueExecutionCurrent,
+  reduceCommandQueueExecutionGate,
+  type CommandQueueExecutionGate,
+} from './commandQueueExecutionGate';
+
+export {
+  reduceCommandQueueExecutionGate,
+  type CommandQueueExecutionGate,
+  type CommandQueueExecutionGateEvent,
+} from './commandQueueExecutionGate';
 
 export type ConversationCommandQueueItem = {
   id: string;
@@ -24,6 +40,24 @@ export const MAX_QUEUED_COMMANDS = 20;
 export const MAX_QUEUED_COMMAND_INPUT_LENGTH = 20_000;
 export const MAX_QUEUED_COMMAND_FILES = 50;
 export const MAX_QUEUED_COMMAND_STATE_BYTES = 256 * 1024;
+export const COMMAND_QUEUE_RUNTIME_QUERY_TIMEOUT_MS = 3_000;
+
+const getConversationForCommandQueue = async (conversationId: ConversationId) => {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      getConversationOrNull(conversationId),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error('Command queue runtime reconciliation timed out')),
+          COMMAND_QUEUE_RUNTIME_QUERY_TIMEOUT_MS
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+};
 
 export type QueueValidationFailureReason =
   | 'emptyInput'
@@ -311,7 +345,14 @@ type UseConversationCommandQueueOptions = {
   enabled?: boolean;
   isBusy: boolean;
   isHydrated?: boolean;
-  onExecute: (item: ConversationCommandQueueItem) => Promise<void>;
+  onExecute: (
+    item: ConversationCommandQueueItem,
+    execution?: ConversationCommandQueueExecution
+  ) => Promise<void>;
+};
+
+export type ConversationCommandQueueExecution = {
+  isCurrent: () => boolean;
 };
 
 type EnqueueCommandInput = Pick<ConversationCommandQueueItem, 'input' | 'files'>;
@@ -361,37 +402,185 @@ export const useConversationCommandQueue = ({
 
   const stateRef = useRef(data);
   const pausedRef = useRef(data.isPaused);
-  const waitingForTurnStartRef = useRef(false);
-  const waitingForTurnCompletionRef = useRef(false);
+  const executionGateRef = useRef<CommandQueueExecutionGate>(IDLE_EXECUTION_GATE);
+  const executionGenerationRef = useRef(0);
+  const executionConversationKeyRef = useRef(conversationKey);
+  const mountedRef = useRef(true);
   const interactionLockedRef = useRef(false);
   const [isInteractionLocked, setIsInteractionLocked] = useState(false);
   const [executionGateVersion, setExecutionGateVersion] = useState(0);
+
+  // Update during render so a promise owned by the previous conversation is
+  // stale before passive effect cleanup has a chance to run.
+  executionConversationKeyRef.current = conversationKey;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      executionGenerationRef.current += 1;
+    };
+  }, []);
+
+  useEffect(() => {
+    executionGenerationRef.current += 1;
+    executionGateRef.current = IDLE_EXECUTION_GATE;
+    pausedRef.current = false;
+    interactionLockedRef.current = false;
+    setIsInteractionLocked(false);
+    setExecutionGateVersion((version) => version + 1);
+
+    return () => {
+      executionGenerationRef.current += 1;
+    };
+  }, [conversationKey]);
+
+  const reconcileActiveExecution = useCallback(async (): Promise<boolean> => {
+    const gate = executionGateRef.current;
+    if (gate.phase === 'idle') return true;
+
+    try {
+      const conversation = await getConversationForCommandQueue(conversationKey);
+      if (executionGateRef.current !== gate) return false;
+      const isProcessing = isConversationProcessing(conversation);
+      // If turn.started was lost, the accepted-send gate remains in
+      // waiting_start. A later authoritative idle read must reconcile that
+      // phase as a start acknowledgement; treating it as completion would
+      // intentionally leave the gate closed forever.
+      const purpose = gate.phase === 'waiting_start' ? 'start' : 'completion';
+      const nextGate = reduceCommandQueueExecutionGate(gate, {
+        type: 'runtimeReconciled',
+        purpose,
+        runtimeIsProcessing: isProcessing,
+      });
+      if (nextGate === gate) return false;
+      executionGateRef.current = nextGate;
+      logCommandQueue(conversationKey, 'execution-reconciled', {
+        purpose,
+        runtimeIsProcessing: isProcessing,
+        nextPhase: nextGate.phase,
+        pendingItemCount: stateRef.current.items.length,
+      });
+      setExecutionGateVersion((version) => version + 1);
+      return true;
+    } catch (error) {
+      console.warn('[conversation-command-queue] Failed to reconcile active execution:', error);
+      return false;
+    }
+  }, [conversationKey]);
 
   useEffect(() => {
     stateRef.current = data;
   }, [data]);
 
   useEffect(() => {
-    if (waitingForTurnStartRef.current && isBusy) {
-      waitingForTurnStartRef.current = false;
-      waitingForTurnCompletionRef.current = true;
-      logCommandQueue(conversationKey, 'turn-started', {
-        pendingItemCount: stateRef.current.items.length,
-      });
-      return;
-    }
+    let disposed = false;
 
-    if (waitingForTurnCompletionRef.current && !isBusy) {
-      waitingForTurnCompletionRef.current = false;
-      logCommandQueue(conversationKey, 'turn-finished', {
+    const releaseExecutionGate = (expectedGate: CommandQueueExecutionGate, source: 'correlated' | 'runtime') => {
+      if (disposed || executionGateRef.current !== expectedGate) return;
+      executionGateRef.current = IDLE_EXECUTION_GATE;
+      logCommandQueue(conversationKey, 'turn-completed', {
+        source,
         pendingItemCount: stateRef.current.items.length,
       });
-    }
-  }, [conversation_id, isBusy]);
+      setExecutionGateVersion((version) => version + 1);
+    };
+
+    const unsubscribeStarted = ipcBridge.conversation.turnStarted.on((event) => {
+      if (event.conversation_id !== conversationKey) return;
+
+      const previousGate = executionGateRef.current;
+      const nextGate = reduceCommandQueueExecutionGate(previousGate, {
+        type: 'turnStarted',
+        turnId: event.turn_id,
+      });
+      if (nextGate === previousGate) return;
+
+      executionGateRef.current = nextGate;
+      logCommandQueue(conversationKey, 'turn-started', {
+        turnId: event.turn_id,
+        pendingItemCount: stateRef.current.items.length,
+      });
+      setExecutionGateVersion((version) => version + 1);
+    });
+
+    const unsubscribeCompleted = ipcBridge.conversation.turnCompleted.on((event) => {
+      if (event.conversation_id !== conversationKey || event.runtime.is_processing) return;
+
+      const gate = executionGateRef.current;
+      if (gate.phase === 'idle') return;
+
+      // A completion racing a newly submitted command still waiting for its
+      // start acknowledgement may belong to the previous generation. Only the
+      // send promise's accepted-result reconciliation may advance this phase.
+      if (gate.phase === 'waiting_start') return;
+
+      // New servers provide an exact generation id. Never let a delayed
+      // completion from an older turn release the gate for a newer turn.
+      const completedGate = reduceCommandQueueExecutionGate(gate, {
+        type: 'turnCompleted',
+        turnId: event.turn_id,
+        runtimeIsProcessing: event.runtime.is_processing,
+      });
+      if (completedGate.phase === 'idle') {
+        releaseExecutionGate(gate, 'correlated');
+        return;
+      }
+
+      // A mismatched correlated completion belongs to an older generation and
+      // must never be upgraded into an uncorrelated runtime release.
+      if (gate.phase === 'waiting_completion' && gate.turnId && event.turn_id) return;
+
+      // Backward compatibility for servers that predate turn_id on completion:
+      // re-read the authoritative runtime after the event. The identity check in
+      // releaseExecutionGate also rejects a start/reset that races this request.
+      void reconcileActiveExecution();
+    });
+
+    return () => {
+      disposed = true;
+      unsubscribeStarted();
+      unsubscribeCompleted();
+    };
+  }, [conversationKey, reconcileActiveExecution]);
 
   useEffect(() => {
     pausedRef.current = data.isPaused;
   }, [data.isPaused]);
+
+  // A manually-started turn (or a running conversation restored on mount) also
+  // owns the queue gate. Queue items added during that turn must wait for the
+  // authoritative completion event, not the earlier visual spinner down-edge.
+  useEffect(() => {
+    if (!isBusy || executionGateRef.current.phase !== 'idle') return;
+    executionGateRef.current = { phase: 'waiting_completion' };
+    setExecutionGateVersion((version) => version + 1);
+  }, [isBusy]);
+
+  // A missing turn.completed event must not strand the queue forever. The
+  // visual busy down-edge only schedules reconciliation; the gate is released
+  // after GET confirms the backend runtime is no longer processing. Failed or
+  // timed-out reads keep retrying with a capped backoff for as long as this
+  // idle UI still owns a non-idle gate, so service recovery always converges.
+  useEffect(() => {
+    if (isBusy || executionGateRef.current.phase === 'idle') return;
+    let cancelled = false;
+
+    void (async () => {
+      let attempt = 0;
+      while (!cancelled) {
+        const delayMs = getCommandQueueReconcileDelayMs(attempt);
+        await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+        if (cancelled) return;
+        if (await reconcileActiveExecution()) return;
+        attempt += 1;
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [executionGateVersion, isBusy, reconcileActiveExecution]);
 
   useEffect(() => {
     interactionLockedRef.current = isInteractionLocked;
@@ -402,8 +591,8 @@ export const useConversationCommandQueue = ({
       return;
     }
 
-    waitingForTurnStartRef.current = false;
-    waitingForTurnCompletionRef.current = false;
+    executionGateRef.current = IDLE_EXECUTION_GATE;
+    executionGenerationRef.current += 1;
     pausedRef.current = false;
     interactionLockedRef.current = false;
     stateRef.current = createDefaultQueueState();
@@ -439,8 +628,6 @@ export const useConversationCommandQueue = ({
   );
 
   const clear = useCallback(() => {
-    waitingForTurnStartRef.current = false;
-    waitingForTurnCompletionRef.current = false;
     pausedRef.current = false;
     logCommandQueue(conversationKey, 'cleared');
     void updateState(() => createDefaultQueueState());
@@ -452,6 +639,8 @@ export const useConversationCommandQueue = ({
       if (deletedConversationId !== conversationKey) {
         return;
       }
+      executionGenerationRef.current += 1;
+      executionGateRef.current = IDLE_EXECUTION_GATE;
       clear();
       removePersistedQueueState(conversationKey);
     },
@@ -578,8 +767,6 @@ export const useConversationCommandQueue = ({
     }
 
     pausedRef.current = true;
-    waitingForTurnStartRef.current = false;
-    waitingForTurnCompletionRef.current = false;
     logCommandQueue(conversationKey, 'paused', {
       itemCount: data.items.length,
     });
@@ -636,9 +823,22 @@ export const useConversationCommandQueue = ({
 
   const resetActiveExecution = useCallback(
     (reason: 'stop' | 'external-reset') => {
-      const hadPendingTurn = waitingForTurnStartRef.current || waitingForTurnCompletionRef.current;
-      waitingForTurnStartRef.current = false;
-      waitingForTurnCompletionRef.current = false;
+      executionGenerationRef.current += 1;
+      const hadPendingTurn = executionGateRef.current.phase !== 'idle';
+
+      // An optimistic stop may lower the visual busy flag before the backend has
+      // released its turn handle. Keep the queue closed until turn.completed;
+      // otherwise the next queued POST can still race the active turn and 409.
+      if (reason === 'stop') {
+        executionGateRef.current = reduceCommandQueueExecutionGate(executionGateRef.current, { type: 'stop' });
+        logCommandQueue(conversationKey, 'execution-stop-pending', {
+          pendingItemCount: stateRef.current.items.length,
+        });
+        setExecutionGateVersion((version) => version + 1);
+        return;
+      }
+
+      executionGateRef.current = IDLE_EXECUTION_GATE;
 
       if (!hadPendingTurn) {
         return;
@@ -659,8 +859,7 @@ export const useConversationCommandQueue = ({
       !isHydrated ||
       pausedRef.current ||
       isBusy ||
-      waitingForTurnStartRef.current ||
-      waitingForTurnCompletionRef.current ||
+      executionGateRef.current.phase !== 'idle' ||
       interactionLockedRef.current ||
       data.items.length === 0
     ) {
@@ -668,7 +867,17 @@ export const useConversationCommandQueue = ({
     }
 
     const [nextCommand, ...remainingCommands] = data.items;
-    waitingForTurnStartRef.current = true;
+    const executionGeneration = executionGenerationRef.current + 1;
+    executionGenerationRef.current = executionGeneration;
+    const isExecutionCurrent = (): boolean =>
+      isCommandQueueExecutionCurrent({
+        mounted: mountedRef.current,
+        currentConversationId: executionConversationKeyRef.current,
+        expectedConversationId: conversationKey,
+        currentGeneration: executionGenerationRef.current,
+        expectedGeneration: executionGeneration,
+      });
+    executionGateRef.current = reduceCommandQueueExecutionGate(executionGateRef.current, { type: 'begin' });
     logCommandQueue(conversationKey, 'dequeued', {
       item: summarizeQueuedCommand(nextCommand),
       remainingItemCount: remainingCommands.length,
@@ -678,25 +887,36 @@ export const useConversationCommandQueue = ({
       isPaused: false,
     }));
 
-    void onExecute(nextCommand).catch((error) => {
-      console.error('[conversation-command-queue] Failed to execute queued command:', error);
-      logCommandQueue(conversationKey, 'execute-failed', {
-        item: summarizeQueuedCommand(nextCommand),
-        error: error instanceof Error ? error.message : String(error),
+    void onExecute(nextCommand, { isCurrent: isExecutionCurrent })
+      .then(() => {
+        if (!isExecutionCurrent()) return;
+        // turn.started normally moves the gate first. If that WS event was
+        // missed, reconcile the accepted send against authoritative runtime so
+        // the queue cannot remain in waiting_start forever. The same helper is
+        // retried on the authoritative visual busy down-edge if this read fails.
+        void reconcileActiveExecution();
+      })
+      .catch((error) => {
+        if (!isExecutionCurrent() || executionGateRef.current.phase !== 'waiting_start') {
+          return;
+        }
+        console.error('[conversation-command-queue] Failed to execute queued command:', error);
+        logCommandQueue(conversationKey, 'execute-failed', {
+          item: summarizeQueuedCommand(nextCommand),
+          error: error instanceof Error ? error.message : String(error),
+        });
+        executionGateRef.current = IDLE_EXECUTION_GATE;
+        pausedRef.current = true;
+        void updateState((state) => ({
+          items: restoreQueuedCommand(state.items, nextCommand),
+          isPaused: true,
+        }));
+        Message.warning(
+          t('conversation.commandQueue.pausedAfterFailure', {
+            defaultValue: 'The next queued command could not start. Edit, reorder, or remove it to continue.',
+          })
+        );
       });
-      waitingForTurnStartRef.current = false;
-      waitingForTurnCompletionRef.current = false;
-      pausedRef.current = true;
-      void updateState((state) => ({
-        items: restoreQueuedCommand(state.items, nextCommand),
-        isPaused: true,
-      }));
-      Message.warning(
-        t('conversation.commandQueue.pausedAfterFailure', {
-          defaultValue: 'The next queued command could not start. Edit, reorder, or remove it to continue.',
-        })
-      );
-    });
   }, [
     conversation_id,
     data.items,
@@ -706,6 +926,7 @@ export const useConversationCommandQueue = ({
     isHydrated,
     isInteractionLocked,
     onExecute,
+    reconcileActiveExecution,
     t,
     updateState,
   ]);
@@ -725,5 +946,6 @@ export const useConversationCommandQueue = ({
     lockInteraction,
     unlockInteraction,
     resetActiveExecution,
+    reconcileActiveExecution,
   };
 };

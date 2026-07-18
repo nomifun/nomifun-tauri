@@ -22,6 +22,12 @@ import { isConversationProcessing } from '@/renderer/pages/conversation/utils/co
 import { warmupConversation } from '@/renderer/pages/conversation/utils/warmupConversation';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import type { ThoughtData } from '../thoughtTypes';
+import { reconcileConversationTurnAfterStreamTerminal } from '../reconcileConversationTurnAfterStreamTerminal';
+import {
+  classifyAuthoritativeTurnCompletion,
+  classifyAuthoritativeTurnStart,
+  resolveVerifiedAuthoritativeTurnStart,
+} from '../authoritativeTurnLifecyclePolicy';
 import { acpTurnReducer, initialAcpTurnState, isAcpTurnBusy } from './acpTurnState';
 
 export const normalizeAcpSlashCommands = (commands: unknown): SlashCommandItem[] => {
@@ -58,8 +64,13 @@ export type UseAcpMessageReturn = {
   acpStatus: 'connecting' | 'connected' | 'authenticated' | 'session_active' | 'disconnected' | 'error' | null;
   aiProcessing: boolean;
   setAiProcessing: (value: boolean) => void;
+  markTurnAccepted: () => void;
   processingStartedAt?: number;
   resetState: () => void;
+  confirmStopped: () => void;
+  restoreRunningAfterStopFailure: () => void;
+  getTurnStartGeneration: () => number;
+  getTurnCompletionGeneration: () => number;
   tokenUsage: TokenUsageData | null;
   context_limit: number;
   hasThinkingMessage: boolean;
@@ -83,6 +94,29 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
   const [tokenUsage, setTokenUsage] = useState<TokenUsageData | null>(null);
   const [context_limit, setContextLimit] = useState<number>(0);
   const [slashCommands, setSlashCommands] = useState<SlashCommandItem[]>([]);
+
+  // Correlate the conversation-scoped authoritative lifecycle. The stream can
+  // contain multiple internal continuation msg_ids; only turn.started /
+  // turn.completed carry the stable outer turn id.
+  const rootTurnIdRef = useRef<MessageId | null>(null);
+  const awaitingBackendTurnRef = useRef(false);
+  const cancelledTurnIdsRef = useRef(new Set<MessageId>());
+  const rejectUnannouncedStartRef = useRef(false);
+  const verifyUnannouncedStartRuntimeRef = useRef(false);
+  const turnLifecycleGenerationRef = useRef(0);
+  const turnStartGenerationRef = useRef(0);
+  const turnCompletionGenerationRef = useRef(0);
+  const turnReconcileSequenceRef = useRef(0);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      turnLifecycleGenerationRef.current += 1;
+      turnReconcileSequenceRef.current += 1;
+    };
+  }, []);
 
   // Track whether current turn has content output
   const hasContentInTurnRef = useRef(false);
@@ -153,14 +187,74 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
   }, []);
 
   const setAiProcessing = useCallback((value: boolean) => {
+    turnLifecycleGenerationRef.current += 1;
     if (value) {
+      turnStartGenerationRef.current += 1;
+      awaitingBackendTurnRef.current = true;
+      rootTurnIdRef.current = null;
+      rejectUnannouncedStartRef.current = false;
       turnFinishedRef.current = false;
       dispatchTurn({ type: 'submit' });
       return;
     }
 
+    awaitingBackendTurnRef.current = false;
+    rootTurnIdRef.current = null;
+    rejectUnannouncedStartRef.current = false;
+    turnFinishedRef.current = true;
     dispatchTurn({ type: 'reset' });
   }, []);
+
+  const settleCompletedTurn = useCallback(() => {
+    turnLifecycleGenerationRef.current += 1;
+    turnCompletionGenerationRef.current += 1;
+    turnReconcileSequenceRef.current += 1;
+    awaitingBackendTurnRef.current = false;
+    rootTurnIdRef.current = null;
+    rejectUnannouncedStartRef.current = false;
+    turnFinishedRef.current = true;
+    dispatchTurn({ type: 'finish' });
+    setThought({ subject: '', description: '' });
+    hasContentInTurnRef.current = false;
+    hasThinkingMessageRef.current = false;
+    activeThinkingRef.current = null;
+    setHasThinkingMessage(false);
+  }, []);
+
+  const reconcileAfterStreamTerminal = useCallback(() => {
+    const generation = turnLifecycleGenerationRef.current;
+    const sequence = turnReconcileSequenceRef.current + 1;
+    turnReconcileSequenceRef.current = sequence;
+    void reconcileConversationTurnAfterStreamTerminal(
+      conversation_id,
+      () =>
+        mountedRef.current &&
+        turnLifecycleGenerationRef.current === generation &&
+        turnReconcileSequenceRef.current === sequence,
+      settleCompletedTurn
+    );
+  }, [conversation_id, settleCompletedTurn]);
+
+  const markTurnAccepted = useCallback(
+    () => {
+      if (!awaitingBackendTurnRef.current || rejectUnannouncedStartRef.current) return;
+      if (!verifyUnannouncedStartRuntimeRef.current) turnLifecycleGenerationRef.current += 1;
+      rootTurnIdRef.current = null;
+      awaitingBackendTurnRef.current = false;
+      const generation = turnLifecycleGenerationRef.current;
+      const sequence = turnReconcileSequenceRef.current + 1;
+      turnReconcileSequenceRef.current = sequence;
+      void reconcileConversationTurnAfterStreamTerminal(
+        conversation_id,
+        () =>
+          mountedRef.current &&
+          turnLifecycleGenerationRef.current === generation &&
+          turnReconcileSequenceRef.current === sequence,
+        settleCompletedTurn
+      );
+    },
+    [conversation_id, settleCompletedTurn]
+  );
 
   const completeActiveThinking = useCallback(
     (
@@ -266,17 +360,16 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
           break;
         }
         case 'start':
-          // New turn starting — clear the finished guard and content flag
-          turnFinishedRef.current = false;
-          hasContentInTurnRef.current = false;
-          dispatchTurn({ type: 'turnStarted', turnId: message.msg_id, processingStartedAt: message.created_at });
+          // responseStream start is not correlated with the conversation-owned
+          // outer turn. turn.started/GET alone may open busy/rendering state,
+          // so a late raw start cannot revive a known-root stopped turn.
+          dispatchTurn({ type: 'rawStreamStarted' });
           break;
         case 'finish':
           {
-            // Mark turn as finished to prevent auto-recover from late messages
+            // Close stream rendering, but keep the backend-owned busy state
+            // until turn.completed or an authoritative runtime read settles it.
             turnFinishedRef.current = true;
-            // Immediate state reset (notification is handled by centralized hook)
-            dispatchTurn({ type: 'finish' });
             setThought({ subject: '', description: '' });
             hasContentInTurnRef.current = false;
             hasThinkingMessageRef.current = false;
@@ -292,6 +385,7 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
               );
               requestTraceRef.current = null;
             }
+            reconcileAfterStreamTerminal();
           }
           break;
         case 'text':
@@ -320,7 +414,7 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
             // Reset all loading states on error or disconnect so UI doesn't stay stuck
             if (['error', 'disconnected'].includes(agentData.status)) {
               turnFinishedRef.current = true;
-              dispatchTurn({ type: 'error' });
+              reconcileAfterStreamTerminal();
             }
           }
           addOrUpdateMessage(transformedMessage);
@@ -418,9 +512,9 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
           }
           break;
         case 'error':
-          // Stop all loading states when error occurs
+          // Error is terminal for stream rendering, not necessarily for the
+          // backend turn handle. Authoritative completion lowers busy state.
           turnFinishedRef.current = true;
-          dispatchTurn({ type: 'error' });
           activeThinkingRef.current = null;
           addOrUpdateMessage(transformedMessage);
           // Log request error
@@ -434,6 +528,7 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
             );
             requestTraceRef.current = null;
           }
+          reconcileAfterStreamTerminal();
           break;
         default:
           // Auto-recover running state only if turn hasn't finished
@@ -448,6 +543,7 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
       conversation_id,
       addOrUpdateMessage,
       completeActiveThinking,
+      reconcileAfterStreamTerminal,
       throttledSetThought,
       setThought,
       setAcpStatus,
@@ -459,20 +555,114 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
   }, [handleResponseMessage]);
 
   useEffect(() => {
-    return ipcBridge.conversation.turnStarted.on((event) => {
+    let disposed = false;
+    const unsubscribe = ipcBridge.conversation.turnStarted.on((event) => {
       if (conversation_id !== event.conversation_id) {
         return;
       }
 
-      turnFinishedRef.current = false;
-      hasContentInTurnRef.current = false;
-      dispatchTurn({
-        type: 'turnStarted',
+      const startAction = classifyAuthoritativeTurnStart({
         turnId: event.turn_id,
-        processingStartedAt: event.runtime.processing_started_at,
+        cancelledTurnIds: cancelledTurnIdsRef.current,
+        rejectUnannouncedStart: rejectUnannouncedStartRef.current,
+        awaitingBackendTurn: awaitingBackendTurnRef.current,
+        verifyUnannouncedStartRuntime: verifyUnannouncedStartRuntimeRef.current,
       });
+      if (startAction === 'ignore') return;
+
+      const acceptStart = () => {
+        turnStartGenerationRef.current += 1;
+        turnLifecycleGenerationRef.current += 1;
+        awaitingBackendTurnRef.current = false;
+        rootTurnIdRef.current = event.turn_id ?? null;
+        rejectUnannouncedStartRef.current = false;
+        verifyUnannouncedStartRuntimeRef.current = false;
+        turnFinishedRef.current = false;
+        hasContentInTurnRef.current = false;
+        dispatchTurn({
+          type: 'turnStarted',
+          turnId: event.turn_id,
+          processingStartedAt: event.runtime.processing_started_at,
+        });
+      };
+
+      if (startAction === 'accept') {
+        acceptStart();
+        return;
+      }
+
+      const generation = turnLifecycleGenerationRef.current;
+      void getConversationOrNull(conversation_id)
+        .then((conversation) => {
+          if (
+            disposed ||
+            turnLifecycleGenerationRef.current !== generation ||
+            !verifyUnannouncedStartRuntimeRef.current ||
+            resolveVerifiedAuthoritativeTurnStart({
+              runtimeIsProcessing: isConversationProcessing(conversation),
+              eventProcessingStartedAt: event.runtime.processing_started_at,
+              runtimeProcessingStartedAt: conversation?.runtime?.processing_started_at,
+            }) !== 'accept'
+          ) {
+            return;
+          }
+          acceptStart();
+        })
+        .catch((error) => {
+          if (disposed) return;
+          console.warn('[useAcpMessage] Failed to verify unannounced turn start:', error);
+        });
     });
+    return () => {
+      disposed = true;
+      unsubscribe();
+    };
   }, [conversation_id]);
+
+  useEffect(() => {
+    let disposed = false;
+
+    const unsubscribe = ipcBridge.conversation.turnCompleted.on((event) => {
+      if (conversation_id !== event.conversation_id || event.runtime.is_processing) return;
+
+      const rootTurnId = rootTurnIdRef.current;
+      const awaitingBackendTurn = awaitingBackendTurnRef.current;
+      const action = classifyAuthoritativeTurnCompletion({
+        rootTurnId,
+        completedTurnId: event.turn_id,
+        awaitingBackendTurn,
+      });
+      if (action === 'settle') {
+        settleCompletedTurn();
+        return;
+      }
+      if (action === 'ignore') return;
+
+      // Compatibility with older servers that omitted turn_id: verify the live
+      // runtime before lowering UI state, and reject a start that races the GET.
+      const observedRootTurnId = rootTurnId;
+      const observedAwaitingBackendTurn = awaitingBackendTurn;
+      const generation = turnLifecycleGenerationRef.current;
+      const sequence = turnReconcileSequenceRef.current + 1;
+      turnReconcileSequenceRef.current = sequence;
+      void reconcileConversationTurnAfterStreamTerminal(
+        conversation_id,
+        () =>
+          !disposed &&
+          mountedRef.current &&
+          turnLifecycleGenerationRef.current === generation &&
+          turnReconcileSequenceRef.current === sequence &&
+          rootTurnIdRef.current === observedRootTurnId &&
+          awaitingBackendTurnRef.current === observedAwaitingBackendTurn,
+        settleCompletedTurn
+      );
+    });
+
+    return () => {
+      disposed = true;
+      unsubscribe();
+    };
+  }, [conversation_id, settleCompletedTurn]);
 
   // Reset state when conversation changes and restore actual running status
   useEffect(() => {
@@ -484,7 +674,14 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
     setContextLimit(0);
     setSlashCommands([]);
     hasContentInTurnRef.current = false;
+    turnLifecycleGenerationRef.current += 1;
+    const hydrationGeneration = turnLifecycleGenerationRef.current;
     turnFinishedRef.current = false;
+    awaitingBackendTurnRef.current = false;
+    rootTurnIdRef.current = null;
+    cancelledTurnIdsRef.current.clear();
+    rejectUnannouncedStartRef.current = false;
+    verifyUnannouncedStartRuntimeRef.current = false;
     hasThinkingMessageRef.current = false;
     activeThinkingRef.current = null;
     setHasThinkingMessage(false);
@@ -495,6 +692,10 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
     void getConversationOrNull(conversation_id)
       .then((res) => {
         if (cancelled) {
+          return;
+        }
+        if (turnLifecycleGenerationRef.current !== hydrationGeneration) {
+          setHasHydratedRunningState(true);
           return;
         }
 
@@ -524,6 +725,10 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
       })
       .catch((error: unknown) => {
         if (cancelled) return;
+        if (turnLifecycleGenerationRef.current !== hydrationGeneration) {
+          setHasHydratedRunningState(true);
+          return;
+        }
         dispatchTurn({ type: 'hydrate', isRunning: false });
         setHasHydratedRunningState(true);
 
@@ -565,6 +770,20 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
   }, [conversation_id, options?.skipWarmup]);
 
   const resetState = useCallback(() => {
+    turnLifecycleGenerationRef.current += 1;
+    const rootTurnId = rootTurnIdRef.current;
+    if (rootTurnId) {
+      const cancelled = cancelledTurnIdsRef.current;
+      cancelled.add(rootTurnId);
+      // Bound tombstones for very long-lived conversations.
+      if (cancelled.size > 32) {
+        const oldest = cancelled.values().next().value;
+        if (oldest) cancelled.delete(oldest);
+      }
+    }
+    awaitingBackendTurnRef.current = false;
+    rejectUnannouncedStartRef.current = true;
+    verifyUnannouncedStartRuntimeRef.current = rootTurnId === null;
     turnFinishedRef.current = true;
     dispatchTurn({ type: 'reset' });
     setThought({ subject: '', description: '' });
@@ -573,6 +792,40 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
     activeThinkingRef.current = null;
     setHasThinkingMessage(false);
   }, []);
+
+  const restoreRunningAfterStopFailure = useCallback(() => {
+    turnLifecycleGenerationRef.current += 1;
+    const rootTurnId = rootTurnIdRef.current;
+    if (rootTurnId) cancelledTurnIdsRef.current.delete(rootTurnId);
+    awaitingBackendTurnRef.current = false;
+    rejectUnannouncedStartRef.current = false;
+    verifyUnannouncedStartRuntimeRef.current = false;
+    turnFinishedRef.current = false;
+    dispatchTurn({ type: 'hydrate', isRunning: true });
+    const generation = turnLifecycleGenerationRef.current;
+    const sequence = turnReconcileSequenceRef.current + 1;
+    turnReconcileSequenceRef.current = sequence;
+    void reconcileConversationTurnAfterStreamTerminal(
+      conversation_id,
+      () =>
+        mountedRef.current &&
+        turnLifecycleGenerationRef.current === generation &&
+        turnReconcileSequenceRef.current === sequence,
+      settleCompletedTurn
+    );
+  }, [conversation_id, settleCompletedTurn]);
+
+  const confirmStopped = useCallback(() => {
+    turnLifecycleGenerationRef.current += 1;
+    rootTurnIdRef.current = null;
+    awaitingBackendTurnRef.current = false;
+    rejectUnannouncedStartRef.current = false;
+    turnFinishedRef.current = true;
+    dispatchTurn({ type: 'reset' });
+  }, []);
+
+  const getTurnStartGeneration = useCallback(() => turnStartGenerationRef.current, []);
+  const getTurnCompletionGeneration = useCallback(() => turnCompletionGenerationRef.current, []);
 
   const fetchSlashCommands = useCallback(() => {
     void ipcBridge.conversation.getSlashCommands
@@ -592,8 +845,13 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
     acpStatus,
     aiProcessing,
     setAiProcessing,
+    markTurnAccepted,
     processingStartedAt: turnState.processingStartedAt,
     resetState,
+    confirmStopped,
+    restoreRunningAfterStopFailure,
+    getTurnStartGeneration,
+    getTurnCompletionGeneration,
     tokenUsage,
     context_limit,
     hasThinkingMessage,

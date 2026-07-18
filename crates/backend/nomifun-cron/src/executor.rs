@@ -12,7 +12,7 @@ use nomifun_common::{
     AgentType, AppError, ConversationId, CronJobId, ExecutionAuthority, ProviderWithModel, UserId,
     now_ms, validate_prefixed_id, workspace_path_has_edge_whitespace_segment,
 };
-use nomifun_conversation::ConversationService;
+use nomifun_conversation::{ConversationService, runtime_state::RuntimeBuildLease};
 use nomifun_db::models::MessageRow;
 use nomifun_db::{ConversationRowUpdate, IConversationRepository};
 use nomifun_realtime::UserEventSink;
@@ -52,10 +52,11 @@ pub enum ExecutionResult {
     Error { message: String },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct PreparedExecution {
     pub conversation_id: String,
     saved_skill: Option<SavedSkillContext>,
+    build_lease: RuntimeBuildLease,
 }
 
 /// Inputs captured for the post-turn skill-suggest detection pipeline.
@@ -147,6 +148,24 @@ impl JobExecutor {
         {
             return self.handle_busy(job);
         }
+        let mut build_lease = if matches!(job.execution_mode, ExecutionMode::Existing) {
+            match job.conversation_id.as_deref() {
+                Some(conversation_id) => match self
+                    .conversation_service
+                    .begin_public_runtime_build(conversation_id, &job.user_id)
+                {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        return ExecutionResult::Error {
+                            message: error.to_string(),
+                        };
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
 
         // Existing-mode cron is a public/background initiator. Fence retained
         // Attempt transcripts before skill-file preparation or any runtime
@@ -190,6 +209,19 @@ impl JobExecutor {
                     };
                 }
             };
+        if build_lease.is_none() {
+            build_lease = match self
+                .conversation_service
+                .begin_public_runtime_build(&target_conversation_id, &job.user_id)
+            {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    return ExecutionResult::Error {
+                        message: error.to_string(),
+                    };
+                }
+            };
+        }
 
         if let Err(error) = self
             .ensure_public_conversation_mutable(job, &target_conversation_id)
@@ -204,7 +236,12 @@ impl JobExecutor {
             .set_processing(&target_conversation_id, true);
 
         let result = self
-            .execute_inner(job, &target_conversation_id, saved_skill.as_ref())
+            .execute_inner_with_lease(
+                job,
+                &target_conversation_id,
+                saved_skill.as_ref(),
+                build_lease.expect("cron runtime lease resolved before execution"),
+            )
             .await;
 
         self.busy_guard
@@ -218,6 +255,18 @@ impl JobExecutor {
         job: &CronJob,
     ) -> Result<PreparedExecution, CronError> {
         cron_job_to_row(job)?;
+        let mut build_lease = if matches!(job.execution_mode, ExecutionMode::Existing) {
+            job.conversation_id
+                .as_deref()
+                .map(|conversation_id| {
+                    self.conversation_service
+                        .begin_public_runtime_build(conversation_id, &job.user_id)
+                        .map_err(CronError::App)
+                })
+                .transpose()?
+        } else {
+            None
+        };
         if matches!(job.execution_mode, ExecutionMode::Existing)
             && let Some(conversation_id) = job.conversation_id.as_deref()
         {
@@ -238,12 +287,20 @@ impl JobExecutor {
 
         self.validate_runtime_job_workspace(job).await?;
         let conversation_id = self.resolve_conversation(job, saved_skill.as_ref()).await?;
+        if build_lease.is_none() {
+            build_lease = Some(
+                self.conversation_service
+                    .begin_public_runtime_build(&conversation_id, &job.user_id)
+                    .map_err(CronError::App)?,
+            );
+        }
         self.ensure_public_conversation_mutable(job, &conversation_id)
             .await?;
 
         Ok(PreparedExecution {
             conversation_id,
             saved_skill,
+            build_lease: build_lease.expect("cron runtime lease resolved during preparation"),
         })
     }
 
@@ -260,19 +317,25 @@ impl JobExecutor {
                 message: error.to_string(),
             };
         }
+        let PreparedExecution {
+            conversation_id,
+            saved_skill,
+            build_lease,
+        } = prepared;
         self.busy_guard
-            .set_processing(&prepared.conversation_id, true);
+            .set_processing(&conversation_id, true);
 
         let result = self
-            .execute_inner(
+            .execute_inner_with_lease(
                 job,
-                &prepared.conversation_id,
-                prepared.saved_skill.as_ref(),
+                &conversation_id,
+                saved_skill.as_ref(),
+                build_lease,
             )
             .await;
 
         self.busy_guard
-            .set_processing(&prepared.conversation_id, false);
+            .set_processing(&conversation_id, false);
 
         result
     }
@@ -537,7 +600,35 @@ impl JobExecutor {
         conversation_id: &str,
         saved_skill: Option<&SavedSkillContext>,
     ) -> ExecutionResult {
+        let build_lease = match self
+            .conversation_service
+            .begin_public_runtime_build(conversation_id, &job.user_id)
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                return ExecutionResult::Error {
+                    message: error.to_string(),
+                };
+            }
+        };
+        self.execute_inner_with_lease(job, conversation_id, saved_skill, build_lease)
+            .await
+    }
+
+    async fn execute_inner_with_lease(
+        &self,
+        job: &CronJob,
+        conversation_id: &str,
+        saved_skill: Option<&SavedSkillContext>,
+        build_lease: RuntimeBuildLease,
+    ) -> ExecutionResult {
+        let build_token = build_lease.cancellation_token();
         let agent_type = parse_agent_type(&self.agent_registry, &job.agent_type).await;
+        if let Err(error) = build_lease.ensure_active() {
+            return ExecutionResult::Error {
+                message: error.to_string(),
+            };
+        }
         // The interactive `send_message` path resolves the model by parsing
         // `conversation.model` via
         // `nomifun_conversation::runtime_options::provider_model_from_conversation_row`.
@@ -703,9 +794,19 @@ impl JobExecutor {
             conversation_created_at,
         };
 
+        if let Err(error) = build_lease.ensure_active() {
+            return ExecutionResult::Error {
+                message: error.to_string(),
+            };
+        }
         let agent = match self
             .runtime_registry
-            .get_or_create_runtime(conversation_id, options)
+            .get_or_create_runtime_for_turn(
+                conversation_id,
+                build_lease.id(),
+                build_token,
+                options,
+            )
             .await
         {
             Ok(handle) => handle,
@@ -720,6 +821,12 @@ impl JobExecutor {
                 };
             }
         };
+        if build_lease.is_cancelled() {
+            let _ = agent.kill(Some(nomifun_common::AgentKillReason::UserCancelled));
+            return ExecutionResult::Error {
+                message: format!("conversation {conversation_id} cron preparation was cancelled"),
+            };
+        }
 
         if let Err(e) = self.ensure_agent_session_mode(job, &agent).await {
             error!(
@@ -730,6 +837,12 @@ impl JobExecutor {
             );
             return ExecutionResult::Error {
                 message: e.to_string(),
+            };
+        }
+        if build_lease.is_cancelled() {
+            let _ = agent.kill(Some(nomifun_common::AgentKillReason::UserCancelled));
+            return ExecutionResult::Error {
+                message: format!("conversation {conversation_id} cron preparation was cancelled"),
             };
         }
 
@@ -756,6 +869,12 @@ impl JobExecutor {
                 ),
             }
         }
+        if build_lease.is_cancelled() {
+            let _ = agent.kill(Some(nomifun_common::AgentKillReason::UserCancelled));
+            return ExecutionResult::Error {
+                message: format!("conversation {conversation_id} cron preparation was cancelled"),
+            };
+        }
 
         let prompt = build_prompt(job, saved_skill, self.controls_host(&job.user_id));
         let turn_rx = agent.subscribe();
@@ -772,7 +891,13 @@ impl JobExecutor {
 
         match self
             .conversation_service
-            .send_message(&job.user_id, conversation_id, send_req, &self.runtime_registry)
+            .send_message_with_runtime_build_lease(
+                &job.user_id,
+                conversation_id,
+                send_req,
+                &self.runtime_registry,
+                build_lease,
+            )
             .await
         {
             Ok(_) => {
@@ -1145,7 +1270,13 @@ async fn wait_for_turn_completion(mut rx: broadcast::Receiver<AgentStreamEvent>)
                 Ok(AgentStreamEvent::Finish(_)) | Ok(AgentStreamEvent::Error(_)) => return true,
                 Ok(_) => continue,
                 Err(broadcast::error::RecvError::Closed) => return true,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                // The skipped item may be the only Finish/Error. Report that
+                // completion was not observed instead of waiting for another
+                // terminal event while the long-lived sender stays open.
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "Cron turn completion stream lost integrity");
+                    return false;
+                }
             }
         }
     };

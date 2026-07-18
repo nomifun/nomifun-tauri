@@ -39,6 +39,24 @@ impl ClassifiedError {
 }
 
 impl AgentSendError {
+    /// An unrecoverable loss of the manager's permanent event relay. This is
+    /// deliberately distinct from provider/API errors: Conversation evicts
+    /// the cached runtime on this code before admitting another turn.
+    pub fn stream_broken(detail: impl Into<String>) -> Self {
+        Self::new(
+            "The Agent event stream disconnected",
+            AgentErrorCode::NomifunStreamBroken,
+            AgentErrorOwnership::Nomifun,
+            Some(detail.into()),
+            true,
+            true,
+            resolution(
+                AgentErrorResolutionKind::Retry,
+                Some(AgentErrorResolutionTarget::AgentSettings),
+            ),
+        )
+    }
+
     pub fn new(
         message: impl Into<String>,
         code: AgentErrorCode,

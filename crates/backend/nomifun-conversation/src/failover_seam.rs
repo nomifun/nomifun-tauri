@@ -15,6 +15,7 @@ use nomifun_api_types::{ExecutionModelPool, ExecutionModelRef, HealthStatus, Mod
 use nomifun_common::{AgentKillReason, AgentType, ErrorChain, ProviderWithModel, now_ms};
 use nomifun_db::{ConversationRowUpdate, UpdateProviderParams};
 use nomifun_ai_agent::{AgentRuntimeHandle, AgentRuntimeRegistry};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::convert::string_to_enum;
@@ -169,6 +170,34 @@ impl ConversationService {
         tried: &[ProviderWithModel],
         runtime_registry: &Arc<dyn AgentRuntimeRegistry>,
     ) -> Option<FailoverSwitch> {
+        // A standalone failover is also a runtime-build initiator. Acquire the
+        // lease before the first await so stop/delete can cancel this exact
+        // attempt instead of letting it resurrect a stale runtime.
+        let lease = self.begin_runtime_build(conversation_id).ok()?;
+        let cancellation = lease.cancellation_token();
+        self.perform_model_failover_inner(
+            conversation_id,
+            config,
+            tried,
+            runtime_registry,
+            lease.id(),
+            &cancellation,
+        )
+        .await
+    }
+
+    async fn perform_model_failover_inner(
+        &self,
+        conversation_id: &str,
+        config: &nomifun_api_types::ModelFailoverConfig,
+        tried: &[ProviderWithModel],
+        runtime_registry: &Arc<dyn AgentRuntimeRegistry>,
+        runtime_generation: u64,
+        cancellation: &CancellationToken,
+    ) -> Option<FailoverSwitch> {
+        if cancellation.is_cancelled() {
+            return None;
+        }
         let Some((provider_repo, _)) = self.failover_deps() else {
             return None;
         };
@@ -184,6 +213,9 @@ impl ConversationService {
                 return None;
             }
         };
+        if cancellation.is_cancelled() {
+            return None;
+        }
 
         // ACP 边界(review #9,plan D7)的**唯一强制闸**:仅 nomi 自有引擎的普通会话
         // 可换模型重建。ACP / 终端 / 远程等 agent 自管模型(独立 reconcile),在此被
@@ -223,6 +255,9 @@ impl ConversationService {
                 return None;
             }
         };
+        if cancellation.is_cancelled() {
+            return None;
+        }
 
         // 队列耗尽 / 无可用候选 → None(调用方回落到原始错误)。
         let picked = next_failover_model(&config.queue, &failed, tried, &providers)?;
@@ -259,9 +294,15 @@ impl ConversationService {
             warn!(error = %ErrorChain(&e), conversation_id, "Failover aborted: failed to persist new model");
             return None;
         }
+        if cancellation.is_cancelled() {
+            return None;
+        }
 
         if config.stamp_unhealthy {
             self.stamp_model_unhealthy(&failed).await;
+            if cancellation.is_cancelled() {
+                return None;
+            }
         }
 
         info!(
@@ -276,9 +317,17 @@ impl ConversationService {
 
         // kill_and_wait,镜像 evict_acp_task_after_terminal_error(acp_error_recovery.rs):
         // 旧任务句柄绑定旧 provider/model,必须等它落幕再用新行重建。
-        runtime_registry
-            .terminate_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
-            .await;
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return None,
+            _ = runtime_registry.terminate_and_wait(
+                conversation_id,
+                Some(AgentKillReason::AgentErrorRecovery),
+            ) => {}
+        }
+        if cancellation.is_cancelled() {
+            return None;
+        }
 
         // 用**刷新后**的行重建。re-fetch 以拿到刚写入的新 model 列。
         let refreshed = match self.conversation_repo().get(conv_id).await {
@@ -292,6 +341,9 @@ impl ConversationService {
                 return None;
             }
         };
+        if cancellation.is_cancelled() {
+            return None;
+        }
         let runtime_options = match self.build_runtime_options(&refreshed) {
             Ok(opts) => opts,
             Err(e) => {
@@ -299,13 +351,25 @@ impl ConversationService {
                 return None;
             }
         };
-        let agent = match runtime_registry.get_or_create_runtime(conversation_id, runtime_options).await {
+        let agent = match runtime_registry
+            .get_or_create_runtime_for_turn(
+                conversation_id,
+                runtime_generation,
+                cancellation.clone(),
+                runtime_options,
+            )
+            .await
+        {
             Ok(agent) => agent,
             Err(e) => {
                 warn!(error = %ErrorChain(&e), conversation_id, "Failover aborted: rebuild task failed");
                 return None;
             }
         };
+        if cancellation.is_cancelled() {
+            let _ = agent.kill(Some(AgentKillReason::UserCancelled));
+            return None;
+        }
 
         Some(FailoverSwitch { agent, picked })
     }
@@ -317,7 +381,12 @@ impl ConversationService {
         &self,
         conversation_id: &str,
         runtime_registry: &Arc<dyn AgentRuntimeRegistry>,
+        turn_generation: u64,
+        cancellation: &CancellationToken,
     ) -> Option<AgentRuntimeHandle> {
+        if cancellation.is_cancelled() {
+            return None;
+        }
         let conv_id = conversation_id;
         let row = match self.conversation_repo().get(conv_id).await {
             Ok(Some(row)) => row,
@@ -330,6 +399,9 @@ impl ConversationService {
                 return None;
             }
         };
+        if cancellation.is_cancelled() {
+            return None;
+        }
         let agent_type: AgentType = string_to_enum(&row.r#type).ok()?;
         if agent_type != AgentType::Nomi {
             return None;
@@ -347,9 +419,21 @@ impl ConversationService {
         };
         nomifun_common::VisionUnsupportedRegistry::global().mark_unsupported(&pm.provider_id, &pm.model);
 
-        runtime_registry
-            .terminate_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
-            .await;
+        if cancellation.is_cancelled() {
+            return None;
+        }
+
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return None,
+            _ = runtime_registry.terminate_and_wait(
+                conversation_id,
+                Some(AgentKillReason::AgentErrorRecovery),
+            ) => {}
+        }
+        if cancellation.is_cancelled() {
+            return None;
+        }
 
         let runtime_options = match self.build_runtime_options(&row) {
             Ok(opts) => opts,
@@ -358,8 +442,20 @@ impl ConversationService {
                 return None;
             }
         };
-        match runtime_registry.get_or_create_runtime(conversation_id, runtime_options).await {
-            Ok(agent) => Some(agent),
+        match runtime_registry
+            .get_or_create_runtime_for_turn(
+                conversation_id,
+                turn_generation,
+                cancellation.clone(),
+                runtime_options,
+            )
+            .await
+        {
+            Ok(agent) if !cancellation.is_cancelled() => Some(agent),
+            Ok(agent) => {
+                let _ = agent.kill(Some(AgentKillReason::UserCancelled));
+                None
+            }
             Err(e) => {
                 warn!(error = %ErrorChain(&e), conversation_id, "strip_images_and_rebuild aborted: rebuild failed");
                 None
@@ -392,7 +488,12 @@ impl ConversationService {
         tried: &[ProviderWithModel],
         extra_json: &str,
         runtime_registry: &Arc<dyn AgentRuntimeRegistry>,
+        turn_generation: u64,
+        cancellation: &CancellationToken,
     ) -> Option<FailoverSwitch> {
+        if cancellation.is_cancelled() {
+            return None;
+        }
         // (5) 仅 nomi 自有引擎的普通会话。便宜的早闸(避免无谓加载);真正的强制点
         //     在 `perform_model_failover` 的 ACP 边界闸(review #9),send-loop 与 IDMM
         //     共用那一处。
@@ -421,6 +522,9 @@ impl ConversationService {
         }
         // (3) 启用?(会话级覆盖否则全局)
         let config = self.resolve_failover_config(extra_json).await?;
+        if cancellation.is_cancelled() {
+            return None;
+        }
         if !config.enabled {
             return None;
         }
@@ -437,8 +541,15 @@ impl ConversationService {
             return None;
         }
 
-        self.perform_model_failover(conversation_id, &config, tried, runtime_registry)
-            .await
+        self.perform_model_failover_inner(
+            conversation_id,
+            &config,
+            tried,
+            runtime_registry,
+            turn_generation,
+            cancellation,
+        )
+        .await
     }
 
     /// IDMM 故障值守(plan D6)的故障转移入口。`maybe_failover_in_send_loop` 是
@@ -469,6 +580,11 @@ impl ConversationService {
         runtime_registry: &Arc<dyn AgentRuntimeRegistry>,
     ) -> Result<bool, nomifun_common::AppError> {
         let conv_id = parse_conv_id(conversation_id)?;
+        // Keep one lease across row/config reads, rebuild, and hidden-send
+        // admission. Reacquiring after rebuild would leave a stop/delete gap
+        // in which this old IDMM wakeup could become a fresh initiator.
+        let lease = self.begin_public_runtime_build(conversation_id, user_id)?;
+        let cancellation = lease.cancellation_token();
         let extra_json = match self.conversation_repo().get(conv_id).await {
             Ok(Some(row)) => row.extra,
             Ok(None) => {
@@ -477,10 +593,12 @@ impl ConversationService {
             }
             Err(e) => return Err(nomifun_common::AppError::from(e)),
         };
+        lease.ensure_active()?;
 
         let Some(config) = self.resolve_failover_config(&extra_json).await else {
             return Ok(false);
         };
+        lease.ensure_active()?;
         if !config.enabled {
             return Ok(false);
         }
@@ -488,7 +606,14 @@ impl ConversationService {
         // 同一份换模型 + 重建实现(send-loop 也调它)。None = 队列耗尽 → 不转移。
         // IDMM 每次 Failover 只切一次,无跨回合累积,故 `tried` 传空切片(review #2)。
         if self
-            .perform_model_failover(conversation_id, &config, &[], runtime_registry)
+            .perform_model_failover_inner(
+                conversation_id,
+                &config,
+                &[],
+                runtime_registry,
+                lease.id(),
+                &cancellation,
+            )
             .await
             .is_none()
         {
@@ -505,7 +630,13 @@ impl ConversationService {
             origin: Some("idmm".into()),
             channel_platform: None,
         };
-        self.send_message(user_id, conversation_id, req, runtime_registry)
+        self.send_message_with_runtime_build_lease(
+            user_id,
+            conversation_id,
+            req,
+            runtime_registry,
+            lease,
+        )
             .await
             .map(|_| true)
     }

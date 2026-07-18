@@ -29,7 +29,7 @@ describe('PinnedPlan composer popover layout', () => {
     expect(source.includes("boxShadow: 'none'")).toBe(true);
     expect(source.includes('h-3px w-full')).toBe(false);
     expect(source.includes('animate-spin')).toBe(true);
-    expect(source.includes('{done < total && (')).toBe(true);
+    expect(source.includes('{active && done < total && (')).toBe(true);
     expect(source.includes("className='ml-18px whitespace-nowrap text-12px leading-none tabular-nums'")).toBe(true);
     expect(source.includes("data-testid='pinned-plan-popover'")).toBe(true);
     expect(source.includes('absolute left-1/2 w-[min(320px,calc(100vw-32px))] -translate-x-1/2')).toBe(true);
@@ -46,6 +46,7 @@ describe('PinnedPlan composer popover layout', () => {
     expect(sendBoxSource.includes('showPinnedPlan?: boolean')).toBe(true);
     expect(sendBoxSource.includes('topRightTools?: React.ReactNode')).toBe(true);
     expect(sendBoxSource.includes("data-testid='sendbox-plan-anchor'")).toBe(true);
+    expect(sendBoxSource.includes('<PinnedPlan plan={pinnedPlan} active={Boolean(loading || isLoading)} />')).toBe(true);
     expect(sendBoxSource.includes("data-testid='sendbox-top-right-tools'")).toBe(false);
     expect(sendBoxSource.includes("data-testid='sendbox-internal-status-row'")).toBe(true);
     expect(sendBoxSource.includes("data-testid='sendbox-internal-plan'")).toBe(false);

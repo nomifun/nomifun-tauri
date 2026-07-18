@@ -2892,6 +2892,12 @@ async fn wait_for_turn_released(svc: &ConversationService, conversation_id: &str
     })
     .await
     .expect("turn should release its runtime handle");
+    assert!(
+        svc.runtime_state()
+            .wait_for_cleanup_fences(conversation_id, Duration::from_secs(2))
+            .await,
+        "turn completion should publish and release its cleanup fence"
+    );
 }
 
 #[tokio::test]
@@ -3627,6 +3633,8 @@ async fn send_message_continues_cron_system_responses() {
     assert_eq!(sends[0], "Create the task now");
     assert_eq!(sends[1], "[System: No scheduled tasks]");
     assert_eq!(sends[2], "[System: Created cron job 'Daily Greeting']");
+
+    wait_for_turn_released(&svc, &conv.id).await;
 
     let finished = svc.get(TEST_USER_1, &conv.id).await.unwrap();
     assert_eq!(finished.status, ConversationStatus::Finished);

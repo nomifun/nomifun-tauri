@@ -141,8 +141,6 @@ impl RemoteAgentManager {
             text_state: Mutex::new(TextFallbackState::new()),
             _reader_handle: Mutex::new(None),
         });
-        manager.start_event_relay().await;
-
         info!(
             conversation_id = %manager.runtime.conversation_id(),
             remote_agent_id = %manager.remote_config.remote_agent_id,
@@ -154,7 +152,7 @@ impl RemoteAgentManager {
         Ok((manager, issued_device_token))
     }
 
-    async fn start_event_relay(self: &Arc<Self>) {
+    pub(crate) async fn start_event_relay(self: &Arc<Self>) {
         let this = Arc::clone(self);
         let handle = tokio::spawn(async move {
             this.run_event_relay().await;
@@ -188,6 +186,10 @@ impl RemoteAgentManager {
                             lagged = n,
                             "Remote OpenClaw event relay lagged"
                         );
+                        self.runtime.emit_stream_broken(format!(
+                            "Remote OpenClaw event relay lost {n} buffered event(s)"
+                        ));
+                        break;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
@@ -200,7 +202,10 @@ impl RemoteAgentManager {
             state.connection_status = RemoteAgentStatus::Error;
         }
         if self.runtime.status() == Some(ConversationStatus::Running) {
-            self.runtime.emit_error("Remote OpenClaw connection closed");
+            self.runtime
+                .emit_stream_broken("Remote OpenClaw connection closed");
+        } else {
+            self.runtime.mark_transport_broken();
         }
     }
 
@@ -365,6 +370,10 @@ impl crate::runtime_handle::AgentRuntimeControl for RemoteAgentManager {
         self.runtime.status()
     }
 
+    fn is_transport_healthy(&self) -> bool {
+        self.runtime.is_transport_healthy()
+    }
+
     fn last_activity_at(&self) -> TimestampMs {
         self.runtime.last_activity_at()
     }
@@ -375,7 +384,19 @@ impl crate::runtime_handle::AgentRuntimeControl for RemoteAgentManager {
 
     async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
         self.runtime.bump_activity();
+        if !self.runtime.is_transport_healthy() {
+            return Err(AgentSendError::stream_broken(
+                "Remote OpenClaw's permanent connection relay is no longer running",
+            ));
+        }
         self.runtime.reset_for_new_turn(ConversationStatus::Running);
+        if !self.runtime.is_transport_healthy() {
+            let error = AgentSendError::stream_broken(
+                "Remote OpenClaw's connection relay stopped during turn admission",
+            );
+            self.runtime.emit_error_data(error.stream_error().clone());
+            return Err(error);
+        }
         let is_first = {
             let mut state = self.state.write().await;
             state.turn_generation = state.turn_generation.wrapping_add(1);
@@ -461,6 +482,15 @@ impl crate::runtime_handle::AgentRuntimeControl for RemoteAgentManager {
         tokio::spawn(async move {
             connection.close().await;
         });
+        if reason == Some(AgentKillReason::UserCancelled) {
+            self.runtime.emit_finish_with_reason(
+                None,
+                Some(crate::protocol::events::TurnStopReason::Cancelled),
+            );
+        } else if self.runtime.status() == Some(ConversationStatus::Running) {
+            self.runtime
+                .emit_error(format!("Remote OpenClaw agent was terminated ({reason:?})"));
+        }
         Ok(())
     }
 }

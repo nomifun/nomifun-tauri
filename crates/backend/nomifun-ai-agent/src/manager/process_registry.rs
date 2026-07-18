@@ -58,6 +58,11 @@ pub(crate) fn register_session_process(
 ) -> Result<(), AppError> {
     let pid = process.pid();
     let process_group_id = process.process_group_id();
+    // Observe exit through the independent watch channel.  Keeping `process`
+    // in this task would create a lifecycle cycle: a cancelled construction
+    // drops its real owner, but this watcher remains an owner waiting for a
+    // process that nobody can now stop.
+    let mut exit_rx = process.exit_receiver();
     let entry = RegisteredAgentProcess {
         pid,
         process_group_id,
@@ -76,7 +81,9 @@ pub(crate) fn register_session_process(
 
     let data_dir = data_dir.to_path_buf();
     tokio::spawn(async move {
-        let _ = process.wait_for_exit().await;
+        if exit_rx.borrow().is_running() {
+            let _ = exit_rx.changed().await;
+        }
         wait_for_process_tree_exit(pid, process_group_id).await;
         if let Err(e) = unregister_agent_process(&data_dir, pid) {
             warn!(

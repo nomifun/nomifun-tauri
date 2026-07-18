@@ -3,7 +3,7 @@ use std::sync::Arc;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use nomifun_api_types::RemoteBuildExtra;
-use nomifun_common::{AppError, RemoteAgentProtocol};
+use nomifun_common::{AgentKillReason, AppError, RemoteAgentProtocol};
 use tracing::warn;
 
 use crate::runtime_handle::AgentRuntimeHandle;
@@ -12,6 +12,31 @@ use crate::factory::context::FactoryContext;
 use crate::manager::openclaw::device_identity::identity_from_secret_bytes;
 use crate::manager::remote::{RemoteAgentConfig, RemoteAgentManager};
 use crate::types::AgentRuntimeBuildOptions;
+
+struct RemoteConstructionGuard {
+    agent: Option<Arc<RemoteAgentManager>>,
+}
+
+impl RemoteConstructionGuard {
+    fn new(agent: Arc<RemoteAgentManager>) -> Self {
+        Self { agent: Some(agent) }
+    }
+
+    fn disarm(&mut self) {
+        self.agent = None;
+    }
+}
+
+impl Drop for RemoteConstructionGuard {
+    fn drop(&mut self) {
+        if let Some(agent) = self.agent.take() {
+            let _ = crate::AgentRuntimeControl::kill(
+                agent.as_ref(),
+                Some(AgentKillReason::UserCancelled),
+            );
+        }
+    }
+}
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
@@ -75,6 +100,7 @@ pub(super) async fn build(
     };
     let (agent, issued_device_token) =
         RemoteAgentManager::connect(ctx.conversation_id, ctx.workspace, config).await?;
+    let mut construction_guard = RemoteConstructionGuard::new(Arc::clone(&agent));
     if let Some(device_token) = issued_device_token {
         let encrypted = nomifun_common::encrypt_string(&device_token, &deps.encryption_key)?;
         deps.remote_agent_repo
@@ -82,5 +108,10 @@ pub(super) async fn build(
             .await
             .map_err(|e| AppError::Internal(format!("Failed to persist remote device token: {e}")))?;
     }
+    // Start the self-retaining relay only after every fallible factory await.
+    // If token persistence is cancelled/fails, the armed guard closes the
+    // already-connected WebSocket instead of leaving an unregistered manager.
+    agent.start_event_relay().await;
+    construction_guard.disarm();
     Ok(AgentRuntimeHandle::Remote(agent))
 }

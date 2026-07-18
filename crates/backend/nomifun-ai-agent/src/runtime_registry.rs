@@ -16,6 +16,7 @@ use nomifun_common::{
     AgentKillReason, AgentType, AppError, ConversationStatus, ErrorChain, OnConversationDelete, TimestampMs, now_ms,
 };
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::runtime_handle::AgentRuntimeHandle;
@@ -53,6 +54,39 @@ pub trait AgentRuntimeRegistry: Send + Sync {
         conversation_id: &str,
         options: AgentRuntimeBuildOptions,
     ) -> Result<AgentRuntimeHandle, AppError>;
+
+    /// Turn-generation-aware build used by Conversation sends. The default
+    /// preserves compatibility for test/custom registries; the in-memory
+    /// production registry overrides it so a stop that lands before/during a
+    /// cold factory build is a durable tombstone for that exact generation.
+    async fn get_or_create_runtime_for_turn(
+        &self,
+        conversation_id: &str,
+        turn_generation: u64,
+        cancellation: CancellationToken,
+        options: AgentRuntimeBuildOptions,
+    ) -> Result<AgentRuntimeHandle, AppError> {
+        let _ = turn_generation;
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(AppError::Conflict(format!(
+                "Agent runtime build for conversation {conversation_id} was cancelled"
+            ))),
+            result = self.get_or_create_runtime(conversation_id, options) => result,
+        }
+    }
+
+    /// Tombstone and terminate one Conversation turn generation. A newer turn
+    /// uses a different generation and can never be hit by this cancellation.
+    fn cancel_runtime_turn(
+        &self,
+        conversation_id: &str,
+        turn_generation: u64,
+        reason: Option<AgentKillReason>,
+    ) -> Result<(), AppError> {
+        let _ = turn_generation;
+        self.terminate(conversation_id, reason)
+    }
 
     /// Terminate and remove a runtime.
     fn terminate(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AppError>;
@@ -99,6 +133,7 @@ const RESTART_WINDOW_MS: i64 = 60_000;
 const RESTART_BASE_BACKOFF_MS: u64 = 500;
 const RESTART_MAX_BACKOFF_MS: u64 = 8_000;
 const MAX_CACHED_LIFECYCLE_GATES: usize = 256;
+const BROKEN_RUNTIME_TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(7);
 
 #[derive(Clone, Copy)]
 struct RestartRecord {
@@ -209,6 +244,7 @@ impl InMemoryAgentRuntimeRegistry {
         self.runtimes
             .get(conversation_id)
             .and_then(|slot| slot.get().cloned())
+            .filter(AgentRuntimeHandle::is_transport_healthy)
     }
 
     fn lifecycle_gate(&self, conversation_id: &str) -> Arc<AsyncMutex<()>> {
@@ -257,41 +293,75 @@ impl InMemoryAgentRuntimeRegistry {
             _ => {}
         }
     }
-}
 
-#[async_trait]
-impl AgentRuntimeRegistry for InMemoryAgentRuntimeRegistry {
-    fn get_runtime(&self, conversation_id: &str) -> Option<AgentRuntimeHandle> {
-        self.initialized_runtime(conversation_id)
-    }
-
-    async fn get_or_create_runtime(
+    async fn get_or_create_runtime_inner(
         &self,
         conversation_id: &str,
+        cancellation: Option<CancellationToken>,
         options: AgentRuntimeBuildOptions,
     ) -> Result<AgentRuntimeHandle, AppError> {
         let lifecycle_gate = self.lifecycle_gate(conversation_id);
-        let _lifecycle = lifecycle_gate.lock().await;
-
-        // Atomically obtain the per-conversation slot. `DashMap::entry` is
-        // synchronous and side-effect-free — only an empty OnceCell is
-        // allocated on the miss path, so concurrent callers for the same id
-        // all end up holding the same `Arc<OnceCell>`.
-        let slot: RuntimeSlot = self
-            .runtimes
-            .entry(conversation_id.to_owned())
-            .or_insert_with(|| Arc::new(OnceCell::new()))
-            .clone();
-
-        // Fast path: a live runtime already exists — hand it back without
-        // touching the restart governor (a healthy warm runtime is never
-        // throttled).
-        if let Some(runtime) = slot.get() {
-            return Ok(runtime.clone());
+        let _lifecycle = if let Some(cancellation) = cancellation.as_ref() {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    return Err(AppError::Conflict(format!(
+                        "Agent runtime build for conversation {conversation_id} was cancelled while waiting for lifecycle admission"
+                    )));
+                }
+                guard = lifecycle_gate.lock() => guard,
+            }
+        } else {
+            lifecycle_gate.lock().await
+        };
+        if cancellation.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return Err(AppError::Conflict(format!(
+                "Agent runtime build for conversation {conversation_id} was cancelled before initialization"
+            )));
         }
 
-        // About to (re)build. Enforce the crash-loop governor so a
-        // deterministically-crashing conversation cannot hot-loop respawns.
+        let slot: RuntimeSlot = loop {
+            let slot = self
+                .runtimes
+                .entry(conversation_id.to_owned())
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone();
+            let Some(runtime) = slot.get().cloned() else {
+                break slot;
+            };
+            if runtime.is_transport_healthy() {
+                return Ok(runtime);
+            }
+
+            // A permanent manager relay has exited or lost events. This slot
+            // can never safely produce another terminal boundary, so evict and
+            // await bounded teardown under the same lifecycle gate before a
+            // replacement factory is admitted.
+            let removed = self
+                .runtimes
+                .remove_if(conversation_id, |_, current| Arc::ptr_eq(current, &slot))
+                .is_some();
+            if !removed {
+                continue;
+            }
+            self.note_termination_for_governor(
+                conversation_id,
+                Some(AgentKillReason::AgentErrorRecovery),
+            );
+            warn!(conversation_id, "Evicting cached runtime with a broken event transport");
+            if tokio::time::timeout(
+                BROKEN_RUNTIME_TEARDOWN_GRACE,
+                runtime.kill_and_wait(Some(AgentKillReason::AgentErrorRecovery)),
+            )
+            .await
+            .is_err()
+            {
+                return Err(AppError::Timeout(format!(
+                    "Broken Agent runtime teardown timed out for conversation {conversation_id}"
+                )));
+            }
+        };
+
         match self.governor.gate(conversation_id, now_ms()) {
             Ok(0) => {}
             Ok(backoff_ms) => {
@@ -299,7 +369,22 @@ impl AgentRuntimeRegistry for InMemoryAgentRuntimeRegistry {
                     conversation_id,
                     backoff_ms, "Backing off before respawning a recently-crashed agent"
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                if let Some(cancellation) = cancellation.as_ref() {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => {
+                            self.runtimes.remove_if(conversation_id, |_, current| {
+                                Arc::ptr_eq(current, &slot)
+                            });
+                            return Err(AppError::Conflict(format!(
+                                "Agent runtime build for conversation {conversation_id} was cancelled during restart backoff"
+                            )));
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)) => {}
+                    }
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                }
             }
             Err(count) => {
                 warn!(
@@ -317,30 +402,71 @@ impl AgentRuntimeRegistry for InMemoryAgentRuntimeRegistry {
             }
         }
 
-        // `OnceCell::get_or_try_init` serialises concurrent initialisers:
-        // the first caller to reach it runs the factory, every other caller
-        // awaits the same future and ends up with the same runtime. On
-        // failure the cell stays empty so a later caller can retry.
-        let factory = self.factory.clone();
-        let runtime = slot.get_or_try_init(|| async move { factory(options).await }).await?;
+        if cancellation.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            self.runtimes.remove_if(conversation_id, |_, current| Arc::ptr_eq(current, &slot));
+            return Err(AppError::Conflict(format!(
+                "Agent runtime build for conversation {conversation_id} was cancelled before factory start"
+            )));
+        }
 
-        // `terminate` is intentionally synchronous and therefore cannot await
-        // this conversation's lifecycle gate. It may remove the slot while a
-        // slow factory is still initializing. Re-check map identity after the
-        // factory settles: a removed/replaced slot is a termination tombstone,
-        // so the just-created process must be stopped instead of escaping the
-        // registry as an untracked live runtime.
+        let factory = self.factory.clone();
+        let build = slot.get_or_try_init(|| async move { factory(options).await });
+        let runtime = if let Some(cancellation) = cancellation.as_ref() {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    self.runtimes.remove_if(conversation_id, |_, current| Arc::ptr_eq(current, &slot));
+                    return Err(AppError::Conflict(format!(
+                        "Agent runtime build for conversation {conversation_id} was cancelled during initialization"
+                    )));
+                }
+                result = build => result?,
+            }
+        } else {
+            build.await?
+        };
+
         let slot_is_current = self
             .runtimes
             .get(conversation_id)
             .is_some_and(|entry| Arc::ptr_eq(entry.value(), &slot));
-        if !slot_is_current {
-            let _ = runtime.kill(None);
+        let cancelled = cancellation.as_ref().is_some_and(CancellationToken::is_cancelled);
+        if cancelled || !slot_is_current {
+            self.runtimes.remove_if(conversation_id, |_, current| Arc::ptr_eq(current, &slot));
+            let reason = cancelled.then_some(AgentKillReason::UserCancelled);
+            let _ = runtime.kill(reason);
             return Err(AppError::Conflict(format!(
                 "Agent runtime for conversation {conversation_id} was terminated while initializing"
             )));
         }
         Ok(runtime.clone())
+    }
+}
+
+#[async_trait]
+impl AgentRuntimeRegistry for InMemoryAgentRuntimeRegistry {
+    fn get_runtime(&self, conversation_id: &str) -> Option<AgentRuntimeHandle> {
+        self.initialized_runtime(conversation_id)
+    }
+
+    async fn get_or_create_runtime(
+        &self,
+        conversation_id: &str,
+        options: AgentRuntimeBuildOptions,
+    ) -> Result<AgentRuntimeHandle, AppError> {
+        self.get_or_create_runtime_inner(conversation_id, None, options)
+            .await
+    }
+
+    async fn get_or_create_runtime_for_turn(
+        &self,
+        conversation_id: &str,
+        _turn_generation: u64,
+        cancellation: CancellationToken,
+        options: AgentRuntimeBuildOptions,
+    ) -> Result<AgentRuntimeHandle, AppError> {
+        self.get_or_create_runtime_inner(conversation_id, Some(cancellation), options)
+            .await
     }
 
     fn terminate(&self, conversation_id: &str, reason: Option<AgentKillReason>) -> Result<(), AppError> {
@@ -390,7 +516,12 @@ impl AgentRuntimeRegistry for InMemoryAgentRuntimeRegistry {
     fn active_runtime_count(&self) -> usize {
         self.runtimes
             .iter()
-            .filter(|entry| entry.value().get().is_some())
+            .filter(|entry| {
+                entry
+                    .value()
+                    .get()
+                    .is_some_and(AgentRuntimeHandle::is_transport_healthy)
+            })
             .count()
     }
 
@@ -400,6 +531,9 @@ impl AgentRuntimeRegistry for InMemoryAgentRuntimeRegistry {
             .iter()
             .filter_map(|entry| {
                 let agent = entry.value().get()?;
+                if !agent.is_transport_healthy() {
+                    return None;
+                }
                 // Only ACP agents participate in idle cleanup per API Spec
                 (agent.agent_type() == AgentType::Acp
                     && agent.status() == Some(ConversationStatus::Finished)
@@ -478,7 +612,7 @@ mod tests {
     use crate::types::SendMessageData;
     use futures_util::FutureExt;
     use nomifun_common::{AgentKillReason, AgentType, ConversationStatus};
-    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
     use tokio::sync::{Semaphore, broadcast};
 
     /// A minimal mock Agent for testing runtime-registry logic. Lives behind
@@ -492,6 +626,7 @@ mod tests {
         status: Option<ConversationStatus>,
         last_activity: AtomicI64,
         event_tx: broadcast::Sender<AgentStreamEvent>,
+        transport_healthy: Arc<AtomicBool>,
         kill_started: Option<Arc<Semaphore>>,
         kill_release: Option<Arc<Semaphore>>,
     }
@@ -506,6 +641,7 @@ mod tests {
                 status,
                 last_activity: AtomicI64::new(now_ms()),
                 event_tx,
+                transport_healthy: Arc::new(AtomicBool::new(true)),
                 kill_started: None,
                 kill_release: None,
             }
@@ -526,6 +662,11 @@ mod tests {
             self.last_activity = AtomicI64::new(ts);
             self
         }
+
+        fn with_transport_health(mut self, health: Arc<AtomicBool>) -> Self {
+            self.transport_healthy = health;
+            self
+        }
     }
 
     #[async_trait::async_trait]
@@ -541,6 +682,9 @@ mod tests {
         }
         fn status(&self) -> Option<ConversationStatus> {
             self.status
+        }
+        fn is_transport_healthy(&self) -> bool {
+            self.transport_healthy.load(Ordering::Acquire)
         }
         fn last_activity_at(&self) -> TimestampMs {
             self.last_activity.load(Ordering::Relaxed)
@@ -761,6 +905,46 @@ mod tests {
         let handle = registry.get_runtime("conv-1");
         assert!(handle.is_some());
         assert_eq!(handle.unwrap().conversation_id(), "conv-1");
+    }
+
+    #[tokio::test]
+    async fn next_turn_rebuilds_instead_of_reusing_a_runtime_with_a_dead_relay() {
+        use std::sync::atomic::AtomicUsize;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_health = Arc::new(AtomicBool::new(true));
+        let factory: AgentRuntimeFactory = {
+            let calls = Arc::clone(&calls);
+            let first_health = Arc::clone(&first_health);
+            Arc::new(move |options: AgentRuntimeBuildOptions| {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                let agent = if call == 0 {
+                    MockAgent::new(&options.conversation_id, Some(ConversationStatus::Finished))
+                        .with_transport_health(Arc::clone(&first_health))
+                } else {
+                    MockAgent::new(&options.conversation_id, None)
+                };
+                async move { Ok(mock_runtime(agent)) }.boxed()
+            })
+        };
+        let registry = InMemoryAgentRuntimeRegistry::new(factory);
+        let first = registry
+            .get_or_create_runtime("conv-broken-relay", make_runtime_options("conv-broken-relay"))
+            .await
+            .expect("initial runtime");
+        first_health.store(false, Ordering::Release);
+
+        assert!(
+            registry.get_runtime("conv-broken-relay").is_none(),
+            "read-only lookup must not expose a dead cached transport",
+        );
+        let replacement = registry
+            .get_or_create_runtime("conv-broken-relay", make_runtime_options("conv-broken-relay"))
+            .await
+            .expect("dead relay is evicted and rebuilt");
+        assert!(!same_mock(&first, &replacement));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(replacement.is_transport_healthy());
     }
 
     #[tokio::test]

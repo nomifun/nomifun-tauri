@@ -9,6 +9,7 @@ use crate::convert::string_to_enum;
 use crate::service::ConversationService;
 use crate::stream_relay::RelayOutcome;
 use nomifun_ai_agent::AgentRuntimeRegistry;
+use tokio_util::sync::CancellationToken;
 
 impl ConversationService {
     async fn clear_conversation_model_seed_after_model_not_found(
@@ -196,9 +197,15 @@ impl ConversationService {
         agent_type: AgentType,
         outcome: &RelayOutcome,
         runtime_registry: &Arc<dyn AgentRuntimeRegistry>,
+        turn_generation: u64,
+        cancellation: &CancellationToken,
     ) -> bool {
+        let _ = turn_generation;
         if agent_type != AgentType::Acp || !outcome.terminal.is_error() {
             return false;
+        }
+        if cancellation.is_cancelled() {
+            return true;
         }
 
         let started_at = now_ms();
@@ -212,11 +219,22 @@ impl ConversationService {
             reason = ?AgentKillReason::AgentErrorRecovery,
             "ACP task marked unhealthy after terminal error; evicting task"
         );
-        runtime_registry
-            .terminate_and_wait(conversation_id, Some(AgentKillReason::AgentErrorRecovery))
-            .await;
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return true,
+            _ = runtime_registry.terminate_and_wait(
+                conversation_id,
+                Some(AgentKillReason::AgentErrorRecovery),
+            ) => {}
+        }
+        if cancellation.is_cancelled() {
+            return true;
+        }
         self.clear_persisted_acp_model_after_model_not_found(conversation_id, error_code)
             .await;
+        if cancellation.is_cancelled() {
+            return true;
+        }
         self.clear_conversation_model_seed_after_model_not_found(conversation_id, error_code)
             .await;
         info!(

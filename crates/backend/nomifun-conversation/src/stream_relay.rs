@@ -1,16 +1,19 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use nomifun_ai_agent::{
     AgentSendError, AgentStreamEvent,
     protocol::events::{
-        PlanEventData, ThinkingEventData,
+        FinishEventData, PlanEventData, ThinkingEventData, TurnStopReason,
         tool_call::{AcpToolCallSessionUpdateKind, AcpToolCallStatus, ToolCallEventData, ToolCallStatus},
     },
 };
 
 use crate::response_middleware::{ICronService, MessageMiddleware, MiddlewareResult};
-use crate::runtime_state::ConversationRuntimeStateService;
+use crate::runtime_state::{AgentTurnCancellation, ConversationRuntimeStateService};
 use nomifun_api_types::{AgentErrorCode, ConversationRuntimeSummary, WebSocketMessage};
 use nomifun_common::{CompanionId, ErrorChain, MessageId, normalize_keys_to_snake_case, now_ms};
 
@@ -24,6 +27,26 @@ use tracing::{debug, error, info, warn};
 
 /// Number of text chunks to accumulate before flushing to the database.
 const FLUSH_INTERVAL: u32 = 20;
+const TURN_COMPLETION_PERSIST_GRACE: Duration = Duration::from_secs(1);
+const TERMINAL_FINALIZATION_GRACE: Duration = Duration::from_secs(5);
+const EVENT_SIDE_EFFECT_GRACE: Duration = Duration::from_secs(1);
+const MAX_TERMINAL_ACTIVE_ITEMS: usize = 256;
+
+fn track_bounded<V>(map: &mut HashMap<String, V>, key: String, value: V, kind: &'static str) {
+    if map.contains_key(&key) || map.len() < MAX_TERMINAL_ACTIVE_ITEMS {
+        map.insert(key, value);
+    } else {
+        warn!(kind, max = MAX_TERMINAL_ACTIVE_ITEMS, "Relay terminal tracking limit reached");
+    }
+}
+
+fn remember_bounded(set: &mut HashSet<String>, value: String, kind: &'static str) {
+    if set.contains(&value) || set.len() < MAX_TERMINAL_ACTIVE_ITEMS {
+        set.insert(value);
+    } else {
+        warn!(kind, max = MAX_TERMINAL_ACTIVE_ITEMS, "Relay terminal deduplication limit reached");
+    }
+}
 
 #[derive(Debug, Clone)]
 struct TextSegmentState {
@@ -51,6 +74,10 @@ struct ThinkingSegmentState {
 pub struct RelayOutcome {
     pub system_responses: Vec<String>,
     pub terminal: RelayTerminal,
+    /// Normalized terminal reason carried by Finish. `Cancelled` is never a
+    /// successful completion and must suppress failover, continuation, and
+    /// post-turn writeback in the service send loop.
+    pub stop_reason: Option<TurnStopReason>,
     /// Phase 3 (plan D4): whether this turn emitted **any** externally-visible
     /// response before terminating — assistant `Text` OR a forwarded/persisted
     /// tool action (ToolCall / AcpToolCall / ToolGroup / persisted Thinking).
@@ -395,13 +422,56 @@ pub struct StreamRelay {
     /// Conversation↔Execution relation identifies an active attempt. Once wired,
     /// the relay always accumulates; it does not perform a second identity lookup.
     runtime_state: Option<Arc<ConversationRuntimeStateService>>,
+    /// Generation-scoped service cancellation. This is independent of every
+    /// backend transport, so a CLI/gateway that ignores its abort request cannot
+    /// leave the relay waiting forever for a terminal event.
+    cancellation: Option<AgentTurnCancellation>,
     /// Stable canonical row IDs for streamed sub-records that receive multiple
     /// updates during one relay. Protocol call/session IDs are correlation keys,
     /// never database entity IDs.
     derived_message_ids: std::sync::Mutex<HashMap<String, String>>,
+    event_side_effect_circuit_open: AtomicBool,
 }
 
 impl StreamRelay {
+    async fn bounded_event_side_effect<T, F>(
+        &self,
+        deadline: tokio::time::Instant,
+        label: &'static str,
+        future: F,
+    ) -> Option<T>
+    where
+        F: Future<Output = T>,
+    {
+        if self.event_side_effect_circuit_open.load(Ordering::Acquire) {
+            return None;
+        }
+        let timed = tokio::time::timeout_at(deadline, future);
+        let result = if let Some(cancellation) = self.cancellation.as_ref() {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return None,
+                result = timed => result,
+            }
+        } else {
+            timed.await
+        };
+        match result {
+            Ok(value) => Some(value),
+            Err(_) => {
+                self.event_side_effect_circuit_open
+                    .store(true, Ordering::Release);
+                warn!(
+                    conversation_id = %self.conversation_id,
+                    msg_id = %self.msg_id,
+                    side_effect = label,
+                    "Relay event side effect exceeded its shared hard bound; continuing to consume the stream"
+                );
+                None
+            }
+        }
+    }
+
     pub fn new(
         conversation_id: String,
         msg_id: String,
@@ -424,7 +494,9 @@ impl StreamRelay {
             channel_platform: None,
             failover_suppressor: None,
             runtime_state: None,
+            cancellation: None,
             derived_message_ids: std::sync::Mutex::new(HashMap::new()),
+            event_side_effect_circuit_open: AtomicBool::new(false),
         }
     }
 
@@ -440,6 +512,11 @@ impl StreamRelay {
     /// chat and companion turns leave it unset.
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
         self.runtime_state = Some(runtime_state);
+        self
+    }
+
+    pub fn with_cancellation(mut self, cancellation: AgentTurnCancellation) -> Self {
+        self.cancellation = Some(cancellation);
         self
     }
 
@@ -506,12 +583,40 @@ impl StreamRelay {
     /// own terminal-error side effects: broadcast the WS `message.stream` error
     /// event and persist the error `tips` row — so a queue-exhausted failover
     /// still shows the ORIGINAL error. No-op for non-`Error` events.
-    pub async fn surface_terminal_error(&self, event: &AgentStreamEvent) {
+    pub async fn surface_terminal_error(
+        &self,
+        event: &AgentStreamEvent,
+        cancellation: &AgentTurnCancellation,
+    ) -> bool {
         let AgentStreamEvent::Error(data) = event else {
-            return;
+            return false;
         };
+        if !cancellation.try_claim_terminal_surface() {
+            return false;
+        }
+        if cancellation.is_cancelled() {
+            self.forward_to_websocket(&Self::cancelled_finish_event());
+            cancellation.mark_terminal_observed();
+            return false;
+        }
         self.forward_to_websocket(event);
-        self.persist_error_tips(data).await;
+        let persistence = tokio::time::timeout(
+            TURN_COMPLETION_PERSIST_GRACE,
+            self.persist_error_tips(data),
+        );
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                warn!(conversation_id = %self.conversation_id, "Cancelled while persisting re-surfaced terminal error");
+            }
+            result = persistence => {
+                if result.is_err() {
+                    warn!(conversation_id = %self.conversation_id, "Timed out persisting re-surfaced terminal error");
+                }
+            }
+        }
+        cancellation.mark_terminal_observed();
+        true
     }
 
     /// Run the relay loop while also accepting a typed send failure from the
@@ -526,7 +631,7 @@ impl StreamRelay {
     pub async fn consume_with_send_error(
         self,
         rx: broadcast::Receiver<AgentStreamEvent>,
-        send_error_rx: oneshot::Receiver<AgentSendError>,
+        send_error_rx: oneshot::Receiver<Result<(), AgentSendError>>,
     ) -> RelayOutcome {
         self.consume_inner(rx, Some(send_error_rx)).await
     }
@@ -534,7 +639,7 @@ impl StreamRelay {
     async fn consume_inner(
         self,
         mut rx: broadcast::Receiver<AgentStreamEvent>,
-        mut send_error_rx: Option<oneshot::Receiver<AgentSendError>>,
+        mut send_error_rx: Option<oneshot::Receiver<Result<(), AgentSendError>>>,
     ) -> RelayOutcome {
         let started_at = now_ms();
         info!("StreamRelay started");
@@ -568,30 +673,97 @@ impl StreamRelay {
         let mut send_error_done = send_error_rx.is_none();
 
         loop {
-            let recv_result = if send_error_done {
-                rx.recv().await
-            } else {
-                tokio::select! {
-                    recv = rx.recv() => recv,
-                    send_error = send_error_rx.as_mut().expect("send_error_rx exists while pending") => {
-                        send_error_done = true;
-                        match send_error {
-                            Ok(send_error) => {
-                                warn!(
-                                    code = ?send_error.code(),
-                                    ownership = ?send_error.ownership(),
-                                    "Injecting stream error for failed agent send"
-                                );
-                                Ok(AgentStreamEvent::Error(send_error.into_stream_error()))
+            let recv_result = match (self.cancellation.as_ref(), send_error_done) {
+                (Some(cancellation), true) => {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => Ok(Self::cancelled_finish_event()),
+                        recv = rx.recv() => recv,
+                    }
+                }
+                (Some(cancellation), false) => {
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => Ok(Self::cancelled_finish_event()),
+                        recv = rx.recv() => recv,
+                        send_error = send_error_rx.as_mut().expect("send_error_rx exists while pending") => {
+                            send_error_done = true;
+                            match send_error {
+                                Ok(Err(send_error)) => {
+                                    warn!(
+                                        code = ?send_error.code(),
+                                        ownership = ?send_error.ownership(),
+                                        "Injecting stream error for failed agent send"
+                                    );
+                                    Ok(AgentStreamEvent::Error(send_error.into_stream_error()))
+                                }
+                                Ok(Ok(())) => continue,
+                                Err(_) => Ok(AgentStreamEvent::Error(
+                                    nomifun_ai_agent::protocol::events::ErrorEventData::legacy(
+                                        "Agent send task exited before reporting acceptance",
+                                        None,
+                                    ),
+                                )),
                             }
-                            Err(_) => continue,
+                        }
+                    }
+                }
+                (None, true) => rx.recv().await,
+                (None, false) => {
+                    tokio::select! {
+                        recv = rx.recv() => recv,
+                        send_error = send_error_rx.as_mut().expect("send_error_rx exists while pending") => {
+                            send_error_done = true;
+                            match send_error {
+                                Ok(Err(send_error)) => {
+                                    warn!(
+                                        code = ?send_error.code(),
+                                        ownership = ?send_error.ownership(),
+                                        "Injecting stream error for failed agent send"
+                                    );
+                                    Ok(AgentStreamEvent::Error(send_error.into_stream_error()))
+                                }
+                                Ok(Ok(())) => continue,
+                                Err(_) => Ok(AgentStreamEvent::Error(
+                                    nomifun_ai_agent::protocol::events::ErrorEventData::legacy(
+                                        "Agent send task exited before reporting acceptance",
+                                        None,
+                                    ),
+                                )),
+                            }
                         }
                     }
                 }
             };
+            let recv_result = match recv_result {
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(lagged = skipped, "Stream relay lagged; terminating the incomplete event stream");
+                    Ok(AgentStreamEvent::Error(
+                        nomifun_ai_agent::protocol::events::ErrorEventData::legacy(
+                            format!(
+                                "Agent event stream lagged and skipped {skipped} events; the turn was terminated to preserve terminal-state integrity"
+                            ),
+                            Some(AgentErrorCode::NomifunStreamBroken),
+                        ),
+                    ))
+                }
+                result => result,
+            };
 
             match recv_result {
-                Ok(event) => {
+                Ok(mut event) => {
+                    // Cancellation is authoritative even if `rx.recv()` won
+                    // just before the token fired. Re-check after receive so a
+                    // concurrently queued ordinary Finish cannot execute
+                    // middleware/cron or be reported as successful.
+                    if self
+                        .cancellation
+                        .as_ref()
+                        .is_some_and(AgentTurnCancellation::is_cancelled)
+                        && matches!(event, AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_))
+                    {
+                        event = Self::cancelled_finish_event();
+                    }
                     if !first_agent_event_logged {
                         first_agent_event_logged = true;
                         info!(
@@ -600,11 +772,23 @@ impl StreamRelay {
                             "StreamRelay received first agent event"
                         );
                     }
+                    // Every non-terminal event shares one persistence budget.
+                    // WebSocket forwarding happens first where applicable;
+                    // a locked/failed DB must never prevent an already-queued
+                    // Finish/Error from being consumed.
+                    let event_side_effect_deadline =
+                        tokio::time::Instant::now() + EVENT_SIDE_EFFECT_GRACE;
 
                     match &event {
                         AgentStreamEvent::Thinking(data) => {
                             if data.status.as_deref() == Some("done") {
-                                self.complete_active_thinking(&mut active_thinking).await;
+                                let _ = self
+                                    .bounded_event_side_effect(
+                                        event_side_effect_deadline,
+                                        "complete_thinking",
+                                        self.complete_active_thinking(&mut active_thinking),
+                                    )
+                                    .await;
                                 continue;
                             }
 
@@ -612,7 +796,16 @@ impl StreamRelay {
                             // externally visible — once it streams we are no
                             // longer pre-response, so the failover seam stands down.
                             emitted_response = true;
-                            self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
+                            let _ = self
+                                .bounded_event_side_effect(
+                                    event_side_effect_deadline,
+                                    "close_text_before_thinking",
+                                    self.close_active_text_segment(
+                                        &mut active_text,
+                                        &mut text_segments,
+                                        "finish",
+                                    ),
+                                )
                                 .await;
                             if !first_visible_output_logged && !data.content.is_empty() {
                                 first_visible_output_logged = true;
@@ -632,7 +825,13 @@ impl StreamRelay {
                             self.forward_to_websocket_with_msg_id(&segment.id, &event);
                         }
                         AgentStreamEvent::Text(data) => {
-                            self.complete_active_thinking(&mut active_thinking).await;
+                            let _ = self
+                                .bounded_event_side_effect(
+                                    event_side_effect_deadline,
+                                    "complete_thinking_before_text",
+                                    self.complete_active_thinking(&mut active_thinking),
+                                )
+                                .await;
                             // Plan D4: any assistant Text means we are no longer
                             // pre-response. The failover seam keys off this.
                             emitted_response = true;
@@ -657,18 +856,64 @@ impl StreamRelay {
                             full_text_buffer.push_str(&data.content);
                             segment.flush_counter += 1;
                             if segment.flush_counter >= FLUSH_INTERVAL {
-                                self.flush_text_segment(segment).await;
+                                let _ = self
+                                    .bounded_event_side_effect(
+                                        event_side_effect_deadline,
+                                        "flush_text",
+                                        self.flush_text_segment(segment),
+                                    )
+                                    .await;
                                 segment.flush_counter = 0;
                             }
                         }
                         AgentStreamEvent::Finish(_) | AgentStreamEvent::Error(_) => {
+                            if self
+                                .cancellation
+                                .as_ref()
+                                .is_some_and(AgentTurnCancellation::is_cancelled)
+                                && !Self::is_cancelled_finish(&event)
+                            {
+                                event = Self::cancelled_finish_event();
+                            }
+                            let mut terminal = Self::terminal_from_event(&event);
+                            // Decide suppression before any persistence await.
+                            // Terminal publication is scoped to the current
+                            // wire segment. The send loop resets that scope for
+                            // every continuation/failover resend, so ordinary
+                            // intermediate terminals cannot mask cancellation
+                            // of a later segment.
+                            let mut suppress_error = !emitted_response
+                                && matches!(event, AgentStreamEvent::Error(_))
+                                && terminal
+                                    .code()
+                                    .zip(self.failover_suppressor.as_ref())
+                                    .is_some_and(|(code, suppressor)| suppressor(code));
+                            let mut terminal_claimed = false;
+                            if !suppress_error {
+                                terminal_claimed = self
+                                    .cancellation
+                                    .as_ref()
+                                    .map(AgentTurnCancellation::try_claim_terminal_surface)
+                                    .unwrap_or(true);
+                                if terminal_claimed {
+                                    self.forward_to_websocket(&event);
+                                } else {
+                                    // A bounded stop fallback (or another
+                                    // terminal publisher for this exact wire
+                                    // segment) already won. Never publish or
+                                    // middleware-process a late ordinary
+                                    // terminal after that cancelled terminal.
+                                    event = Self::cancelled_finish_event();
+                                    terminal = Self::terminal_from_event(&event);
+                                    suppress_error = false;
+                                }
+                            }
                             let elapsed_ms = now_ms() - started_at;
                             let event_type = if matches!(event, AgentStreamEvent::Finish(_)) {
                                 "Finish"
                             } else {
                                 "Error"
                             };
-                            let terminal = Self::terminal_from_event(&event);
                             match &terminal {
                                 RelayTerminal::Error { code, retryable } => {
                                     info!(
@@ -690,11 +935,27 @@ impl StreamRelay {
                                 }
                             }
 
+                            let fallback_terminal = terminal.clone();
+                            let fallback_stop_reason = match &event {
+                                AgentStreamEvent::Finish(data) => data.stop_reason,
+                                _ => None,
+                            };
+                            let fallback_suppressed = suppress_error.then(|| event.clone());
+                            let fallback_text = (!full_text_buffer.trim().is_empty())
+                                .then(|| full_text_buffer.trim().to_owned());
+                            let fallback_msg_id = active_text
+                                .as_ref()
+                                .map(|segment| segment.id.clone())
+                                .or_else(|| text_segments.last().map(|segment| segment.id.clone()));
+                            let terminal_cleanup = async {
+
                             self.complete_active_thinking(&mut active_thinking).await;
                             self.close_active_text_segment(
                                 &mut active_text,
                                 &mut text_segments,
-                                if matches!(event, AgentStreamEvent::Error(_)) {
+                                if matches!(event, AgentStreamEvent::Error(_))
+                                    || Self::is_cancelled_finish(&event)
+                                {
                                     "error"
                                 } else {
                                     "finish"
@@ -708,12 +969,6 @@ impl StreamRelay {
                             // model's output. Only the Error terminal with no
                             // emitted response and a positive suppressor verdict
                             // qualifies; everything else broadcasts/persists as before.
-                            let suppress_error = !emitted_response
-                                && matches!(event, AgentStreamEvent::Error(_))
-                                && terminal
-                                    .code()
-                                    .zip(self.failover_suppressor.as_ref())
-                                    .is_some_and(|(code, suppressor)| suppressor(code));
                             if suppress_error {
                                 info!("StreamRelay suppressing pre-response error pending model failover");
                             } else {
@@ -722,7 +977,6 @@ impl StreamRelay {
                                     self.fail_active_acp_tool_calls(&mut active_acp_tool_calls, reason).await;
                                     self.fail_active_tool_groups(&mut active_tool_groups, reason).await;
                                 }
-                                self.forward_to_websocket(&event);
                             }
                             self.finalize_active_plans(
                                 &mut active_plan_ids,
@@ -734,7 +988,7 @@ impl StreamRelay {
                                 Self::plan_terminal_status(&event),
                             )
                             .await;
-                            let outcome = self
+                            self
                                 .finalize(
                                     &full_text_buffer,
                                     &text_segments,
@@ -743,13 +997,48 @@ impl StreamRelay {
                                     emitted_response,
                                     suppress_error,
                                 )
-                                .await;
+                                .await
+                            };
+                            let outcome = match tokio::time::timeout(
+                                TERMINAL_FINALIZATION_GRACE,
+                                terminal_cleanup,
+                            )
+                            .await
+                            {
+                                Ok(outcome) => outcome,
+                                Err(_) => {
+                                    warn!(
+                                        conversation_id = %self.conversation_id,
+                                        msg_id = %self.msg_id,
+                                        "Terminal relay finalization exceeded the hard bound"
+                                    );
+                                    RelayOutcome {
+                                        system_responses: Vec::new(),
+                                        terminal: fallback_terminal,
+                                        stop_reason: fallback_stop_reason,
+                                        emitted_response,
+                                        suppressed_error: fallback_suppressed,
+                                        final_text: fallback_text,
+                                        final_text_msg_id: fallback_msg_id,
+                                    }
+                                }
+                            };
+                            if terminal_claimed
+                                && let Some(cancellation) = self.cancellation.as_ref()
+                            {
+                                // Relay persistence/finalization is complete
+                                // and the authoritative Finish is already on
+                                // the wire. The stop worker may now release the
+                                // exact generation and publish turn.completed.
+                                cancellation.mark_terminal_observed();
+                            }
                             if self.complete_turn {
                                 Self::complete_conversation_with_context(
                                     &self.repo,
                                     &self.user_events,
                                     &self.user_id,
                                     &self.conversation_id,
+                                    Some(self.msg_id.clone()),
                                     None,
                                     self.companion,
                                     self.companion_id.clone(),
@@ -775,18 +1064,48 @@ impl StreamRelay {
                                         );
                                         continue;
                                     }
-                                    active_tool_calls.insert(data.call_id.clone(), data.clone());
+                                    track_bounded(
+                                        &mut active_tool_calls,
+                                        data.call_id.clone(),
+                                        data.clone(),
+                                        "tool_call",
+                                    );
                                 }
                                 ToolCallStatus::Completed | ToolCallStatus::Error => {
                                     active_tool_calls.remove(&data.call_id);
-                                    terminal_tool_calls.insert(data.call_id.clone());
+                                    remember_bounded(
+                                        &mut terminal_tool_calls,
+                                        data.call_id.clone(),
+                                        "terminal_tool_call",
+                                    );
                                 }
                             }
-                            self.complete_active_thinking(&mut active_thinking).await;
-                            self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
+                            let _ = self
+                                .bounded_event_side_effect(
+                                    event_side_effect_deadline,
+                                    "complete_thinking_before_tool",
+                                    self.complete_active_thinking(&mut active_thinking),
+                                )
+                                .await;
+                            let _ = self
+                                .bounded_event_side_effect(
+                                    event_side_effect_deadline,
+                                    "close_text_before_tool",
+                                    self.close_active_text_segment(
+                                        &mut active_text,
+                                        &mut text_segments,
+                                        "finish",
+                                    ),
+                                )
                                 .await;
                             self.forward_to_websocket(&event);
-                            self.persist_tool_call(data).await;
+                            let _ = self
+                                .bounded_event_side_effect(
+                                    event_side_effect_deadline,
+                                    "persist_tool_call",
+                                    self.persist_tool_call(data),
+                                )
+                                .await;
                         }
                         AgentStreamEvent::AcpToolCall(data) => {
                             // Plan D4: see ToolCall — an ACP tool call is a
@@ -796,7 +1115,11 @@ impl StreamRelay {
                             match data.update.status {
                                 Some(AcpToolCallStatus::Completed | AcpToolCallStatus::Failed) => {
                                     active_acp_tool_calls.remove(&tool_call_id);
-                                    terminal_acp_tool_calls.insert(tool_call_id);
+                                    remember_bounded(
+                                        &mut terminal_acp_tool_calls,
+                                        tool_call_id,
+                                        "terminal_acp_tool_call",
+                                    );
                                 }
                                 Some(AcpToolCallStatus::Pending | AcpToolCallStatus::InProgress) | None => {
                                     if terminal_acp_tool_calls.contains(&tool_call_id) {
@@ -806,14 +1129,40 @@ impl StreamRelay {
                                         );
                                         continue;
                                     }
-                                    active_acp_tool_calls.insert(tool_call_id, data.clone());
+                                    track_bounded(
+                                        &mut active_acp_tool_calls,
+                                        tool_call_id,
+                                        data.clone(),
+                                        "acp_tool_call",
+                                    );
                                 }
                             }
-                            self.complete_active_thinking(&mut active_thinking).await;
-                            self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
+                            let _ = self
+                                .bounded_event_side_effect(
+                                    event_side_effect_deadline,
+                                    "complete_thinking_before_acp_tool",
+                                    self.complete_active_thinking(&mut active_thinking),
+                                )
+                                .await;
+                            let _ = self
+                                .bounded_event_side_effect(
+                                    event_side_effect_deadline,
+                                    "close_text_before_acp_tool",
+                                    self.close_active_text_segment(
+                                        &mut active_text,
+                                        &mut text_segments,
+                                        "finish",
+                                    ),
+                                )
                                 .await;
                             self.forward_to_websocket(&event);
-                            self.persist_acp_tool_call(data).await;
+                            let _ = self
+                                .bounded_event_side_effect(
+                                    event_side_effect_deadline,
+                                    "persist_acp_tool_call",
+                                    self.persist_acp_tool_call(data),
+                                )
+                                .await;
                         }
                         AgentStreamEvent::ToolGroup(entries) => {
                             // Plan D4: see ToolCall — a tool group is a visible,
@@ -821,16 +1170,44 @@ impl StreamRelay {
                             emitted_response = true;
                             if let Some(group_id) = entries.first().map(|entry| entry.call_id.clone()) {
                                 if entries.iter().any(|entry| entry.status == ToolCallStatus::Running) {
-                                    active_tool_groups.insert(group_id, entries.clone());
+                                    let mut tracked_entries = entries.clone();
+                                    tracked_entries.truncate(MAX_TERMINAL_ACTIVE_ITEMS);
+                                    track_bounded(
+                                        &mut active_tool_groups,
+                                        group_id,
+                                        tracked_entries,
+                                        "tool_group",
+                                    );
                                 } else {
                                     active_tool_groups.remove(&group_id);
                                 }
                             }
-                            self.complete_active_thinking(&mut active_thinking).await;
-                            self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
+                            let _ = self
+                                .bounded_event_side_effect(
+                                    event_side_effect_deadline,
+                                    "complete_thinking_before_tool_group",
+                                    self.complete_active_thinking(&mut active_thinking),
+                                )
+                                .await;
+                            let _ = self
+                                .bounded_event_side_effect(
+                                    event_side_effect_deadline,
+                                    "close_text_before_tool_group",
+                                    self.close_active_text_segment(
+                                        &mut active_text,
+                                        &mut text_segments,
+                                        "finish",
+                                    ),
+                                )
                                 .await;
                             self.forward_to_websocket(&event);
-                            self.persist_tool_group(entries).await;
+                            let _ = self
+                                .bounded_event_side_effect(
+                                    event_side_effect_deadline,
+                                    "persist_tool_group",
+                                    self.persist_tool_group(entries),
+                                )
+                                .await;
                         }
                         AgentStreamEvent::AgentStatus(data) => {
                             self.forward_to_websocket(&event);
@@ -840,18 +1217,35 @@ impl StreamRelay {
                                 } else {
                                     active_agent_status = None;
                                 }
-                                self.persist_agent_status(data).await;
+                                let _ = self
+                                    .bounded_event_side_effect(
+                                        event_side_effect_deadline,
+                                        "persist_agent_status",
+                                        self.persist_agent_status(data),
+                                    )
+                                    .await;
                             }
                         }
                         AgentStreamEvent::Plan(data) => {
                             emitted_response = true;
-                            self.complete_active_thinking(&mut active_thinking).await;
-                            self.close_active_text_segment(
-                                &mut active_text,
-                                &mut text_segments,
-                                "finish",
-                            )
-                            .await;
+                            let _ = self
+                                .bounded_event_side_effect(
+                                    event_side_effect_deadline,
+                                    "complete_thinking_before_plan",
+                                    self.complete_active_thinking(&mut active_thinking),
+                                )
+                                .await;
+                            let _ = self
+                                .bounded_event_side_effect(
+                                    event_side_effect_deadline,
+                                    "close_text_before_plan",
+                                    self.close_active_text_segment(
+                                        &mut active_text,
+                                        &mut text_segments,
+                                        "finish",
+                                    ),
+                                )
+                                .await;
                             if let Some(source_call_id) = data.source_call_id.as_deref() {
                                 let mut source = active_tool_calls.remove(source_call_id).unwrap_or_else(|| {
                                     ToolCallEventData {
@@ -866,21 +1260,53 @@ impl StreamRelay {
                                 });
                                 source.status = ToolCallStatus::Completed;
                                 source.output = Some("Plan updated".to_owned());
-                                terminal_tool_calls.insert(source_call_id.to_owned());
+                                remember_bounded(
+                                    &mut terminal_tool_calls,
+                                    source_call_id.to_owned(),
+                                    "terminal_tool_call",
+                                );
                                 let source_event = AgentStreamEvent::ToolCall(source.clone());
                                 self.forward_to_websocket_hidden(&source_event);
-                                self.persist_tool_call_with_hidden(&source, true).await;
+                                let _ = self
+                                    .bounded_event_side_effect(
+                                        event_side_effect_deadline,
+                                        "persist_plan_source_tool",
+                                        self.persist_tool_call_with_hidden(&source, true),
+                                    )
+                                    .await;
                             }
-                            let plan_id = self.plan_message_id(data).await;
+                            let plan_id = self
+                                .bounded_event_side_effect(
+                                    event_side_effect_deadline,
+                                    "resolve_plan_message_id",
+                                    self.plan_message_id(data),
+                                )
+                                .await
+                                .unwrap_or_else(|| {
+                                    Self::mint_segment_msg_id(
+                                        &mut used_primary_segment_msg_id,
+                                        &self.msg_id,
+                                    )
+                                });
                             if data.entries.iter().all(|entry| {
                                 entry.get("status").and_then(serde_json::Value::as_str) == Some("completed")
                             }) {
                                 active_plan_ids.remove(&plan_id);
                             } else {
-                                active_plan_ids.insert(plan_id.clone());
+                                remember_bounded(
+                                    &mut active_plan_ids,
+                                    plan_id.clone(),
+                                    "active_plan",
+                                );
                             }
                             self.forward_to_websocket_with_msg_id(&plan_id, &event);
-                            self.persist_plan(data).await;
+                            let _ = self
+                                .bounded_event_side_effect(
+                                    event_side_effect_deadline,
+                                    "persist_plan",
+                                    self.persist_plan(data),
+                                )
+                                .await;
                         }
                         AgentStreamEvent::TurnCompleted(metrics) => {
                             // Accumulate this turn's token usage into the owning
@@ -911,44 +1337,127 @@ impl StreamRelay {
                         "StreamRelay channel closed without terminal event"
                     );
 
-                    let channel_error = AgentStreamEvent::Error(
-                        nomifun_ai_agent::protocol::events::ErrorEventData::legacy(
-                            "Agent event channel closed before the turn completed",
-                            None,
-                        ),
-                    );
-                    self.complete_active_thinking(&mut active_thinking).await;
-                    self.close_active_text_segment(&mut active_text, &mut text_segments, "error")
+                    let mut terminal_event = if self
+                        .cancellation
+                        .as_ref()
+                        .is_some_and(AgentTurnCancellation::is_cancelled)
+                    {
+                        Self::cancelled_finish_event()
+                    } else {
+                        AgentStreamEvent::Error(
+                            nomifun_ai_agent::protocol::events::ErrorEventData::legacy(
+                                "Agent event channel closed before the turn completed",
+                                None,
+                            ),
+                        )
+                    };
+                    if self
+                        .cancellation
+                        .as_ref()
+                        .is_some_and(AgentTurnCancellation::is_cancelled)
+                    {
+                        terminal_event = Self::cancelled_finish_event();
+                    }
+                    let terminal_claimed = self
+                        .cancellation
+                        .as_ref()
+                        .map(AgentTurnCancellation::try_claim_terminal_surface)
+                        .unwrap_or(true);
+                    if terminal_claimed {
+                        self.forward_to_websocket(&terminal_event);
+                    }
+                    let terminal = if Self::is_cancelled_finish(&terminal_event) {
+                        RelayTerminal::Finish
+                    } else {
+                        RelayTerminal::ChannelClosed
+                    };
+                    let fallback_terminal = terminal.clone();
+                    let fallback_stop_reason = match &terminal_event {
+                        AgentStreamEvent::Finish(data) => data.stop_reason,
+                        _ => None,
+                    };
+                    let fallback_text = (!full_text_buffer.trim().is_empty())
+                        .then(|| full_text_buffer.trim().to_owned());
+                    let fallback_msg_id = active_text
+                        .as_ref()
+                        .map(|segment| segment.id.clone())
+                        .or_else(|| text_segments.last().map(|segment| segment.id.clone()));
+                    let terminal_cleanup = async {
+                        self.complete_active_thinking(&mut active_thinking).await;
+                        self.close_active_text_segment(
+                            &mut active_text,
+                            &mut text_segments,
+                            "error",
+                        )
                         .await;
-                    self.fail_active_tool_calls(&mut active_tool_calls, "channel_closed").await;
-                    self.fail_active_acp_tool_calls(&mut active_acp_tool_calls, "channel_closed")
+                        let incomplete_reason = if Self::is_cancelled_finish(&terminal_event) {
+                            "cancelled"
+                        } else {
+                            "channel_closed"
+                        };
+                        self.fail_active_tool_calls(&mut active_tool_calls, incomplete_reason).await;
+                        self.fail_active_acp_tool_calls(&mut active_acp_tool_calls, incomplete_reason)
+                            .await;
+                        self.fail_active_tool_groups(&mut active_tool_groups, incomplete_reason)
+                            .await;
+                        self.finalize_active_plans(
+                            &mut active_plan_ids,
+                            Self::plan_terminal_status(&terminal_event),
+                        )
                         .await;
-                    self.fail_active_tool_groups(&mut active_tool_groups, "channel_closed")
+                        self.finalize_active_agent_status(
+                            &mut active_agent_status,
+                            Self::plan_terminal_status(&terminal_event),
+                        )
                         .await;
-                    self.finalize_active_plans(&mut active_plan_ids, "error").await;
-                    self.finalize_active_agent_status(&mut active_agent_status, "error")
-                        .await;
-                    self.forward_to_websocket(&channel_error);
-                    // Channel closure is an unexpected terminal failure. Finalize
-                    // partial output, but never manufacture a clean Finish.
-                    let outcome = self
-                        .finalize(
+                        self.finalize(
                             &full_text_buffer,
                             &text_segments,
-                            &channel_error,
-                            RelayTerminal::ChannelClosed,
+                            &terminal_event,
+                            terminal,
                             emitted_response,
                             // A channel-closed terminal is never an Error event,
                             // so there is nothing to suppress here.
                             false,
                         )
-                        .await;
+                        .await
+                    };
+                    let outcome = match tokio::time::timeout(
+                        TERMINAL_FINALIZATION_GRACE,
+                        terminal_cleanup,
+                    )
+                    .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(_) => {
+                            warn!(
+                                conversation_id = %self.conversation_id,
+                                msg_id = %self.msg_id,
+                                "Channel-closed relay finalization exceeded the hard bound"
+                            );
+                            RelayOutcome {
+                                system_responses: Vec::new(),
+                                terminal: fallback_terminal,
+                                stop_reason: fallback_stop_reason,
+                                emitted_response,
+                                suppressed_error: None,
+                                final_text: fallback_text,
+                                final_text_msg_id: fallback_msg_id,
+                            }
+                        }
+                    };
+                    if terminal_claimed
+                        && let Some(cancellation) = self.cancellation.as_ref()
+                    {
+                        cancellation.mark_terminal_observed();
+                    }
                     if self.complete_turn {
                         Self::complete_conversation_with_context(
                             &self.repo,
                             &self.user_events,
                             &self.user_id,
                             &self.conversation_id,
+                            Some(self.msg_id.clone()),
                             None,
                             self.companion,
                             self.companion_id.clone(),
@@ -959,8 +1468,8 @@ impl StreamRelay {
                     }
                     break outcome;
                 }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(lagged = n, "Stream relay lagged, some events dropped");
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    unreachable!("lagged receive results are normalized to terminal errors")
                 }
             }
         }
@@ -1007,6 +1516,38 @@ impl StreamRelay {
             AgentStreamEvent::Finish(_) => RelayTerminal::Finish,
             _ => RelayTerminal::ChannelClosed,
         }
+    }
+
+    fn cancelled_finish_event() -> AgentStreamEvent {
+        AgentStreamEvent::Finish(FinishEventData {
+            session_id: None,
+            stop_reason: Some(TurnStopReason::Cancelled),
+        })
+    }
+
+    fn is_cancelled_finish(event: &AgentStreamEvent) -> bool {
+        matches!(
+            event,
+            AgentStreamEvent::Finish(FinishEventData {
+                stop_reason: Some(TurnStopReason::Cancelled),
+                ..
+            })
+        )
+    }
+
+    /// Publish the bounded stop fallback when no backend/relay terminal was
+    /// observed. The generation snapshot arbitrates the single publisher, so
+    /// a late backend acknowledgement cannot duplicate the cancelled Finish.
+    pub(crate) fn surface_cancelled_turn(
+        &self,
+        cancellation: &AgentTurnCancellation,
+    ) -> bool {
+        if !cancellation.try_claim_terminal_surface() {
+            return false;
+        }
+        self.forward_to_websocket(&Self::cancelled_finish_event());
+        cancellation.mark_terminal_observed();
+        true
     }
 
     fn mint_segment_msg_id(used_primary: &mut bool, primary_msg_id: &str) -> String {
@@ -1154,18 +1695,35 @@ impl StreamRelay {
         let mut outcome = RelayOutcome {
             system_responses: Vec::new(),
             terminal,
+            stop_reason: match event {
+                AgentStreamEvent::Finish(data) => data.stop_reason,
+                _ => None,
+            },
             emitted_response,
             suppressed_error: None,
             final_text: None,
             final_text_msg_id: None,
         };
-        let status = match event {
-            AgentStreamEvent::Error(_) => "error",
-            _ => "finish",
+        let cancelled = Self::is_cancelled_finish(event);
+        let status = if matches!(event, AgentStreamEvent::Error(_)) || cancelled {
+            "error"
+        } else {
+            "finish"
         };
 
         if !text.is_empty() {
-            let processed = self.process_final_text(text).await;
+            let processed = if cancelled {
+                // A cancelled partial response is data to preserve, never a
+                // completed instruction stream. In particular, do not execute
+                // embedded cron commands or produce continuation responses.
+                MiddlewareResult {
+                    message: text.to_owned(),
+                    display_message: None,
+                    system_responses: Vec::new(),
+                }
+            } else {
+                self.process_final_text(text).await
+            };
             let final_text = processed.message.trim().to_owned();
             let hidden = final_text.is_empty();
             if !hidden {
@@ -1442,7 +2000,14 @@ impl StreamRelay {
             return;
         };
         if let Some(segment) = self.finalize_text_segment(text_segment, status).await {
-            text_segments.push(segment);
+            if text_segments.len() < MAX_TERMINAL_ACTIVE_ITEMS {
+                text_segments.push(segment);
+            } else {
+                warn!(
+                    max = MAX_TERMINAL_ACTIVE_ITEMS,
+                    "Relay finalized-text tracking limit reached"
+                );
+            }
         }
     }
 
@@ -1587,7 +2152,10 @@ impl StreamRelay {
     }
 
     async fn finalize_active_plans(&self, active_plan_ids: &mut HashSet<String>, status: &str) {
-        for plan_id in active_plan_ids.drain() {
+        if active_plan_ids.len() > MAX_TERMINAL_ACTIVE_ITEMS {
+            warn!(count = active_plan_ids.len(), "Truncating active plans during terminal cleanup");
+        }
+        for plan_id in active_plan_ids.drain().take(MAX_TERMINAL_ACTIVE_ITEMS) {
             let update = nomifun_db::MessageRowUpdate {
                 content: None,
                 status: Some(Some(status.to_owned())),
@@ -1614,8 +2182,12 @@ impl StreamRelay {
         }
 
         let output = format!("The turn ended before this tool completed: {reason}");
+        if active_tool_calls.len() > MAX_TERMINAL_ACTIVE_ITEMS {
+            warn!(count = active_tool_calls.len(), "Truncating active tool calls during terminal cleanup");
+        }
         let failed: Vec<ToolCallEventData> = active_tool_calls
             .drain()
+            .take(MAX_TERMINAL_ACTIVE_ITEMS)
             .map(|(_, mut data)| {
                 data.status = ToolCallStatus::Error;
                 data.output = Some(output.clone());
@@ -1641,8 +2213,12 @@ impl StreamRelay {
         reason: &str,
     ) {
         let output = format!("The turn ended before this tool completed: {reason}");
+        if active_tool_calls.len() > MAX_TERMINAL_ACTIVE_ITEMS {
+            warn!(count = active_tool_calls.len(), "Truncating active ACP tool calls during terminal cleanup");
+        }
         let failed: Vec<_> = active_tool_calls
             .drain()
+            .take(MAX_TERMINAL_ACTIVE_ITEMS)
             .map(|(_, mut data)| {
                 data.update.session_update = AcpToolCallSessionUpdateKind::ToolCallUpdate;
                 data.update.status = Some(AcpToolCallStatus::Failed);
@@ -1666,9 +2242,14 @@ impl StreamRelay {
         >,
         reason: &str,
     ) {
+        if active_tool_groups.len() > MAX_TERMINAL_ACTIVE_ITEMS {
+            warn!(count = active_tool_groups.len(), "Truncating active tool groups during terminal cleanup");
+        }
         let failed: Vec<_> = active_tool_groups
             .drain()
+            .take(MAX_TERMINAL_ACTIVE_ITEMS)
             .map(|(_, mut entries)| {
+                entries.truncate(MAX_TERMINAL_ACTIVE_ITEMS);
                 for entry in &mut entries {
                     if entry.status == ToolCallStatus::Running {
                         entry.status = ToolCallStatus::Error;
@@ -1885,7 +2466,18 @@ impl StreamRelay {
                 .map(|service| Box::new(SharedCronService(Arc::clone(service))) as Box<dyn ICronService>),
         );
 
-        middleware.process(text, &self.user_id, &self.conversation_id).await
+        let cancellation = self
+            .cancellation
+            .as_ref()
+            .map(AgentTurnCancellation::cancellation_token);
+        middleware
+            .process_with_cancellation(
+                text,
+                &self.user_id,
+                &self.conversation_id,
+                cancellation.as_ref(),
+            )
+            .await
     }
 
     fn send_final_text_override(&self, msg_id: &str, text: &str, hidden: bool) {
@@ -1935,23 +2527,67 @@ impl StreamRelay {
         user_events: &Arc<dyn UserEventSink>,
         user_id: &str,
         conversation_id: &str,
+        turn_id: Option<String>,
         runtime: Option<ConversationRuntimeSummary>,
         companion: bool,
         companion_id: Option<CompanionId>,
         origin: Option<String>,
         channel_platform: Option<String>,
     ) {
+        Self::persist_conversation_finished(repo, conversation_id).await;
+        Self::broadcast_turn_completed_with_context(
+            user_events,
+            user_id,
+            conversation_id,
+            turn_id,
+            runtime,
+            companion,
+            companion_id,
+            origin,
+            channel_platform,
+        );
+    }
+
+    pub async fn persist_conversation_finished(
+        repo: &Arc<dyn IConversationRepository>,
+        conversation_id: &str,
+    ) {
         let update = nomifun_db::ConversationRowUpdate {
             status: Some("finished".to_owned()),
             updated_at: Some(now_ms()),
             ..Default::default()
         };
-        if let Err(e) = repo.update(conversation_id, &update).await {
-            error!(error = %ErrorChain(&e), "Failed to update conversation status");
+        match tokio::time::timeout(
+            TURN_COMPLETION_PERSIST_GRACE,
+            repo.update(conversation_id, &update),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                error!(error = %ErrorChain(&e), "Failed to update conversation status");
+            }
+            Err(_) => {
+                warn!(conversation_id, "Timed out updating conversation status");
+            }
         }
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn broadcast_turn_completed_with_context(
+        user_events: &Arc<dyn UserEventSink>,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: Option<String>,
+        runtime: Option<ConversationRuntimeSummary>,
+        companion: bool,
+        companion_id: Option<CompanionId>,
+        origin: Option<String>,
+        channel_platform: Option<String>,
+    ) {
         let payload = json!({
             "conversation_id": conversation_id,
+            "turn_id": turn_id,
             "status": "finished",
             "can_send_message": true,
             "runtime": runtime,
@@ -2046,7 +2682,10 @@ mod tests {
     };
     use nomifun_common::{ConversationId, MessageId};
     use nomifun_db::DbError;
-    use std::sync::Mutex;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    };
 
     const TEST_ASSISTANT_MESSAGE_ID: &str = "msg_0190f5fe-7c00-7a00-8abc-012345678941";
     const TEST_TURN_A: &str = "msg_0190f5fe-7c00-7a00-8abc-012345678942";
@@ -2126,6 +2765,81 @@ mod tests {
 
         let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
         assert_eq!(content["content"], "Hello World");
+    }
+
+    #[tokio::test]
+    async fn non_terminal_persistence_timeout_opens_a_turn_wide_circuit_breaker() {
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            Arc::new(RecordingRepo::new()),
+            Arc::new(TestUserEventBus::new(8)),
+            None,
+        );
+        let first = relay
+            .bounded_event_side_effect(
+                tokio::time::Instant::now() + Duration::from_millis(1),
+                "never_resolves",
+                std::future::pending::<()>(),
+            )
+            .await;
+        assert!(first.is_none());
+
+        let polls = Arc::new(AtomicUsize::new(0));
+        let polls_for_future = Arc::clone(&polls);
+        let second = relay
+            .bounded_event_side_effect(
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                "must_not_poll",
+                async move {
+                    polls_for_future.fetch_add(1, AtomicOrdering::SeqCst);
+                },
+            )
+            .await;
+        assert!(second.is_none());
+        assert_eq!(polls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn lagged_stream_with_live_sender_becomes_one_bounded_terminal_error() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(TestUserEventBus::new(16));
+        let mut ws_rx = bus.subscribe();
+        let (tx, _) = broadcast::channel(1);
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "overwrites the only finish".into(),
+        }))
+        .unwrap();
+
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo,
+            bus,
+            None,
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(2), relay.consume(rx))
+            .await
+            .expect("live sender must not keep a lagged relay pending");
+
+        assert_eq!(
+            outcome.terminal.code(),
+            Some(AgentErrorCode::NomifunStreamBroken)
+        );
+        assert_eq!(tx.receiver_count(), 0, "relay receiver is released after terminal fallback");
+        let mut error_events = 0;
+        while let Ok(event) = ws_rx.try_recv() {
+            if event.name == "message.stream" && event.data["type"] == "error" {
+                error_events += 1;
+            }
+        }
+        assert_eq!(error_events, 1);
+        assert!(tx.send(AgentStreamEvent::Finish(FinishEventData::default())).is_err());
     }
 
     // UC-2b: a relay wired with runtime state accumulates the TurnCompleted token
@@ -2841,9 +3555,9 @@ mod tests {
         let rx = tx.subscribe();
         let (send_error_tx, send_error_rx) = tokio::sync::oneshot::channel();
         send_error_tx
-            .send(AgentSendError::from_app_error(nomifun_common::AppError::BadGateway(
+            .send(Err(AgentSendError::from_app_error(nomifun_common::AppError::BadGateway(
                 "provider returned 401 invalid api key".into(),
-            )))
+            ))))
             .unwrap();
 
         let outcome = relay.consume_with_send_error(rx, send_error_rx).await;
@@ -2912,7 +3626,7 @@ mod tests {
         let (send_error_tx, send_error_rx) = tokio::sync::oneshot::channel();
         let delayed_send_error = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            let _ = send_error_tx.send(send_error);
+            let _ = send_error_tx.send(Err(send_error));
         });
 
         let outcome = relay.consume_with_send_error(rx, send_error_rx).await;
@@ -2945,9 +3659,9 @@ mod tests {
         let rx = tx.subscribe();
         let (send_error_tx, send_error_rx) = tokio::sync::oneshot::channel();
         send_error_tx
-            .send(AgentSendError::from_app_error(nomifun_common::AppError::BadGateway(
+            .send(Err(AgentSendError::from_app_error(nomifun_common::AppError::BadGateway(
                 "provider returned 401 invalid api key".into(),
-            )))
+            ))))
             .unwrap();
         let delayed_stream_error = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -2976,6 +3690,38 @@ mod tests {
         assert_eq!(content["type"], "error");
         assert_eq!(content["error"]["resolution"]["kind"], "check_provider_credentials");
         assert_eq!(content["error"]["resolution"]["target"], "provider_settings");
+    }
+
+    #[tokio::test]
+    async fn closed_send_task_signal_is_a_bounded_terminal_error() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(TestUserEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let rx = tx.subscribe();
+        let (send_tx, send_rx) = tokio::sync::oneshot::channel::<Result<(), AgentSendError>>();
+        drop(send_tx);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            relay.consume_with_send_error(rx, send_rx),
+        )
+        .await
+        .expect("closed send task signal must not leave the relay waiting");
+        assert!(outcome.terminal.is_error());
+        let inserts = repo.take_inserts();
+        let tips = inserts
+            .iter()
+            .find(|row| row.r#type == "tips")
+            .expect("abnormal send task exit must be persisted as an error");
+        assert!(tips.content.contains("exited before reporting acceptance"));
     }
 
     #[tokio::test]
@@ -3191,9 +3937,155 @@ mod tests {
         assert!(turn_event.is_some());
         let data = &turn_event.unwrap().data;
         assert_eq!(data["conversation_id"], conversation_id);
-        assert_eq!(data["conversation_id"], conversation_id);
+        assert_eq!(data["turn_id"], TEST_ASSISTANT_MESSAGE_ID);
         assert_eq!(data["status"], "finished");
         assert_eq!(data["can_send_message"], true);
+    }
+
+    #[tokio::test]
+    async fn cancellation_token_injects_terminal_finish_without_backend_ack() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(TestUserEventBus::new(64));
+        let (_tx, rx) = broadcast::channel(64);
+        let runtime_state = Arc::new(ConversationRuntimeStateService::default());
+        let turn_handle = runtime_state
+            .try_acquire_turn_with_wire_id(
+                &test_conversation_id(),
+                Some(TEST_ASSISTANT_MESSAGE_ID.to_owned()),
+            )
+            .expect("turn handle");
+        let cancellation = turn_handle.turn_cancellation();
+        cancellation.cancel();
+
+        let mut ws_rx = bus.subscribe();
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo,
+            bus,
+            None,
+        )
+        .with_cancellation(cancellation);
+
+        let outcome = tokio::time::timeout(Duration::from_millis(250), relay.consume(rx))
+            .await
+            .expect("cancelled relay must not wait for the backend channel");
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+
+        let mut ws_events = Vec::new();
+        while let Ok(event) = ws_rx.try_recv() {
+            ws_events.push(event);
+        }
+        let finish = ws_events
+            .iter()
+            .find(|event| event.name == "message.stream" && event.data["type"] == "finish")
+            .expect("cancel must surface a terminal stream event");
+        assert_eq!(finish.data["data"]["stop_reason"], "cancelled");
+        let completed = ws_events
+            .iter()
+            .find(|event| event.name == "turn.completed")
+            .expect("cancelled relay must complete the turn");
+        assert_eq!(completed.data["turn_id"], TEST_ASSISTANT_MESSAGE_ID);
+    }
+
+    #[tokio::test]
+    async fn cancellation_marks_streamed_partial_text_as_error() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(TestUserEventBus::new(64));
+        let (tx, rx) = broadcast::channel(64);
+        let runtime_state = Arc::new(ConversationRuntimeStateService::default());
+        let turn_handle = runtime_state
+            .try_acquire_turn_with_wire_id(
+                &test_conversation_id(),
+                Some(TEST_ASSISTANT_MESSAGE_ID.to_owned()),
+            )
+            .expect("turn handle");
+        let cancellation = turn_handle.turn_cancellation();
+        let mut ws_rx = bus.subscribe();
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            bus,
+            None,
+        )
+        .with_cancellation(cancellation.clone());
+        let relay_task = tokio::spawn(relay.consume(rx));
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "partial before stop".into(),
+        }))
+        .unwrap();
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                let event = ws_rx.recv().await.expect("stream event");
+                if event.name == "message.stream" && event.data["type"] == "content" {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("partial text reached relay");
+        cancellation.cancel();
+        relay_task.await.expect("relay task");
+
+        let text = repo
+            .take_inserts()
+            .into_iter()
+            .find(|row| row.r#type == "text")
+            .expect("partial text persisted");
+        assert_eq!(text.status.as_deref(), Some("error"));
+    }
+
+    #[tokio::test]
+    async fn fallback_cancel_winner_suppresses_late_ordinary_terminal() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(TestUserEventBus::new(64));
+        let (tx, rx) = broadcast::channel(64);
+        let runtime_state = Arc::new(ConversationRuntimeStateService::default());
+        let turn_handle = runtime_state
+            .try_acquire_turn_with_wire_id(
+                &test_conversation_id(),
+                Some(TEST_ASSISTANT_MESSAGE_ID.to_owned()),
+            )
+            .expect("turn handle");
+        let cancellation = turn_handle.turn_cancellation();
+        let mut ws_rx = bus.subscribe();
+
+        let fallback = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            bus.clone(),
+            None,
+        );
+        assert!(fallback.surface_cancelled_turn(&cancellation));
+
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo,
+            bus,
+            None,
+        )
+        .with_cancellation(cancellation);
+        let outcome = relay.consume(rx).await;
+        assert_eq!(outcome.stop_reason, Some(TurnStopReason::Cancelled));
+
+        let mut terminal_count = 0;
+        while let Ok(event) = ws_rx.try_recv() {
+            if event.name == "message.stream"
+                && matches!(event.data["type"].as_str(), Some("finish" | "error"))
+            {
+                terminal_count += 1;
+            }
+        }
+        assert_eq!(terminal_count, 1, "one wire segment has one terminal publisher");
     }
 
     #[tokio::test]

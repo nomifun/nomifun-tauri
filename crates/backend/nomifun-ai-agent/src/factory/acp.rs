@@ -10,12 +10,41 @@ use agent_client_protocol::schema::{
     EnvVariable, HttpHeader, McpServer, McpServerHttp, McpServerSse, McpServerStdio,
 };
 use nomifun_api_types::{AcpBuildExtra, SessionMcpServer, SessionMcpTransport};
-use nomifun_common::{AppError, CommandSpec};
+use nomifun_common::{AgentKillReason, AppError, CommandSpec};
 use nomifun_db::IMcpServerRepository;
 use nomifun_db::models::McpServerRow;
 use nomifun_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
 use nomifun_runtime::resolve_command_path;
 use tracing::{info, warn};
+
+/// A factory future may be dropped by generation-scoped turn cancellation at
+/// any await after the ACP process and its self-retaining router tasks exist.
+/// Keep an armed teardown guard until the fully initialized handle is handed
+/// to the registry so cancellation cannot orphan that process.
+struct AcpConstructionGuard {
+    agent: Option<Arc<AcpAgentManager>>,
+}
+
+impl AcpConstructionGuard {
+    fn new(agent: Arc<AcpAgentManager>) -> Self {
+        Self { agent: Some(agent) }
+    }
+
+    fn disarm(&mut self) {
+        self.agent = None;
+    }
+}
+
+impl Drop for AcpConstructionGuard {
+    fn drop(&mut self) {
+        if let Some(agent) = self.agent.take() {
+            let _ = crate::AgentRuntimeControl::kill(
+                agent.as_ref(),
+                Some(AgentKillReason::UserCancelled),
+            );
+        }
+    }
+}
 
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
@@ -198,6 +227,7 @@ pub(super) async fn build(
         AcpAgentManager::build(params, skill_mgr, &catalog_tx).await?;
 
     let arc = Arc::new(agent);
+    let mut construction_guard = AcpConstructionGuard::new(Arc::clone(&arc));
     arc.start_permission_handler();
     arc.start_session_event_tracker(notification_rx);
     CatalogForwarder::spawn(
@@ -233,6 +263,7 @@ pub(super) async fn build(
         .attach(ctx.conversation_id, domain_rx)
         .await;
 
+    construction_guard.disarm();
     Ok(instance)
 }
 

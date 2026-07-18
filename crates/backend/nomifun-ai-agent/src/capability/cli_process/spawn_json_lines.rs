@@ -4,11 +4,12 @@ use nomifun_common::{AppError, CommandSpec, ErrorChain};
 use nomi_process_runtime::ChildProcessBuilder as CmdBuilder;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
-use tokio::sync::{Mutex, broadcast, watch};
+use tokio::sync::{Mutex, broadcast};
 use tracing::{debug, error, info, trace, warn};
 
 use super::{
-    CliAgentProcess, EVENT_CHANNEL_CAPACITY, STDERR_BUFFER_MAX, prepare_command_cwd, tracked_process_group_id,
+    CliAgentProcess, EVENT_CHANNEL_CAPACITY, STDERR_BUFFER_MAX, prepare_command_cwd,
+    spawn_exit_monitor, tracked_process_group_id,
 };
 
 impl CliAgentProcess {
@@ -61,7 +62,6 @@ impl CliAgentProcess {
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         // Pre-subscribe before spawning background tasks to guarantee no events are lost
         let initial_rx = event_tx.subscribe();
-        let (exit_tx, exit_rx) = watch::channel(None);
 
         // Background task: read stdout line-by-line → parse JSON → broadcast
         let stdout_tx = event_tx.clone();
@@ -113,20 +113,7 @@ impl CliAgentProcess {
             debug!(pid, "Stderr reader finished");
         });
 
-        // Background task: monitor process exit
-        let exit_handle = tokio::spawn(async move {
-            match child.wait().await {
-                Ok(status) => {
-                    info!(pid, ?status, "CLI process exited");
-                    let _ = exit_tx.send(Some(status));
-                }
-                Err(e) => {
-                    error!(pid, error = %ErrorChain(&e), "Failed to wait on CLI process");
-                    // Signal exit even on error so callers don't hang
-                    let _ = exit_tx.send(None);
-                }
-            }
-        });
+        let (force_kill_tx, exit_rx, exit_handle) = spawn_exit_monitor(child, pid);
 
         Ok(Self {
             stdin: Mutex::new(Some(stdin)),
@@ -134,6 +121,7 @@ impl CliAgentProcess {
             pid,
             process_group_id: tracked_process_group_id(pid),
             event_tx,
+            force_kill_tx,
             exit_rx,
             initial_rx: std::sync::Mutex::new(Some(initial_rx)),
             stderr_buffer,

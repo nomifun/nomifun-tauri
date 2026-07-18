@@ -7,14 +7,18 @@ use std::time::Duration;
 use nomifun_common::{AppError, workspace_path_has_edge_whitespace_segment};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdin, ChildStdout};
-use tokio::sync::{Mutex, broadcast, watch};
+use tokio::sync::{Mutex, broadcast, oneshot, watch};
 use tracing::{debug, error, warn};
 
 mod spawn_json_lines;
 mod spawn_sdk;
 mod stderr_monitor;
+mod process_monitor;
 
-use stderr_monitor::force_kill;
+use process_monitor::{
+    ForceKillRequest, ForceKillSender, ProcessExitState, spawn_exit_monitor,
+    wait_for_terminal_state,
+};
 
 /// Wrapper to hold a pre-subscribed receiver from before background tasks start.
 /// Ensures no events are lost between process spawn and consumer subscription.
@@ -81,8 +85,11 @@ pub struct CliAgentProcess {
     /// Broadcast sender for parsed stdout events (JSON-lines mode only).
     #[allow(dead_code)] // Part of the complete CliProcess API; used in JSON-lines mode via subscribe()
     event_tx: broadcast::Sender<serde_json::Value>,
-    /// Watch channel that transitions from `None` → `Some(ExitStatus)` on exit.
-    exit_rx: watch::Receiver<Option<ExitStatus>>,
+    /// Exact-child control channel owned by the exit monitor.
+    force_kill_tx: ForceKillSender,
+    /// Watch channel that always reaches an explicit terminal state, including
+    /// monitor/cleanup failure; failure must never masquerade as Running.
+    exit_rx: watch::Receiver<ProcessExitState>,
     /// Pre-subscribed receiver created before background tasks start (JSON-lines mode).
     /// Take this via [`take_initial_receiver`] to guarantee no events are lost.
     initial_rx: InitialReceiver,
@@ -174,50 +181,73 @@ impl CliAgentProcess {
 
         // Wait for graceful exit within the grace period
         let mut rx = self.exit_rx.clone();
-        let exited = tokio::time::timeout(grace_period, async {
-            // If already exited, return immediately
-            if rx.borrow().is_some() {
-                return;
+        if let Ok(state) = tokio::time::timeout(grace_period, wait_for_terminal_state(&mut rx)).await {
+            if let Some(error) = state.failure() {
+                return Err(AppError::Internal(error.to_owned()));
             }
-            // Wait for state change
-            let _ = rx.changed().await;
-        })
-        .await;
-
-        if exited.is_ok() && self.exit_rx.borrow().is_some() {
             debug!(pid = self.pid, "CLI process exited gracefully");
             return Ok(());
         }
 
-        // Force kill
+        // Force-kill through the task that owns the exact Child handle. The
+        // shared process runtime terminates its registered group/Job Object and
+        // proves tree cleanup, without a PID-reuse race or `taskkill` process.
         warn!(pid = self.pid, "Grace period expired, sending SIGKILL");
-        force_kill(self.pid, self.process_group_id)?;
+        let (completion, completed) = oneshot::channel();
+        if self
+            .force_kill_tx
+            .send(ForceKillRequest {
+                completion: Some(completion),
+            })
+            .is_err()
+        {
+            let state = self.exit_rx.borrow().clone();
+            return match state.failure() {
+                Some(error) => Err(AppError::Internal(error.to_owned())),
+                None if !state.is_running() => Ok(()),
+                None => Err(AppError::Internal(format!(
+                    "Process {} force-kill monitor is unavailable",
+                    self.pid
+                ))),
+            };
+        }
 
-        // Wait for the exit monitor to observe process termination so callers
-        // do not race a still-live child after force-kill returns.
-        let mut rx = self.exit_rx.clone();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            if rx.borrow().is_some() {
-                return;
+        match tokio::time::timeout(Duration::from_secs(7), completed).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(error))) => Err(AppError::Internal(error)),
+            Ok(Err(_)) => {
+                // Another concurrent force request may have won and completed
+                // the single monitor task. Its authoritative terminal state is
+                // the result for every waiter.
+                let mut rx = self.exit_rx.clone();
+                match tokio::time::timeout(Duration::from_secs(1), wait_for_terminal_state(&mut rx)).await {
+                    Ok(state) => match state.failure() {
+                        Some(error) => Err(AppError::Internal(error.to_owned())),
+                        None => Ok(()),
+                    },
+                    Err(_) => Err(AppError::Internal(format!(
+                        "Process {} force-kill request closed without a terminal state",
+                        self.pid
+                    ))),
+                }
             }
-            let _ = rx.changed().await;
-        })
-        .await
-        .map_err(|_| AppError::Internal(format!("Process {} did not exit after force_kill", self.pid)))?;
-
-        Ok(())
+            Err(_) => Err(AppError::Internal(format!(
+                "Process {} did not terminate within the exact tree-cleanup deadline",
+                self.pid
+            ))),
+        }
     }
 
     /// Check whether the subprocess is still running.
     #[allow(dead_code)] // Complete CliProcess lifecycle API
     pub fn is_running(&self) -> bool {
-        self.exit_rx.borrow().is_none()
+        self.exit_rx.borrow().is_running()
     }
 
     /// Get the exit status if the process has exited.
     #[allow(dead_code)] // Complete CliProcess lifecycle API
     pub fn exit_status(&self) -> Option<ExitStatus> {
-        *self.exit_rx.borrow()
+        self.exit_rx.borrow().exit_status()
     }
 
     /// Get the OS process ID.
@@ -235,13 +265,16 @@ impl CliAgentProcess {
     #[allow(dead_code)] // Complete CliProcess lifecycle API
     pub async fn wait_for_exit(&self) -> Option<ExitStatus> {
         let mut rx = self.exit_rx.clone();
-        // If already exited, return immediately
-        if let Some(status) = *rx.borrow() {
-            return Some(status);
-        }
-        // Wait for state change
-        let _ = rx.changed().await;
-        *rx.borrow()
+        wait_for_terminal_state(&mut rx).await.exit_status()
+    }
+
+    /// Clone the exit observation channel without retaining the process
+    /// wrapper itself. Lifecycle bookkeeping tasks must use this instead of
+    /// holding an `Arc<CliAgentProcess>` until exit; otherwise the bookkeeping
+    /// task prevents the wrapper's last-owner `Drop` backstop from ever
+    /// force-killing a process abandoned by a cancelled factory future.
+    pub(crate) fn exit_receiver(&self) -> watch::Receiver<ProcessExitState> {
+        self.exit_rx.clone()
     }
 
     /// Take the buffered stderr content (consuming).
@@ -281,6 +314,28 @@ impl CliAgentProcess {
         let mut tail: Vec<&str> = trimmed.rsplit('\n').take(max_lines).collect();
         tail.reverse();
         tail.join("\n")
+    }
+}
+
+impl Drop for CliAgentProcess {
+    fn drop(&mut self) {
+        // Runtime factories can be cancelled while a CLI is between spawn and
+        // protocol handshake. At that point no manager exists yet to call
+        // `kill()`. Make last-owner drop a hard lifecycle backstop so dropping
+        // a cancelled factory future cannot orphan the child/process tree.
+        if self.exit_rx.borrow().is_running() {
+            warn!(pid = self.pid, "CLI process owner dropped while child was still running; scheduling exact tree cleanup");
+            if self
+                .force_kill_tx
+                .send(ForceKillRequest { completion: None })
+                .is_err()
+            {
+                // A missing monitor means its Child future has already been
+                // dropped; ChildProcessBuilder's kill-on-drop and Job/group
+                // reaper are then the ownership backstop.
+                error!(pid = self.pid, "Exact-child cleanup monitor was unavailable during Drop");
+            }
+        }
     }
 }
 
@@ -379,7 +434,7 @@ pub(crate) mod tests {
                 name: "MY_TEST_VAR".into(),
                 value: "hello_env".into(),
             }],
-            cwd: Some("/tmp".into()),
+            cwd: Some(std::env::temp_dir().to_string_lossy().into_owned()),
         };
         let proc = CliAgentProcess::spawn(config).await.unwrap();
         let mut rx = proc.subscribe();

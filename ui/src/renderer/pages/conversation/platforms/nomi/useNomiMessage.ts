@@ -7,6 +7,7 @@
 import type { ConversationId, MessageId } from '@/common/types/ids';
 import { ipcBridge } from '@/common';
 import { transformMessage, transformUserCreatedEvent } from '@/common/chat/chatLib';
+import { isToolGroupStatusActive, normalizeToolGroupStatus } from '@/common/chat/toolGroupStatus';
 import { extractResponseTextChunk, optionalDisplayText, toDisplayText } from '@/common/chat/displayText';
 import type { IResponseMessage } from '@/common/adapter/ipcBridge';
 import type { TChatConversation, TokenUsageData } from '@/common/config/storage';
@@ -20,11 +21,17 @@ import {
 import { emitter } from '@/renderer/utils/emitter';
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import type { ThoughtData } from '../thoughtTypes';
+import { reconcileConversationTurnAfterStreamTerminal } from '../reconcileConversationTurnAfterStreamTerminal';
+import {
+  classifyAuthoritativeTurnCompletion,
+  classifyAuthoritativeTurnStart,
+  resolveVerifiedAuthoritativeTurnStart,
+} from '../authoritativeTurnLifecyclePolicy';
 import { processLocalCronResponse } from './localCronCommands';
-import { initialNomiTurnState, isTurnRunning, nomiTurnReducer } from './nomiTurnState';
+import { initialNomiTurnState, isTurnRunning, nomiTurnReducer, type NomiTurnEvent } from './nomiTurnState';
 
 type NomiToolGroupRuntimeTool = {
-  status: string;
+  status: ReturnType<typeof normalizeToolGroupStatus>;
   name?: string;
   description?: string;
 };
@@ -40,13 +47,12 @@ export const getNomiToolGroupRuntimeState = (data: unknown): {
     ? data
         .filter((item): item is Record<string, unknown> => !!item && typeof item === 'object' && !Array.isArray(item))
         .map((tool) => ({
-          status: toDisplayText(tool.status),
+          status: normalizeToolGroupStatus(tool.status),
           ...(tool.name != null ? { name: toDisplayText(tool.name) } : {}),
           ...(tool.description != null ? { description: toDisplayText(tool.description) } : {}),
         }))
     : [];
-  const activeStatuses = new Set(['Executing', 'Confirming', 'Pending']);
-  const hasActive = tools.some((tool) => activeStatuses.has(tool.status));
+  const hasActive = tools.some((tool) => isToolGroupStatusActive(tool.status));
   const confirmingTool = tools.find((tool) => tool.status === 'Confirming');
   const executingTool = tools.find((tool) => tool.status === 'Executing');
 
@@ -98,8 +104,28 @@ export const useNomiMessage = (
   const [tokenUsage, setTokenUsage] = useState<TokenUsageData | null>(null);
   // Current active message ID to filter out events from old requests (prevents aborted request events from interfering with new ones)
   const activeMsgIdRef = useRef<string | null>(null);
+  const rootTurnIdRef = useRef<MessageId | null>(null);
+  const awaitingBackendTurnRef = useRef(false);
+  const turnClosedRef = useRef(false);
+  const cancelledTurnIdsRef = useRef(new Set<MessageId>());
+  const rejectUnannouncedStartRef = useRef(false);
+  const verifyUnannouncedStartRuntimeRef = useRef(false);
+  const turnLifecycleGenerationRef = useRef(0);
+  const turnStartGenerationRef = useRef(0);
+  const turnCompletionGenerationRef = useRef(0);
+  const turnReconcileSequenceRef = useRef(0);
+  const mountedRef = useRef(true);
   const messageBufferRef = useRef(new Map<string, string>());
   const processedCronMsgIdsRef = useRef(new Set<string>());
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      turnLifecycleGenerationRef.current += 1;
+      turnReconcileSequenceRef.current += 1;
+    };
+  }, []);
 
   // Mirror the reducer state into a ref so the (non-resubscribing) stream
   // closure can read the current turn state without being a dependency.
@@ -168,6 +194,59 @@ export const useNomiMessage = (
   const setActiveMsgId = useCallback((msgId: string | null) => {
     activeMsgIdRef.current = msgId;
   }, []);
+
+  const dispatchTurnIfOpen = useCallback((event: NomiTurnEvent) => {
+    if (turnClosedRef.current && !awaitingBackendTurnRef.current) return;
+    dispatchTurn(event);
+  }, []);
+
+  const settleCompletedTurn = useCallback(() => {
+    turnLifecycleGenerationRef.current += 1;
+    turnCompletionGenerationRef.current += 1;
+    turnReconcileSequenceRef.current += 1;
+    rootTurnIdRef.current = null;
+    awaitingBackendTurnRef.current = false;
+    turnClosedRef.current = true;
+    rejectUnannouncedStartRef.current = false;
+    activeMsgIdRef.current = null;
+    dispatchTurn({ type: 'finish' });
+    setThought({ subject: '', description: '' });
+  }, []);
+
+  const reconcileAfterStreamTerminal = useCallback(() => {
+    const generation = turnLifecycleGenerationRef.current;
+    const sequence = turnReconcileSequenceRef.current + 1;
+    turnReconcileSequenceRef.current = sequence;
+    void reconcileConversationTurnAfterStreamTerminal(
+      conversation_id,
+      () =>
+        mountedRef.current &&
+        turnLifecycleGenerationRef.current === generation &&
+        turnReconcileSequenceRef.current === sequence,
+      settleCompletedTurn
+    );
+  }, [conversation_id, settleCompletedTurn]);
+
+  const markTurnAccepted = useCallback(
+    () => {
+      if (!awaitingBackendTurnRef.current || rejectUnannouncedStartRef.current) return;
+      if (!verifyUnannouncedStartRuntimeRef.current) turnLifecycleGenerationRef.current += 1;
+      rootTurnIdRef.current = null;
+      awaitingBackendTurnRef.current = false;
+      const generation = turnLifecycleGenerationRef.current;
+      const sequence = turnReconcileSequenceRef.current + 1;
+      turnReconcileSequenceRef.current = sequence;
+      void reconcileConversationTurnAfterStreamTerminal(
+        conversation_id,
+        () =>
+          mountedRef.current &&
+          turnLifecycleGenerationRef.current === generation &&
+          turnReconcileSequenceRef.current === sequence,
+        settleCompletedTurn
+      );
+    },
+    [conversation_id, settleCompletedTurn]
+  );
 
   const processCompletedAssistantMessage = useCallback(
     async (msgId: MessageId) => {
@@ -253,11 +332,11 @@ export const useNomiMessage = (
 
       switch (message.type) {
         case 'thought':
-          dispatchTurn({ type: 'activity' });
+          dispatchTurnIfOpen({ type: 'activity' });
           throttledSetThought(normalizeThoughtData(message.data));
           break;
         case 'start':
-          dispatchTurn({ type: 'activity' });
+          dispatchTurnIfOpen({ type: 'activity' });
           // Don't reset waitingResponse here - let tool completion flow handle it
           break;
         case 'turn_completed':
@@ -306,18 +385,19 @@ export const useNomiMessage = (
           break;
         case 'finish':
           {
-            dispatchTurn({ type: 'finish' });
+            // Stream completion can precede backend turn-handle release.
             setThought({ subject: '', description: '' });
             if (message.msg_id) {
               void processCompletedAssistantMessage(message.msg_id);
             }
+            reconcileAfterStreamTerminal();
           }
           break;
         case 'tool_group':
           {
             // Check if any tools are executing or awaiting confirmation
             const toolState = getNomiToolGroupRuntimeState(message.data);
-            dispatchTurn({ type: 'toolGroup', hasActive: toolState.hasActive, hasAny: toolState.hasAny });
+            dispatchTurnIfOpen({ type: 'toolGroup', hasActive: toolState.hasActive, hasAny: toolState.hasAny });
 
             // If tools are awaiting confirmation, update thought hint
             if (toolState.confirmingDescription) {
@@ -345,7 +425,7 @@ export const useNomiMessage = (
           break;
         case 'permission':
         case 'acp_permission':
-          dispatchTurn({ type: 'activity' });
+          dispatchTurnIfOpen({ type: 'activity' });
           // Backend nomi emits wire type 'acp_permission' but the payload is
           // Confirmation-shaped (legacy), which matches MessagePermission, not
           // MessageAcpPermission. Re-tag so transformMessage routes it correctly.
@@ -356,21 +436,21 @@ export const useNomiMessage = (
           break;
         default: {
           if (message.type === 'error') {
-            dispatchTurn({ type: 'error' });
             setThought({ subject: '', description: '' });
             onError?.(message as IResponseMessage);
+            reconcileAfterStreamTerminal();
           } else if (message.type === 'content') {
             // A terminal Agent Execution report is a self-contained projection,
             // not a new model stream. Render it without re-raising the send-box
             // busy state; ordinary stream content still marks the turn active.
-            dispatchTurn({
+            dispatchTurnIfOpen({
               type: 'content',
               streamComplete: isCompleteMessageProjection(message),
             });
           } else {
             // Any other non-error output: keep the turn marked running (handles
             // events that arrive after a premature finish).
-            dispatchTurn({ type: 'activity' });
+            dispatchTurnIfOpen({ type: 'activity' });
           }
           // Backend handles persistence, Frontend only updates UI
           addOrUpdateMessage(transformMessage(message));
@@ -379,7 +459,115 @@ export const useNomiMessage = (
       }
     });
     // Note: turn state is read via turnStateRef to avoid re-subscription
-  }, [conversation_id, addOrUpdateMessage, onError, processCompletedAssistantMessage, readOnly]);
+  }, [
+    conversation_id,
+    addOrUpdateMessage,
+    dispatchTurnIfOpen,
+    onError,
+    processCompletedAssistantMessage,
+    readOnly,
+    reconcileAfterStreamTerminal,
+  ]);
+
+  useEffect(() => {
+    let disposed = false;
+    const unsubscribe = ipcBridge.conversation.turnStarted.on((event) => {
+      if (event.conversation_id !== conversation_id) return;
+      const startAction = classifyAuthoritativeTurnStart({
+        turnId: event.turn_id,
+        cancelledTurnIds: cancelledTurnIdsRef.current,
+        rejectUnannouncedStart: rejectUnannouncedStartRef.current,
+        awaitingBackendTurn: awaitingBackendTurnRef.current,
+        verifyUnannouncedStartRuntime: verifyUnannouncedStartRuntimeRef.current,
+      });
+      if (startAction === 'ignore') return;
+
+      const acceptStart = () => {
+        turnStartGenerationRef.current += 1;
+        turnLifecycleGenerationRef.current += 1;
+        rootTurnIdRef.current = event.turn_id ?? null;
+        awaitingBackendTurnRef.current = false;
+        turnClosedRef.current = false;
+        rejectUnannouncedStartRef.current = false;
+        verifyUnannouncedStartRuntimeRef.current = false;
+        dispatchTurn({ type: 'activity' });
+      };
+
+      if (startAction === 'accept') {
+        acceptStart();
+        return;
+      }
+
+      const generation = turnLifecycleGenerationRef.current;
+      void getConversationOrNull(conversation_id)
+        .then((conversation) => {
+          if (
+            disposed ||
+            turnLifecycleGenerationRef.current !== generation ||
+            !verifyUnannouncedStartRuntimeRef.current ||
+            resolveVerifiedAuthoritativeTurnStart({
+              runtimeIsProcessing: isConversationProcessing(conversation),
+              eventProcessingStartedAt: event.runtime.processing_started_at,
+              runtimeProcessingStartedAt: conversation?.runtime?.processing_started_at,
+            }) !== 'accept'
+          ) {
+            return;
+          }
+          acceptStart();
+        })
+        .catch((error) => {
+          if (disposed) return;
+          console.warn('[useNomiMessage] Failed to verify unannounced turn start:', error);
+        });
+    });
+    return () => {
+      disposed = true;
+      unsubscribe();
+    };
+  }, [conversation_id]);
+
+  useEffect(() => {
+    let disposed = false;
+
+    const unsubscribe = ipcBridge.conversation.turnCompleted.on((event) => {
+      if (event.conversation_id !== conversation_id || event.runtime.is_processing) return;
+
+      const rootTurnId = rootTurnIdRef.current;
+      const awaitingBackendTurn = awaitingBackendTurnRef.current;
+      const action = classifyAuthoritativeTurnCompletion({
+        rootTurnId,
+        completedTurnId: event.turn_id,
+        awaitingBackendTurn,
+      });
+      if (action === 'settle') {
+        settleCompletedTurn();
+        return;
+      }
+      if (action === 'ignore') return;
+
+      const observedRootTurnId = rootTurnId;
+      const observedAwaitingBackendTurn = awaitingBackendTurn;
+      const generation = turnLifecycleGenerationRef.current;
+      const sequence = turnReconcileSequenceRef.current + 1;
+      turnReconcileSequenceRef.current = sequence;
+      void reconcileConversationTurnAfterStreamTerminal(
+        conversation_id,
+        () =>
+          !disposed &&
+          mountedRef.current &&
+          turnLifecycleGenerationRef.current === generation &&
+          turnReconcileSequenceRef.current === sequence &&
+          rootTurnIdRef.current === observedRootTurnId &&
+          awaitingBackendTurnRef.current === observedAwaitingBackendTurn,
+        settleCompletedTurn
+      );
+    });
+
+    return () => {
+      disposed = true;
+      unsubscribe();
+    };
+  }, [conversation_id, settleCompletedTurn]);
 
   useEffect(() => {
     let cancelled = false;
@@ -388,14 +576,26 @@ export const useNomiMessage = (
     // running state cannot bleed into this one; the raise-only `hydrate` below
     // then merges the backend status with any send that races the async query.
     dispatchTurn({ type: 'reset' });
+    turnLifecycleGenerationRef.current += 1;
+    const hydrationGeneration = turnLifecycleGenerationRef.current;
     setThought({ subject: '', description: '' });
     setTokenUsage(null);
     setHasHydratedRunningState(false);
+    rootTurnIdRef.current = null;
+    awaitingBackendTurnRef.current = false;
+    turnClosedRef.current = false;
+    cancelledTurnIdsRef.current.clear();
+    rejectUnannouncedStartRef.current = false;
+    verifyUnannouncedStartRuntimeRef.current = false;
 
     // Check actual conversation status from backend before resetting all running states
     // to avoid flicker when switching to a running conversation
     void getConversationOrNull(conversation_id).then((res) => {
       if (cancelled) {
+        return;
+      }
+      if (turnLifecycleGenerationRef.current !== hydrationGeneration) {
+        setHasHydratedRunningState(true);
         return;
       }
 
@@ -429,6 +629,20 @@ export const useNomiMessage = (
   }, [conversation_id]);
 
   const resetState = useCallback(() => {
+    turnLifecycleGenerationRef.current += 1;
+    const rootTurnId = rootTurnIdRef.current;
+    if (rootTurnId) {
+      const cancelled = cancelledTurnIdsRef.current;
+      cancelled.add(rootTurnId);
+      if (cancelled.size > 32) {
+        const oldest = cancelled.values().next().value;
+        if (oldest) cancelled.delete(oldest);
+      }
+    }
+    awaitingBackendTurnRef.current = false;
+    turnClosedRef.current = true;
+    rejectUnannouncedStartRef.current = true;
+    verifyUnannouncedStartRuntimeRef.current = rootTurnId === null;
     dispatchTurn({ type: 'reset' });
     setThought({ subject: '', description: '' });
     // Clear active message ID to prevent filtering events from new messages after stop
@@ -437,8 +651,55 @@ export const useNomiMessage = (
 
   // External setter used by the send box to raise the spinner on submit.
   const setWaitingResponse = useCallback((value: boolean) => {
+    turnLifecycleGenerationRef.current += 1;
+    if (value) {
+      turnStartGenerationRef.current += 1;
+      rootTurnIdRef.current = null;
+      awaitingBackendTurnRef.current = true;
+      turnClosedRef.current = false;
+      rejectUnannouncedStartRef.current = false;
+    } else {
+      rootTurnIdRef.current = null;
+      awaitingBackendTurnRef.current = false;
+      turnClosedRef.current = true;
+      rejectUnannouncedStartRef.current = false;
+    }
     dispatchTurn({ type: 'setWaiting', value });
   }, []);
+
+  const restoreRunningAfterStopFailure = useCallback(() => {
+    turnLifecycleGenerationRef.current += 1;
+    const rootTurnId = rootTurnIdRef.current;
+    if (rootTurnId) cancelledTurnIdsRef.current.delete(rootTurnId);
+    awaitingBackendTurnRef.current = false;
+    turnClosedRef.current = false;
+    rejectUnannouncedStartRef.current = false;
+    verifyUnannouncedStartRuntimeRef.current = false;
+    dispatchTurn({ type: 'hydrate', isRunning: true });
+    const generation = turnLifecycleGenerationRef.current;
+    const sequence = turnReconcileSequenceRef.current + 1;
+    turnReconcileSequenceRef.current = sequence;
+    void reconcileConversationTurnAfterStreamTerminal(
+      conversation_id,
+      () =>
+        mountedRef.current &&
+        turnLifecycleGenerationRef.current === generation &&
+        turnReconcileSequenceRef.current === sequence,
+      settleCompletedTurn
+    );
+  }, [conversation_id, settleCompletedTurn]);
+
+  const confirmStopped = useCallback(() => {
+    turnLifecycleGenerationRef.current += 1;
+    rootTurnIdRef.current = null;
+    awaitingBackendTurnRef.current = false;
+    turnClosedRef.current = true;
+    rejectUnannouncedStartRef.current = false;
+    dispatchTurn({ type: 'reset' });
+  }, []);
+
+  const getTurnStartGeneration = useCallback(() => turnStartGenerationRef.current, []);
+  const getTurnCompletionGeneration = useCallback(() => turnCompletionGenerationRef.current, []);
 
   return {
     thought,
@@ -447,8 +708,13 @@ export const useNomiMessage = (
     hasHydratedRunningState,
     tokenUsage,
     setActiveMsgId,
+    markTurnAccepted,
     setWaitingResponse,
     resetState,
+    confirmStopped,
+    restoreRunningAfterStopFailure,
+    getTurnStartGeneration,
+    getTurnCompletionGeneration,
   };
 };
 

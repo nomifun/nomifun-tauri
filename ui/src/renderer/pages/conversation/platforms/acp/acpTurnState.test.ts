@@ -43,6 +43,17 @@ describe('acpTurnReducer - turn busy lifecycle', () => {
     expect(isAcpTurnBusy(s)).toBe(true);
   });
 
+  test('known-root stop is not revived by a late raw stream start', () => {
+    const stopped = run([
+      { type: 'turnStarted', turnId: 'msg_stopped', processingStartedAt: 456 },
+      { type: 'reset' },
+    ]);
+    const afterLateRawStart = acpTurnReducer(stopped, { type: 'rawStreamStarted' });
+
+    expect(afterLateRawStart).toEqual(initialAcpTurnState);
+    expect(isAcpTurnBusy(afterLateRawStart)).toBe(false);
+  });
+
   test('thinking and content keep the turn busy', () => {
     const thinking = run([{ type: 'submit' }, { type: 'turnStarted' }, { type: 'thinking' }]);
     expect(thinking.phase).toBe('thinking');

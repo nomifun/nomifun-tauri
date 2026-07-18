@@ -32,8 +32,14 @@ import { savePreferredMode } from '@/renderer/pages/guid/hooks/agentSelectionUti
 import {
   shouldEnqueueConversationCommand,
   useConversationCommandQueue,
+  type ConversationCommandQueueExecution,
   type ConversationCommandQueueItem,
 } from '@/renderer/pages/conversation/platforms/useConversationCommandQueue';
+import { stopConversationAndConfirmRelease } from '@/renderer/pages/conversation/platforms/requestConversationStop';
+import {
+  shouldReleaseStopInteraction,
+  useConversationStopAttemptGuard,
+} from '@/renderer/pages/conversation/platforms/useConversationStopAttemptGuard';
 import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conversationCache';
 import { getConversationRuntimeWorkspaceErrorMessage } from '@/renderer/pages/conversation/utils/conversationCreateError';
 import { warmupConversation } from '@/renderer/pages/conversation/utils/warmupConversation';
@@ -148,7 +154,19 @@ const NomiSendBox: React.FC<{
   const { checkAndUpdateTitle } = useAutoTitle();
   const { current_model } = modelSelection;
 
-  const { running, hasHydratedRunningState, tokenUsage, setActiveMsgId, setWaitingResponse, resetState } = turnActivity;
+  const {
+    running,
+    hasHydratedRunningState,
+    tokenUsage,
+    setActiveMsgId,
+    markTurnAccepted,
+    setWaitingResponse,
+    resetState,
+    confirmStopped,
+    restoreRunningAfterStopFailure,
+    getTurnStartGeneration,
+    getTurnCompletionGeneration,
+  } = turnActivity;
   const hasContextUsage =
     typeof tokenUsage?.context_window === 'number' &&
     tokenUsage.context_window > 0 &&
@@ -196,7 +214,17 @@ const NomiSendBox: React.FC<{
   const removeMessageByMsgId = useRemoveMessageByMsgId();
   const removeMessagesFrom = useRemoveMessagesFrom();
   const { setSendBoxHandler } = usePreviewContext();
-  const isBusy = running;
+  const [isStopping, setIsStopping] = useState(false);
+  const isBusy = running || isStopping;
+  const { beginStopAttempt, getStopAttemptStatus } = useConversationStopAttemptGuard(
+    conversation_id,
+    getTurnStartGeneration,
+    getTurnCompletionGeneration
+  );
+
+  useEffect(() => {
+    setIsStopping(false);
+  }, [conversation_id]);
 
   const setContentRef = useLatestRef(setContent);
   const contentRef = useLatestRef(content);
@@ -230,7 +258,10 @@ const NomiSendBox: React.FC<{
   });
 
   const executeCommand = useCallback(
-    async ({ input, files }: Pick<ConversationCommandQueueItem, 'input' | 'files'>) => {
+    async (
+      { input, files }: Pick<ConversationCommandQueueItem, 'input' | 'files'>,
+      execution?: ConversationCommandQueueExecution
+    ) => {
       if (!current_model?.use_model) {
         Message.warning(t('conversation.chat.noModelSelected'));
         throw new Error('No model selected');
@@ -251,7 +282,9 @@ const NomiSendBox: React.FC<{
           conversation_id,
           files,
         });
+        if (execution && !execution.isCurrent()) return;
         msg_id = res.msg_id;
+        markTurnAccepted();
         setActiveMsgId(msg_id);
         // Use add=false (compose mode) so composeMessageWithIndex can de-dup
         // by msg_id — this prevents a duplicate bubble if useMessageLstCache
@@ -272,7 +305,10 @@ const NomiSendBox: React.FC<{
           emitter.emit('nomi.workspace.refresh');
         }
       } catch (error) {
+        if (execution && !execution.isCurrent()) return;
         if (msg_id) removeMessageByMsgId(msg_id);
+        setActiveMsgId(null);
+        setWaitingResponse(false);
         Message.error(getConversationRuntimeWorkspaceErrorMessage(error, t));
         throw error;
       }
@@ -282,6 +318,7 @@ const NomiSendBox: React.FC<{
       checkAndUpdateTitle,
       conversation_id,
       current_model?.use_model,
+      markTurnAccepted,
       setActiveMsgId,
       removeMessageByMsgId,
       setWaitingResponse,
@@ -399,6 +436,7 @@ const NomiSendBox: React.FC<{
           input: displayMessage,
           files: filesToSend,
         });
+        markTurnAccepted();
         // 乐观插入新用户气泡（compose 模式按 msg_id 去重，避免 DB 行重复）。
         addOrUpdateMessage({
           id: res.msg_id,
@@ -426,6 +464,7 @@ const NomiSendBox: React.FC<{
       uploadFile,
       workspacePath,
       clearFiles,
+      markTurnAccepted,
       removeMessagesFrom,
       addOrUpdateMessage,
       setActiveMsgId,
@@ -706,16 +745,33 @@ const NomiSendBox: React.FC<{
 
   // Stop conversation handler
   const handleStop = async (): Promise<void> => {
-    // Best-effort cancel: swallow rejections so they don't bubble up as
-    // unhandled rejections. UI state is still reset via finally.
-    try {
-      await ipcBridge.conversation.stop.invoke({ conversation_id });
-    } catch (error) {
-      console.warn('[NomiSendBox] stop request failed', error);
-    } finally {
-      resetState();
-      resetActiveExecution('stop');
+    if (isStopping) return;
+    const stopAttempt = beginStopAttempt();
+    setIsStopping(true);
+    resetState();
+    pause();
+    resetActiveExecution('stop');
+
+    const result = await stopConversationAndConfirmRelease(conversation_id);
+    const stopAttemptStatus = getStopAttemptStatus(stopAttempt);
+    if (stopAttemptStatus !== 'current') {
+      if (shouldReleaseStopInteraction(stopAttemptStatus)) setIsStopping(false);
+      return;
     }
+    if (result.status === 'released' || result.status === 'deleted') {
+      confirmStopped();
+      setIsStopping(false);
+      resetActiveExecution('external-reset');
+      return;
+    }
+
+    console.warn('[NomiSendBox] stop request could not be confirmed', result);
+    restoreRunningAfterStopFailure();
+    setIsStopping(false);
+    Message.error({
+      content: t('conversation.stop.failed', { defaultValue: 'Failed to stop the current task. Please try again.' }),
+      closable: true,
+    });
   };
 
   // Clear conversation context (release model context); keeps message records.
@@ -752,6 +808,7 @@ const NomiSendBox: React.FC<{
         onClear={clear}
       />
       <SendBox
+        key={conversation_id}
         data-testid='nomi-sendbox'
         showPinnedPlan
         onMobilePlusClick={isMobile ? () => setIsMobileSheetOpen(true) : undefined}

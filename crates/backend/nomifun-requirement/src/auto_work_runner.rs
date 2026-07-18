@@ -10,13 +10,13 @@ use nomifun_ai_agent::registry::AgentRegistry;
 use nomifun_ai_agent::runtime_registry::AgentRuntimeRegistry;
 use nomifun_ai_agent::types::AgentRuntimeBuildOptions;
 use nomifun_api_types::{AutoWorkState, AutoWorkTargetKind, Requirement, RequirementStatus, SendMessageRequest};
-use nomifun_common::{AppError, ConversationId, TerminalId, UserId};
-use nomifun_conversation::ConversationService;
+use nomifun_common::{AgentKillReason, AppError, ConversationId, TerminalId, UserId};
+use nomifun_conversation::{ConversationService, runtime_state::RuntimeBuildLease};
 use nomifun_db::IConversationRepository;
 use nomifun_terminal::{LifecycleKind, TerminalDriver};
 use tokio::sync::broadcast;
 use tokio::time::{interval, sleep, timeout};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::prompt::{build_requirement_prompt, build_terminal_requirement_prompt};
 use crate::service::{DEFAULT_LEASE_MS, RequirementService};
@@ -462,6 +462,23 @@ async fn run_loop(
     max_requirements: Option<u32>,
 ) {
     let owner_id = target_id;
+    // Close the startup preflight window as well as the per-claim window. The
+    // first conversation lease is acquired before ownership verification's
+    // first await, then consumed by the first claim iteration.
+    let mut startup_conversation_lease = if kind == AutoWorkTargetKind::Conversation {
+        match deps
+            .conversation_service
+            .begin_public_runtime_build(owner_id, &deps.authoritative_user_id)
+        {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                debug!(target_id, tag, error = %error, "AutoWork startup admission is fenced");
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let owner_check = match kind {
         AutoWorkTargetKind::Conversation => {
             deps.service
@@ -511,6 +528,43 @@ async fn run_loop(
             continue;
         }
 
+        // Conversation AutoWork is a runtime initiator. Fence it before the
+        // claim await, not inside `inject_and_wait`: otherwise a stop can fully
+        // finish while the old claim is pending and that old wakeup can later
+        // resurrect a runtime under a fresh lease.
+        let claim_started_ms = nomifun_common::now_ms();
+        let mut conversation_build_lease = if kind == AutoWorkTargetKind::Conversation {
+            let lease = match startup_conversation_lease.take() {
+                Some(lease) => Ok(lease),
+                None => deps
+                    .conversation_service
+                    .begin_public_runtime_build(owner_id, &deps.authoritative_user_id),
+            };
+            match lease {
+                Ok(lease) => {
+                    if let Err(error) = lease.ensure_active() {
+                        info!(target_id, tag, error = %error, "AutoWork preparation was cancelled before claim");
+                        break;
+                    }
+                    Some(lease)
+                }
+                Err(error) => {
+                    debug!(target_id, tag, error = %error, "AutoWork conversation admission is fenced");
+                    if deps
+                        .conversation_service
+                        .user_cancelled_since(target_id, claim_started_ms)
+                    {
+                        info!(target_id, tag, "AutoWork idle preparation was stopped by user");
+                        break;
+                    }
+                    sleep(IDLE_POLL).await;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
         // Claim the next requirement. The wake future is armed BEFORE the claim
         // (and dropped right after) so a requirement created/re-pended between the
         // claim returning None and our await is never lost. On drain or a transient
@@ -524,6 +578,7 @@ async fn run_loop(
                 Ok(None) => {
                     // Tag drained (or paused) → not a failure spin; reset backoff.
                     consecutive_failures = 0;
+                    drop(conversation_build_lease.take());
                     tokio::select! {
                         _ = wake.as_mut() => {}
                         _ = sleep(IDLE_POLL) => {}
@@ -532,6 +587,7 @@ async fn run_loop(
                 }
                 Err(e) => {
                     warn!(target_id, tag, error = %e, "AutoWork claim failed —retrying");
+                    drop(conversation_build_lease.take());
                     tokio::select! {
                         _ = wake.as_mut() => {}
                         _ = sleep(IDLE_POLL) => {}
@@ -554,8 +610,11 @@ async fn run_loop(
                 // can only be aimed at this AutoWork-driven turn (the session
                 // is claim-locked while it runs), so it is read as "stop this
                 // work", not as a failed attempt.
-                let turn_started_ms = nomifun_common::now_ms();
-                match inject_and_wait(&deps, target_id, tag, &claimed).await {
+                let turn_started_ms = claim_started_ms;
+                let build_lease = conversation_build_lease
+                    .take()
+                    .expect("conversation AutoWork acquired a pre-claim runtime lease");
+                match inject_and_wait(&deps, target_id, tag, &claimed, build_lease).await {
                     Ok((end, note, expects_verdict)) => {
                         // User interrupt: the engine reported Cancelled, OR the
                         // user hit the cancel endpoint during the turn (covers
@@ -599,6 +658,21 @@ async fn run_loop(
                     // this, a transient busy window burns the requirement's retries
                     // and falsely fails it (and pauses its tag).
                     Err(AppError::Conflict(_)) => {
+                        if deps
+                            .conversation_service
+                            .user_cancelled_since(target_id, turn_started_ms)
+                        {
+                            info!(
+                                target_id,
+                                tag,
+                                requirement_id = req_id,
+                                "AutoWork preparation was stopped by user —pausing tag"
+                            );
+                            if let Err(e) = deps.service.user_interrupt(&req_id, owner_id, tag).await {
+                                error!(target_id, requirement_id = req_id, error = %e, "AutoWork user-interrupt failed");
+                            }
+                            TurnResult::UserInterrupted
+                        } else {
                         warn!(
                             target_id,
                             requirement_id = req_id,
@@ -608,6 +682,7 @@ async fn run_loop(
                             error!(target_id, requirement_id = req_id, error = %e, "AutoWork unclaim_busy failed");
                         }
                         TurnResult::Busy
+                        }
                     }
                     // The session backing this loop is GONE (deleted mid-flight →
                     // inject_and_wait's conversation_repo.get returns NotFound). This
@@ -731,14 +806,18 @@ async fn inject_and_wait(
     conversation_id: &str,
     tag: &str,
     req: &Requirement,
+    build_lease: RuntimeBuildLease,
 ) -> Result<(TurnEnd, Option<String>, bool), AppError> {
     let conv_id = conversation_id;
+    build_lease.ensure_active()?;
+    let build_token = build_lease.cancellation_token();
     // Load the conversation row to resolve agent_type / model / workspace / user.
     let row = deps
         .conversation_repo
         .get(conv_id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("conversation {conversation_id}")))?;
+    build_lease.ensure_active()?;
 
     let user_id = UserId::parse(&row.user_id).map_err(|error| {
         AppError::Forbidden(format!("AutoWork conversation has invalid owner identity: {error}"))
@@ -758,6 +837,7 @@ async fn inject_and_wait(
     deps.conversation_service
         .ensure_public_mutation_allowed(&user_id, conversation_id)
         .await?;
+    build_lease.ensure_active()?;
 
     let agent_type = parse_agent_type(&deps.agent_registry, &row.r#type).await;
     let model = nomifun_conversation::runtime_options::provider_model_from_conversation_row(&row)?;
@@ -788,7 +868,21 @@ async fn inject_and_wait(
         conversation_created_at: Some(row.created_at),
     };
 
-    let agent = deps.runtime_registry.get_or_create_runtime(conversation_id, options).await?;
+    let agent = deps
+        .runtime_registry
+        .get_or_create_runtime_for_turn(
+            conversation_id,
+            build_lease.id(),
+            build_token,
+            options,
+        )
+        .await?;
+    if build_lease.is_cancelled() {
+        let _ = agent.kill(Some(AgentKillReason::UserCancelled));
+        return Err(AppError::Conflict(format!(
+            "conversation {conversation_id} AutoWork preparation was cancelled"
+        )));
+    }
     // Arm IDMM now that THIS turn's runtime exists (so its probe.observe() attaches
     // to this turn's event stream), and ONLY now —never on an idle poll. Mirrors
     // the user-driven path's `on_turn_start` hook (which also arms right after
@@ -804,6 +898,12 @@ async fn inject_and_wait(
     // workspace-initialization checks (e.g. "does the workspace exist yet").
     let ws_path = (!workspace_for_stage.is_empty()).then(|| std::path::Path::new(workspace_for_stage.as_str()));
     let attachments = deps.service.stage_attachments_for_prompt(&req.id, ws_path).await;
+    if build_lease.is_cancelled() {
+        let _ = agent.kill(Some(AgentKillReason::UserCancelled));
+        return Err(AppError::Conflict(format!(
+            "conversation {conversation_id} AutoWork preparation was cancelled"
+        )));
+    }
 
     let prompt = build_requirement_prompt(tag, req, agent_type, deps.requirement_mcp_enabled, &attachments);
     let send_req = SendMessageRequest {
@@ -815,7 +915,13 @@ async fn inject_and_wait(
         channel_platform: None,
     };
     deps.conversation_service
-        .send_message(&user_id, conversation_id, send_req, &deps.runtime_registry)
+        .send_message_with_runtime_build_lease(
+            &user_id,
+            conversation_id,
+            send_req,
+            &deps.runtime_registry,
+            build_lease,
+        )
         .await?;
 
     let outcome = wait_for_terminal_with_renewal(deps, conversation_id, conv_id, req.id.clone(), rx).await;
@@ -974,7 +1080,17 @@ async fn wait_for_terminal_with_renewal(
                         // connection) —the turn did NOT finish cleanly. Treat as
                         // errored, matching the terminal path's `Closed => errored`.
                         Err(broadcast::error::RecvError::Closed) => return TurnEnd::Errored,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        // The skipped event may be the only terminal boundary.
+                        // Continuing against a live sender can otherwise park
+                        // AutoWork until the very large turn timeout.
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            warn!(
+                                conversation_id,
+                                skipped,
+                                "AutoWork conversation event stream lost integrity"
+                            );
+                            return TurnEnd::Errored;
+                        }
                     }
                 }
             }
@@ -1201,7 +1317,18 @@ async fn wait_terminal_turn_end(
                                 Err(broadcast::error::RecvError::Closed) => {
                                     return TerminalTurnEnd::Errored; // lifecycle server gone
                                 }
-                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                // A skipped lifecycle item may be the sole
+                                // TurnEnd. Never infer clean completion from an
+                                // incomplete stream or wait indefinitely for a
+                                // second terminal event that will not exist.
+                                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                    warn!(
+                                        terminal_id,
+                                        skipped,
+                                        "AutoWork terminal lifecycle stream lost integrity"
+                                    );
+                                    return TerminalTurnEnd::Errored;
+                                }
                             }
                         }
                     }

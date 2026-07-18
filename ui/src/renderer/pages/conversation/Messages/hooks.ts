@@ -890,6 +890,20 @@ export const useMessageLstCache = (key: ConversationId, opts?: { windowed?: bool
     };
   }, [key, loadMessages, setLoading]);
 
+  // Plan rows are finalized in the database when the authoritative turn
+  // completes, but that status-only write does not need another plan stream
+  // fragment. Refresh the current window so terminal plan state is reflected
+  // immediately instead of waiting for a remount/manual history refresh.
+  useEffect(() => {
+    if (!key) return;
+    return ipcBridge.conversation.turnCompleted.on((event) => {
+      if (event.conversation_id !== key || event.runtime.is_processing) return;
+      void loadMessages().catch((error) => {
+        console.warn('[useMessageLstCache] Failed to refresh terminal message state:', error);
+      });
+    });
+  }, [key, loadMessages]);
+
   return { loadOlder, hasMore, loadingOlder };
 };
 

@@ -23,8 +23,15 @@ import { useAddOrUpdateMessage, useRemoveMessageByMsgId } from '@/renderer/pages
 import {
   shouldEnqueueConversationCommand,
   useConversationCommandQueue,
+  type ConversationCommandQueueExecution,
   type ConversationCommandQueueItem,
 } from '@/renderer/pages/conversation/platforms/useConversationCommandQueue';
+import { stopConversationAndConfirmRelease } from '@/renderer/pages/conversation/platforms/requestConversationStop';
+import { useAuthoritativeTurnLifecycle } from '@/renderer/pages/conversation/platforms/useAuthoritativeTurnLifecycle';
+import {
+  shouldReleaseStopInteraction,
+  useConversationStopAttemptGuard,
+} from '@/renderer/pages/conversation/platforms/useConversationStopAttemptGuard';
 import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conversationCache';
 import { getConversationRuntimeWorkspaceErrorMessage } from '@/renderer/pages/conversation/utils/conversationCreateError';
 import { isConversationProcessing } from '@/renderer/pages/conversation/utils/conversationRuntime';
@@ -64,7 +71,30 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
   const { setSendBoxHandler } = usePreviewContext();
 
   const [aiProcessing, setAiProcessing] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
   const [hasHydratedRunningState, setHasHydratedRunningState] = useState(false);
+  const isBusy = aiProcessing || isStopping;
+  const {
+    beginLocalTurn,
+    markLocalTurnAccepted,
+    cancelLocalTurn,
+    stopOptimistically,
+    confirmStopped,
+    restoreAfterStopFailure,
+    acceptsStreamActivity,
+    reconcileAfterStreamTerminal,
+    getTurnStartGeneration,
+    getTurnCompletionGeneration,
+    getTurnLifecycleGeneration,
+  } = useAuthoritativeTurnLifecycle(conversation_id, {
+    onTurnStarted: () => setAiProcessing(true),
+    onTurnCompleted: () => setAiProcessing(false),
+  });
+  const { beginStopAttempt, getStopAttemptStatus } = useConversationStopAttemptGuard(
+    conversation_id,
+    getTurnStartGeneration,
+    getTurnCompletionGeneration
+  );
 
   const { data: draftData, mutate: mutateDraft } = useNanobotSendBoxDraft(conversation_id);
   const atPath = draftData?.atPath ?? EMPTY_AT_PATH;
@@ -100,12 +130,18 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
 
   useEffect(() => {
     let cancelled = false;
+    const hydrationGeneration = getTurnLifecycleGeneration();
 
     setAiProcessing(false);
+    setIsStopping(false);
     setHasHydratedRunningState(false);
 
     void getConversationOrNull(conversation_id).then((res) => {
       if (cancelled) {
+        return;
+      }
+      if (getTurnLifecycleGeneration() !== hydrationGeneration) {
+        setHasHydratedRunningState(true);
         return;
       }
 
@@ -117,7 +153,7 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
     return () => {
       cancelled = true;
     };
-  }, [conversation_id]);
+  }, [conversation_id, getTurnLifecycleGeneration]);
 
   useEffect(() => {
     const handler = (text: string) => {
@@ -143,20 +179,20 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
       }
       switch (message.type) {
         case 'thought':
-          setAiProcessing(true);
+          if (acceptsStreamActivity()) setAiProcessing(true);
           break;
         case 'finish': {
-          setAiProcessing(false);
+          reconcileAfterStreamTerminal();
           break;
         }
         case 'error':
-          setAiProcessing(false);
+          reconcileAfterStreamTerminal();
           break;
         default:
           break;
       }
     });
-  }, [conversation_id]);
+  }, [acceptsStreamActivity, conversation_id, reconcileAfterStreamTerminal]);
 
   const handleFilesAdded = useCallback(
     (pastedFiles: FileMetadata[]) => {
@@ -182,9 +218,13 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
   });
 
   const executeCommand = useCallback(
-    async ({ input, files }: Pick<ConversationCommandQueueItem, 'input' | 'files'>) => {
+    async (
+      { input, files }: Pick<ConversationCommandQueueItem, 'input' | 'files'>,
+      execution?: ConversationCommandQueueExecution
+    ) => {
       const displayMessage = buildDisplayMessage(input, files, workspacePath);
 
+      beginLocalTurn();
       setAiProcessing(true);
       let msg_id: MessageId | null = null;
       try {
@@ -198,7 +238,9 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
           conversation_id,
           files,
         });
+        if (execution && !execution.isCurrent()) return;
         msg_id = res.msg_id;
+        markLocalTurnAccepted();
         const userMessage: TMessage = {
           id: msg_id,
           msg_id,
@@ -214,13 +256,25 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
         addOrUpdateMessage(userMessage);
         emitter.emit('chat.history.refresh');
       } catch (error) {
+        if (execution && !execution.isCurrent()) return;
         if (msg_id) removeMessageByMsgId(msg_id);
+        cancelLocalTurn();
         setAiProcessing(false);
         Message.error(getConversationRuntimeWorkspaceErrorMessage(error, t));
         throw error;
       }
     },
-    [addOrUpdateMessage, checkAndUpdateTitle, conversation_id, removeMessageByMsgId, t, workspacePath]
+    [
+      addOrUpdateMessage,
+      beginLocalTurn,
+      cancelLocalTurn,
+      checkAndUpdateTitle,
+      conversation_id,
+      markLocalTurnAccepted,
+      removeMessageByMsgId,
+      t,
+      workspacePath,
+    ]
   );
 
   const {
@@ -240,7 +294,7 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
   } = useConversationCommandQueue({
     conversation_id: conversation_id,
     enabled: true,
-    isBusy: aiProcessing,
+    isBusy,
     isHydrated: hasHydratedRunningState,
     onExecute: executeCommand,
   });
@@ -254,7 +308,7 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
     if (
       shouldEnqueueConversationCommand({
         enabled: true,
-        isBusy: aiProcessing,
+        isBusy,
         hasPendingCommands,
       })
     ) {
@@ -301,6 +355,7 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
       sessionStorage.setItem(processedKey, 'true');
 
       try {
+        beginLocalTurn();
         setAiProcessing(true);
         const { input, files = [] } = JSON.parse(stored) as { input: string; files?: string[] };
         const res = await getConversationOrNull(conversation_id);
@@ -317,6 +372,7 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
           files,
         });
         const { msg_id } = sendResult;
+        markLocalTurnAccepted();
 
         const userMessage: TMessage = {
           id: msg_id,
@@ -336,24 +392,52 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
         sessionStorage.removeItem(storageKey);
       } catch (error) {
         sessionStorage.removeItem(processedKey);
+        cancelLocalTurn();
         setAiProcessing(false);
         Message.error(getConversationRuntimeWorkspaceErrorMessage(error, t));
       }
     };
     processInitialMessage().catch(console.error);
-  }, [conversation_id, addOrUpdateMessage]);
+  }, [
+    addOrUpdateMessage,
+    beginLocalTurn,
+    cancelLocalTurn,
+    checkAndUpdateTitle,
+    conversation_id,
+    markLocalTurnAccepted,
+    t,
+  ]);
 
   const handleStop = async (): Promise<void> => {
-    // Best-effort cancel: swallow rejections so they don't bubble up as
-    // unhandled rejections. UI state is still reset via finally.
-    try {
-      await ipcBridge.conversation.stop.invoke({ conversation_id });
-    } catch (error) {
-      console.warn('[NanobotSendBox] stop request failed', error);
-    } finally {
-      setAiProcessing(false);
-      resetActiveExecution('stop');
+    if (isStopping) return;
+    const stopAttempt = beginStopAttempt();
+    setIsStopping(true);
+    stopOptimistically();
+    setAiProcessing(false);
+    pause();
+    resetActiveExecution('stop');
+
+    const result = await stopConversationAndConfirmRelease(conversation_id);
+    const stopAttemptStatus = getStopAttemptStatus(stopAttempt);
+    if (stopAttemptStatus !== 'current') {
+      if (shouldReleaseStopInteraction(stopAttemptStatus)) setIsStopping(false);
+      return;
     }
+    if (result.status === 'released' || result.status === 'deleted') {
+      confirmStopped();
+      setIsStopping(false);
+      resetActiveExecution('external-reset');
+      return;
+    }
+
+    console.warn('[NanobotSendBox] stop request could not be confirmed', result);
+    restoreAfterStopFailure();
+    setAiProcessing(true);
+    setIsStopping(false);
+    Message.error({
+      content: t('conversation.stop.failed', { defaultValue: 'Failed to stop the current task. Please try again.' }),
+      closable: true,
+    });
   };
 
   // Nanobot has no resumable session history, so clear-context is intentionally
@@ -375,6 +459,7 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
         onClear={clear}
       />
       <SendBox
+        key={conversation_id}
         showPinnedPlan
         value={content}
         onChange={handleContentChange}
@@ -383,11 +468,11 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
           emitter.emit('nanobot.selected.file', nextSelectedItems);
           setAtPath(nextSelectedItems);
         }}
-        loading={aiProcessing}
+        loading={isBusy}
         disabled={false}
         className='z-10'
         placeholder={
-          aiProcessing
+          isBusy
             ? t('conversation.chat.processing')
             : t('acp.sendbox.placeholder', {
                 backend: 'Nanobot',
