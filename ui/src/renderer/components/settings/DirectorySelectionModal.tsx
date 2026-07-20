@@ -54,6 +54,7 @@ const DirectorySelectionModal: React.FC<DirectorySelectionModalProps> = ({
           {
             method: 'GET',
             credentials: 'include',
+            cache: 'no-store',
           }
         );
         if (!response.ok) {

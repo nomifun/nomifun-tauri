@@ -455,72 +455,90 @@ export function composeMessageForTest(message: TMessage | undefined, list: TMess
   return composeMessageWithIndex(message, list, buildMessageIndex(list));
 }
 
+type PendingMessageUpdate = { message: TMessage; add: boolean };
+type PendingMessageUpdateRef = { current: PendingMessageUpdate[] };
+type MessageListFunctionalUpdate = (updater: (list: TMessage[]) => TMessage[]) => void;
+
+/**
+ * Atomically drains one renderer message batch into the shared list.
+ *
+ * Keeping the drain synchronous is important for effect cleanup: a stream event
+ * can arrive in the same task as a route/conversation switch, before the normal
+ * zero-delay timer runs. Clearing that timer without consuming its queue drops
+ * the event. The ref is swapped before invoking React's updater so a re-entrant
+ * event is placed in a new batch and can never be applied twice.
+ */
+export function drainPendingMessageUpdates(
+  pendingRef: PendingMessageUpdateRef,
+  update: MessageListFunctionalUpdate
+): boolean {
+  const pending = pendingRef.current;
+  if (!pending.length) return false;
+  pendingRef.current = [];
+
+  update((list) => {
+    const index = getOrBuildIndex(list);
+    let newList = list;
+
+    for (const item of pending) {
+      if (!item.message) {
+        continue;
+      }
+
+      if (logDroppedToolCallWithoutCallId(item.message)) {
+        continue;
+      }
+
+      if (item.add) {
+        const msg = item.message;
+        const newIdx = newList.length;
+        const msgIndexKey = getMessageIndexKey(msg);
+        if (msgIndexKey) index.msgIdIndex.set(msgIndexKey, newIdx);
+        if (msg.type === 'tool_call' && msg.content?.call_id) {
+          index.call_idIndex.set(getToolLifecycleKey(msg, msg.content.call_id), newIdx);
+        }
+        if (msg.type === 'acp_tool_call' && msg.content?.update?.tool_call_id) {
+          index.tool_call_idIndex.set(getToolLifecycleKey(msg, msg.content.update.tool_call_id), newIdx);
+        }
+        if (msg.type === 'permission' && msg.content?.call_id) {
+          index.permission_call_idIndex.set(msg.content.call_id, newIdx);
+        }
+        newList = newList.concat(msg);
+      } else {
+        newList = composeMessageWithIndex(item.message, newList, index);
+      }
+
+      while (beforeUpdateMessageListStack.length) {
+        newList = beforeUpdateMessageListStack.shift()!(newList);
+      }
+    }
+    return newList;
+  });
+
+  return true;
+}
+
 export const useAddOrUpdateMessage = () => {
   const update = useUpdateMessageList();
-  const pendingRef = useRef<Array<{ message: TMessage; add: boolean }>>([]);
+  const pendingRef = useRef<PendingMessageUpdate[]>([]);
   const rafRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const flush = useCallback(() => {
     rafRef.current = null;
-
-    const pending = pendingRef.current;
-    if (!pending.length) return;
-    pendingRef.current = [];
-    update((list) => {
-      // 获取或构建索引用于快速查找 (O(1) instead of O(n))
-      // Get or build index for fast lookup
-      const index = getOrBuildIndex(list);
-      let newList = list;
-
-      for (const item of pending) {
-        if (!item.message) {
-          continue;
-        }
-
-        if (logDroppedToolCallWithoutCallId(item.message)) {
-          continue;
-        }
-
-        if (item.add) {
-          // 新增消息，更新索引
-          // New message, update index
-          const msg = item.message;
-          const newIdx = newList.length;
-          const msgIndexKey = getMessageIndexKey(msg);
-          if (msgIndexKey) index.msgIdIndex.set(msgIndexKey, newIdx);
-          if (msg.type === 'tool_call' && msg.content?.call_id) {
-            index.call_idIndex.set(getToolLifecycleKey(msg, msg.content.call_id), newIdx);
-          }
-          if (msg.type === 'acp_tool_call' && msg.content?.update?.tool_call_id) {
-            index.tool_call_idIndex.set(getToolLifecycleKey(msg, msg.content.update.tool_call_id), newIdx);
-          }
-          if (msg.type === 'permission' && msg.content?.call_id) {
-            index.permission_call_idIndex.set(msg.content.call_id, newIdx);
-          }
-          newList = newList.concat(msg);
-        } else {
-          // 使用索引优化的消息合并
-          // Use index-optimized message compose
-          newList = composeMessageWithIndex(item.message, newList, index);
-        }
-
-        while (beforeUpdateMessageListStack.length) {
-          newList = beforeUpdateMessageListStack.shift()!(newList);
-        }
-      }
-      return newList;
-    });
-
-    rafRef.current = setTimeout(flush);
-  }, []);
+    drainPendingMessageUpdates(pendingRef, update);
+  }, [update]);
 
   useEffect(() => {
     return () => {
       if (rafRef.current !== null) {
         clearTimeout(rafRef.current);
+        rafRef.current = null;
       }
+      // Navigation can race the zero-delay batch timer. Drain synchronously so
+      // cleanup never discards the final user/stream message in that task.
+      flush();
     };
-  }, []);
+  }, [flush]);
 
   return useCallback(
     (message: TMessage | undefined, add = false) => {

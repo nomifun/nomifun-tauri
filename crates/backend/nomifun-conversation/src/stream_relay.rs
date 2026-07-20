@@ -270,6 +270,7 @@ struct ThinkingSegmentState {
     id: String,
     buffer: String,
     started_at: i64,
+    completed_duration_ms: Option<u64>,
 }
 
 /// Result returned after a relay turn has fully drained and finalized.
@@ -1067,6 +1068,7 @@ impl StreamRelay {
                                 id: Self::mint_segment_msg_id(&mut used_primary_segment_msg_id, &self.msg_id),
                                 buffer: String::new(),
                                 started_at: now_ms(),
+                                completed_duration_ms: None,
                             });
                             segment.buffer.push_str(&data.content);
                             self.forward_to_websocket_with_msg_id(&segment.id, &event);
@@ -1152,6 +1154,72 @@ impl StreamRelay {
                                     terminal = Self::terminal_from_event(&event);
                                     suppress_error = false;
                                 }
+                            }
+
+                            // Visible assistant-segment durability is a
+                            // prerequisite for committing successful artifact
+                            // receipts. If this bounded write cannot settle,
+                            // convert Finish before the
+                            // artifact commit gate so the ordinary terminal
+                            // correction path retracts every provisional
+                            // receipt instead of leaving a green artifact on an
+                            // otherwise inconsistent turn.
+                            let text_status = if matches!(event, AgentStreamEvent::Error(_))
+                                || Self::is_cancelled_finish(&event)
+                            {
+                                "error"
+                            } else {
+                                "finish"
+                            };
+                            let (thinking_persistence_complete, text_persistence_complete) = match tokio::time::timeout(
+                                TERMINAL_FINALIZATION_GRACE,
+                                async {
+                                    let thinking_complete = self
+                                        .complete_active_thinking(&mut active_thinking)
+                                        .await;
+                                    let thinking_complete = if thinking_complete {
+                                        true
+                                    } else {
+                                        self.retry_terminal_thinking_segment(&mut active_thinking)
+                                            .await
+                                    };
+                                    self.close_active_text_segment(
+                                        &mut active_text,
+                                        &mut text_segments,
+                                        text_status,
+                                    )
+                                    .await;
+                                    let text_complete = self.retry_terminal_text_segment(
+                                        &mut active_text,
+                                        &mut text_segments,
+                                        text_status,
+                                    )
+                                    .await;
+                                    (thinking_complete, text_complete)
+                                },
+                            )
+                            .await
+                            {
+                                Ok(complete) => complete,
+                                Err(_) => {
+                                    let thinking_complete = active_thinking.is_none();
+                                    let text_complete = active_text.is_none();
+                                    if !thinking_complete || !text_complete {
+                                        warn!(
+                                            conversation_id = %self.conversation_id,
+                                            msg_id = %self.msg_id,
+                                            "Assistant segment terminal persistence exceeded the hard bound"
+                                        );
+                                    }
+                                    (thinking_complete, text_complete)
+                                }
+                            };
+                            if (!thinking_persistence_complete || !text_persistence_complete)
+                                && matches!(event, AgentStreamEvent::Finish(_))
+                            {
+                                event = Self::assistant_segment_persistence_error_event();
+                                terminal = Self::terminal_from_event(&event);
+                                suppress_error = false;
                             }
 
                             if terminal_claimed
@@ -1254,18 +1322,6 @@ impl StreamRelay {
                                 }
                             }
 
-                            let fallback_terminal = terminal.clone();
-                            let fallback_stop_reason = match &event {
-                                AgentStreamEvent::Finish(data) => data.stop_reason,
-                                _ => None,
-                            };
-                            let fallback_suppressed = suppress_error.then(|| event.clone());
-                            let fallback_text = (!full_text_buffer.trim().is_empty())
-                                .then(|| full_text_buffer.trim().to_owned());
-                            let fallback_msg_id = active_text
-                                .as_ref()
-                                .map(|segment| segment.id.clone())
-                                .or_else(|| text_segments.last().map(|segment| segment.id.clone()));
                             let terminal_cleanup = async {
                             // Artifact corrections are the first terminal side
                             // effect and are all broadcast before any repository
@@ -1296,19 +1352,6 @@ impl StreamRelay {
                                 self.persist_failed_tool_calls(&failed_completed_tools),
                                 self.persist_failed_acp_tool_calls(&failed_completed_acp_tools),
                             );
-                            self.complete_active_thinking(&mut active_thinking).await;
-                            self.close_active_text_segment(
-                                &mut active_text,
-                                &mut text_segments,
-                                if matches!(event, AgentStreamEvent::Error(_))
-                                    || Self::is_cancelled_finish(&event)
-                                {
-                                    "error"
-                                } else {
-                                    "finish"
-                                },
-                            )
-                            .await;
                             // review #1/#5: a pre-response provider-fault that the
                             // send loop will fail over must NOT reach the user —
                             // suppress the WS error event AND the error `tips` row
@@ -1345,6 +1388,7 @@ impl StreamRelay {
                                 .finalize(
                                     &full_text_buffer,
                                     &text_segments,
+                                    text_persistence_complete,
                                     &event,
                                     terminal,
                                     emitted_response,
@@ -1379,12 +1423,19 @@ impl StreamRelay {
                                     }
                                     RelayOutcome {
                                         system_responses: Vec::new(),
-                                        terminal: fallback_terminal,
-                                        stop_reason: fallback_stop_reason,
+                                        terminal: Self::terminal_from_event(&event),
+                                        stop_reason: match &event {
+                                            AgentStreamEvent::Finish(data) => data.stop_reason,
+                                            _ => None,
+                                        },
                                         emitted_response,
-                                        suppressed_error: fallback_suppressed,
-                                        final_text: fallback_text,
-                                        final_text_msg_id: fallback_msg_id,
+                                        suppressed_error: suppress_error.then(|| event.clone()),
+                                        final_text: (text_persistence_complete
+                                            && !full_text_buffer.trim().is_empty())
+                                            .then(|| full_text_buffer.trim().to_owned()),
+                                        final_text_msg_id: text_persistence_complete
+                                            .then(|| text_segments.last().map(|segment| segment.id.clone()))
+                                            .flatten(),
                                     }
                                 }
                             };
@@ -1949,18 +2000,17 @@ impl StreamRelay {
                         AgentStreamEvent::AgentStatus(data) => {
                             self.forward_to_websocket(&event);
                             if data.backend == "nomi" && (data.status == "preparing" || data.status == "prepared") {
-                                if data.status == "preparing" {
-                                    active_agent_status = Some(data.clone());
-                                } else {
-                                    active_agent_status = None;
-                                }
-                                let _ = self
+                                active_agent_status = Some(data.clone());
+                                let persisted = self
                                     .bounded_event_side_effect(
                                         event_side_effect_deadline,
                                         "persist_agent_status",
                                         self.persist_agent_status(data),
                                     )
                                     .await;
+                                if data.status == "prepared" && persisted == Some(true) {
+                                    active_agent_status = None;
+                                }
                             }
                         }
                         AgentStreamEvent::Plan(data) => {
@@ -2101,23 +2151,12 @@ impl StreamRelay {
                         .as_ref()
                         .map(AgentTurnCancellation::try_claim_terminal_surface)
                         .unwrap_or(true);
-                    let terminal = if Self::is_cancelled_finish(&terminal_event) {
+                    let mut terminal = if Self::is_cancelled_finish(&terminal_event) {
                         RelayTerminal::Finish
                     } else {
                         RelayTerminal::ChannelClosed
                     };
-                    let fallback_terminal = terminal.clone();
-                    let fallback_stop_reason = match &terminal_event {
-                        AgentStreamEvent::Finish(data) => data.stop_reason,
-                        _ => None,
-                    };
-                    let fallback_text = (!full_text_buffer.trim().is_empty())
-                        .then(|| full_text_buffer.trim().to_owned());
-                    let fallback_msg_id = active_text
-                        .as_ref()
-                        .map(|segment| segment.id.clone())
-                        .or_else(|| text_segments.last().map(|segment| segment.id.clone()));
-                    let terminal_message_id = if matches!(terminal_event, AgentStreamEvent::Error(_)) {
+                    let mut terminal_message_id = if matches!(terminal_event, AgentStreamEvent::Error(_)) {
                         ConversationService::mint_msg_id()
                     } else {
                         self.msg_id.clone()
@@ -2142,7 +2181,15 @@ impl StreamRelay {
                             self.persist_failed_tool_calls(&failed_completed_tools),
                             self.persist_failed_acp_tool_calls(&failed_completed_acp_tools),
                         );
-                        self.complete_active_thinking(&mut active_thinking).await;
+                        let thinking_persistence_complete = self
+                            .complete_active_thinking(&mut active_thinking)
+                            .await;
+                        let thinking_persistence_complete = if thinking_persistence_complete {
+                            true
+                        } else {
+                            self.retry_terminal_thinking_segment(&mut active_thinking)
+                                .await
+                        };
                         self.close_active_text_segment(
                             &mut active_text,
                             &mut text_segments,
@@ -2164,10 +2211,25 @@ impl StreamRelay {
                             Self::plan_terminal_status(&terminal_event),
                         )
                         .await;
+                        let text_persistence_complete = self
+                            .retry_terminal_text_segment(
+                                &mut active_text,
+                                &mut text_segments,
+                                "error",
+                            )
+                            .await;
+                        if (!thinking_persistence_complete || !text_persistence_complete)
+                            && matches!(terminal_event, AgentStreamEvent::Finish(_))
+                        {
+                            terminal_event = Self::assistant_segment_persistence_error_event();
+                            terminal = Self::terminal_from_event(&terminal_event);
+                            terminal_message_id = ConversationService::mint_msg_id();
+                        }
                         let outcome = self
                             .finalize(
                                 &full_text_buffer,
                                 &text_segments,
+                                text_persistence_complete,
                                 &terminal_event,
                                 terminal,
                                 emitted_response,
@@ -2195,17 +2257,32 @@ impl StreamRelay {
                                 msg_id = %self.msg_id,
                                 "Channel-closed relay finalization exceeded the hard bound"
                             );
+                            let thinking_persistence_complete = active_thinking.is_none();
+                            let text_persistence_complete = active_text.is_none();
+                            if (!thinking_persistence_complete || !text_persistence_complete)
+                                && matches!(terminal_event, AgentStreamEvent::Finish(_))
+                            {
+                                terminal_event = Self::assistant_segment_persistence_error_event();
+                                terminal_message_id = ConversationService::mint_msg_id();
+                            }
                             if terminal_claimed {
                                 self.forward_to_websocket_with_msg_id(&terminal_message_id, &terminal_event);
                             }
                             RelayOutcome {
                                 system_responses: Vec::new(),
-                                terminal: fallback_terminal,
-                                stop_reason: fallback_stop_reason,
+                                terminal: Self::terminal_from_event(&terminal_event),
+                                stop_reason: match &terminal_event {
+                                    AgentStreamEvent::Finish(data) => data.stop_reason,
+                                    _ => None,
+                                },
                                 emitted_response,
                                 suppressed_error: None,
-                                final_text: fallback_text,
-                                final_text_msg_id: fallback_msg_id,
+                                final_text: (text_persistence_complete
+                                    && !full_text_buffer.trim().is_empty())
+                                    .then(|| full_text_buffer.trim().to_owned()),
+                                final_text_msg_id: text_persistence_complete
+                                    .then(|| text_segments.last().map(|segment| segment.id.clone()))
+                                    .flatten(),
                             }
                         }
                     };
@@ -2286,6 +2363,15 @@ impl StreamRelay {
             session_id: None,
             stop_reason: Some(TurnStopReason::Cancelled),
         })
+    }
+
+    fn assistant_segment_persistence_error_event() -> AgentStreamEvent {
+        AgentStreamEvent::Error(
+            nomifun_ai_agent::protocol::events::ErrorEventData::legacy(
+                "The assistant response could not be fully saved to conversation history",
+                Some(AgentErrorCode::NomifunStateInconsistent),
+            ),
+        )
     }
 
     fn is_cancelled_finish(event: &AgentStreamEvent) -> bool {
@@ -2371,6 +2457,92 @@ impl StreamRelay {
         self.broadcast_stream_payload(payload);
     }
 
+    /// Insert a streamed assistant row, reconciling the cancellation-ambiguous case
+    /// where SQLite committed the INSERT but its future returned an error (or a
+    /// previous timed-out attempt was dropped before the caller observed it).
+    /// We do not classify the insert error: SQLite uniqueness failures arrive as
+    /// `DbError::Query`, and transport/executor errors can be ambiguous too.
+    async fn insert_stream_message_with_reconciliation(
+        &self,
+        row: &MessageRow,
+        operation: &'static str,
+    ) -> bool {
+        let insert_error = match self.repo.insert_message(row).await {
+            Ok(()) => return true,
+            Err(error) => error,
+        };
+
+        let existing = match self.repo.get_message(&row.conversation_id, &row.id).await {
+            Ok(Some(existing)) => existing,
+            Ok(None) => {
+                error!(
+                    error = %ErrorChain(&insert_error),
+                    operation,
+                    message_id = %row.id,
+                    "Failed to insert stream segment and no committed row was found to reconcile"
+                );
+                return false;
+            }
+            Err(reconcile_error) => {
+                error!(
+                    error = %ErrorChain(&insert_error),
+                    reconcile_error = %ErrorChain(&reconcile_error),
+                    operation,
+                    message_id = %row.id,
+                    "Failed to inspect an ambiguous stream-segment insert"
+                );
+                return false;
+            }
+        };
+
+        // IDs are globally canonical, but still fail closed before updating an
+        // existing row: a collision must never overwrite another message type
+        // or turn. get_message already scopes this lookup to the conversation.
+        if existing.conversation_id != row.conversation_id
+            || existing.r#type != row.r#type
+            || existing.msg_id != row.msg_id
+        {
+            error!(
+                error = %ErrorChain(&insert_error),
+                operation,
+                message_id = %row.id,
+                stored_type = %existing.r#type,
+                expected_type = %row.r#type,
+                stored_msg_id = ?existing.msg_id,
+                expected_msg_id = ?row.msg_id,
+                "Refusing to reconcile an ambiguous stream insert with an incompatible row"
+            );
+            return false;
+        }
+
+        let update = MessageRowUpdate {
+            content: Some(row.content.clone()),
+            status: Some(row.status.clone()),
+            hidden: Some(row.hidden),
+        };
+        match self.repo.update_message(&row.id, &update).await {
+            Ok(()) => {
+                warn!(
+                    error = %ErrorChain(&insert_error),
+                    operation,
+                    message_id = %row.id,
+                    "Reconciled an ambiguous stream-segment insert against its committed row"
+                );
+                true
+            }
+            Err(reconcile_error) => {
+                error!(
+                    error = %ErrorChain(&insert_error),
+                    reconcile_error = %ErrorChain(&reconcile_error),
+                    operation,
+                    message_id = %row.id,
+                    "Failed to reconcile an ambiguous stream-segment insert"
+                );
+                false
+            }
+        }
+    }
+
     /// Flush an active text segment to the database (create or update).
     #[tracing::instrument(skip_all)]
     async fn flush_text_segment(&self, segment: &mut TextSegmentState) {
@@ -2405,15 +2577,21 @@ impl StreamRelay {
                 hidden: false,
                 created_at: segment.created_at,
             };
-            if let Err(e) = self.repo.insert_message(&row).await {
-                error!(error = %ErrorChain(&e), "Failed to create streaming text segment");
+            if self
+                .insert_stream_message_with_reconciliation(&row, "create_streaming_text")
+                .await
+            {
+                segment.record_created = true;
             }
-            segment.record_created = true;
         }
     }
 
     #[tracing::instrument(skip_all)]
-    async fn finalize_text_segment(&self, segment: TextSegmentState, status: &str) -> Option<PersistedTextSegment> {
+    async fn finalize_text_segment(
+        &self,
+        segment: &TextSegmentState,
+        status: &str,
+    ) -> Option<PersistedTextSegment> {
         if segment.buffer.is_empty() {
             return None;
         }
@@ -2431,6 +2609,7 @@ impl StreamRelay {
             };
             if let Err(e) = self.repo.update_message(&segment.id, &update).await {
                 error!(error = %ErrorChain(&e), "Failed to finalize text segment");
+                return None;
             }
         } else {
             let row = MessageRow {
@@ -2444,12 +2623,17 @@ impl StreamRelay {
                 hidden: false,
                 created_at: segment.created_at,
             };
-            if let Err(e) = self.repo.insert_message(&row).await {
-                error!(error = %ErrorChain(&e), "Failed to create finalized text segment");
+            if !self
+                .insert_stream_message_with_reconciliation(&row, "create_finalized_text")
+                .await
+            {
+                return None;
             }
         }
 
-        Some(PersistedTextSegment { id: segment.id })
+        Some(PersistedTextSegment {
+            id: segment.id.clone(),
+        })
     }
 
     /// Finalize assistant text on stream end and apply middleware rewrites.
@@ -2458,6 +2642,7 @@ impl StreamRelay {
         &self,
         text: &str,
         text_segments: &[PersistedTextSegment],
+        text_persistence_complete: bool,
         event: &AgentStreamEvent,
         terminal: RelayTerminal,
         emitted_response: bool,
@@ -2495,6 +2680,14 @@ impl StreamRelay {
         }
 
         if !text.is_empty() {
+            if !text_persistence_complete {
+                error!(
+                    conversation_id = %self.conversation_id,
+                    msg_id = %self.msg_id,
+                    "Assistant text terminal persistence failed after its bounded retry"
+                );
+                return outcome;
+            }
             let processed = if cancelled {
                 // A cancelled partial response is data to preserve, never a
                 // completed instruction stream. In particular, do not execute
@@ -2515,11 +2708,8 @@ impl StreamRelay {
 
             if let Some(primary_segment) = text_segments.first() {
                 if processed.message != text || hidden {
-                    if !hidden {
-                        outcome.final_text_msg_id = Some(primary_segment.id.clone());
-                    }
                     let content = json!({
-                        "content": final_text,
+                        "content": &final_text,
                         "turn_id": &self.root_turn_id,
                     })
                     .to_string();
@@ -2528,21 +2718,45 @@ impl StreamRelay {
                         status: Some(Some(status.to_owned())),
                         hidden: Some(hidden),
                     };
-                    if let Err(e) = self.repo.update_message(&primary_segment.id, &update).await {
-                        error!(error = %ErrorChain(&e), "Failed to rewrite finalized text segment");
-                    }
-                    self.send_final_text_override(&primary_segment.id, &processed.message, hidden);
+                    match self.repo.update_message(&primary_segment.id, &update).await {
+                        Ok(()) => {
+                            self.send_final_text_override(&primary_segment.id, &final_text, hidden);
 
-                    for segment in text_segments.iter().skip(1) {
-                        let hide_update = nomifun_db::MessageRowUpdate {
-                            content: None,
-                            status: None,
-                            hidden: Some(true),
-                        };
-                        if let Err(e) = self.repo.update_message(&segment.id, &hide_update).await {
-                            error!(error = %ErrorChain(&e), "Failed to hide superseded text segment");
+                            let mut all_superseded_hidden = true;
+                            for segment in text_segments.iter().skip(1) {
+                                let hide_update = nomifun_db::MessageRowUpdate {
+                                    content: None,
+                                    status: None,
+                                    hidden: Some(true),
+                                };
+                                match self.repo.update_message(&segment.id, &hide_update).await {
+                                    Ok(()) => self.send_final_text_override(&segment.id, "", true),
+                                    Err(e) => {
+                                        all_superseded_hidden = false;
+                                        error!(error = %ErrorChain(&e), "Failed to hide superseded text segment");
+                                    }
+                                }
+                            }
+                            if all_superseded_hidden {
+                                if !hidden {
+                                    outcome.final_text_msg_id = Some(primary_segment.id.clone());
+                                }
+                            } else {
+                                // Every emitted override now reflects an
+                                // acknowledged row update, but a partial
+                                // multi-row rewrite is not a coherent target
+                                // for turn-final writeback.
+                                outcome.final_text = None;
+                            }
                         }
-                        self.send_final_text_override(&segment.id, "", true);
+                        Err(e) => {
+                            // The raw streamed segments are already durable.
+                            // Keep the live UI on that same raw representation
+                            // and do not claim that the middleware projection
+                            // was persisted.
+                            outcome.final_text = None;
+                            error!(error = %ErrorChain(&e), "Failed to rewrite finalized text segment");
+                        }
                     }
                 } else {
                     outcome.final_text_msg_id = text_segments.last().map(|segment| segment.id.clone());
@@ -2566,9 +2780,12 @@ impl StreamRelay {
                     hidden: false,
                     created_at: now_ms(),
                 };
-                outcome.final_text_msg_id = Some(row.id.clone());
-                if let Err(e) = self.repo.insert_message(&row).await {
-                    error!(error = %ErrorChain(&e), "Failed to create final fallback message");
+                match self.repo.insert_message(&row).await {
+                    Ok(()) => outcome.final_text_msg_id = Some(row.id.clone()),
+                    Err(e) => {
+                        outcome.final_text = None;
+                        error!(error = %ErrorChain(&e), "Failed to create final fallback message");
+                    }
                 }
             }
 
@@ -2620,7 +2837,10 @@ impl StreamRelay {
     }
 
     #[tracing::instrument(skip_all)]
-    async fn persist_agent_status(&self, data: &nomifun_ai_agent::protocol::events::AgentStatusEventData) {
+    async fn persist_agent_status(
+        &self,
+        data: &nomifun_ai_agent::protocol::events::AgentStatusEventData,
+    ) -> bool {
         let id = self.agent_status_message_id().await;
         let content = serde_json::to_string(data).unwrap_or_else(|_| "{}".to_owned());
         let status = match data.status.as_str() {
@@ -2628,11 +2848,17 @@ impl StreamRelay {
             "error" => "error",
             _ => "work",
         };
-        let existing = self
-            .repo
-            .get_message(self.conv_id(), &id)
-            .await
-            .unwrap_or(None);
+        let existing = match self.repo.get_message(self.conv_id(), &id).await {
+            Ok(existing) => existing,
+            Err(e) => {
+                error!(
+                    status = %data.status,
+                    error = %ErrorChain(&e),
+                    "Failed to load agent_status message"
+                );
+                return false;
+            }
+        };
 
         if existing.is_some() {
             let update = nomifun_db::MessageRowUpdate {
@@ -2640,14 +2866,17 @@ impl StreamRelay {
                 status: Some(Some(status.to_owned())),
                 hidden: Some(false),
             };
-            if let Err(e) = self.repo.update_message(&id, &update).await {
-                error!(
-                    status = %data.status,
-                    error = %ErrorChain(&e),
-                    "Failed to update agent_status message"
-                );
-            }
-            return;
+            return match self.repo.update_message(&id, &update).await {
+                Ok(()) => true,
+                Err(e) => {
+                    error!(
+                        status = %data.status,
+                        error = %ErrorChain(&e),
+                        "Failed to update agent_status message"
+                    );
+                    false
+                }
+            };
         }
 
         let row = MessageRow {
@@ -2661,13 +2890,8 @@ impl StreamRelay {
             hidden: false,
             created_at: now_ms(),
         };
-        if let Err(e) = self.repo.insert_message(&row).await {
-            error!(
-                status = %data.status,
-                error = %ErrorChain(&e),
-                "Failed to persist agent_status message"
-            );
-        }
+        self.insert_stream_message_with_reconciliation(&row, "persist_agent_status")
+            .await
     }
 
     async fn agent_status_message_id(&self) -> String {
@@ -2678,18 +2902,28 @@ impl StreamRelay {
         &self,
         active_status: &mut Option<nomifun_ai_agent::protocol::events::AgentStatusEventData>,
         terminal_status: &str,
-    ) {
-        let Some(mut data) = active_status.take() else {
-            return;
+    ) -> bool {
+        let Some(current) = active_status.as_ref() else {
+            return true;
         };
-        data.status = if terminal_status == "finish" {
-            "prepared".to_owned()
+        let final_status = if terminal_status == "finish" {
+            "prepared"
         } else {
-            "error".to_owned()
+            "error"
         };
-        let event = AgentStreamEvent::AgentStatus(data.clone());
-        self.forward_to_websocket(&event);
-        self.persist_agent_status(&data).await;
+        let should_forward = current.status != final_status;
+        let mut data = current.clone();
+        data.status = final_status.to_owned();
+
+        if !self.persist_agent_status(&data).await {
+            return false;
+        }
+
+        if should_forward {
+            self.forward_to_websocket(&AgentStreamEvent::AgentStatus(data));
+        }
+        *active_status = None;
+        true
     }
 
     fn plan_session_id(&self, data: &PlanEventData) -> String {
@@ -2757,34 +2991,69 @@ impl StreamRelay {
     }
 
     #[tracing::instrument(skip_all)]
-    async fn complete_active_thinking(&self, active_thinking: &mut Option<ThinkingSegmentState>) {
-        let Some(segment) = active_thinking.take() else {
-            return;
+    async fn complete_active_thinking(
+        &self,
+        active_thinking: &mut Option<ThinkingSegmentState>,
+    ) -> bool {
+        let Some(segment) = active_thinking.as_mut() else {
+            return true;
         };
-        let duration_ms = (now_ms() - segment.started_at).max(0);
-        self.send_thinking_done(&segment.id, duration_ms as u64);
+
+        let duration_ms = match segment.completed_duration_ms {
+            Some(duration_ms) => duration_ms,
+            None => {
+                let duration_ms = (now_ms() - segment.started_at).max(0) as u64;
+                segment.completed_duration_ms = Some(duration_ms);
+                self.send_thinking_done(&segment.id, duration_ms);
+                duration_ms
+            }
+        };
         if segment.buffer.is_empty() {
-            return;
+            *active_thinking = None;
+            return true;
         }
-        let content = json!({
-            "content": segment.buffer,
-            "status": "done",
-            "duration_ms": duration_ms,
-        })
-        .to_string();
+
         let row = MessageRow {
             id: segment.id.clone(),
             conversation_id: self.conversation_id.clone(),
-            msg_id: Some(segment.id),
+            msg_id: Some(segment.id.clone()),
             r#type: "thinking".into(),
-            content,
+            content: json!({
+                "content": segment.buffer,
+                "status": "done",
+                "duration_ms": duration_ms,
+            })
+            .to_string(),
             position: Some("left".into()),
             status: Some("finish".into()),
             hidden: false,
             created_at: segment.started_at,
         };
-        if let Err(e) = self.repo.insert_message(&row).await {
-            error!(error = %ErrorChain(&e), "Failed to persist thinking message");
+        let persisted = self
+            .insert_stream_message_with_reconciliation(&row, "complete_thinking")
+            .await;
+        if persisted {
+            *active_thinking = None;
+        }
+        persisted
+    }
+
+    /// Retry a terminal thinking write once. The state remains owned by
+    /// `active_thinking` until the repository acknowledges it, so cancellation
+    /// of either attempt cannot discard the only durable-retry copy.
+    async fn retry_terminal_thinking_segment(
+        &self,
+        active_thinking: &mut Option<ThinkingSegmentState>,
+    ) -> bool {
+        if active_thinking.is_some() {
+            warn!(
+                conversation_id = %self.conversation_id,
+                msg_id = %self.msg_id,
+                "Retrying assistant thinking terminal persistence"
+            );
+            self.complete_active_thinking(active_thinking).await
+        } else {
+            true
         }
     }
 
@@ -2795,19 +3064,60 @@ impl StreamRelay {
         text_segments: &mut Vec<PersistedTextSegment>,
         status: &str,
     ) {
-        let Some(text_segment) = active_text.take() else {
+        if active_text
+            .as_ref()
+            .is_some_and(|segment| segment.buffer.is_empty())
+        {
+            *active_text = None;
+            return;
+        }
+
+        // Keep the in-memory segment authoritative until the repository has
+        // acknowledged the terminal write. This future is deliberately used
+        // behind the non-terminal side-effect timeout: taking the segment
+        // before the await would drop its only retryable copy when that timeout
+        // cancels the future, leaving the later terminal cleanup with nothing
+        // to persist.
+        let persisted = {
+            let Some(text_segment) = active_text.as_ref() else {
+                return;
+            };
+            self.finalize_text_segment(text_segment, status).await
+        };
+        let Some(segment) = persisted else {
             return;
         };
-        if let Some(segment) = self.finalize_text_segment(text_segment, status).await {
-            if text_segments.len() < MAX_TERMINAL_ACTIVE_ITEMS {
-                text_segments.push(segment);
-            } else {
-                warn!(
-                    max = MAX_TERMINAL_ACTIVE_ITEMS,
-                    "Relay finalized-text tracking limit reached"
-                );
-            }
+
+        *active_text = None;
+        if text_segments.len() < MAX_TERMINAL_ACTIVE_ITEMS {
+            text_segments.push(segment);
+        } else {
+            warn!(
+                max = MAX_TERMINAL_ACTIVE_ITEMS,
+                "Relay finalized-text tracking limit reached"
+            );
         }
+    }
+
+    /// Retry a terminal text write once after the first close attempt failed.
+    /// The enclosing terminal cleanup already owns the global hard deadline, so
+    /// this adds recovery for transient SQLite errors without an unbounded loop.
+    async fn retry_terminal_text_segment(
+        &self,
+        active_text: &mut Option<TextSegmentState>,
+        text_segments: &mut Vec<PersistedTextSegment>,
+        status: &str,
+    ) -> bool {
+        if active_text.is_some() {
+            warn!(
+                conversation_id = %self.conversation_id,
+                msg_id = %self.msg_id,
+                "Retrying assistant text terminal persistence"
+            );
+            self.close_active_text_segment(active_text, text_segments, status)
+                .await;
+        }
+        active_text.is_none()
     }
 
     /// Persist a Gemini-style tool_call event.
@@ -4067,6 +4377,573 @@ mod tests {
             .await;
         assert!(second.is_none());
         assert_eq!(polls.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_streaming_text_insert_is_retried_by_terminal_finalization() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.fail_next_message_insert();
+        let bus = Arc::new(TestUserEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let rx = tx.subscribe();
+
+        for _ in 0..FLUSH_INTERVAL {
+            tx.send(AgentStreamEvent::Text(TextEventData {
+                content: "x".into(),
+            }))
+            .unwrap();
+        }
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+
+        assert_eq!(outcome.terminal, RelayTerminal::Finish);
+        assert_eq!(outcome.final_text_msg_id.as_deref(), Some(TEST_ASSISTANT_MESSAGE_ID));
+        let inserts = repo.take_inserts();
+        assert_eq!(inserts.len(), 1, "the failed work insert must be retried as the terminal row");
+        assert_eq!(inserts[0].status.as_deref(), Some("finish"));
+        let content: Value = serde_json::from_str(&inserts[0].content).unwrap();
+        assert_eq!(content["content"], "x".repeat(FLUSH_INTERVAL as usize));
+        assert!(
+            repo.take_updates().is_empty(),
+            "a failed insert must not make finalization update a nonexistent row"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_streaming_insert_is_reconciled_without_a_duplicate_row() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.commit_next_message_insert_then_error();
+        let bus = Arc::new(TestUserEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let rx = tx.subscribe();
+
+        for _ in 0..FLUSH_INTERVAL {
+            tx.send(AgentStreamEvent::Text(TextEventData {
+                content: "x".into(),
+            }))
+            .unwrap();
+        }
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+
+        assert_eq!(
+            outcome.final_text_msg_id.as_deref(),
+            Some(TEST_ASSISTANT_MESSAGE_ID)
+        );
+        let inserts = repo.take_inserts();
+        assert_eq!(
+            inserts.len(),
+            1,
+            "a committed-but-unacknowledged insert must be reconciled, not duplicated"
+        );
+        let updates = repo.take_updates();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(
+            updates[0]
+                .1
+                .status
+                .as_ref()
+                .and_then(|status| status.as_deref()),
+            Some("work"),
+            "the ambiguous streaming insert is reconciled to its intended work state"
+        );
+        assert_eq!(
+            updates[1]
+                .1
+                .status
+                .as_ref()
+                .and_then(|status| status.as_deref()),
+            Some("finish")
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_terminal_insert_failure_surfaces_state_inconsistent_error() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.fail_message_inserts();
+        let bus = Arc::new(TestUserEventBus::new(64));
+        let mut ws_rx = bus.subscribe();
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "visible but unavailable database".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+
+        assert!(outcome.terminal.is_error());
+        assert_eq!(
+            outcome.terminal.code(),
+            Some(AgentErrorCode::NomifunStateInconsistent)
+        );
+        assert!(outcome.emitted_response);
+        assert!(outcome.final_text.is_none());
+        assert!(outcome.final_text_msg_id.is_none());
+        assert!(
+            repo.take_inserts().iter().all(|row| row.r#type != "text"),
+            "no text row may be claimed after every insert attempt failed"
+        );
+
+        let mut stream_types = Vec::new();
+        while let Ok(event) = ws_rx.try_recv() {
+            if event.name == "message.stream" {
+                stream_types.push(event.data["type"].clone());
+            }
+        }
+        assert!(!stream_types.iter().any(|kind| *kind == json!("finish")));
+        assert_eq!(stream_types.last(), Some(&json!("error")));
+    }
+
+    #[tokio::test]
+    async fn failed_text_finalization_keeps_the_segment_retryable_and_untracked() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.fail_next_message_insert();
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            Arc::new(TestUserEventBus::new(8)),
+            None,
+        );
+        let mut active_text = Some(TextSegmentState {
+            id: TEST_ASSISTANT_MESSAGE_ID.into(),
+            buffer: "durable answer".into(),
+            created_at: now_ms(),
+            record_created: false,
+            flush_counter: 0,
+        });
+        let mut text_segments = Vec::new();
+
+        relay
+            .close_active_text_segment(&mut active_text, &mut text_segments, "finish")
+            .await;
+
+        assert!(active_text.is_some(), "a failed final write must retain the retry state");
+        assert!(
+            text_segments.is_empty(),
+            "a failed final write must not be reported as a persisted segment"
+        );
+
+        relay
+            .close_active_text_segment(&mut active_text, &mut text_segments, "finish")
+            .await;
+
+        assert!(active_text.is_none());
+        assert_eq!(text_segments.len(), 1);
+        let inserts = repo.take_inserts();
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(inserts[0].status.as_deref(), Some("finish"));
+    }
+
+    #[tokio::test]
+    async fn transient_terminal_update_failure_retries_the_existing_work_row() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.fail_next_message_update();
+        let bus = Arc::new(TestUserEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let rx = tx.subscribe();
+
+        for _ in 0..FLUSH_INTERVAL {
+            tx.send(AgentStreamEvent::Text(TextEventData {
+                content: "x".into(),
+            }))
+            .unwrap();
+        }
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+
+        assert_eq!(outcome.final_text_msg_id.as_deref(), Some(TEST_ASSISTANT_MESSAGE_ID));
+        let inserts = repo.take_inserts();
+        assert_eq!(inserts.len(), 1, "the work row must not be inserted a second time");
+        assert_eq!(inserts[0].status.as_deref(), Some("work"));
+        let updates = repo.take_updates();
+        assert_eq!(updates.len(), 1, "terminal finalization should retry exactly once");
+        assert_eq!(updates[0].0, TEST_ASSISTANT_MESSAGE_ID);
+        assert_eq!(
+            updates[0].1.status.as_ref().and_then(|status| status.as_deref()),
+            Some("finish")
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_terminal_update_failure_does_not_claim_or_insert_the_work_row() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.fail_message_updates();
+        let bus = Arc::new(TestUserEventBus::new(64));
+        let mut ws_rx = bus.subscribe();
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let rx = tx.subscribe();
+
+        for _ in 0..FLUSH_INTERVAL {
+            tx.send(AgentStreamEvent::Text(TextEventData {
+                content: "x".into(),
+            }))
+            .unwrap();
+        }
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+
+        assert!(outcome.terminal.is_error());
+        assert_eq!(
+            outcome.terminal.code(),
+            Some(AgentErrorCode::NomifunStateInconsistent)
+        );
+        assert!(outcome.emitted_response, "the visible text must continue to block failover");
+        assert!(outcome.final_text.is_none());
+        assert!(
+            outcome.final_text_msg_id.is_none(),
+            "an unfinalized work row must not be advertised as durable final text"
+        );
+        let inserts = repo.take_inserts();
+        let text_rows: Vec<_> = inserts.iter().filter(|row| row.r#type == "text").collect();
+        assert_eq!(
+            text_rows.len(),
+            1,
+            "finalize must not fall back to a conflicting INSERT for an existing work row"
+        );
+        assert_eq!(text_rows[0].status.as_deref(), Some("work"));
+        assert!(
+            inserts.iter().any(|row| row.r#type == "tips" && row.status.as_deref() == Some("error")),
+            "the state-inconsistent terminal must itself be durable"
+        );
+        assert!(repo.take_updates().is_empty());
+
+        let mut stream_types = Vec::new();
+        while let Ok(event) = ws_rx.try_recv() {
+            if event.name == "message.stream" {
+                stream_types.push(event.data["type"].clone());
+            }
+        }
+        assert!(!stream_types.iter().any(|kind| *kind == json!("finish")));
+        assert_eq!(stream_types.last(), Some(&json!("error")));
+    }
+
+    #[tokio::test]
+    async fn text_persistence_failure_prevents_completed_artifact_commit() {
+        use nomifun_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+
+        let repo = Arc::new(RecordingRepo::new());
+        repo.fail_message_updates();
+        let bus = Arc::new(TestUserEventBus::new(128));
+        let mut ws_rx = bus.subscribe();
+        let (tx, _) = broadcast::channel(128);
+        let workspace = std::env::temp_dir().join(format!(
+            "nomifun-text-persistence-artifact-test-{}",
+            MessageId::new().into_string()
+        ));
+        std::fs::create_dir_all(&workspace).expect("create test workspace");
+        let artifact = persisted_png_artifact(&workspace);
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_TURN_A.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            bus,
+            None,
+        )
+        .with_artifact_workspace(workspace.clone());
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "artifact-before-unpersisted-text".into(),
+            name: "ImageGeneration".into(),
+            args: json!({"prompt": "cat"}),
+            status: ToolCallStatus::Completed,
+            input: None,
+            output: Some("generated".into()),
+            description: None,
+            artifacts: vec![artifact],
+        }))
+        .unwrap();
+        for _ in 0..FLUSH_INTERVAL {
+            tx.send(AgentStreamEvent::Text(TextEventData {
+                content: "x".into(),
+            }))
+            .unwrap();
+        }
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+
+        assert_eq!(
+            outcome.terminal.code(),
+            Some(AgentErrorCode::NomifunStateInconsistent)
+        );
+        let inserts = repo.take_inserts();
+        let tool_row = inserts
+            .iter()
+            .find(|row| row.r#type == "tool_call")
+            .expect("artifact tool has a provisional row");
+        assert_eq!(tool_row.status.as_deref(), Some("work"));
+        assert!(
+            repo.take_updates().iter().all(|(id, update)| {
+                id != &tool_row.id
+                    || update.status.as_ref().and_then(|status| status.as_deref())
+                        != Some("finish")
+            }),
+            "artifact receipt must not commit after assistant text durability fails"
+        );
+
+        let mut tool_statuses = Vec::new();
+        let mut stream_types = Vec::new();
+        while let Ok(event) = ws_rx.try_recv() {
+            if event.name != "message.stream" {
+                continue;
+            }
+            stream_types.push(event.data["type"].clone());
+            if event.data["type"] == "tool_call"
+                && let Some(status) = event.data["data"]["status"].as_str()
+            {
+                tool_statuses.push(status.to_owned());
+            }
+        }
+        assert!(!tool_statuses.iter().any(|status| status == "completed"));
+        assert_eq!(tool_statuses.last().map(String::as_str), Some("error"));
+        assert!(!stream_types.iter().any(|kind| *kind == json!("finish")));
+        assert_eq!(stream_types.last(), Some(&json!("error")));
+        std::fs::remove_dir_all(workspace).expect("remove test workspace");
+    }
+
+    #[tokio::test]
+    async fn timed_out_text_close_remains_available_for_terminal_retry() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.set_block_message_inserts(true);
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            Arc::new(TestUserEventBus::new(8)),
+            None,
+        );
+        let mut active_text = Some(TextSegmentState {
+            id: TEST_ASSISTANT_MESSAGE_ID.into(),
+            buffer: "answer after a busy database".into(),
+            created_at: now_ms(),
+            record_created: false,
+            flush_counter: 0,
+        });
+        let mut text_segments = Vec::new();
+
+        let bounded = relay
+            .bounded_event_side_effect(
+                tokio::time::Instant::now() + Duration::from_millis(10),
+                "close_text_before_tool",
+                relay.close_active_text_segment(&mut active_text, &mut text_segments, "finish"),
+            )
+            .await;
+
+        assert!(bounded.is_none());
+        assert!(relay.event_side_effect_circuit_open.load(Ordering::Acquire));
+        assert!(
+            active_text.is_some(),
+            "cancelling a non-terminal close must not consume the only text copy"
+        );
+        assert!(text_segments.is_empty());
+
+        // Terminal cleanup bypasses the non-terminal circuit breaker. Once the
+        // repository is responsive it must be able to write the retained text.
+        repo.set_block_message_inserts(false);
+        relay
+            .close_active_text_segment(&mut active_text, &mut text_segments, "finish")
+            .await;
+
+        assert!(active_text.is_none());
+        assert_eq!(text_segments.len(), 1);
+        let inserts = repo.take_inserts();
+        assert_eq!(inserts.len(), 1);
+        let content: Value = serde_json::from_str(&inserts[0].content).unwrap();
+        assert_eq!(content["content"], "answer after a busy database");
+        assert_eq!(inserts[0].status.as_deref(), Some("finish"));
+    }
+
+    #[tokio::test]
+    async fn timed_out_thinking_close_keeps_state_and_sends_done_once() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.set_block_message_inserts(true);
+        let bus = Arc::new(TestUserEventBus::new(16));
+        let mut ws_rx = bus.subscribe();
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let mut active_thinking = Some(ThinkingSegmentState {
+            id: TEST_ASSISTANT_MESSAGE_ID.into(),
+            buffer: "reasoning".into(),
+            started_at: now_ms(),
+            completed_duration_ms: None,
+        });
+
+        let bounded = relay
+            .bounded_event_side_effect(
+                tokio::time::Instant::now() + Duration::from_millis(10),
+                "complete_thinking_before_text",
+                relay.complete_active_thinking(&mut active_thinking),
+            )
+            .await;
+
+        assert!(bounded.is_none());
+        assert!(active_thinking.is_some());
+        assert!(repo.take_inserts().is_empty());
+
+        repo.set_block_message_inserts(false);
+        assert!(relay.complete_active_thinking(&mut active_thinking).await);
+        assert!(active_thinking.is_none());
+        let inserts = repo.take_inserts();
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(inserts[0].r#type, "thinking");
+
+        let done_count = std::iter::from_fn(|| ws_rx.try_recv().ok())
+            .filter(|event| {
+                event.name == "message.stream"
+                    && event.data["type"] == "thinking"
+                    && event.data["data"]["status"] == "done"
+            })
+            .count();
+        assert_eq!(done_count, 1, "a persistence retry must not duplicate thinking.done");
+    }
+
+    #[tokio::test]
+    async fn thinking_insert_reconcile_update_failure_remains_retryable() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.commit_next_message_insert_then_error();
+        repo.fail_next_message_update();
+        repo.reject_duplicate_message_inserts();
+        let bus = Arc::new(TestUserEventBus::new(16));
+        let mut ws_rx = bus.subscribe();
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let mut active_thinking = Some(ThinkingSegmentState {
+            id: TEST_ASSISTANT_MESSAGE_ID.into(),
+            buffer: "reasoning".into(),
+            started_at: now_ms(),
+            completed_duration_ms: None,
+        });
+
+        assert!(!relay.complete_active_thinking(&mut active_thinking).await);
+        assert!(active_thinking.is_some());
+        assert!(relay.complete_active_thinking(&mut active_thinking).await);
+        assert!(active_thinking.is_none());
+
+        assert_eq!(repo.take_inserts().len(), 1);
+        let updates = repo.take_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, TEST_ASSISTANT_MESSAGE_ID);
+        assert_eq!(
+            updates[0].1.status.as_ref().and_then(|status| status.as_deref()),
+            Some("finish")
+        );
+        let done_count = std::iter::from_fn(|| ws_rx.try_recv().ok())
+            .filter(|event| {
+                event.name == "message.stream"
+                    && event.data["type"] == "thinking"
+                    && event.data["data"]["status"] == "done"
+            })
+            .count();
+        assert_eq!(done_count, 1);
+    }
+
+    #[tokio::test]
+    async fn persistent_thinking_insert_failure_rejects_finish() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.fail_message_inserts();
+        let bus = Arc::new(TestUserEventBus::new(32));
+        let mut ws_rx = bus.subscribe();
+        let (tx, _) = broadcast::channel(32);
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            bus,
+            None,
+        );
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::Thinking(ThinkingEventData {
+            content: "visible reasoning".into(),
+            subject: None,
+            duration: None,
+            status: Some("thinking".into()),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+
+        assert_eq!(
+            outcome.terminal.code(),
+            Some(AgentErrorCode::NomifunStateInconsistent)
+        );
+        assert!(outcome.emitted_response);
+        assert!(
+            repo.take_inserts().iter().all(|row| row.r#type != "thinking"),
+            "failed thinking writes must not be claimed as history"
+        );
+        let mut stream_types = Vec::new();
+        while let Ok(event) = ws_rx.try_recv() {
+            if event.name == "message.stream" {
+                stream_types.push(event.data["type"].clone());
+            }
+        }
+        assert!(!stream_types.iter().any(|kind| *kind == json!("finish")));
+        assert_eq!(stream_types.last(), Some(&json!("error")));
     }
 
     #[tokio::test]
@@ -6541,6 +7418,106 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn failed_final_rewrite_emits_no_unacknowledged_override_or_outcome() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.fail_next_message_update();
+        let bus = Arc::new(TestUserEventBus::new(64));
+        let mut ws_rx = bus.subscribe();
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            bus,
+            Some(Arc::new(MockCronService)),
+        );
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "Hello [CRON_LIST]".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+
+        assert!(outcome.final_text.is_none());
+        assert!(outcome.final_text_msg_id.is_none());
+        assert_eq!(outcome.system_responses, vec!["[System: listed]".to_string()]);
+        assert!(repo.take_updates().is_empty());
+        let inserts = repo.take_inserts();
+        let raw: Value = serde_json::from_str(&inserts[0].content).unwrap();
+        assert_eq!(raw["content"], "Hello [CRON_LIST]");
+        assert!(
+            std::iter::from_fn(|| ws_rx.try_recv().ok()).all(|event| {
+                event.name != "message.stream" || event.data["replace"] != true
+            }),
+            "live replacement must wait for the database rewrite acknowledgement"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_superseded_hide_emits_only_acknowledged_overrides() {
+        let repo = Arc::new(RecordingRepo::new());
+        repo.fail_message_update_attempt(2);
+        let bus = Arc::new(TestUserEventBus::new(128));
+        let mut ws_rx = bus.subscribe();
+        let (tx, _) = broadcast::channel(128);
+        let relay = StreamRelay::new(
+            test_conversation_id(),
+            TEST_ASSISTANT_MESSAGE_ID.into(),
+            TEST_USER_ID.into(),
+            repo.clone(),
+            bus,
+            Some(Arc::new(MockCronService)),
+        );
+        let rx = tx.subscribe();
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "Alpha ".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Thinking(ThinkingEventData {
+            content: String::new(),
+            subject: None,
+            duration: None,
+            status: Some("thinking".into()),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "Beta [CRON_LIST]".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+
+        let outcome = relay.consume(rx).await;
+
+        assert!(outcome.final_text.is_none());
+        assert!(outcome.final_text_msg_id.is_none());
+        let inserts = repo.take_inserts();
+        let text_rows: Vec<_> = inserts.iter().filter(|row| row.r#type == "text").collect();
+        assert_eq!(text_rows.len(), 2);
+        let updates = repo.take_updates();
+        assert_eq!(updates.len(), 1, "only the acknowledged primary rewrite is recorded");
+        assert_eq!(updates[0].0, text_rows[0].id);
+
+        let replacements: Vec<_> = std::iter::from_fn(|| ws_rx.try_recv().ok())
+            .filter(|event| {
+                event.name == "message.stream"
+                    && event.data["type"] == "content"
+                    && event.data["replace"] == true
+            })
+            .collect();
+        assert_eq!(replacements.len(), 1);
+        assert_eq!(replacements[0].data["msg_id"], text_rows[0].id);
+        assert!(
+            replacements
+                .iter()
+                .all(|event| event.data["msg_id"] != text_rows[1].id),
+            "a failed hide must remain visible both live and after reload"
+        );
+    }
+
     // ── Tool persistence tests ────────────────────────────────────
 
     #[tokio::test]
@@ -7564,6 +8541,15 @@ mod tests {
         inserts: Mutex<Vec<MessageRow>>,
         updates: Mutex<Vec<(String, nomifun_db::MessageRowUpdate)>>,
         correlations: Mutex<HashMap<(String, String, String, String), String>>,
+        fail_next_message_insert: AtomicBool,
+        commit_next_message_insert_then_error: AtomicBool,
+        fail_message_inserts: AtomicBool,
+        reject_duplicate_message_inserts: AtomicBool,
+        block_message_inserts: AtomicBool,
+        fail_next_message_update: AtomicBool,
+        fail_message_updates: AtomicBool,
+        message_update_attempts: AtomicUsize,
+        fail_message_update_attempt: AtomicUsize,
         block_message_updates: AtomicBool,
         fail_message_correlations: AtomicBool,
         fail_artifact_commits: AtomicBool,
@@ -7576,11 +8562,55 @@ mod tests {
                 inserts: Mutex::new(vec![]),
                 updates: Mutex::new(vec![]),
                 correlations: Mutex::new(HashMap::new()),
+                fail_next_message_insert: AtomicBool::new(false),
+                commit_next_message_insert_then_error: AtomicBool::new(false),
+                fail_message_inserts: AtomicBool::new(false),
+                reject_duplicate_message_inserts: AtomicBool::new(false),
+                block_message_inserts: AtomicBool::new(false),
+                fail_next_message_update: AtomicBool::new(false),
+                fail_message_updates: AtomicBool::new(false),
+                message_update_attempts: AtomicUsize::new(0),
+                fail_message_update_attempt: AtomicUsize::new(0),
                 block_message_updates: AtomicBool::new(false),
                 fail_message_correlations: AtomicBool::new(false),
                 fail_artifact_commits: AtomicBool::new(false),
                 block_artifact_commits: AtomicBool::new(false),
             }
+        }
+
+        fn fail_next_message_insert(&self) {
+            self.fail_next_message_insert.store(true, AtomicOrdering::SeqCst);
+        }
+
+        fn commit_next_message_insert_then_error(&self) {
+            self.commit_next_message_insert_then_error
+                .store(true, AtomicOrdering::SeqCst);
+        }
+
+        fn fail_message_inserts(&self) {
+            self.fail_message_inserts.store(true, AtomicOrdering::SeqCst);
+        }
+
+        fn reject_duplicate_message_inserts(&self) {
+            self.reject_duplicate_message_inserts
+                .store(true, AtomicOrdering::SeqCst);
+        }
+
+        fn set_block_message_inserts(&self, block: bool) {
+            self.block_message_inserts.store(block, AtomicOrdering::SeqCst);
+        }
+
+        fn fail_next_message_update(&self) {
+            self.fail_next_message_update.store(true, AtomicOrdering::SeqCst);
+        }
+
+        fn fail_message_updates(&self) {
+            self.fail_message_updates.store(true, AtomicOrdering::SeqCst);
+        }
+
+        fn fail_message_update_attempt(&self, attempt: usize) {
+            self.fail_message_update_attempt
+                .store(attempt, AtomicOrdering::SeqCst);
         }
 
         fn block_message_updates(&self) {
@@ -7683,6 +8713,31 @@ mod tests {
                 .cloned())
         }
         async fn insert_message(&self, row: &MessageRow) -> Result<(), DbError> {
+            if self.block_message_inserts.load(AtomicOrdering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            if self
+                .commit_next_message_insert_then_error
+                .swap(false, AtomicOrdering::SeqCst)
+            {
+                self.inserts.lock().unwrap().push(row.clone());
+                return Err(DbError::Init(
+                    "injected committed-but-unacknowledged message insert".to_owned(),
+                ));
+            }
+            if self.fail_message_inserts.load(AtomicOrdering::SeqCst) {
+                return Err(DbError::Conflict("injected message insert failure".to_owned()));
+            }
+            if self.fail_next_message_insert.swap(false, AtomicOrdering::SeqCst) {
+                return Err(DbError::Conflict("injected message insert failure".to_owned()));
+            }
+            if self
+                .reject_duplicate_message_inserts
+                .load(AtomicOrdering::SeqCst)
+                && self.inserts.lock().unwrap().iter().any(|existing| existing.id == row.id)
+            {
+                return Err(DbError::Conflict("injected duplicate message insert".to_owned()));
+            }
             self.inserts.lock().unwrap().push(row.clone());
             Ok(())
         }
@@ -7779,6 +8834,16 @@ mod tests {
         async fn update_message(&self, id: &str, updates: &nomifun_db::MessageRowUpdate) -> Result<(), DbError> {
             if self.block_message_updates.load(AtomicOrdering::SeqCst) {
                 std::future::pending::<()>().await;
+            }
+            let attempt = self
+                .message_update_attempts
+                .fetch_add(1, AtomicOrdering::SeqCst)
+                + 1;
+            if self.fail_message_updates.load(AtomicOrdering::SeqCst)
+                || self.fail_next_message_update.swap(false, AtomicOrdering::SeqCst)
+                || self.fail_message_update_attempt.load(AtomicOrdering::SeqCst) == attempt
+            {
+                return Err(DbError::Conflict("injected message update failure".to_owned()));
             }
             self.updates.lock().unwrap().push((id.to_owned(), updates.clone()));
             Ok(())

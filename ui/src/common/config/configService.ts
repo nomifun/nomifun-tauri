@@ -56,6 +56,7 @@ async function fetchJson<T>(method: string, path: string, body?: unknown): Promi
     method,
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
+    cache: method.toUpperCase() === 'GET' ? 'no-store' : undefined,
   });
   if (!response.ok) {
     const errorBody = await response.text();

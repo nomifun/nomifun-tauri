@@ -107,6 +107,7 @@ async function fetchCurrentUser(signal?: AbortSignal): Promise<AuthUser | null> 
       method: 'GET',
       credentials: 'include',
       signal,
+      cache: 'no-store',
     });
 
     if (!response.ok) {
@@ -142,6 +143,7 @@ async function fetchNeedsSetup(signal?: AbortSignal): Promise<boolean> {
       method: 'GET',
       credentials: 'include',
       signal,
+      cache: 'no-store',
     });
     if (!response.ok) return false;
     const data = (await response.json()) as { success?: boolean; needs_setup?: boolean };

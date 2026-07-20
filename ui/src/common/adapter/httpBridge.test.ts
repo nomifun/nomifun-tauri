@@ -52,6 +52,28 @@ function restoreWebSocketGlobal() {
 }
 
 describe('httpRequest client deadline + network-failure diagnosis', () => {
+  test('forces mutable API reads past every host WebView HTTP cache', async () => {
+    const requestInits: RequestInit[] = [];
+    globalThis.fetch = ((_url: string, init?: RequestInit) => {
+      if (init) requestInits.push(init);
+      return Promise.resolve(
+        new Response(JSON.stringify({ success: true, data: { items: [] } }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      );
+    }) as unknown as typeof fetch;
+
+    try {
+      await httpRequest('GET', '/api/conversations/conv_test/messages?page=0&page_size=10000');
+      await httpRequest('POST', '/api/conversations/conv_test/messages', { content: 'hello' });
+      expect(requestInits[0]?.cache).toBe('no-store');
+      expect(requestInits[1]?.cache).toBeUndefined();
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
   test('aborts and throws a legible timeout error when the request exceeds timeoutMs', async () => {
     // A fetch that never resolves on its own but honors the abort signal —
     // models a backend hung inside a slow/stale NAS walk.

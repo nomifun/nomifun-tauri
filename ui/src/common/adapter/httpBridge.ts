@@ -447,6 +447,14 @@ export async function httpRequest<T>(
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
       signal: controller?.signal,
+      // Every GET issued through this bridge targets mutable application state
+      // (conversation history, settings, catalogs, runtime status, ...).  The
+      // same URL is intentionally reused when a view remounts, so allowing the
+      // host WebView's HTTP cache to satisfy it can resurrect a pre-mutation
+      // response.  WebKitGTK is particularly eager to reuse loopback GETs, but
+      // the contract must be identical on macOS WKWebView, Windows WebView2 and
+      // ordinary WebUI browsers: a bridge read always observes the backend.
+      cache: method.toUpperCase() === 'GET' ? 'no-store' : undefined,
     });
   } catch (e) {
     // No HTTP response was produced: our own timeout abort, or a transport

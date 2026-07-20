@@ -1,7 +1,8 @@
 use axum::extract::Request;
 use axum::http::HeaderMap;
 use axum::http::header::{
-    HeaderName, HeaderValue, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS, X_XSS_PROTECTION,
+    CACHE_CONTROL, HeaderName, HeaderValue, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS, X_FRAME_OPTIONS,
+    X_XSS_PROTECTION,
 };
 use axum::middleware::Next;
 use axum::response::Response;
@@ -99,6 +100,15 @@ pub async fn security_headers_middleware(request: Request, next: Next) -> Respon
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
 
+    // API responses represent mutable application state.  They must never be
+    // replayed from a WebView/browser cache when a route is revisited after a
+    // mutation (most visibly: an initially-empty conversation after sending a
+    // message).  Preserve an explicit route policy so immutable logo/assets and
+    // other deliberately cacheable binaries keep their ETag/max-age behavior.
+    if path.starts_with("/api/") && !headers.contains_key(CACHE_CONTROL) {
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+
     if is_office_preview_capability_path(&path) {
         apply_office_frame_policy(headers);
     } else if !allows_embedding(&path) {
@@ -155,6 +165,58 @@ mod tests {
         assert_eq!(
             response.headers().get("referrer-policy").unwrap(),
             "strict-origin-when-cross-origin"
+        );
+        assert!(response.headers().get(CACHE_CONTROL).is_none());
+    }
+
+    #[tokio::test]
+    async fn mutable_api_responses_are_not_cacheable() {
+        let app = Router::new()
+            .route("/api/conversations/{id}/messages", get(|| async { "[]" }))
+            .layer(middleware::from_fn(security_headers_middleware));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/conversations/conv-1/messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.headers().get(CACHE_CONTROL).unwrap(), "no-store");
+    }
+
+    #[tokio::test]
+    async fn explicit_asset_cache_policy_is_preserved() {
+        let app = Router::new()
+            .route(
+                "/api/assets/logo.svg",
+                get(|| async {
+                    let mut response = Response::new(Body::from("svg"));
+                    response.headers_mut().insert(
+                        CACHE_CONTROL,
+                        HeaderValue::from_static("public, max-age=31536000, immutable"),
+                    );
+                    response
+                }),
+            )
+            .layer(middleware::from_fn(security_headers_middleware));
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/assets/logo.svg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.headers().get(CACHE_CONTROL).unwrap(),
+            "public, max-age=31536000, immutable"
         );
     }
 

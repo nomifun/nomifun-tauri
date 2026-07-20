@@ -3,6 +3,7 @@
 mod common;
 
 use axum::body::Body;
+use axum::http::header::CACHE_CONTROL;
 use axum::http::StatusCode;
 use serde_json::json;
 use tower::ServiceExt;
@@ -151,6 +152,7 @@ async fn t8_1_messages_empty() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get(CACHE_CONTROL).unwrap(), "no-store");
     let json = body_json(resp).await;
     assert_eq!(json["data"]["items"].as_array().unwrap().len(), 0);
     assert_eq!(json["data"]["total"], 0);
@@ -844,6 +846,53 @@ async fn t2_1c_send_message_accepts_interior_whitespace_workspace() {
     let json = body_json(resp).await;
     assert!(json["success"].as_bool().unwrap());
     assert!(json["data"]["msg_id"].as_str().is_some_and(|s| !s.is_empty()));
+}
+
+#[tokio::test]
+async fn t2_1d_accepted_user_message_is_immediately_readable_without_cache() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Message Readback").await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("conversation");
+    std::fs::create_dir_all(&workspace).unwrap();
+    update_conversation_workspace(&services, &conv_id, &workspace.to_string_lossy()).await;
+
+    let req = common::json_with_token(
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        json!({ "content": "survives conversation reload" }),
+        &token,
+        &csrf,
+    );
+    let send_resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(send_resp.status(), StatusCode::ACCEPTED);
+    let send_json = body_json(send_resp).await;
+    let msg_id = send_json["data"]["msg_id"].as_str().unwrap();
+
+    // The accepted response is sent only after the user row commits. A fresh
+    // history read must therefore see that exact row, and must never be served
+    // from a WebView/browser cache when the conversation is revisited.
+    let history_resp = app
+        .oneshot(get_with_token(
+            &format!("/api/conversations/{conv_id}/messages"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(history_resp.status(), StatusCode::OK);
+    assert_eq!(history_resp.headers().get(CACHE_CONTROL).unwrap(), "no-store");
+    let history_json = body_json(history_resp).await;
+    let user_message = history_json["data"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["msg_id"].as_str() == Some(msg_id))
+        .expect("accepted user message must be present in immediate history readback");
+
+    assert_eq!(user_message["position"], "right");
+    assert_eq!(user_message["content"]["content"], "survives conversation reload");
 }
 
 #[tokio::test]
