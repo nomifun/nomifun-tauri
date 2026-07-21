@@ -2,6 +2,12 @@
 
 English: [CONTRIBUTING.md](CONTRIBUTING.md)
 
+> **强制规则：本仓库绝对禁止使用 GitHub Actions。** 不得新增、恢复、生成、
+> 重命名或重新启用任何 workflow；已禁用、仅手动触发、临时、发布专用的
+> workflow 也不例外。构建、测试、打包和发布必须使用本地脚本及文档化的手动
+> 命令。任何包含 `.github/workflows/*.yml` 或 `.github/workflows/*.yaml` 的
+> 提交或 PR 都必须拒绝并移除。
+
 NomiFun 是一个 Rust + Tauri + React monorepo，也是一套本地优先的高权限自动化系统：它可以驱动 shell、文件、浏览器、桌面应用、智能体、MCP server 和远程能力 API。我们非常欢迎贡献，但贡献必须让维护者能快速理解、快速验证，并且不伤害用户数据与本地安全承诺。
 
 这份手册是本仓库的开发与提交约定：如何选题、如何改代码、如何验证、如何提交一个维护者愿意认真 review 的 PR。

@@ -15,21 +15,26 @@ that maintainers can review without guessing.
 
 If you only remember one page of rules, remember these:
 
-1. Keep pull requests small. One problem, one behavior change, one reviewable
+1. GitHub Actions are strictly forbidden. Do not add, restore, generate, or
+   re-enable any workflow, including disabled or manual-only workflows. Use
+   local scripts and documented manual commands instead. A pull request that
+   introduces `.github/workflows/*.yml` or `.github/workflows/*.yaml` must be
+   rejected.
+2. Keep pull requests small. One problem, one behavior change, one reviewable
    story.
-2. Ask first before large product changes, new top-level surfaces, database
+3. Ask first before large product changes, new top-level surfaces, database
    migrations, security-sensitive flows, bundled assets, vendored code, or broad
    refactors.
-3. Follow the existing ownership boundaries: renderer code through `ui/`,
+4. Follow the existing ownership boundaries: renderer code through `ui/`,
    backend feature code through `crates/backend/`, agent-engine code through
    `crates/agent/`, and backend-to-agent usage through `nomifun-ai-agent` unless
    a documented exception already exists.
-4. Run the narrowest checks that prove your change works. If you cannot run a
+5. Run the narrowest checks that prove your change works. If you cannot run a
    check, say so in the PR and explain why.
-5. Do not commit secrets, local data, build output, private workspaces,
+6. Do not commit secrets, local data, build output, private workspaces,
    proprietary assets, or third-party assets whose redistribution license is
    unclear.
-6. User-visible changes need user-facing notes: screenshots when UI changes,
+7. User-visible changes need user-facing notes: screenshots when UI changes,
    docs when workflows change, i18n updates for both supported locales, and
    changelog notes when the change affects a release user.
 
