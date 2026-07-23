@@ -1,5 +1,4 @@
 //! Shared primitives: error types, enums, ID generation, crypto, timestamps, and pagination.
-pub mod channel;
 pub mod constants;
 pub mod agent_execution;
 

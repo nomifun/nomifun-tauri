@@ -6,10 +6,10 @@
   "workspaces": ["ui"],
   "scripts": {
     "dev": "bun scripts/prune-build.mjs && bun scripts/free-ports.mjs 5173 && bun scripts/kill-stale-dev.mjs && NOMI_CHANNEL=dev tauri dev --config apps/desktop/tauri.conf.json --config apps/desktop/tauri.dev.conf.json",
-    "dev:web": "bun scripts/prune-build.mjs && bun scripts/free-ports.mjs 5173 8787 && concurrently -k -n api,ui -c blue,magenta \"cargo run -p nomifun-web -- --port 8787 --api-only --insecure-no-auth\" \"bun run --filter=./ui dev:web\"",
+    "dev:web": "bun scripts/prune-build.mjs && bun scripts/free-ports.mjs 5173 8787 && NOMI_CHANNEL=dev concurrently -k -n api,ui -c blue,magenta \"cargo run -p nomifun-web -- --port 8787 --api-only --insecure-no-auth\" \"bun run --filter=./ui dev:web\"",
     "dev:ui": "bun run --filter=./ui dev",
     "build": "CI=true tauri build --config apps/desktop/tauri.conf.json && bun scripts/prune-build.mjs --post",
-    "build:fast": "CI=true tauri build --debug --no-bundle --config apps/desktop/tauri.conf.json --config apps/desktop/tauri.dev.conf.json",
+    "build:fast": "CI=true NOMI_CHANNEL=dev tauri build --debug --no-bundle --config apps/desktop/tauri.conf.json --config apps/desktop/tauri.dev.conf.json",
     "build:mac": "bash scripts/desktop-build-mac.sh",
     "build:win": "bun scripts/run-win-build.mjs",
     "build:linux": "bash scripts/desktop-build-linux.sh",

@@ -43,9 +43,9 @@ the root `Cargo.toml`.
 | Command | Use when | What runs |
 | --- | --- | --- |
 | `bun run dev:ui` | UI-only work that can tolerate missing API calls | Vite on `http://localhost:5173`; no backend. |
-| `bun run dev:web` | Browser + backend iteration with auth disabled | `nomifun-web --port 8787 --dist ui/dist --insecure-no-auth` plus Vite dev server. |
+| `bun run dev:web` | Browser + backend iteration with auth disabled | `NOMI_CHANNEL=dev` `nomifun-web --port 8787 --dist ui/dist --insecure-no-auth` plus Vite dev server. |
 | `bun run serve:web` | Running the production-style web host from source | `nomifun-web` on `http://127.0.0.1:8787`; serves built `ui/dist`; auth on by default. |
-| `bun run dev` | Desktop/Tauri work | Tauri dev shell, Vite, and embedded backend under the desktop local-trust policy. |
+| `bun run dev` | Desktop/Tauri work | `NOMI_CHANNEL=dev` Tauri shell, Vite, and embedded backend under the desktop local-trust policy. |
 
 `serve:web` expects a built SPA:
 
@@ -56,6 +56,11 @@ bun run serve:web
 
 `dev:web` is a convenience loop that starts API and UI together. It uses
 `--insecure-no-auth`, so keep it on localhost or an isolated network.
+
+The Rust-backed development loops (`dev`, `dev:web`, and `build:fast`) use the
+`dev` build channel and therefore default to the `Nomi-dev` data directory.
+Production-style `serve:web` and release builds remain on the stable `Nomi`
+directory. Use `bun run seed:dev` when dev needs a snapshot of stable state.
 
 The desktop loop does **not** use the old Electron process model. The Tauri
 shell links `nomifun-app`, starts the backend in-process on a free localhost

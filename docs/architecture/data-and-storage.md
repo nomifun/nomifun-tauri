@@ -32,10 +32,12 @@ Inside the data directory:
 
 All three hosts resolve the unset default through one shared helper,
 [`nomifun_app::cli::default_data_dir()`](../../crates/backend/nomifun-app/src/cli.rs):
-`dirs::data_local_dir()/NomiFun/Nomi` (the per-user application-data
-location), with the system temp dir (`<system temp>/nomifun-data/Nomi`)
-only as an extreme fallback when the OS reports no user dir. Env semantics
-stay host-specific: the desktop shell appends `"Nomi"` to `NOMIFUN_DATA_DIR`
+`dirs::data_local_dir()/NomiFun/Nomi<channel-suffix>` (the per-user
+application-data location). Stable uses `Nomi`; non-stable channels use
+siblings such as `Nomi-dev`. The system temp dir
+(`<system temp>/nomifun-data/Nomi<channel-suffix>`) is only an extreme
+fallback when the OS reports no user dir. Env semantics stay host-specific:
+the desktop shell appends `"Nomi"` to `NOMIFUN_DATA_DIR`
 (see [`apps/desktop/src/main.rs`](../../apps/desktop/src/main.rs)), while
 `nomifun-web` and `nomicore` take the env value literally (a clap `env`
 binding — new for `nomicore`, which previously ignored the variable).
@@ -45,17 +47,15 @@ data directory. A detected historical managed dataset is moved intact to a
 retired/quarantine location by the dataset reset state machine. NomiFun then
 creates a new v3 dataset rather than rewriting historical database paths.
 
-### One directory, one state
+### One directory per channel, one state
 
-Sharing one default across every host is deliberate: the dev loops
-(`bun run serve:web`, `dev:web`, `dev`) and the installed desktop app
-read and write the same state, so a provider or companion configured once is
-testable everywhere, and troubleshooting only ever has one directory to
-look at. When you *do* want an isolated sandbox, `NOMIFUN_DATA_DIR` or
-`--data-dir` is the escape hatch. (The dev scripts no longer pass a
-repo-relative `--data-dir`; the old `data/` and `.dev-data/` directories
-are not imported into v3. Pointing `NOMIFUN_DATA_DIR` at one of them subjects
-that whole root to the same v3 contract check and reset policy.)
+Sharing one default among hosts built for the same channel is deliberate.
+The installed desktop app and production-style `bun run serve:web` use stable
+state under `Nomi`; `bun run dev`, `dev:web`, and `build:fast` use dev state
+under `Nomi-dev`. This keeps unauthenticated and experimental development
+loops away from installed-app state while preserving one state per channel.
+Use `bun run seed:dev` to copy a stable snapshot into dev, or use
+`NOMIFUN_DATA_DIR` / `--data-dir` to select an explicit directory.
 
 What makes the sharing safe is an **exclusive server lock**: at boot
 (`bootstrap::init_environment`, before the database is opened) the backend
