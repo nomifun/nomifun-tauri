@@ -68,6 +68,10 @@ renderer presents that per-boot trust secret on every request.
 | --- | --- |
 | `cargo check --workspace` | All Rust crates and app hosts compile. |
 | `cargo test -p <crate>` | Focused Rust tests for one crate. |
+| `bun run test:crate <crate> [cargo args]` | Focused crate tests with the build-cache guard. |
+| `bun run test:core` | Workspace regression without desktop-only features. |
+| `bun run test:desktop` | Desktop shell tests without watching `ui/dist` resources. |
+| `bun run test` | Full regression including desktop features and doctests. |
 | `bun run typecheck` | Renderer TypeScript. |
 | `bun run check:i18n` | Generated i18n key types are up to date. |
 | `bun run check:theme` | Theme token contract. |

@@ -5584,6 +5584,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.26.2",
+ "toml 0.8.2",
  "tower",
  "tower-http",
  "tracing",

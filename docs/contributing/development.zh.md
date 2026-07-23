@@ -66,6 +66,10 @@ secret。
 | --- | --- |
 | `cargo check --workspace` | 所有 Rust crate 和 app host 编译。 |
 | `cargo test -p <crate>` | 单个 crate 的 Rust 测试。 |
+| `bun run test:crate <crate> [cargo 参数]` | 带构建缓存清理保护的单 crate 聚焦测试。 |
+| `bun run test:core` | 不启用 desktop-only feature 的 workspace 回归。 |
+| `bun run test:desktop` | 不监听 `ui/dist` 资源的桌面壳测试。 |
+| `bun run test` | 包含 desktop feature 与 doctest 的全量回归。 |
 | `bun run typecheck` | Renderer TypeScript。 |
 | `bun run check:i18n` | i18n key 类型生成是否最新。 |
 | `bun run check:theme` | 主题 token 契约。 |

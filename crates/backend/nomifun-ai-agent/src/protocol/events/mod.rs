@@ -67,7 +67,7 @@ pub enum AgentStreamEvent {
 
 /// Data for the `Start` event.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../../../ui/src/common/protocolBindings/")]
+#[ts(export_to = "../../../../ui/src/common/protocolBindings/")]
 pub struct StartEventData {
     #[serde(default)]
     pub session_id: Option<String>,
@@ -75,7 +75,7 @@ pub struct StartEventData {
 
 /// Data for the `SessionAssigned` event.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../../../ui/src/common/protocolBindings/")]
+#[ts(export_to = "../../../../ui/src/common/protocolBindings/")]
 pub struct SessionAssignedEventData {
     pub session_id: String,
 }
@@ -105,7 +105,7 @@ pub enum TipType {
 
 /// Data for the `Finish` event.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../../../ui/src/common/protocolBindings/")]
+#[ts(export_to = "../../../../ui/src/common/protocolBindings/")]
 pub struct FinishEventData {
     #[serde(default)]
     pub session_id: Option<String>,
@@ -119,7 +119,7 @@ pub struct FinishEventData {
 
 /// Data for the `TurnCompleted` event — aggregate metrics for one turn.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../../../ui/src/common/protocolBindings/")]
+#[ts(export_to = "../../../../ui/src/common/protocolBindings/")]
 pub struct TurnCompletedEventData {
     /// Wall-clock duration of the turn in milliseconds.
     #[ts(type = "number")]
@@ -153,7 +153,7 @@ pub struct TurnCompletedEventData {
 /// ACP SDK's `StopReason` so the shared event type does not couple to ACP
 /// (nomi / openclaw / remote are not ACP); each backend maps its own outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../../../../ui/src/common/protocolBindings/")]
+#[ts(export_to = "../../../../ui/src/common/protocolBindings/")]
 #[serde(rename_all = "snake_case")]
 pub enum TurnStopReason {
     /// Turn completed normally.
@@ -171,6 +171,32 @@ pub enum TurnStopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use ts_rs::Config;
+
+    fn export_binding_if_changed<T: TS + 'static>(file_name: &str) {
+        let generated = T::export_to_string(&Config::default())
+            .unwrap_or_else(|error| panic!("{file_name} must export to TypeScript: {error}"));
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../ui/src/common/protocolBindings")
+            .join(file_name);
+        let unchanged = std::fs::read_to_string(&path)
+            .map(|current| current == generated)
+            .unwrap_or(false);
+        if !unchanged {
+            std::fs::write(&path, generated)
+                .unwrap_or_else(|error| panic!("failed to write {}: {error}", path.display()));
+        }
+    }
+
+    #[test]
+    fn export_protocol_bindings() {
+        export_binding_if_changed::<StartEventData>("StartEventData.ts");
+        export_binding_if_changed::<SessionAssignedEventData>("SessionAssignedEventData.ts");
+        export_binding_if_changed::<FinishEventData>("FinishEventData.ts");
+        export_binding_if_changed::<TurnCompletedEventData>("TurnCompletedEventData.ts");
+        export_binding_if_changed::<TurnStopReason>("TurnStopReason.ts");
+    }
     use agent_client_protocol::schema::{
         ContentBlock as SdkContentBlock, ContentChunk, Diff, ImageContent, PermissionOption,
         PermissionOptionKind as SdkPermissionOptionKind, RequestPermissionRequest, ResourceLink,

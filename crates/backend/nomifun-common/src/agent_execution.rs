@@ -411,7 +411,7 @@ string_enum! {
     /// Durable outbox event categories. Realtime clients may use `change_kind`
     /// as a rendering hint, but revision remains the source of ordering.
     #[derive(TS)]
-    #[ts(export, export_to = "../../../../ui/src/common/protocolBindings/")]
+    #[ts(export_to = "../../../../ui/src/common/protocolBindings/")]
     pub enum AgentExecutionEventKind {
         Created => "created",
         StatusChanged => "status_changed",
@@ -427,6 +427,22 @@ string_enum! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use ts_rs::Config;
+
+    #[test]
+    fn export_bindings_agent_execution_event_kind() {
+        let generated = AgentExecutionEventKind::export_to_string(&Config::default())
+            .expect("AgentExecutionEventKind must export to TypeScript");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../ui/src/common/protocolBindings/AgentExecutionEventKind.ts");
+        let unchanged = std::fs::read_to_string(&path)
+            .map(|current| current == generated)
+            .unwrap_or(false);
+        if !unchanged {
+            std::fs::write(&path, generated).expect("write AgentExecutionEventKind binding");
+        }
+    }
 
     #[test]
     fn values_round_trip_without_fallbacks() {

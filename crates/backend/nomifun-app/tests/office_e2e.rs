@@ -12,8 +12,6 @@
 //! PP-1..3, RP-1/RP-3, RP-5..7, SO-5..6, DC-5..8) are tested at the service
 //! integration level in `nomifun-office/tests/`.
 
-mod common;
-
 use std::sync::Arc;
 
 use axum::http::StatusCode;
