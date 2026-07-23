@@ -52,16 +52,11 @@ describe('turn process disclosure content layout', () => {
     expect(enMessages.turnCanceled.includes('{{duration}}')).toBe(true);
   });
 
-  test('keeps a live thinking status visible before process rows arrive', () => {
+  test('does not render an empty disclosure body before process rows arrive', () => {
     expect(disclosureSource.includes('const hasProcessItems = item.processItems.length > 0')).toBe(true);
     expect(disclosureSource.includes('const disclosureExpanded = hasProcessItems && expanded')).toBe(true);
     expect(disclosureSource.includes('{hasProcessItems && (')).toBe(true);
-    expect(disclosureSource.includes('const showThinkingTail = displayState === \'running\' && !hasActiveProcessItem')).toBe(
-      true
-    );
-    expect(disclosureSource.includes('{(disclosureExpanded || showThinkingTail) && (')).toBe(true);
-    expect(disclosureSource.includes("role='status'")).toBe(true);
-    expect(disclosureSource.includes("messages.processReceipt.thinkingRunning")).toBe(true);
+    expect(disclosureSource.includes('{disclosureExpanded && (')).toBe(true);
   });
 
   test('offers a one-click control to expand all completed thinking blocks', () => {

@@ -57,12 +57,12 @@ describe('buildTurnDisclosureItems', () => {
     expect(disclosure.defaultCollapsed).toBe(true);
     expect(disclosure.state).toBe('completed');
     expect(disclosure.processItemIds).toEqual(['analysis', 'tool']);
-    expect(disclosure.startAt).toBe(2000);
+    expect(disclosure.startAt).toBe(1000);
     expect(disclosure.endAt).toBe(5000);
     expect(disclosure.sourceMessageIds).toEqual([SOURCE_1, SOURCE_2]);
   });
 
-  test('uses completed process intervals when calculating disclosure duration', () => {
+  test('anchors the duration to the request and final answer timestamps', () => {
     const result = buildTurnDisclosureItems(
       [
         item('user', 'user', { createdAt: 0 }),
@@ -81,7 +81,7 @@ describe('buildTurnDisclosureItems', () => {
     expect(disclosure.type).toBe('turn_disclosure');
     if (disclosure.type !== 'turn_disclosure') return;
     expect(disclosure.processItemIds).toEqual(['analysis', 'tool']);
-    expect(disclosure.startAt).toBe(1000);
+    expect(disclosure.startAt).toBe(0);
     expect(disclosure.endAt).toBe(35600);
   });
 
@@ -123,7 +123,7 @@ describe('buildTurnDisclosureItems', () => {
     expect(disclosure.running).toBe(true);
     expect(disclosure.defaultCollapsed).toBe(false);
     expect(disclosure.processItemIds).toEqual(['analysis', 'tool']);
-    expect(disclosure.startAt).toBe(1500);
+    expect(disclosure.startAt).toBe(1000);
     expect(disclosure.endAt).toBe(3200);
   });
 
@@ -146,16 +146,6 @@ describe('buildTurnDisclosureItems', () => {
     expect(disclosure.sourceMessageIds).toEqual([]);
     expect(disclosure.startAt).toBe(1000);
     expect(disclosure.endAt).toBe(1000);
-  });
-
-  test('keeps a text-only streaming turn terminated by its live disclosure', () => {
-    const result = buildTurnDisclosureItems([
-      item('user', 'user', { createdAt: 1000 }),
-      item('streaming-text', 'assistant', { createdAt: 2000 }),
-    ]);
-
-    expect(result.map((entry) => entry.id)).toEqual(['user', 'streaming-text', DISCLOSURE_1]);
-    expect(result.at(-1)?.type).toBe('turn_disclosure');
   });
 
   test('keeps the current turn disclosure visible between active process phases', () => {
@@ -245,7 +235,7 @@ describe('buildTurnDisclosureItems', () => {
     expect(disclosure.processItemStates).toEqual({ thinking: 'completed' });
   });
 
-  test('keeps the live disclosure after running assistant text', () => {
+  test('keeps running assistant text visible after the live disclosure', () => {
     const result = buildTurnDisclosureItems([
       item('user', 'user', { createdAt: 1000 }),
       item('progress-note', 'assistant', { createdAt: 1500 }),
@@ -255,10 +245,10 @@ describe('buildTurnDisclosureItems', () => {
 
     expect(result.map((entry) => (entry.type === 'item' ? entry.id : entry.id))).toEqual([
       'user',
-      'partial-answer',
       DISCLOSURE_1,
+      'partial-answer',
     ]);
-    const disclosure = result[2];
+    const disclosure = result[1];
     expect(disclosure.type).toBe('turn_disclosure');
     if (disclosure.type !== 'turn_disclosure') return;
     expect(disclosure.state).toBe('running');
@@ -274,10 +264,10 @@ describe('buildTurnDisclosureItems', () => {
 
     expect(result.map((entry) => (entry.type === 'item' ? entry.id : entry.id))).toEqual([
       'user',
-      'partial-answer',
       DISCLOSURE_1,
+      'partial-answer',
     ]);
-    const disclosure = result[2];
+    const disclosure = result[1];
     expect(disclosure.type).toBe('turn_disclosure');
     if (disclosure.type !== 'turn_disclosure') return;
     expect(disclosure.state).toBe('waiting');
@@ -323,7 +313,7 @@ describe('buildTurnDisclosureItems', () => {
     if (disclosure.type !== 'turn_disclosure') return;
     expect(disclosure.state).toBe('completed');
     expect(disclosure.running).toBe(false);
-    expect(disclosure.startAt).toBe(1500);
+    expect(disclosure.startAt).toBe(1000);
     expect(disclosure.endAt).toBe(3000);
     expect(disclosure.processItemStates).toEqual({ tool: 'failed' });
   });
@@ -361,7 +351,7 @@ describe('buildTurnDisclosureItems', () => {
     if (disclosure.type !== 'turn_disclosure') return;
     expect(disclosure.state).toBe('canceled');
     expect(disclosure.running).toBe(false);
-    expect(disclosure.startAt).toBe(1200);
+    expect(disclosure.startAt).toBe(1000);
     expect(disclosure.endAt).toBe(5200);
     expect(disclosure.processItemStates).toEqual({ tool: 'canceled' });
   });
@@ -390,7 +380,7 @@ describe('buildTurnDisclosureItems', () => {
     expect(disclosure.type).toBe('turn_disclosure');
     if (disclosure.type !== 'turn_disclosure') return;
     expect(disclosure.state).toBe('canceled');
-    expect(disclosure.startAt).toBe(1200);
+    expect(disclosure.startAt).toBe(1000);
     expect(disclosure.endAt).toBe(6200);
     expect(disclosure.processItemStates).toEqual({
       'failed-tool': 'failed',
@@ -415,7 +405,7 @@ describe('buildTurnDisclosureItems', () => {
     expect(disclosure.processItemIds).toEqual(['tool']);
   });
 
-  test('keeps a completed live disclosure after assistant text so processing remains the tail', () => {
+  test('keeps a completed tail in the live disclosure while assistant text remains readable', () => {
     const result = buildTurnDisclosureItems([
       item('user', 'user', { createdAt: 1000 }),
       item('tool', 'process', { createdAt: 2000, processState: 'completed' }),
@@ -424,10 +414,10 @@ describe('buildTurnDisclosureItems', () => {
 
     expect(result.map((entry) => (entry.type === 'item' ? entry.id : entry.id))).toEqual([
       'user',
-      'assistant-text',
       DISCLOSURE_1,
+      'assistant-text',
     ]);
-    const disclosure = result[2];
+    const disclosure = result[1];
     expect(disclosure.type).toBe('turn_disclosure');
     if (disclosure.type !== 'turn_disclosure') return;
     expect(disclosure.state).toBe('running');
@@ -510,7 +500,7 @@ describe('buildTurnDisclosureItems', () => {
     expect(firstDisclosure?.type).toBe('turn_disclosure');
     if (firstDisclosure?.type !== 'turn_disclosure') return;
     expect(firstDisclosure.processItemIds).toEqual(['tool-1', 'late-tool-1']);
-    expect(firstDisclosure.endAt).toBe(7000);
+    expect(firstDisclosure.endAt).toBe(3000);
   });
 
   test('selects final assistant content across non-contiguous fragments of the same turn', () => {
@@ -674,23 +664,6 @@ describe('buildTurnDisclosureItems', () => {
     expect(disclosures).toHaveLength(2);
     expect(disclosures.find((entry) => entry.turnId === TURN_1)?.state).toBe('completed');
     expect(disclosures.find((entry) => entry.turnId === TURN_2)?.state).toBe('running');
-  });
-
-  test('keeps a coalesced active-turn disclosure at the transcript tail', () => {
-    const result = buildTurnDisclosureItems(
-      [
-        item('user-1', 'user', { turnId: TURN_1, createdAt: 1000 }),
-        item('tool-1', 'process', { turnId: TURN_1, createdAt: 2000, processState: 'completed' }),
-        item('partial-1', 'assistant', { turnId: TURN_1, createdAt: 3000 }),
-        item('delayed-tool-2', 'process', { turnId: TURN_2, createdAt: 4000, processState: 'completed' }),
-        item('running-1', 'process', { turnId: TURN_1, createdAt: 5000, processState: 'running' }),
-      ],
-      { activeTurnId: TURN_1 }
-    );
-
-    expect(result.at(-1)?.type).toBe('turn_disclosure');
-    expect(result.at(-1)?.id).toBe(DISCLOSURE_1);
-    expect(result.filter((entry) => entry.id === DISCLOSURE_1)).toHaveLength(1);
   });
 
   test('uses an explicit active turn for background work without a visible user row', () => {
