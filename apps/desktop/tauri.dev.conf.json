@@ -2,6 +2,12 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "NomiFun Dev",
   "identifier": "com.nomifun.desktop.dev",
+  "build": {
+    "beforeBuildCommand": "bun scripts/prune-build.mjs && bun run --filter=./ui build"
+  },
+  "bundle": {
+    "resources": []
+  },
   "plugins": {
     "deep-link": {
       "desktop": {
