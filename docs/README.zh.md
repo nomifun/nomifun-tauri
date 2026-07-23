@@ -43,6 +43,10 @@ docs/
 computer/browser 自动化能力。前端路由真相来源是
 `ui/src/renderer/components/layout/Router.tsx`。
 
+## 文档范围
+
+临时实施计划和已被替代的设计草稿不再保留在 `docs/` 中；确需追溯实施过程时使用 Git 历史。
+
 ## 编辑规则
 
 - 有中英文兄弟文件时，保持两者同步。

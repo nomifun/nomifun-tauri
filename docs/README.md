@@ -46,6 +46,10 @@ scheduled tasks, companions, knowledge, and feature-gated computer/browser
 automation. The frontend source of truth is
 `ui/src/renderer/components/layout/Router.tsx`.
 
+## Documentation scope
+
+Temporary implementation plans and superseded design drafts are intentionally not kept under `docs/`; use Git history when implementation archaeology is required.
+
 ## Editing Rules
 
 - Keep English and Simplified Chinese siblings in sync when both exist.

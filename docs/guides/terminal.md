@@ -94,7 +94,7 @@ The session page is xterm.js wired to the realtime stream:
   becomes re-launchable). **Delete** kills the child and removes the row
   entirely.
 
-![Driving a terminal session](../images/terminal-03-driving-session.png)
+![Driving a terminal session](../images/terminal-01-session.png)
 
 ## Streaming model
 

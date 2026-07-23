@@ -91,7 +91,7 @@ This is where you watch active bindings. To **start** AutoWork on a binding, ope
 the session itself and toggle AutoWork there — that is the canonical place
 to bind a tag, set `max_requirements`, and persist the configuration.
 
-![Tag sessions admin](../images/autowork-04-tag-sessions.png)
+![Tag sessions admin](../images/autowork-01-tag-sessions.png)
 
 ## Filing a requirement
 

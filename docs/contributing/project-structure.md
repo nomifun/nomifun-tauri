@@ -28,14 +28,13 @@ nomifun-tauri/
 │   └── vite.config.ts            Vite config
 ├── docs/
 │   ├── getting-started/          install + first run
-│   ├── guides/                   task-focused how-tos for end users
-│   ├── architecture/             how NomiFun is built (runtime, crates, frontend)
+│   ├── guides/                   task-focused user/operator guides
+│   ├── architecture/             current runtime, crates, and frontend architecture
 │   ├── reference/                configuration, API surface, troubleshooting
-│   ├── contributing/             this directory
-│   ├── specs/                    dated engineering design docs (historical)
-│   ├── audit/                    dated audit reports (historical)
-│   ├── superpowers/              session-scoped planning artifacts (historical)
-│   └── archive/                  historical-doc policy
+│   ├── contributing/             contributor standards and this repo map
+│   ├── continuity/               historical decisions, handoff context, release audits
+│   ├── skills/                   exported instructions for external agents
+│   └── images/                   screenshot manifest and referenced assets
 ├── packaging/
 │   └── linux/                    nomifun-web.service systemd unit + README
 ├── Cargo.toml                    Rust workspace (resolver "3", edition 2024)

@@ -94,11 +94,9 @@ see notes).
 | `webui-04-qr-login-phone.png` | `#/login` @ 390px | web (phone) | Login on a phone-width viewport | guides/webui-remote-access | live |
 | `terminal-01-session.png` | `#/terminal/:id` | web | In-app terminal session | guides/terminal | live |
 | `terminal-02-create-page.png` | `#/terminal-new` | web | Terminal create page | guides/terminal | live |
-| `terminal-03-driving-session.png` | `#/terminal/:id` | web | Driving a terminal (live output) | guides/terminal | live |
 | `autowork-01-tag-sessions.png` | `#/requirements/extensions?tab=autowork` | web | AutoWork tag-sessions overview | guides/autowork-requirements | live |
 | `autowork-02-list.png` | `#/requirements` | web | Requirements list | guides/autowork-requirements | live |
 | `autowork-03-kanban.png` | `#/requirements?view=board` | web | Requirements board (pending/in-progress/done/…) | guides/autowork-requirements | live |
-| `autowork-04-tag-sessions.png` | `#/requirements/extensions?tab=autowork` | web | Tag-sessions table | guides/autowork-requirements | live |
 | `autowork-05-webhook-binding.png` | `#/requirements/extensions?tab=notify` | web | Notify / webhook tab | guides/autowork-requirements | live |
 | `cron-01-list.png` | `#/scheduled` | web | Scheduled Tasks list + keep-awake banner | guides/scheduled-tasks | live |
 | `cron-02-create-dialog.png` | `#/scheduled` (New task) | web | Create scheduled task dialog | guides/scheduled-tasks | live |

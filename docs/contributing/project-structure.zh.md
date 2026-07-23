@@ -16,7 +16,7 @@ nomifun-tauri/
 │   ├── backend/                  29 个 nomifun-* crate，HTTP/WS 后端
 │   └── shared/                   2 个真正跨层共享 crate
 ├── ui/                           React SPA，Vite + UnoCSS，唯一 Bun workspace
-├── docs/                         当前文档、历史设计、审计与归档说明
+├── docs/                         当前文档、专项历史决策、外部 skill 与图片资源
 ├── packaging/linux/              nomifun-web systemd unit 与部署说明
 ├── Cargo.toml                    Rust workspace
 ├── package.json                  Bun/Tauri/Cargo 入口脚本
