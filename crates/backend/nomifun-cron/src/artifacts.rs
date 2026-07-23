@@ -1,5 +1,5 @@
 use nomifun_api_types::{ConversationArtifactResponse, WebSocketMessage};
-use nomifun_common::{ConversationId, CronJobId, UserId, generate_id, validate_uuidv7};
+use nomifun_common::{ConversationId, CronJobId, UserId, validate_uuidv7};
 use nomifun_db::ConversationArtifactRow;
 use nomifun_realtime::UserEventSink;
 use serde::de::DeserializeOwned;
@@ -26,7 +26,7 @@ pub(crate) fn build_cron_trigger_artifact(
     });
 
     Ok(ConversationArtifactRow {
-        conversation_artifact_id: generate_id(),
+        conversation_artifact_id: nomifun_common::ConversationArtifactId::new().into_string(),
         conversation_id: conversation_id.to_owned(),
         cron_job_id: Some(cron_job_id),
         kind: "cron_trigger".into(),
@@ -59,7 +59,7 @@ pub(crate) fn build_skill_suggest_artifact(
     });
 
     Ok(ConversationArtifactRow {
-        conversation_artifact_id: generate_id(),
+        conversation_artifact_id: nomifun_common::ConversationArtifactId::new().into_string(),
         conversation_id: conversation_id.to_owned(),
         cron_job_id: Some(cron_job_id),
         kind: "skill_suggest".into(),

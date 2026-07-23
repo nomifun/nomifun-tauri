@@ -865,8 +865,8 @@ mod tests {
     fn session_binding_deserialization_rejects_prefixed_or_mismatched_entity_ids() {
         let legacy_prefixed = serde_json::json!({
             "kind": "conversation",
-            "session_id": "0190f5fe-7c00-7a00-8000-000000000001",
-            "conversation_id": "0190f5fe-7c00-7a00-8000-000000000001"
+            "session_id": "conv_0190f5fe-7c00-7a00-8000-000000000001",
+            "conversation_id": "conv_0190f5fe-7c00-7a00-8000-000000000001"
         });
         assert!(serde_json::from_value::<LoopbackSessionBinding>(legacy_prefixed).is_err());
 

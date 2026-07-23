@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use nomifun_common::{
     AgentId, MAX_AGENT_EXECUTION_MODELS, MAX_AGENT_EXECUTION_PARALLELISM,
-    MAX_AGENT_EXECUTION_PARTICIPANTS, ProviderId, generate_id, now_ms,
+    MAX_AGENT_EXECUTION_PARTICIPANTS, ProviderId, now_ms,
 };
 use serde_json::Value;
 use sqlx::{Sqlite, SqlitePool, Transaction};
@@ -332,7 +332,8 @@ impl IAgentExecutionTemplateRepository for SqliteAgentExecutionTemplateRepositor
         params: &CreateAgentExecutionTemplateParams,
     ) -> Result<AgentExecutionTemplateDetailRows, DbError> {
         validate_create(params)?;
-        let execution_template_id = generate_id();
+        let execution_template_id =
+            nomifun_common::AgentExecutionTemplateId::new().into_string();
         let now = now_ms();
         let mut tx = self.pool.begin().await?;
         let owner = sqlx::query("UPDATE users SET updated_at = updated_at WHERE user_id = ?")

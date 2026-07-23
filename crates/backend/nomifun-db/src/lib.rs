@@ -11,7 +11,7 @@ pub use database::{
     open_database_for_backup,
 };
 pub use error::DbError;
-pub use id_schema_contract::validate_id_schema_contract;
+pub use id_schema_contract::{validate_id_data_contract, validate_id_schema_contract};
 pub use models::{
     AgentExecutionAttemptDetailRow, AgentExecutionAttemptRow, AgentExecutionDetailRows,
     AgentExecutionEventRow, AgentExecutionParticipantRow, AgentExecutionRow,

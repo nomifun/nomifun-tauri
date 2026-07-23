@@ -764,7 +764,8 @@ impl AgentExecutionEngine {
             disabled_builtin_skills
         };
         Ok(NewAgentExecutionTemplateParticipant {
-            template_participant_id: generate_id(),
+            template_participant_id:
+                nomifun_common::AgentExecutionTemplateParticipantId::new().into_string(),
             source_agent_id,
             preset_id,
             preset_revision,
@@ -2925,7 +2926,7 @@ fn runtime_participants_from_template(
             "template participant builtin exclusions",
         )?;
         participants.push(NewAgentExecutionParticipant {
-            participant_id: generate_id(),
+            participant_id: nomifun_common::AgentExecutionParticipantId::new().into_string(),
             source_agent_id: row.source_agent_id.clone(),
             preset_id: row.preset_id.clone(),
             preset_revision: row.preset_revision,
@@ -3201,7 +3202,7 @@ fn validate_step_command_versions(
 
 fn replacement_step_snapshot(step: &ExecutionStep) -> Result<NewAgentExecutionStep, AppError> {
     Ok(NewAgentExecutionStep {
-        step_id: generate_id(),
+        step_id: nomifun_common::AgentExecutionStepId::new().into_string(),
         title: step.title.clone(),
         spec: step.spec.clone(),
         role: step.role.clone(),

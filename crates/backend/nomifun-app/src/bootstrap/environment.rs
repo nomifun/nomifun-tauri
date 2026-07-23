@@ -260,6 +260,16 @@ async fn probe_v3_database_pool(pool: &SqlitePool) -> Result<ExistingV3DatabaseP
             "database migration lineage is not the exact v3 baseline".into(),
         ));
     }
+    if let Err(error) = nomifun_db::validate_id_schema_contract(pool).await {
+        return Ok(ExistingV3DatabaseProbe::Incompatible(format!(
+            "database does not satisfy the complete v3 ID schema contract: {error}"
+        )));
+    }
+    if let Err(error) = nomifun_db::validate_id_data_contract(pool).await {
+        return Ok(ExistingV3DatabaseProbe::Incompatible(format!(
+            "database does not satisfy the complete v3 ID data contract: {error}"
+        )));
+    }
 
     let schema_matches = table_has_column_contract(pool, "users", "id", "INTEGER", false, true)
         .await?
@@ -411,9 +421,9 @@ async fn prepare_v3_data_layer(config: &AppConfig) -> Result<V3DataLayerState> {
     // The filesystem gate always runs before the read-only SQLite probe, but
     // it is deliberately non-destructive when a database file exists.  The
     // app probe below is the only authority allowed to classify/retire that
-    // database.  Receipt-valid databases still have to prove their exact v3
-    // migration lineage and a small core identity/schema envelope before
-    // writable initialization is allowed.
+    // database. Receipt-valid databases still have to prove their exact v3
+    // migration lineage plus the complete schema and durable ID data contract
+    // before writable initialization is allowed.
     match nomifun_common::factory_reset::prepare_v3_dataset(
         &config.data_dir,
         &config.work_dir,
@@ -703,7 +713,7 @@ mod tests {
         assert!(matches!(
             probe_existing_v3_database(&path).await.unwrap(),
             ExistingV3DatabaseProbe::Incompatible(reason)
-                if reason.contains("identity columns")
+                if reason.contains("complete v3 ID schema contract")
         ));
     }
 
@@ -722,6 +732,42 @@ mod tests {
             probe_existing_v3_database(&path).await.unwrap(),
             ExistingV3DatabaseProbe::Incompatible(reason)
                 if reason.contains("migration lineage")
+        ));
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_current_lineage_with_invalid_managed_origin_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nomifun-backend.db");
+        let database = nomifun_db::init_database(&path).await.unwrap();
+        let mut connection = database.pool().acquire().await.unwrap();
+        nomifun_db::sqlx::query("PRAGMA ignore_check_constraints = ON")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        let asset_id = nomifun_common::WorkshopAssetId::new();
+        nomifun_db::sqlx::query(
+            "INSERT INTO workshop_assets \
+                (asset_id, kind, title, tags, in_library, origin, created_at, updated_at) \
+             VALUES (?, 'image', 'corrupt origin', '[]', 1, \
+                     '{\"canvas_id\":null}', 1, 1)",
+        )
+        .bind(asset_id.as_str())
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        nomifun_db::sqlx::query("PRAGMA ignore_check_constraints = OFF")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        drop(connection);
+        database.close().await;
+
+        assert!(matches!(
+            probe_existing_v3_database(&path).await.unwrap(),
+            ExistingV3DatabaseProbe::Incompatible(reason)
+                if reason.contains("complete v3 ID data contract")
+                    && reason.contains("origin.canvas_id")
         ));
     }
 

@@ -902,7 +902,7 @@ mod tests {
         );
         let error = repo.insert(&noncanonical).await.unwrap_err();
         assert!(
-            matches!(error, DbError::Conflict(ref message) if message.contains("not a canonical provider_id")),
+            matches!(error, DbError::Conflict(ref message) if message.contains("not a canonical UUIDv7")),
             "unexpected noncanonical-provider error: {error:?}"
         );
 

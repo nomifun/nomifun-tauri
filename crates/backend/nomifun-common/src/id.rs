@@ -104,6 +104,12 @@ macro_rules! define_entity_id {
             }
         }
 
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
         impl fmt::Display for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 formatter.write_str(&self.0)
@@ -306,6 +312,18 @@ define_entity_id!(
     CompanionLearnRunId
 );
 define_entity_id!(
+    /// Globally unique companion collected-event identifier.
+    CompanionEventId
+);
+define_entity_id!(
+    /// Globally unique companion skill identifier.
+    CompanionSkillId
+);
+define_entity_id!(
+    /// Globally unique companion skill-pattern identifier.
+    CompanionSkillPatternId
+);
+define_entity_id!(
     /// Globally unique companion session-window identifier.
     CompanionSessionWindowId
 );
@@ -341,12 +359,40 @@ define_entity_id!(
     WorkshopAssetId
 );
 define_entity_id!(
+    /// Globally unique creation-task identifier.
+    CreationTaskId
+);
+define_entity_id!(
     /// Globally unique node identifier within a durable workshop canvas doc.
     WorkshopNodeId
 );
 define_entity_id!(
     /// Globally unique edge identifier within a durable workshop canvas doc.
     WorkshopEdgeId
+);
+define_entity_id!(
+    /// Globally unique MCP-server configuration identifier.
+    McpServerId
+);
+define_entity_id!(
+    /// Globally unique webhook configuration identifier.
+    WebhookId
+);
+define_entity_id!(
+    /// Globally unique conversation-artifact identifier.
+    ConversationArtifactId
+);
+define_entity_id!(
+    /// Globally unique preset-tag identifier.
+    PresetTagId
+);
+define_entity_id!(
+    /// Globally unique execution-participant identifier.
+    AgentExecutionParticipantId
+);
+define_entity_id!(
+    /// Globally unique execution-template participant identifier.
+    AgentExecutionTemplateParticipantId
 );
 
 #[cfg(test)]

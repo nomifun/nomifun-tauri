@@ -4,7 +4,7 @@ use nomifun_common::{
     AgentExecutionActor, AgentExecutionEventKind, AgentExecutionStatus, ExecutionAttemptStatus,
     ExecutionStepKind, ExecutionStepStatus, MAX_AGENT_EXECUTION_PARALLELISM,
     MAX_AGENT_DELEGATION_DEPTH, MAX_AGENT_EXECUTION_PARTICIPANTS, MAX_AGENT_EXECUTION_STEPS,
-    generate_id, now_ms,
+    now_ms,
 };
 use sqlx::{QueryBuilder, Sqlite, SqlitePool, Transaction};
 
@@ -1253,7 +1253,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
                 "max_parallel must be between 1 and {MAX_AGENT_EXECUTION_PARALLELISM}"
             )));
         }
-        let execution_id = generate_id();
+        let execution_id = nomifun_common::AgentExecutionId::new().into_string();
         let now = now_ms();
         let mut tx = self.pool.begin().await?;
         let owner = sqlx::query(
@@ -3116,7 +3116,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
         .bind(step_id)
         .fetch_one(&mut *tx)
         .await?;
-        let attempt_id = generate_id();
+        let attempt_id = nomifun_common::AgentExecutionAttemptId::new().into_string();
         if let Some(participant_id) = participant_id.as_deref() {
             let participant = sqlx::query(
                 "UPDATE agent_execution_participants SET created_at = created_at \
@@ -3502,7 +3502,7 @@ impl IAgentExecutionRepository for SqliteAgentExecutionRepository {
             "queued"
         };
         let started_at = params.start_immediately.then_some(now);
-        let attempt_id = generate_id();
+        let attempt_id = nomifun_common::AgentExecutionAttemptId::new().into_string();
         if let Some(participant_id) = params.participant_id.as_deref() {
             let participant = sqlx::query(
                 "UPDATE agent_execution_participants SET created_at = created_at \

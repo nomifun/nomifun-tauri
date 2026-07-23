@@ -131,8 +131,7 @@ pub async fn open_database_for_backup(path: &Path) -> Result<Database, DbError> 
 async fn validate_restorable_database_contract(pool: &SqlitePool) -> Result<(), DbError> {
     validate_exact_v3_migration_lineage(pool).await?;
     crate::id_schema_contract::validate_id_schema_contract(pool).await?;
-    crate::id_schema_contract::validate_id_value_contract(pool).await?;
-    validate_no_logical_reference_orphans(pool, "backup").await?;
+    crate::id_schema_contract::validate_id_data_contract(pool).await?;
 
     let identities =
         sqlx::query("SELECT singleton_key, owner_user_id FROM installation_identity")
@@ -210,35 +209,6 @@ async fn validate_exact_v3_migration_lineage(pool: &SqlitePool) -> Result<(), Db
     Ok(())
 }
 
-async fn validate_no_logical_reference_orphans(
-    pool: &SqlitePool,
-    context: &str,
-) -> Result<(), DbError> {
-    let findings = crate::id_schema_contract::audit_logical_reference_orphans(pool).await?;
-    if findings.is_empty() {
-        return Ok(());
-    }
-    let details = findings
-        .iter()
-        .map(|finding| {
-            format!(
-                "{}.{} -> {}.{}: {} orphan(s), delete={}, rebuild={}",
-                finding.child_table,
-                finding.child_column,
-                finding.parent_table,
-                finding.parent_column,
-                finding.count,
-                finding.delete_policy,
-                finding.rebuild_policy,
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    Err(DbError::Init(format!(
-        "{context} logical-reference orphan audit failed: {details}"
-    )))
-}
-
 /// Initialize a file-backed SQLite database.
 ///
 /// Creates the database file and parent directories if they don't exist,
@@ -297,7 +267,7 @@ async fn init_database_memory_inner(requested_owner_user_id: Option<String>) -> 
     run_migrations(&pool).await?;
     crate::id_schema_contract::validate_id_schema_contract(&pool).await?;
     ensure_installation_owner(&pool, requested_owner_user_id.as_deref()).await?;
-    validate_no_logical_reference_orphans(&pool, "post-initialization").await?;
+    crate::id_schema_contract::validate_id_data_contract(&pool).await?;
 
     info!("In-memory database initialized");
     Ok(Database { pool })
@@ -335,7 +305,7 @@ async fn try_init_file(path: &Path) -> Result<Database, DbError> {
         run_migrations(&pool).await?;
         crate::id_schema_contract::validate_id_schema_contract(&pool).await?;
         ensure_installation_owner(&pool, None).await?;
-        validate_no_logical_reference_orphans(&pool, "post-initialization").await
+        crate::id_schema_contract::validate_id_data_contract(&pool).await
     }
     .await;
     if let Err(e) = setup {

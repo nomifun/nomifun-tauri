@@ -2934,14 +2934,16 @@ mod tests {
         .unwrap();
 
         let participant_id = nomifun_common::generate_id();
+        let source_agent_id = nomifun_common::AgentId::new();
         sqlx::query(
             "INSERT INTO agent_execution_participants \
              (participant_id, execution_id, source_agent_id, provider_id, model, \
               introduced_in_revision, created_at) \
-             VALUES (?, ?, 'test-agent', ?, 'fixture-model', 0, ?)",
+             VALUES (?, ?, ?, ?, 'fixture-model', 0, ?)",
         )
         .bind(&participant_id)
         .bind(&execution_id)
+        .bind(source_agent_id.as_str())
         .bind(FIXTURE_PROVIDER_ID)
         .bind(now)
         .execute(pool)

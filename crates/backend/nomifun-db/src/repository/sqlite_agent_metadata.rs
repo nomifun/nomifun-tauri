@@ -563,7 +563,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO presets \
                 (preset_id, source_kind, name, instructions, created_at, updated_at) \
-             VALUES (?, 'builtin', 'fixture', '', ?, ?)",
+             VALUES (?, 'user', 'fixture', '', ?, ?)",
         )
         .bind(DELETE_FIXTURE_PRESET_ID)
         .bind(now)

@@ -826,7 +826,7 @@ impl ConversationService {
     /// function so callers that hold only `ConversationService::mint_msg_id`
     /// (or none of the service at all, via re-export) can use it.
     pub fn mint_msg_id() -> String {
-        generate_id()
+        MessageId::new().into_string()
     }
 
     pub fn conversation_repo(&self) -> &Arc<dyn IConversationRepository> {

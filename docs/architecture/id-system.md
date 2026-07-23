@@ -127,6 +127,11 @@ and Channel Plugin/User/Session. Requirements use `requirement_id` plus a
 human-facing `display_no`. The Agent Execution and Channel child entities use
 `participant_id`, `step_id`, `attempt_id`, `template_participant_id`,
 `channel_plugin_id`, `channel_user_id`, and `channel_session_id`.
+Managed Companion side-store records that can be addressed again through an
+API, file, or another record—memories, suggestions, learn runs, session
+windows, collected events, skills, and skill patterns—also use distinct named
+UUIDv7 newtypes. A temporary evolution summary that exists only in one call
+result remains an operation token and is not promoted to a stable entity.
 
 ## Internal technical rows
 
@@ -262,6 +267,9 @@ At every boundary:
 - external IDs remain explicitly typed opaque values;
 - invalid values fail rather than becoming `0`, an empty string, or another
   ID kind;
+- an absent optional business ID in JSON is represented by an omitted field;
+  explicit `null`, retired aliases, and wrong JSON types violate the data
+  contract;
 - routes, DTOs, caches, events, and filesystem manifests use the same business
   or external field type as the domain model; a technical `id` is never the
   portable value at those boundaries.
@@ -274,7 +282,10 @@ At startup, before opening the product database:
 
 1. acquire the dataset/reset lock;
 2. detect the dataset contract and generation;
-3. if the dataset is already v3, continue normally;
+3. require the exact baseline checksum, complete ID schema registry, every
+   physical/registered JSON ID value, the logical-reference orphan audit, and
+   managed side-store ID/filesystem indexes such as Workshop and Companion to
+   pass before accepting the dataset as current v3;
 4. if it is historical or incompatible, move the complete managed dataset to
    a retired/quarantine location;
 5. create a new empty v3 dataset and baseline schema;

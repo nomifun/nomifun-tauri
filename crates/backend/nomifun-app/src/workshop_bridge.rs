@@ -711,11 +711,7 @@ impl WorkshopAssetBridge {
 #[async_trait]
 impl AssetSink for WorkshopAssetBridge {
     async fn persist(&self, asset: PersistAsset) -> Result<String, CreationError> {
-        let PersistAsset { canvas_id, node_id: _, bytes, mime, in_library, mut origin } = asset;
-        // Tie the produced asset to its canvas via origin JSON (already stamped);
-        // the explicit column set on `workshop_assets` has no canvas_id, matching
-        // the contract (canvas linkage lives in origin + the node's resultAssetIds).
-        let _ = canvas_id;
+        let PersistAsset { bytes, mime, in_library, mut origin } = asset;
 
         if bytes.len() > MAX_ASSET_BYTES {
             return Err(CreationError::new(
@@ -907,7 +903,6 @@ fn ext_for_mime(mime: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nomifun_common::{WorkshopCanvasId, WorkshopNodeId};
     use nomifun_db::{SqliteWorkshopRepository, init_database_memory};
     use serde_json::json;
 
@@ -1021,8 +1016,6 @@ mod tests {
         let (bridge, dir, _db) = bridge().await;
         let id = bridge
             .persist(PersistAsset {
-                canvas_id: Some(WorkshopCanvasId::new().into_string()),
-                node_id: Some(WorkshopNodeId::new().into_string()),
                 bytes: "generated story".as_bytes().to_vec(),
                 mime: "text/plain; charset=utf-8".into(),
                 in_library: true,
@@ -1053,8 +1046,6 @@ mod tests {
         let bytes = valid_png();
         let id = bridge
             .persist(PersistAsset {
-                canvas_id: Some(WorkshopCanvasId::new().into_string()),
-                node_id: Some(WorkshopNodeId::new().into_string()),
                 bytes: bytes.clone(),
                 mime: "image/png; charset=binary".into(),
                 in_library: true,
@@ -1093,8 +1084,6 @@ mod tests {
 
         let error = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: valid_png(),
                 mime: "image/png".into(),
                 in_library: true,
@@ -1119,8 +1108,6 @@ mod tests {
 
         let error = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: valid_png(),
                 mime: "image/png".into(),
                 in_library: true,
@@ -1141,8 +1128,6 @@ mod tests {
         let (bridge, dir, _db) = bridge().await;
         let id = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: valid_png(),
                 mime: "image/png".into(),
                 in_library: true,
@@ -1175,8 +1160,6 @@ mod tests {
         let (bridge, dir, _db) = bridge().await;
         let id = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: valid_png(),
                 mime: "image/png".into(),
                 in_library: true,
@@ -1256,8 +1239,6 @@ mod tests {
         assert_eq!(replacement.len(), original.len(), "fixture must exercise same-size replacement");
         let asset_id = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: original,
                 mime: "image/png".into(),
                 in_library: true,
@@ -1288,8 +1269,6 @@ mod tests {
         let bytes = valid_wav();
         let id = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: bytes.clone(),
                 mime: "audio/x-wav".into(),
                 in_library: true,
@@ -1310,8 +1289,6 @@ mod tests {
         let (bridge, dir, _db) = bridge().await;
         let image_id = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: valid_png(),
                 mime: "image/png".into(),
                 in_library: true,
@@ -1321,8 +1298,6 @@ mod tests {
             .unwrap();
         let text_id = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: b"provisional text".to_vec(),
                 mime: "text/plain".into(),
                 in_library: true,
@@ -1353,8 +1328,6 @@ mod tests {
         let missing_file_task = generate_id();
         let committed = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: valid_png(),
                 mime: "image/png".into(),
                 in_library: true,
@@ -1364,8 +1337,6 @@ mod tests {
             .unwrap();
         let extra_same_task = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: b"uncommitted retry".to_vec(),
                 mime: "text/plain".into(),
                 in_library: true,
@@ -1375,8 +1346,6 @@ mod tests {
             .unwrap();
         let canceled = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: b"canceled".to_vec(),
                 mime: "text/plain".into(),
                 in_library: true,
@@ -1386,8 +1355,6 @@ mod tests {
             .unwrap();
         let empty_success = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: b"empty manifest".to_vec(),
                 mime: "text/plain".into(),
                 in_library: true,
@@ -1398,8 +1365,6 @@ mod tests {
         let orphan_task = generate_id();
         let orphan = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: b"missing task".to_vec(),
                 mime: "text/plain".into(),
                 in_library: true,
@@ -1409,8 +1374,6 @@ mod tests {
             .unwrap();
         let missing_file = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: valid_png(),
                 mime: "image/png".into(),
                 in_library: true,
@@ -1424,8 +1387,6 @@ mod tests {
         tokio::fs::remove_file(&missing_file_path).await.unwrap();
         let unowned_upload = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: b"user-owned".to_vec(),
                 mime: "text/plain".into(),
                 in_library: true,
@@ -1480,8 +1441,6 @@ mod tests {
             let (bridge, dir, _db) = bridge().await;
             let result = bridge
                 .persist(PersistAsset {
-                    canvas_id: None,
-                    node_id: None,
                     bytes,
                     mime: "image/png".into(),
                     in_library: true,
@@ -1502,8 +1461,6 @@ mod tests {
             let (bridge, dir, _db) = bridge().await;
             let result = bridge
                 .persist(PersistAsset {
-                    canvas_id: None,
-                    node_id: None,
                     bytes,
                     mime: mime.into(),
                     in_library: true,
@@ -1522,8 +1479,6 @@ mod tests {
         let (bridge, _dir, _db) = bridge().await;
         let id = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: b"draft".to_vec(),
                 mime: "text/plain; charset=utf-8".into(),
                 in_library: false,
@@ -1541,8 +1496,6 @@ mod tests {
         let (bridge, _dir, _db) = bridge().await;
         let id = bridge
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: "reusable prompt text".as_bytes().to_vec(),
                 mime: "text/plain; charset=utf-8".into(),
                 in_library: true,

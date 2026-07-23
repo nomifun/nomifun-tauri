@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nomifun_api_types::WebSocketMessage;
-use nomifun_common::{AppError, CompanionId, generate_id, now_ms, validate_uuidv7};
+use nomifun_common::{AppError, CompanionEventId, CompanionId, now_ms, validate_uuidv7};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -494,7 +494,7 @@ impl Collector {
 
     fn append(&self, source: &str, name: &str, data: serde_json::Value) {
         let event = CollectedEvent {
-            event_id: generate_id(),
+            event_id: CompanionEventId::new().into_string(),
             ts: now_ms(),
             source: source.to_owned(),
             name: name.to_owned(),

@@ -5,8 +5,8 @@ use nomifun_api_types::{
     StepControlPolicy, VerificationPolicy,
 };
 use nomifun_common::{
-    AgentStepMode, AgentToolPolicy, AppError, ExecutionStepKind, ExecutionStepStatus,
-    ParticipantAssignmentSource, MAX_AGENT_EXECUTION_STEPS, generate_id,
+    AgentExecutionStepId, AgentStepMode, AgentToolPolicy, AppError, ExecutionStepKind,
+    ExecutionStepStatus, ParticipantAssignmentSource, MAX_AGENT_EXECUTION_STEPS,
 };
 use nomifun_db::{NewAgentExecutionStep, NewAgentExecutionStepDependency};
 
@@ -45,7 +45,9 @@ pub(crate) fn materialize(
         ));
     }
 
-    let step_ids: Vec<String> = (0..plan.steps.len()).map(|_| generate_id()).collect();
+    let step_ids: Vec<String> = (0..plan.steps.len())
+        .map(|_| AgentExecutionStepId::new().into_string())
+        .collect();
     let mut steps = Vec::with_capacity(plan.steps.len());
     let mut dependencies = Vec::new();
     for (index, planned) in plan.steps.into_iter().enumerate() {

@@ -6,18 +6,11 @@
 
 function randomBytes(): Uint8Array {
   const bytes = new Uint8Array(16);
-  try {
-    const cryptoObj = globalThis.crypto;
-    if (cryptoObj && typeof cryptoObj.getRandomValues === 'function') {
-      cryptoObj.getRandomValues(bytes);
-      return bytes;
-    }
-  } catch {
-    // Use the non-cryptographic fallback only when WebCrypto is unavailable.
+  const cryptoObj = globalThis.crypto;
+  if (!cryptoObj || typeof cryptoObj.getRandomValues !== 'function') {
+    throw new Error('WebCrypto getRandomValues is required to mint stable UUIDv7 business IDs');
   }
-  for (let index = 0; index < bytes.length; index += 1) {
-    bytes[index] = Math.floor(Math.random() * 256);
-  }
+  cryptoObj.getRandomValues(bytes);
   return bytes;
 }
 

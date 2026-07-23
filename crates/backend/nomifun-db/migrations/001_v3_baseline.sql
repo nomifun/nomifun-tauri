@@ -419,10 +419,52 @@ CREATE TABLE workshop_assets (
                        OR (
                            json_valid(origin)
                            AND json_type(origin) = 'object'
-                           AND coalesce(json_type(origin, '$.task_id'), 'missing') = 'missing'
+                           AND json_type(origin, '$.task_id') IS NULL
+                           AND json_type(origin, '$.providerId') IS NULL
+                           AND json_type(origin, '$.canvasId') IS NULL
+                           AND json_type(origin, '$.nodeId') IS NULL
+                           AND json_type(origin, '$.creationTaskId') IS NULL
                            AND (
-                               coalesce(json_type(origin, '$.creation_task_id'), 'missing')
-                                   IN ('missing', 'null')
+                               json_type(origin, '$.provider_id') IS NULL
+                               OR (
+                                   json_type(origin, '$.provider_id') = 'text'
+                                   AND length(json_extract(origin, '$.provider_id')) = 36
+                                   AND lower(json_extract(origin, '$.provider_id')) =
+                                       json_extract(origin, '$.provider_id')
+                                   AND json_extract(origin, '$.provider_id')
+                                       GLOB '????????-????-7???-[89ab]???-????????????'
+                                   AND replace(json_extract(origin, '$.provider_id'), '-', '')
+                                       NOT GLOB '*[^0-9a-f]*'
+                               )
+                           )
+                           AND (
+                               json_type(origin, '$.canvas_id') IS NULL
+                               OR (
+                                   json_type(origin, '$.canvas_id') = 'text'
+                                   AND length(json_extract(origin, '$.canvas_id')) = 36
+                                   AND lower(json_extract(origin, '$.canvas_id')) =
+                                       json_extract(origin, '$.canvas_id')
+                                   AND json_extract(origin, '$.canvas_id')
+                                       GLOB '????????-????-7???-[89ab]???-????????????'
+                                   AND replace(json_extract(origin, '$.canvas_id'), '-', '')
+                                       NOT GLOB '*[^0-9a-f]*'
+                               )
+                           )
+                           AND (
+                               json_type(origin, '$.node_id') IS NULL
+                               OR (
+                                   json_type(origin, '$.node_id') = 'text'
+                                   AND length(json_extract(origin, '$.node_id')) = 36
+                                   AND lower(json_extract(origin, '$.node_id')) =
+                                       json_extract(origin, '$.node_id')
+                                   AND json_extract(origin, '$.node_id')
+                                       GLOB '????????-????-7???-[89ab]???-????????????'
+                                   AND replace(json_extract(origin, '$.node_id'), '-', '')
+                                       NOT GLOB '*[^0-9a-f]*'
+                               )
+                           )
+                           AND (
+                               json_type(origin, '$.creation_task_id') IS NULL
                                OR (
                                    json_type(origin, '$.creation_task_id') = 'text'
                                    AND length(json_extract(origin, '$.creation_task_id')) = 36
@@ -997,7 +1039,16 @@ CREATE TABLE creation_tasks (
                              AND replace(canvas_id, '-', '') NOT GLOB '*[^0-9a-f]*'
                          )
                      ),
-    node_id          TEXT,
+    node_id          TEXT
+                     CHECK (
+                         node_id IS NULL
+                         OR (
+                             length(node_id) = 36
+                             AND lower(node_id) = node_id
+                             AND node_id GLOB '????????-????-7???-[89ab]???-????????????'
+                             AND replace(node_id, '-', '') NOT GLOB '*[^0-9a-f]*'
+                         )
+                     ),
     provider_id      TEXT NOT NULL,
     model            TEXT NOT NULL,
     capability       TEXT NOT NULL,

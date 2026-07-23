@@ -36,6 +36,29 @@ struct OriginReferences {
     creation_task_id: Option<String>,
 }
 
+fn optional_origin_id(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, DbError> {
+    match object.get(key) {
+        None => Ok(None),
+        Some(Value::String(value)) => {
+            nomifun_common::validate_uuidv7(value).map_err(|error| {
+                DbError::Conflict(format!(
+                    "workshop asset origin.{key} is not a canonical UUIDv7: {error}"
+                ))
+            })?;
+            Ok(Some(value.clone()))
+        }
+        Some(Value::Null) => Err(DbError::Conflict(format!(
+            "workshop asset origin.{key} must be omitted when absent; JSON null is not valid"
+        ))),
+        Some(_) => Err(DbError::Conflict(format!(
+            "workshop asset origin.{key} must be a canonical UUIDv7 string"
+        ))),
+    }
+}
+
 fn origin_references(origin: Option<&str>) -> Result<OriginReferences, DbError> {
     let Some(origin) = origin else {
         return Ok(OriginReferences {
@@ -49,67 +72,51 @@ fn origin_references(origin: Option<&str>) -> Result<OriginReferences, DbError> 
     let object = value.as_object().ok_or_else(|| {
         DbError::Conflict("workshop asset origin must be a JSON object".into())
     })?;
-    let provider_id = match object.get("provider_id") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(provider)) => Some(
-            nomifun_common::ProviderId::parse(provider)
-                .map_err(|error| {
-                    DbError::Conflict(format!(
-                        "workshop asset origin.provider_id is not canonical: {error}"
-                    ))
-                })?
-                .into_string(),
-        ),
-        Some(_) => {
-            return Err(DbError::Conflict(
-                "workshop asset origin.provider_id must be a string or null".into(),
-            ));
+    for retired_key in [
+        "task_id",
+        "providerId",
+        "canvasId",
+        "nodeId",
+        "creationTaskId",
+    ] {
+        if object.contains_key(retired_key) {
+            return Err(DbError::Conflict(format!(
+                "workshop asset origin contains unsupported ID field {retired_key:?}"
+            )));
         }
-    };
-    let canvas_id = match object.get("canvas_id") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(canvas)) => Some(
-            nomifun_common::WorkshopCanvasId::parse(canvas)
-                .map_err(|error| {
-                    DbError::Conflict(format!(
-                        "workshop asset origin.canvas_id is not canonical: {error}"
-                    ))
-                })?
-                .into_string(),
-        ),
-        Some(_) => {
-            return Err(DbError::Conflict(
-                "workshop asset origin.canvas_id must be a string or null".into(),
-            ));
-        }
-    };
-    if object.contains_key("task_id") {
-        return Err(DbError::Conflict(
-            "workshop asset origin.task_id is retired; use origin.creation_task_id".into(),
-        ));
     }
-    let creation_task_id = match object.get("creation_task_id") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(creation_task_id)) => Some(
-            nomifun_common::validate_uuidv7(creation_task_id)
-                .map_err(|error| {
-                    DbError::Conflict(format!(
-                        "workshop asset origin.creation_task_id is not canonical: {error}"
-                    ))
-                })
-                .map(|_| creation_task_id.clone())?,
-        ),
-        Some(_) => {
-            return Err(DbError::Conflict(
-                "workshop asset origin.creation_task_id must be a UUIDv7 string or null".into(),
-            ));
-        }
-    };
+    let provider_id = optional_origin_id(object, "provider_id")?;
+    let canvas_id = optional_origin_id(object, "canvas_id")?;
+    let _node_id = optional_origin_id(object, "node_id")?;
+    let creation_task_id = optional_origin_id(object, "creation_task_id")?;
     Ok(OriginReferences {
         provider_id,
         canvas_id,
         creation_task_id,
     })
+}
+
+fn validate_asset_row(row: &WorkshopAssetRow) -> Result<(), DbError> {
+    nomifun_common::WorkshopAssetId::parse(&row.asset_id).map_err(|error| {
+        DbError::Conflict(format!(
+            "workshop asset asset_id {:?} is not a canonical UUIDv7: {error}",
+            row.asset_id
+        ))
+    })?;
+    origin_references(row.origin.as_deref()).map_err(|error| {
+        DbError::Conflict(format!(
+            "workshop asset {} has invalid durable origin: {error}",
+            row.asset_id
+        ))
+    })?;
+    Ok(())
+}
+
+fn validate_asset_rows(rows: &[WorkshopAssetRow]) -> Result<(), DbError> {
+    for row in rows {
+        validate_asset_row(row)?;
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -252,6 +259,7 @@ impl IWorkshopRepository for SqliteWorkshopRepository {
     // ---- assets ----
 
     async fn create_asset(&self, row: &WorkshopAssetRow) -> Result<WorkshopAssetRow, DbError> {
+        validate_asset_row(row)?;
         let references = origin_references(row.origin.as_deref())?;
         let mut tx = self.pool.begin().await?;
         if let Some(provider_id) = references.provider_id {
@@ -328,6 +336,9 @@ impl IWorkshopRepository for SqliteWorkshopRepository {
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
+        if let Some(row) = &row {
+            validate_asset_row(row)?;
+        }
         Ok(row)
     }
 
@@ -335,6 +346,7 @@ impl IWorkshopRepository for SqliteWorkshopRepository {
         let rows = sqlx::query_as::<_, WorkshopAssetRow>("SELECT * FROM workshop_assets")
             .fetch_all(&self.pool)
             .await?;
+        validate_asset_rows(&rows)?;
         Ok(rows)
     }
 
@@ -396,6 +408,7 @@ impl IWorkshopRepository for SqliteWorkshopRepository {
             .push(" OFFSET ")
             .push_bind(offset);
         let items = qb.build_query_as::<WorkshopAssetRow>().fetch_all(&self.pool).await?;
+        validate_asset_rows(&items)?;
 
         Ok((items, total))
     }
@@ -703,14 +716,26 @@ mod tests {
         );
 
         for (label, origin) in [
-            ("legacy task_id integer", serde_json::json!({ "task_id": 1 })),
+            ("unsupported task_id integer", serde_json::json!({ "task_id": 1 })),
             (
-                "legacy task_id numeric string",
+                "unsupported task_id numeric string",
                 serde_json::json!({ "task_id": "1" }),
             ),
             (
-                "legacy task_id UUIDv7",
+                "unsupported task_id UUIDv7",
                 serde_json::json!({ "task_id": nomifun_common::generate_id() }),
+            ),
+            (
+                "explicit null canvas_id",
+                serde_json::json!({ "canvas_id": null }),
+            ),
+            (
+                "explicit null node_id",
+                serde_json::json!({ "node_id": null }),
+            ),
+            (
+                "camel-case canvasId",
+                serde_json::json!({ "canvasId": nomifun_common::generate_id() }),
             ),
             (
                 "integer creation_task_id",

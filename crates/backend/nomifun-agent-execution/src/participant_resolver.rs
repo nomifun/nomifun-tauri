@@ -10,8 +10,10 @@ use nomifun_api_types::{
 };
 use nomifun_common::{
     AppError, MAX_AGENT_EXECUTION_MODELS, MAX_AGENT_EXECUTION_PARTICIPANTS, ProviderId,
-    NOMI_AGENT_ID, generate_id,
+    NOMI_AGENT_ID,
 };
+#[cfg(test)]
+use nomifun_common::generate_id;
 use nomifun_db::{IProviderRepository, NewAgentExecutionParticipant};
 use nomifun_preset::PresetService;
 use serde_json::Value;
@@ -177,7 +179,8 @@ impl ParticipantResolver {
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty());
             snapshots.push(NewAgentExecutionParticipant {
-                participant_id: generate_id(),
+                participant_id:
+                    nomifun_common::AgentExecutionParticipantId::new().into_string(),
                 source_agent_id: NOMI_AGENT_ID.to_owned(),
                 preset_id: None,
                 preset_revision: None,
@@ -272,7 +275,8 @@ impl ParticipantResolver {
                 }
             }
             snapshots.push(NewAgentExecutionParticipant {
-                participant_id: generate_id(),
+                participant_id:
+                    nomifun_common::AgentExecutionParticipantId::new().into_string(),
                 source_agent_id: resolved
                     .resolved_agent_id
                     .clone()
@@ -377,7 +381,8 @@ impl ParticipantResolver {
         participants.insert(
             0,
             NewAgentExecutionParticipant {
-                participant_id: generate_id(),
+                participant_id:
+                    nomifun_common::AgentExecutionParticipantId::new().into_string(),
                 source_agent_id: snapshot
                     .resolved_agent_id
                     .clone()

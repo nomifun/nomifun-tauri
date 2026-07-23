@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use nomifun_common::TimestampMs;
+use nomifun_common::{McpServerId, TimestampMs};
 use sqlx::QueryBuilder;
 use sqlx::SqlitePool;
 
@@ -102,7 +102,7 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
 
     async fn create(&self, params: CreateMcpServerParams<'_>) -> Result<McpServerRow, DbError> {
         let now = nomifun_common::now_ms();
-        let mcp_server_id = nomifun_common::generate_id();
+        let mcp_server_id = McpServerId::new().into_string();
         let last_test_status = "disconnected";
 
         sqlx::query(

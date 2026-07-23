@@ -1,96 +1,9 @@
 use std::collections::HashMap;
-use std::fmt;
-use std::str::FromStr;
 
-use nomifun_common::{McpServerStatus, McpSource, TimestampMs, UuidV7Error};
+use nomifun_common::{McpServerStatus, McpSource, TimestampMs};
 use serde::{Deserialize, Serialize};
 
-/// Stable MCP server business identifier.
-///
-/// Only canonical bare lowercase UUIDv7 values are accepted. Legacy integer
-/// row IDs, numeric strings, prefixed IDs, UUIDv4, uppercase, and whitespace
-/// variants are intentionally rejected at the wire boundary.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(transparent)]
-pub struct McpServerId(String);
-
-impl McpServerId {
-    pub fn new() -> Self {
-        Self(nomifun_common::generate_id())
-    }
-
-    pub fn parse(value: impl Into<String>) -> Result<Self, UuidV7Error> {
-        let value = value.into();
-        nomifun_common::validate_uuidv7(&value)?;
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn into_string(self) -> String {
-        self.0
-    }
-}
-
-impl Default for McpServerId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Display for McpServerId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl FromStr for McpServerId {
-    type Err = UuidV7Error;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::parse(value)
-    }
-}
-
-impl TryFrom<String> for McpServerId {
-    type Error = UuidV7Error;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::parse(value)
-    }
-}
-
-impl TryFrom<&str> for McpServerId {
-    type Error = UuidV7Error;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        Self::parse(value)
-    }
-}
-
-impl From<McpServerId> for String {
-    fn from(value: McpServerId) -> Self {
-        value.0
-    }
-}
-
-impl AsRef<str> for McpServerId {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl<'de> Deserialize<'de> for McpServerId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(value).map_err(serde::de::Error::custom)
-    }
-}
+pub use nomifun_common::McpServerId;
 
 // ---------------------------------------------------------------------------
 // A. Transport types
