@@ -12,7 +12,7 @@ import { CronJobManager } from '@/renderer/pages/cron';
 import { usePresetInfo } from '@/renderer/hooks/agent/usePresetInfo';
 import { iconColors } from '@/renderer/styles/colors';
 import { Button, Dropdown, Menu, Message, Tooltip, Typography } from '@arco-design/web-react';
-import { ChartHistogram, History } from '@icon-park/react';
+import { ChartHistogram, History, Terminal } from '@icon-park/react';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
@@ -48,6 +48,7 @@ import ExecutionConversationLayout from '../execution/ExecutionConversationLayou
 import ReadOnlyConversationView from '../execution/ReadOnlyConversationView';
 import StarOfficeMonitorCard from '../platforms/openclaw/StarOfficeMonitorCard.tsx';
 import NomiSessionMetricsPanel from '../platforms/nomi/NomiSessionMetricsPanel';
+import ConversationTerminalPanel from './ConversationTerminalPanel';
 import { useExecutionModelPool } from '../execution/useExecutionModelPool';
 import { reconcileModelRefs, sameModelRefs } from '../execution/executionModelRefs';
 // import SkillRuleGenerator from './components/SkillRuleGenerator'; // Temporarily hidden
@@ -204,6 +205,12 @@ const NomiConversationLayout: React.FC<{
   const { t } = useTranslation();
   const workspaceExtraTabs = useMemo(
     () => [
+      {
+        key: 'conversation-terminals',
+        title: t('terminal.conversationPanel.tab'),
+        icon: <Terminal size={18} />,
+        content: <ConversationTerminalPanel conversationId={conversation.id} />,
+      },
       {
         key: 'nomi-session-metrics',
         title: t('conversation.sessionMetrics.tab'),
@@ -606,6 +613,21 @@ const ChatConversation: React.FC<{
     );
   }, [t]);
 
+  const workspaceExtraTabs = useMemo(
+    () =>
+      conversation?.extra?.workspace
+        ? [
+            {
+              key: 'conversation-terminals',
+              title: t('terminal.conversationPanel.tab'),
+              icon: <Terminal size={18} />,
+              content: <ConversationTerminalPanel conversationId={conversation.id} />,
+            },
+          ]
+        : [],
+    [conversation?.id, conversation?.extra?.workspace, t],
+  );
+
   const isRetainedAttemptTranscript = Boolean(
     conversation?.execution_step_id || conversation?.execution_attempt_id,
   );
@@ -623,13 +645,14 @@ const ChatConversation: React.FC<{
           hideAdvancedControls
           disableRename
           siderTitle={sliderTitle}
-          sider={<ChatSlider conversation={conversation} />}
+          sider={<ChatSlider conversation={conversation} extraTabs={workspaceExtraTabs} />}
           workspaceEnabled={Boolean(conversation.extra?.workspace)}
           workspacePath={conversation.extra?.workspace}
           isTemporaryWorkspace={
             (conversation.extra as { is_temporary_workspace?: boolean } | undefined)
               ?.is_temporary_workspace
           }
+          workspaceExtraTabs={workspaceExtraTabs}
         >
           <ReadOnlyConversationView
             conversation={conversation}
@@ -648,7 +671,11 @@ const ChatConversation: React.FC<{
     if (conversation.extra?.companion_session) {
       return (
         <ExecutionProvider conversation={conversation}>
-          <CompanionChatPanel key={conversation.id} conversation={conversation} />
+          <CompanionChatPanel
+            key={conversation.id}
+            conversation={conversation}
+            extraTabs={workspaceExtraTabs}
+          />
         </ExecutionProvider>
       );
     }
@@ -708,13 +735,14 @@ const ChatConversation: React.FC<{
       {...chatLayoutProps}
       headerExtra={headerExtraNode}
       siderTitle={sliderTitle}
-      sider={<ChatSlider conversation={conversation} />}
+      sider={<ChatSlider conversation={conversation} extraTabs={workspaceExtraTabs} />}
       workspaceEnabled={workspaceEnabled}
       workspacePath={conversation?.extra?.workspace}
       isTemporaryWorkspace={
         (conversation?.extra as { is_temporary_workspace?: boolean } | undefined)?.is_temporary_workspace
       }
       conversation_id={conversation?.id}
+      workspaceExtraTabs={workspaceExtraTabs}
     >
       {conversationNode}
     </ExecutionConversationLayout>

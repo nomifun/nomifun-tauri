@@ -29,6 +29,7 @@ use tokio::sync::{Mutex, broadcast};
 use tracing::{debug, error, info, warn};
 
 use crate::runtime_state::AgentRuntimeState;
+use crate::runtime_handle::SystemResourceNoticeDelivery;
 use crate::capability::backend_output_sink::BackendOutputSink;
 use crate::capability::backend_protocol_sink::BackendProtocolSink;
 use crate::protocol::events::{AgentStreamEvent, TurnCompletedEventData, TurnStopReason};
@@ -84,6 +85,11 @@ pub struct NomiAgentManager {
     /// engine via `set_steering_inbox` each turn). `std::sync::Mutex` — locked
     /// only for brief push/drain, never across an await.
     steering_inbox: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    /// Trusted host resource state. This queue is mounted on the engine for
+    /// every turn but is injected only through the provider's top-level system
+    /// context, never through a user message. It persists while the runtime is
+    /// idle so notices do not need to start a synthetic turn.
+    system_resource_inbox: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     /// Target directory for post-session memory distillation. `None` =
     /// this session never distills (companion red line, or no base dir).
     /// Set once at construction.
@@ -577,6 +583,9 @@ impl NomiAgentManager {
             turn_gate: Mutex::new(()),
             closing: AtomicBool::new(false),
             steering_inbox: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            system_resource_inbox: Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
             distill_dir,
             image_read_root,
             distill_cfg,
@@ -787,6 +796,7 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
 
             self.backend_output_sink.begin_artifact_delivery_turn();
             engine.set_steering_inbox(Some(self.steering_inbox.clone()));
+            engine.set_system_resource_inbox(Some(self.system_resource_inbox.clone()));
 
             // Each iteration runs one engine pass inside the same accepted
             // Agent turn. Re-run only for steering race-tail interjections or
@@ -811,6 +821,7 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
                         );
                         engine.abort_current_turn("Tool execution canceled by user");
                         engine.set_steering_inbox(None);
+                        engine.set_system_resource_inbox(None);
                         break 'accepted None;
                     }
                     res = engine.execute_turn_with_content(current_content, &data.msg_id) => res,
@@ -891,6 +902,7 @@ impl crate::runtime_handle::AgentRuntimeControl for NomiAgentManager {
             };
 
             engine.set_steering_inbox(None);
+            engine.set_system_resource_inbox(None);
             Some((result, engine))
         };
 
@@ -1124,6 +1136,48 @@ impl NomiAgentManager {
             .push_back(text);
         self.runtime.bump_activity();
         Ok(true)
+    }
+
+    /// Queue trusted host-side resource state without starting a turn.
+    ///
+    /// The dedicated inbox is mounted on the engine during every real Nomi
+    /// turn. The engine drains it into top-level system context immediately
+    /// before the next provider request, so an idle runtime retains the notice
+    /// until the next user-initiated model call and an active runtime can see it
+    /// at its next model boundary. It never enters the user transcript.
+    pub fn notify_system_resource(
+        &self,
+        notice: String,
+    ) -> Result<SystemResourceNoticeDelivery, AppError> {
+        let notice = notice.trim();
+        if notice.is_empty() {
+            return Err(AppError::BadRequest(
+                "System resource notice must not be empty".into(),
+            ));
+        }
+
+        let _lifecycle = self
+            .lifecycle_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.closing.load(Ordering::Acquire) {
+            return Err(AppError::Conflict(
+                "Agent runtime is shutting down and cannot accept resource notifications"
+                    .to_owned(),
+            ));
+        }
+
+        let delivery = if self.runtime.status() == Some(ConversationStatus::Running) {
+            SystemResourceNoticeDelivery::ActiveTurn
+        } else {
+            SystemResourceNoticeDelivery::NextModelCall
+        };
+        self.system_resource_inbox
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push_back(notice.to_owned());
+        self.runtime.bump_activity();
+        Ok(delivery)
     }
 
     pub fn confirm(&self, _msg_id: &str, call_id: &str, data: Value, always_allow: bool) -> Result<(), AppError> {
@@ -1596,12 +1650,90 @@ mod tests {
             turn_gate: Mutex::new(()),
             closing: AtomicBool::new(false),
             steering_inbox: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            system_resource_inbox: Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
             distill_dir: None,
             image_read_root: None,
             distill_cfg: Arc::new(config),
             knowledge_prelude: std::sync::Mutex::new(None),
             knowledge_auto_rag: None,
         }
+    }
+
+    #[tokio::test]
+    async fn idle_system_resource_notice_waits_for_next_real_model_call() {
+        let provider = Arc::new(ScriptedProvider::new(vec![vec![LlmEvent::Done {
+            stop_reason: StopReason::EndTurn,
+            usage: Default::default(),
+        }]]));
+        let agent = make_agent_with_provider(provider.clone());
+
+        let delivery = agent
+            .notify_system_resource(
+                "terminal term-idle transitioned to exited (exit_code=0)".to_owned(),
+            )
+            .unwrap();
+        assert_eq!(delivery, SystemResourceNoticeDelivery::NextModelCall);
+        assert_eq!(
+            provider.calls(),
+            0,
+            "queuing resource state must not synthesize a model turn"
+        );
+
+        agent
+            .send_message(SendMessageData {
+                content: "continue".into(),
+                msg_id: "msg-after-idle-resource".into(),
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                origin: None,
+            })
+            .await
+            .unwrap();
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .system
+                .contains("terminal term-idle transitioned to exited (exit_code=0)")
+        );
+        assert!(
+            requests[0].messages.iter().all(|message| {
+                message.content.iter().all(|block| {
+                    !matches!(
+                        block,
+                        ContentBlock::Text { text }
+                            if text.contains("terminal term-idle transitioned to exited")
+                    )
+                })
+            }),
+            "resource state must not be presented as a user message"
+        );
+    }
+
+    #[test]
+    fn running_system_resource_notice_enters_active_runtime_inbox() {
+        let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+        let agent = make_agent_with_provider(provider);
+        agent.runtime.transition_to(ConversationStatus::Running);
+
+        let delivery = agent
+            .notify_system_resource("terminal term-live was closed".to_owned())
+            .unwrap();
+
+        assert_eq!(delivery, SystemResourceNoticeDelivery::ActiveTurn);
+        assert_eq!(
+            agent
+                .system_resource_inbox
+                .lock()
+                .unwrap()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["terminal term-live was closed"]
+        );
     }
 
     fn assert_single_cancelled_finish_without_running_tools(
@@ -1707,6 +1839,9 @@ mod tests {
             turn_gate: Mutex::new(()),
             closing: AtomicBool::new(false),
             steering_inbox: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            system_resource_inbox: Arc::new(std::sync::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
             distill_dir: None,
             image_read_root: None,
             distill_cfg: Arc::new(config),

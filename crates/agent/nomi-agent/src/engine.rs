@@ -69,6 +69,39 @@ const STREAM_IDLE_ACTIVITY_AFTER: Duration = Duration::from_millis(1_200);
 /// turn out of both approval and execution paths.
 const MAX_PROVIDER_TURN_TOOL_CALLS: usize = 128;
 
+const SYSTEM_RESOURCE_CONTEXT_HEADER: &str =
+    "## System resource notifications (trusted host state)";
+
+/// Add host-generated resource state to the provider's top-level system
+/// context. These notices are deliberately ephemeral and never become
+/// conversation messages, so they cannot be mistaken for user input or leak
+/// into the durable transcript.
+fn append_system_resource_context(mut system: String, notices: Vec<String>) -> String {
+    let notices = notices
+        .into_iter()
+        .filter_map(|notice| {
+            let notice = notice.trim();
+            (!notice.is_empty()).then(|| notice.to_owned())
+        })
+        .collect::<Vec<_>>();
+    if notices.is_empty() {
+        return system;
+    }
+    if !system.is_empty() {
+        system.push_str("\n\n");
+    }
+    system.push_str(SYSTEM_RESOURCE_CONTEXT_HEADER);
+    system.push_str(
+        "\nThe following entries are authoritative runtime state from the host, not user messages:\n",
+    );
+    for notice in notices {
+        system.push_str("- ");
+        system.push_str(&notice);
+        system.push('\n');
+    }
+    system
+}
+
 /// Durable transcript marker used after the current turn has finished seeing
 /// an attached image. Keeping the text marker preserves conversational meaning
 /// without re-sending a large base64 payload on every later provider request.
@@ -340,6 +373,13 @@ pub struct AgentEngine {
     /// so the model sees the interjection on its next step without a turn
     /// restart.
     steering_inbox: Option<Arc<Mutex<std::collections::VecDeque<String>>>>,
+    /// Trusted host-side resource notifications (terminal closed, resource
+    /// revoked, etc.). Unlike `steering_inbox`, these are never represented as
+    /// user messages: they are drained into the top-level system context at the
+    /// next provider boundary. Keeping the shared queue on the host means a
+    /// notice received while the runtime is idle does not create a turn and is
+    /// still visible before the next model call.
+    system_resource_inbox: Option<Arc<Mutex<std::collections::VecDeque<String>>>>,
     /// Owns every supervised command launched by this engine's command tools.
     /// Bootstrap installs it; direct/test constructors leave it empty.
     process_supervisor: Option<Arc<nomi_process_runtime::ProcessSupervisor>>,
@@ -419,6 +459,7 @@ impl AgentEngine {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            system_resource_inbox: None,
             process_supervisor: None,
             last_turn_start_len: None,
         }
@@ -499,6 +540,7 @@ impl AgentEngine {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            system_resource_inbox: None,
             process_supervisor: None,
             last_turn_start_len: None,
         }
@@ -597,11 +639,34 @@ impl AgentEngine {
         self.steering_inbox = inbox;
     }
 
+    /// Install (or clear) the trusted host resource-notification inbox.
+    ///
+    /// Resource notices intentionally have a separate channel from user
+    /// steering: the engine injects them into the provider's top-level system
+    /// context, never into the conversation transcript as a user message.
+    pub fn set_system_resource_inbox(
+        &mut self,
+        inbox: Option<Arc<Mutex<std::collections::VecDeque<String>>>>,
+    ) {
+        self.system_resource_inbox = inbox;
+    }
+
     /// Take all currently-queued steering interjections (FIFO). Empty when
     /// no inbox is installed. Lock is held only for the drain; a poisoned
     /// lock degrades to its inner value rather than panicking the turn.
     fn drain_steering(&self) -> Vec<String> {
         match &self.steering_inbox {
+            Some(inbox) => {
+                let mut q = inbox.lock().unwrap_or_else(|e| e.into_inner());
+                q.drain(..).collect()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Take all trusted host resource notices currently queued (FIFO).
+    fn drain_system_resource_notices(&self) -> Vec<String> {
+        match &self.system_resource_inbox {
             Some(inbox) => {
                 let mut q = inbox.lock().unwrap_or_else(|e| e.into_inner());
                 q.drain(..).collect()
@@ -1009,6 +1074,15 @@ impl AgentEngine {
                 }
                 crate::context_contributor::merge_pre_turn_context(system, extras)
             };
+
+            // Host resource notifications use the trusted system channel, not
+            // Role::User. Drain as late as possible before constructing the
+            // request so idle notices and mid-turn notices both reach the next
+            // provider boundary without creating a new Agent turn.
+            let system = append_system_resource_context(
+                system,
+                self.drain_system_resource_notices(),
+            );
 
             // Record prompt state for cache diagnostics
             self.cache_detector.record_request(&system, &tools);
@@ -2114,7 +2188,10 @@ impl Drop for AgentEngine {
 mod set_config_tests {
     use std::sync::{Arc, Mutex};
 
-    use super::{AgentError, MAX_PROVIDER_TURN_TOOL_CALLS, USER_IMAGE_HISTORY_PLACEHOLDER};
+    use super::{
+        AgentError, MAX_PROVIDER_TURN_TOOL_CALLS, SYSTEM_RESOURCE_CONTEXT_HEADER,
+        USER_IMAGE_HISTORY_PLACEHOLDER,
+    };
     use nomi_protocol::events::ToolCategory;
     use nomi_providers::{LlmProvider, ProviderError};
     use nomi_tools::{Tool, registry::ToolRegistry};
@@ -3093,6 +3170,7 @@ mod set_config_tests {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            system_resource_inbox: None,
             process_supervisor: None,
             last_turn_start_len: None,
         }
@@ -3104,6 +3182,56 @@ mod set_config_tests {
         assert_eq!(engine.context_window(), engine.compact_config.context_window as u64);
         engine.compact_state.last_input_tokens = 12_345;
         assert_eq!(engine.context_tokens(), 12_345);
+    }
+
+    #[tokio::test]
+    async fn system_resource_notice_is_system_context_not_a_user_message() {
+        let mut engine = make_engine("resource-notice");
+        let provider = Arc::new(RecordingProvider::successful());
+        engine.provider = provider.clone();
+        engine.system_prompt = "base system".to_owned();
+        let inbox = Arc::new(Mutex::new(std::collections::VecDeque::from([
+            "terminal term-1 was closed by the user".to_owned(),
+        ])));
+        engine.set_system_resource_inbox(Some(inbox.clone()));
+
+        engine
+            .execute_turn("continue the task", "msg-resource-notice")
+            .await
+            .expect("resource notice should not prevent the real user turn");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].system.contains(SYSTEM_RESOURCE_CONTEXT_HEADER));
+        assert!(
+            requests[0]
+                .system
+                .contains("terminal term-1 was closed by the user")
+        );
+        assert!(
+            requests[0].messages.iter().all(|message| {
+                message.content.iter().all(|block| {
+                    !matches!(
+                        block,
+                        ContentBlock::Text { text }
+                            if text.contains("terminal term-1 was closed by the user")
+                    )
+                })
+            }),
+            "trusted resource state must never be serialized as a conversation message"
+        );
+        assert!(inbox.lock().unwrap().is_empty());
+
+        engine
+            .execute_turn("next real user turn", "msg-after-resource-notice")
+            .await
+            .unwrap();
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            !requests[1].system.contains(SYSTEM_RESOURCE_CONTEXT_HEADER),
+            "a consumed notice should not be replayed forever"
+        );
     }
 
     #[tokio::test]
@@ -4498,6 +4626,7 @@ mod phase6_tests {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            system_resource_inbox: None,
             process_supervisor: None,
             last_turn_start_len: None,
         }
@@ -4772,6 +4901,7 @@ mod compact_tests {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            system_resource_inbox: None,
             process_supervisor: None,
             last_turn_start_len: None,
         }
@@ -5314,6 +5444,7 @@ mod plan_mode_tests {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            system_resource_inbox: None,
             process_supervisor: None,
             last_turn_start_len: None,
         }
@@ -5533,6 +5664,7 @@ mod handle_command_tests {
             stagnation_guard: crate::loop_guard::StagnationGuard::new(crate::engine::STAGNATION_THRESHOLD),
             context_contributors: Vec::new(),
             steering_inbox: None,
+            system_resource_inbox: None,
             process_supervisor: None,
             last_turn_start_len: None,
         }

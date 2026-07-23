@@ -6,7 +6,11 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use nomifun_ai_agent::{AgentRouterState, AgentService, RemoteAgentRouterState, RemoteAgentService};
+use nomifun_ai_agent::{
+    AgentRouterState, AgentRuntimeRegistry, AgentService, RemoteAgentRouterState,
+    RemoteAgentService,
+};
+use nomifun_api_types::TerminalExitEvent;
 use nomifun_preset::{BuiltinPresetRegistry, PresetRouterState, PresetService};
 use nomifun_auth::extract_token_from_ws_headers;
 use nomifun_channel::ChannelRouterState;
@@ -363,6 +367,12 @@ pub fn build_conversation_state(
     conversation_service.with_delete_hook(
         services.requirement_service.clone() as Arc<dyn OnConversationDelete>,
     );
+    // A terminal minted by a conversation is part of that conversation's
+    // resource lifecycle, not a global sidebar session. Deleting the owner is
+    // the final safety net if the agent or user did not close it earlier.
+    conversation_service.with_delete_hook(Arc::new(ConversationTerminalCascade {
+        terminals: services.terminal_service.clone(),
+    }) as Arc<dyn OnConversationDelete>);
     // Drop this conversation's IDMM decision records (disposable audit trail,
     // polymorphic target_id with no FK —app-level cascade).
     conversation_service.with_delete_hook(Arc::new(IdmmRecordCascade {
@@ -801,9 +811,22 @@ pub fn build_terminal_state(services: &AppServices) -> TerminalRouterState {
         .with_delete_hook(Arc::new(IdmmRecordCascade {
             records: Arc::new(SqliteIdmmInterventionRepository::new(services.database.pool().clone())),
         }) as Arc<dyn OnTerminalDelete>);
+    let lifecycle_notice = Arc::new(AgentTerminalLifecycleNotice {
+        runtimes: services.agent_runtime_registry.clone(),
+    });
+    // `terminal.exit` is emitted only after the PTY exit status and final
+    // scrollback have been persisted. Observe the internal owner-scoped event
+    // so natural child exits (not just REST kill/delete requests) update the
+    // owning Agent's trusted resource context.
+    spawn_terminal_exit_agent_notice_forwarder(
+        services,
+        lifecycle_notice.clone(),
+    );
+
     // Reuse the singleton terminal service (owns the live PTY map), so the
     // terminal routes and the AutoWork runner share the same PTYs.
     TerminalRouterState::new(services.terminal_service.clone())
+        .with_conversation_notice_sink(lifecycle_notice)
 }
 
 /// Build the `RequirementRouterState` + `IdmmRouterState` from application
@@ -1159,6 +1182,226 @@ impl nomifun_companion::service::CompanionCleanupHook for CompanionKnowledgeClea
     }
 }
 
+/// Conversation-delete cascade for agent-created terminal resources. Normal
+/// operation expects the creating agent or the conversation terminal panel to
+/// close these explicitly; this hook is the durable owner-lifecycle fallback.
+struct ConversationTerminalCascade {
+    terminals: Arc<nomifun_terminal::TerminalService>,
+}
+
+#[async_trait::async_trait]
+impl OnConversationDelete for ConversationTerminalCascade {
+    async fn on_conversation_deleted(&self, user_id: &str, conversation_id: &str) {
+        let sessions = match self
+            .terminals
+            .list_for_conversation(user_id, conversation_id)
+            .await
+        {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                tracing::warn!(
+                    conversation_id,
+                    error = %error,
+                    "failed to enumerate conversation-owned terminals during owner cleanup"
+                );
+                return;
+            }
+        };
+        for session in sessions {
+            if let Err(error) = self.terminals.delete(session.terminal_id.as_str()).await {
+                tracing::warn!(
+                    conversation_id,
+                    terminal_id = %session.terminal_id,
+                    error = %error,
+                    "failed to delete conversation-owned terminal during owner cleanup"
+                );
+            }
+        }
+    }
+}
+
+fn spawn_terminal_exit_agent_notice_forwarder(
+    services: &AppServices,
+    notice_sink: Arc<AgentTerminalLifecycleNotice>,
+) {
+    let mut events = services.event_bus.subscribe_user();
+    let terminal_service = services.terminal_service.clone();
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!(
+            "terminal exit Agent-notice forwarder was not started because no Tokio runtime is active"
+        );
+        return;
+    };
+    runtime.spawn(async move {
+        loop {
+            let envelope = match events.recv().await {
+                Ok(envelope) => envelope,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        skipped,
+                        "terminal exit Agent-notice forwarder lagged; scoped terminal state remains authoritative"
+                    );
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            if envelope.event.name != "terminal.exit" {
+                continue;
+            }
+            let exit = match serde_json::from_value::<TerminalExitEvent>(
+                envelope.event.data,
+            ) {
+                Ok(exit) => exit,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "ignored malformed terminal.exit event in Agent-notice forwarder"
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) = terminal_service
+                .authorize_user(&envelope.user_id, exit.terminal_id.as_str())
+                .await
+            {
+                tracing::debug!(
+                    terminal_id = %exit.terminal_id,
+                    error = %error,
+                    "ignored terminal.exit event whose owner no longer authorizes the terminal"
+                );
+                continue;
+            }
+            let session = match terminal_service.get(exit.terminal_id.as_str()).await {
+                Ok(session) => session,
+                Err(error) => {
+                    tracing::debug!(
+                        terminal_id = %exit.terminal_id,
+                        error = %error,
+                        "terminal exited but its owner conversation could not be resolved"
+                    );
+                    continue;
+                }
+            };
+            // A queued exit event can race with relaunch of the same terminal
+            // id. Only forward it while the durable row still describes this
+            // exact exit; otherwise the event belongs to an obsolete PTY epoch
+            // and would incorrectly tell the Agent that the replacement is
+            // gone.
+            if !terminal_exit_matches_current_state(
+                &session.last_status,
+                session.exit_code,
+                exit.exit_code,
+            ) {
+                tracing::debug!(
+                    terminal_id = %exit.terminal_id,
+                    event_exit_code = ?exit.exit_code,
+                    current_status = session.last_status,
+                    current_exit_code = ?session.exit_code,
+                    "ignored stale terminal.exit event after terminal state advanced"
+                );
+                continue;
+            }
+            let Some(conversation_id) = session.owner_conversation_id else {
+                continue;
+            };
+            notice_sink.notify_terminal_exit(
+                conversation_id.as_str(),
+                exit.terminal_id.as_str(),
+                exit.exit_code,
+            );
+        }
+    });
+}
+
+fn terminal_exit_matches_current_state(
+    current_status: &str,
+    current_exit_code: Option<i32>,
+    event_exit_code: Option<i32>,
+) -> bool {
+    current_status == "exited" && current_exit_code == event_exit_code
+}
+
+/// Feed terminal lifecycle state back into a Nomi runtime at its next model
+/// boundary. This is intentionally best-effort: scoped terminal tools remain
+/// the durable source of truth, while the trusted system-resource notice keeps
+/// a present runtime from relying on stale process state.
+struct AgentTerminalLifecycleNotice {
+    runtimes: Arc<dyn AgentRuntimeRegistry>,
+}
+
+impl AgentTerminalLifecycleNotice {
+    fn notify(
+        &self,
+        conversation_id: &str,
+        terminal_id: &str,
+        lifecycle: String,
+    ) {
+        let Some(runtime) = self.runtimes.get_runtime(conversation_id) else {
+            tracing::debug!(
+                conversation_id,
+                terminal_id,
+                lifecycle,
+                "terminal lifecycle changed with no registered Agent runtime"
+            );
+            return;
+        };
+        let notice = format!(
+            "Terminal {terminal_id} {lifecycle}. Treat any previous running \
+             state as stale and call nomi_list_terminals before further \
+             terminal actions."
+        );
+        match runtime.notify_system_resource(notice) {
+            Ok(delivery) => {
+                tracing::debug!(
+                    conversation_id,
+                    terminal_id,
+                    lifecycle,
+                    ?delivery,
+                    "queued terminal lifecycle as trusted Agent resource state"
+                );
+            }
+            Err(error) => {
+                tracing::info!(
+                    conversation_id,
+                    terminal_id,
+                    lifecycle,
+                    agent_type = runtime.agent_type().serde_name(),
+                    error = %error,
+                    "Agent runtime has no trusted system-resource channel; terminal notice remains best-effort via scoped state"
+                );
+            }
+        }
+    }
+
+    fn notify_terminal_exit(
+        &self,
+        conversation_id: &str,
+        terminal_id: &str,
+        exit_code: Option<i32>,
+    ) {
+        let lifecycle = match exit_code {
+            Some(code) => format!("transitioned to exited (exit_code={code})"),
+            None => "transitioned to exited (exit code unavailable)".to_owned(),
+        };
+        self.notify(conversation_id, terminal_id, lifecycle);
+    }
+}
+
+impl nomifun_terminal::TerminalConversationNoticeSink for AgentTerminalLifecycleNotice {
+    fn notify_terminal_lifecycle(
+        &self,
+        conversation_id: &str,
+        terminal_id: &str,
+        event: &'static str,
+    ) {
+        self.notify(
+            conversation_id,
+            terminal_id,
+            format!("received lifecycle event `{event}`"),
+        );
+    }
+}
+
 /// Session-delete cascade for IDMM decision records: `idmm_interventions` has a
 /// polymorphic `target_id` (no FK to cascade), so when a conversation or terminal
 /// is deleted the app layer clears its disposable audit trail here. Best-effort:
@@ -1436,6 +1679,23 @@ mod tests {
 
     use crate::AppConfig;
     use nomifun_extension::{ExtensionSource, ScanPath};
+
+    #[test]
+    fn terminal_exit_notice_rejects_stale_relaunch_epochs() {
+        assert!(terminal_exit_matches_current_state(
+            "exited",
+            Some(0),
+            Some(0)
+        ));
+        assert!(
+            !terminal_exit_matches_current_state("running", None, Some(0)),
+            "an old exit event must not describe a relaunched running PTY"
+        );
+        assert!(
+            !terminal_exit_matches_current_state("exited", Some(1), Some(0)),
+            "an exit event from another PTY epoch must not override current state"
+        );
+    }
 
     #[test]
     fn every_production_conversation_service_uses_shared_private_event_and_execution_boundaries() {

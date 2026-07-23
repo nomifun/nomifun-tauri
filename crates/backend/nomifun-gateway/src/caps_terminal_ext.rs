@@ -161,14 +161,48 @@ struct UpdateTerminalParams {
 
 // 闁冲厜鍋撻柍鍏夊亾闁冲厜鍋?Handlers 闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾闁冲厜鍋撻柍鍏夊亾
 
-async fn get_terminal(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: GetTerminalParams) -> Value {
+/// Gateway terminal capabilities are conversation-scoped. A signed user id is
+/// necessary but not sufficient: an agent must never inspect or mutate a
+/// standalone terminal, or a terminal owned by another conversation.
+async fn authorize_terminal(
+    deps: &GatewayDeps,
+    ctx: &CallerCtx,
+    terminal_id: &str,
+) -> Result<(), Value> {
     if nomifun_common::UserId::parse(ctx.user_id.as_str()).is_err() {
-        return json!({"error": "missing caller user identity in signed Gateway capability"});
+        return Err(json!({
+            "error": "missing caller user identity in signed Gateway capability"
+        }));
     }
+    let conversation_id = match ctx.conversation_id.as_deref() {
+        Some(id) if nomifun_common::ConversationId::parse(id).is_ok() => id,
+        _ => {
+            return Err(json!({
+                "error": "terminal access requires a signed conversation context"
+            }));
+        }
+    };
+    deps.terminal_service
+        .authorize_conversation(ctx.user_id.as_str(), conversation_id, terminal_id)
+        .await
+        .map_err(|error| {
+            json!({
+                "error": format!(
+                    "terminal is not owned by the current conversation or no longer exists: {error}"
+                )
+            })
+        })
+}
+
+async fn get_terminal(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: GetTerminalParams) -> Value {
     let terminal_id = p.terminal_id.as_str();
+    if let Err(error) = authorize_terminal(&deps, &ctx, terminal_id).await {
+        return error;
+    }
     match deps.terminal_service.get(terminal_id).await {
         Ok(resp) => ok(json!({
             "terminal_id": resp.terminal_id,
+            "owner_conversation_id": resp.owner_conversation_id,
             "name": resp.name,
             "status": resp.last_status,
             "cwd": resp.cwd,
@@ -188,10 +222,10 @@ async fn get_terminal(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: GetTerminalPara
 }
 
 async fn write_input(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: WriteInputParams) -> Value {
-    if nomifun_common::UserId::parse(ctx.user_id.as_str()).is_err() {
-        return json!({"error": "missing caller user identity in signed Gateway capability"});
-    }
     let terminal_id = p.terminal_id.as_str();
+    if let Err(error) = authorize_terminal(&deps, &ctx, terminal_id).await {
+        return error;
+    }
     match deps
         .terminal_service
         .input(terminal_id, &p.data_b64)
@@ -203,10 +237,10 @@ async fn write_input(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: WriteInputParams
 }
 
 async fn submit_terminal(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: SubmitTerminalParams) -> Value {
-    if nomifun_common::UserId::parse(ctx.user_id.as_str()).is_err() {
-        return json!({"error": "missing caller user identity in signed Gateway capability"});
-    }
     let terminal_id = p.terminal_id.as_str();
+    if let Err(error) = authorize_terminal(&deps, &ctx, terminal_id).await {
+        return error;
+    }
     if let Err(e) = deps
         .terminal_service
         .submit_text(terminal_id, &p.text)
@@ -226,6 +260,10 @@ async fn submit_terminal(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: SubmitTermin
         .terminal_service
         .await_turn_settle(terminal_id, std::time::Duration::from_secs(secs))
         .await;
+    let structured_turn_end = matches!(
+        reason,
+        nomifun_terminal::submit::SettleReason::TurnEnd
+    );
     let tail = deps
         .terminal_service
         .read_output_tail(terminal_id, 4096)
@@ -236,15 +274,21 @@ async fn submit_terminal(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: SubmitTermin
         "submitted": true,
         "terminal_id": terminal_id,
         "settle_reason": reason,
+        "structured_turn_end": structured_turn_end,
         "output_tail": tail,
+        "note": if structured_turn_end {
+            "the agent CLI emitted a structured turn-end event"
+        } else {
+            "idle only means output became quiet; it does NOT prove that a shell command or agent task succeeded. Inspect output_tail and terminal status before reporting success"
+        },
     }))
 }
 
 async fn read_terminal_output(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: ReadTerminalOutputParams) -> Value {
-    if nomifun_common::UserId::parse(ctx.user_id.as_str()).is_err() {
-        return json!({"error": "missing caller user identity in signed Gateway capability"});
-    }
     let terminal_id = p.terminal_id.as_str();
+    if let Err(error) = authorize_terminal(&deps, &ctx, terminal_id).await {
+        return error;
+    }
     let cap = p.max_bytes.unwrap_or(16_384).min(65_536);
     match deps
         .terminal_service
@@ -262,21 +306,26 @@ async fn read_terminal_output(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: ReadTer
 }
 
 async fn kill_terminal(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: KillTerminalParams) -> Value {
-    if nomifun_common::UserId::parse(ctx.user_id.as_str()).is_err() {
-        return json!({"error": "missing caller user identity in signed Gateway capability"});
-    }
     let terminal_id = p.terminal_id.as_str();
+    if let Err(error) = authorize_terminal(&deps, &ctx, terminal_id).await {
+        return error;
+    }
     match deps.terminal_service.kill(terminal_id).await {
-        Ok(()) => ok(json!({"killed": true, "terminal_id": terminal_id})),
+        Ok(()) => ok(json!({
+            "close_requested": true,
+            "terminal_id": terminal_id,
+            "status": "stopping",
+            "note": "the process termination signal was accepted; use nomi_list_terminals or nomi_terminal_get to observe the durable exited status"
+        })),
         Err(e) => json!({"error": e.to_string()}),
     }
 }
 
 async fn delete_terminal(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: DeleteTerminalParams) -> Value {
-    if nomifun_common::UserId::parse(ctx.user_id.as_str()).is_err() {
-        return json!({"error": "missing caller user identity in signed Gateway capability"});
-    }
     let terminal_id = p.terminal_id.as_str();
+    if let Err(error) = authorize_terminal(&deps, &ctx, terminal_id).await {
+        return error;
+    }
     match deps.terminal_service.delete(terminal_id).await {
         Ok(()) => ok(json!({"deleted": true, "terminal_id": terminal_id})),
         Err(e) => json!({"error": e.to_string()}),
@@ -284,10 +333,10 @@ async fn delete_terminal(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: DeleteTermin
 }
 
 async fn resize_terminal(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: ResizeTerminalParams) -> Value {
-    if nomifun_common::UserId::parse(ctx.user_id.as_str()).is_err() {
-        return json!({"error": "missing caller user identity in signed Gateway capability"});
-    }
     let terminal_id = p.terminal_id.as_str();
+    if let Err(error) = authorize_terminal(&deps, &ctx, terminal_id).await {
+        return error;
+    }
     match deps
         .terminal_service
         .resize(terminal_id, p.cols, p.rows)
@@ -299,13 +348,14 @@ async fn resize_terminal(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: ResizeTermin
 }
 
 async fn relaunch_terminal(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: RelaunchTerminalParams) -> Value {
-    if nomifun_common::UserId::parse(ctx.user_id.as_str()).is_err() {
-        return json!({"error": "missing caller user identity in signed Gateway capability"});
-    }
     let terminal_id = p.terminal_id.as_str();
+    if let Err(error) = authorize_terminal(&deps, &ctx, terminal_id).await {
+        return error;
+    }
     match deps.terminal_service.relaunch(terminal_id).await {
         Ok(resp) => ok(json!({
             "terminal_id": resp.terminal_id,
+            "owner_conversation_id": resp.owner_conversation_id,
             "name": resp.name,
             "status": resp.last_status,
             "cwd": resp.cwd,
@@ -320,13 +370,13 @@ async fn relaunch_terminal(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: RelaunchTe
 }
 
 async fn update_terminal(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: UpdateTerminalParams) -> Value {
-    if nomifun_common::UserId::parse(ctx.user_id.as_str()).is_err() {
-        return json!({"error": "missing caller user identity in signed Gateway capability"});
-    }
     if p.name.is_none() && p.pinned.is_none() {
         return json!({"error": "nothing to update: provide at least one of name / pinned"});
     }
     let terminal_id = p.terminal_id.as_str();
+    if let Err(error) = authorize_terminal(&deps, &ctx, terminal_id).await {
+        return error;
+    }
     match deps
         .terminal_service
         .update_meta(terminal_id, p.name, p.pinned)

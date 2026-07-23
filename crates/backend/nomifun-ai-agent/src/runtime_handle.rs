@@ -29,6 +29,18 @@ use nomifun_api_types::{
     GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, SideQuestionRequest, SideQuestionResponse, SlashCommandItem,
 };
 
+/// Where a trusted host resource notification was queued.
+///
+/// Both dispositions are non-turn-creating. `ActiveTurn` means a Nomi turn was
+/// running when the notice entered its dedicated system-resource inbox;
+/// `NextModelCall` means the runtime was idle and will expose the notice in the
+/// top-level system context of its next real model request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemResourceNoticeDelivery {
+    ActiveTurn,
+    NextModelCall,
+}
+
 #[cfg(any(test, feature = "test-support"))]
 use nomifun_common::Confirmation;
 
@@ -112,6 +124,14 @@ pub trait MockAgentRuntime: AgentRuntimeControl {
     /// that exercise the steering path override this.
     fn steer(&self, _text: String) -> Result<bool, AppError> {
         Ok(false)
+    }
+    fn notify_system_resource(
+        &self,
+        _notice: String,
+    ) -> Result<SystemResourceNoticeDelivery, AppError> {
+        Err(AppError::BadRequest(
+            "System resource notifications are not supported for this mock".into(),
+        ))
     }
     fn confirm(
         &self,
@@ -408,6 +428,36 @@ impl AgentRuntimeHandle {
             ),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.steer(text),
+        }
+    }
+
+    /// Queue trusted host resource state without creating a turn or pretending
+    /// the event came from the user.
+    ///
+    /// Nomi owns a dedicated inbox whose entries are injected into the
+    /// provider's top-level system context at the next model boundary. External
+    /// runtimes do not currently expose an equivalent trusted-context channel;
+    /// callers get an explicit error and can log the best-effort limitation
+    /// instead of falling back to `send_message`.
+    pub fn notify_system_resource(
+        &self,
+        notice: String,
+    ) -> Result<SystemResourceNoticeDelivery, AppError> {
+        if notice.trim().is_empty() {
+            return Err(AppError::BadRequest(
+                "System resource notice must not be empty".into(),
+            ));
+        }
+        match self {
+            Self::Nomi(m) => m.notify_system_resource(notice),
+            Self::Acp(_) | Self::OpenClaw(_) | Self::Nanobot(_) | Self::Remote(_) => {
+                Err(AppError::BadRequest(format!(
+                    "System resource notifications are not supported for {} runtimes",
+                    self.agent_type().display_name()
+                )))
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(m) => m.notify_system_resource(notice),
         }
     }
 

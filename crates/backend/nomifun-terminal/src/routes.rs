@@ -9,7 +9,7 @@ use nomifun_api_types::{
     UpdateTerminalRequest, WorkspaceEntry,
 };
 use nomifun_auth::CurrentUser;
-use nomifun_common::{AppError, TerminalId};
+use nomifun_common::{AppError, ConversationId, TerminalId};
 use serde::Deserialize;
 
 use crate::state::TerminalRouterState;
@@ -27,6 +27,10 @@ pub struct TerminalWorkspaceQuery {
 pub fn terminal_routes(state: TerminalRouterState) -> Router {
     Router::new()
         .route("/api/terminals", get(list_terminals).post(create_terminal))
+        .route(
+            "/api/conversations/{conversation_id}/terminals",
+            get(list_conversation_terminals),
+        )
         .route(
             "/api/terminals/{terminal_id}",
             get(get_terminal).patch(update_terminal).delete(delete_terminal),
@@ -64,22 +68,48 @@ async fn list_terminals(
     Ok(Json(ApiResponse::ok(items)))
 }
 
+async fn list_conversation_terminals(
+    State(state): State<TerminalRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(conversation_id): Path<ConversationId>,
+) -> Result<Json<ApiResponse<Vec<TerminalSessionResponse>>>, AppError> {
+    let items = state
+        .terminal_service
+        .list_for_conversation(&user.id, conversation_id.as_str())
+        .await?;
+    Ok(Json(ApiResponse::ok(items)))
+}
+
+async fn authorize_terminal(
+    state: &TerminalRouterState,
+    user: &CurrentUser,
+    terminal_id: &TerminalId,
+) -> Result<(), AppError> {
+    state
+        .terminal_service
+        .authorize_user(&user.id, terminal_id.as_str())
+        .await?;
+    Ok(())
+}
+
 async fn get_terminal(
     State(state): State<TerminalRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(terminal_id): Path<TerminalId>,
 ) -> Result<Json<ApiResponse<TerminalSessionResponse>>, AppError> {
+    authorize_terminal(&state, &user, &terminal_id).await?;
     let resp = state.terminal_service.get(terminal_id.as_str()).await?;
     Ok(Json(ApiResponse::ok(resp)))
 }
 
 async fn write_input(
     State(state): State<TerminalRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(terminal_id): Path<TerminalId>,
     body: Result<Json<TerminalInputRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    authorize_terminal(&state, &user, &terminal_id).await?;
     state
         .terminal_service
         .input(terminal_id.as_str(), &req.data_b64)
@@ -89,11 +119,12 @@ async fn write_input(
 
 async fn resize_terminal(
     State(state): State<TerminalRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(terminal_id): Path<TerminalId>,
     body: Result<Json<TerminalResizeRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    authorize_terminal(&state, &user, &terminal_id).await?;
     state
         .terminal_service
         .resize(terminal_id.as_str(), req.cols, req.rows)
@@ -103,27 +134,54 @@ async fn resize_terminal(
 
 async fn kill_terminal(
     State(state): State<TerminalRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(terminal_id): Path<TerminalId>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
+    authorize_terminal(&state, &user, &terminal_id).await?;
+    let owner_conversation_id = state
+        .terminal_service
+        .get(terminal_id.as_str())
+        .await?
+        .owner_conversation_id;
     state.terminal_service.kill(terminal_id.as_str()).await?;
+    if let Some(owner_conversation_id) = owner_conversation_id {
+        state.notify_owner(
+            owner_conversation_id.as_str(),
+            terminal_id.as_str(),
+            "close_requested_by_user",
+        );
+    }
     Ok(Json(ApiResponse::success()))
 }
 
 async fn delete_terminal(
     State(state): State<TerminalRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(terminal_id): Path<TerminalId>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
+    authorize_terminal(&state, &user, &terminal_id).await?;
+    let owner_conversation_id = state
+        .terminal_service
+        .get(terminal_id.as_str())
+        .await?
+        .owner_conversation_id;
     state.terminal_service.delete(terminal_id.as_str()).await?;
+    if let Some(owner_conversation_id) = owner_conversation_id {
+        state.notify_owner(
+            owner_conversation_id.as_str(),
+            terminal_id.as_str(),
+            "deleted_by_user",
+        );
+    }
     Ok(Json(ApiResponse::success()))
 }
 
 async fn relaunch_terminal(
     State(state): State<TerminalRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(terminal_id): Path<TerminalId>,
 ) -> Result<Json<ApiResponse<TerminalSessionResponse>>, AppError> {
+    authorize_terminal(&state, &user, &terminal_id).await?;
     let resp = state.terminal_service.relaunch(terminal_id.as_str()).await?;
     Ok(Json(ApiResponse::ok(resp)))
 }
@@ -133,9 +191,10 @@ async fn relaunch_terminal(
 /// for a garbled/unresponsive claude/codex TUI — see `relaunch_as_shell`.
 async fn relaunch_shell_terminal(
     State(state): State<TerminalRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(terminal_id): Path<TerminalId>,
 ) -> Result<Json<ApiResponse<TerminalSessionResponse>>, AppError> {
+    authorize_terminal(&state, &user, &terminal_id).await?;
     let resp = state
         .terminal_service
         .relaunch_as_shell(terminal_id.as_str())
@@ -145,11 +204,12 @@ async fn relaunch_shell_terminal(
 
 async fn update_terminal(
     State(state): State<TerminalRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(terminal_id): Path<TerminalId>,
     body: Result<Json<UpdateTerminalRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<TerminalSessionResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
+    authorize_terminal(&state, &user, &terminal_id).await?;
     let resp = state
         .terminal_service
         .update_meta(terminal_id.as_str(), req.name, req.pinned)
@@ -163,10 +223,11 @@ async fn update_terminal(
 /// `..` traversal → 400 (both from the service / `list_workspace_level`).
 async fn browse_workspace(
     State(state): State<TerminalRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     Path(terminal_id): Path<TerminalId>,
     Query(query): Query<TerminalWorkspaceQuery>,
 ) -> Result<Json<ApiResponse<Vec<WorkspaceEntry>>>, AppError> {
+    authorize_terminal(&state, &user, &terminal_id).await?;
     let entries = state
         .terminal_service
         .browse_workspace(

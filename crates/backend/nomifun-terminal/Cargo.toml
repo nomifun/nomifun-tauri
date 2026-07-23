@@ -10,6 +10,7 @@ nomifun-api-types.workspace = true
 nomifun-realtime.workspace = true
 nomifun-auth.workspace = true
 nomifun-runtime.workspace = true
+nomi-process-runtime.workspace = true
 nomifun-knowledge.workspace = true
 nomifun-file.workspace = true
 axum.workspace = true

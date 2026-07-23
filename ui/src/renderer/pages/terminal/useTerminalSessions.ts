@@ -11,9 +11,10 @@ import type { TerminalId } from '@/common/types/ids';
 import { emitter } from '@/renderer/utils/emitter';
 
 /**
- * Live list of terminal sessions for the sidebar. Loads via HTTP and stays in
- * sync through `terminal.created/updated/removed/exit` WS events and a local
- * `terminal.list.refresh` emitter event (fired after create/relaunch).
+ * Live list of standalone, user-owned terminal sessions for the global
+ * sidebar. Conversation-owned terminals are intentionally excluded: their
+ * lifecycle belongs to the conversation that created them and they are shown
+ * in that conversation's right-hand terminal panel instead.
  */
 export function useTerminalSessions() {
   const [sessions, setSessions] = useState<ITerminalSession[]>([]);
@@ -35,12 +36,18 @@ export function useTerminalSessions() {
     void refresh();
 
     const offCreated = ipcBridge.terminal.onCreated.on((s) => {
+      if (s.owner_conversation_id) return;
       setSessions((prev) =>
         prev.some((p) => p.terminal_id === s.terminal_id) ? prev : [s, ...prev],
       );
     });
     const offUpdated = ipcBridge.terminal.onUpdated.on((s) => {
-      setSessions((prev) => prev.map((p) => (p.terminal_id === s.terminal_id ? s : p)));
+      setSessions((prev) => {
+        if (s.owner_conversation_id) {
+          return prev.filter((p) => p.terminal_id !== s.terminal_id);
+        }
+        return prev.map((p) => (p.terminal_id === s.terminal_id ? s : p));
+      });
     });
     const offRemoved = ipcBridge.terminal.onRemoved.on((evt) => {
       setSessions((prev) => prev.filter((p) => p.terminal_id !== evt.terminal_id));
@@ -58,12 +65,16 @@ export function useTerminalSessions() {
       void refresh();
     };
     emitter.on('terminal.list.refresh', offRefresh);
+    const offReconnected = ipcBridge.terminal.onReconnected.on(() => {
+      void refresh();
+    });
 
     return () => {
       offCreated();
       offUpdated();
       offRemoved();
       offExit();
+      offReconnected();
       emitter.off('terminal.list.refresh', offRefresh);
     };
   }, [refresh]);

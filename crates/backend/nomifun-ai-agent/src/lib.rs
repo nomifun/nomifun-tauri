@@ -39,7 +39,9 @@ pub use nomi_types;
 pub use runtime_state::AgentRuntimeState;
 #[cfg(any(test, feature = "test-support"))]
 pub use runtime_handle::MockAgentRuntime;
-pub use runtime_handle::{AgentRuntimeControl, AgentRuntimeHandle};
+pub use runtime_handle::{
+    AgentRuntimeControl, AgentRuntimeHandle, SystemResourceNoticeDelivery,
+};
 pub use capability::skill_manager::{
     AcpSkillManager, SkillDefinition, SkillIndex, build_skills_index_text, build_system_instructions,
     build_system_instructions_with_skills_index, detect_skill_load_request, prepare_first_message,
