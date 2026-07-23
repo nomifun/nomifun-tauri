@@ -50,7 +50,7 @@ export const usePublicAgents = () => {
         if (provider && model) {
           try {
             await ipcBridge.publicAgent.patch.invoke({
-              id: created.id,
+              public_agent_id: created.public_agent_id,
               patch: { model: { provider_id: provider.id, model } },
             });
           } catch {
@@ -70,25 +70,29 @@ export const usePublicAgents = () => {
 /**
  * 单个对外伙伴的档案 + 乐观 PATCH 通道。乐观更新本地状态，失败则回读权威值。
  */
-export const usePublicAgent = (id: PublicAgentId | null) => {
+export const usePublicAgent = (publicAgentId: PublicAgentId | null) => {
   const [agent, setAgent] = useState<IPublicAgent | null>(null);
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
-    if (!id) {
+    if (!publicAgentId) {
       setAgent(null);
       setLoading(false);
       return;
     }
     setLoading(true);
     try {
-      setAgent(await ipcBridge.publicAgent.get.invoke({ id }));
+      setAgent(
+        await ipcBridge.publicAgent.get.invoke({
+          public_agent_id: publicAgentId,
+        })
+      );
     } catch {
       setAgent(null);
     } finally {
       setLoading(false);
     }
-  }, [id]);
+  }, [publicAgentId]);
 
   useEffect(() => {
     void load();
@@ -96,7 +100,7 @@ export const usePublicAgent = (id: PublicAgentId | null) => {
 
   const patch = useCallback(
     async (p: IPublicAgentPatch): Promise<IPublicAgent | undefined> => {
-      if (!id) return undefined;
+      if (!publicAgentId) return undefined;
       // Optimistic merge (model is a nested object → shallow-merge it too).
       setAgent((prev) =>
         prev
@@ -104,7 +108,10 @@ export const usePublicAgent = (id: PublicAgentId | null) => {
           : prev
       );
       try {
-        const updated = await ipcBridge.publicAgent.patch.invoke({ id, patch: p });
+        const updated = await ipcBridge.publicAgent.patch.invoke({
+          public_agent_id: publicAgentId,
+          patch: p,
+        });
         setAgent(updated);
         return updated;
       } catch (e) {
@@ -113,7 +120,7 @@ export const usePublicAgent = (id: PublicAgentId | null) => {
         throw e;
       }
     },
-    [id, load]
+    [publicAgentId, load]
   );
 
   return { agent, loading, reload: load, patch };

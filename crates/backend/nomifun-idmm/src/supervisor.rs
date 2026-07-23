@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use nomifun_api_types::{AutoWorkTargetKind, IdmmConfig, IdmmState, IdmmTargetKind, InterventionRecord};
-use nomifun_common::{AppError, IdmmInterventionId, UserId, now_ms};
+use nomifun_common::{AppError, UserId, now_ms};
 use nomifun_db::IIdmmInterventionRepository;
-use nomifun_db::models::IdmmInterventionRow;
+use nomifun_db::models::NewIdmmInterventionRow;
 use tracing::{debug, info, warn};
 
 use crate::events::IdmmEventEmitter;
@@ -707,46 +707,58 @@ async fn emit_intervention(
     let reason = reason.map(truncate_detail);
     let detail = extra.detail.map(truncate_detail);
 
-    let rec = InterventionRecord {
-        id: IdmmInterventionId::new(),
+    // Fail-open: persist the audit row, but a DB error must never block or fail
+    // the decision path — only warn. The DB is the sole source of truth for
+    // `/log`; the supervisor itself keeps only live counters (count / last-at).
+    let row = NewIdmmInterventionRow {
+        intervention_id: nomifun_common::IdmmInterventionId::new().into_string(),
+        user_id: owner_id.to_owned(),
         target_kind: target_kind.clone(),
         target_id: target_id.to_string(),
         watch: watch.clone(),
         at,
-        stall_class: stall_class.clone(),
+        signal: stall_class.clone(),
         tier_used: tier_used.to_string(),
         category: extra.category.clone(),
         action: action.to_string(),
         detail: detail.clone(),
-        outcome: outcome.to_string(),
         reason: reason.clone(),
-        confidence: extra.confidence,
+        confidence: extra.confidence.map(f64::from),
         bypass_model: extra.bypass_model.clone(),
+        outcome: outcome.to_string(),
+    };
+    let inserted = match deps.records.insert(&row).await {
+        Ok(inserted) => inserted,
+        Err(e) => {
+            warn!(target_id, error = %e, "IDMM intervention persist failed (fail-open)");
+            // No durable row exists. The decision path remains fail-open, but
+            // do not publish a fabricated technical ID to the API/WS stream.
+            return;
+        }
     };
 
-    // Fail-open: persist the audit row, but a DB error must never block or fail
-    // the decision path — only warn. The DB is the sole source of truth for
-    // `/log`; the supervisor itself keeps only live counters (count / last-at).
-    let row = IdmmInterventionRow {
-        id: rec.id.clone().into_string(),
-        user_id: owner_id.to_owned(),
+    let rec = InterventionRecord {
+        intervention_id: match nomifun_common::IdmmInterventionId::parse(inserted.intervention_id) {
+            Ok(intervention_id) => intervention_id,
+            Err(error) => {
+                warn!(target_id, %error, "IDMM repository returned invalid intervention_id");
+                return;
+            }
+        },
         target_kind,
         target_id: target_id.to_string(),
         watch,
         at,
-        signal: stall_class,
+        stall_class,
         tier_used: tier_used.to_string(),
         category: extra.category,
         action: action.to_string(),
         detail,
-        reason,
-        confidence: rec.confidence.map(f64::from),
-        bypass_model: extra.bypass_model,
         outcome: outcome.to_string(),
+        reason,
+        confidence: extra.confidence,
+        bypass_model: extra.bypass_model,
     };
-    if let Err(e) = deps.records.insert(&row).await {
-        warn!(target_id, error = %e, "IDMM intervention persist failed (fail-open)");
-    }
 
     info!(
         target_id,
@@ -1110,14 +1122,14 @@ mod tests {
     use std::sync::Mutex;
     use tokio::sync::mpsc;
 
-    const TEST_USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
     const CONVERSATION_TARGET_ID: &str =
-        "conv_0190f5fe-7c00-7a00-8000-000000000002";
+        "0190f5fe-7c00-7a00-8000-000000000002";
     const TERMINAL_TARGET_ID: &str =
-        "term_0190f5fe-7c00-7a00-8000-000000000002";
-    const TEST_PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000003";
+        "0190f5fe-7c00-7a00-8000-000000000002";
+    const TEST_PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000003";
     const TEST_BYPASS_MODEL: &str =
-        "prov_0190f5fe-7c00-7a00-8000-000000000003/m";
+        "0190f5fe-7c00-7a00-8000-000000000003/m";
 
     // ── Mock probe: scripted signal queue + captured injects ──
     struct MockProbe {
@@ -1241,6 +1253,7 @@ mod tests {
                 .iter()
                 .filter_map(|k| {
                     m.get(*k).map(|v| ClientPreference {
+                        id: 0,
                         key: k.to_string(),
                         value: v.clone(),
                         updated_at: 0,
@@ -1286,12 +1299,51 @@ mod tests {
     }
     #[async_trait]
     impl nomifun_db::IIdmmInterventionRepository for RecordingRepo {
-        async fn insert(&self, row: &nomifun_db::models::IdmmInterventionRow) -> Result<(), DbError> {
-            self.inserted.lock().unwrap().push(row.clone());
+        async fn insert(
+            &self,
+            row: &nomifun_db::models::NewIdmmInterventionRow,
+        ) -> Result<nomifun_db::models::IdmmInterventionRow, DbError> {
             if self.fail {
+                self.inserted.lock().unwrap().push(nomifun_db::models::IdmmInterventionRow {
+                    id: 0,
+                    intervention_id: row.intervention_id.clone(),
+                    user_id: row.user_id.clone(),
+                    target_kind: row.target_kind.clone(),
+                    target_id: row.target_id.clone(),
+                    watch: row.watch.clone(),
+                    at: row.at,
+                    signal: row.signal.clone(),
+                    tier_used: row.tier_used.clone(),
+                    category: row.category.clone(),
+                    action: row.action.clone(),
+                    detail: row.detail.clone(),
+                    reason: row.reason.clone(),
+                    confidence: row.confidence,
+                    bypass_model: row.bypass_model.clone(),
+                    outcome: row.outcome.clone(),
+                });
                 return Err(DbError::Query(sqlx::Error::Protocol("boom".into())));
             }
-            Ok(())
+            let inserted = nomifun_db::models::IdmmInterventionRow {
+                id: self.inserted.lock().unwrap().len() as i64 + 1,
+                intervention_id: row.intervention_id.clone(),
+                user_id: row.user_id.clone(),
+                target_kind: row.target_kind.clone(),
+                target_id: row.target_id.clone(),
+                watch: row.watch.clone(),
+                at: row.at,
+                signal: row.signal.clone(),
+                tier_used: row.tier_used.clone(),
+                category: row.category.clone(),
+                action: row.action.clone(),
+                detail: row.detail.clone(),
+                reason: row.reason.clone(),
+                confidence: row.confidence,
+                bypass_model: row.bypass_model.clone(),
+                outcome: row.outcome.clone(),
+            };
+            self.inserted.lock().unwrap().push(inserted.clone());
+            Ok(inserted)
         }
         async fn list_for_target(
             &self,
@@ -1434,7 +1486,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn intervention_persists_row_with_enriched_fields() {
         // A sidecar-tier chat decision: the model answers a choice. The emitted
-        // record must be written to the repo with a `idmmrec_`-prefixed id,
+        // record must be written to the repo with a local technical id,
         // target_kind=conversation, watch=decision (a decision, not a fault),
         // tier=sidecar, the chosen text in `detail`, the model's confidence, a
         // bypass_model, and outcome=applied.
@@ -1453,7 +1505,10 @@ mod tests {
         let rows = records.inserted.lock().unwrap();
         assert_eq!(rows.len(), 1, "exactly one intervention should be persisted; got {rows:?}");
         let row = &rows[0];
-        assert!(row.id.starts_with("idmmrec_"), "id must be idmmrec_-prefixed; got {}", row.id);
+        assert!(
+            nomifun_common::IdmmInterventionId::parse(&row.intervention_id).is_ok(),
+            "the repository must preserve a canonical UUIDv7 business id"
+        );
         assert_eq!(row.user_id, TEST_USER_ID);
         assert_eq!(row.target_kind, "conversation");
         assert_eq!(row.target_id, CONVERSATION_TARGET_ID);
@@ -1611,11 +1666,11 @@ mod tests {
         let shared = Arc::new(SupervisorShared::default());
         let cancel = Arc::new(AtomicBool::new(false));
         run_supervisor(probe, rule_cfg(), deps, shared.clone(), cancel).await;
-        // Insert was attempted, the action was still applied, the WS-side
-        // in-memory counter still incremented (fail-open).
+        // Insert was attempted and the action was still applied. Without a
+        // durable technical ID there is no record/WS event to publish.
         assert_eq!(records.inserted.lock().unwrap().len(), 1);
         assert_eq!(injected.lock().unwrap().as_slice(), &[WakeAction::Retry]);
-        assert_eq!(shared.count.load(Ordering::Relaxed), 1);
+        assert_eq!(shared.count.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test(start_paused = true)]

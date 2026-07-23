@@ -24,12 +24,14 @@ use nomifun_db::{
     NewAgentExecutionParticipant, SqliteAgentExecutionRepository,
 };
 
+const NOMI_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000114";
+
 async fn seed_test_provider(services: &nomifun_app::AppServices) {
     nomifun_db::sqlx::query(
         "INSERT INTO providers (\
-            id, platform, name, base_url, api_key_encrypted, models, enabled, \
+            provider_id, platform, name, base_url, api_key_encrypted, models, enabled, \
             capabilities, created_at, updated_at\
-         ) VALUES ('prov_0190f5fe-7c00-7a00-8000-000000000013', 'openai', 'test', 'https://example.invalid', \
+         ) VALUES ('0190f5fe-7c00-7a00-8000-000000000013', 'openai', 'test', 'https://example.invalid', \
                    'encrypted', '[\"model_test\"]', 1, '[]', 1, 1)",
     )
     .execute(services.database.pool())
@@ -96,12 +98,12 @@ async fn repository_execution_round_trips_through_the_app_engine() {
                 initial_plan_input: r#"{"mode":"automatic"}"#.to_owned(),
             },
             &[NewAgentExecutionParticipant {
-                id: "execpart_0190f5fe-7c00-7a00-8000-000000000014".to_owned(),
-                source_agent_id: "nomi".to_owned(),
+                participant_id: nomifun_common::generate_id(),
+                source_agent_id: NOMI_AGENT_ID.to_owned(),
                 preset_id: None,
                 preset_revision: None,
                 preset_snapshot: None,
-                provider_id: Some("prov_0190f5fe-7c00-7a00-8000-000000000013".to_owned()),
+                provider_id: Some("0190f5fe-7c00-7a00-8000-000000000013".to_owned()),
                 model: Some("model_test".to_owned()),
                 role: Some("tester".to_owned()),
                 capability: None,
@@ -125,6 +127,8 @@ async fn repository_execution_round_trips_through_the_app_engine() {
         .await
         .unwrap();
 
+    assert!(nomifun_common::validate_uuidv7(&row.execution_id).is_ok());
+
     let response = app
         .clone()
         .oneshot(get_with_token("/api/agent-executions", &token))
@@ -134,21 +138,26 @@ async fn repository_execution_round_trips_through_the_app_engine() {
     let body = body_json(response).await;
     let listed = body["data"].as_array().unwrap();
     assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0]["id"], row.id);
+    assert_eq!(listed[0]["execution_id"], row.execution_id);
+    assert!(listed[0].get("id").is_none());
     assert_eq!(listed[0]["goal"], "验证统一执行边界");
     assert_eq!(listed[0]["status"], "paused");
 
     let response = app
         .clone()
         .oneshot(get_with_token(
-            &format!("/api/agent-executions/{}", row.id),
+            &format!("/api/agent-executions/{}", row.execution_id),
             &token,
         ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let detail = body_json(response).await;
-    assert_eq!(detail["data"]["execution"]["id"], row.id);
+    assert_eq!(
+        detail["data"]["execution"]["execution_id"],
+        row.execution_id
+    );
+    assert!(detail["data"]["execution"].get("id").is_none());
     assert_eq!(detail["data"]["participants"].as_array().unwrap().len(), 1);
     assert!(detail["data"]["steps"].as_array().unwrap().is_empty());
     assert!(detail["data"]["attempts"].as_array().unwrap().is_empty());
@@ -158,7 +167,7 @@ async fn repository_execution_round_trips_through_the_app_engine() {
         .oneshot(delete_with_token(
             &format!(
                 "/api/agent-executions/{}?expected_version={}",
-                row.id, row.version
+                row.execution_id, row.version
             ),
             &token,
             &csrf,
@@ -169,7 +178,7 @@ async fn repository_execution_round_trips_through_the_app_engine() {
 
     let response = app
         .oneshot(get_with_token(
-            &format!("/api/agent-executions/{}", row.id),
+            &format!("/api/agent-executions/{}", row.execution_id),
             &token,
         ))
         .await
@@ -205,8 +214,8 @@ async fn collaboration_template_routes_are_owner_scoped_crud() {
                 "work_dir": "/tmp/project",
                 "context": {"ticket":"NOMI-37"},
                 "participants": [{
-                    "source_agent_id": "reviewer",
-                    "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000013",
+                    "source_agent_id": NOMI_AGENT_ID,
+                    "provider_id": "0190f5fe-7c00-7a00-8000-000000000013",
                     "model": "model_test",
                     "role": "reviewer"
                 }]
@@ -218,7 +227,12 @@ async fn collaboration_template_routes_are_owner_scoped_crud() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
     let created = body_json(response).await;
-    let template_id = created["data"]["id"].as_str().unwrap().to_owned();
+    let template_id = created["data"]["execution_template_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(created["data"].get("id").is_none());
+    assert!(nomifun_common::validate_uuidv7(&template_id).is_ok());
     assert_eq!(created["data"]["participants"].as_array().unwrap().len(), 1);
 
     let response = app

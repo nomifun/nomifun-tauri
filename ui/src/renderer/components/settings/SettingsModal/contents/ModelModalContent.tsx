@@ -6,7 +6,7 @@
 
 import { ipcBridge } from '@/common';
 import type { IProvider, ModelProfile, ModelTask, ModelTrait } from '@/common/config/storage';
-import { prefixedId } from '@/common/utils';
+import { uuidv7 } from '@/common/utils';
 import { parseProviderId, type ProviderId } from '@/common/types/ids';
 import { Button, Checkbox, Collapse, Divider, Input, Message, Modal, Popconfirm, Popover, Select, Switch, Tag, Tooltip } from '@arco-design/web-react';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
@@ -210,13 +210,11 @@ const ModelDescriptionEditor: React.FC<{
  */
 const ModelContextLimitEditor: React.FC<{
   value?: number;
-  inheritedValue?: number;
   onSave: (value?: number) => void;
-}> = ({ value, inheritedValue, onSave }) => {
+}> = ({ value, onSave }) => {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState<number | undefined>(value);
-  const effectiveValue = value ?? inheritedValue;
 
   const handleVisibleChange = (visible: boolean) => {
     if (visible) setDraft(value);
@@ -228,10 +226,9 @@ const ModelContextLimitEditor: React.FC<{
     setOpen(false);
   };
 
-  const label = effectiveValue
-    ? formatContextLimit(effectiveValue)
+  const label = value
+    ? formatContextLimit(value)
     : t('settings.modelContextLimitDefault', { defaultValue: '默认' });
-  const inherited = value == null && inheritedValue != null;
 
   return (
     <Popover
@@ -245,14 +242,6 @@ const ModelContextLimitEditor: React.FC<{
             {t('settings.modelContextLimit', { defaultValue: '模型上下文窗口' })}
           </div>
           <ContextLimitSelect value={draft} onChange={setDraft} />
-          {inherited && (
-            <div className='text-11px text-t-tertiary leading-4'>
-              {t('settings.modelContextLimitInherited', {
-                value: formatContextLimit(inheritedValue),
-                defaultValue: '当前继承旧供应商设置 {{value}}；选择并保存后会写入该模型自己的配置。',
-              })}
-            </div>
-          )}
           <div className='flex items-center justify-end gap-8px'>
             <Button size='mini' onClick={() => setOpen(false)}>
               {t('common.cancel', { defaultValue: '取消' })}
@@ -270,7 +259,7 @@ const ModelContextLimitEditor: React.FC<{
           className={`model-provider-action-btn !h-24px !min-w-44px shrink-0 px-6px text-11px ${value ? 'text-[rgb(var(--primary-6))] hover:text-[rgb(var(--primary-5))]' : 'text-t-secondary hover:text-t-primary'}`}
           onClick={(e) => e.stopPropagation()}
         >
-          {inherited ? `${label}*` : label}
+          {label}
         </Button>
       </Tooltip>
     </Popover>
@@ -501,7 +490,7 @@ const ModelModalContent: React.FC = () => {
     const existing = (data || []).some((item) => item.id === platform.id);
     if (existing) {
       const { id, ...body } = platform;
-      await ipcBridge.mode.updateProvider.invoke({ id, ...body });
+      await ipcBridge.mode.updateProvider.invoke({ provider_id: id, ...body });
     } else {
       await ipcBridge.mode.createProvider.invoke(platform);
     }
@@ -539,7 +528,7 @@ const ModelModalContent: React.FC = () => {
     const nextArray = (data ?? []).filter((item: IProvider) => item.id !== id);
     void mutate(nextArray, false);
     ipcBridge.mode.deleteProvider
-      .invoke({ id })
+      .invoke({ provider_id: id })
       .then(() => {
         void mutate();
       })
@@ -589,7 +578,7 @@ const ModelModalContent: React.FC = () => {
     await Promise.all(
       changed.map((platform) =>
         ipcBridge.mode.updateProvider.invoke({
-          id: platform.id,
+          provider_id: platform.id,
           sort_order: platform.sort_order,
         })
       )
@@ -661,7 +650,7 @@ const ModelModalContent: React.FC = () => {
   const duplicatePlatform = (platform: IProvider) => {
     const copied = cloneProviderConfig(
       platform,
-      parseProviderId(prefixedId('prov')),
+      parseProviderId(uuidv7()),
       t('settings.providerCopySuffix', { defaultValue: '副本' })
     );
     updatePlatform(copied, () => {
@@ -729,7 +718,7 @@ const ModelModalContent: React.FC = () => {
           error: success ? undefined : errorMessage,
         };
 
-        await ipcBridge.mode.updateProvider.invoke({ id: platform.id, model_health });
+        await ipcBridge.mode.updateProvider.invoke({ provider_id: platform.id, model_health });
         await mutate();
         if (success) {
           Message.success({
@@ -769,7 +758,7 @@ const ModelModalContent: React.FC = () => {
           error: errorMessage,
         };
 
-        await ipcBridge.mode.updateProvider.invoke({ id: platform.id, model_health });
+        await ipcBridge.mode.updateProvider.invoke({ provider_id: platform.id, model_health });
         await mutate();
       } catch (saveError) {
         console.error('Failed to save health check result:', saveError);
@@ -792,7 +781,7 @@ const ModelModalContent: React.FC = () => {
     void mutate(nextArray, false);
 
     Promise.all(
-      editableProviders.map((platform) => ipcBridge.mode.updateProvider.invoke({ id: platform.id, model_health: {} }))
+      editableProviders.map((platform) => ipcBridge.mode.updateProvider.invoke({ provider_id: platform.id, model_health: {} }))
     )
       .then(() => {
         void mutate();
@@ -1052,7 +1041,6 @@ const ModelModalContent: React.FC = () => {
                       const healthStatus = model_health?.status || 'unknown';
                       const modelDescription = platform.model_descriptions?.[model] ?? '';
                       const modelContextLimit = platform.model_context_limits?.[model];
-                      const inheritedContextLimit = modelContextLimit == null ? platform.context_limit : undefined;
                       const modelProfile = profileFor(platform.id, model);
 
                       return (
@@ -1145,7 +1133,6 @@ const ModelModalContent: React.FC = () => {
                                 {/* 每模型上下文窗口 / Per-model context window */}
                                 <ModelContextLimitEditor
                                   value={modelContextLimit}
-                                  inheritedValue={inheritedContextLimit}
                                   onSave={(value) => {
                                     const next = { ...platform.model_context_limits };
                                     if (value && value > 0) {

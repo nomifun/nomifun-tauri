@@ -302,7 +302,7 @@ const AssetLibraryPage: React.FC = () => {
   useEffect(() => {
     setSelected((prev) => {
       if (prev.size === 0) return prev;
-      const present = new Set(lib.items.map((a) => a.id));
+      const present = new Set(lib.items.map((a) => a.asset_id));
       let changed = false;
       const next = new Set<AssetId>();
       for (const id of prev) {
@@ -365,18 +365,18 @@ const AssetLibraryPage: React.FC = () => {
   const toggleSelect = useCallback((asset: WorkshopAsset) => {
     setSelected((prev) => {
       const next = new Set(prev);
-      if (next.has(asset.id)) next.delete(asset.id);
-      else next.add(asset.id);
+      if (next.has(asset.asset_id)) next.delete(asset.asset_id);
+      else next.add(asset.asset_id);
       return next;
     });
   }, []);
   const selectAll = useCallback(() => {
-    setSelected(new Set(lib.displayItems.map((a) => a.id)));
+    setSelected(new Set(lib.displayItems.map((a) => a.asset_id)));
   }, [lib.displayItems]);
   const clearSelection = useCallback(() => setSelected(new Set()), []);
 
   // ─── Detail prev / next (within the loaded list) ─────────────────────────────
-  const detailIndex = detailAsset ? lib.displayItems.findIndex((a) => a.id === detailAsset.id) : -1;
+  const detailIndex = detailAsset ? lib.displayItems.findIndex((a) => a.asset_id === detailAsset.asset_id) : -1;
   const hasPrev = detailIndex > 0;
   const hasNext = detailIndex >= 0 && detailIndex < lib.displayItems.length - 1;
   const goPrev = useCallback(() => {
@@ -420,8 +420,8 @@ const AssetLibraryPage: React.FC = () => {
         okButtonProps: { status: 'danger' },
         onOk: async () => {
           try {
-            await lib.remove(asset.id);
-            setDetailAsset((cur) => (cur?.id === asset.id ? null : cur));
+            await lib.remove(asset.asset_id);
+            setDetailAsset((cur) => (cur?.asset_id === asset.asset_id ? null : cur));
             message.success(t('workshopAssets.delete.done', { defaultValue: '资产已删除' }));
           } catch (e) {
             message.error(
@@ -436,7 +436,7 @@ const AssetLibraryPage: React.FC = () => {
 
   // ─── Bulk actions ────────────────────────────────────────────────────────────
   const bulkTargets = useCallback(
-    () => lib.items.filter((a) => selected.has(a.id)),
+    () => lib.items.filter((a) => selected.has(a.asset_id)),
     [lib.items, selected]
   );
 
@@ -446,7 +446,7 @@ const AssetLibraryPage: React.FC = () => {
       let fail = 0;
       for (const asset of bulkTargets()) {
         try {
-          await apiPatchAsset(asset.id, patchFor(asset));
+          await apiPatchAsset(asset.asset_id, patchFor(asset));
           ok += 1;
         } catch {
           fail += 1;
@@ -542,8 +542,8 @@ const AssetLibraryPage: React.FC = () => {
         let fail = 0;
         for (const asset of bulkTargets()) {
           try {
-            await apiDeleteAsset(asset.id);
-            revokeWorkshopMedia(asset.id);
+            await apiDeleteAsset(asset.asset_id);
+            revokeWorkshopMedia(asset.asset_id);
             ok += 1;
           } catch {
             fail += 1;
@@ -870,12 +870,12 @@ const AssetLibraryPage: React.FC = () => {
             >
               {lib.displayItems.map((asset) => (
                 <AssetCard
-                  key={asset.id}
+                  key={asset.asset_id}
                   asset={asset}
                   t={t}
                   draggable={false}
                   selectable
-                  selected={selected.has(asset.id)}
+                  selected={selected.has(asset.asset_id)}
                   selectionActive={selectionActive}
                   onToggleSelect={toggleSelect}
                   onOpenDetail={setDetailAsset}

@@ -19,7 +19,9 @@ impl SqliteSettingsRepository {
 #[async_trait::async_trait]
 impl ISettingsRepository for SqliteSettingsRepository {
     async fn get_settings(&self) -> Result<Option<SystemSettings>, DbError> {
-        let row = sqlx::query_as::<_, SystemSettings>("SELECT * FROM system_settings WHERE id = 1")
+        let row = sqlx::query_as::<_, SystemSettings>(
+            "SELECT * FROM system_settings WHERE singleton_key = 'system'",
+        )
             .fetch_optional(&self.pool)
             .await?;
 
@@ -38,10 +40,10 @@ impl ISettingsRepository for SqliteSettingsRepository {
 
         sqlx::query(
             "INSERT INTO system_settings \
-                (id, language, notification_enabled, cron_notification_enabled, \
+                (singleton_key, language, notification_enabled, cron_notification_enabled, \
                  command_queue_enabled, save_upload_to_workspace, updated_at) \
-             VALUES (1, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(id) DO UPDATE SET \
+             VALUES ('system', ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(singleton_key) DO UPDATE SET \
                 language = excluded.language, \
                 notification_enabled = excluded.notification_enabled, \
                 cron_notification_enabled = excluded.cron_notification_enabled, \
@@ -59,7 +61,12 @@ impl ISettingsRepository for SqliteSettingsRepository {
         .await?;
 
         Ok(SystemSettings {
-            id: 1,
+            id: sqlx::query_scalar(
+                "SELECT id FROM system_settings WHERE singleton_key = 'system'",
+            )
+            .fetch_one(&self.pool)
+            .await?,
+            singleton_key: "system".into(),
             language: language.to_string(),
             notification_enabled,
             cron_notification_enabled,
@@ -82,9 +89,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_settings_returns_none_when_empty() {
+    async fn get_settings_returns_v3_baseline_defaults() {
         let (repo, _db) = setup().await;
-        assert!(repo.get_settings().await.unwrap().is_none());
+        let settings = repo.get_settings().await.unwrap().unwrap();
+        assert_eq!(settings.singleton_key, "system");
+        assert_eq!(settings.language, "en-US");
+        assert!(settings.notification_enabled);
+        assert!(!settings.cron_notification_enabled);
+        assert!(!settings.command_queue_enabled);
+        assert!(!settings.save_upload_to_workspace);
     }
 
     #[tokio::test]

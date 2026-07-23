@@ -7,10 +7,11 @@ use axum::routing::{get, post};
 
 use nomifun_api_types::{
     ApiResponse, BatchImportMcpServersRequest, CreateMcpServerRequest, DetectedMcpServerResponse, ErrorResponse,
-    McpConnectionTestErrorCode, McpServerResponse, OAuthCheckStatusRequest, OAuthLoginRequest, OAuthLoginResponse,
-    OAuthLogoutRequest, OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
+    McpConnectionTestErrorCode, McpServerId, McpServerResponse, OAuthCheckStatusRequest, OAuthLoginRequest,
+    OAuthLoginResponse, OAuthLogoutRequest, OAuthStatusResponse, TestMcpConnectionRequest,
+    UpdateMcpServerRequest,
 };
-use nomifun_common::{AppError, McpServerId};
+use nomifun_common::AppError;
 
 use crate::connection_test::McpConnectionTestService;
 use crate::oauth_service::McpOAuthService;
@@ -44,10 +45,13 @@ pub fn mcp_routes(state: McpRouterState) -> Router {
         .route("/api/mcp/servers", get(list_servers).post(add_server))
         .route("/api/mcp/servers/import", post(batch_import))
         .route(
-            "/api/mcp/servers/{id}",
+            "/api/mcp/servers/{mcp_server_id}",
             get(get_server).put(edit_server).delete(delete_server),
         )
-        .route("/api/mcp/servers/{id}/toggle", post(toggle_server))
+        .route(
+            "/api/mcp/servers/{mcp_server_id}/toggle",
+            post(toggle_server),
+        )
         // Connection test route
         .route("/api/mcp/test-connection", post(test_connection))
         // Agent config discovery route
@@ -72,12 +76,12 @@ async fn list_servers(
     Ok(Json(ApiResponse::ok(servers)))
 }
 
-/// `GET /api/mcp/servers/:id` — get a single MCP server.
+/// `GET /api/mcp/servers/:mcp_server_id` — get a single MCP server.
 async fn get_server(
     State(state): State<McpRouterState>,
-    Path(id): Path<McpServerId>,
+    Path(mcp_server_id): Path<McpServerId>,
 ) -> Result<Json<ApiResponse<McpServerResponse>>, AppError> {
-    let server = state.config_service.get_server(&id).await?;
+    let server = state.config_service.get_server(&mcp_server_id).await?;
     Ok(Json(ApiResponse::ok(server)))
 }
 
@@ -91,32 +95,35 @@ async fn add_server(
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(server))))
 }
 
-/// `PUT /api/mcp/servers/:id` — partial update an MCP server.
+/// `PUT /api/mcp/servers/:mcp_server_id` — partial update an MCP server.
 async fn edit_server(
     State(state): State<McpRouterState>,
-    Path(id): Path<McpServerId>,
+    Path(mcp_server_id): Path<McpServerId>,
     body: Result<Json<UpdateMcpServerRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<McpServerResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let server = state.config_service.edit_server(&id, req).await?;
+    let server = state
+        .config_service
+        .edit_server(&mcp_server_id, req)
+        .await?;
     Ok(Json(ApiResponse::ok(server)))
 }
 
-/// `DELETE /api/mcp/servers/:id` — delete an MCP server.
+/// `DELETE /api/mcp/servers/:mcp_server_id` — delete an MCP server.
 async fn delete_server(
     State(state): State<McpRouterState>,
-    Path(id): Path<McpServerId>,
+    Path(mcp_server_id): Path<McpServerId>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    state.config_service.delete_server(&id).await?;
+    state.config_service.delete_server(&mcp_server_id).await?;
     Ok(Json(ApiResponse::success()))
 }
 
-/// `POST /api/mcp/servers/:id/toggle` — toggle enabled state.
+/// `POST /api/mcp/servers/:mcp_server_id/toggle` — toggle enabled state.
 async fn toggle_server(
     State(state): State<McpRouterState>,
-    Path(id): Path<McpServerId>,
+    Path(mcp_server_id): Path<McpServerId>,
 ) -> Result<Json<ApiResponse<McpServerResponse>>, AppError> {
-    let server = state.config_service.toggle_server(&id).await?;
+    let server = state.config_service.toggle_server(&mcp_server_id).await?;
     Ok(Json(ApiResponse::ok(server)))
 }
 
@@ -147,7 +154,7 @@ async fn test_connection(
         .connection_test_service
         .test_connection(&req.name, &transport)
         .await;
-    if let Some(server_id) = req.id {
+    if let Some(server_id) = req.mcp_server_id {
         state.config_service.persist_test_result(&server_id, &result).await?;
     }
     if result.success || result.needs_auth == Some(true) {

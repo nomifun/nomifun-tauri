@@ -23,8 +23,8 @@ use crate::types::CreationInput;
 pub fn creation_routes(state: CreationRouterState) -> Router {
     Router::new()
         .route("/api/creation/tasks", get(list_tasks).post(create_task))
-        .route("/api/creation/tasks/{id}", get(get_task))
-        .route("/api/creation/tasks/{id}/cancel", post(cancel_task))
+        .route("/api/creation/tasks/{creation_task_id}", get(get_task))
+        .route("/api/creation/tasks/{creation_task_id}/cancel", post(cancel_task))
         .with_state(state)
 }
 
@@ -106,15 +106,15 @@ async fn list_tasks(
 async fn get_task(
     State(state): State<CreationRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
+    Path(creation_task_id): Path<String>,
 ) -> Result<Json<ApiResponse<CreationTask>>, AppError> {
-    Ok(Json(ApiResponse::ok(state.service.get_task(&id).await?)))
+    Ok(Json(ApiResponse::ok(state.service.get_task(&creation_task_id).await?)))
 }
 
 async fn cancel_task(
     State(state): State<CreationRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
+    Path(creation_task_id): Path<String>,
 ) -> Result<Json<ApiResponse<CreationTask>>, AppError> {
-    Ok(Json(ApiResponse::ok(state.service.cancel_task(&id).await?)))
+    Ok(Json(ApiResponse::ok(state.service.cancel_task(&creation_task_id).await?)))
 }

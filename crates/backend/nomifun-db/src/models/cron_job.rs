@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct CronJobRow {
-    pub id: String,
+    pub id: i64,
+    pub cron_job_id: String,
     /// Immutable aggregate owner. Runtime code must never infer or default it
     /// from an optional Conversation.
     pub user_id: String,
@@ -21,8 +22,8 @@ pub struct CronJobRow {
     pub preset_id: Option<String>,
     pub preset_revision: Option<i64>,
     pub preset_snapshot: Option<String>,
-    /// Target conversation; NULL for a new_conversation job before first fire
-    /// (FK to conversations, ON DELETE SET NULL).
+    /// Target conversation; NULL for a new_conversation job before first fire.
+    /// This is a business-ID logical reference.
     pub conversation_id: Option<String>,
     pub conversation_title: Option<String>,
     pub agent_type: String,
@@ -47,8 +48,9 @@ mod tests {
     #[test]
     fn cron_job_row_serialization_roundtrip() {
         let row = CronJobRow {
-            id: "cron_abc123".into(),
-            user_id: "user_1".into(),
+            id: 42,
+            cron_job_id: nomifun_common::CronJobId::new().into_string(),
+            user_id: nomifun_common::UserId::new().into_string(),
             name: "Daily report".into(),
             enabled: true,
             schedule_kind: "cron".into(),
@@ -57,7 +59,7 @@ mod tests {
             schedule_description: Some("Every day at 9am".into()),
             payload_message: "Generate daily report".into(),
             execution_mode: "new_conversation".into(),
-            agent_config: Some(r#"{"backend":"openai"}"#.into()),
+            agent_config: Some(r#"{"backend":"openai","name":"OpenAI"}"#.into()),
             preset_id: None,
             preset_revision: None,
             preset_snapshot: None,
@@ -89,8 +91,9 @@ mod tests {
     #[test]
     fn cron_job_row_optional_fields_default_to_none() {
         let row = CronJobRow {
-            id: "cron_min".into(),
-            user_id: "user_1".into(),
+            id: 7,
+            cron_job_id: nomifun_common::CronJobId::new().into_string(),
+            user_id: nomifun_common::UserId::new().into_string(),
             name: "Minimal".into(),
             enabled: true,
             schedule_kind: "every".into(),

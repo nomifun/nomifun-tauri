@@ -99,12 +99,12 @@ fn detect_cron_list() {
 
 #[test]
 fn detect_cron_update_with_all_fields() {
-    let input = "[CRON_UPDATE: job-456]\nname: 更新后的任务\nschedule: 0 10 * * MON\nschedule_description: 每周一上午 10 点\nmessage: 请发送更新后的提醒\n[/CRON_UPDATE]";
+    let input = "[CRON_UPDATE: 0190f5fe-7c00-7a00-8abc-012345678908]\nname: 更新后的任务\nschedule: 0 10 * * MON\nschedule_description: 每周一上午 10 点\nmessage: 请发送更新后的提醒\n[/CRON_UPDATE]";
     let commands = detect_cron_commands(input);
     assert_eq!(commands.len(), 1);
     match &commands[0] {
         CronCommand::Update(params) => {
-            assert_eq!(params.job_id, "job-456");
+            assert_eq!(params.job_id, "0190f5fe-7c00-7a00-8abc-012345678908");
             assert_eq!(params.name, "更新后的任务");
             assert_eq!(params.schedule, "0 10 * * MON");
             assert_eq!(params.schedule_description, "每周一上午 10 点");
@@ -116,21 +116,21 @@ fn detect_cron_update_with_all_fields() {
 
 #[test]
 fn detect_cron_delete_with_id() {
-    let input = "[CRON_DELETE: job-123]";
+    let input = "[CRON_DELETE: 0190f5fe-7c00-7a00-8abc-012345678907]";
     let commands = detect_cron_commands(input);
     assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0], CronCommand::Delete("job-123".to_string()));
+    assert_eq!(commands[0], CronCommand::Delete("0190f5fe-7c00-7a00-8abc-012345678907".into()));
 }
 
 #[test]
 fn detect_mixed_content_with_cron() {
-    let input = "Here's what I did:\n\n[CRON_CREATE]\nname: cleanup\nschedule: 0 0 * * *\nschedule_description: daily midnight\nmessage: clean old files\n[/CRON_CREATE]\n\nThen updated one:\n[CRON_UPDATE: job-22]\nname: cleanup-v2\nschedule: 0 1 * * *\nschedule_description: daily 1am\nmessage: clean old files carefully\n[/CRON_UPDATE]\n\nAlso check: [CRON_LIST]\n\nAnd remove old one: [CRON_DELETE: old-123]";
+    let input = "Here's what I did:\n\n[CRON_CREATE]\nname: cleanup\nschedule: 0 0 * * *\nschedule_description: daily midnight\nmessage: clean old files\n[/CRON_CREATE]\n\nThen updated one:\n[CRON_UPDATE: 0190f5fe-7c00-7a00-8abc-012345678905]\nname: cleanup-v2\nschedule: 0 1 * * *\nschedule_description: daily 1am\nmessage: clean old files carefully\n[/CRON_UPDATE]\n\nAlso check: [CRON_LIST]\n\nAnd remove old one: [CRON_DELETE: 0190f5fe-7c00-7a00-8abc-012345678907]";
     let commands = detect_cron_commands(input);
     assert_eq!(commands.len(), 4);
     assert!(matches!(&commands[0], CronCommand::Create(_)));
     assert!(matches!(&commands[1], CronCommand::Update(_)));
     assert_eq!(commands[2], CronCommand::List);
-    assert_eq!(commands[3], CronCommand::Delete("old-123".to_string()));
+    assert_eq!(commands[3], CronCommand::Delete("0190f5fe-7c00-7a00-8abc-012345678907".into()));
 }
 
 #[test]
@@ -142,15 +142,15 @@ fn detect_no_commands_in_normal_text() {
 #[test]
 fn has_cron_detects_all_types() {
     assert!(has_cron_commands("[CRON_CREATE]\nschedule: *\n[/CRON_CREATE]"));
-    assert!(has_cron_commands("[CRON_UPDATE: job-1]\nschedule: *\n[/CRON_UPDATE]"));
+    assert!(has_cron_commands("[CRON_UPDATE: 0190f5fe-7c00-7a00-8abc-012345678901]\nschedule: *\n[/CRON_UPDATE]"));
     assert!(has_cron_commands("[CRON_LIST]"));
-    assert!(has_cron_commands("[CRON_DELETE: x]"));
+    assert!(has_cron_commands("[CRON_DELETE: 0190f5fe-7c00-7a00-8abc-012345678901]"));
     assert!(!has_cron_commands("nothing here"));
 }
 
 #[test]
 fn strip_cron_removes_all_types_preserves_text() {
-    let input = "Before\n[CRON_CREATE]\nname: t\nschedule: *\n[/CRON_CREATE]\nMiddle [CRON_LIST] After [CRON_DELETE: x] Between [CRON_UPDATE: id-7]\nname: t2\nschedule: 0 * * * *\n[/CRON_UPDATE] End";
+    let input = "Before\n[CRON_CREATE]\nname: t\nschedule: *\n[/CRON_CREATE]\nMiddle [CRON_LIST] After [CRON_DELETE: 0190f5fe-7c00-7a00-8abc-012345678901] Between [CRON_UPDATE: 0190f5fe-7c00-7a00-8abc-012345678904]\nname: t2\nschedule: 0 * * * *\n[/CRON_UPDATE] End";
     let stripped = strip_cron_commands(input);
     assert!(!stripped.contains("[CRON_"));
     assert!(stripped.contains("Before"));
@@ -168,10 +168,10 @@ fn cron_create_missing_schedule_not_parsed() {
 
 #[test]
 fn cron_delete_with_whitespace_in_id() {
-    let input = "[CRON_DELETE:   spaced-id   ]";
+    let input = "[CRON_DELETE:   0190f5fe-7c00-7a00-8abc-012345678906   ]";
     let commands = detect_cron_commands(input);
     assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0], CronCommand::Delete("spaced-id".to_string()));
+    assert_eq!(commands[0], CronCommand::Delete("0190f5fe-7c00-7a00-8abc-012345678906".into()));
 }
 
 #[test]
@@ -314,30 +314,30 @@ async fn middleware_executes_cron_list() {
 #[tokio::test]
 async fn middleware_executes_cron_update() {
     let mw = MessageMiddleware::new(Some(Box::new(TrackingCronService)));
-    let input = "Updating it now. [CRON_UPDATE: job-42]\nname: renamed\nschedule: 0 8 * * *\nschedule_description: Daily at 8am\nmessage: New prompt\n[/CRON_UPDATE]";
+    let input = "Updating it now. [CRON_UPDATE: 0190f5fe-7c00-7a00-8abc-012345678906]\nname: renamed\nschedule: 0 8 * * *\nschedule_description: Daily at 8am\nmessage: New prompt\n[/CRON_UPDATE]";
     let result = mw.process(input, "u1", "c1").await;
 
     assert!(!result.message.contains("[CRON_UPDATE"));
     assert_eq!(result.system_responses.len(), 1);
-    assert!(result.system_responses[0].contains("job-42"));
+    assert!(result.system_responses[0].contains("42"));
     assert!(result.system_responses[0].contains("c1"));
 }
 
 #[tokio::test]
 async fn middleware_executes_cron_delete() {
     let mw = MessageMiddleware::new(Some(Box::new(TrackingCronService)));
-    let input = "Removing it now. [CRON_DELETE: job-42]";
+    let input = "Removing it now. [CRON_DELETE: 0190f5fe-7c00-7a00-8abc-012345678906]";
     let result = mw.process(input, "u1", "c1").await;
 
     assert!(!result.message.contains("[CRON_DELETE"));
     assert_eq!(result.system_responses.len(), 1);
-    assert!(result.system_responses[0].contains("job-42"));
+    assert!(result.system_responses[0].contains("42"));
 }
 
 #[tokio::test]
 async fn middleware_handles_cron_failure() {
     let mw = MessageMiddleware::new(Some(Box::new(FailingCronService)));
-    let input = "[CRON_UPDATE: x]\nname: renamed\nschedule: 0 8 * * *\nschedule_description: Daily at 8am\nmessage: New prompt\n[/CRON_UPDATE]";
+    let input = "[CRON_UPDATE: 0190f5fe-7c00-7a00-8abc-012345678901]\nname: renamed\nschedule: 0 8 * * *\nschedule_description: Daily at 8am\nmessage: New prompt\n[/CRON_UPDATE]";
     let result = mw.process(input, "u1", "c1").await;
 
     assert_eq!(result.system_responses.len(), 1);
@@ -375,7 +375,7 @@ async fn middleware_combined_think_tags_and_cron_commands() {
 #[tokio::test]
 async fn middleware_multiple_cron_commands_all_executed() {
     let mw = MessageMiddleware::new(Some(Box::new(TrackingCronService)));
-    let input = "[CRON_CREATE]\nname: job1\nschedule: 0 * * * *\n[/CRON_CREATE] and [CRON_UPDATE: old]\nname: job2\nschedule: 0 1 * * *\nschedule_description: daily 1am\nmessage: New prompt\n[/CRON_UPDATE] and [CRON_LIST] and [CRON_DELETE: old]";
+    let input = "[CRON_CREATE]\nname: job1\nschedule: 0 * * * *\n[/CRON_CREATE] and [CRON_UPDATE: 0190f5fe-7c00-7a00-8abc-012345678901]\nname: job2\nschedule: 0 1 * * *\nschedule_description: daily 1am\nmessage: New prompt\n[/CRON_UPDATE] and [CRON_LIST] and [CRON_DELETE: 0190f5fe-7c00-7a00-8abc-012345678901]";
     let result = mw.process(input, "u1", "c1").await;
 
     assert_eq!(result.system_responses.len(), 4);

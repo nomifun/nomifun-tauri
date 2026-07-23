@@ -1,168 +1,272 @@
 ﻿# ID 体系
 
-本文档是 NomiFun 标识符的权威契约，适用于数据库、Rust 领域模型、HTTP/WebSocket/MCP 协议、运行时注册表、文件系统、备份与导入。
+本文档是 NomiFun v3 标识符的权威契约，适用于产品数据库表、Rust 领域模型、
+HTTP/WebSocket/MCP 协议、运行时注册表、受管文件、备份与导入。
 
-## 目标
+## 核心规则
 
-所有持久化且可被其他记录引用的实体统一使用：
-
-```text
-{已注册前缀}_{规范小写连字符 UUIDv7}
-```
-
-例如：
+v3 明确区分五类概念：
 
 ```text
-conv_019bffff-ffff-7abc-8def-0123456789ab
+表技术主键
+稳定业务 ID
+内部技术行
+自然键/外部 ID
+操作 token
 ```
 
-实体 ID 在 JSON 中永远是字符串，在 SQLite 中永远是 `TEXT`。它不能是 SQLite `rowid`、自增整数、时间戳或本地序号。数据库重建、跨设备迁移、备份恢复和合并导入都不得改变实体 ID。后端使用 `Uuid::now_v7()` 的完整 128 bit UUID，不截断、不使用自定义短 ID。
+它们不得混用。
 
-## ID 分类
+1. 每张由 NomiFun 定义的产品持久表，都必须有统一的技术主键：
 
-### 1. 实体 ID
+   ```sql
+   id INTEGER PRIMARY KEY AUTOINCREMENT
+   ```
 
-实体 ID 标识持久化、可引用的对象。它必须使用带已注册前缀的 UUIDv7，并在 Rust 边界使用领域 newtype。普通恢复或合并导入保留原 ID；同一 ID 内容不同必须失败且原子不变。只有显式“克隆”操作可以生成新 ID，并通过完整 old → new remap 重写全部引用。
+2. 需要跨数据库、跨设备、跨文件、API、事件或受管 store 稳定定位的实体，
+   增加 `user_id`、`conversation_id`、`message_id`、`mcp_server_id`、
+   `webhook_id`、`credential_id`、`creation_task_id` 等具名裸 UUIDv7
+   业务字段。
+3. 从不离开所属持久化子系统的关系、单例、缓存和事件行只使用整数 `id`
+   作为内部技术身份，不为形式统一而额外生成 UUID，也不把该值升级为产品
+   wire locator。
+4. 表间关系由 Repository/Service 维护为逻辑外键；产品 schema 不包含物理
+   外键、`REFERENCES`、trigger 或数据库级联。
+5. v3 是新的数据集代际。历史数据集整体重置，不迁移旧行和旧 ID 格式。
 
-### 2. 外部 ID
+## 技术主键
 
-ACP session ID、平台消息 ID、远程任务 ID、provider request ID 等由外部系统签发。它们保持不透明，并使用能说明签发方和用途的字段名；不得直接作为 NomiFun 实体主键。
+所有产品表，包括关系表、值对象表、单例表、缓存表和依附表，都必须声明：
 
-### 3. 自然键
-
-Skill 名称、extension slug、URL、模型名和配置 key 属于自然键，不是实体 ID。不要仅因为它们参与查询或唯一约束就命名为 `*_id`。
-
-### 4. 操作键与幂等键
-
-请求关联 ID、幂等键、capability nonce 和临时 operation token 标识一次动作而非持久化实体。无前缀的 `generate_id()` 仅允许用于这类场景。若操作最终创建实体，必须另行生成 typed entity ID。
-
-### 5. 不是 ID 的数值
-
-revision、sequence、分页 offset、计数、时间戳、进程 PID、端口以及 JSON-RPC 请求号继续使用数值，但应按真实含义命名。
-
-## 严格规范格式
-
-实体 ID 必须满足：
-
-- 前缀长度为 1–32 个 ASCII 字符；
-- 首字符为 `a-z`；
-- 后续字符只能是 `a-z` 或 `0-9`；
-- 前缀与 UUID 之间恰好一个 `_`；
-- UUID 必须是小写、带连字符、RFC 4122 variant、version 7；
-- 禁止空白、大写、花括号、紧凑 UUID、其他分隔符和 JSON number。
-
-非法 ID 必须立即报错，绝不能降级为 `0`、空字符串或另一种实体 ID。
-
-## Rust API
-
-`nomifun-common` 统一负责生成、校验和 typed newtype：
-
-```rust
-let id = ConversationId::new();
-let parsed: ConversationId = text.parse()?;
+```sql
+id INTEGER PRIMARY KEY AUTOINCREMENT
 ```
 
-Typed ID 以透明 JSON 字符串序列化，但反序列化时严格校验前缀、UUID 格式、版本和 variant。因此 `ConversationId` 无法从 Terminal ID 或 JSON number 反序列化。
+SQLite 内部表、migration metadata 和临时表不属于产品持久表。
 
-实现保持轻量：每种持久化实体一个小 newtype，由 `nomifun-common/src/id.rs` 内部宏生成，不引入复杂的泛型 ID 框架。
+技术 `id` 的语义是：
 
-## 已注册前缀表
+- 当前 active dataset 内、本表内的行身份；
+- 表主键和索引定位入口；
+- Rust 中使用 `i64`；
+- 绝不以技术行主键的身份跨越 API、事件、受管文件名/manifest 或数据集边界；
+- 不是跨数据集身份、公开 locator、文件名契约或分布式 ID，也不写入稳定
+  事件或文件引用；
+- 不得依赖整数连续。
 
-前缀是永久协议值。一旦使用，不得重命名、复用或分配给第二种实体。下表覆盖 ID-contract-v2 主数据库及参与备份/恢复的 companion 存储中全部持久化、可引用实体。
+`AUTOINCREMENT` 用于固定所有产品表的结构，并防止已经签发过的正整数行 ID
+被复用；它不会让该整数自动成为稳定业务 ID。
 
-| 前缀 | Rust 类型 | 实体 |
-| --- | --- | --- |
-| `user` | `UserId` | 用户账户 |
-| `conv` | `ConversationId` | 会话 |
-| `term` | `TerminalId` | 终端会话 |
-| `req` | `RequirementId` | Requirement / AutoWork 项 |
-| `msg` | `MessageId` | 会话消息 |
-| `artifact` | `ConversationArtifactId` | 会话 Artifact |
-| `mcp` | `McpServerId` | 已配置 MCP Server |
-| `ragent` | `RemoteAgentId` | Remote Agent 配置 |
-| `webhook` | `WebhookId` | 出站 Webhook |
-| `prov` | `ProviderId` | Provider 配置 |
-| `agent` | `AgentId` | 用户/自定义 Agent |
-| `preset` | `PresetId` | 用户创建的 Preset |
-| `presettag` | `PresetTagId` | 用户创建的 Preset Tag |
-| `kb` | `KnowledgeBaseId` | 知识库 |
-| `kbind` | `KnowledgeBindingId` | 知识绑定 |
-| `att` | `AttachmentId` | Requirement 附件 |
-| `conn` | `ConnectorCredentialId` | Connector 凭据 |
-| `cron` | `CronJobId` | 定时任务 |
-| `cronrun` | `CronJobRunId` | 定时任务运行记录 |
-| `idmmrec` | `IdmmInterventionId` | IDMM 干预记录 |
-| `aext` | `AgentExecutionTemplateId` | Agent Execution 模板 |
-| `aetp` | `AgentExecutionTemplateParticipantId` | 模板参与者 |
-| `exec` | `AgentExecutionId` | Agent Execution |
-| `execpart` | `AgentExecutionParticipantId` | Execution 参与者 |
-| `execstep` | `AgentExecutionStepId` | Execution 步骤 |
-| `eattempt` | `AgentExecutionAttemptId` | Execution 尝试 |
-| `aevt` | `AgentExecutionEventId` | Execution 事件 |
-| `execlink` | `ConversationExecutionLinkId` | 会话/Execution 关联 |
-| `chn` | `ChannelId` | Channel Plugin |
-| `chu` | `ChannelUserId` | Channel 用户 |
-| `chs` | `ChannelSessionId` | Channel 会话 |
-| `companion` | `CompanionId` | Companion 配置 |
-| `mem` | `CompanionMemoryId` | Companion 记忆 |
-| `sug` | `CompanionSuggestionId` | Companion 建议 |
-| `plr` | `CompanionLearnRunId` | Companion 学习运行 |
-| `csw` | `CompanionSessionWindowId` | Companion 会话窗口 |
-| `figure` | `FigureId` | Companion 形象库条目 |
-| `audit` | `PublicAgentAuditEntryId` | Public Agent 审计记录 |
-| `evf` | `CompanionEvolutionFeedbackId` | Companion 进化反馈记录 |
-| `pubagent` | `PublicAgentId` | Public Agent 配置 |
-| `wsc` | `WorkshopCanvasId` | Workshop 画布 |
-| `wsa` | `WorkshopAssetId` | Workshop 资产 |
-| `wst` | `CreationTaskId` | Workshop 创建任务 |
-| `wsn` | `WorkshopNodeId` | 持久化 Workshop 画布节点 |
-| `wse` | `WorkshopEdgeId` | 持久化 Workshop 画布边 |
+## 稳定业务 ID
 
-内置 Agent 目录行（`agent_builtin_*`）和 Extension 提供的 Preset key 是稳定的**安装自然键**，不是 UUID 实体 ID，因此不会解析为 `AgentId`/`PresetId`；用户创建的记录使用 `agent_`/`preset_`。
+只有确实需要脱离本地数据库行仍保持身份的实体，才增加具名业务字段：
 
-`preset_tag_bindings.tag_key` 是明确的字符串联合类型，不是无类型的单一实体外键：
+```text
+user_id
+conversation_id
+message_id
+provider_id
+execution_id
+knowledge_base_id
+```
 
-- 以保留命名空间 `presettag_` 开头的值是规范 `PresetTagId`，对应 `preset_tags` 中的用户标签行，且 `dimension` 必须与该行一致；
-- 其余值是 `office`、`coding` 等稳定的内置 manifest 词表自然键，因此不存在对应的 `preset_tags` 数据库行。
+业务 ID 使用裸、规范的 UUIDv7：
 
-因此该列使用 `TEXT` 但不能声明单一 SQLite 外键。消费方必须先按联合类型分支：不得把内置自然键强制解析为 `PresetTagId`，也不得仅因 `presettag_` 值是字符串就把它当成宽松自然键。
+```text
+0190f5fe-7c00-7a00-8000-000000000003
+```
 
-短生命周期的操作/传输标识目前包括 `browseroob`、`wso` 以及只返回给当前调用方的 evolution-run token。该 evolution token 由 `generate_id()` 生成为无前缀 UUIDv7；`evr` 明确不注册为持久前缀，也没有 typed entity newtype。`client` 值属于外部协议 locator，不是 NomiFun 实体。禁止将它们直接提升为数据库主键或备份实体引用；若未来变为持久实体，必须先注册前缀并增加 typed newtype。
+固定契约如下：
 
-“持久化”不限于主 SQLite：`figure` 同时写入 `figures/index.json` 和图片文件名，`audit` 写入保留期 JSONL，`evf` 是 companion store 主键，`wsn`/`wse` 写入并导出 `canvas.json`。因此它们都遵守同一 canonical entity-ID 契约，并必须参与 clone/import remap。
+- 标准 `8-4-4-4-12` 结构，共 36 字符；
+- 小写十六进制；
+- RFC UUID variant；
+- UUID version 7；
+- 无前缀、无后缀、无花括号、无紧凑格式、无空白、无替代分隔符；
+- JSON 中为字符串，SQLite 中为 `TEXT`；
+- 保留完整 128 bit UUID，不截断。
 
-## 存储与协议规则
+实体类型由字段名、表语义和 Rust/TypeScript 领域类型表达，不从 UUID 字符串
+内容推断。
 
-- 数据库实体 PK/FK 原样保存完整字符串。
-- HTTP path、WebSocket 事件、MCP 参数、缓存 key 和 owner manifest 使用同一值，不得转为整数。
-- 文件目录可以直接使用规范实体 ID；若同时带可读名称，ID 仍是权威部分。
-- 多态引用使用 tagged union 或拆分后的 typed FK，禁止裸 `(kind, integer)`。
-- 事件使用强类型 DTO，避免散落的 `json!` 让同一 ID 以不同 JSON 类型序列化。
-- Workshop 画布的 payload 语义仍由前端拥有，但后端在每次读写时严格校验持久身份包络：`nodes[].id` 和 `groupId` 必须是规范 `wsn` ID，`edges[].id` 必须是规范 `wse` ID，边端点与 `node:<wsn>` mention 必须指向同一文档内的节点。已存储文档校验失败时按损坏数据处理并返回空默认文档；非法写入在替换文件前失败。
-- 导入 Workshop archive 属于克隆：必须重新生成 `wsn`/`wse` ID，并通过一张完整 old → new remap 同步改写 group、边端点与 `node:<wsn>` mention 引用。
-- 主 schema 的运行时 contract 校验全部已登记实体键/引用列为 `TEXT`，禁止 `AUTOINCREMENT`，并只允许 `system_settings.id` 作为显式 singleton 的单列 `INTEGER PRIMARY KEY`。
+稳定实体表的典型结构：
 
-## Reset、备份与导入
+```sql
+CREATE TABLE conversations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL UNIQUE
+                    CHECK (
+                        length(conversation_id) = 36
+                        AND lower(conversation_id) = conversation_id
+                        AND conversation_id
+                            GLOB '????????-????-7???-[89ab]???-????????????'
+                        AND replace(conversation_id, '-', '')
+                            NOT GLOB '*[^0-9a-f]*'
+                    )
+);
+```
 
-删除或重建主数据库不代表旧 ID 可以复用。UUIDv7 实体 ID 永不主动回收。
+v3 中的稳定实体包括用户、会话、消息、终端会话、Provider、Requirement、
+Agent Execution 及模板、Agent Execution
+Participant/Step/Attempt/Template Participant、知识库、附件、Remote Agent、
+用户 Preset、Workshop 画布/资产，以及 Channel Plugin/User/Session。
+这些实体分别使用具名业务字段；其中 Requirement 使用 `requirement_id`，
+并另有只供人类展示的 `display_no`，Agent Execution 和 Channel 子实体使用
+`participant_id`、`step_id`、`attempt_id`、`template_participant_id`、
+`channel_plugin_id`、`channel_user_id`、`channel_session_id`。
 
-Session、workspace、browser profile、attachment、knowledge inbox、companion DB 和事件文件等衍生存储必须：
+## 内部技术行
 
-1. 使用同一个规范实体 ID，并校验 owner manifest；或
-2. 在 destructive reset 时与权威存储一起删除。
+部分关系表、单例表、缓存表和事件表不需要独立业务身份，仍必须拥有统一的
+表 `id`，但该值只在当前 SQLite 数据集内部有效。它不是产品 locator、数字
+字符串、公开 API 字段、事件身份、受管文件名或可移植 backup 身份。
 
-导入模式：
+凡是由产品 API、运行时注册表、受管文件、备份或其他 side-store 定位的实体，
+即使生命周期只在本安装内，也使用具名裸 UUIDv7 业务字段。当前 v3 baseline
+包括 `mcp_server_id`、`webhook_id`、`credential_id`、`creation_task_id`、
+`conversation_artifact_id` 和 `intervention_id`；表内 `id` 仍然只是技术主键。
 
-- **恢复/合并**：保留 ID；完全相同的数据幂等跳过；同 ID 不同内容报错且原子不变。
-- **克隆**：生成新 typed ID，并使用显式 remap 表重写全部声明的引用，包括嵌套对象和数组中的实体引用。
+当前产品 wire 契约不引入整数业务 ID，也不引入通用 `id` alias。未来若内部
+子系统确实需要整数 handle，必须限制在该子系统内部，不能越过产品边界。
 
-任何模式都不得依赖 SQLite 自增值，也不得把 ID 冲突静默解释为旧实体失效。
+## 逻辑外键
 
-## 新增实体前缀
+v3 全面移除产品 schema 中的物理外键。DDL 不得出现：
 
-1. 确认它是持久化、可引用实体，而非外部 ID、自然键、操作键或序号；
-2. 选择未使用的规范前缀；
-3. 更新中英文注册表；
-4. 在 `nomifun-common` 增加 typed newtype 和校验测试；
-5. 在存储及协议边界全链路使用该类型；
-6. 增加导入导出与契约测试，证明 ID 始终为字符串且引用可完整往返。
+```text
+FOREIGN KEY
+REFERENCES
+CREATE TRIGGER
+ON DELETE CASCADE
+ON UPDATE CASCADE
+*_row_id
+```
+
+一条关系只保存一个引用字段：
+
+- 父实体有稳定业务 ID：保存同名 UUIDv7 业务字段；
+- 内部关系、依附和事件行通过父实体业务 ID + sequence、自然键或复合条件
+  确定作用域，不把技术 `id` 传播到其他表；
+- 值由外部系统签发：保存能说明来源和用途的不透明外部 ID。
+
+当前 v3 baseline 不存在指向其他表技术 `id` 的 `INTEGER` 关系。
+
+稳定父实体示例：
+
+```sql
+CREATE TABLE messages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id      TEXT NOT NULL UNIQUE,
+    conversation_id TEXT NOT NULL
+);
+
+CREATE INDEX idx_messages_conversation_id
+    ON messages(conversation_id);
+```
+
+稳定 Cron 父实体示例：
+
+```sql
+CREATE TABLE cron_jobs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    cron_job_id TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE cron_job_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    cron_job_run_id TEXT NOT NULL UNIQUE,
+    cron_job_id     TEXT NOT NULL
+);
+
+CREATE INDEX idx_cron_job_runs_cron_job_id
+    ON cron_job_runs(cron_job_id);
+```
+
+`messages.conversation_id` 逻辑指向 `conversations.conversation_id`；
+`cron_job_runs.cron_job_id` 逻辑指向 `cron_jobs.cron_job_id`。两者都不向
+SQLite 声明物理关系。
+
+同一关系禁止同时保存 `conversation_id` 与 `conversation_row_id`，也禁止任何
+等价的业务 ID/行 ID 双轨字段。
+
+### 应用层完整性
+
+移除物理外键不等于取消完整性。每个逻辑关联都必须登记：
+
+- 子表和字段；
+- 父表和目标字段；
+- 类型、可空性和作用域；
+- 必需索引；
+- 删除策略：`RESTRICT`、应用层 `CASCADE`、`SET_NULL` 或
+  `KEEP_HISTORY`；
+- restore/clone 重建策略；
+- orphan audit 查询。
+
+Repository/Service 必须在显式事务中校验父记录、写入关联数据并执行删除策略。
+这里的 `CASCADE` 只表示应用层事务策略，不是 SQLite cascade 或 trigger。
+批量 restore/import 后必须运行完整 orphan audit。业务代码不得绕过这一边界
+直接写逻辑关联列。
+
+## 自然键、外部 ID 与 Token
+
+Skill 名、Extension slug、模型名、URL、locale、tag 和 singleton key 等自然键
+保留各自领域格式。关系表和单例表仍有自增 `id`，业务唯一性由额外 `UNIQUE`
+约束表达。
+
+`acp_session_id`、`platform_user_id`、`platform_chat_id`、
+`remote_task_id` 和 Provider request ID 等外部标识保持不透明，只按来源协议
+校验。
+
+请求 ID、幂等键、capability nonce、workspace token 等短生命周期操作值不是
+实体 ID。它们必须使用用途明确的字段名，不能意外升级为表主键或逻辑业务 ID。
+
+## Rust 与协议边界
+
+`nomifun-common` 负责裸 UUIDv7 的生成和严格校验。稳定业务 ID 使用包裹同一
+规范字符串的小型领域 newtype；技术行 ID 只允许在 repository/storage
+实现内部使用 `i64`，不是领域或 wire 标识。
+
+所有边界统一遵循：
+
+- 稳定业务 ID 是规范 UUIDv7 字符串；
+- 技术行 ID 留在 repository/storage 实现内部；
+- 外部 ID 是显式类型的不透明值；
+- 非法值直接失败，不得变成 `0`、空字符串或另一类 ID；
+- Route、DTO、缓存、事件和文件 manifest 与领域模型使用相同的业务或外部
+  字段类型；技术 `id` 绝不是这些边界上的可移植值。
+
+## v3 hard reset、备份与恢复
+
+v3 hard reset 不迁移历史数据集。
+
+启动时必须在打开产品数据库之前：
+
+1. 获取 dataset/reset lock；
+2. 检测数据集契约和 generation；
+3. 已经是 v3 时正常继续；
+4. 历史或不兼容数据集整体移动到 retired/quarantine 位置；
+5. 创建全新的空 v3 数据集和 baseline schema；
+6. 写入并完成 reset receipt 后，才允许对外服务。
+
+禁止逐表转换、dual-read、alias 列、legacy-ID 映射或选择性复制业务数据。
+Reset 失败必须终止启动，不能在新旧状态混合时继续运行。用户自有的外部
+workspace 不删除，但 v3 不延续其历史数据库引用。
+
+v3 restore 只接受 v3 backup manifest。Restore 保留全部稳定业务 UUIDv7 并
+重建技术 `id`；逻辑关系从业务 UUIDv7、自然键、外部 ID 和登记的 JSON/
+side-store 引用重建，不读取源库行号。Clone 同样保留输入中的业务 UUIDv7，
+不会 mint 或隐式重写业务 UUID；如果与目标已有业务 UUID 冲突，必须
+fail-closed，不能留下部分写入。技术 `id` 只属于当前数据集，绝不能作为
+portable graph identity。
+
+## 新增带 ID 的实体
+
+新增表或实体时：
+
+1. 产品表必须增加 `id INTEGER PRIMARY KEY AUTOINCREMENT`；
+2. 判断该实体是否确实需要跨数据集身份；
+3. 需要时增加一个具名、唯一的裸 UUIDv7 业务字段和领域 newtype；
+4. 不需要时让 `id` 保持内部；必要定位使用 owner + sequence、自然键或复合条件；
+5. 将每条关系分类为业务、自然或外部逻辑关联，禁止指向其他表技术 `id`；
+6. 在 registry 中登记索引、删除/重建策略和 orphan audit；
+7. 为所选表示增加 schema 与协议边界测试。

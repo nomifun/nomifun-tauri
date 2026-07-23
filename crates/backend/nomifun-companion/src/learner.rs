@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use nomifun_ai_agent::nomi_config;
 use nomifun_ai_agent::{one_shot_completion, resolve_provider_config, user_message};
-use nomifun_common::{AppError, generate_prefixed_id, now_ms};
+use nomifun_common::{AppError, generate_id, now_ms};
 use nomifun_db::IProviderRepository;
 use tokio::sync::Mutex;
 
@@ -116,7 +116,7 @@ impl Learner {
 
         let model = { self.config.read().await.learn.model.clone() };
         let mut run = CompanionLearnRun {
-            id: generate_prefixed_id("plr"),
+            learn_run_id: generate_id(),
             started_at,
             finished_at: None,
             status: "ok".into(),
@@ -135,7 +135,8 @@ impl Learner {
         };
 
         let cursor = self.store.get_state_i64("learn_cursor_ts").await?;
-        let (events, truncated) = read_events_since(&self.companion_dir, cursor, MAX_EVENTS_PER_RUN);
+        let (events, truncated) =
+            read_events_since(&self.companion_dir, cursor, MAX_EVENTS_PER_RUN)?;
         if events.is_empty() {
             run.status = "no_events".into();
             run.finished_at = Some(now_ms());
@@ -168,8 +169,12 @@ impl Learner {
         let pending_suggestions = self.store.list_suggestions(Some("new"), 50).await.unwrap_or_default();
         let event_lines: Vec<String> = events
             .iter()
-            .map(|e| serde_json::to_string(e).unwrap_or_default())
-            .collect();
+            .map(|event| {
+                serde_json::to_string(event).map_err(|error| {
+                    AppError::Internal(format!("serialize collected event: {error}"))
+                })
+            })
+            .collect::<Result<_, _>>()?;
         let user_prompt = prompt::build_learn_prompt(&existing, &pending_suggestions, &event_lines, truncated);
 
         // One retry on parse failure (the model occasionally wraps in prose).
@@ -229,8 +234,12 @@ impl Learner {
 
         // Apply: decay first, then reinforce/supersede/insert.
         let _ = self.store.decay_memories().await;
-        self.store.reinforce_memories(&output.reinforce_ids).await?;
-        self.store.archive_memories(&output.supersede_ids).await?;
+        self.store
+            .reinforce_memories(&output.reinforce_memory_ids)
+            .await?;
+        self.store
+            .archive_memories(&output.supersede_memory_ids)
+            .await?;
 
         let prior_active = self.store.count_memories("active").await.unwrap_or(0);
         for m in &output.memories {
@@ -336,7 +345,10 @@ mod tests {
             model: "test-model".into(),
             use_model: None,
         });
-        let registry = Arc::new(CompanionRegistry::scan(dir.join("companions"), dir.join("shared")));
+        let registry = Arc::new(
+            CompanionRegistry::scan(dir.join("companions"), dir.join("shared"))
+                .unwrap(),
+        );
         let companion = registry.create("测试宠", "ink").await.unwrap();
         let learner = Learner {
             companion_dir: dir.to_path_buf(),
@@ -347,13 +359,14 @@ mod tests {
             emitter: CompanionEventEmitter::new(Arc::new(BroadcastEventBus::new(16)), "owner-a"),
             run_lock: Arc::new(Mutex::new(())),
         };
-        (learner, companion.id)
+        (learner, companion.companion_id)
     }
 
     fn seed_event(dir: &std::path::Path) {
         append_event(
             dir,
             &CollectedEvent {
+                event_id: nomifun_common::generate_id(),
                 ts: now_ms(),
                 source: "chat_user_messages".into(),
                 name: "message.userCreated".into(),
@@ -398,7 +411,8 @@ mod tests {
         assert_eq!(run1.suggestions_added, 1);
         assert_eq!(learner.store.count_suggestions("new").await.unwrap(), 1);
         let first = &learner.store.list_suggestions(Some("new"), 10).await.unwrap()[0];
-        let (first_id, first_created_at) = (first.id.clone(), first.created_at);
+        let (first_suggestion_id, first_created_at) =
+            (first.suggestion_id.clone(), first.created_at);
 
         // Same model output over a new event batch: the pending suggestion
         // blocks the duplicate, and the dedup hit touches it (created_at
@@ -412,7 +426,10 @@ mod tests {
         assert_eq!(run2.suggestions_added, 0);
         assert_eq!(learner.store.count_suggestions("new").await.unwrap(), 1);
         let touched = &learner.store.list_suggestions(Some("new"), 10).await.unwrap()[0];
-        assert_eq!(touched.id, first_id, "dedup must keep the existing suggestion");
+        assert_eq!(
+            touched.suggestion_id, first_suggestion_id,
+            "dedup must keep the existing suggestion"
+        );
         assert!(
             touched.created_at > first_created_at,
             "dedup hit must touch the existing suggestion ({} -> {})",
@@ -422,7 +439,11 @@ mod tests {
 
         // Once decided, the same suggestion may be raised again.
         let pending = learner.store.list_suggestions(Some("new"), 10).await.unwrap();
-        learner.store.decide_suggestion(&pending[0].id, false).await.unwrap();
+        learner
+            .store
+            .decide_suggestion(&pending[0].suggestion_id, false)
+            .await
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         seed_event(dir.path());
         let run3 = learner.run_once().await.unwrap();
@@ -473,10 +494,16 @@ mod tests {
             model: "test-model".into(),
             use_model: None,
         });
-        let registry = Arc::new(CompanionRegistry::scan(dir.path().join("companions"), dir.path().join("shared")));
+        let registry = Arc::new(
+            CompanionRegistry::scan(
+                dir.path().join("companions"),
+                dir.path().join("shared"),
+            )
+            .unwrap(),
+        );
         let _a = registry.create("甲", "ink").await.unwrap();
         let b = registry.create("乙", "ink").await.unwrap();
-        config.default_companion_id = Some(b.id.clone()); // 默认体 = 乙
+        config.default_companion_id = Some(b.companion_id.clone()); // 默认体 = 乙
 
         let bc = Arc::new(RecordingBroadcaster::default());
         let learner = Learner {
@@ -502,7 +529,7 @@ mod tests {
             for e in evs {
                 assert_eq!(
                     e.data.get("companion_id").and_then(|v| v.as_str()),
-                    Some(b.id.as_str()),
+                    Some(b.companion_id.as_str()),
                     "{name} 必须 scope 到默认体 乙"
                 );
             }

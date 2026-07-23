@@ -1,11 +1,18 @@
 import { describe, expect, test } from 'bun:test';
 import type { ReactFlowInstance } from '@xyflow/react';
-import type { AssetId, WorkshopNodeId } from '@/common/types/ids';
+import { parseAssetId, parseWorkshopNodeId, type AssetId } from '@/common/types/ids';
 import type { WorkshopFlowEdge, WorkshopFlowNode } from '../canvas/model';
 import { orderResultAssetIds } from './ResultView';
 import { spawnResultNodes } from './spawn';
 
-const asset = (suffix: string): AssetId => `wsa_${suffix}` as AssetId;
+const asset = (label: string): AssetId => {
+  const suffix = Array.from(label)
+    .map((char) => char.charCodeAt(0).toString(16).padStart(2, '0'))
+    .join('')
+    .slice(0, 12)
+    .padEnd(12, '0');
+  return parseAssetId(`019b0000-0000-7000-8000-${suffix}`);
+};
 
 function harness(): {
   rf: ReactFlowInstance<WorkshopFlowNode, WorkshopFlowEdge>;
@@ -16,7 +23,7 @@ function harness(): {
   const nodes: WorkshopFlowNode[] = [];
   const edges: WorkshopFlowEdge[] = [];
   const card = {
-    id: 'wsn_card' as WorkshopNodeId,
+    id: parseWorkshopNodeId('019b0000-0000-7000-8000-000000000001'),
     type: 'generator',
     position: { x: 40, y: 60 },
     width: 344,

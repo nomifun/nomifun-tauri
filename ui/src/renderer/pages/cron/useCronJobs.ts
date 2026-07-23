@@ -15,6 +15,7 @@ import { parseConversationId, type ConversationId, type CronJobId } from '@/comm
 import { emitter } from '@/renderer/utils/emitter';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { repairCronJobTimeZones } from '@renderer/pages/cron/repairCronJobTimeZone';
+import { browserStorageGenerationKey } from '@/common/utils/browserStorageKey';
 
 const isJobErrorLike = (job: ICronJob): boolean => {
   return job.state.last_status === 'error' || job.state.last_status === 'missed';
@@ -24,47 +25,47 @@ const isJobErrorLike = (job: ICronJob): boolean => {
  * Common cron job actions
  */
 interface CronJobActionsResult {
-  pauseJob: (job_id: CronJobId) => Promise<void>;
-  resumeJob: (job_id: CronJobId) => Promise<void>;
-  deleteJob: (job_id: CronJobId) => Promise<void>;
-  updateJob: (job_id: CronJobId, updates: Partial<ICronJob>) => Promise<ICronJob>;
+  pauseJob: (cron_job_id: CronJobId) => Promise<void>;
+  resumeJob: (cron_job_id: CronJobId) => Promise<void>;
+  deleteJob: (cron_job_id: CronJobId) => Promise<void>;
+  updateJob: (cron_job_id: CronJobId, updates: Partial<ICronJob>) => Promise<ICronJob>;
 }
 
 /**
  * Creates common cron job action handlers
  */
 function useCronJobActions(
-  onJobUpdated?: (job_id: CronJobId, job: ICronJob) => void,
-  onJobDeleted?: (job_id: CronJobId) => void
+  onJobUpdated?: (cron_job_id: CronJobId, job: ICronJob) => void,
+  onJobDeleted?: (cron_job_id: CronJobId) => void
 ): CronJobActionsResult {
   const pauseJob = useCallback(
-    async (job_id: CronJobId) => {
-      const updated = await ipcBridge.cron.updateJob.invoke({ job_id, updates: { enabled: false } });
-      onJobUpdated?.(job_id, updated);
+    async (cron_job_id: CronJobId) => {
+      const updated = await ipcBridge.cron.updateJob.invoke({ cron_job_id, updates: { enabled: false } });
+      onJobUpdated?.(cron_job_id, updated);
     },
     [onJobUpdated]
   );
 
   const resumeJob = useCallback(
-    async (job_id: CronJobId) => {
-      const updated = await ipcBridge.cron.updateJob.invoke({ job_id, updates: { enabled: true } });
-      onJobUpdated?.(job_id, updated);
+    async (cron_job_id: CronJobId) => {
+      const updated = await ipcBridge.cron.updateJob.invoke({ cron_job_id, updates: { enabled: true } });
+      onJobUpdated?.(cron_job_id, updated);
     },
     [onJobUpdated]
   );
 
   const deleteJob = useCallback(
-    async (job_id: CronJobId) => {
-      await ipcBridge.cron.removeJob.invoke({ job_id });
-      onJobDeleted?.(job_id);
+    async (cron_job_id: CronJobId) => {
+      await ipcBridge.cron.removeJob.invoke({ cron_job_id });
+      onJobDeleted?.(cron_job_id);
     },
     [onJobDeleted]
   );
 
   const updateJob = useCallback(
-    async (job_id: CronJobId, updates: Partial<ICronJob>) => {
-      const updated = await ipcBridge.cron.updateJob.invoke({ job_id, updates });
-      onJobUpdated?.(job_id, updated);
+    async (cron_job_id: CronJobId, updates: Partial<ICronJob>) => {
+      const updated = await ipcBridge.cron.updateJob.invoke({ cron_job_id, updates });
+      onJobUpdated?.(cron_job_id, updated);
       return updated;
     },
     [onJobUpdated]
@@ -79,7 +80,7 @@ function useCronJobActions(
 interface CronJobEventHandlers {
   onJobCreated: (job: ICronJob) => void;
   onJobUpdated: (job: ICronJob) => void;
-  onJobRemoved: (data: { job_id: CronJobId }) => void;
+  onJobRemoved: (data: { cron_job_id: CronJobId }) => void;
 }
 
 /**
@@ -139,15 +140,15 @@ export function useCronJobs(conversation_id?: ConversationId) {
     () => ({
       onJobCreated: (job: ICronJob) => {
         if (conversation_id && job.metadata.conversation_id === conversation_id) {
-          setJobs((prev) => (prev.some((j) => j.id === job.id) ? prev : [...prev, job]));
+          setJobs((prev) => (prev.some((j) => j.cron_job_id === job.cron_job_id) ? prev : [...prev, job]));
         }
       },
       onJobUpdated: (job: ICronJob) => {
         if (!conversation_id) return;
         setJobs((prev) => reconcileCronJobsForConversation(prev, conversation_id, job));
       },
-      onJobRemoved: ({ job_id }: { job_id: CronJobId }) => {
-        setJobs((prev) => prev.filter((j) => j.id !== job_id));
+      onJobRemoved: ({ cron_job_id }: { cron_job_id: CronJobId }) => {
+        setJobs((prev) => prev.filter((j) => j.cron_job_id !== cron_job_id));
       },
     }),
     [conversation_id]
@@ -204,13 +205,13 @@ export function useAllCronJobs() {
   const eventHandlers = useMemo<CronJobEventHandlers>(
     () => ({
       onJobCreated: (job: ICronJob) => {
-        setJobs((prev) => (prev.some((j) => j.id === job.id) ? prev : [...prev, job]));
+        setJobs((prev) => (prev.some((j) => j.cron_job_id === job.cron_job_id) ? prev : [...prev, job]));
       },
       onJobUpdated: (job: ICronJob) => {
-        setJobs((prev) => prev.map((j) => (j.id === job.id ? job : j)));
+        setJobs((prev) => prev.map((j) => (j.cron_job_id === job.cron_job_id ? job : j)));
       },
-      onJobRemoved: ({ job_id }: { job_id: CronJobId }) => {
-        setJobs((prev) => prev.filter((j) => j.id !== job_id));
+      onJobRemoved: ({ cron_job_id }: { cron_job_id: CronJobId }) => {
+        setJobs((prev) => prev.filter((j) => j.cron_job_id !== cron_job_id));
       },
     }),
     []
@@ -219,12 +220,12 @@ export function useAllCronJobs() {
   useCronJobSubscription(eventHandlers);
 
   // Actions with local state updates
-  const handleJobUpdated = useCallback((job_id: CronJobId, job: ICronJob) => {
-    setJobs((prev) => prev.map((j) => (j.id === job_id ? job : j)));
+  const handleJobUpdated = useCallback((cron_job_id: CronJobId, job: ICronJob) => {
+    setJobs((prev) => prev.map((j) => (j.cron_job_id === cron_job_id ? job : j)));
   }, []);
 
-  const handleJobDeleted = useCallback((job_id: CronJobId) => {
-    setJobs((prev) => prev.filter((j) => j.id !== job_id));
+  const handleJobDeleted = useCallback((cron_job_id: CronJobId) => {
+    setJobs((prev) => prev.filter((j) => j.cron_job_id !== cron_job_id));
   }, []);
 
   const actions = useCronJobActions(handleJobUpdated, handleJobDeleted);
@@ -250,11 +251,13 @@ export function useAllCronJobs() {
 export function useCronJobsMap() {
   const [jobsMap, setJobsMap] = useState<Map<ConversationId, ICronJob[]>>(new Map());
   const [loading, setLoading] = useState(true);
+  const unreadStorageKey = browserStorageGenerationKey('cron-unread');
   // Track conversations with unread cron executions (red dot indicator)
   const [unreadConversations, setUnreadConversations] = useState<Set<ConversationId>>(() => {
-    // Restore from localStorage
+    // Restore only from the current backend dataset generation. The old
+    // unscoped key is intentionally not read after a hard database reset.
     try {
-      const stored = localStorage.getItem('nomifun_cron_unread');
+      const stored = localStorage.getItem(unreadStorageKey);
       if (stored) {
         const parsed = JSON.parse(stored);
         if (Array.isArray(parsed)) {
@@ -274,18 +277,18 @@ export function useCronJobsMap() {
     return new Set<ConversationId>();
   });
   // Track last_run_at_ms for each job to detect new executions
-  const lastRunAtMapRef = useRef<Map<string, number>>(new Map());
+  const lastRunAtMapRef = useRef<Map<CronJobId, number>>(new Map());
   // Track current active conversation (use ref to access latest value in event handlers)
   const activeConversationIdRef = useRef<ConversationId | null>(null);
 
   // Persist unread state to localStorage
   useEffect(() => {
     try {
-      localStorage.setItem('nomifun_cron_unread', JSON.stringify([...unreadConversations]));
+      localStorage.setItem(unreadStorageKey, JSON.stringify([...unreadConversations]));
     } catch {
       // ignore
     }
-  }, [unreadConversations]);
+  }, [unreadConversations, unreadStorageKey]);
 
   // Fetch all jobs and group by conversation
   const fetchAllJobs = useCallback(async () => {
@@ -298,7 +301,7 @@ export function useCronJobsMap() {
       for (const job of jobs) {
         // Initialize lastRunAtMap for detecting new executions
         if (job.state.last_run_at_ms) {
-          lastRunAtMapRef.current.set(job.id, job.state.last_run_at_ms);
+          lastRunAtMapRef.current.set(job.cron_job_id, job.state.last_run_at_ms);
         }
       }
 
@@ -330,10 +333,10 @@ export function useCronJobsMap() {
         const convId = job.metadata.conversation_id;
 
         // Check if this is a new execution (last_run_at_ms changed)
-        const prevLastRunAt = lastRunAtMapRef.current.get(job.id);
+        const prevLastRunAt = lastRunAtMapRef.current.get(job.cron_job_id);
         const newLastRunAt = job.state.last_run_at_ms;
         if (convId && newLastRunAt && newLastRunAt !== prevLastRunAt) {
-          lastRunAtMapRef.current.set(job.id, newLastRunAt);
+          lastRunAtMapRef.current.set(job.cron_job_id, newLastRunAt);
 
           // Mark as unread only if user is not currently viewing this conversation
           // Use ref to access the latest activeConversationId value
@@ -352,11 +355,11 @@ export function useCronJobsMap() {
 
         setJobsMap((prev) => upsertCronJobByConversation(prev, job));
       },
-      onJobRemoved: ({ job_id }: { job_id: CronJobId }) => {
+      onJobRemoved: ({ cron_job_id }: { cron_job_id: CronJobId }) => {
         setJobsMap((prev) => {
           const newMap = new Map(prev);
           for (const [convId, convJobs] of newMap.entries()) {
-            const filtered = convJobs.filter((j) => j.id !== job_id);
+            const filtered = convJobs.filter((j) => j.cron_job_id !== cron_job_id);
             if (filtered.length === 0) {
               newMap.delete(convId);
             } else if (filtered.length !== convJobs.length) {
@@ -475,19 +478,19 @@ export function useCronJobsMap() {
  * Hook for fetching lightweight execution records for a specific cron job.
  * Each job is pruned server-side to its latest seven runs.
  */
-export function useCronJobRuns(job_id: CronJobId | undefined) {
+export function useCronJobRuns(cron_job_id: CronJobId | undefined) {
   const [runs, setRuns] = useState<ICronJobRun[]>([]);
   const [loading, setLoading] = useState(false);
 
   const fetchRuns = useCallback(async () => {
-    if (!job_id) {
+    if (!cron_job_id) {
       setRuns([]);
       return;
     }
 
     setLoading(true);
     try {
-      const result = await ipcBridge.cron.listRuns.invoke({ job_id });
+      const result = await ipcBridge.cron.listRuns.invoke({ cron_job_id: cron_job_id });
       setRuns(result || []);
     } catch (err) {
       console.error('[useCronJobRuns] Failed to fetch:', err);
@@ -495,7 +498,7 @@ export function useCronJobRuns(job_id: CronJobId | undefined) {
     } finally {
       setLoading(false);
     }
-  }, [job_id]);
+  }, [cron_job_id]);
 
   // Initial fetch
   useEffect(() => {
@@ -504,16 +507,16 @@ export function useCronJobRuns(job_id: CronJobId | undefined) {
 
   // Refetch when this job executes.
   useEffect(() => {
-    if (!job_id) return;
+    if (!cron_job_id) return;
     const unsubExecuted = ipcBridge.cron.onJobExecuted.on((data) => {
-      if (data.job_id === job_id) {
+      if (data.cron_job_id === cron_job_id) {
         void fetchRuns();
       }
     });
     return () => {
       unsubExecuted();
     };
-  }, [job_id, fetchRuns]);
+  }, [cron_job_id, fetchRuns]);
 
   return { runs, loading };
 }

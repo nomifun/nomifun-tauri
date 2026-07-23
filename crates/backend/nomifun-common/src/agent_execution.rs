@@ -414,7 +414,6 @@ string_enum! {
     #[ts(export, export_to = "../../../../ui/src/common/protocolBindings/")]
     pub enum AgentExecutionEventKind {
         Created => "created",
-        Migrated => "migrated",
         StatusChanged => "status_changed",
         PlanChanged => "plan_changed",
         StepChanged => "step_changed",
@@ -490,16 +489,16 @@ mod tests {
     #[test]
     fn agent_actor_keeps_stable_identity_separate_from_local_context() {
         let local = AgentExecutionActor::agent(
-            "conv_019bffffffff-7abc-8def-0123-456789abcdef",
+            "019bffffffff-7abc-8def-8123-456789abcdef",
             Some("attempt_1".to_owned()),
         );
         assert_eq!(
             local.actor_id().as_deref(),
-            Some("conv_019bffffffff-7abc-8def-0123-456789abcdef")
+            Some("019bffffffff-7abc-8def-8123-456789abcdef")
         );
         assert_eq!(
             local.conversation_id(),
-            Some("conv_019bffffffff-7abc-8def-0123-456789abcdef")
+            Some("019bffffffff-7abc-8def-8123-456789abcdef")
         );
         assert_eq!(local.attempt_id(), Some("attempt_1"));
 
@@ -519,10 +518,9 @@ mod tests {
     }
 
     #[test]
-    fn durable_execution_event_vocabulary_is_exactly_nine_facts() {
+    fn durable_execution_event_vocabulary_is_exactly_eight_facts() {
         let kinds = [
             AgentExecutionEventKind::Created,
-            AgentExecutionEventKind::Migrated,
             AgentExecutionEventKind::StatusChanged,
             AgentExecutionEventKind::PlanChanged,
             AgentExecutionEventKind::StepChanged,
@@ -533,7 +531,7 @@ mod tests {
         ];
         let wires: std::collections::BTreeSet<&str> =
             kinds.iter().map(|kind| kind.as_str()).collect();
-        assert_eq!(wires.len(), 9, "event facts must stay unique");
+        assert_eq!(wires.len(), 8, "event facts must stay unique");
         assert_eq!(
             wires,
             std::collections::BTreeSet::from([
@@ -542,12 +540,12 @@ mod tests {
                 "decision_answered",
                 "decision_requested",
                 "deleted",
-                "migrated",
                 "plan_changed",
                 "status_changed",
                 "step_changed",
             ])
         );
+        assert!("migrated".parse::<AgentExecutionEventKind>().is_err());
         assert!("run_started".parse::<AgentExecutionEventKind>().is_err());
         assert!("worker_changed".parse::<AgentExecutionEventKind>().is_err());
     }

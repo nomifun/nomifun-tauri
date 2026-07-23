@@ -7,8 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use nomifun_common::{
-    AgentExecutionAttemptId, AgentExecutionId, AgentExecutionStepId, AppError, ConversationExecutionRelation,
-    ConversationId,
+    AgentExecutionId, AppError, ConversationExecutionRelation, ConversationId,
 };
 use nomifun_db::IAgentExecutionRepository;
 
@@ -109,15 +108,23 @@ impl ExecutionConversationBoundary for RepositoryExecutionConversationBoundary {
             AgentExecutionId::try_from(link.execution_id.as_str()).map_err(|error| {
                 AppError::Internal(format!("invalid persisted execution link execution_id: {error}"))
             })?;
-            if let Some(step_id) = link.step_id.as_deref() {
-                AgentExecutionStepId::try_from(step_id).map_err(|error| {
-                    AppError::Internal(format!("invalid persisted execution link step_id: {error}"))
-                })?;
+            if link
+                .step_id
+                .as_deref()
+                .is_some_and(|step_id| nomifun_common::validate_uuidv7(step_id).is_err())
+            {
+                return Err(AppError::Internal(
+                    "invalid persisted execution link step_id".to_owned(),
+                ));
             }
-            if let Some(attempt_id) = link.attempt_id.as_deref() {
-                AgentExecutionAttemptId::try_from(attempt_id).map_err(|error| {
-                    AppError::Internal(format!("invalid persisted execution link attempt_id: {error}"))
-                })?;
+            if link
+                .attempt_id
+                .as_deref()
+                .is_some_and(|attempt_id| nomifun_common::validate_uuidv7(attempt_id).is_err())
+            {
+                return Err(AppError::Internal(
+                    "invalid persisted execution link attempt_id".to_owned(),
+                ));
             }
         }
 

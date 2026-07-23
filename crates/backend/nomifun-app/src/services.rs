@@ -31,6 +31,9 @@ use crate::config::{AppConfig, load_or_create_data_encryption_key};
 
 pub struct AppServices {
     pub database: Database,
+    /// Process-local barrier covering Provider lifecycle operations that span
+    /// SQLite and JSON side stores (companions/public agents).
+    pub provider_lifecycle: nomifun_common::SharedProviderLifecycleBarrier,
     /// Canonical owner of every installation-scoped resource. Resolved once
     /// through `installation_identity` at boot; usernames are mutable display
     /// data and must never be used as an authorization identity.
@@ -224,7 +227,7 @@ impl AppServices {
             .ok_or_else(|| {
                 anyhow::anyhow!("Database invariant violated: installation owner is missing")
             })?;
-        let authoritative_user_id: Arc<str> = Arc::from(installation_owner.id.as_str());
+        let authoritative_user_id: Arc<str> = Arc::from(installation_owner.user_id.as_str());
 
         let db_secret = installation_owner.jwt_secret.as_deref().filter(|s| !s.is_empty());
 
@@ -233,7 +236,7 @@ impl AppServices {
         // Persist newly generated secret to database
         if is_new {
             user_repo
-                .update_jwt_secret(&installation_owner.id, &secret)
+                .update_jwt_secret(installation_owner.user_id.as_str(), &secret)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to persist JWT secret: {e}"))?;
             tracing::info!("Generated and persisted new JWT secret");
@@ -651,12 +654,15 @@ impl AppServices {
                 encryption_key,
                 workspace: data_dir.clone(),
             });
-        let companion_service = nomifun_companion::CompanionService::start(
+        let provider_lifecycle = Arc::new(nomifun_common::ProviderLifecycleBarrier::new());
+        let companion_service = nomifun_companion::CompanionService::start_with_provider_lifecycle(
             &data_dir,
             event_bus.clone(),
             authoritative_user_id.as_ref(),
             companion_completer,
             skill_paths.clone(),
+            Some(provider_repo.clone() as Arc<dyn nomifun_db::IProviderRepository>),
+            Some(provider_lifecycle.clone()),
         )
         .await
         .map_err(|e| anyhow::anyhow!("companion service start failed: {e}"))?;
@@ -664,16 +670,22 @@ impl AppServices {
         // Public-companion (对外伙伴) domain — its own store under public-agents/.
         // No completer / event bus / memory: it is a controlled enterprise service
         // agent, not a growing personal companion.
-        let public_agent_service = nomifun_public_agent::PublicAgentService::start(&data_dir);
+        let public_agent_service =
+            nomifun_public_agent::PublicAgentService::start_with_provider_lifecycle(
+                &data_dir,
+                Some(provider_repo.clone() as Arc<dyn nomifun_db::IProviderRepository>),
+                Some(provider_lifecycle.clone()),
+            );
 
         // 创意工坊 (Creative Workshop) + 生成引擎 (creation): the workshop service
         // owns canvas/asset index rows + on-disk docs/binaries; the creation
         // service owns the media generation task queue. Both are plain repo-backed
         // services (no agent-factory dependency), constructed here alongside the
         // other singletons and reused by the router states.
-        let workshop_service = nomifun_workshop::WorkshopService::start(
+        let workshop_service = nomifun_workshop::WorkshopService::start_with_provider_lifecycle(
             &data_dir,
             Arc::new(nomifun_db::SqliteWorkshopRepository::new(database.pool().clone())),
+            provider_lifecycle.clone(),
         );
         // The generation engine resolves provider rows (endpoint + decrypted key,
         // same machine-bound AES key the provider column uses), runs the media
@@ -822,6 +834,7 @@ impl AppServices {
 
         Ok(Self {
             database,
+            provider_lifecycle,
             authoritative_user_id,
             jwt_service: Arc::new(JwtService::new(secret.clone())),
             user_repo,
@@ -888,7 +901,7 @@ async fn reconcile_model_profiles(
         let models: Vec<String> = serde_json::from_str(&provider.models).unwrap_or_default();
         match nomifun_system::seed_missing_inferred_profiles(
             model_profile_repo.as_ref(),
-            &provider.id,
+            &provider.provider_id,
             &provider.platform,
             &models,
         )
@@ -896,7 +909,7 @@ async fn reconcile_model_profiles(
         {
             Ok(count) => seeded += count,
             Err(error) => tracing::warn!(
-                provider_id = %provider.id,
+                provider_id = %provider.provider_id,
                 error = %error,
                 "model-profile reconcile failed"
             ),
@@ -933,7 +946,7 @@ mod tests {
         assert!(!tmp.path().join("local-ai").exists());
 
         // JWT service should be functional
-        let test_user_id = "user_0190f5fe-7c00-7a00-8000-000000000001";
+        let test_user_id = "0190f5fe-7c00-7a00-8000-000000000001";
         let token = services.jwt_service.sign(test_user_id, "testuser").unwrap();
         let payload = services.jwt_service.verify(&token).unwrap();
         assert_eq!(payload.user_id.as_str(), test_user_id);

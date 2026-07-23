@@ -143,7 +143,7 @@ export const useMcpConnection = (
   const handleTestMcpConnection = useCallback(
     async (server: IMcpServer, options?: TestOptions) => {
       const notify = options?.notify ?? true;
-      setTestingServers((prev) => ({ ...prev, [server.id]: true }));
+      setTestingServers((prev) => ({ ...prev, [server.mcp_server_id]: true }));
 
       // 更新服务器状态 - 使用统一的保存函数，避免竞态条件
       const updateServerStatus = async (
@@ -152,7 +152,9 @@ export const useMcpConnection = (
       ) => {
         setMcpServers((prevServers) =>
           prevServers.map((s) =>
-            s.id === server.id ? { ...s, last_test_status, updated_at: Date.now(), ...additionalData } : s
+            s.mcp_server_id === server.mcp_server_id
+              ? { ...s, last_test_status, updated_at: Date.now(), ...additionalData }
+              : s
           )
         );
       };
@@ -233,7 +235,7 @@ export const useMcpConnection = (
           });
         }
       } finally {
-        setTestingServers((prev) => ({ ...prev, [server.id]: false }));
+        setTestingServers((prev) => ({ ...prev, [server.mcp_server_id]: false }));
       }
     },
     [setMcpServers, t, onAuthRequired, onAuthResolved]

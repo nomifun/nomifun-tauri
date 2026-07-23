@@ -30,8 +30,11 @@ static BUILTIN_ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../nomifun-ap
 
 /// Single built-in preset entry, loaded from `presets.json`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuiltinPreset {
-    pub id: String,
+    /// Builtin catalog identity. Product-facing `preset_id` values are
+    /// materialized UUIDv7 values and never reuse this natural key.
+    pub source_key: String,
     pub name: String,
     #[serde(default)]
     pub name_i18n: HashMap<String, String>,
@@ -193,12 +196,12 @@ impl BuiltinPresetRegistry {
         Self::with_presets(HashMap::new(), Vec::new(), Source::Embedded)
     }
 
-    pub fn has(&self, id: &str) -> bool {
-        self.presets.contains_key(id)
+    pub fn has(&self, source_key: &str) -> bool {
+        self.presets.contains_key(source_key)
     }
 
-    pub fn get(&self, id: &str) -> Option<&BuiltinPreset> {
-        self.presets.get(id)
+    pub fn get(&self, source_key: &str) -> Option<&BuiltinPreset> {
+        self.presets.get(source_key)
     }
 
     pub fn all(&self) -> impl Iterator<Item = &BuiltinPreset> {
@@ -222,8 +225,8 @@ impl BuiltinPresetRegistry {
     /// Read the rule file bytes for a built-in preset. Substitutes
     /// `{locale}` in the manifest-declared `rule_file` path. Returns `None`
     /// when the preset has no declared rule or the file is missing.
-    pub fn rule_bytes(&self, id: &str, locale: &str) -> Option<Vec<u8>> {
-        let rel = self.presets.get(id)?.rule_file.as_ref()?;
+    pub fn rule_bytes(&self, source_key: &str, locale: &str) -> Option<Vec<u8>> {
+        let rel = self.presets.get(source_key)?.rule_file.as_ref()?;
         self.read_asset(&rel.replace("{locale}", locale))
     }
 
@@ -235,8 +238,8 @@ impl BuiltinPresetRegistry {
     /// (like `"📝"`) rather than a relative path, no file is resolved and
     /// this method returns `None`. Callers treating an preset without a
     /// shipped avatar should fall back to the text avatar on the client.
-    pub fn avatar_asset(&self, id: &str) -> Option<AvatarAsset> {
-        let a = self.presets.get(id)?;
+    pub fn avatar_asset(&self, source_key: &str) -> Option<AvatarAsset> {
+        let a = self.presets.get(source_key)?;
         let rel = a.avatar.as_ref()?;
         // Emoji / text avatars have no path separator and no extension.
         if !looks_like_relative_path(rel) {
@@ -267,7 +270,7 @@ impl Default for BuiltinPresetRegistry {
 
 fn parse_manifest_bytes(bytes: &[u8]) -> HashMap<String, BuiltinPreset> {
     match serde_json::from_slice::<BuiltinManifest>(bytes) {
-        Ok(m) => m.presets.into_iter().map(|a| (a.id.clone(), a)).collect(),
+        Ok(m) => m.presets.into_iter().map(|a| (a.source_key.clone(), a)).collect(),
         Err(e) => {
             error!("Embedded built-in manifest parse failed: {e}");
             HashMap::new()
@@ -277,7 +280,7 @@ fn parse_manifest_bytes(bytes: &[u8]) -> HashMap<String, BuiltinPreset> {
 
 fn parse_manifest_str(content: &str) -> HashMap<String, BuiltinPreset> {
     match serde_json::from_str::<BuiltinManifest>(content) {
-        Ok(m) => m.presets.into_iter().map(|a| (a.id.clone(), a)).collect(),
+        Ok(m) => m.presets.into_iter().map(|a| (a.source_key.clone(), a)).collect(),
         Err(e) => {
             error!("Built-in manifest parse failed: {e}");
             HashMap::new()
@@ -307,6 +310,8 @@ fn looks_like_relative_path(s: &str) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    const GEMINI_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000103";
 
     fn write_manifest(dir: &Path, body: &str) {
         std::fs::write(dir.join("presets.json"), body).unwrap();
@@ -372,9 +377,9 @@ mod tests {
             r#"{
                 "version": "1.0.0",
                 "presets": [{
-                    "id": "builtin-office",
+                    "source_key": "builtin-office",
                     "name": "Office",
-                    "preferred_agent_id": "gemini",
+                    "preferred_agent_id": "0190f5fe-7c00-7a00-8000-000000000103",
                     "rule_file": "rules/office.{locale}.md"
                 }]
             }"#,
@@ -397,9 +402,9 @@ mod tests {
             tmp.path(),
             r#"{
                 "presets": [{
-                    "id": "x",
+                    "source_key": "x",
                     "name": "X",
-                    "preferred_agent_id": "gemini",
+                    "preferred_agent_id": "0190f5fe-7c00-7a00-8000-000000000103",
                     "rule_file": "rules/x.{locale}.md"
                 }]
             }"#,
@@ -417,7 +422,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_manifest(
             tmp.path(),
-            r#"{"presets":[{"id":"env-only","name":"E","preferred_agent_id":"gemini"}]}"#,
+            r#"{"presets":[{"source_key":"env-only","name":"E","preferred_agent_id":"0190f5fe-7c00-7a00-8000-000000000103"}]}"#,
         );
         // SAFETY: env-var mutation is only unsafe if another thread reads
         // environment concurrently. This test is self-contained.
@@ -452,13 +457,17 @@ mod tests {
         write_manifest(
             tmp.path(),
             r#"{"presets":[{
-                "id": "with-file-avatar",
+                "source_key": "with-file-avatar",
                 "name": "F",
-                "preferred_agent_id": "gemini",
+                "preferred_agent_id": "0190f5fe-7c00-7a00-8000-000000000103",
                 "avatar": "duck.svg"
             }]}"#,
         );
         let reg = BuiltinPresetRegistry::load_from_dir(tmp.path().to_path_buf());
+        assert_eq!(
+            reg.get("with-file-avatar").map(|preset| preset.preferred_agent_id.as_str()),
+            Some(GEMINI_AGENT_ID)
+        );
         let asset = reg.avatar_asset("with-file-avatar").unwrap();
         assert_eq!(asset.bytes, b"<svg/>");
         assert_eq!(asset.extension.as_deref(), Some("svg"));

@@ -53,7 +53,10 @@ const ExecutionContentSwitcher: React.FC<ConversationContentSwitcherProps> = ({ 
           projection key across that replacement, while a genuinely different
           selected task still remounts with clean task-local drafts. */}
       {projecting && projectedPayload && (
-        <ProjectedAttemptView key={projectedPayload.projectionKey ?? projectedPayload.step.id} payload={projectedPayload} />
+        <ProjectedAttemptView
+          key={projectedPayload.projectionKey ?? projectedPayload.step.step_id}
+          payload={projectedPayload}
+        />
       )}
     </div>
   );

@@ -39,5 +39,6 @@ pub async fn run_embedded_server(cli: &cli::Cli, merged_path: &str) -> anyhow::R
     let env = bootstrap::init_environment(cli, merged_path)?;
     let database = bootstrap::init_data_layer(&env.config).await?;
     let services = AppServices::from_config(database, &env.config).await?;
+    bootstrap::finalize_data_layer(&env.config)?;
     commands::run_server(env, services).await
 }

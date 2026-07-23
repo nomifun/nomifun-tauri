@@ -88,7 +88,7 @@ pub(crate) async fn resolve_provider_fields(
         base_url,
         compat_overrides,
         bedrock_config,
-        context_limit: resolve_model_context_limit(row.context_limit, row.model_context_limits.as_deref(), model),
+        context_limit: resolve_model_context_limit(row.model_context_limits.as_deref(), model),
     })
 }
 
@@ -144,15 +144,13 @@ pub(crate) async fn resolve_provider_fields_with_fallback(
 }
 
 fn resolve_model_context_limit(
-    provider_context_limit: Option<i64>,
     model_context_limits: Option<&str>,
     model: &str,
 ) -> Option<i64> {
-    let per_model = model_context_limits
+    model_context_limits
         .and_then(|raw| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw).ok())
-        .and_then(|map| map.get(model).and_then(serde_json::Value::as_i64));
-
-    per_model.filter(|value| *value > 0).or(provider_context_limit)
+        .and_then(|map| map.get(model).and_then(serde_json::Value::as_i64))
+        .filter(|value| *value > 0)
 }
 
 /// Resolve a provider DB row into a base `Config` suitable for LLM calls.
@@ -558,21 +556,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_model_context_limit_prefers_selected_model_map() {
+    fn resolve_model_context_limit_uses_only_selected_model_map_entry() {
         let per_model = r#"{"model-a":32000,"model-b":128000}"#;
 
         assert_eq!(
-            resolve_model_context_limit(Some(200_000), Some(per_model), "model-b"),
+            resolve_model_context_limit(Some(per_model), "model-b"),
             Some(128_000)
         );
-        assert_eq!(
-            resolve_model_context_limit(Some(200_000), Some(per_model), "missing"),
-            Some(200_000)
-        );
-        assert_eq!(
-            resolve_model_context_limit(None, Some(per_model), "model-a"),
-            Some(32_000)
-        );
+        assert_eq!(resolve_model_context_limit(Some(per_model), "missing"), None);
+        assert_eq!(resolve_model_context_limit(Some(per_model), "model-a"), Some(32_000));
+        assert_eq!(resolve_model_context_limit(None, "model-a"), None);
+        assert_eq!(resolve_model_context_limit(Some(r#"{"model-a":0}"#), "model-a"), None);
     }
 
     // The kinded drain forwards TextDelta as DeltaKind::Text and ThinkingDelta as
@@ -687,8 +681,8 @@ mod fallback_tests {
     use nomifun_db::models::Provider;
     use nomifun_db::{CreateProviderParams, DbError, UpdateProviderParams};
 
-    const PROVIDER_A: &str = "prov_0190f5fe-7c00-7a00-8000-000000000001";
-    const PROVIDER_DEAD: &str = "prov_0190f5fe-7c00-7a00-8000-000000000099";
+    const PROVIDER_A: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const PROVIDER_DEAD: &str = "0190f5fe-7c00-7a00-8000-000000000099";
 
     // Copied (and lightly adapted) from knowledge_completer.rs tests: the same
     // `ListOnlyRepo` + `provider(...)` fixture. `api_key_encrypted` is a REAL
@@ -697,7 +691,8 @@ mod fallback_tests {
     // takes a `&[&str]` and is serialized to the JSON the repo stores.
     fn provider(id: &str, enabled: bool, models: &[&str], model_enabled: Option<&str>) -> Provider {
         Provider {
-            id: id.into(),
+            id: 0,
+            provider_id: id.into(),
             platform: "openai".into(),
             name: id.into(),
             base_url: String::new(),
@@ -706,7 +701,6 @@ mod fallback_tests {
             models: serde_json::to_string(models).expect("serialize models"),
             enabled,
             capabilities: "[]".into(),
-            context_limit: None,
             model_context_limits: None,
             model_protocols: None,
             model_descriptions: None,
@@ -728,7 +722,7 @@ mod fallback_tests {
             Ok(self.0.clone())
         }
         async fn find_by_id(&self, id: &str) -> Result<Option<Provider>, DbError> {
-            Ok(self.0.iter().find(|p| p.id == id).cloned())
+            Ok(self.0.iter().find(|p| p.provider_id == id).cloned())
         }
         async fn create(&self, _params: CreateProviderParams<'_>) -> Result<Provider, DbError> {
             unimplemented!("not used by these tests")

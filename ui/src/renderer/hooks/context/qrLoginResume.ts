@@ -17,17 +17,19 @@ export type QrLoginResumeUser = {
 
 type QrLoginResumePayload = {
   at: number;
-  user: { id: string; username: string };
+  user: { user_id: string; username: string };
 };
 
 const isResumePayload = (value: unknown): value is QrLoginResumePayload => {
   if (!value || typeof value !== 'object') return false;
   const payload = value as Partial<QrLoginResumePayload>;
+  const user = payload.user as (Partial<QrLoginResumePayload['user']> & { id?: unknown }) | undefined;
   return (
     typeof payload.at === 'number' &&
-    Boolean(payload.user) &&
-    typeof payload.user?.id === 'string' &&
-    typeof payload.user?.username === 'string'
+    Boolean(user) &&
+    !Object.prototype.hasOwnProperty.call(user, 'id') &&
+    typeof user?.user_id === 'string' &&
+    typeof user?.username === 'string'
   );
 };
 
@@ -46,7 +48,7 @@ export function consumeQrLoginResume(now = Date.now()): QrLoginResumeUser | null
     const parsed = JSON.parse(raw) as unknown;
     if (!isResumePayload(parsed)) return null;
     if (now - parsed.at > QR_LOGIN_RESUME_MAX_AGE_MS) return null;
-    return { id: parseUserId(parsed.user.id), username: parsed.user.username };
+    return { id: parseUserId(parsed.user.user_id), username: parsed.user.username };
   } catch {
     return null;
   } finally {

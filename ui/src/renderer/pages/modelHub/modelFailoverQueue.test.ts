@@ -8,8 +8,8 @@ import { describe, expect, test } from 'bun:test';
 import { buildModelFailoverConfigForSave } from './modelFailoverQueue';
 import { parseProviderId } from '@/common/types/ids';
 
-const P1 = parseProviderId('prov_019b0000-0000-7000-8000-000000000001');
-const P2 = parseProviderId('prov_019b0000-0000-7000-8000-000000000002');
+const P1 = parseProviderId('019b0000-0000-7000-8000-000000000001');
+const P2 = parseProviderId('019b0000-0000-7000-8000-000000000002');
 
 const baseConfig = {
   enabled: true,

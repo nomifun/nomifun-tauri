@@ -3,6 +3,12 @@
 pub const NOMIFUN_TIMESTAMP_SEPARATOR: &str = "_nomifun_";
 pub const NOMIFUN_FILES_MARKER: &str = "[[NOMI_FILES]]";
 
+/// Stable business ID of the built-in Nomi agent.
+///
+/// Catalog/source identity belongs in `agent_metadata.source_key`; all
+/// persisted agent references use this bare UUIDv7 business ID.
+pub const NOMI_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000114";
+
 // --- WebSocket ---
 
 pub const HEARTBEAT_INTERVAL_MS: u64 = 30_000;

@@ -27,9 +27,12 @@ pub fn agent_routes(state: AgentRouterState) -> Router {
         .route("/api/agents/refresh", post(refresh_agents))
         .route("/api/agents/health-check", post(health_check))
         .route("/api/agents/provider-health-check", post(provider_health_check))
-        .route("/api/agents/{id}/enabled", patch(set_agent_enabled))
+        .route("/api/agents/{agent_id}/enabled", patch(set_agent_enabled))
         .route("/api/agents/custom", post(create_custom))
-        .route("/api/agents/custom/{id}", put(update_custom).delete(delete_custom))
+        .route(
+            "/api/agents/custom/{agent_id}",
+            put(update_custom).delete(delete_custom),
+        )
         .route("/api/agents/custom/try-connect", post(try_connect_custom))
         .with_state(state)
 }
@@ -89,32 +92,32 @@ async fn create_custom(
 async fn update_custom(
     State(state): State<AgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
+    Path(agent_id): Path<String>,
     body: Result<Json<CustomAgentUpsertRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentMetadata>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     Ok(Json(ApiResponse::ok(
-        state.service.update_custom_agent(&id, req).await?,
+        state.service.update_custom_agent(&agent_id, req).await?,
     )))
 }
 
 async fn delete_custom(
     State(state): State<AgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
+    Path(agent_id): Path<String>,
 ) -> Result<Json<ApiResponse<DeleteCustomAgentResponse>>, AppError> {
-    state.service.delete_custom_agent(&id).await?;
+    state.service.delete_custom_agent(&agent_id).await?;
     Ok(Json(ApiResponse::ok(DeleteCustomAgentResponse { deleted: true })))
 }
 
 async fn set_agent_enabled(
     State(state): State<AgentRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
+    Path(agent_id): Path<String>,
     body: Result<Json<SetEnabledRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentMetadata>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     Ok(Json(ApiResponse::ok(
-        state.service.set_agent_enabled(&id, req.enabled).await?,
+        state.service.set_agent_enabled(&agent_id, req.enabled).await?,
     )))
 }

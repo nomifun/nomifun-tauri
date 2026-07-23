@@ -254,15 +254,13 @@ impl Capability {
             inject_confirm_property(&mut input_schema);
         }
         let f = Arc::new(f);
-        let schema = Value::Object(input_schema.clone());
         let handler: Handler = Arc::new(move |deps, ctx, args: Value| {
             let f = f.clone();
-            let schema = schema.clone();
             Box::pin(async move {
                 // `confirm` is a cross-cutting gate field injected into the schema,
                 // not part of `P`; drop it before typed deserialization so an
                 // `deny_unknown_fields` request type would not choke on it.
-                let args = strip_confirm(coerce_args_to_schema(&schema, args));
+                let args = strip_confirm(args);
                 match serde_json::from_value::<P>(args) {
                     Ok(p) => f(deps, ctx, p).await,
                     Err(e) => invalid_arguments_error(e),
@@ -294,17 +292,14 @@ impl Capability {
             inject_confirm_property(&mut input_schema);
         }
         let f = Arc::new(f);
-        let schema = Value::Object(input_schema.clone());
 
         // Streaming path: deserialize P, run f feeding the caller's sink.
         let stream_f = f.clone();
-        let stream_schema = schema.clone();
         let stream: StreamingHandler =
             Arc::new(move |deps, ctx, args: Value, sink: ProgressSink| {
                 let f = stream_f.clone();
-                let schema = stream_schema.clone();
                 Box::pin(async move {
-                    let args = strip_confirm(coerce_args_to_schema(&schema, args));
+                    let args = strip_confirm(args);
                     match serde_json::from_value::<P>(args) {
                         Ok(p) => f(deps, ctx, p, sink).await,
                         Err(e) => invalid_arguments_error(e),
@@ -314,12 +309,10 @@ impl Capability {
 
         // Buffered path: run the same handler with a sink whose receiver is
         // drained-and-discarded, returning only the final value.
-        let handler_schema = schema.clone();
         let handler: Handler = Arc::new(move |deps, ctx, args: Value| {
             let f = f.clone();
-            let schema = handler_schema.clone();
             Box::pin(async move {
-                let args = strip_confirm(coerce_args_to_schema(&schema, args));
+                let args = strip_confirm(args);
                 let p = match serde_json::from_value::<P>(args) {
                     Ok(p) => p,
                     Err(e) => return invalid_arguments_error(e),
@@ -353,6 +346,8 @@ fn schema_for_params<P: JsonSchema>() -> Map<String, Value> {
     map.remove("$schema");
     map.remove("title");
     map.entry("type").or_insert_with(|| json!("object"));
+    map.entry("additionalProperties")
+        .or_insert_with(|| json!(false));
     // Tools with no fields still need a `properties` object so clients render an
     // empty-args form rather than rejecting the schema.
     map.entry("properties").or_insert_with(|| json!({}));
@@ -380,151 +375,6 @@ fn strip_confirm(mut args: Value) -> Value {
         m.remove("confirm");
     }
     args
-}
-
-pub(crate) fn coerce_args_to_schema(schema: &Value, args: Value) -> Value {
-    let mut args = match args {
-        Value::String(ref s) => match serde_json::from_str::<Value>(s) {
-            Ok(parsed @ Value::Object(_)) => parsed,
-            _ => return args,
-        },
-        other => other,
-    };
-
-    let Some(obj) = args.as_object_mut() else {
-        return args;
-    };
-
-    // Schemars represents untagged/tagged enum request DTOs with root-level
-    // oneOf/anyOf branches, commonly through local $defs references. Tool
-    // clients sometimes stringify arrays, objects, numbers, or booleans; walk
-    // every branch that defines the supplied property so those requests receive
-    // the same coercion as a plain struct schema.
-    let keys = obj.keys().cloned().collect::<Vec<_>>();
-    for key in keys {
-        let mut property_schemas = Vec::new();
-        collect_property_schemas(schema, schema, &key, &mut property_schemas, 0);
-        let mut expected = Vec::new();
-        for property_schema in property_schemas {
-            collect_schema_type_names(schema, property_schema, &mut expected, 0);
-        }
-        if expected.iter().any(|t| *t == "string") {
-            continue;
-        }
-        let Some(s) = obj.get(&key).and_then(Value::as_str).map(str::to_owned) else {
-            continue;
-        };
-        if let Some(coerced) = coerce_string_to_types(&s, &expected) {
-            obj.insert(key, coerced);
-        }
-    }
-
-    args
-}
-
-fn collect_property_schemas<'a>(
-    root: &'a Value,
-    schema: &'a Value,
-    key: &str,
-    out: &mut Vec<&'a Value>,
-    depth: usize,
-) {
-    if depth > 32 {
-        return;
-    }
-    if let Some(resolved) = resolve_local_schema_ref(root, schema) {
-        collect_property_schemas(root, resolved, key, out, depth + 1);
-        return;
-    }
-    if let Some(property) = schema
-        .get("properties")
-        .and_then(Value::as_object)
-        .and_then(|properties| properties.get(key))
-    {
-        out.push(property);
-    }
-    for branch_key in ["oneOf", "anyOf", "allOf"] {
-        if let Some(branches) = schema.get(branch_key).and_then(Value::as_array) {
-            for branch in branches {
-                collect_property_schemas(root, branch, key, out, depth + 1);
-            }
-        }
-    }
-}
-
-fn collect_schema_type_names<'a>(
-    root: &'a Value,
-    schema: &'a Value,
-    out: &mut Vec<&'a str>,
-    depth: usize,
-) {
-    if depth > 32 {
-        return;
-    }
-    if let Some(resolved) = resolve_local_schema_ref(root, schema) {
-        collect_schema_type_names(root, resolved, out, depth + 1);
-        return;
-    }
-    match schema.get("type") {
-        Some(Value::String(s)) => out.push(s.as_str()),
-        Some(Value::Array(items)) => {
-            for item in items {
-                if let Some(s) = item.as_str() {
-                    out.push(s);
-                }
-            }
-        }
-        _ => {}
-    }
-    for key in ["oneOf", "anyOf", "allOf"] {
-        if let Some(items) = schema.get(key).and_then(Value::as_array) {
-            for item in items {
-                collect_schema_type_names(root, item, out, depth + 1);
-            }
-        }
-    }
-}
-
-fn resolve_local_schema_ref<'a>(root: &'a Value, schema: &Value) -> Option<&'a Value> {
-    let reference = schema.get("$ref")?.as_str()?;
-    let pointer = reference.strip_prefix('#')?;
-    root.pointer(pointer)
-}
-
-fn coerce_string_to_types(s: &str, expected: &[&str]) -> Option<Value> {
-    if expected.iter().any(|t| *t == "array" || *t == "object") {
-        if let Ok(parsed) = serde_json::from_str::<Value>(s) {
-            if (expected.contains(&"array") && parsed.is_array())
-                || (expected.contains(&"object") && parsed.is_object())
-            {
-                return Some(parsed);
-            }
-        }
-    }
-
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if expected.contains(&"integer") {
-        if let Ok(n) = trimmed.parse::<i64>() {
-            return Some(Value::Number(n.into()));
-        }
-    }
-    if expected.contains(&"number") {
-        if let Ok(n) = trimmed.parse::<f64>() {
-            return serde_json::Number::from_f64(n).map(Value::Number);
-        }
-    }
-    if expected.contains(&"boolean") {
-        if trimmed.eq_ignore_ascii_case("true") {
-            return Some(Value::Bool(true));
-        }
-        if trimmed.eq_ignore_ascii_case("false") {
-            return Some(Value::Bool(false));
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -669,78 +519,99 @@ mod tests {
         assert!(value.get("result").is_none());
     }
 
-    #[derive(Deserialize, JsonSchema)]
-    struct NumericStringParams {
+    #[derive(Debug, Deserialize, JsonSchema, PartialEq)]
+    #[serde(deny_unknown_fields)]
+    struct FixedShapeParams {
         id: i64,
         limit: Option<u32>,
         wait_secs: Option<f64>,
         confirm: Option<bool>,
+        tasks: Vec<String>,
     }
 
     #[test]
-    fn schema_coercion_accepts_numeric_and_boolean_strings() {
-        let schema = schema_for_params::<NumericStringParams>();
-        let coerced = coerce_args_to_schema(
-            &Value::Object(schema),
+    fn typed_arguments_reject_stringified_native_values() {
+        for args in [
             json!({
                 "id": "8",
-                "limit": "50",
-                "wait_secs": "1.5",
-                "confirm": "true"
+                "limit": 50,
+                "wait_secs": 1.5,
+                "confirm": true,
+                "tasks": ["research"]
             }),
-        );
-        let parsed: NumericStringParams = serde_json::from_value(coerced).unwrap();
-        assert_eq!(parsed.id, 8);
-        assert_eq!(parsed.limit, Some(50));
-        assert_eq!(parsed.wait_secs, Some(1.5));
-        assert_eq!(parsed.confirm, Some(true));
-    }
-
-    #[derive(Debug, Deserialize, JsonSchema)]
-    #[serde(untagged)]
-    enum UnionParams {
-        Parallel {
-            strategy: String,
-            tasks: Vec<UnionTask>,
-            synthesize: bool,
-        },
-        Planned {
-            strategy: String,
-            goal: String,
-        },
-    }
-
-    #[derive(Debug, Deserialize, JsonSchema)]
-    struct UnionTask {
-        name: String,
+            json!({
+                "id": 8,
+                "limit": "50",
+                "wait_secs": 1.5,
+                "confirm": true,
+                "tasks": ["research"]
+            }),
+            json!({
+                "id": 8,
+                "limit": 50,
+                "wait_secs": "1.5",
+                "confirm": true,
+                "tasks": ["research"]
+            }),
+            json!({
+                "id": 8,
+                "limit": 50,
+                "wait_secs": 1.5,
+                "confirm": "true",
+                "tasks": ["research"]
+            }),
+            json!({
+                "id": 8,
+                "limit": 50,
+                "wait_secs": 1.5,
+                "confirm": true,
+                "tasks": "[\"research\"]"
+            }),
+        ] {
+            assert!(serde_json::from_value::<FixedShapeParams>(args).is_err());
+        }
     }
 
     #[test]
-    fn schema_coercion_walks_union_branches_and_local_refs() {
-        let schema = schema_for_params::<UnionParams>();
-        let coerced = coerce_args_to_schema(
-            &Value::Object(schema),
-            json!({
-                "strategy": "parallel",
-                "tasks": "[{\"name\":\"research\"}]",
-                "synthesize": "True"
-            }),
+    fn typed_arguments_accept_native_json_values() {
+        let parsed: FixedShapeParams = serde_json::from_value(json!({
+            "id": 8,
+            "limit": 50,
+            "wait_secs": 1.5,
+            "confirm": true,
+            "tasks": ["research"]
+        }))
+        .unwrap();
+        assert_eq!(
+            parsed,
+            FixedShapeParams {
+                id: 8,
+                limit: Some(50),
+                wait_secs: Some(1.5),
+                confirm: Some(true),
+                tasks: vec!["research".into()],
+            }
         );
-        let parsed: UnionParams = serde_json::from_value(coerced).unwrap();
-        match parsed {
-            UnionParams::Parallel {
-                strategy,
-                tasks,
-                synthesize,
-            } => {
-                assert_eq!(strategy, "parallel");
-                assert_eq!(tasks.len(), 1);
-                assert_eq!(tasks[0].name, "research");
-                assert!(synthesize);
-            }
-            UnionParams::Planned { strategy, goal } => {
-                panic!("expected parallel request, got planned {strategy}: {goal}")
-            }
-        }
+    }
+
+    #[test]
+    fn typed_arguments_reject_unknown_fields() {
+        assert!(
+            serde_json::from_value::<FixedShapeParams>(json!({
+                "id": 8,
+                "limit": 50,
+                "wait_secs": 1.5,
+                "confirm": true,
+                "tasks": ["research"],
+                "legacy_id": "8"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn generated_capability_schema_is_closed_by_default() {
+        let schema = schema_for_params::<FixedShapeParams>();
+        assert_eq!(schema.get("additionalProperties"), Some(&json!(false)));
     }
 }

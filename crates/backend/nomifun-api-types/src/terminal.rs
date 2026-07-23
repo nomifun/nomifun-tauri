@@ -20,8 +20,9 @@ fn default_rows() -> u16 {
 
 /// A terminal session as returned by the API.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct TerminalSessionResponse {
-    pub id: TerminalId,
+    pub terminal_id: TerminalId,
     pub name: String,
     pub cwd: String,
     /// Derived on every read —never persisted: whether `cwd` equals or sits
@@ -113,23 +114,26 @@ pub struct TerminalResizeRequest {
 
 /// `terminal.output` WebSocket event payload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct TerminalOutputEvent {
-    pub id: TerminalId,
+    pub terminal_id: TerminalId,
     pub data_b64: String,
 }
 
 /// `terminal.exit` WebSocket event payload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct TerminalExitEvent {
-    pub id: TerminalId,
+    pub terminal_id: TerminalId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
 }
 
 /// `terminal.removed` WebSocket event payload.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct TerminalRemovedPayload {
-    pub id: TerminalId,
+    pub terminal_id: TerminalId,
 }
 
 #[cfg(test)]
@@ -189,7 +193,12 @@ mod tests {
 
     #[test]
     fn create_request_rejects_noncanonical_knowledge_base_ids() {
-        for invalid in [json!(42), json!("kb_1"), json!(""), json!("term_0190f5fe-7c00-7a00-8000-000000000001")] {
+        for invalid in [
+            json!(42),
+            json!("kb_1"),
+            json!(""),
+            json!("knowledge_base_0190f5fe-7c00-7a00-8abc-012345678901"),
+        ] {
             let raw = json!({
                 "cwd": "/tmp",
                 "command": "bash",
@@ -202,7 +211,7 @@ mod tests {
     #[test]
     fn terminal_wire_entities_reject_noncanonical_ids() {
         let response = json!({
-            "id": "term_1",
+            "terminal_id": "term_1",
             "name": "shell",
             "cwd": "/tmp",
             "command": "$SHELL",
@@ -215,11 +224,44 @@ mod tests {
         });
         assert!(serde_json::from_value::<TerminalSessionResponse>(response).is_err());
         assert!(serde_json::from_value::<TerminalOutputEvent>(json!({
-            "id": 42,
+            "terminal_id": 42,
             "data_b64": ""
         })).is_err());
         assert!(serde_json::from_value::<TerminalRemovedPayload>(json!({
-            "id": "conv_0190f5fe-7c00-7a00-8000-000000000001"
+            "terminal_id": "term_0190f5fe-7c00-7a00-8000-000000000001"
+        })).is_err());
+    }
+
+    #[test]
+    fn terminal_wire_entities_reject_legacy_id_field() {
+        let terminal_id = nomifun_common::TerminalId::new();
+        let legacy_id = nomifun_common::TerminalId::new();
+        let response = json!({
+            "terminal_id": terminal_id,
+            "id": legacy_id,
+            "name": "shell",
+            "cwd": "/tmp",
+            "command": "$SHELL",
+            "args": [],
+            "cols": 80,
+            "rows": 24,
+            "created_at": 1,
+            "updated_at": 1,
+            "last_status": "running"
+        });
+        assert!(serde_json::from_value::<TerminalSessionResponse>(response).is_err());
+        assert!(serde_json::from_value::<TerminalOutputEvent>(json!({
+            "terminal_id": terminal_id,
+            "id": legacy_id,
+            "data_b64": ""
+        })).is_err());
+        assert!(serde_json::from_value::<TerminalExitEvent>(json!({
+            "terminal_id": terminal_id,
+            "id": legacy_id
+        })).is_err());
+        assert!(serde_json::from_value::<TerminalRemovedPayload>(json!({
+            "terminal_id": terminal_id,
+            "id": legacy_id
         })).is_err());
     }
 
@@ -238,7 +280,7 @@ mod tests {
     #[test]
     fn session_response_roundtrip_and_omits_none() {
         let resp = TerminalSessionResponse {
-            id: nomifun_common::TerminalId::new(),
+            terminal_id: nomifun_common::TerminalId::new(),
             name: "shell".into(),
             cwd: "/tmp".into(),
             is_default_workpath: false,
@@ -260,6 +302,11 @@ mod tests {
         assert!(v.get("backend").is_none());
         assert!(v.get("exit_code").is_none());
         assert!(v.get("scrollback_b64").is_none());
+        assert!(v.get("id").is_none());
+        assert_eq!(
+            v.get("terminal_id").and_then(serde_json::Value::as_str),
+            Some(resp.terminal_id.as_str())
+        );
         let parsed: TerminalSessionResponse = serde_json::from_value(v).unwrap();
         assert_eq!(parsed, resp);
     }
@@ -281,20 +328,23 @@ mod tests {
     #[test]
     fn output_event_roundtrip() {
         let e = TerminalOutputEvent {
-            id: nomifun_common::TerminalId::new(),
+            terminal_id: nomifun_common::TerminalId::new(),
             data_b64: "ZGF0YQ==".into(),
         };
         let s = serde_json::to_string(&e).unwrap();
+        assert!(s.contains("\"terminal_id\""));
+        assert!(!s.contains("\"id\""));
         assert_eq!(serde_json::from_str::<TerminalOutputEvent>(&s).unwrap(), e);
     }
 
     #[test]
     fn exit_event_omits_none_code() {
         let e = TerminalExitEvent {
-            id: nomifun_common::TerminalId::new(),
+            terminal_id: nomifun_common::TerminalId::new(),
             exit_code: None,
         };
         let v = serde_json::to_value(&e).unwrap();
+        assert!(v.get("id").is_none());
         assert!(v.get("exit_code").is_none());
     }
 }

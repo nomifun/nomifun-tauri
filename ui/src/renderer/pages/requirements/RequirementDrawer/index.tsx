@@ -76,7 +76,7 @@ const RequirementDrawer: React.FC<RequirementDrawerProps> = ({
     if (requirementId === undefined) return;
     setLoading(true);
     try {
-      const full = await ipcBridge.requirements.get.invoke({ id: requirementId });
+      const full = await ipcBridge.requirements.get.invoke({ requirement_id: requirementId });
       setData(full);
     } catch (e) {
       message.error(String(e));
@@ -100,7 +100,7 @@ const RequirementDrawer: React.FC<RequirementDrawerProps> = ({
     let cancelled = false;
     setLoading(true);
     void ipcBridge.requirements.get
-      .invoke({ id: requirementId })
+      .invoke({ requirement_id: requirementId })
       .then((full) => {
         if (!cancelled) setData(full);
       })
@@ -144,7 +144,7 @@ const RequirementDrawer: React.FC<RequirementDrawerProps> = ({
       setSubmitting(true);
       try {
         await ipcBridge.requirements.update.invoke({
-          id: requirementId,
+          requirement_id: requirementId,
           updates: {
             title: payload.title,
             content: payload.content,
@@ -234,7 +234,7 @@ const RequirementDrawer: React.FC<RequirementDrawerProps> = ({
                     value: <RequirementDisplayNumber displayNo={data.display_no} />,
                   },
                   // The canonical ID remains available without dominating the layout.
-                  { label: t('requirements.columns.id'), value: <CopyFullIdButton id={data.id} /> },
+                  { label: t('requirements.columns.id'), value: <CopyFullIdButton id={data.requirement_id} /> },
                   { label: t('requirements.columns.tag'), value: data.tag },
                   { label: t('requirements.columns.order'), value: data.order_key || '-' },
                   {

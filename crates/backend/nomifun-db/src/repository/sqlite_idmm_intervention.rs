@@ -1,7 +1,7 @@
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
-use crate::models::IdmmInterventionRow;
+use crate::models::{IdmmInterventionRow, NewIdmmInterventionRow};
 use crate::repository::idmm_intervention::{IIdmmInterventionRepository, PER_TARGET_CAP};
 
 #[derive(Clone, Debug)]
@@ -13,18 +13,78 @@ impl SqliteIdmmInterventionRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
+
 }
 
 #[async_trait::async_trait]
 impl IIdmmInterventionRepository for SqliteIdmmInterventionRepository {
-    async fn insert(&self, row: &IdmmInterventionRow) -> Result<(), DbError> {
-        sqlx::query(
+    async fn insert(&self, row: &NewIdmmInterventionRow) -> Result<IdmmInterventionRow, DbError> {
+        let mut transaction = self.pool.begin().await?;
+        let intervention_id =
+            nomifun_common::IdmmInterventionId::parse(&row.intervention_id).map_err(|error| {
+                DbError::Conflict(format!(
+                    "IDMM intervention_id '{}' is not a canonical UUIDv7: {error}",
+                    row.intervention_id
+                ))
+            })?;
+        match row.target_kind.as_str() {
+            "conversation" => {
+                let target = nomifun_common::ConversationId::parse(&row.target_id).map_err(|error| {
+                    DbError::Conflict(format!(
+                        "IDMM conversation target '{}' is not a canonical UUIDv7: {error}",
+                        row.target_id
+                    ))
+                })?;
+                let locked = sqlx::query(
+                    "UPDATE conversations SET updated_at = updated_at \
+                     WHERE conversation_id = ? AND user_id = ?",
+                )
+                .bind(target.as_str())
+                .bind(&row.user_id)
+                .execute(&mut *transaction)
+                .await?;
+                if locked.rows_affected() == 0 {
+                    return Err(DbError::Conflict(
+                        "IDMM conversation target owner mismatch".into(),
+                    ));
+                }
+            }
+            "terminal" => {
+                let target = nomifun_common::TerminalId::parse(&row.target_id).map_err(|error| {
+                    DbError::Conflict(format!(
+                        "IDMM terminal target '{}' is not a canonical UUIDv7: {error}",
+                        row.target_id
+                    ))
+                })?;
+                let locked = sqlx::query(
+                    "UPDATE terminal_sessions SET updated_at = updated_at \
+                     WHERE terminal_id = ? AND user_id = ?",
+                )
+                .bind(target.as_str())
+                .bind(&row.user_id)
+                .execute(&mut *transaction)
+                .await?;
+                if locked.rows_affected() == 0 {
+                    return Err(DbError::Conflict(
+                        "IDMM terminal target owner mismatch".into(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(DbError::Conflict(format!(
+                    "unsupported IDMM target kind '{}'",
+                    row.target_kind
+                )));
+            }
+        }
+        let inserted = sqlx::query_as::<_, IdmmInterventionRow>(
             "INSERT INTO idmm_interventions (\
-                id, user_id, target_kind, target_id, watch, at, signal, tier_used, category, \
+                intervention_id, user_id, target_kind, target_id, watch, at, signal, tier_used, category, \
                 action, detail, reason, confidence, bypass_model, outcome\
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+            RETURNING *",
         )
-        .bind(&row.id)
+        .bind(intervention_id.as_str())
         .bind(&row.user_id)
         .bind(&row.target_kind)
         .bind(&row.target_id)
@@ -39,7 +99,7 @@ impl IIdmmInterventionRepository for SqliteIdmmInterventionRepository {
         .bind(row.confidence)
         .bind(&row.bypass_model)
         .bind(&row.outcome)
-        .execute(&self.pool)
+        .fetch_one(&mut *transaction)
         .await?;
 
         // 激进淘汰:每写入即把该 target 裁到最近 PER_TARGET_CAP 条(数据可丢)。
@@ -56,10 +116,11 @@ impl IIdmmInterventionRepository for SqliteIdmmInterventionRepository {
         .bind(&row.target_kind)
         .bind(&row.target_id)
         .bind(PER_TARGET_CAP)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
 
-        Ok(())
+        transaction.commit().await?;
+        Ok(inserted)
     }
 
     async fn list_for_target(
@@ -154,10 +215,11 @@ mod tests {
     use super::*;
     use crate::init_database_memory;
 
-    const CONVERSATION_A: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678901";
-    const CONVERSATION_B: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678902";
-    const OWNER_B_CONVERSATION: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678903";
-    const TERMINAL_A: &str = "term_0190f5fe-7c00-7a00-8abc-012345678901";
+    const CONVERSATION_A: &str = "0190f5fe-7c00-7a00-8abc-012345678901";
+    const CONVERSATION_B: &str = "0190f5fe-7c00-7a00-8abc-012345678902";
+    const OWNER_B_CONVERSATION: &str = "0190f5fe-7c00-7a00-8abc-012345678903";
+    const TERMINAL_A: &str = "0190f5fe-7c00-7a00-8abc-012345678901";
+    const OWNER_B: &str = "0190f5fe-7c00-7a00-8abc-012345678904";
 
     async fn setup() -> (SqliteIdmmInterventionRepository, crate::Database, String) {
         let db = init_database_memory().await.unwrap();
@@ -165,7 +227,7 @@ mod tests {
         for (id, name) in [(CONVERSATION_A, "conversation-a"), (CONVERSATION_B, "conversation-b")] {
             sqlx::query(
                 "INSERT INTO conversations \
-                 (id, user_id, name, type, extra, status, created_at, updated_at) \
+                 (conversation_id, user_id, name, type, extra, status, created_at, updated_at) \
                  VALUES (?, ?, ?, 'nomi', '{}', 'pending', 1, 1)",
             )
             .bind(id)
@@ -177,7 +239,7 @@ mod tests {
         }
         sqlx::query(
             "INSERT INTO terminal_sessions \
-             (id, name, cwd, command, args, created_at, updated_at, user_id) \
+             (terminal_id, name, cwd, command, args, created_at, updated_at, user_id) \
              VALUES (?, 'terminal-a', '/tmp', '$SHELL', '[]', 1, 1, ?)",
         )
         .bind(TERMINAL_A)
@@ -191,7 +253,7 @@ mod tests {
 
     async fn insert_user(db: &crate::Database, id: &str) {
         sqlx::query(
-            "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
+            "INSERT INTO users (user_id, username, password_hash, created_at, updated_at) \
              VALUES (?, ?, 'hash', 1, 1)",
         )
         .bind(id)
@@ -201,7 +263,7 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO conversations \
-             (id, user_id, name, type, extra, status, delegation_policy, created_at, updated_at) \
+             (conversation_id, user_id, name, type, extra, status, delegation_policy, created_at, updated_at) \
              VALUES (?, ?, 'owner-b-conversation', 'nomi', '{}', 'pending', 'disabled', 1, 1)",
         )
         .bind(OWNER_B_CONVERSATION)
@@ -213,23 +275,21 @@ mod tests {
 
     fn sample_row(
         installation_owner: &str,
-        id: &str,
         target_kind: &str,
         target_id: &str,
         at: i64,
-    ) -> IdmmInterventionRow {
-        sample_row_for_user(installation_owner, id, target_kind, target_id, at)
+    ) -> NewIdmmInterventionRow {
+        sample_row_for_user(installation_owner, target_kind, target_id, at)
     }
 
     fn sample_row_for_user(
         user_id: &str,
-        id: &str,
         target_kind: &str,
         target_id: &str,
         at: i64,
-    ) -> IdmmInterventionRow {
-        IdmmInterventionRow {
-            id: id.to_string(),
+    ) -> NewIdmmInterventionRow {
+        NewIdmmInterventionRow {
+            intervention_id: nomifun_common::IdmmInterventionId::new().into_string(),
             user_id: user_id.to_string(),
             target_kind: target_kind.to_string(),
             target_id: target_id.to_string(),
@@ -250,33 +310,33 @@ mod tests {
     #[tokio::test]
     async fn insert_then_list_returns_recent_first() {
         let (repo, _db, owner) = setup().await;
-        repo.insert(&sample_row(&owner, "idmmrec_a", "conversation", CONVERSATION_A, 10))
+        let first = repo.insert(&sample_row(&owner, "conversation", CONVERSATION_A, 10))
             .await
             .unwrap();
-        repo.insert(&sample_row(&owner, "idmmrec_b", "conversation", CONVERSATION_A, 30))
+        let second = repo.insert(&sample_row(&owner, "conversation", CONVERSATION_A, 30))
             .await
             .unwrap();
-        repo.insert(&sample_row(&owner, "idmmrec_c", "conversation", CONVERSATION_A, 20))
+        let third = repo.insert(&sample_row(&owner, "conversation", CONVERSATION_A, 20))
             .await
             .unwrap();
+        assert_eq!([first.id, second.id, third.id], [1, 2, 3]);
 
         let rows = repo
             .list_for_target(&owner, "conversation", CONVERSATION_A, 100)
             .await
             .unwrap();
-        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
         // 按 at DESC:30 -> 20 -> 10。
-        assert_eq!(ids, vec!["idmmrec_b", "idmmrec_c", "idmmrec_a"]);
+        assert_eq!(ids, vec![2, 3, 1]);
     }
 
     #[tokio::test]
     async fn insert_prunes_to_per_target_cap() {
         let (repo, _db, owner) = setup().await;
-        // 插 35 条,at 递增(at=i 对应 id idmmrec_i)。
+        // 插 35 条,at 递增(at=i 对应正整数本地 id=i+1)。
         for i in 0..35 {
             repo.insert(&sample_row(
                 &owner,
-                &format!("idmmrec_{i:02}"),
                 "conversation",
                 CONVERSATION_A,
                 i,
@@ -293,28 +353,28 @@ mod tests {
         assert_eq!(rows.len(), 30);
 
         // 最旧 5 条(at 0..=4)应已被裁掉。
-        let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
         for i in 0..5 {
-            let stale = format!("idmmrec_{i:02}");
+            let stale = i + 1;
             assert!(!ids.contains(&stale), "oldest id {stale} should have been evicted");
         }
         // 最新一条仍在。
-        assert!(ids.contains(&"idmmrec_34".to_string()));
+        assert!(ids.contains(&35));
         // 最旧的留存项是 at=5。
         let oldest = rows.last().unwrap();
-        assert_eq!(oldest.id, "idmmrec_05");
+        assert_eq!(oldest.id, 6);
     }
 
     #[tokio::test]
     async fn delete_for_target_removes_only_that_target() {
         let (repo, _db, owner) = setup().await;
-        repo.insert(&sample_row(&owner, "idmmrec_c1a", "conversation", CONVERSATION_A, 10))
+        repo.insert(&sample_row(&owner, "conversation", CONVERSATION_A, 10))
             .await
             .unwrap();
-        repo.insert(&sample_row(&owner, "idmmrec_c1b", "conversation", CONVERSATION_A, 20))
+        repo.insert(&sample_row(&owner, "conversation", CONVERSATION_A, 20))
             .await
             .unwrap();
-        repo.insert(&sample_row(&owner, "idmmrec_t1a", "terminal", TERMINAL_A, 15))
+        repo.insert(&sample_row(&owner, "terminal", TERMINAL_A, 15))
             .await
             .unwrap();
 
@@ -335,16 +395,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].id, "idmmrec_t1a");
+        assert_eq!(remaining[0].id, 3);
     }
 
     #[tokio::test]
     async fn sweep_removes_older_than_cutoff() {
         let (repo, _db, owner) = setup().await;
-        repo.insert(&sample_row(&owner, "idmmrec_old", "conversation", CONVERSATION_A, 100))
+        repo.insert(&sample_row(&owner, "conversation", CONVERSATION_A, 100))
             .await
             .unwrap();
-        repo.insert(&sample_row(&owner, "idmmrec_new", "conversation", CONVERSATION_A, 1000))
+        repo.insert(&sample_row(&owner, "conversation", CONVERSATION_A, 1000))
             .await
             .unwrap();
 
@@ -357,53 +417,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, "idmmrec_new");
+        assert_eq!(rows[0].id, 2);
     }
 
     #[tokio::test]
     async fn list_recent_is_owner_scoped_cross_target_recent_first_capped() {
         let (repo, _db, owner) = setup().await;
         // 跨多个 target 写入,at 交错。
-        repo.insert(&sample_row(&owner, "idmmrec_c1a", "conversation", CONVERSATION_A, 10))
+        repo.insert(&sample_row(&owner, "conversation", CONVERSATION_A, 10))
             .await
             .unwrap();
-        repo.insert(&sample_row(&owner, "idmmrec_t1a", "terminal", TERMINAL_A, 40))
+        repo.insert(&sample_row(&owner, "terminal", TERMINAL_A, 40))
             .await
             .unwrap();
-        repo.insert(&sample_row(&owner, "idmmrec_c2a", "conversation", CONVERSATION_B, 20))
+        repo.insert(&sample_row(&owner, "conversation", CONVERSATION_B, 20))
             .await
             .unwrap();
-        repo.insert(&sample_row(&owner, "idmmrec_t1b", "terminal", TERMINAL_A, 30))
+        repo.insert(&sample_row(&owner, "terminal", TERMINAL_A, 30))
             .await
             .unwrap();
 
         // 跨全部 target 按 at DESC:40 -> 30 -> 20 -> 10。
         let rows = repo.list_recent(&owner, 100).await.unwrap();
-        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
-        assert_eq!(ids, vec!["idmmrec_t1a", "idmmrec_t1b", "idmmrec_c2a", "idmmrec_c1a"]);
+        let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![2, 4, 3, 1]);
 
         // limit 封顶,仍取最近的。
         let capped = repo.list_recent(&owner, 2).await.unwrap();
-        let ids: Vec<&str> = capped.iter().map(|r| r.id.as_str()).collect();
-        assert_eq!(ids, vec!["idmmrec_t1a", "idmmrec_t1b"]);
+        let ids: Vec<i64> = capped.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![2, 4]);
     }
 
     #[tokio::test]
     async fn clear_all_empties_only_the_owners_activity_and_returns_count() {
         let (repo, db, owner) = setup().await;
-        insert_user(&db, "owner-b").await;
-        repo.insert(&sample_row(&owner, "idmmrec_c1a", "conversation", CONVERSATION_A, 10))
+        insert_user(&db, OWNER_B).await;
+        repo.insert(&sample_row(&owner, "conversation", CONVERSATION_A, 10))
             .await
             .unwrap();
-        repo.insert(&sample_row(&owner, "idmmrec_t1a", "terminal", TERMINAL_A, 20))
+        repo.insert(&sample_row(&owner, "terminal", TERMINAL_A, 20))
             .await
             .unwrap();
-        repo.insert(&sample_row(&owner, "idmmrec_c2a", "conversation", CONVERSATION_B, 30))
+        repo.insert(&sample_row(&owner, "conversation", CONVERSATION_B, 30))
             .await
             .unwrap();
         repo.insert(&sample_row_for_user(
-            "owner-b",
-            "idmmrec_other",
+            OWNER_B,
             "conversation",
             OWNER_B_CONVERSATION,
             40,
@@ -415,20 +474,19 @@ mod tests {
         assert_eq!(removed, 3);
 
         assert!(repo.list_recent(&owner, 100).await.unwrap().is_empty());
-        let other = repo.list_recent("owner-b", 100).await.unwrap();
+        let other = repo.list_recent(OWNER_B, 100).await.unwrap();
         assert_eq!(other.len(), 1);
-        assert_eq!(other[0].id, "idmmrec_other");
+        assert_eq!(other[0].id, 4);
     }
 
     #[tokio::test]
     async fn target_queries_and_pruning_are_partitioned_by_owner() {
         let (repo, db, owner) = setup().await;
-        insert_user(&db, "owner-b").await;
+        insert_user(&db, OWNER_B).await;
 
         for i in 0..35 {
             repo.insert(&sample_row(
                 &owner,
-                &format!("idmmrec_a_{i:02}"),
                 "conversation",
                 CONVERSATION_A,
                 i,
@@ -436,8 +494,7 @@ mod tests {
                 .await
                 .unwrap();
             repo.insert(&sample_row_for_user(
-                "owner-b",
-                &format!("idmmrec_b_{i:02}"),
+                OWNER_B,
                 "conversation",
                 OWNER_B_CONVERSATION,
                 i,
@@ -451,23 +508,22 @@ mod tests {
             .await
             .unwrap();
         let owner_b = repo
-            .list_for_target("owner-b", "conversation", OWNER_B_CONVERSATION, 100)
+            .list_for_target(OWNER_B, "conversation", OWNER_B_CONVERSATION, 100)
             .await
             .unwrap();
         assert_eq!(owner_a.len(), PER_TARGET_CAP as usize);
         assert_eq!(owner_b.len(), PER_TARGET_CAP as usize);
         assert!(owner_a.iter().all(|row| row.user_id == owner));
-        assert!(owner_b.iter().all(|row| row.user_id == "owner-b"));
+        assert!(owner_b.iter().all(|row| row.user_id == OWNER_B));
     }
 
     #[tokio::test]
     async fn intervention_owner_cannot_forge_another_users_target() {
         let (repo, db, _owner) = setup().await;
-        insert_user(&db, "owner-b").await;
+        insert_user(&db, OWNER_B).await;
 
         let forged = sample_row_for_user(
-            "owner-b",
-            "idmmrec_forged",
+            OWNER_B,
             "conversation",
             CONVERSATION_A,
             10,
@@ -482,11 +538,10 @@ mod tests {
     #[tokio::test]
     async fn sweep_cap_is_enforced_independently_per_owner() {
         let (repo, db, owner) = setup().await;
-        insert_user(&db, "owner-b").await;
+        insert_user(&db, OWNER_B).await;
         for i in 0..4 {
             repo.insert(&sample_row(
                 &owner,
-                &format!("idmmrec_a_cap_{i}"),
                 "conversation",
                 CONVERSATION_A,
                 i,
@@ -494,8 +549,7 @@ mod tests {
                 .await
                 .unwrap();
             repo.insert(&sample_row_for_user(
-                "owner-b",
-                &format!("idmmrec_b_cap_{i}"),
+                OWNER_B,
                 "conversation",
                 OWNER_B_CONVERSATION,
                 i,
@@ -506,6 +560,6 @@ mod tests {
 
         assert_eq!(repo.sweep_all_owners(i64::MIN, 2).await.unwrap(), 4);
         assert_eq!(repo.list_recent(&owner, 100).await.unwrap().len(), 2);
-        assert_eq!(repo.list_recent("owner-b", 100).await.unwrap().len(), 2);
+        assert_eq!(repo.list_recent(OWNER_B, 100).await.unwrap().len(), 2);
     }
 }

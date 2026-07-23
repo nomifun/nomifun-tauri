@@ -44,10 +44,10 @@ pub fn validate_artifact_receipt_integrity(
     let mut canonical_paths = HashSet::with_capacity(artifacts.len());
     let mut relative_paths = HashSet::with_capacity(artifacts.len());
     for artifact in artifacts {
-        if artifact.id.trim().is_empty() {
+        if let Err(error) = nomifun_common::PersistedArtifactId::parse(&artifact.id) {
             return Err(format!(
-                "tool '{}' reported an artifact with an empty id",
-                tool_name
+                "tool '{}' reported a non-canonical artifact id '{}': {error}",
+                tool_name, artifact.id
             ));
         }
         if !artifact_ids.insert(artifact.id.as_str()) {
@@ -231,11 +231,12 @@ pub struct ToolGroupEntry {
 mod tests {
     use super::*;
     use crate::artifact_store::ArtifactKind;
+    use nomifun_common::PersistedArtifactId;
     use serde_json::json;
 
     fn image(path: &str, relative_path: &str) -> PersistedArtifact {
         PersistedArtifact {
-            id: format!("artifact-{relative_path}"),
+            id: PersistedArtifactId::new().into_string(),
             kind: ArtifactKind::Image,
             mime_type: "image/png".to_owned(),
             path: path.to_owned(),
@@ -281,7 +282,7 @@ mod tests {
             image("/workspace/b.png", "nomifun-artifacts/b.png"),
         ]));
 
-        assert!(result.unwrap_err().contains("artifact with an empty id"));
+        assert!(result.unwrap_err().contains("non-canonical artifact id"));
     }
 
     #[test]
@@ -301,7 +302,7 @@ mod tests {
     #[test]
     fn duplicate_relative_path_cannot_satisfy_requested_count() {
         let mut second = image("/workspace/b.png", "nomifun-artifacts/a.png");
-        second.id = "artifact-relative-alias".to_owned();
+        second.id = PersistedArtifactId::new().into_string();
         let result = validate_completed_artifact_contract(&completed_images(vec![
             image("/workspace/a.png", "nomifun-artifacts/a.png"),
             second,

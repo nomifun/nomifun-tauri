@@ -32,10 +32,10 @@ const resolveMood = (value: string | undefined, fallback: CompanionMood): Compan
   value && KNOWN_MOODS.has(value as CompanionMood) ? (value as CompanionMood) : fallback;
 
 const companionToPosterFigure = (companion: ICompanionWithStatus, index: number): PosterFigure => ({
-  id: companion.id,
+  id: companion.companion_id,
   name: companion.name,
   character: companion.character,
-  companionId: companion.id,
+  companionId: companion.companion_id,
   customFigure: customFigureMetaOf(companion),
   mood: resolveMood(companion.status?.mood, POSTER_MOODS[index % POSTER_MOODS.length]),
   activity: companion.status?.last_learn?.status === 'running' ? 'thinking' : 'idle',

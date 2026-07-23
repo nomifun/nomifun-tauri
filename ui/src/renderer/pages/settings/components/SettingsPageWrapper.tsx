@@ -101,7 +101,7 @@ const SettingsPageWrapper: React.FC<SettingsPageWrapperProps> = ({ children, cla
         unanchored.push(tab);
         continue;
       }
-      const { relativeTo: rawAnchor, placement } = tab.position;
+      const { relative_to: rawAnchor, placement } = tab.position;
       const anchor = LEGACY_ANCHOR_REMAP[rawAnchor] ?? rawAnchor;
       if (!result.some((item) => item.id === anchor)) {
         unanchored.push(tab);

@@ -8,7 +8,10 @@
 //! OC-1, SR-1, ICronService trait integration.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use nomifun_ai_agent::AgentRegistry;
 use nomifun_ai_agent::runtime_handle::AgentRuntimeHandle;
@@ -17,7 +20,7 @@ use nomifun_api_types::{
     CreateCronJobRequest, CronAgentConfigDto, CronScheduleDto, ListCronJobsQuery,
     SaveCronSkillRequest, UpdateCronJobRequest, WebSocketMessage,
 };
-use nomifun_common::{ConversationArtifactId, PaginatedResult, TimestampMs, now_ms};
+use nomifun_common::{PaginatedResult, TimestampMs, now_ms};
 use nomifun_conversation::ConversationService;
 use nomifun_conversation::response_middleware::{CronCreateParams, CronUpdateParams};
 use nomifun_db::{
@@ -36,31 +39,32 @@ use nomifun_cron::service::CronService;
 use nomifun_cron::skill_file::{has_skill_file, write_raw_skill_file};
 use nomifun_cron::types::JobStatus;
 
-const TEST_USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
-const CONV_1: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678901";
-const CONV_2: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678902";
-const CONV_3: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678903";
-const CONV_4: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678904";
-const CONV_5: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678905";
-const CONV_6: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678906";
-const CONV_7: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678907";
-const CONV_8: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678908";
-const CONV_MISSING: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678909";
-const CONV_MODE: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678910";
-const CONV_MODE_DEFAULT: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678911";
-const CONV_MODE_CODEX: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678912";
-const CONV_MODE_CLAUDE: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678913";
-const CONV_MODE_NOMI: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678914";
-const MISSING_JOB_ID: &str = "cron_0190f5fe-7c00-7a00-8000-000000009999";
-const SECONDARY_USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000002";
-const SAFE_PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000002";
-const FOREIGN_USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000003";
-const OWNER_A_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000004";
-const OWNER_B_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000005";
-const GEMINI_PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000003";
-const CODEX_PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000004";
-const CLAUDE_PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000005";
-const NOMI_PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000006";
+const TEST_USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+const CONV_1: &str = "0190f5fe-7c00-7a00-8abc-012345678901";
+const CONV_2: &str = "0190f5fe-7c00-7a00-8abc-012345678902";
+const CONV_3: &str = "0190f5fe-7c00-7a00-8abc-012345678903";
+const CONV_4: &str = "0190f5fe-7c00-7a00-8abc-012345678904";
+const CONV_5: &str = "0190f5fe-7c00-7a00-8abc-012345678905";
+const CONV_6: &str = "0190f5fe-7c00-7a00-8abc-012345678906";
+const CONV_7: &str = "0190f5fe-7c00-7a00-8abc-012345678907";
+const CONV_8: &str = "0190f5fe-7c00-7a00-8abc-012345678908";
+const CONV_MISSING: &str = "0190f5fe-7c00-7a00-8abc-012345678909";
+const CONV_MODE: &str = "0190f5fe-7c00-7a00-8abc-012345678910";
+const CONV_MODE_DEFAULT: &str = "0190f5fe-7c00-7a00-8abc-012345678911";
+const CONV_MODE_CODEX: &str = "0190f5fe-7c00-7a00-8abc-012345678912";
+const CONV_MODE_CLAUDE: &str = "0190f5fe-7c00-7a00-8abc-012345678913";
+const CONV_MODE_NOMI: &str = "0190f5fe-7c00-7a00-8abc-012345678914";
+const ARTIFACT_1: &str = "0190f5fe-7c00-7a00-8abc-012345678915";
+const MISSING_JOB_ID: &str = "0190f5fe-7c00-7a00-8abc-ffffffffffff";
+const SECONDARY_USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+const SAFE_PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+const FOREIGN_USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000003";
+const OWNER_A_ID: &str = "0190f5fe-7c00-7a00-8000-000000000004";
+const OWNER_B_ID: &str = "0190f5fe-7c00-7a00-8000-000000000005";
+const GEMINI_PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000003";
+const CODEX_PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000004";
+const CLAUDE_PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000005";
+const NOMI_PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000006";
 
 async fn init_database_memory() -> Result<nomifun_db::Database, nomifun_db::DbError> {
     nomifun_db::init_database_memory_with_owner(
@@ -146,6 +150,7 @@ struct StubConvRepo {
     messages: Mutex<Vec<MessageRow>>,
     artifacts: Mutex<Vec<nomifun_db::ConversationArtifactRow>>,
     rows: Mutex<HashMap<String, nomifun_db::models::ConversationRow>>,
+    fail_cron_binding: AtomicBool,
 }
 
 impl StubConvRepo {
@@ -154,7 +159,12 @@ impl StubConvRepo {
             messages: Mutex::new(Vec::new()),
             artifacts: Mutex::new(Vec::new()),
             rows: Mutex::new(HashMap::new()),
+            fail_cron_binding: AtomicBool::new(false),
         }
+    }
+
+    fn set_fail_cron_binding(&self, fail: bool) {
+        self.fail_cron_binding.store(fail, Ordering::SeqCst);
     }
 
     fn take_messages(&self) -> Vec<MessageRow> {
@@ -162,12 +172,12 @@ impl StubConvRepo {
         std::mem::take(&mut *guard)
     }
 
-    fn upsert_artifact_row(&self, mut artifact: nomifun_db::ConversationArtifactRow) {
+    fn upsert_artifact_row(&self, artifact: nomifun_db::ConversationArtifactRow) {
         let mut guard = self.artifacts.lock().unwrap();
-        if artifact.id.is_empty() {
-            artifact.id = ConversationArtifactId::new().into_string();
-        }
-        if let Some(existing) = guard.iter_mut().find(|row| row.id == artifact.id) {
+        if let Some(existing) = guard
+            .iter_mut()
+            .find(|row| row.conversation_artifact_id == artifact.conversation_artifact_id)
+        {
             *existing = artifact;
         } else {
             guard.push(artifact);
@@ -198,7 +208,8 @@ impl IConversationRepository for StubConvRepo {
         let row = if id == CONV_MODE {
             // conv_mode
             nomifun_db::models::ConversationRow {
-                id: id.to_owned(),
+                id: 0,
+                conversation_id: id.to_owned(),
                 user_id: TEST_USER_ID.into(),
                 name: "Gemini Chat".into(),
                 r#type: "acp".into(),
@@ -237,7 +248,8 @@ impl IConversationRepository for StubConvRepo {
         } else if id == CONV_MODE_DEFAULT {
             // conv_mode_default
             nomifun_db::models::ConversationRow {
-                id: id.to_owned(),
+                id: 0,
+                conversation_id: id.to_owned(),
                 user_id: TEST_USER_ID.into(),
                 name: "Gemini Default Chat".into(),
                 r#type: "acp".into(),
@@ -276,7 +288,8 @@ impl IConversationRepository for StubConvRepo {
         } else if id == CONV_MODE_CODEX {
             // conv_mode_codex
             nomifun_db::models::ConversationRow {
-                id: id.to_owned(),
+                id: 0,
+                conversation_id: id.to_owned(),
                 user_id: TEST_USER_ID.into(),
                 name: "Codex Chat".into(),
                 r#type: "acp".into(),
@@ -315,7 +328,8 @@ impl IConversationRepository for StubConvRepo {
         } else if id == CONV_MODE_CLAUDE {
             // conv_mode_claude
             nomifun_db::models::ConversationRow {
-                id: id.to_owned(),
+                id: 0,
+                conversation_id: id.to_owned(),
                 user_id: TEST_USER_ID.into(),
                 name: "Claude Chat".into(),
                 r#type: "acp".into(),
@@ -354,7 +368,8 @@ impl IConversationRepository for StubConvRepo {
         } else if id == CONV_MODE_NOMI {
             // conv_mode_nomi
             nomifun_db::models::ConversationRow {
-                id: id.to_owned(),
+                id: 0,
+                conversation_id: id.to_owned(),
                 user_id: TEST_USER_ID.into(),
                 name: "Nomi Chat".into(),
                 r#type: "nomi".into(),
@@ -392,10 +407,11 @@ impl IConversationRepository for StubConvRepo {
             }
         } else {
             nomifun_db::models::ConversationRow {
-                id: id.to_owned(),
+                id: 0,
+                conversation_id: id.to_owned(),
                 user_id: TEST_USER_ID.into(),
                 name: "stub".into(),
-                r#type: "default".into(),
+                r#type: "acp".into(),
                 delegation_policy: "automatic".into(),
                 execution_model_pool: None,
                 decision_policy: "automatic".into(),
@@ -404,7 +420,7 @@ impl IConversationRepository for StubConvRepo {
                 status: Some("active".into()),
                 source: None,
                 channel_chat_id: None,
-                extra: "{}".into(),
+                extra: r#"{"workspace":"/tmp/cron-test-workspace"}"#.into(),
                 pinned: false,
                 pinned_at: None,
                 cron_job_id: None,
@@ -426,22 +442,33 @@ impl IConversationRepository for StubConvRepo {
         self.rows
             .lock()
             .unwrap()
-            .insert(row.id.clone(), row.clone());
-        Ok(row.id.clone())
+            .insert(row.conversation_id.clone(), row.clone());
+        Ok(row.conversation_id.clone())
     }
     async fn update(
         &self,
         id: &str,
         updates: &ConversationRowUpdate,
     ) -> Result<(), nomifun_db::DbError> {
+        if updates
+            .cron_job_id
+            .as_ref()
+            .is_some_and(|cron_job_id| cron_job_id.is_some())
+            && self.fail_cron_binding.load(Ordering::SeqCst)
+        {
+            return Err(nomifun_db::DbError::Conflict(
+                "fixture cron binding failure".into(),
+            ));
+        }
         let mut rows = self.rows.lock().unwrap();
         let row = rows
             .entry(id.to_owned())
             .or_insert_with(|| nomifun_db::models::ConversationRow {
-                id: id.to_owned(),
+                id: 0,
+                conversation_id: id.to_owned(),
                 user_id: TEST_USER_ID.into(),
                 name: "stub".into(),
-                r#type: "default".into(),
+                r#type: "acp".into(),
                 delegation_policy: "automatic".into(),
                 execution_model_pool: None,
                 decision_policy: "automatic".into(),
@@ -450,7 +477,7 @@ impl IConversationRepository for StubConvRepo {
                 status: Some("active".into()),
                 source: None,
                 channel_chat_id: None,
-                extra: "{}".into(),
+                extra: r#"{"workspace":"/tmp/cron-test-workspace"}"#.into(),
                 pinned: false,
                 pinned_at: None,
                 cron_job_id: None,
@@ -583,14 +610,17 @@ impl IConversationRepository for StubConvRepo {
     async fn get_artifact(
         &self,
         conversation_id: &str,
-        artifact_id: &str,
+        conversation_artifact_id: &str,
     ) -> Result<Option<nomifun_db::ConversationArtifactRow>, nomifun_db::DbError> {
         Ok(self
             .artifacts
             .lock()
             .unwrap()
             .iter()
-            .find(|row| row.conversation_id == conversation_id && row.id == artifact_id)
+            .find(|row| {
+                row.conversation_id == conversation_id
+                    && row.conversation_artifact_id == conversation_artifact_id
+            })
             .cloned())
     }
     async fn upsert_artifact(
@@ -607,27 +637,28 @@ impl IConversationRepository for StubConvRepo {
                     && row.cron_job_id == artifact.cron_job_id
             })
         {
-            let id = existing.id.clone();
+            let conversation_artifact_id = existing.conversation_artifact_id.clone();
             *existing = artifact.clone();
-            existing.id = id;
+            existing.conversation_artifact_id = conversation_artifact_id;
             return Ok(existing.clone());
         }
-        let mut stored = artifact.clone();
-        stored.id = ConversationArtifactId::new().into_string();
-        guard.push(stored.clone());
-        Ok(stored)
+        guard.push(artifact.clone());
+        Ok(artifact.clone())
     }
     async fn update_artifact_status(
         &self,
         conversation_id: &str,
-        artifact_id: &str,
+        conversation_artifact_id: &str,
         status: &str,
         updated_at: TimestampMs,
     ) -> Result<Option<nomifun_db::ConversationArtifactRow>, nomifun_db::DbError> {
         let mut guard = self.artifacts.lock().unwrap();
         let Some(existing) = guard
             .iter_mut()
-            .find(|row| row.conversation_id == conversation_id && row.id == artifact_id)
+            .find(|row| {
+                row.conversation_id == conversation_id
+                    && row.conversation_artifact_id == conversation_artifact_id
+            })
         else {
             return Ok(None);
         };
@@ -673,14 +704,36 @@ async fn setup_with_conv_repo() -> (
     let pool = db.pool().clone();
     let cron_repo: Arc<dyn ICronRepository> = Arc::new(SqliteCronRepository::new(pool.clone()));
 
-    sqlx::query("UPDATE users SET password_hash='hash' WHERE id = ?")
-    .bind(TEST_USER_ID)
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("UPDATE users SET password_hash='hash' WHERE user_id = ?")
+        .bind(TEST_USER_ID)
+        .execute(&pool)
+        .await
+        .unwrap();
 
-    // Seed canonical conversation IDs into the real DB so cron-job foreign keys
-    // exercise the same string-only ID contract as production.
+    for (provider_id, name) in [
+        (SAFE_PROVIDER_ID, "safe"),
+        (GEMINI_PROVIDER_ID, "gemini"),
+        (CODEX_PROVIDER_ID, "codex"),
+        (CLAUDE_PROVIDER_ID, "claude"),
+        (NOMI_PROVIDER_ID, "nomi"),
+    ] {
+        sqlx::query(
+            "INSERT INTO providers (\
+                provider_id, platform, name, base_url, api_key_encrypted, models, enabled, \
+                capabilities, created_at, updated_at\
+             ) VALUES (?, 'openai', ?, 'https://example.invalid', 'encrypted', \
+                       '[\"model-safe\",\"gemini-2.5-pro\",\"claude-sonnet-4-20250514\"]', \
+                       1, '[]', 1, 1)",
+        )
+        .bind(provider_id)
+        .bind(name)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // Seed canonical conversation business IDs into the real DB so logical Cron relations
+    // exercise the same UUIDv7 conversation contract as production.
     {
         let real_conv_repo = SqliteConversationRepository::new(pool.clone());
         for id in [
@@ -701,11 +754,12 @@ async fn setup_with_conv_repo() -> (
         ] {
             real_conv_repo
                 .create(&nomifun_db::models::ConversationRow {
-                    id: id.to_owned(),
+                    id: 0,
+                    conversation_id: id.to_owned(),
                     user_id: TEST_USER_ID.into(),
                     name: "Seed Conversation".into(),
                     r#type: "acp".into(),
-                    extra: "{}".into(),
+                    extra: r#"{"workspace":"/tmp/cron-test-workspace"}"#.into(),
                     delegation_policy: "automatic".into(),
                     execution_model_pool: None,
                     decision_policy: "automatic".into(),
@@ -814,12 +868,26 @@ fn make_create_req(name: &str, schedule: CronScheduleDto) -> CreateCronJobReques
         schedule,
         prompt: None,
         message: Some("test message".into()),
-        conversation_id: Some(CONV_1.to_owned()),
-        conversation_title: Some("Test Conv".into()),
+        conversation_id: None,
+        conversation_title: None,
         agent_type: "acp".into(),
         created_by: "user".into(),
         execution_mode: None,
-        agent_config: None,
+        agent_config: Some(CronAgentConfigDto {
+            backend: Some("gemini".into()),
+            name: "Gemini".into(),
+            cli_path: None,
+            custom_agent_id: None,
+            preset_id: None,
+            preset_revision: None,
+            preset_snapshot: None,
+            mode: None,
+            model: None,
+            provider_id: None,
+            config_options: None,
+            workspace: None,
+            clear_context_each_run: false,
+        }),
     }
 }
 
@@ -851,7 +919,7 @@ async fn secondary_cron_keeps_model_selection_but_cannot_gain_host_configuration
         setup_with_conv_repo().await;
     let secondary = SECONDARY_USER_ID;
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
+        "INSERT INTO users (user_id, username, password_hash, created_at, updated_at) \
          VALUES (?, 'secondary-cron-user', 'hash', 1, 1)",
     )
     .bind(secondary)
@@ -874,7 +942,7 @@ async fn secondary_cron_keeps_model_selection_but_cannot_gain_host_configuration
                 created_by: "user".into(),
                 execution_mode: Some("new_conversation".into()),
                 agent_config: Some(CronAgentConfigDto {
-                    backend: SAFE_PROVIDER_ID.into(),
+                    backend: None,
                     name: "Nomi".into(),
                     cli_path: Some("/bin/sh".into()),
                     custom_agent_id: Some("custom-host-agent".into()),
@@ -882,7 +950,8 @@ async fn secondary_cron_keeps_model_selection_but_cannot_gain_host_configuration
                     preset_revision: Some(7),
                     preset_snapshot: None,
                     mode: Some("yolo".into()),
-                    model_id: Some("model-safe".into()),
+                    model: Some("model-safe".into()),
+                    provider_id: Some(SAFE_PROVIDER_ID.into()),
                     config_options: Some(HashMap::from([("host".into(), "true".into())])),
                     workspace: Some("/unsafe".into()),
                     clear_context_each_run: true,
@@ -893,8 +962,9 @@ async fn secondary_cron_keeps_model_selection_but_cannot_gain_host_configuration
         .unwrap();
 
     let config = job.agent_config.as_ref().unwrap();
-    assert_eq!(config.backend, SAFE_PROVIDER_ID);
-    assert_eq!(config.model_id.as_deref(), Some("model-safe"));
+    assert_eq!(config.backend, None);
+    assert_eq!(config.provider_id.as_deref(), Some(SAFE_PROVIDER_ID));
+    assert_eq!(config.model.as_deref(), Some("model-safe"));
     assert!(config.clear_context_each_run);
     assert!(config.cli_path.is_none());
     assert!(config.custom_agent_id.is_none());
@@ -905,9 +975,9 @@ async fn secondary_cron_keeps_model_selection_but_cannot_gain_host_configuration
     assert!(config.workspace.is_none());
 
     let persisted: String = sqlx::query_scalar(
-        "SELECT agent_config FROM cron_jobs WHERE id = ? AND user_id = ?",
+        "SELECT agent_config FROM cron_jobs WHERE cron_job_id = ? AND user_id = ?",
     )
-    .bind(&job.id)
+    .bind(&job.cron_job_id)
     .bind(secondary)
     .fetch_one(&pool)
     .await
@@ -916,7 +986,7 @@ async fn secondary_cron_keeps_model_selection_but_cannot_gain_host_configuration
     let keys = persisted.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
     assert_eq!(
         keys.into_iter().collect::<std::collections::BTreeSet<_>>(),
-        ["backend", "clear_context_each_run", "model_id", "name"]
+        ["clear_context_each_run", "model", "name", "provider_id"]
             .into_iter()
             .map(str::to_owned)
             .collect()
@@ -925,7 +995,7 @@ async fn secondary_cron_keeps_model_selection_but_cannot_gain_host_configuration
     let skill_error = svc
         .save_skill(
             secondary,
-            &job.id,
+            &job.cron_job_id,
             SaveCronSkillRequest {
                 content: "---\nname: forbidden\ndescription: forbidden host skill\n---\nrun host steps".into(),
             },
@@ -939,22 +1009,21 @@ async fn secondary_cron_keeps_model_selection_but_cannot_gain_host_configuration
     let error = svc.add_job(secondary, forbidden).await.unwrap_err();
     assert!(error.to_string().contains("model-only"));
 
-    sqlx::query("UPDATE cron_jobs SET enabled=0, agent_config=NULL WHERE id=?")
-        .bind(&job.id)
+    sqlx::query("UPDATE cron_jobs SET enabled=0, agent_config=NULL WHERE cron_job_id=?")
+        .bind(&job.cron_job_id)
         .execute(&pool)
         .await
         .unwrap();
     let reenable_error = svc
         .update_job(
             secondary,
-            &job.id,
+            &job.cron_job_id,
             UpdateCronJobRequest {
                 name: None,
                 description: None,
                 enabled: Some(true),
                 schedule: None,
                 message: None,
-                execution_mode: None,
                 agent_config: None,
                 conversation_title: None,
                 max_retries: None,
@@ -969,21 +1038,27 @@ async fn secondary_cron_keeps_model_selection_but_cannot_gain_host_configuration
         .await
         .unwrap();
     let skill = "---\nname: retained-owner-skill\ndescription: owner-only scheduled instructions\n---\n\nPerform the scheduled task.";
-    write_raw_skill_file(&data_dir, &job.id, skill)
+    write_raw_skill_file(&data_dir, &job.cron_job_id, skill)
         .await
         .unwrap();
-    write_raw_skill_file(&data_dir, &owner_job.id, skill)
+    svc.save_skill(
+        TEST_USER_ID,
+        &owner_job.cron_job_id,
+        SaveCronSkillRequest {
+            content: skill.into(),
+        },
+    )
         .await
         .unwrap();
 
     svc.init().await;
 
     assert!(
-        !has_skill_file(&data_dir, &job.id).await.unwrap(),
-        "startup reconciliation must delete migrated secondary-user skill directories"
+        !has_skill_file(&data_dir, &job.cron_job_id).await.unwrap(),
+        "startup reconciliation must delete secondary-user skill directories outside the v3 ownership boundary"
     );
     assert!(
-        has_skill_file(&data_dir, &owner_job.id).await.unwrap(),
+        has_skill_file(&data_dir, &owner_job.cron_job_id).await.unwrap(),
         "startup reconciliation must retain the installation owner's skill directory"
     );
 }
@@ -997,7 +1072,11 @@ async fn cj1_create_cron_job() {
 
     let job = svc.add_job(TEST_USER_ID, req).await.unwrap();
 
-    assert!(job.id.starts_with("cron_"));
+    let parsed_job_id =
+        nomifun_common::CronJobId::parse(&job.cron_job_id).expect("created cron job has a canonical UUIDv7 id");
+    assert_eq!(parsed_job_id.as_str(), job.cron_job_id);
+    assert_eq!(job.cron_job_id.len(), 36);
+    assert_eq!(job.cron_job_id, job.cron_job_id.to_ascii_lowercase());
     assert_eq!(job.name, "Daily Report");
     assert!(job.enabled);
     assert!(job.next_run_at.is_some());
@@ -1009,11 +1088,82 @@ async fn cj1_create_cron_job() {
 }
 
 #[tokio::test]
+async fn existing_conversation_binding_failure_compensates_inserted_cron_job() {
+    let (svc, _repo, _events, conversations, pool, _data_dir) =
+        setup_with_conv_repo().await;
+    conversations.set_fail_cron_binding(true);
+
+    let mut request = make_create_req("binding failure", every_60s());
+    request.conversation_id = Some(CONV_1.to_owned());
+    request.execution_mode = Some("existing".into());
+
+    let error = svc.add_job(TEST_USER_ID, request).await.unwrap_err();
+    assert!(error.to_string().contains("fixture cron binding failure"));
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM cron_jobs WHERE user_id = ? AND name = 'binding failure'",
+    )
+    .bind(TEST_USER_ID)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn existing_conversation_binding_failure_compensates_updated_cron_job() {
+    let (svc, _repo, _events, conversations, pool, _data_dir) =
+        setup_with_conv_repo().await;
+    let mut request = make_create_req("before binding failure", every_60s());
+    request.conversation_id = Some(CONV_1.to_owned());
+    let job = svc.add_job(TEST_USER_ID, request).await.unwrap();
+    conversations
+        .update(
+            CONV_1,
+            &ConversationRowUpdate {
+                cron_job_id: Some(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    conversations.set_fail_cron_binding(true);
+
+    let error = svc
+        .update_job(
+            TEST_USER_ID,
+            &job.cron_job_id,
+            UpdateCronJobRequest {
+                name: Some("after binding failure".into()),
+                description: None,
+                enabled: None,
+                schedule: None,
+                message: None,
+                agent_config: None,
+                conversation_title: None,
+                max_retries: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("fixture cron binding failure"));
+
+    let row = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT name, conversation_id FROM cron_jobs WHERE cron_job_id = ?",
+    )
+    .bind(&job.cron_job_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "before binding failure");
+    assert_eq!(row.1.as_deref(), Some(CONV_1));
+}
+
+#[tokio::test]
 async fn cron_crud_run_history_and_skill_boundaries_are_owner_scoped() {
     let (svc, _, _) = setup().await;
     // This boundary test does not exercise a Conversation binding. Keep the
     // aggregate unbound so its result depends only on Cron ownership and host
-    // capability ordering, not on the StubConvRepo's legacy `u1` fixture.
+    // capability ordering, not on the StubConvRepo's fixed `u1` fixture.
     let mut owner_request = make_create_req("Owner Boundary", every_60s());
     owner_request.conversation_id = None;
     owner_request.execution_mode = Some("new_conversation".into());
@@ -1024,7 +1174,7 @@ async fn cron_crud_run_history_and_skill_boundaries_are_owner_scoped() {
     let foreign = FOREIGN_USER_ID;
 
     assert!(matches!(
-        svc.get_job(foreign, &job.id).await,
+        svc.get_job(foreign, &job.cron_job_id).await,
         Err(nomifun_cron::error::CronError::JobNotFound(_))
     ));
     assert!(
@@ -1036,14 +1186,13 @@ async fn cron_crud_run_history_and_skill_boundaries_are_owner_scoped() {
     assert!(matches!(
         svc.update_job(
             foreign,
-            &job.id,
+            &job.cron_job_id,
             UpdateCronJobRequest {
                 name: Some("forged".into()),
                 description: None,
                 enabled: None,
                 schedule: None,
                 message: None,
-                execution_mode: None,
                 agent_config: None,
                 conversation_title: None,
                 max_retries: None,
@@ -1053,21 +1202,21 @@ async fn cron_crud_run_history_and_skill_boundaries_are_owner_scoped() {
         Err(nomifun_cron::error::CronError::JobNotFound(_))
     ));
     assert!(matches!(
-        svc.run_now(foreign, &job.id).await,
+        svc.run_now(foreign, &job.cron_job_id).await,
         Err(nomifun_cron::error::CronError::JobNotFound(_))
     ));
     assert!(matches!(
-        svc.list_runs(foreign, &job.id).await,
+        svc.list_runs(foreign, &job.cron_job_id).await,
         Err(nomifun_cron::error::CronError::JobNotFound(_))
     ));
     assert!(matches!(
-        svc.has_skill(foreign, &job.id).await,
+        svc.has_skill(foreign, &job.cron_job_id).await,
         Err(nomifun_cron::error::CronError::JobNotFound(_))
     ));
     assert!(matches!(
         svc.save_skill(
             foreign,
-            &job.id,
+            &job.cron_job_id,
             SaveCronSkillRequest {
                 content: "---\nname: forged\n---\nForeign content".into(),
             },
@@ -1076,20 +1225,20 @@ async fn cron_crud_run_history_and_skill_boundaries_are_owner_scoped() {
         Err(nomifun_cron::error::CronError::JobNotFound(_))
     ));
     assert!(matches!(
-        svc.delete_skill(foreign, &job.id).await,
+        svc.delete_skill(foreign, &job.cron_job_id).await,
         Err(nomifun_cron::error::CronError::JobNotFound(_))
     ));
 
     // Scheduler callbacks capture the owner at timer installation.  A stale
     // callback (for example after delete/recreate) must not execute the row
     // merely because the opaque job id still exists.
-    svc.tick(foreign, &job.id).await;
+    svc.tick(foreign, &job.cron_job_id).await;
     assert!(matches!(
-        svc.remove_job(foreign, &job.id).await,
+        svc.remove_job(foreign, &job.cron_job_id).await,
         Err(nomifun_cron::error::CronError::JobNotFound(_))
     ));
 
-    let unchanged = svc.get_job(TEST_USER_ID, &job.id).await.unwrap();
+    let unchanged = svc.get_job(TEST_USER_ID, &job.cron_job_id).await.unwrap();
     assert_eq!(unchanged.name, "Owner Boundary");
     assert_eq!(unchanged.run_count, 0);
 
@@ -1098,6 +1247,7 @@ async fn cron_crud_run_history_and_skill_boundaries_are_owner_scoped() {
     // assertion reaches the owner-scoped Conversation lookup rather than being
     // rejected earlier for requesting an ACP host runtime.
     foreign_request.agent_type = "nomi".into();
+    foreign_request.agent_config = None;
     assert!(matches!(
         svc.add_job(foreign, foreign_request).await,
         Err(nomifun_cron::error::CronError::JobNotFound(_))
@@ -1111,7 +1261,7 @@ async fn cj1_private_job_events_are_scoped_to_each_conversation_owner() {
 
     for owner in [OWNER_A_ID, OWNER_B_ID] {
         sqlx::query(
-            "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
+            "INSERT INTO users (user_id, username, password_hash, created_at, updated_at) \
              VALUES (?, ?, 'hash', 0, 0)",
         )
         .bind(owner)
@@ -1122,29 +1272,31 @@ async fn cj1_private_job_events_are_scoped_to_each_conversation_owner() {
     }
     sqlx::query(
         "INSERT INTO providers (\
-            id, platform, name, base_url, api_key_encrypted, models, enabled, \
+            provider_id, platform, name, base_url, api_key_encrypted, models, enabled, \
             capabilities, created_at, updated_at\
-         ) VALUES ('prov_0190f5fe-7c00-7a00-8000-000000000008', 'openai', 'multiuser', \
+         ) VALUES ('0190f5fe-7c00-7a00-8000-000000000008', 'openai', 'multiuser', \
                    'https://example.invalid', 'encrypted', \
                    '[\"model-multiuser\"]', 1, '[]', 1, 1)",
     )
         .execute(&pool)
         .await
         .unwrap();
-    // Ownership is immutable after migration 041, so replace the setup's
-    // installation-owner seed rows with legal model-only rows instead of
-    // rewriting user_id in place.
-    sqlx::query("DELETE FROM conversations WHERE id IN (?, ?)").bind(CONV_1).bind(CONV_2)
+    // Conversation ownership is immutable in the v3 contract. Replace the
+    // setup's installation-owner seed rows with legal model-only rows instead
+    // of rewriting `user_id` in place.
+    sqlx::query("DELETE FROM conversations WHERE conversation_id IN (?, ?)")
+        .bind(CONV_1)
+        .bind(CONV_2)
         .execute(&pool)
         .await
         .unwrap();
     for (id, owner) in [(CONV_1, OWNER_A_ID), (CONV_2, OWNER_B_ID)] {
         sqlx::query(
             "INSERT INTO conversations (\
-                id, user_id, name, type, model, status, delegation_policy, \
+                conversation_id, user_id, name, type, model, status, delegation_policy, \
                 decision_policy, extra, created_at, updated_at\
              ) VALUES (?, ?, 'Private model-only cron conversation', 'nomi', \
-                       '{\"provider_id\":\"prov_0190f5fe-7c00-7a00-8000-000000000008\",\"model\":\"model-multiuser\"}', \
+                       '{\"provider_id\":\"0190f5fe-7c00-7a00-8000-000000000008\",\"model\":\"model-multiuser\"}', \
                        'finished', 'disabled', 'automatic', '{}', 1, 1)",
         )
         .bind(id)
@@ -1160,12 +1312,12 @@ async fn cj1_private_job_events_are_scoped_to_each_conversation_owner() {
     owner_a_conversation.delegation_policy = "disabled".into();
     owner_a_conversation.model = Some(
         serde_json::json!({
-            "provider_id": "prov_0190f5fe-7c00-7a00-8000-000000000008",
+            "provider_id": "0190f5fe-7c00-7a00-8000-000000000008",
             "model": "model-multiuser"
         })
         .to_string(),
     );
-    owner_a_conversation.extra = "{}".into();
+    owner_a_conversation.extra = r#"{"workspace":"/tmp/owner-a-workspace"}"#.into();
     conversation_repo
         .create(&owner_a_conversation)
         .await
@@ -1175,7 +1327,7 @@ async fn cj1_private_job_events_are_scoped_to_each_conversation_owner() {
     owner_b_conversation.r#type = "nomi".into();
     owner_b_conversation.delegation_policy = "disabled".into();
     owner_b_conversation.model = owner_a_conversation.model.clone();
-    owner_b_conversation.extra = "{}".into();
+    owner_b_conversation.extra = r#"{"workspace":"/tmp/owner-b-workspace"}"#.into();
     conversation_repo
         .create(&owner_b_conversation)
         .await
@@ -1184,11 +1336,13 @@ async fn cj1_private_job_events_are_scoped_to_each_conversation_owner() {
     let mut owner_a_job = make_create_req("Owner A Job", every_60s());
     owner_a_job.conversation_id = Some(CONV_1.to_owned());
     owner_a_job.agent_type = "nomi".into();
+    owner_a_job.agent_config = None;
     svc.add_job(OWNER_A_ID, owner_a_job).await.unwrap();
 
     let mut owner_b_job = make_create_req("Owner B Job", every_60s());
     owner_b_job.conversation_id = Some(CONV_2.to_owned());
     owner_b_job.agent_type = "nomi".into();
+    owner_b_job.agent_config = None;
     svc.add_job(OWNER_B_ID, owner_b_job).await.unwrap();
 
     let deliveries = user_events.take_deliveries();
@@ -1236,8 +1390,8 @@ async fn cj4_get_single_job() {
         .await
         .unwrap();
 
-    let fetched = svc.get_job(TEST_USER_ID, &created.id).await.unwrap();
-    assert_eq!(fetched.id, created.id);
+    let fetched = svc.get_job(TEST_USER_ID, &created.cron_job_id).await.unwrap();
+    assert_eq!(fetched.cron_job_id, created.cron_job_id);
     assert_eq!(fetched.name, "Get Test");
 }
 
@@ -1258,10 +1412,10 @@ async fn cj5_get_nonexistent_job() {
 #[tokio::test]
 async fn cj6_list_all_jobs() {
     let (svc, _, _) = setup().await;
-    for i in 0..3 {
-        svc.add_job(TEST_USER_ID, make_create_req(&format!("Job {i}"), every_60s()))
-            .await
-            .unwrap();
+    for (i, conversation_id) in [CONV_1, CONV_2, CONV_3].into_iter().enumerate() {
+        let mut request = make_create_req(&format!("Job {i}"), every_60s());
+        request.conversation_id = Some(conversation_id.to_owned());
+        svc.add_job(TEST_USER_ID, request).await.unwrap();
     }
 
     let jobs = svc.list_jobs(TEST_USER_ID, &ListCronJobsQuery::default()).await.unwrap();
@@ -1279,18 +1433,19 @@ async fn cj7_list_by_conversation() {
     svc.add_job(TEST_USER_ID, req1).await.unwrap();
 
     let mut req2 = make_create_req("Job B", every_60s());
-    req2.conversation_id = Some(CONV_2.to_owned());
+    req2.conversation_id = Some(CONV_3.to_owned());
     svc.add_job(TEST_USER_ID, req2).await.unwrap();
 
     let mut req3 = make_create_req("Job C", every_60s());
-    req3.conversation_id = Some(CONV_3.to_owned());
+    req3.conversation_id = Some(CONV_1.to_owned());
     svc.add_job(TEST_USER_ID, req3).await.unwrap();
 
     let query = ListCronJobsQuery {
         conversation_id: Some(CONV_2.to_owned()),
     };
     let jobs = svc.list_jobs(TEST_USER_ID, &query).await.unwrap();
-    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].name, "Job A");
 }
 
 #[tokio::test]
@@ -1303,14 +1458,40 @@ async fn cj7b_add_job_binds_existing_conversation_to_job() {
     let job = svc.add_job(TEST_USER_ID, req).await.unwrap();
 
     let bound = conv_repo.get(CONV_4).await.unwrap().unwrap();
-    assert_eq!(bound.cron_job_id.as_deref(), Some(job.id.as_str()));
+    assert_eq!(bound.cron_job_id.as_deref(), Some(job.cron_job_id.as_str()));
 
     let linked = conv_repo
-        .list_by_cron_job(TEST_USER_ID, &job.id)
+        .list_by_cron_job(TEST_USER_ID, &job.cron_job_id)
         .await
         .unwrap();
     assert_eq!(linked.len(), 1);
-    assert_eq!(linked[0].id, CONV_4);
+    assert_eq!(linked[0].conversation_id, CONV_4);
+}
+
+#[tokio::test]
+async fn cj7c_existing_conversation_binding_is_one_to_one_and_fail_closed() {
+    let (svc, _, _, conv_repo, _, _) = setup_with_conv_repo().await;
+
+    let mut first_request = make_create_req("First binding", every_60s());
+    first_request.conversation_id = Some(CONV_4.to_owned());
+    let first = svc.add_job(TEST_USER_ID, first_request).await.unwrap();
+
+    let mut second_request = make_create_req("Second binding", every_60s());
+    second_request.conversation_id = Some(CONV_4.to_owned());
+    let error = svc
+        .add_job(TEST_USER_ID, second_request)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        nomifun_cron::error::CronError::App(nomifun_common::AppError::Conflict(_))
+    ));
+    let bound = conv_repo.get(CONV_4).await.unwrap().unwrap();
+    assert_eq!(bound.cron_job_id.as_deref(), Some(first.cron_job_id.as_str()));
+    assert!(svc.list_jobs(TEST_USER_ID, &ListCronJobsQuery::default()).await.unwrap().iter().all(
+        |job| job.name != "Second binding"
+    ));
 }
 
 // ── CJ-8: Update job ──────────────────────────────────────────────
@@ -1330,13 +1511,12 @@ async fn cj8_update_job() {
         enabled: Some(false),
         schedule: None,
         message: None,
-        execution_mode: None,
         agent_config: None,
         conversation_title: None,
         max_retries: None,
     };
 
-    let updated = svc.update_job(TEST_USER_ID, &created.id, req).await.unwrap();
+    let updated = svc.update_job(TEST_USER_ID, &created.cron_job_id, req).await.unwrap();
     assert_eq!(updated.name, "Updated Name");
     assert_eq!(updated.description.as_deref(), Some("Updated description"));
     assert!(!updated.enabled);
@@ -1363,13 +1543,12 @@ async fn cj9_update_schedule_type() {
         enabled: None,
         schedule: Some(cron_every_5min()),
         message: None,
-        execution_mode: None,
         agent_config: None,
         conversation_title: None,
         max_retries: None,
     };
 
-    let updated = svc.update_job(TEST_USER_ID, &created.id, req).await.unwrap();
+    let updated = svc.update_job(TEST_USER_ID, &created.cron_job_id, req).await.unwrap();
     assert!(matches!(
         updated.schedule,
         nomifun_cron::types::CronSchedule::Cron { .. }
@@ -1388,7 +1567,6 @@ async fn cj10_update_nonexistent() {
         enabled: None,
         schedule: None,
         message: None,
-        execution_mode: None,
         agent_config: None,
         conversation_title: None,
         max_retries: None,
@@ -1411,9 +1589,9 @@ async fn cj11_delete_job() {
         .unwrap();
     bc.take_events();
 
-    svc.remove_job(TEST_USER_ID, &created.id).await.unwrap();
+    svc.remove_job(TEST_USER_ID, &created.cron_job_id).await.unwrap();
 
-    let err = svc.get_job(TEST_USER_ID, &created.id).await.unwrap_err();
+    let err = svc.get_job(TEST_USER_ID, &created.cron_job_id).await.unwrap_err();
     assert!(matches!(
         err,
         nomifun_cron::error::CronError::JobNotFound(_)
@@ -1449,7 +1627,7 @@ async fn sk1_save_skill() {
     let req = SaveCronSkillRequest {
         content: "---\nname: test\ndescription: test skill\n---\nDo something".into(),
     };
-    svc.save_skill(TEST_USER_ID, &job.id, req).await.unwrap();
+    svc.save_skill(TEST_USER_ID, &job.cron_job_id, req).await.unwrap();
 }
 
 #[tokio::test]
@@ -1461,13 +1639,13 @@ async fn sk1_1_save_skill_marks_related_skill_suggest_artifacts_saved() {
         .unwrap();
 
     conv_repo.upsert_artifact_row(nomifun_db::ConversationArtifactRow {
-        id: ConversationArtifactId::new().into_string(),
+        conversation_artifact_id: ARTIFACT_1.to_owned(),
         conversation_id: CONV_1.to_owned(),
-        cron_job_id: Some(job.id.clone()),
+        cron_job_id: Some(job.cron_job_id.clone()),
         kind: "skill_suggest".into(),
         status: "active".into(),
         payload: serde_json::json!({
-            "cron_job_id": job.id,
+            "cron_job_id": &job.cron_job_id,
             "name": "daily-report",
             "description": "Daily report",
             "skillContent": "---\nname: daily-report\n---\nUse it."
@@ -1479,7 +1657,7 @@ async fn sk1_1_save_skill_marks_related_skill_suggest_artifacts_saved() {
 
     svc.save_skill(
         TEST_USER_ID,
-        &job.id,
+        &job.cron_job_id,
         SaveCronSkillRequest {
             content: "---\nname: daily-report\ndescription: Daily report\n---\nUse it.".into(),
         },
@@ -1496,7 +1674,8 @@ async fn sk1_1_save_skill_marks_related_skill_suggest_artifacts_saved() {
         .iter()
         .find(|event| {
             event.name == "conversation.artifact"
-                && event.data["id"] == artifacts[0].id
+                && event.data["conversation_artifact_id"].as_str()
+                    == Some(artifacts[0].conversation_artifact_id.as_str())
                 && event.data["status"] == "saved"
         })
         .expect("save_skill should broadcast saved artifact upsert");
@@ -1515,7 +1694,7 @@ async fn sk2_has_skill_true() {
 
     svc.save_skill(
         TEST_USER_ID,
-        &job.id,
+        &job.cron_job_id,
         SaveCronSkillRequest {
             content: "---\nname: x\n---\nContent".into(),
         },
@@ -1523,7 +1702,7 @@ async fn sk2_has_skill_true() {
     .await
     .unwrap();
 
-    let resp = svc.has_skill(TEST_USER_ID, &job.id).await.unwrap();
+    let resp = svc.has_skill(TEST_USER_ID, &job.cron_job_id).await.unwrap();
     assert!(resp.has_skill);
 }
 
@@ -1537,7 +1716,7 @@ async fn sk3_has_skill_false() {
         .await
         .unwrap();
 
-    let resp = svc.has_skill(TEST_USER_ID, &job.id).await.unwrap();
+    let resp = svc.has_skill(TEST_USER_ID, &job.cron_job_id).await.unwrap();
     assert!(!resp.has_skill);
 }
 
@@ -1552,7 +1731,7 @@ async fn sk4_save_empty_skill() {
         .unwrap();
 
     let err = svc
-        .save_skill(TEST_USER_ID, &job.id, SaveCronSkillRequest { content: "".into() })
+        .save_skill(TEST_USER_ID, &job.cron_job_id, SaveCronSkillRequest { content: "".into() })
         .await
         .unwrap_err();
     assert!(matches!(
@@ -1574,7 +1753,7 @@ async fn sk5_save_placeholder_skill() {
     let err = svc
         .save_skill(
             TEST_USER_ID,
-            &job.id,
+            &job.cron_job_id,
             SaveCronSkillRequest {
                 content: "TODO: fill in later".into(),
             },
@@ -1619,7 +1798,7 @@ async fn sk7_delete_cleans_skill() {
         .unwrap();
     svc.save_skill(
         TEST_USER_ID,
-        &job.id,
+        &job.cron_job_id,
         SaveCronSkillRequest {
             content: "---\nname: x\n---\nContent".into(),
         },
@@ -1627,9 +1806,9 @@ async fn sk7_delete_cleans_skill() {
     .await
     .unwrap();
 
-    svc.remove_job(TEST_USER_ID, &job.id).await.unwrap();
+    svc.remove_job(TEST_USER_ID, &job.cron_job_id).await.unwrap();
 
-    let err = svc.has_skill(TEST_USER_ID, &job.id).await.unwrap_err();
+    let err = svc.has_skill(TEST_USER_ID, &job.cron_job_id).await.unwrap_err();
     assert!(matches!(
         err,
         nomifun_cron::error::CronError::JobNotFound(_)
@@ -1748,21 +1927,20 @@ async fn oc1_init_preserves_lazy_existing_jobs() {
 
     svc.init().await;
 
-    let found_lazy = svc.get_job(TEST_USER_ID, &lazy.id).await;
+    let found_lazy = svc.get_job(TEST_USER_ID, &lazy.cron_job_id).await;
     assert!(
         found_lazy.is_ok(),
         "lazy-bind existing job should survive init"
     );
 
-    let found = svc.get_job(TEST_USER_ID, &normal.id).await;
+    let found = svc.get_job(TEST_USER_ID, &normal.cron_job_id).await;
     assert!(found.is_ok());
 }
 
-// NewConversation jobs don't depend on any existing conversation — they
-// create one on every run. They must never be cleaned up as orphans.
+// NewConversation jobs do not accept a pre-existing conversation relation.
 #[tokio::test]
-async fn oc1b_init_preserves_new_conversation_jobs() {
-    let (svc, _repo, _) = setup().await;
+async fn oc1b_new_conversation_rejects_conversation_id_without_persisting() {
+    let (svc, _, _) = setup().await;
 
     let mut empty_req = make_create_req("New-conv empty", every_60s());
     empty_req.conversation_id = None;
@@ -1772,18 +1950,19 @@ async fn oc1b_init_preserves_new_conversation_jobs() {
     let mut stale_req = make_create_req("New-conv with stale id", every_60s());
     stale_req.conversation_id = Some(CONV_8.to_owned());
     stale_req.execution_mode = Some("new_conversation".into());
-    let stale = svc.add_job(TEST_USER_ID, stale_req).await.unwrap();
+    let error = svc.add_job(TEST_USER_ID, stale_req).await.unwrap_err();
 
-    svc.init().await;
+    assert!(matches!(
+        error,
+        nomifun_cron::error::CronError::App(nomifun_common::AppError::BadRequest(_))
+    ));
 
     assert!(
-        svc.get_job(TEST_USER_ID, &empty.id).await.is_ok(),
-        "empty new_conversation job must survive"
+        svc.get_job(TEST_USER_ID, &empty.cron_job_id).await.is_ok(),
+        "valid unbound new_conversation job must persist"
     );
-    assert!(
-        svc.get_job(TEST_USER_ID, &stale.id).await.is_ok(),
-        "new_conversation job with stale id must survive"
-    );
+    let jobs = svc.list_jobs(TEST_USER_ID, &ListCronJobsQuery::default()).await.unwrap();
+    assert_eq!(jobs.len(), 1);
 }
 
 #[tokio::test]
@@ -1792,13 +1971,13 @@ async fn oc2_init_cleans_jobs_with_missing_conversation() {
 
     let mut missing_req = make_create_req("Missing Conversation", every_60s());
     // Create through a valid owner-scoped boundary, then mutate the persisted
-    // fixture to emulate a legacy/orphaned row discovered during boot. New API
-    // writes correctly reject a missing Conversation before persistence.
+    // fixture to emulate an orphaned logical reference discovered during boot.
+    // New API writes reject a missing Conversation before persistence.
     missing_req.conversation_id = Some(CONV_7.to_owned());
     let missing = svc.add_job(TEST_USER_ID, missing_req).await.unwrap();
     repo.update(
         TEST_USER_ID,
-        &missing.id,
+        &missing.cron_job_id,
         &nomifun_db::UpdateCronJobParams {
             conversation_id: Some(Some(CONV_MISSING.to_owned())),
             ..Default::default()
@@ -1813,10 +1992,10 @@ async fn oc2_init_cleans_jobs_with_missing_conversation() {
 
     svc.init().await;
 
-    let err = svc.get_job(TEST_USER_ID, &missing.id).await;
+    let err = svc.get_job(TEST_USER_ID, &missing.cron_job_id).await;
     assert!(err.is_err());
 
-    let found = svc.get_job(TEST_USER_ID, &normal.id).await;
+    let found = svc.get_job(TEST_USER_ID, &normal.cron_job_id).await;
     assert!(found.is_ok());
 }
 
@@ -1832,17 +2011,17 @@ async fn delete_skill_clears_content() {
 
     svc.save_skill(
         TEST_USER_ID,
-        &job.id,
+        &job.cron_job_id,
         SaveCronSkillRequest {
             content: "---\nname: x\n---\nOk".into(),
         },
     )
     .await
     .unwrap();
-    assert!(svc.has_skill(TEST_USER_ID, &job.id).await.unwrap().has_skill);
+    assert!(svc.has_skill(TEST_USER_ID, &job.cron_job_id).await.unwrap().has_skill);
 
-    svc.delete_skill(TEST_USER_ID, &job.id).await.unwrap();
-    assert!(!svc.has_skill(TEST_USER_ID, &job.id).await.unwrap().has_skill);
+    svc.delete_skill(TEST_USER_ID, &job.cron_job_id).await.unwrap();
+    assert!(!svc.has_skill(TEST_USER_ID, &job.cron_job_id).await.unwrap().has_skill);
 }
 
 // ── ICronService trait: create ─────────────────────────────────────
@@ -1899,10 +2078,10 @@ async fn icron_service_create_job_inherits_conversation_mode_and_backend() {
         .expect("agent config should be copied");
     assert_eq!(job.agent_type, "acp");
     assert_eq!(job.conversation_title.as_deref(), Some("Gemini Chat"));
-    assert_eq!(config.backend, "gemini");
+    assert_eq!(config.backend.as_deref(), Some("gemini"));
     assert_eq!(config.name, "Gemini");
     assert_eq!(config.mode.as_deref(), Some("yolo"));
-    assert_eq!(config.model_id.as_deref(), Some("gemini-2.5-pro"));
+    assert_eq!(config.model.as_deref(), Some("gemini-2.5-pro"));
     assert_eq!(config.workspace.as_deref(), Some("/tmp/gemini-workspace"));
 }
 
@@ -2026,13 +2205,12 @@ async fn icron_service_update_job() {
 
     use nomifun_conversation::response_middleware::ICronService;
 
-    let job = svc
-        .add_job(TEST_USER_ID, make_create_req("Update Via Trait", every_60s()))
-        .await
-        .unwrap();
+    let mut request = make_create_req("Update Via Trait", every_60s());
+    request.conversation_id = Some(CONV_1.to_owned());
+    let job = svc.add_job(TEST_USER_ID, request).await.unwrap();
 
     let params = CronUpdateParams {
-        job_id: job.id.clone(),
+        job_id: job.cron_job_id.clone(),
         name: "Updated Via Trait".into(),
         schedule: "0 */10 * * * *".into(),
         schedule_description: "every 10 min".into(),
@@ -2044,14 +2222,44 @@ async fn icron_service_update_job() {
     assert!(result.message.contains("Updated Via Trait"));
 
     let bound = conv_repo.get(CONV_1).await.unwrap().unwrap();
-    assert_eq!(bound.cron_job_id.as_deref(), Some(job.id.as_str()));
+    assert_eq!(bound.cron_job_id.as_deref(), Some(job.cron_job_id.as_str()));
 
     let linked = conv_repo
-        .list_by_cron_job(TEST_USER_ID, &job.id)
+        .list_by_cron_job(TEST_USER_ID, &job.cron_job_id)
         .await
         .unwrap();
     assert_eq!(linked.len(), 1);
-    assert_eq!(linked[0].id, CONV_1);
+    assert_eq!(linked[0].conversation_id, CONV_1);
+}
+
+#[tokio::test]
+async fn icron_service_update_job_rejects_cross_conversation_scope() {
+    let (svc, _, _, _, _, _) = setup_with_conv_repo().await;
+
+    use nomifun_conversation::response_middleware::ICronService;
+
+    let job = svc
+        .add_job(TEST_USER_ID, make_create_req("Scoped Update", every_60s()))
+        .await
+        .unwrap();
+    let params = CronUpdateParams {
+        job_id: job.cron_job_id.clone(),
+        name: "Must Not Change".into(),
+        schedule: "0 */10 * * * *".into(),
+        schedule_description: "every 10 min".into(),
+        message: "must not change".into(),
+    };
+
+    let result = ICronService::update_job(&svc, TEST_USER_ID, CONV_2, &params).await;
+    assert!(!result.success);
+    assert!(result.message.contains("is not bound to conversation"));
+
+    let persisted = svc
+        .get_job(TEST_USER_ID, &job.cron_job_id)
+        .await
+        .unwrap();
+    assert_eq!(persisted.name, "Scoped Update");
+    assert_eq!(persisted.message, "test message");
 }
 
 // ── ICronService trait: delete ─────────────────────────────────────
@@ -2067,7 +2275,7 @@ async fn icron_service_delete_job() {
         .await
         .unwrap();
 
-    let result = ICronService::delete_job(&svc, TEST_USER_ID, &job.id).await;
+    let result = ICronService::delete_job(&svc, TEST_USER_ID, &job.cron_job_id).await;
     assert!(result.success);
 
     let result = ICronService::delete_job(&svc, TEST_USER_ID, MISSING_JOB_ID).await;
@@ -2078,7 +2286,7 @@ async fn icron_service_delete_job() {
 
 #[tokio::test]
 async fn update_max_retries() {
-    let (svc, _, _) = setup().await;
+    let (svc, repo, _) = setup().await;
     let job = svc
         .add_job(TEST_USER_ID, make_create_req("Retries", every_60s()))
         .await
@@ -2091,13 +2299,54 @@ async fn update_max_retries() {
         enabled: None,
         schedule: None,
         message: None,
-        execution_mode: None,
         agent_config: None,
         conversation_title: None,
         max_retries: Some(5),
     };
-    let updated = svc.update_job(TEST_USER_ID, &job.id, req).await.unwrap();
+    let updated = svc.update_job(TEST_USER_ID, &job.cron_job_id, req).await.unwrap();
     assert_eq!(updated.max_retries, 5);
+    let persisted = repo
+        .get_by_cron_job_id(TEST_USER_ID, &job.cron_job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.max_retries, 5);
+}
+
+#[tokio::test]
+async fn update_rejects_negative_max_retries_without_partial_write() {
+    let (svc, repo, _) = setup().await;
+    let job = svc
+        .add_job(TEST_USER_ID, make_create_req("Retries", every_60s()))
+        .await
+        .unwrap();
+
+    let error = svc
+        .update_job(
+            TEST_USER_ID,
+            &job.cron_job_id,
+            UpdateCronJobRequest {
+                name: Some("Must Not Change".into()),
+                description: None,
+                enabled: None,
+                schedule: None,
+                message: None,
+                agent_config: None,
+                conversation_title: None,
+                max_retries: Some(-1),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("must be non-negative"));
+
+    let persisted = repo
+        .get_by_cron_job_id(TEST_USER_ID, &job.cron_job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.name, "Retries");
+    assert_eq!(persisted.max_retries, 3);
 }
 
 // ── SC-1: At type — future timestamp, nextRunAtMs == atMs ────────
@@ -2140,7 +2389,8 @@ async fn sc2_at_type_past_timestamp() {
 async fn sr1_system_resume_missed_job() {
     let (svc, repo, bc, conv_repo, _, _) = setup_with_conv_repo().await;
 
-    let req = make_create_req("Resume Job", every_60s());
+    let mut req = make_create_req("Resume Job", every_60s());
+    req.conversation_id = Some(CONV_1.to_owned());
     let job = svc.add_job(TEST_USER_ID, req).await.unwrap();
     bc.take_events();
 
@@ -2149,11 +2399,11 @@ async fn sr1_system_resume_missed_job() {
         next_run_at: Some(Some(past_ms)),
         ..Default::default()
     };
-    repo.update(TEST_USER_ID, &job.id, &params).await.unwrap();
+    repo.update(TEST_USER_ID, &job.cron_job_id, &params).await.unwrap();
 
     svc.handle_system_resume().await;
 
-    let updated = svc.get_job(TEST_USER_ID, &job.id).await.unwrap();
+    let updated = svc.get_job(TEST_USER_ID, &job.cron_job_id).await.unwrap();
     assert!(
         updated.last_run_at.is_none(),
         "missed job should not be auto-executed on resume"
@@ -2218,7 +2468,7 @@ async fn cd1_cascade_delete_by_conversation() {
     let job_a = svc.add_job(TEST_USER_ID, req_a).await.unwrap();
 
     let mut req_b = make_create_req("Cascade B", every_60s());
-    req_b.conversation_id = Some(CONV_5.to_owned());
+    req_b.conversation_id = Some(CONV_6.to_owned());
     let job_b = svc.add_job(TEST_USER_ID, req_b).await.unwrap();
 
     let mut req_c = make_create_req("Unrelated", every_60s());
@@ -2230,18 +2480,18 @@ async fn cd1_cascade_delete_by_conversation() {
     svc.delete_jobs_by_conversation(TEST_USER_ID, CONV_5)
         .await;
 
-    assert!(svc.get_job(TEST_USER_ID, &job_a.id).await.is_err());
-    assert!(svc.get_job(TEST_USER_ID, &job_b.id).await.is_err());
+    assert!(svc.get_job(TEST_USER_ID, &job_a.cron_job_id).await.is_err());
+    assert!(svc.get_job(TEST_USER_ID, &job_b.cron_job_id).await.is_ok());
 
     let remaining = svc.list_jobs(TEST_USER_ID, &ListCronJobsQuery::default()).await.unwrap();
-    assert_eq!(remaining.len(), 1, "only the unrelated job should remain");
+    assert_eq!(remaining.len(), 2, "unrelated jobs should remain");
 
     let events = bc.take_events();
     let removed_events: Vec<_> = events
         .iter()
         .filter(|e| e.name == "cron.job-removed")
         .collect();
-    assert_eq!(removed_events.len(), 2, "should emit 2 removed events");
+    assert_eq!(removed_events.len(), 1, "should emit 1 removed event");
 }
 
 // ── CD-2: Cascade delete on empty conversation (no-op) ──────────
@@ -2255,7 +2505,7 @@ async fn cd2_cascade_delete_no_matching_jobs() {
         .unwrap();
     bc.take_events();
 
-    svc.delete_jobs_by_conversation(TEST_USER_ID, "conv_0190f5fe-7c00-7a00-8abc-012345679999")
+    svc.delete_jobs_by_conversation(TEST_USER_ID, "0190f5fe-7c00-7a00-8abc-012345679999")
         .await;
 
     let events = bc.take_events();
@@ -2283,9 +2533,110 @@ async fn cd3_on_conversation_delete_trait() {
 
     svc.on_conversation_deleted(TEST_USER_ID, CONV_6).await;
 
-    assert!(svc.get_job(TEST_USER_ID, &job.id).await.is_err());
+    assert!(svc.get_job(TEST_USER_ID, &job.cron_job_id).await.is_err());
 
     let events = bc.take_events();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].name, "cron.job-removed");
+}
+
+#[tokio::test]
+async fn cd4_conversation_transaction_hands_captured_job_ids_to_post_commit_cleanup() {
+    let (cron_service, _repo, bc, _stub_conversations, pool, data_dir) =
+        setup_with_conv_repo().await;
+    let cron_service = Arc::new(cron_service);
+
+    let mut req = make_create_req("Transactional Cascade", every_60s());
+    req.conversation_id = Some(CONV_MODE.to_owned());
+    let job = cron_service.add_job(TEST_USER_ID, req).await.unwrap();
+    write_raw_skill_file(
+        &data_dir,
+        &job.cron_job_id,
+        "---\nname: transactional-cascade\ndescription: cascade fixture\n---\n\nRun it.",
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO cron_job_runs \
+            (cron_job_run_id, cron_job_id, executed_at_ms, status, created_at_ms) \
+         VALUES (?, ?, ?, 'ok', ?)",
+    )
+    .bind(nomifun_common::CronJobRunId::new().into_string())
+    .bind(&job.cron_job_id)
+    .bind(now_ms())
+    .bind(now_ms())
+    .execute(&pool)
+    .await
+    .unwrap();
+    bc.take_events();
+
+    struct EmptySkillResolver;
+    #[async_trait::async_trait]
+    impl nomifun_conversation::skill_resolver::SkillResolver for EmptySkillResolver {
+        async fn auto_inject_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn resolve_skills(
+            &self,
+            _names: &[String],
+        ) -> Vec<nomifun_conversation::skill_resolver::ResolvedAgentSkill> {
+            Vec::new()
+        }
+
+        async fn link_workspace_skills(
+            &self,
+            _workspace: &std::path::Path,
+            _rel_dirs: &[&str],
+            _skills: &[nomifun_conversation::skill_resolver::ResolvedAgentSkill],
+        ) -> usize {
+            0
+        }
+    }
+
+    let conversation_service = ConversationService::new(
+        Arc::<str>::from(TEST_USER_ID),
+        std::env::temp_dir(),
+        bc.clone() as Arc<dyn UserEventSink>,
+        Arc::new(EmptySkillResolver),
+        Arc::new(StubAgentRuntimeRegistry),
+        Arc::new(SqliteConversationRepository::new(pool.clone())),
+        Arc::new(SqliteAgentMetadataRepository::new(pool.clone())),
+        Arc::new(SqliteAcpSessionRepository::new(pool.clone())),
+        Arc::new(nomifun_conversation::NoExecutionConversationBoundary),
+    );
+    conversation_service.with_delete_hook(cron_service.clone());
+    conversation_service
+        .delete(TEST_USER_ID, CONV_MODE)
+        .await
+        .unwrap();
+
+    assert!(
+        cron_service.get_job(TEST_USER_ID, &job.cron_job_id).await.is_err(),
+        "the Conversation transaction must delete the Cron row"
+    );
+    let run_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM cron_job_runs WHERE cron_job_id = ?")
+            .bind(&job.cron_job_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(run_count, 0, "Cron run history must cascade in the same transaction");
+
+    for _ in 0..50 {
+        if !has_skill_file(&data_dir, &job.cron_job_id).await.unwrap() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        !has_skill_file(&data_dir, &job.cron_job_id).await.unwrap(),
+        "the post-commit hook must remove the generated skill using captured IDs"
+    );
+    assert!(
+        bc.take_events()
+            .iter()
+            .any(|event| event.name == "cron.job-removed" && event.data["cron_job_id"] == job.cron_job_id),
+        "the post-commit hook must emit the Cron removal event"
+    );
 }

@@ -6,11 +6,11 @@
 
 import { describe, expect, test } from 'bun:test';
 import { fromApiConversation } from './apiModelMapper';
-import { parseRemoteAgentId } from '../types/ids';
+import { parseMcpServerId, parseRemoteAgentId } from '../types/ids';
 
 // 最小 ApiConversation 片段：只构造 mapper 关心的字段
 const apiConv = (o: Record<string, unknown>) => ({
-  id: 'conv_0190f5fe-7c00-7a00-8000-000000000001',
+  conversation_id: '0190f5fe-7c00-7a00-8000-000000000001',
   name: 'conv',
   type: 'acp',
   created_at: 1,
@@ -20,69 +20,60 @@ const apiConv = (o: Record<string, unknown>) => ({
 
 type MappedExtra =
   | {
-      pinned?: boolean;
-      pinned_at?: number;
       custom_workspace?: boolean;
       remote_agent_id?: ReturnType<typeof parseRemoteAgentId>;
-      remoteAgentId?: ReturnType<typeof parseRemoteAgentId>;
     }
   | null
   | undefined;
 const extraOf = (raw: Record<string, unknown>): MappedExtra => (fromApiConversation(raw) as { extra?: MappedExtra }).extra;
 
-describe('fromApiConversation 置顶镜像（DB 顶层 pinned 列 → extra）', () => {
-  test('顶层列置顶 → 镜像进 extra（含服务端维护的 pinned_at）', () => {
-    const extra = extraOf(apiConv({ pinned: true, pinned_at: 1712345678000, extra: {} }));
-    expect(extra?.pinned).toBe(true);
-    expect(extra?.pinned_at).toBe(1712345678000);
+describe('fromApiConversation first-class fields', () => {
+  test('maps the explicit wire conversation_id to the UI id and removes the wire field', () => {
+    const mapped = fromApiConversation(apiConv({ extra: {} })) as {
+      id?: string;
+      conversation_id?: string;
+    };
+    expect(mapped.id).toBe('0190f5fe-7c00-7a00-8000-000000000001');
+    expect(mapped.conversation_id).toBeUndefined();
   });
 
-  test('extra 为空/缺失时列置顶也能生成镜像', () => {
-    const extra = extraOf(apiConv({ pinned: true, pinned_at: 100, extra: null }));
-    expect(extra?.pinned).toBe(true);
-    expect(extra?.pinned_at).toBe(100);
+  test('rejects the removed generic wire id', () => {
+    let error: unknown;
+    try {
+      fromApiConversation({
+        id: '0190f5fe-7c00-7a00-8000-000000000001',
+        name: 'legacy',
+        type: 'acp',
+        created_at: 1,
+        modified_at: 2,
+        extra: {},
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error instanceof Error).toBe(true);
   });
 
-  test('冲突时列优先：列置顶覆盖 extra.pinned=false，pinned_at 取列值', () => {
-    const extra = extraOf(apiConv({ pinned: true, pinned_at: 200, extra: { pinned: false, pinned_at: 999 } }));
-    expect(extra?.pinned).toBe(true);
-    expect(extra?.pinned_at).toBe(200);
+  test('keeps pin state at the conversation top level', () => {
+    const mapped = fromApiConversation(
+      apiConv({ pinned: true, pinned_at: 1712345678000, extra: {} }),
+    ) as { pinned?: boolean; pinned_at?: number; extra?: Record<string, unknown> };
+    expect(mapped.pinned).toBe(true);
+    expect(mapped.pinned_at).toBe(1712345678000);
+    expect(mapped.extra && 'pinned' in mapped.extra).toBe(false);
   });
 
-  test('OR 兼容：列未置顶但旧数据仅 extra 置顶 → 不丢，pinned_at 保留 extra 来源', () => {
-    const extra = extraOf(apiConv({ pinned: false, extra: { pinned: true, pinned_at: 300 } }));
-    expect(extra?.pinned).toBe(true);
-    expect(extra?.pinned_at).toBe(300);
-  });
-
-  test('两侧均未置顶 → 不注入 pinned key', () => {
-    const extra = extraOf(apiConv({ pinned: false, extra: {} }));
-    expect(extra && 'pinned' in extra).toBe(false);
-  });
-
-  test('列置顶但列 pinned_at 缺失 → 回退 extra.pinned_at', () => {
-    const extra = extraOf(apiConv({ pinned: true, extra: { pinned: true, pinned_at: 400 } }));
-    expect(extra?.pinned).toBe(true);
-    expect(extra?.pinned_at).toBe(400);
-  });
-
-  test('custom_workspace 推导不受置顶镜像影响', () => {
-    const extra = extraOf(apiConv({ pinned: true, pinned_at: 1, extra: { workspace: '/w/p1' } }));
-    expect(extra?.custom_workspace).toBe(true);
-    expect(extra?.pinned).toBe(true);
-  });
-
-  test('remote_agent_id is mirrored to the legacy remoteAgentId UI key', () => {
-    const remoteAgentId = parseRemoteAgentId('ragent_0190f5fe-7c00-7a00-8000-000000000001');
+  test('keeps the canonical remote-agent logical reference only', () => {
+    const remoteAgentId = parseRemoteAgentId('0190f5fe-7c00-7a00-8000-000000000001');
     const extra = extraOf(apiConv({ type: 'remote', extra: { remote_agent_id: remoteAgentId } }));
     expect(extra?.remote_agent_id).toBe(remoteAgentId);
-    expect(extra?.remoteAgentId).toBe(remoteAgentId);
+    expect(extra && 'remoteAgentId' in extra).toBe(false);
   });
 });
 
 describe('fromApiConversation 协作方案顶层契约', () => {
   test('保留顶层 execution_template_id，不从旧 extra 回填', () => {
-    const currentTemplateId = 'aext_0190f5fe-7c00-7a00-8000-000000000001';
+    const currentTemplateId = '0190f5fe-7c00-7a00-8000-000000000001';
     const topLevel = fromApiConversation(
       apiConv({
         execution_template_id: currentTemplateId,
@@ -91,9 +82,102 @@ describe('fromApiConversation 协作方案顶层契约', () => {
     ) as { execution_template_id?: string };
     expect(topLevel.execution_template_id).toBe(currentTemplateId);
 
-    const legacyExtraOnly = fromApiConversation(
+    const extraOnly = fromApiConversation(
       apiConv({ extra: { execution_template_id: 'template-stale' } }),
     ) as { execution_template_id?: string };
-    expect(legacyExtraOnly.execution_template_id).toBeUndefined();
+    expect(extraOnly.execution_template_id).toBeUndefined();
+  });
+});
+
+describe('fromApiConversation MCP id boundaries', () => {
+  test('keeps canonical UUIDv7 MCP identities across snapshots', () => {
+    const mcpServerId = parseMcpServerId('0190f5fe-7c00-7a00-8000-000000000123');
+    const mapped = fromApiConversation(
+      apiConv({
+        extra: {
+          mcp_server_ids: [mcpServerId],
+          mcp_statuses: [
+            { mcp_server_id: mcpServerId, name: 'everything', status: 'loaded' },
+          ],
+          session_mcp_servers: [
+            {
+              mcp_server_id: mcpServerId,
+              name: 'everything',
+              transport: { type: 'stdio', command: 'npx' },
+            },
+          ],
+        },
+      }),
+    ) as unknown as {
+      extra: {
+        mcp_server_ids: ReturnType<typeof parseMcpServerId>[];
+        mcp_statuses: Array<{ mcp_server_id: ReturnType<typeof parseMcpServerId> }>;
+        session_mcp_servers: Array<{ mcp_server_id: ReturnType<typeof parseMcpServerId> }>;
+      };
+    };
+
+    expect(mapped.extra.mcp_server_ids).toEqual([mcpServerId]);
+    expect(mapped.extra.mcp_statuses[0]?.mcp_server_id).toBe(mcpServerId);
+    expect(mapped.extra.session_mcp_servers[0]?.mcp_server_id).toBe(mcpServerId);
+  });
+
+  test('rejects integer, numeric string, UUIDv4, uppercase, and prefixed MCP ids', () => {
+    const invalidIds = [
+      3,
+      '3',
+      '550e8400-e29b-41d4-a716-446655440000',
+      '0190F5FE-7C00-7A00-8000-000000000123',
+      'mcp_0190f5fe-7c00-7a00-8000-000000000123',
+    ];
+    for (const invalidId of invalidIds) {
+      for (const extra of [
+        { mcp_server_ids: [invalidId] },
+        {
+          mcp_statuses: [
+            { mcp_server_id: invalidId, name: 'everything', status: 'loaded' },
+          ],
+        },
+        {
+          session_mcp_servers: [
+            {
+              mcp_server_id: invalidId,
+              name: 'everything',
+              transport: { type: 'stdio', command: 'npx' },
+            },
+          ],
+        },
+      ]) {
+        let rejected = false;
+        try {
+          fromApiConversation(apiConv({ extra }));
+        } catch {
+          rejected = true;
+        }
+        expect(rejected).toBe(true);
+      }
+    }
+  });
+
+  test('rejects removed generic id fields for MCP status and session snapshots', () => {
+    for (const extra of [
+      { mcp_statuses: [{ id: 3, name: 'everything', status: 'loaded' }] },
+      {
+        session_mcp_servers: [
+          {
+            id: 3,
+            name: 'everything',
+            transport: { type: 'stdio', command: 'npx' },
+          },
+        ],
+      },
+    ]) {
+      let rejected = false;
+      try {
+        fromApiConversation(apiConv({ extra }));
+      } catch {
+        rejected = true;
+      }
+      expect(rejected).toBe(true);
+    }
   });
 });

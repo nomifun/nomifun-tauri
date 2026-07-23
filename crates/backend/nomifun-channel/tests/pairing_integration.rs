@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use nomifun_api_types::WebSocketMessage;
 use nomifun_common::{TimestampMs, now_ms};
-use nomifun_db::models::{ChannelPluginRow, ChannelPairingCodeRow};
+use nomifun_db::models::{NewChannelPairingCodeRow, NewChannelPluginRow};
 use nomifun_db::{IChannelRepository, SqliteChannelRepository, init_database_memory};
 use nomifun_realtime::UserEventSink;
 
@@ -16,18 +16,14 @@ use nomifun_channel::constants::{PAIRING_CODE_LENGTH, PAIRING_CODE_TTL};
 use nomifun_channel::error::ChannelError;
 use nomifun_channel::pairing::PairingService;
 
-/// Telegram bot channel id used by the integration tests. `channel_pairing_codes`
-/// and `channel_users` carry an FK channel_id → channel_plugins(id), so the
-/// plugin rows must exist before any pairing is created.
-const CH_TG: &str = "chn_018f1234-5678-7abc-8def-012345678910";
+/// Stable `channel_plugins.channel_plugin_id` values used by the integration tests.
+///
+/// These are logical references only: the v3 schema deliberately has no
+/// physical foreign-key dependency between channel tables.
+const CH_TG: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 /// Lark bot channel id (second platform exercised by these tests).
-const CH_LARK: &str = "chn_018f1234-5678-7abc-8def-012345678911";
-/// A second lark bot channel id. Same platform as `CH_LARK`, different bot —
-/// used to prove pairing/auth are scoped per bot (channel), not per platform.
-/// `setup()` does not seed this; the multi-bot test seeds it itself so the
-/// channel_id FK is satisfied.
-const CH_LARK2: &str = "chn_018f1234-5678-7abc-8def-012345678912";
-const OWNER_ID: &str = "user_018f1234-5678-7abc-8def-012345678913";
+const CH_LARK: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+const OWNER_ID: &str = "018f1234-5678-7abc-8def-012345678913";
 
 // ── Test infrastructure ─────────────────────────────────────────────
 
@@ -60,31 +56,57 @@ async fn setup() -> (PairingService, Arc<dyn IChannelRepository>, Arc<MockBroadc
     let bc = Arc::new(MockBroadcaster::new());
     let svc = PairingService::new(repo.clone(), bc.clone(), OWNER_ID);
 
-    // Seed the bot channels the tests pair against. channel_pairing_codes /
-    // channel_users have an FK channel_id → channel_plugins(id), so these
-    // rows must exist before request_pairing inserts a code.
-    for (id, ty, name) in [(CH_TG, "telegram", "Telegram Bot"), (CH_LARK, "lark", "Lark Bot")] {
-        repo.upsert_plugin(&ChannelPluginRow {
-            id: id.into(),
-            r#type: ty.into(),
-            name: name.into(),
-            enabled: true,
-            config: "{}".into(),
-            status: None,
-            last_connected: None,
-            companion_id: None,
-            public_agent_id: None,
-            bot_key: None,
-            created_at: now_ms(),
-            updated_at: now_ms(),
-        })
+    // Seed the logical channel references used by the tests.
+    for (channel_plugin_id, ty, name) in [
+        (CH_TG, "telegram", "Telegram Bot"),
+        (CH_LARK, "lark", "Lark Bot"),
+    ] {
+        let plugin = repo
+            .create_plugin(&NewChannelPluginRow {
+                r#type: ty.into(),
+                name: name.into(),
+                enabled: true,
+                config: "{}".into(),
+                status: None,
+                last_connected: None,
+                companion_id: None,
+                public_agent_id: None,
+                bot_key: None,
+                created_at: now_ms(),
+                updated_at: now_ms(),
+            })
+            .await
+            .unwrap();
+        nomifun_db::sqlx::query(
+            "UPDATE channel_plugins SET channel_plugin_id = ? WHERE channel_plugin_id = ?",
+        )
+        .bind(channel_plugin_id)
+        .bind(&plugin.channel_plugin_id)
+        .execute(db.pool())
         .await
         .unwrap();
     }
 
-    // Keep db alive by leaking — test process exits anyway
-    std::mem::forget(db);
     (svc, repo, bc)
+}
+
+fn new_pairing(
+    code: &str,
+    platform_user_id: &str,
+    platform_type: &str,
+    channel_plugin_id: Option<&str>,
+    expires_at: TimestampMs,
+) -> NewChannelPairingCodeRow {
+    NewChannelPairingCodeRow {
+        code: code.to_owned(),
+        platform_user_id: platform_user_id.to_owned(),
+        platform_type: platform_type.to_owned(),
+        channel_plugin_id: channel_plugin_id.map(str::to_owned),
+        display_name: None,
+        requested_at: 1000,
+        expires_at,
+        status: "pending".to_owned(),
+    }
 }
 
 // ── PG-1: Generated code is 6 digits ───────────────────────────────
@@ -157,16 +179,7 @@ async fn pp3_expired_not_in_pending() {
     svc.request_pairing("u1", "telegram", CH_TG, None).await.unwrap();
 
     // Insert already-expired code directly
-    let expired_row = ChannelPairingCodeRow {
-        code: "000001".into(),
-        platform_user_id: "u2".into(),
-        platform_type: "lark".into(),
-        channel_id: None,
-        display_name: None,
-        requested_at: 1000,
-        expires_at: 1001,
-        status: "pending".into(),
-    };
+    let expired_row = new_pairing("000001", "u2", "lark", None, 1001);
     repo.create_pairing(&expired_row).await.unwrap();
 
     let pending = svc.get_pending_pairings().await.unwrap();
@@ -219,16 +232,7 @@ async fn ap4_approve_expired_code() {
     let (_svc, repo, bc) = setup().await;
     let svc = PairingService::new(repo.clone(), bc.clone(), OWNER_ID);
 
-    let expired_row = ChannelPairingCodeRow {
-        code: "999999".into(),
-        platform_user_id: "u1".into(),
-        platform_type: "telegram".into(),
-        channel_id: None,
-        display_name: None,
-        requested_at: 1000,
-        expires_at: 1001,
-        status: "pending".into(),
-    };
+    let expired_row = new_pairing("999999", "u1", "telegram", None, 1001);
     repo.create_pairing(&expired_row).await.unwrap();
 
     let err = svc.approve_pairing("999999").await.unwrap_err();
@@ -309,16 +313,7 @@ async fn ec1_expired_codes_cleaned_up() {
     let (_svc, repo, bc) = setup().await;
     let _svc = PairingService::new(repo.clone(), bc.clone(), OWNER_ID);
 
-    let expired_row = ChannelPairingCodeRow {
-        code: "111111".into(),
-        platform_user_id: "u1".into(),
-        platform_type: "telegram".into(),
-        channel_id: None,
-        display_name: None,
-        requested_at: 1000,
-        expires_at: 2000,
-        status: "pending".into(),
-    };
+    let expired_row = new_pairing("111111", "u1", "telegram", None, 2000);
     repo.create_pairing(&expired_row).await.unwrap();
 
     let count = repo.cleanup_expired_pairings(now_ms()).await.unwrap();
@@ -392,7 +387,7 @@ async fn ws3_approve_broadcasts_user_authorized() {
     assert_eq!(events[0].data["platform_user_id"], "tg_42");
     assert_eq!(events[0].data["platform_type"], "telegram");
     assert_eq!(events[0].data["display_name"], "Alice");
-    assert!(events[0].data["id"].is_string());
+    assert!(events[0].data["channel_user_id"].is_string());
 }
 
 // ── is_user_authorized ─────────────────────────────────────────────
@@ -433,31 +428,33 @@ async fn is_user_authorized_different_platform_false() {
 async fn two_lark_bots_pair_independently() {
     let (svc, repo, _bc) = setup().await;
 
-    // setup() seeds one canonical Lark channel. Seed a second lark bot so the
-    // channel_id FK (channel_pairing_codes/channel_users → channel_plugins)
-    // is satisfied for bot 2. Same upsert_plugin pattern setup() uses.
-    repo.upsert_plugin(&ChannelPluginRow {
-        id: CH_LARK2.into(),
-        r#type: "lark".into(),
-        name: "Lark Bot 2".into(),
-        enabled: true,
-        config: "{}".into(),
-        status: None,
-        last_connected: None,
-        companion_id: None,
-        public_agent_id: None,
-        bot_key: None,
-        created_at: now_ms(),
-        updated_at: now_ms(),
-    })
-    .await
-    .unwrap();
+    // Seed a second logical lark channel for bot 2.
+    let plugin = repo
+        .create_plugin(&NewChannelPluginRow {
+            r#type: "lark".into(),
+            name: "Lark Bot 2".into(),
+            enabled: true,
+            config: "{}".into(),
+            status: None,
+            last_connected: None,
+            companion_id: None,
+            public_agent_id: None,
+            bot_key: None,
+            created_at: now_ms(),
+            updated_at: now_ms(),
+        })
+        .await
+        .unwrap();
+    let lark2_id = plugin.channel_plugin_id;
 
     // Two distinct lark users each initiate pairing, one per bot. Distinct
     // open_ids mirror reality (Lark open_id is per-app) and keep the test
     // focused on channel isolation rather than same-user expiry behavior.
     let code1 = svc.request_pairing("ou_a", "lark", CH_LARK, Some("A")).await.unwrap();
-    let code2 = svc.request_pairing("ou_b", "lark", CH_LARK2, Some("B")).await.unwrap();
+    let code2 = svc
+        .request_pairing("ou_b", "lark", &lark2_id, Some("B"))
+        .await
+        .unwrap();
     assert_ne!(code1, code2);
 
     // Both codes are pending simultaneously, each carrying its own channel_id.
@@ -471,9 +468,9 @@ async fn two_lark_bots_pair_independently() {
         .iter()
         .find(|p| p.code == code2)
         .expect("bot 2 code pending");
-    assert_eq!(p1.channel_id.as_deref(), Some(CH_LARK));
+    assert_eq!(p1.channel_plugin_id.as_deref(), Some(CH_LARK));
     assert_eq!(p1.platform_user_id, "ou_a");
-    assert_eq!(p2.channel_id.as_deref(), Some(CH_LARK2));
+    assert_eq!(p2.channel_plugin_id.as_deref(), Some(lark2_id.as_str()));
     assert_eq!(p2.platform_user_id, "ou_b");
 
     // Approve only bot 1's pairing.
@@ -488,11 +485,17 @@ async fn two_lark_bots_pair_independently() {
     // Bot 2 is entirely unaffected: its user is not authorized and its code
     // is still pending.
     assert!(
-        !svc.is_user_authorized("ou_b", "lark", CH_LARK2).await.unwrap(),
+        !svc
+            .is_user_authorized("ou_b", "lark", &lark2_id)
+            .await
+            .unwrap(),
         "bot 2's user must NOT be authorized by bot 1's approval"
     );
     let pending_after = svc.get_pending_pairings().await.unwrap();
     assert_eq!(pending_after.len(), 1, "bot 2's pairing should remain pending");
     assert_eq!(pending_after[0].code, code2);
-    assert_eq!(pending_after[0].channel_id.as_deref(), Some(CH_LARK2));
+    assert_eq!(
+        pending_after[0].channel_plugin_id.as_deref(),
+        Some(lark2_id.as_str())
+    );
 }

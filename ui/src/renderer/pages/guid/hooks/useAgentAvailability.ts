@@ -13,14 +13,14 @@ type UseAgentAvailabilityOptions = {
   isGoogleAuth: boolean;
   availableAgents: AvailableAgent[] | undefined;
   resolvePresetAgentType: (
-    agentInfo: { agent_type: string; backend?: string; custom_agent_id?: string } | undefined
+    agentInfo: { agent_type: string; backend?: string } | undefined
   ) => string;
 };
 
 type UseAgentAvailabilityResult = {
   isMainAgentAvailable: (agent_type: string) => boolean;
   getEffectiveAgentType: (
-    agentInfo: { agent_type: string; backend?: string; custom_agent_id?: string } | undefined
+    agentInfo: { agent_type: string; backend?: string } | undefined
   ) => EffectiveAgentInfo;
 };
 
@@ -45,7 +45,7 @@ export const useAgentAvailability = ({
   );
 
   const getEffectiveAgentType = useCallback(
-    (agentInfo: { agent_type: string; backend?: string; custom_agent_id?: string } | undefined): EffectiveAgentInfo => {
+    (agentInfo: { agent_type: string; backend?: string } | undefined): EffectiveAgentInfo => {
       const originalType = resolvePresetAgentType(agentInfo);
       const isAvailable = isMainAgentAvailable(originalType);
       return { agent_type: originalType, isFallback: false, originalType, isAvailable };

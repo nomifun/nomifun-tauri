@@ -4,10 +4,10 @@
 
 use nomifun_auth::{AuthError, JwtService, resolve_jwt_secret};
 
-const USER_1: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
-const USER_2: &str = "user_0190f5fe-7c00-7a00-8000-000000000002";
-const USER_3: &str = "user_0190f5fe-7c00-7a00-8000-000000000003";
-const USER_42: &str = "user_0190f5fe-7c00-7a00-8000-000000000042";
+const USER_1: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+const USER_2: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+const USER_3: &str = "0190f5fe-7c00-7a00-8000-000000000003";
+const USER_42: &str = "0190f5fe-7c00-7a00-8000-000000000042";
 
 #[test]
 fn full_lifecycle_sign_verify_blacklist() {

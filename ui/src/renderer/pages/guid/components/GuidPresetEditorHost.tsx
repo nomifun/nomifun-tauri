@@ -83,7 +83,7 @@ const GuidPresetEditorHost: React.FC<GuidPresetEditorHostProps> = ({
       return;
     }
 
-    const targetPreset = presets.find((preset) => preset.id === presetId);
+    const targetPreset = presets.find((preset) => preset.preset_id === presetId);
     if (!targetPreset) {
       agentMessage.warning(
         t('common.failed', { defaultValue: 'Failed' }) +
@@ -102,7 +102,7 @@ const GuidPresetEditorHost: React.FC<GuidPresetEditorHostProps> = ({
   // ── Resolved agent (shared between description block and promptsNode) ──
   const resolvedAgent = useMemo(() => {
     if (!selectedAgentInfo?.preset_id) return null;
-    return presets.find((a) => a.id === selectedAgentInfo.preset_id) ?? null;
+    return presets.find((preset) => preset.preset_id === selectedAgentInfo.preset_id) ?? null;
   }, [presets, selectedAgentInfo?.preset_id]);
 
   // ── Description + details link block ──

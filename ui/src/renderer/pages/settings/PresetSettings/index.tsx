@@ -110,7 +110,7 @@ const PresetSettings: React.FC = () => {
     if (!targetPresetId) return;
     if (presets.length === 0) return;
 
-    const targetPreset = presets.find((preset) => preset.id === targetPresetId);
+    const targetPreset = presets.find((preset) => preset.preset_id === targetPresetId);
     if (!targetPreset) return;
 
     hasConsumedNavigationIntentRef.current = true;
@@ -147,7 +147,7 @@ const PresetSettings: React.FC = () => {
           onHighlightConsumed={handleHighlightConsumed}
           audienceTags={tags.audienceTags}
           scenarioTags={tags.scenarioTags}
-          tagByKey={tags.tagByKey}
+          tagById={tags.tagById}
           onManageTags={() => setTagModalVisible(true)}
         />
 

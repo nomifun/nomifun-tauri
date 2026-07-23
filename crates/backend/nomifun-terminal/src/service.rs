@@ -222,7 +222,7 @@ pub struct TerminalService {
     /// Hooks notified after a terminal row is deleted (registration order),
     /// mirroring `ConversationService::delete_hooks`. Used by `nomifun-app` to
     /// wire `RequirementService::clear_owner_for_session` so a deleted terminal
-    /// drops its requirements' dual-domain owner (no FK to cascade, spec §9.B).
+    /// explicitly drops its requirements' dual-domain owner (spec §9.B).
     delete_hooks: Arc<std::sync::RwLock<Vec<Arc<dyn OnTerminalDelete>>>>,
     /// Late-wired IDMM supervision hook (same slot pattern as `delete_hooks`).
     /// Fired on create/relaunch/input so a user-driven terminal re-arms 智能决策
@@ -595,7 +595,7 @@ impl TerminalService {
                 user_id: user_id.clone(),
             })
             .await?;
-        let id = row.id.clone();
+        let id = row.terminal_id.clone();
         let lifecycle_slot = Arc::new(tokio::sync::Mutex::new(TerminalLifecycleState::Pending));
         let mut lifecycle = lifecycle_slot
             .try_lock()
@@ -878,10 +878,9 @@ impl TerminalService {
     ///
     /// The binding is keyed by **workpath** (spec §7), not the per-session id —
     /// the exact key the session-header `KnowledgeControl` and the mount
-    /// resolver (`ensure_mounts_for_session`) read. Writing the legacy
-    /// `("terminal", id)` key here is what made the create-time picker invisible
-    /// in the session header (it reads `("workpath", key)`, which had no row)
-    /// and let any workpath row silently shadow the selection at mount time.
+    /// resolver read. Writing the legacy `("terminal", id)` key here is what
+    /// made the create-time picker invisible in the session header (it reads
+    /// `("workpath", key)`, which had no row).
     async fn bind_knowledge(&self, id: &str, cwd: &str, kb_ids: &[KnowledgeBaseId]) {
         let Some(ks) = self.knowledge_service() else {
             warn!(
@@ -930,18 +929,22 @@ impl TerminalService {
             return TerminalKnowledgeScope::default();
         };
         let id_str = id.to_string();
-        // Workpath-first (session-list unification spec §7): the binding
-        // belongs to the workspace path, not the terminal session.
+        // Workpath-only (session-list unification spec §7): the binding
+        // belongs to the workspace path, never the terminal session.
         // `session_workpath_key` maps a backend-managed default cwd —one
         // under `work_dir`, the same root `row_to_response` uses for the
         // `is_default_workpath` flag —to the `__default__` sentinel, and a
-        // custom cwd to its normalized key. The knowledge service looks up
-        // the `('workpath', key)` row first and only falls back to the legacy
-        // `('terminal', id)` binding on a full miss.
+        // custom cwd to its normalized key. Resolve that canonical workpath
+        // target directly so a missing row cannot fall back to the obsolete
+        // `('terminal', id)` identity.
         let cwd_path = std::path::Path::new(cwd);
         let wp_key = nomifun_knowledge::session_workpath_key(cwd_path, &self.work_dir);
         let outcome = ks
-            .ensure_mounts_for_session(&wp_key, "terminal", &id_str, cwd_path)
+            .ensure_mounts_for_target(
+                nomifun_knowledge::WORKPATH_BINDING_KIND,
+                &wp_key,
+                cwd_path,
+            )
             .await;
         if outcome.mounts.is_empty() {
             return TerminalKnowledgeScope::default();
@@ -988,7 +991,11 @@ impl TerminalService {
             }
         }
         TerminalKnowledgeScope {
-            kb_ids: outcome.mounts.iter().map(|m| m.id.clone()).collect(),
+            kb_ids: outcome
+                .mounts
+                .iter()
+                .map(|m| m.knowledge_base_id.clone())
+                .collect(),
             allow_write: outcome.writeback,
         }
     }
@@ -1925,7 +1932,8 @@ impl TerminalService {
     }
 
     /// Tear down EVERY terminal session on real app exit: kill all live PTYs and
-    /// delete all session rows (scrollback drops via FK CASCADE). The next launch
+    /// delete all session rows (scrollback is removed by repository-owned
+    /// logical cleanup). The next launch
     /// then starts with a clean list instead of a pile of dirty `exited` ghosts.
     ///
     /// MUST be called only on a real quit (desktop tray-quit / `RunEvent::Exit`),
@@ -1952,6 +1960,10 @@ impl TerminalService {
             lifecycle_guards.push(slot.lock_owned().await);
         }
 
+        // Capture authoritative owners before rows disappear so delete_all does
+        // not bypass the same logical-reference hooks as individual delete().
+        let deleted_rows = self.repo.list_all().await?;
+
         // Keep live processes and lifecycle states intact until the durable
         // delete-all succeeds. On failure the service is reopened unchanged.
         let n = match self.repo.delete_all().await {
@@ -1975,6 +1987,17 @@ impl TerminalService {
         self.lifecycle_slots.clear();
         self.titled.clear();
         self.first_input.clear();
+        let hooks: Vec<Arc<dyn OnTerminalDelete>> = self
+            .delete_hooks
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        for row in deleted_rows {
+            for hook in &hooks {
+                hook.on_terminal_deleted(row.user_id.as_str(), row.terminal_id.as_str())
+                    .await;
+            }
+        }
         info!(
             deleted = n,
             "terminal shutdown cleanup: all sessions killed and removed"
@@ -2135,8 +2158,8 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    const TEST_USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
-    const TEST_KB_ID: &str = "kb_0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_KB_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 
     fn test_kb_id() -> nomifun_common::KnowledgeBaseId {
         nomifun_common::KnowledgeBaseId::parse(TEST_KB_ID).unwrap()
@@ -2479,7 +2502,8 @@ mod tests {
             p: &CreateTerminalParams,
         ) -> Result<nomifun_db::TerminalSessionRow, nomifun_db::DbError> {
             let row = nomifun_db::TerminalSessionRow {
-                id: p.id.clone(),
+                id: 0,
+                terminal_id: p.id.clone(),
                 name: p.name.clone(),
                 cwd: p.cwd.clone(),
                 command: p.command.clone(),
@@ -2502,7 +2526,7 @@ mod tests {
             self.rows
                 .lock()
                 .unwrap()
-                .insert(row.id.to_string(), row.clone());
+                .insert(row.terminal_id.to_string(), row.clone());
             let gate = self.create_commit_gate.lock().unwrap().take();
             if let Some(gate) = gate {
                 gate.committed.notify_one();
@@ -2535,6 +2559,12 @@ mod tests {
                 .filter(|row| row.user_id.as_str() == user_id)
                 .cloned()
                 .collect())
+        }
+
+        async fn list_all(
+            &self,
+        ) -> Result<Vec<nomifun_db::TerminalSessionRow>, nomifun_db::DbError> {
+            Ok(self.rows.lock().unwrap().values().cloned().collect())
         }
 
         async fn update_status(
@@ -2863,7 +2893,7 @@ mod tests {
             self.bases
                 .lock()
                 .unwrap()
-                .insert(row.id.to_string(), row.clone());
+                .insert(row.knowledge_base_id.clone(), row.clone());
             Ok(())
         }
         async fn update_base(
@@ -2873,7 +2903,7 @@ mod tests {
             self.bases
                 .lock()
                 .unwrap()
-                .insert(row.id.to_string(), row.clone());
+                .insert(row.knowledge_base_id.clone(), row.clone());
             Ok(())
         }
         async fn delete_base(&self, id: &str) -> Result<(), nomifun_db::DbError> {
@@ -2916,39 +2946,56 @@ mod tests {
             writeback: bool,
             writeback_mode: &str,
             writeback_eagerness: &str,
-            _channel_write_enabled: bool,
+            channel_write_enabled: bool,
             updated_at: nomifun_common::TimestampMs,
         ) -> Result<String, nomifun_db::DbError> {
             let key = (target_kind.to_owned(), target_id.to_owned());
             let mut bindings = self.bindings.lock().unwrap();
-            // Preserve an existing binding_id on replace; allocate otherwise.
-            let binding_id = bindings
+            // Preserve both identities on upsert. The local integer is only
+            // the technical row key; callers receive the UUIDv7 business ID.
+            let (technical_id, knowledge_binding_id) = bindings
                 .get(&key)
-                .map(|(row, _)| row.binding_id.clone())
-                .unwrap_or_else(nomifun_common::KnowledgeBindingId::new);
+                .map(|(row, _)| (row.id, row.knowledge_binding_id.clone()))
+                .unwrap_or_else(|| {
+                    (
+                        bindings
+                            .values()
+                            .map(|(row, _)| row.id)
+                            .max()
+                            .unwrap_or(0)
+                            + 1,
+                        nomifun_common::KnowledgeBindingId::new(),
+                    )
+                });
+            let business_id = knowledge_binding_id.to_string();
             let mut row = nomifun_db::models::KnowledgeBindingRow {
-                binding_id: binding_id.clone(),
+                id: technical_id,
+                knowledge_binding_id,
                 target_kind: target_kind.to_owned(),
                 target_workpath: None,
-                target_conv_id: None,
-                target_term_id: None,
+                target_conversation_id: None,
+                target_terminal_id: None,
                 target_companion_id: None,
                 enabled,
                 writeback,
                 writeback_mode: writeback_mode.to_owned(),
                 writeback_eagerness: writeback_eagerness.to_owned(),
-                channel_write_enabled: _channel_write_enabled,
+                channel_write_enabled,
                 updated_at,
             };
             match target_kind {
                 "workpath" => row.target_workpath = Some(target_id.to_owned()),
                 "conversation" => {
-                    row.target_conv_id = Some(nomifun_common::ConversationId::parse(target_id)
-                        .map_err(|error| nomifun_db::DbError::Init(error.to_string()))?)
+                    row.target_conversation_id =
+                        Some(nomifun_common::ConversationId::parse(target_id).map_err(|error| {
+                            nomifun_db::DbError::Init(error.to_string())
+                        })?)
                 }
                 "terminal" => {
-                    row.target_term_id = Some(nomifun_common::TerminalId::parse(target_id)
-                        .map_err(|error| nomifun_db::DbError::Init(error.to_string()))?)
+                    row.target_terminal_id =
+                        Some(nomifun_common::TerminalId::parse(target_id).map_err(|error| {
+                            nomifun_db::DbError::Init(error.to_string())
+                        })?)
                 }
                 "companion" => {
                     row.target_companion_id = Some(nomifun_common::CompanionId::parse(target_id)
@@ -2957,7 +3004,7 @@ mod tests {
                 _ => {}
             }
             bindings.insert(key, (row, kb_ids.to_vec()));
-            Ok(binding_id.to_string())
+            Ok(business_id)
         }
         async fn delete_binding(
             &self,
@@ -3010,7 +3057,8 @@ mod tests {
         repo.bases.lock().unwrap().insert(
             TEST_KB_ID.into(),
             nomifun_db::models::KnowledgeBaseRow {
-                id: test_kb_id(),
+                id: 1,
+                knowledge_base_id: TEST_KB_ID.into(),
                 name: "Domain Notes".into(),
                 description: "test base".into(),
                 root_path: kb_root.to_string_lossy().into_owned(),
@@ -3063,7 +3111,7 @@ mod tests {
         // The legacy per-session key must NOT be written —that mismatch is the
         // bug this fix closes (header/mount read workpath, create wrote terminal).
         let legacy = ks
-            .get_binding("terminal", &resp.id.to_string())
+            .get_binding("terminal", &resp.terminal_id.to_string())
             .await
             .unwrap();
         assert!(
@@ -3082,7 +3130,7 @@ mod tests {
         );
         assert!(text.contains("Domain Notes"));
 
-        svc.kill(&resp.id).await.ok();
+        svc.kill(&resp.terminal_id).await.ok();
     }
 
     /// A user-picked working directory (NOT under the managed work dir) binds
@@ -3133,7 +3181,7 @@ mod tests {
             "the workpath binding must drive the mount + README"
         );
 
-        svc.kill(&resp.id).await.ok();
+        svc.kill(&resp.terminal_id).await.ok();
     }
 
     /// Read-modify-write: binding kb_ids at create time must NOT clobber the
@@ -3193,11 +3241,11 @@ mod tests {
             "writeback eagerness must be preserved"
         );
 
-        svc.kill(&resp.id).await.ok();
+        svc.kill(&resp.terminal_id).await.ok();
     }
 
     #[tokio::test]
-    async fn relaunch_resyncs_knowledge_and_rewrites_readme() {
+    async fn relaunch_ignores_legacy_terminal_knowledge_binding() {
         let kb_root = tempfile::TempDir::new().unwrap();
         std::fs::write(kb_root.path().join("guide.md"), "# Guide\nbody").unwrap();
         let (ks, _data) = knowledge_fixture(kb_root.path());
@@ -3211,11 +3259,11 @@ mod tests {
         let readme = cwd.path().join(".nomi").join("knowledge").join("README.md");
         assert!(!readme.exists(), "no binding yet → no README");
 
-        // Bind afterwards (the KnowledgeControl UI path), then relaunch in place
-        // —the documented way for a binding change to take effect.
+        // Only the obsolete per-terminal identity is bound. A canonical
+        // workpath miss must not consult it during relaunch.
         ks.set_binding(
             "terminal",
-            &resp.id.to_string(),
+            &resp.terminal_id.to_string(),
             nomifun_knowledge::KnowledgeBinding {
                 enabled: true,
                 writeback: false,
@@ -3227,28 +3275,20 @@ mod tests {
         )
         .await
         .unwrap();
-        svc.relaunch(&resp.id).await.unwrap();
-        assert!(
-            readme.exists(),
-            "relaunch must re-sync mounts and write the README"
-        );
+        let legacy = ks
+            .get_binding("terminal", &resp.terminal_id.to_string())
+            .await
+            .unwrap();
+        assert!(legacy.enabled);
+        assert_eq!(legacy.kb_ids, vec![test_kb_id()]);
 
-        // Unbind, relaunch again: the mount engine clears the whole mount dir
-        // (README included), so stale knowledge guidance never lingers.
-        ks.set_binding(
-            "terminal",
-            &resp.id.to_string(),
-            nomifun_knowledge::KnowledgeBinding::default(),
-        )
-        .await
-        .unwrap();
-        svc.relaunch(&resp.id).await.unwrap();
+        svc.relaunch(&resp.terminal_id).await.unwrap();
         assert!(
             !readme.exists(),
-            "relaunch after unbinding must sweep the README with the mounts"
+            "legacy (terminal, id) binding must not mount on a canonical workpath miss"
         );
 
-        svc.kill(&resp.id).await.ok();
+        svc.kill(&resp.terminal_id).await.ok();
     }
 
     #[tokio::test]
@@ -3271,7 +3311,7 @@ mod tests {
                 .join("README.md")
                 .exists()
         );
-        svc.kill(&resp.id).await.ok();
+        svc.kill(&resp.terminal_id).await.ok();
     }
 
     async fn wait_for<F: Fn() -> bool>(pred: F, ms: u64) -> bool {
@@ -3298,7 +3338,7 @@ mod tests {
     #[tokio::test]
     async fn read_output_tail_strips_ansi_and_tails() {
         let (svc, _bc) = service();
-        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         svc.submit_text(&id, "marker-xyz").await.unwrap();
 
         let mut ok = false;
@@ -3353,7 +3393,7 @@ mod tests {
         let mut persisted = false;
         for _ in 0..200 {
             if svc
-                .get(&resp.id)
+                .get(&resp.terminal_id)
                 .await
                 .map(|s| s.last_status == "exited")
                 .unwrap_or(false)
@@ -3370,11 +3410,11 @@ mod tests {
     async fn input_is_echoed_back_by_cat() {
         let (svc, bc) = service();
         let resp = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap();
-        svc.input(&resp.id, &BASE64.encode("ping\n")).await.unwrap();
+        svc.input(&resp.terminal_id, &BASE64.encode("ping\n")).await.unwrap();
 
         let got = wait_for(|| collect_output(&bc).contains("ping"), 4000).await;
         assert!(got, "cat should echo input, got: {:?}", collect_output(&bc));
-        svc.kill(&resp.id).await.unwrap();
+        svc.kill(&resp.terminal_id).await.unwrap();
     }
 
     #[tokio::test]
@@ -3386,10 +3426,10 @@ mod tests {
         // Subscribe via the driver seam, then write raw bytes; the echo must
         // arrive on the broadcast stream (independent of the WS path).
         let mut rx = svc
-            .subscribe_output(&resp.id)
+            .subscribe_output(&resp.terminal_id)
             .expect("live session has an output stream");
-        assert!(svc.is_alive(&resp.id), "session should be alive");
-        TerminalDriver::write_input(&svc, &resp.id, b"hello-driver\n")
+        assert!(svc.is_alive(&resp.terminal_id), "session should be alive");
+        TerminalDriver::write_input(&svc, &resp.terminal_id, b"hello-driver\n")
             .await
             .unwrap();
 
@@ -3416,29 +3456,29 @@ mod tests {
         );
 
         // describe + autowork round-trip through the driver.
-        let desc = svc.describe(&resp.id).await.unwrap().unwrap();
+        let desc = svc.describe(&resp.terminal_id).await.unwrap().unwrap();
         assert_eq!(desc.last_status, "running");
         assert_eq!(desc.cwd, std::env::temp_dir().to_string_lossy());
-        svc.write_autowork(&resp.id, Some(r#"{"enabled":true,"tag":"t"}"#))
+        svc.write_autowork(&resp.terminal_id, Some(r#"{"enabled":true,"tag":"t"}"#))
             .await
             .unwrap();
         assert_eq!(
-            svc.read_autowork(&resp.id).await.unwrap().as_deref(),
+            svc.read_autowork(&resp.terminal_id).await.unwrap().as_deref(),
             Some(r#"{"enabled":true,"tag":"t"}"#)
         );
 
         // idmm round-trip through the driver (set, read, clear).
-        svc.write_idmm(&resp.id, Some(r#"{"enabled":true,"tier":"rule"}"#))
+        svc.write_idmm(&resp.terminal_id, Some(r#"{"enabled":true,"tier":"rule"}"#))
             .await
             .unwrap();
         assert_eq!(
-            svc.read_idmm(&resp.id).await.unwrap().as_deref(),
+            svc.read_idmm(&resp.terminal_id).await.unwrap().as_deref(),
             Some(r#"{"enabled":true,"tier":"rule"}"#)
         );
-        svc.write_idmm(&resp.id, None).await.unwrap();
-        assert_eq!(svc.read_idmm(&resp.id).await.unwrap(), None);
+        svc.write_idmm(&resp.terminal_id, None).await.unwrap();
+        assert_eq!(svc.read_idmm(&resp.terminal_id).await.unwrap(), None);
 
-        svc.kill(&resp.id).await.unwrap();
+        svc.kill(&resp.terminal_id).await.unwrap();
     }
 
     #[tokio::test]
@@ -3448,23 +3488,23 @@ mod tests {
         // cwd == work_dir (the fixture's temp_dir) → the derived flag is set
         // on both the create and GET responses.
         assert!(resp.is_default_workpath);
-        svc.input(&resp.id, &BASE64.encode("xyz\n")).await.unwrap();
+        svc.input(&resp.terminal_id, &BASE64.encode("xyz\n")).await.unwrap();
         wait_for(|| true, 200).await;
 
-        let got = svc.get(&resp.id).await.unwrap();
+        let got = svc.get(&resp.terminal_id).await.unwrap();
         assert!(got.scrollback_b64.is_some());
         assert!(got.is_default_workpath);
 
-        svc.resize(&resp.id, 120, 40).await.unwrap();
-        let after = svc.get(&resp.id).await.unwrap();
+        svc.resize(&resp.terminal_id, 120, 40).await.unwrap();
+        let after = svc.get(&resp.terminal_id).await.unwrap();
         assert_eq!((after.cols, after.rows), (120, 40));
-        svc.kill(&resp.id).await.unwrap();
+        svc.kill(&resp.terminal_id).await.unwrap();
     }
 
     #[tokio::test]
     async fn submit_text_single_line_executes_via_cat_echo() {
         let (svc, _bc) = service();
-        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         svc.submit_text(&id, "hello-world").await.unwrap();
 
         let mut seen = false;
@@ -3497,7 +3537,7 @@ mod tests {
     #[tokio::test]
     async fn await_turn_settle_idle_when_shell_goes_quiet() {
         let (svc, _bc) = service();
-        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         svc.submit_text(&id, "ping").await.unwrap();
         let reason = svc
             .await_turn_settle(&id, std::time::Duration::from_secs(5))
@@ -3509,7 +3549,7 @@ mod tests {
     #[tokio::test]
     async fn await_turn_settle_timeout_when_output_never_quiets() {
         let (svc, _bc) = service();
-        let id = svc.create(TEST_USER_ID, req("yes", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("yes", &[])).await.unwrap().terminal_id;
         let reason = svc
             .await_turn_settle(&id, std::time::Duration::from_millis(400))
             .await;
@@ -3537,7 +3577,7 @@ mod tests {
             defer_spawn: false,
             knowledge_base_ids: None,
         };
-        let id = svc.create(TEST_USER_ID, request).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, request).await.unwrap().terminal_id;
 
         // settle future 与 POST future 用 tokio::join! 同任务并发（svc 非 Clone，
         // 借用即可）。settle 先被 poll → 内部 subscribe_lifecycle 建立订阅；post
@@ -3581,7 +3621,7 @@ mod tests {
             defer_spawn: false,
             knowledge_base_ids: None,
         };
-        let id = svc.create(TEST_USER_ID, request).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, request).await.unwrap().terminal_id;
 
         // Kill the PTY and let the exit callback drop it from the live map.
         svc.kill(&id).await.unwrap();
@@ -3608,7 +3648,7 @@ mod tests {
     async fn reconcile_on_boot_marks_running_exited() {
         let (svc, _bc) = service();
         // `cat` stays alive, so its row stays `running` until reconciliation.
-        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
 
         let n = svc.reconcile_on_boot().await.unwrap();
         assert_eq!(n, 1, "the one running session must be reconciled");
@@ -3628,7 +3668,7 @@ mod tests {
             .create(TEST_USER_ID, req("printf", &["restore-me"]))
             .await
             .unwrap()
-            .id;
+            .terminal_id;
 
         // Exit drops the live handle and persists the final scrollback.
         assert!(
@@ -3662,7 +3702,7 @@ mod tests {
     #[tokio::test]
     async fn flush_persists_dirty_live_scrollback() {
         let (svc, _bc) = service();
-        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         // Feed a line; the PTY echoes it (and cat re-emits) → scrollback dirty.
         svc.input(&id, &BASE64.encode("echoline\n")).await.unwrap();
 
@@ -3701,7 +3741,7 @@ mod tests {
         let (svc, _bc) = service();
         let mut r = req("cat", &[]);
         r.defer_spawn = true;
-        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().terminal_id;
 
         // Not spawned yet: no live PTY → no scrollback, and input fails (the
         // root-cause fix —`claude` never draws at 80×24 before the real size).
@@ -3729,7 +3769,7 @@ mod tests {
         let (svc, _bc, repo) = service_with_repo();
         let mut r = req("cat", &[]);
         r.defer_spawn = true;
-        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().terminal_id;
 
         // Hold the first resize after it owns the activation slot but before it
         // can spawn. This deterministically reproduces the old marker-removal
@@ -3771,7 +3811,7 @@ mod tests {
         let (svc, bc) = service();
         let mut r = req("nomifun-command-that-does-not-exist-2c5f4d", &[]);
         r.defer_spawn = true;
-        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().terminal_id;
         bc.events.lock().unwrap().clear();
 
         let epoch_before = svc.next_epoch.load(std::sync::atomic::Ordering::SeqCst);
@@ -3836,7 +3876,7 @@ mod tests {
             .create(TEST_USER_ID, req("cat", &[]))
             .await
             .unwrap()
-            .id;
+            .terminal_id;
         let old_epoch = svc.live.get(id.as_str()).unwrap().epoch();
         bc.events.lock().unwrap().clear();
         repo.fail_next_update_command
@@ -3881,7 +3921,7 @@ mod tests {
             .create(TEST_USER_ID, req("cat", &[]))
             .await
             .unwrap()
-            .id;
+            .terminal_id;
         let old_epoch = svc.live.get(id.as_str()).unwrap().epoch();
         repo.fail_next_update_status
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3907,7 +3947,7 @@ mod tests {
             .create(TEST_USER_ID, req("cat", &[]))
             .await
             .unwrap()
-            .id;
+            .terminal_id;
         let old_epoch = svc.live.get(id.as_str()).unwrap().epoch();
         repo.fail_next_delete
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3936,7 +3976,7 @@ mod tests {
             .create(TEST_USER_ID, req("cat", &[]))
             .await
             .unwrap()
-            .id;
+            .terminal_id;
         let gate = Arc::new(CommitGate::default());
         *repo.delete_commit_gate.lock().unwrap() = Some(gate.clone());
 
@@ -3980,7 +4020,7 @@ mod tests {
             .expect("terminal create should commit");
         let rows = repo.list_by_user(TEST_USER_ID).await.unwrap();
         assert_eq!(rows.len(), 1);
-        let id = rows[0].id.clone();
+        let id = rows[0].terminal_id.clone();
 
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
@@ -4007,7 +4047,7 @@ mod tests {
             .create(TEST_USER_ID, req("cat", &[]))
             .await
             .unwrap()
-            .id;
+            .terminal_id;
         let old_epoch = svc.live.get(id.as_str()).unwrap().epoch();
         let gate = Arc::new(CommitGate::default());
         *repo.launch_state_commit_gate.lock().unwrap() = Some(gate.clone());
@@ -4062,7 +4102,7 @@ mod tests {
 
         let mut r = req("cat", &[]);
         r.defer_spawn = true;
-        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().terminal_id;
         let epoch_before = svc.next_epoch.load(std::sync::atomic::Ordering::SeqCst);
         for (cols, rows) in [
             (0, 24),
@@ -4097,7 +4137,7 @@ mod tests {
         let (svc, _bc, repo) = service_with_repo();
         let mut r = req("cat", &[]);
         r.defer_spawn = true;
-        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().terminal_id;
 
         let gate = Arc::new(GetByIdGate::default());
         *repo.get_by_id_gate.lock().unwrap() = Some(gate.clone());
@@ -4129,7 +4169,7 @@ mod tests {
             .create(TEST_USER_ID, req("cat", &[]))
             .await
             .unwrap()
-            .id;
+            .terminal_id;
         let gate = Arc::new(CommitGate::default());
         *repo.delete_commit_gate.lock().unwrap() = Some(gate.clone());
 
@@ -4166,7 +4206,7 @@ mod tests {
     async fn non_deferred_create_spawns_immediately() {
         let (svc, _bc) = service();
         // `req` defaults `defer_spawn = false` —headless/cron behaviour unchanged.
-        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         // Live without any resize: input succeeds immediately.
         svc.input(&id, &BASE64.encode("hi\n")).await.unwrap();
         svc.kill(&id).await.unwrap();
@@ -4196,7 +4236,7 @@ mod tests {
         // Start as an "agent" session (backend label set), then fall back to shell.
         let mut r = req("cat", &[]);
         r.backend = Some("claude".into());
-        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().terminal_id;
         bc.events.lock().unwrap().clear();
 
         let resp = svc.relaunch_as_shell(&id).await.unwrap();
@@ -4228,8 +4268,8 @@ mod tests {
     #[tokio::test]
     async fn shutdown_cleanup_kills_and_deletes_all_sessions() {
         let (svc, _bc) = service();
-        let a = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
-        let b = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let a = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
+        let b = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         assert!(svc.live.contains_key(a.as_str()) && svc.live.contains_key(b.as_str()));
 
         let n = svc.shutdown_cleanup().await.unwrap();
@@ -4246,7 +4286,7 @@ mod tests {
         let (svc, _bc, repo) = service_with_repo();
         let mut r = req("cat", &[]);
         r.defer_spawn = true;
-        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().terminal_id;
         let gate = Arc::new(GetByIdGate::default());
         *repo.get_by_id_gate.lock().unwrap() = Some(gate.clone());
 
@@ -4295,7 +4335,7 @@ mod tests {
             .create(TEST_USER_ID, req("cat", &[]))
             .await
             .unwrap()
-            .id;
+            .terminal_id;
         let old_epoch = svc.live.get(id.as_str()).unwrap().epoch();
         repo.fail_next_delete_all
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4308,7 +4348,7 @@ mod tests {
         assert_eq!(svc.live.get(id.as_str()).unwrap().epoch(), old_epoch);
         assert!(svc.get(&id).await.is_ok());
 
-        let second = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let second = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         assert!(svc.live.contains_key(second.as_str()));
         assert_eq!(svc.shutdown_cleanup().await.unwrap(), 2);
     }
@@ -4335,7 +4375,7 @@ mod tests {
     async fn shell_session_autotitles_from_first_input_line() {
         let (svc, _bc) = service();
         // command "cat", no backend → is_agent=false, mechanical name "cat".
-        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         // First input line (ends with CR) → fallback title from that line.
         svc.input(&id, &BASE64.encode("echo hello world\r"))
             .await
@@ -4357,7 +4397,7 @@ mod tests {
         // here, so it takes the first-N-chars path.
         let mut r = req("cat", &[]);
         r.backend = Some("claude".into());
-        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().terminal_id;
         svc.input(&id, &BASE64.encode("你好\r")).await.unwrap();
         assert!(
             wait_for_name(&svc, &id, "你好", 4000).await,
@@ -4373,7 +4413,7 @@ mod tests {
         // sends focus events (CSI I) and SGR mouse reports (CSI < —M) into the
         // PTY before the user's typed text. These must be stripped, not titled.
         let (svc, _bc) = service();
-        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         let noisy = "\u{1b}[I\u{1b}[<35;29;26M\u{1b}[<0;30;25m你好\r";
         svc.input(&id, &BASE64.encode(noisy)).await.unwrap();
         assert!(
@@ -4391,7 +4431,7 @@ mod tests {
         // backend "claude" → mechanical name "claude" (the agent label).
         let mut r = req("cat", &[]);
         r.backend = Some("claude".into());
-        let id = svc.create(TEST_USER_ID, r).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, r).await.unwrap().terminal_id;
 
         svc.maybe_autotitle(&id, Some("user deployed prod; assistant confirmed".into()))
             .await;
@@ -4407,7 +4447,7 @@ mod tests {
     async fn autotitle_skips_when_name_is_custom() {
         let (svc, _bc) = service();
         svc.with_title_completer(Arc::new(FakeTitler::new("auto-")));
-        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         // A manual rename makes name != default_name → never overwritten.
         svc.update_meta(&id, Some("我的终端".into()), None)
             .await
@@ -4425,7 +4465,7 @@ mod tests {
     async fn autotitle_fires_at_most_once() {
         let (svc, _bc) = service();
         svc.with_title_completer(Arc::new(FakeTitler::new("t")));
-        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().id;
+        let id = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         svc.maybe_autotitle(&id, Some("a".into())).await;
         assert_eq!(svc.get(&id).await.unwrap().name, "t0");
         // Second call is a no-op (once-guard): the completer is NOT called again,
@@ -4438,7 +4478,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_id_is_not_found() {
         let (svc, _bc) = service();
-        let missing = "term_0190f5fe-7c00-7a00-8000-000000000099";
+        let missing = "0190f5fe-7c00-7a00-8000-000000000099";
         assert!(matches!(
             svc.get(missing).await.unwrap_err(),
             TerminalError::NotFound(_)
@@ -4486,7 +4526,7 @@ mod tests {
         create.defer_spawn = true; // no live PTY needed to list files
         let resp = svc.create(TEST_USER_ID, create).await.unwrap();
 
-        let entries = svc.browse_workspace(&resp.id, "", None).await.unwrap();
+        let entries = svc.browse_workspace(&resp.terminal_id, "", None).await.unwrap();
         assert!(
             entries
                 .iter()
@@ -4519,7 +4559,7 @@ mod tests {
         let resp = svc.create(TEST_USER_ID, create).await.unwrap();
 
         let err = svc
-            .browse_workspace(&resp.id, "../", None)
+            .browse_workspace(&resp.terminal_id, "../", None)
             .await
             .unwrap_err();
         assert!(
@@ -4532,18 +4572,18 @@ mod tests {
     async fn invalid_base64_input_is_rejected() {
         let (svc, _bc) = service();
         let resp = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap();
-        let err = svc.input(&resp.id, "!!!not-base64!!!").await.unwrap_err();
+        let err = svc.input(&resp.terminal_id, "!!!not-base64!!!").await.unwrap_err();
         assert!(matches!(err, TerminalError::InvalidInput(_)));
-        svc.kill(&resp.id).await.unwrap();
+        svc.kill(&resp.terminal_id).await.unwrap();
     }
 
     #[tokio::test]
     async fn delete_removes_and_emits() {
         let (svc, bc) = service();
         let resp = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap();
-        svc.delete(&resp.id).await.unwrap();
+        svc.delete(&resp.terminal_id).await.unwrap();
         assert!(matches!(
-            svc.get(&resp.id).await.unwrap_err(),
+            svc.get(&resp.terminal_id).await.unwrap_err(),
             TerminalError::NotFound(_)
         ));
         assert!(
@@ -4561,7 +4601,7 @@ mod tests {
         let (svc, bc) = service();
         // short-lived child so it exits, then relaunch in place.
         let resp = svc.create(TEST_USER_ID, req("printf", &["x"])).await.unwrap();
-        let id = resp.id.clone();
+        let id = resp.terminal_id.clone();
         // wait until it exits
         let exited = wait_for(
             || {
@@ -4577,7 +4617,7 @@ mod tests {
         assert!(exited);
 
         let relaunched = svc.relaunch(&id).await.unwrap();
-        assert_eq!(relaunched.id, id, "relaunch must reuse the same session id");
+        assert_eq!(relaunched.terminal_id, id, "relaunch must reuse the same session id");
         assert_eq!(relaunched.last_status, "running");
         assert!(
             bc.events
@@ -4600,7 +4640,7 @@ mod tests {
         let (svc, _bc) = service();
         // A long-lived child (cat blocks reading the PTY) → genuinely running.
         let resp = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap();
-        let id = resp.id;
+        let id = resp.terminal_id;
         assert!(
             svc.live.contains_key(id.as_str()),
             "freshly created session must be live"
@@ -4636,7 +4676,7 @@ mod tests {
             .create(TEST_USER_ID, req("cat", &[]))
             .await
             .unwrap()
-            .id;
+            .terminal_id;
         let old_epoch = svc.live.get(id.as_str()).unwrap().epoch();
         let gate = Arc::new(CommitGate::default());
         *repo.running_status_commit_gate.lock().unwrap() = Some(gate.clone());
@@ -4779,7 +4819,7 @@ mod tests {
         let (svc, bc) = service();
         let resp = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap();
         let updated = svc
-            .update_meta(&resp.id, Some("Renamed".into()), Some(true))
+            .update_meta(&resp.terminal_id, Some("Renamed".into()), Some(true))
             .await
             .unwrap();
         assert_eq!(updated.name, "Renamed");
@@ -4793,11 +4833,11 @@ mod tests {
         );
         // blank name is ignored (keeps prior)
         let again = svc
-            .update_meta(&resp.id, Some("   ".into()), None)
+            .update_meta(&resp.terminal_id, Some("   ".into()), None)
             .await
             .unwrap();
         assert_eq!(again.name, "Renamed");
-        svc.delete(&resp.id).await.ok();
+        svc.delete(&resp.terminal_id).await.ok();
     }
 
     #[tokio::test]

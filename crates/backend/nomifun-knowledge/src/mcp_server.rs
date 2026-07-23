@@ -434,8 +434,8 @@ async fn resolve_base_id<I: AsRef<str>>(
         .await
         .unwrap_or_default()
         .into_iter()
-        .filter(|b| bound_kb_ids.iter().any(|id| id.as_ref() == b.id.as_str()))
-        .map(|b| (b.id, b.name))
+        .filter(|b| bound_kb_ids.iter().any(|id| id.as_ref() == b.knowledge_base_id.as_str()))
+        .map(|b| (b.knowledge_base_id, b.name))
         .collect();
     if bases.is_empty() {
         return Err("no knowledge bases are in scope to write to".to_owned());
@@ -488,10 +488,10 @@ fn render_hits(query: &str, hits: &[KnowledgeSearchHit]) -> String {
 mod tests {
     use super::*;
 
-    const TEST_OWNER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
-    const TEST_CONVERSATION_ID: &str = "conv_0190f5fe-7c00-7a00-8000-000000000017";
-    const TEST_KB_ID_A: &str = "kb_0190f5fe-7c00-7a00-8000-000000000001";
-    const TEST_KB_ID_B: &str = "kb_0190f5fe-7c00-7a00-8000-000000000002";
+    const TEST_OWNER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000017";
+    const TEST_KB_ID_A: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_KB_ID_B: &str = "0190f5fe-7c00-7a00-8000-000000000002";
     use crate::events::KnowledgeEventEmitter;
 
     #[derive(Default)]
@@ -563,12 +563,12 @@ mod tests {
     async fn dispatch_search_finds_doc_and_wraps_result() {
         let (svc, _tmp) = build_service().await;
         let info = svc.create_base("运维手册", "", None, None).await.unwrap();
-        let root = svc.data_dir().join("knowledge").join(info.id.as_str());
+        let root = svc.data_dir().join("knowledge").join(info.knowledge_base_id.as_str());
         // The self-ignore the mount writes — must NOT blind the search.
         std::fs::write(root.join(".gitignore"), "*\n").unwrap();
         std::fs::write(root.join("rollback.md"), "# 回滚流程\n回滚分三步\n").unwrap();
 
-        let out = dispatch_search(&svc, &[info.id], "回滚", 8).await;
+        let out = dispatch_search(&svc, &[info.knowledge_base_id], "回滚", 8).await;
         let result = out
             .get("result")
             .and_then(Value::as_str)
@@ -581,10 +581,10 @@ mod tests {
     async fn dispatch_search_no_match_reports_cleanly() {
         let (svc, _tmp) = build_service().await;
         let info = svc.create_base("库", "", None, None).await.unwrap();
-        let root = svc.data_dir().join("knowledge").join(info.id.as_str());
+        let root = svc.data_dir().join("knowledge").join(info.knowledge_base_id.as_str());
         std::fs::write(root.join("a.md"), "# A\nunrelated content\n").unwrap();
 
-        let out = dispatch_search(&svc, &[info.id], "完全不存在的主题词", 8).await;
+        let out = dispatch_search(&svc, &[info.knowledge_base_id], "完全不存在的主题词", 8).await;
         let result = out.get("result").and_then(Value::as_str).unwrap_or_else(|| panic!("got {out}"));
         assert!(result.contains("No matches"), "got: {result}");
     }
@@ -741,13 +741,13 @@ mod tests {
         let claims = KnowledgeCapabilityClaims::issue(
             TEST_OWNER_ID,
             nomifun_common::LoopbackSessionBinding::conversation(
-                "conv_0190f5fe-7c00-7a00-8000-000000000017",
+                "0190f5fe-7c00-7a00-8000-000000000017",
             ),
             ["knowledge_search"],
             KnowledgeCapabilityScope {
                 workspace_path: " /not-canonical".to_owned(),
                 kb_ids: vec![KnowledgeBaseId::parse(
-                    "kb_0190f5fe-7c00-7a00-8000-000000000001",
+                    "0190f5fe-7c00-7a00-8000-000000000001",
                 )
                 .unwrap()],
             },
@@ -769,23 +769,23 @@ mod tests {
         let (server, svc, _tmp) = start_wired_server().await;
 
         let info = svc.create_base("项目库", "", None, None).await.unwrap();
-        let root = svc.data_dir().join("knowledge").join(info.id.as_str());
+        let root = svc.data_dir().join("knowledge").join(info.knowledge_base_id.as_str());
         std::fs::write(root.join("api.md"), "# API\n接口文档内容\n").unwrap();
         let other = svc.create_base("无关库", "", None, None).await.unwrap();
-        let other_root = svc.data_dir().join("knowledge").join(other.id.as_str());
+        let other_root = svc.data_dir().join("knowledge").join(other.knowledge_base_id.as_str());
         std::fs::write(other_root.join("secret.md"), "# Secret\n接口隐藏内容\n").unwrap();
 
         let child = conversation_child(
             &server,
             TEST_CONVERSATION_ID,
             "/Users/test/myproject",
-            std::slice::from_ref(&info.id),
+            std::slice::from_ref(&info.knowledge_base_id),
             false,
         );
         let (status, resp) = post_tool(&server, &child.bootstrap.access.token, &child.bootstrap.access.claims, json!({
             "tool": "knowledge_search",
             "cwd": "/forged",
-            "kb_ids": [other.id],
+            "kb_ids": [other.knowledge_base_id],
             "args": { "query": "接口" }
         }))
         .await;
@@ -804,13 +804,13 @@ mod tests {
             &server,
             TEST_CONVERSATION_ID,
             "/workspace",
-            std::slice::from_ref(&info.id),
+            std::slice::from_ref(&info.knowledge_base_id),
             false,
         );
 
         let mut forged = child.bootstrap.access.claims.clone();
         forged.session = nomifun_common::LoopbackSessionBinding::conversation(
-            "conv_0190f5fe-7c00-7a00-8000-000000000099",
+            "0190f5fe-7c00-7a00-8000-000000000099",
         );
         let (status, _) = post_tool(
             &server,
@@ -855,16 +855,16 @@ mod tests {
     async fn dispatch_read_returns_content_within_scope_and_denies_outside() {
         let (svc, _tmp) = build_service().await;
         let info = svc.create_base("库", "", None, None).await.unwrap();
-        svc.write_file(&info.id, "terms.md", "# T\nBODY-市盈率").await.unwrap();
-        let h = encode_doc_handle(&info.id, "terms.md");
+        svc.write_file(&info.knowledge_base_id, "terms.md", "# T\nBODY-市盈率").await.unwrap();
+        let h = encode_doc_handle(&info.knowledge_base_id, "terms.md");
 
-        let ok = dispatch_read(&svc, std::slice::from_ref(&info.id), &h).await;
+        let ok = dispatch_read(&svc, std::slice::from_ref(&info.knowledge_base_id), &h).await;
         assert!(ok.get("result").and_then(Value::as_str).unwrap_or("").contains("BODY-市盈率"), "{ok}");
         // Out of scope (empty kb_ids) → denied.
         let denied = dispatch_read(&svc, &[] as &[String], &h).await;
         assert!(denied.get("error").is_some(), "out-of-scope handle must be denied: {denied}");
         // Malformed handle → error.
-        let bad = dispatch_read(&svc, std::slice::from_ref(&info.id), "not-a-handle").await;
+        let bad = dispatch_read(&svc, std::slice::from_ref(&info.knowledge_base_id), "not-a-handle").await;
         assert!(bad.get("error").is_some(), "{bad}");
     }
 
@@ -872,34 +872,34 @@ mod tests {
     async fn dispatch_write_staged_lands_in_inbox_and_preserves_original() {
         let (svc, _tmp) = build_service().await;
         let info = svc.create_base("库", "", None, None).await.unwrap();
-        svc.write_file(&info.id, "terms.md", "ORIGINAL").await.unwrap();
+        svc.write_file(&info.knowledge_base_id, "terms.md", "ORIGINAL").await.unwrap();
         let binding = KnowledgeBinding {
             enabled: true,
             writeback: true,
             writeback_mode: "staged".into(),
-            kb_ids: vec![info.id.clone()],
+            kb_ids: vec![info.knowledge_base_id.clone()],
             ..Default::default()
         };
         let out = dispatch_write(
             &svc,
-            std::slice::from_ref(&info.id),
+            std::slice::from_ref(&info.knowledge_base_id),
             &binding,
             TEST_CONVERSATION_ID,
-            &json!({ "handle": encode_doc_handle(&info.id, "terms.md"), "content": "PROPOSED" }),
+            &json!({ "handle": encode_doc_handle(&info.knowledge_base_id, "terms.md"), "content": "PROPOSED" }),
         )
         .await;
         let r = out.get("result").unwrap_or_else(|| panic!("{out}"));
         assert_eq!(
             r.get("rel_path").and_then(Value::as_str),
-            Some("_inbox/conv_0190f5fe-7c00-7a00-8000-000000000017/terms.md")
+            Some("_inbox/0190f5fe-7c00-7a00-8000-000000000017/terms.md")
         );
         assert_eq!(r.get("staged").and_then(Value::as_bool), Some(true));
         // Original untouched; proposal staged.
-        assert_eq!(svc.read_file(&info.id, "terms.md").await.unwrap().content, "ORIGINAL");
+        assert_eq!(svc.read_file(&info.knowledge_base_id, "terms.md").await.unwrap().content, "ORIGINAL");
         assert_eq!(
             svc.read_file(
-                &info.id,
-                "_inbox/conv_0190f5fe-7c00-7a00-8000-000000000017/terms.md",
+                &info.knowledge_base_id,
+                "_inbox/0190f5fe-7c00-7a00-8000-000000000017/terms.md",
             )
             .await
             .unwrap()
@@ -912,15 +912,15 @@ mod tests {
     async fn dispatch_write_refused_when_writeback_disabled() {
         let (svc, _tmp) = build_service().await;
         let info = svc.create_base("库", "", None, None).await.unwrap();
-        svc.write_file(&info.id, "terms.md", "x").await.unwrap();
+        svc.write_file(&info.knowledge_base_id, "terms.md", "x").await.unwrap();
         // Binding present but writeback off → policy Disabled.
-        let binding = KnowledgeBinding { enabled: true, writeback: false, kb_ids: vec![info.id.clone()], ..Default::default() };
+        let binding = KnowledgeBinding { enabled: true, writeback: false, kb_ids: vec![info.knowledge_base_id.clone()], ..Default::default() };
         let out = dispatch_write(
             &svc,
-            std::slice::from_ref(&info.id),
+            std::slice::from_ref(&info.knowledge_base_id),
             &binding,
             "wp",
-            &json!({ "handle": encode_doc_handle(&info.id, "terms.md"), "content": "y" }),
+            &json!({ "handle": encode_doc_handle(&info.knowledge_base_id, "terms.md"), "content": "y" }),
         )
         .await;
         assert!(out.get("error").is_some(), "writeback off must refuse: {out}");
@@ -930,7 +930,7 @@ mod tests {
     async fn http_knowledge_write_routes_through_policy_direct() {
         let (server, svc, _tmp) = start_wired_server().await;
         let info = svc.create_base("项目库", "", None, None).await.unwrap();
-        svc.write_file(&info.id, "notes.md", "OLD").await.unwrap();
+        svc.write_file(&info.knowledge_base_id, "notes.md", "OLD").await.unwrap();
         let ws = "/Users/test/wp-write";
         let key = crate::workpath::workpath_key(ws);
         svc.set_binding(
@@ -940,7 +940,7 @@ mod tests {
                 enabled: true,
                 writeback: true,
                 writeback_mode: "direct".into(),
-                kb_ids: vec![info.id.clone()],
+                kb_ids: vec![info.knowledge_base_id.clone()],
                 ..Default::default()
             },
         )
@@ -950,16 +950,16 @@ mod tests {
             &server,
             TEST_CONVERSATION_ID,
             ws,
-            std::slice::from_ref(&info.id),
+            std::slice::from_ref(&info.knowledge_base_id),
             true,
         );
         let (status, resp) = post_tool(&server, &child.bootstrap.access.token, &child.bootstrap.access.claims, json!({
             "tool": "knowledge_write",
-            "args": { "handle": encode_doc_handle(&info.id, "notes.md"), "content": "NEW" }
+            "args": { "handle": encode_doc_handle(&info.knowledge_base_id, "notes.md"), "content": "NEW" }
         }))
         .await;
         assert_eq!(status, 200);
         assert!(resp.get("result").is_some(), "expected result, got {resp}");
-        assert_eq!(svc.read_file(&info.id, "notes.md").await.unwrap().content, "NEW");
+        assert_eq!(svc.read_file(&info.knowledge_base_id, "notes.md").await.unwrap().content, "NEW");
     }
 }

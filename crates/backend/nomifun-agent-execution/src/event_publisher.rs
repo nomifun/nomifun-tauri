@@ -105,7 +105,8 @@ impl AgentExecutionEventPublisher {
                     Ok(kind) => kind,
                     Err(error) => {
                         tracing::error!(
-                            event_id = %event.id,
+                            execution_id = %event.execution_id,
+                            sequence = event.sequence,
                             event_type = %event.event_type,
                             %error,
                             "refusing to publish invalid Agent Execution outbox event"
@@ -121,8 +122,16 @@ impl AgentExecutionEventPublisher {
                         change_kind,
                     },
                 );
-                if let Err(error) = repository.mark_event_published(&event.id, now_ms()).await {
-                    tracing::warn!(event_id = %event.id, %error, "failed to mark execution event published");
+                if let Err(error) = repository
+                    .mark_event_published(&event.execution_id, event.sequence, now_ms())
+                    .await
+                {
+                    tracing::warn!(
+                        execution_id = %event.execution_id,
+                        sequence = event.sequence,
+                        %error,
+                        "failed to mark execution event published"
+                    );
                     return false;
                 }
             }
@@ -199,10 +208,10 @@ mod tests {
         init_database_memory,
     };
 
-    const EXECUTION_ID: &str = "exec_0190f5fe-7c00-7a00-8000-000000000001";
-    const PARTICIPANT_ID: &str = "execpart_0190f5fe-7c00-7a00-8000-000000000001";
-    const PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000001";
-    const USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
+    const EXECUTION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+    const USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000003";
+    const NOMI_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000114";
 
     struct RecordingSink(std::sync::Mutex<Vec<(String, WebSocketMessage<serde_json::Value>)>>);
 
@@ -254,10 +263,10 @@ mod tests {
         assert_eq!(events[0].1.data["content"], "private content");
     }
 
-    fn participant(id: &str) -> NewAgentExecutionParticipant {
+    fn participant(participant_id: &str) -> NewAgentExecutionParticipant {
         NewAgentExecutionParticipant {
-            id: id.to_owned(),
-            source_agent_id: "agent_nomi".to_owned(),
+            participant_id: participant_id.to_owned(),
+            source_agent_id: NOMI_AGENT_ID.to_owned(),
             preset_id: None,
             preset_revision: None,
             preset_snapshot: None,
@@ -305,7 +314,7 @@ mod tests {
         let installation_owner = nomifun_db::installation_owner_id(database.pool()).await.unwrap();
         sqlx::query(
             "INSERT INTO providers (\
-                id, platform, name, base_url, api_key_encrypted, models, enabled, \
+                provider_id, platform, name, base_url, api_key_encrypted, models, enabled, \
                 capabilities, created_at, updated_at\
              ) VALUES (?1, 'openai', 'provider', 'https://example.invalid', \
                        'encrypted', '[\"model\"]', 1, '[]', 1, 1)",
@@ -319,7 +328,9 @@ mod tests {
             .create_execution_with_participants(
                 &installation_owner,
                 &create_params(),
-                &[participant(PARTICIPANT_ID)],
+                &[participant(
+                    "0190f5fe-7c00-7a00-8000-000000000041",
+                )],
                 &created_event(),
             )
             .await
@@ -332,7 +343,7 @@ mod tests {
         let events = sink.0.lock().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, installation_owner);
-        assert_eq!(events[0].1.data["execution_id"], execution.id);
+        assert_eq!(events[0].1.data["execution_id"], execution.execution_id);
         drop(events);
         assert!(repository.list_unpublished_events(100).await.unwrap().is_empty());
     }

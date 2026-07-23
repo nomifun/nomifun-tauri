@@ -241,7 +241,7 @@ mod tests {
         let entry = RegisteredAgentProcess {
             pid: 42,
             process_group_id: Some(42),
-            conversation_id: "conv-1".into(),
+            conversation_id: "0190f5fe-7c00-7a00-8000-000000000211".into(),
             agent_type: AgentType::Acp.serde_name().into(),
             backend: Some("codex".into()),
             command_preview: Some("codex-acp".into()),

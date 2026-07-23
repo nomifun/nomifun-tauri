@@ -178,9 +178,9 @@ mod tests {
     /// Build a member at a given index with an optional capability profile.
     fn member_with(cap: Option<ParticipantCapability>) -> ExecutionParticipant {
         ExecutionParticipant {
-            id: "m".to_string(),
-            execution_id: "exec".to_string(),
-            source_agent_id: "a".to_string(),
+            participant_id: "0190f5fe-7c00-7a00-8000-000000000031".to_owned(),
+            execution_id: "0190f5fe-7c00-7a00-8000-000000000032".to_owned(),
+            source_agent_id: "0190f5fe-7c00-7a00-8000-000000000114".to_owned(),
             preset_id: None,
             preset_revision: None,
             preset_snapshot: None,

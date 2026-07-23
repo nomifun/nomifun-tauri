@@ -14,7 +14,7 @@ export type RemoteAgentStatus = 'unknown' | 'connected' | 'pending' | 'error';
 
 /** Remote Agent instance configuration (corresponds to remote_agents DB table) */
 export type RemoteAgentConfig = {
-  id: RemoteAgentId;
+  remote_agent_id: RemoteAgentId;
   name: string;
   protocol: RemoteAgentProtocol;
   url: string;

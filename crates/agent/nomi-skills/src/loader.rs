@@ -7,8 +7,7 @@ use crate::bundled;
 use crate::frontmatter::{parse_frontmatter, parse_skill_fields};
 use crate::mcp::load_mcp_skills;
 use crate::paths::{
-    additional_skills_dirs, project_commands_dirs, project_skills_dirs, user_commands_dir,
-    user_skills_dir,
+    additional_skills_dirs, project_commands_dirs, project_skills_dirs, user_skills_dir,
 };
 use crate::types::{LoadedFrom, SkillMetadata, SkillSource};
 use nomi_mcp::manager::McpManager;
@@ -92,14 +91,9 @@ pub async fn load_all_skills(
         all.extend(batch);
     }
 
-    // 4. User-level legacy commands (lowest user priority)
-    if let Some(dir) = user_commands_dir()
-        && dir.is_dir()
-    {
-        all.extend(load_skills_from_commands_dir(&dir, SkillSource::User).await);
-    }
-
-    // 5. Project-level legacy commands (parallel)
+    // 4. Project-level legacy commands (parallel). The v3 product dataset no
+    // longer reads a second user-global commands root from platform config;
+    // project-owned `.nomi/commands` remains an explicit workspace input.
     let cmd_dirs = project_commands_dirs(cwd);
     let futures: Vec<_> = cmd_dirs
         .iter()

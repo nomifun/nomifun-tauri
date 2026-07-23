@@ -7,7 +7,7 @@
 import { ipcBridge } from '@/common';
 import { configService } from '@/common/config/configService';
 import type { IMcpServer } from '@/common/config/storage';
-import type { McpServerId } from '@/common/types/ids';
+import { parseAgentId, type AgentId, type McpServerId } from '@/common/types/ids';
 import {
   MAX_AGENT_EXECUTION_MODELS,
   type TDecisionPolicy,
@@ -283,7 +283,7 @@ const GuidPage: React.FC = () => {
     delegationPolicy,
     executionModelPool,
     decisionPolicy,
-    executionTemplateId: selectedCollaborationTemplate?.id,
+    executionTemplateId: selectedCollaborationTemplate?.execution_template_id,
 
     // Mention state reset
     setMentionOpen: mention.setMentionOpen,
@@ -433,7 +433,9 @@ const GuidPage: React.FC = () => {
   const typewriterPlaceholder = useTypewriterPlaceholder(t('conversation.welcome.placeholder'));
   const selectedPresetRecord = useMemo(() => {
     if (!agentSelection.is_presetAgent || !agentSelection.selectedAgentInfo?.preset_id) return undefined;
-    return agentSelection.presets.find((item) => item.id === agentSelection.selectedAgentInfo?.preset_id);
+    return agentSelection.presets.find(
+      (item) => item.preset_id === agentSelection.selectedAgentInfo?.preset_id,
+    );
   }, [agentSelection.presets, agentSelection.is_presetAgent, agentSelection.selectedAgentInfo?.preset_id]);
 
   // Sync disabledBuiltinSkills + enabledSkills from preset preset config
@@ -456,7 +458,7 @@ const GuidPage: React.FC = () => {
   const selectedPresetAvatar = useMemo(() => {
     if (!agentSelection.is_presetAgent) return null;
     const selectedPreset = agentSelection.presets.find(
-      (item) => item.id === agentSelection.selectedAgentInfo?.preset_id,
+      (item) => item.preset_id === agentSelection.selectedAgentInfo?.preset_id,
     );
     const avatarValue = selectedPreset?.avatar?.trim() || agentSelection.selectedAgentInfo?.avatar?.trim();
     if (!avatarValue) return { kind: 'icon' as const };
@@ -529,7 +531,7 @@ const GuidPage: React.FC = () => {
           resolveAgentLogo({
             icon: a.icon,
             backend: a.backend || a.agent_type,
-            custom_agent_id: a.custom_agent_id,
+            agentId: a.id,
             isExtension: a.isExtension,
           });
         return {
@@ -554,24 +556,26 @@ const GuidPage: React.FC = () => {
       resolveAgentLogo({
         icon: effectiveAgentRecord?.icon,
         backend: effectiveAgentRecord?.backend || agentSelection.currentEffectiveAgentInfo.agent_type,
-        custom_agent_id: effectiveAgentRecord?.custom_agent_id,
+        agentId: effectiveAgentRecord?.id,
         isExtension: effectiveAgentRecord?.isExtension,
       }),
     [effectiveAgentRecord, agentSelection.currentEffectiveAgentInfo.agent_type],
   );
   const handlePresetAgentSwitch = useCallback(
-    async (nextAgentId: string) => {
-      const presetId = selectedPresetRecord?.id;
+    async (nextAgentId: AgentId) => {
+      const presetId = selectedPresetRecord?.preset_id;
       if (!presetId || nextAgentId === currentPresetAgentId) return;
       try {
         await swrMutate(
           'presets.list',
           (prev: Preset[] | undefined) =>
-            prev?.map((item) => (item.id === presetId ? { ...item, preferred_agent_id: nextAgentId } : item)),
+            prev?.map((item) =>
+              item.preset_id === presetId ? { ...item, preferred_agent_id: nextAgentId } : item,
+            ),
           { revalidate: false },
         );
         await ipcBridge.presets.setState.invoke({
-          id: presetId,
+          preset_id: presetId,
           preferred_agent_id: nextAgentId,
         });
         await Promise.all([swrMutate('presets.list'), agentSelection.refreshCustomAgents()]);
@@ -631,7 +635,7 @@ const GuidPage: React.FC = () => {
       workDir={guidInput.dir}
       onTemplateApply={(template) => {
         setSelectedCollaborationTemplate({
-          id: template.id,
+          execution_template_id: template.execution_template_id,
           name: template.name,
           participantCount: template.participantCount,
           models: template.models,
@@ -709,7 +713,9 @@ const GuidPage: React.FC = () => {
       agentLogo={effectiveAgentLogo}
       agentSwitcherItems={agentSwitcherItems}
       onAgentSwitch={(key) => {
-        handlePresetAgentSwitch(key).catch((err) => console.error('Failed to switch preset agent:', err));
+        handlePresetAgentSwitch(parseAgentId(key)).catch((err) =>
+          console.error('Failed to switch preset agent:', err)
+        );
       }}
       mcpServers={availableMcpServers}
       selectedMcpServerIds={guidSelectedMcpServerIds ?? []}

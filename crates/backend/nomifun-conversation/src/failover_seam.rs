@@ -646,9 +646,9 @@ impl ConversationService {
 mod tests {
     use super::*;
 
-    const FAILED_PROVIDER: &str = "prov_0190f5fe-7c00-7a00-8000-000000000001";
-    const PICKED_PROVIDER: &str = "prov_0190f5fe-7c00-7a00-8000-000000000002";
-    const OTHER_PROVIDER: &str = "prov_0190f5fe-7c00-7a00-8000-000000000003";
+    const FAILED_PROVIDER: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const PICKED_PROVIDER: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+    const OTHER_PROVIDER: &str = "0190f5fe-7c00-7a00-8000-000000000003";
 
     fn provider(provider_id: &str, model: &str) -> ProviderWithModel {
         ProviderWithModel {

@@ -576,7 +576,7 @@ const CompanionPage: React.FC = () => {
         const companions = await ipcBridge.companion.listCompanions.invoke();
         if (disposed) return;
         const candidate = companions.find((p) => p.appearance.companion_enabled) ?? companions[0];
-        if (candidate) setCompanionId(candidate.id);
+        if (candidate) setCompanionId(candidate.companion_id);
       } catch (e) {
         console.error('companion id resolve failed:', e);
         if (!disposed && attempt < INIT_MAX_RETRIES) {
@@ -669,9 +669,13 @@ const CompanionPage: React.FC = () => {
       // Dedup against current list outside the state updater — updaters must
       // stay pure (StrictMode double-invokes them) and popBubble/setUnread
       // are side effects.
-      const known = suggestionsRef.current.some((x) => x.id === s.id);
+      const known = suggestionsRef.current.some(
+        (x) => x.suggestion_id === s.suggestion_id
+      );
       if (known) return;
-      setSuggestions((list) => (list.some((x) => x.id === s.id) ? list : [s, ...list]));
+      setSuggestions((list) =>
+        list.some((x) => x.suggestion_id === s.suggestion_id) ? list : [s, ...list]
+      );
       setUnread((n) => n + 1);
       popBubble(`${s.title}`);
     });
@@ -681,8 +685,14 @@ const CompanionPage: React.FC = () => {
     // unread for items we were actually showing (StrictMode-safe: no side
     // effects inside the state updater).
     const unsubSuggestionDecided = ipcBridge.companion.onSuggestionDecided.on((s) => {
-      if (!suggestionsRef.current.some((x) => x.id === s.id)) return;
-      setSuggestions((list) => list.filter((x) => x.id !== s.id));
+      if (
+        !suggestionsRef.current.some(
+          (x) => x.suggestion_id === s.suggestion_id
+        )
+      ) return;
+      setSuggestions((list) =>
+        list.filter((x) => x.suggestion_id !== s.suggestion_id)
+      );
       setUnread((n) => Math.max(0, n - 1));
     });
     const unsubConfig = ipcBridge.companion.onConfigUpdated.on((evt) => {
@@ -1434,7 +1444,12 @@ const CompanionPage: React.FC = () => {
     const pending = suggestionsRef.current;
     setSuggestions([]);
     void Promise.allSettled(
-      pending.map((s) => ipcBridge.companion.decideSuggestion.invoke({ id: s.id, accept: false }))
+      pending.map((s) =>
+        ipcBridge.companion.decideSuggestion.invoke({
+          suggestion_id: s.suggestion_id,
+          accept: false,
+        })
+      )
     );
   }, [memoryPanel]);
 

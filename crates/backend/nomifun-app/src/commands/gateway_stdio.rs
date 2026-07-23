@@ -240,13 +240,13 @@ mod tests {
     use nomifun_api_types::GatewayCapabilityScope;
     use nomifun_common::LoopbackSessionBinding;
 
-    const TEST_OWNER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_OWNER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 
     fn test_claims() -> GatewayCapabilityClaims {
         GatewayCapabilityClaims::issue(
             TEST_OWNER_ID,
             LoopbackSessionBinding::conversation(
-                "conv_0190f5fe-7c00-7a00-8000-000000000001",
+                "0190f5fe-7c00-7a00-8000-000000000001",
             ),
             [
                 GATEWAY_LIST_TOOLS_OPERATION,
@@ -416,7 +416,7 @@ mod tests {
 
         claims.scope.companion_id = Some(
             nomifun_common::CompanionId::parse(
-                "companion_0190f5fe-7c00-7a00-8000-000000000001",
+                "0190f5fe-7c00-7a00-8000-000000000001",
             )
             .unwrap(),
         );
@@ -435,7 +435,7 @@ mod tests {
     fn secondary_session_keeps_user_tools_and_never_sees_owner_tools() {
         let mut claims = test_claims();
         claims.user_id = nomifun_common::UserId::parse(
-            "user_0190f5fe-7c00-7a00-8000-000000000002",
+            "0190f5fe-7c00-7a00-8000-000000000002",
         )
         .unwrap();
         claims.scope.instance_owner = false;

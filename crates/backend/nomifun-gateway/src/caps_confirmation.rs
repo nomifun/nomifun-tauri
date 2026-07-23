@@ -19,15 +19,19 @@ use crate::registry::{Capability, CapabilityMeta, DangerTier};
 use crate::server::ok;
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ListConfirmationsParams {
     /// The id of the conversation whose pending decisions to read.
-    conversation_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    conversation_id: ConversationId,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ResolveConfirmationParams {
     /// The id of the conversation containing the pending decision.
-    conversation_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    conversation_id: ConversationId,
     /// The call_id of the specific pending decision to resolve (from nomi_list_confirmations).
     call_id: String,
     /// The chosen option's value (a bare option-id string for ACP).
@@ -48,10 +52,7 @@ async fn list(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: ListConfirmationsParams
     if nomifun_common::UserId::parse(ctx.user_id.as_str()).is_err() {
         return json!({"error": "missing caller user identity"});
     }
-    let id = match ConversationId::try_from(p.conversation_id) {
-        Ok(id) => id.into_string(),
-        Err(error) => return json!({"error": format!("invalid conversation_id: {error}")}),
-    };
+    let id = p.conversation_id.into_string();
     let confs = match deps
         .conversation_service
         .list_confirmations(ctx.user_id.as_str(), &id, &deps.runtime_registry)
@@ -81,10 +82,7 @@ async fn resolve(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: ResolveConfirmationP
     if nomifun_common::UserId::parse(ctx.user_id.as_str()).is_err() {
         return json!({"error": "missing caller user identity"});
     }
-    let id = match ConversationId::try_from(p.conversation_id) {
-        Ok(id) => id.into_string(),
-        Err(error) => return json!({"error": format!("invalid conversation_id: {error}")}),
-    };
+    let id = p.conversation_id.into_string();
 
     // Self-confirmation guard: an agent may not resolve a decision in its own
     // conversation (that would bypass the human-in-the-loop contract).
@@ -166,14 +164,14 @@ mod tests {
     fn self_confirmation_guard_forbids_own_conversation() {
         let ctx = CallerCtx {
             conversation_id: Some(
-                ConversationId::parse("conv_0190f5fe-7c00-7a00-8abc-012345678901")
+                ConversationId::parse("0190f5fe-7c00-7a00-8abc-012345678901")
                     .unwrap(),
             ),
-            user_id: UserId::parse("user_0190f5fe-7c00-7a00-8000-000000000001")
+            user_id: UserId::parse("0190f5fe-7c00-7a00-8000-000000000001")
                 .unwrap(),
             ..Default::default()
         };
-        let id = ConversationId::try_from("conv_0190f5fe-7c00-7a00-8abc-012345678901")
+        let id = ConversationId::try_from("0190f5fe-7c00-7a00-8abc-012345678901")
             .unwrap()
             .into_string();
         let forbidden = ctx.conversation_id.as_ref().is_some_and(|caller| id == caller.as_str());
@@ -184,14 +182,14 @@ mod tests {
     fn self_confirmation_guard_allows_different_conversation() {
         let ctx = CallerCtx {
             conversation_id: Some(
-                ConversationId::parse("conv_0190f5fe-7c00-7a00-8abc-012345678901")
+                ConversationId::parse("0190f5fe-7c00-7a00-8abc-012345678901")
                     .unwrap(),
             ),
-            user_id: UserId::parse("user_0190f5fe-7c00-7a00-8000-000000000001")
+            user_id: UserId::parse("0190f5fe-7c00-7a00-8000-000000000001")
                 .unwrap(),
             ..Default::default()
         };
-        let id = ConversationId::try_from("conv_0190f5fe-7c00-7a00-8abc-012345678904")
+        let id = ConversationId::try_from("0190f5fe-7c00-7a00-8abc-012345678904")
             .unwrap()
             .into_string();
         let allowed = ctx.conversation_id.as_ref().is_none_or(|caller| id != caller.as_str());
@@ -202,11 +200,11 @@ mod tests {
     fn self_confirmation_guard_allows_when_caller_has_no_conversation() {
         let ctx = CallerCtx {
             conversation_id: None,
-            user_id: UserId::parse("user_0190f5fe-7c00-7a00-8000-000000000001")
+            user_id: UserId::parse("0190f5fe-7c00-7a00-8000-000000000001")
                 .unwrap(),
             ..Default::default()
         };
-        let id = ConversationId::try_from("conv_0190f5fe-7c00-7a00-8abc-012345678901")
+        let id = ConversationId::try_from("0190f5fe-7c00-7a00-8abc-012345678901")
             .unwrap()
             .into_string();
         let allowed = ctx.conversation_id.as_ref().is_none_or(|caller| id != caller.as_str());

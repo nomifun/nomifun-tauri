@@ -26,7 +26,7 @@ const PolicySection: React.FC<Props> = ({ agent, patch, message }) => {
 
   useEffect(() => {
     setPolicy(agent.service_policy);
-  }, [agent.id, agent.service_policy]);
+  }, [agent.public_agent_id, agent.service_policy]);
 
   const dirty = policy !== agent.service_policy;
 

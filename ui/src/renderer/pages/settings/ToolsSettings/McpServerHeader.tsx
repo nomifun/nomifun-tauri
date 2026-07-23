@@ -213,7 +213,7 @@ const McpServerHeader: React.FC<McpServerHeaderProps> = ({
                       {t('settings.mcpEditServer')}
                     </div>
                   </Menu.Item>
-                  <Menu.Item key='delete' onClick={() => onDeleteServer(server.id)}>
+                  <Menu.Item key='delete' onClick={() => onDeleteServer(server.mcp_server_id)}>
                     <div className='flex items-center gap-2 text-red-500'>
                       <DeleteFour size={'14'} />
                       {t('settings.mcpDeleteServer')}

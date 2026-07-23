@@ -31,8 +31,9 @@ impl Default for SystemSettingsResponse {
 /// Request body for `PATCH /api/settings`.
 ///
 /// All fields are optional — only the fields present in the request body
-/// are updated. Unknown fields are silently ignored by serde.
+/// are updated. Unknown or retired fields are rejected.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateSettingsRequest {
     pub language: Option<String>,
     pub notification_enabled: Option<bool>,
@@ -161,19 +162,15 @@ mod tests {
     }
 
     #[test]
-    fn test_update_request_camel_case_ignored() {
-        // camelCase keys are treated as unknown fields and silently ignored
+    fn test_update_request_rejects_camel_case() {
         let raw = r#"{"notificationEnabled":true}"#;
-        let req: UpdateSettingsRequest = serde_json::from_str(raw).unwrap();
-        assert!(req.notification_enabled.is_none());
-        assert!(req.is_empty());
+        assert!(serde_json::from_str::<UpdateSettingsRequest>(raw).is_err());
     }
 
     #[test]
-    fn test_update_request_unknown_field_ignored() {
+    fn test_update_request_rejects_unknown_field() {
         let raw = r#"{"unknownField":123}"#;
-        let req: UpdateSettingsRequest = serde_json::from_str(raw).unwrap();
-        assert!(req.is_empty());
+        assert!(serde_json::from_str::<UpdateSettingsRequest>(raw).is_err());
     }
 
     // -- ClientPreferencesResponse / UpdateClientPreferencesRequest --

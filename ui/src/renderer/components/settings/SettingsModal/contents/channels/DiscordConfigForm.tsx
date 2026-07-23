@@ -57,28 +57,28 @@ const DiscordConfigForm: React.FC<DiscordConfigFormProps> = ({ pluginStatus, cha
     try {
       const pairings = await channel.getPendingPairings.invoke();
       if (pairings) {
-        setPendingPairings(pairings.filter((p) => p.platformType === 'discord' && (!channelTarget?.channelId || p.channelId === channelTarget.channelId)));
+        setPendingPairings(pairings.filter((p) => p.platformType === 'discord' && (!channelTarget?.channelPluginId || p.channel_plugin_id === channelTarget.channelPluginId)));
       }
     } catch (error) {
       console.error('[ChannelSettings] Failed to load pending pairings:', error);
     } finally {
       setPairingLoading(false);
     }
-  }, [channelTarget?.channelId]);
+  }, [channelTarget?.channelPluginId]);
 
   const loadAuthorizedUsers = useCallback(async () => {
     setUsersLoading(true);
     try {
       const users = await channel.getAuthorizedUsers.invoke();
       if (users) {
-        setAuthorizedUsers(users.filter((u) => u.platformType === 'discord' && (!channelTarget?.channelId || u.channelId === channelTarget.channelId)));
+        setAuthorizedUsers(users.filter((u) => u.platformType === 'discord' && (!channelTarget?.channelPluginId || u.channel_plugin_id === channelTarget.channelPluginId)));
       }
     } catch (error) {
       console.error('[ChannelSettings] Failed to load authorized users:', error);
     } finally {
       setUsersLoading(false);
     }
-  }, [channelTarget?.channelId]);
+  }, [channelTarget?.channelPluginId]);
 
   useEffect(() => {
     void loadPendingPairings();
@@ -88,33 +88,33 @@ const DiscordConfigForm: React.FC<DiscordConfigFormProps> = ({ pluginStatus, cha
   useEffect(() => {
     const unsubscribe = channel.pairingRequested.on((request) => {
       if (request.platformType !== 'discord') return;
-      if (channelTarget?.channelId && request.channelId !== channelTarget.channelId) return;
+      if (channelTarget?.channelPluginId && request.channel_plugin_id !== channelTarget.channelPluginId) return;
       setPendingPairings((prev) => (prev.some((p) => p.code === request.code) ? prev : [request, ...prev]));
     });
     return () => unsubscribe();
-  }, [channelTarget?.channelId]);
+  }, [channelTarget?.channelPluginId]);
 
   useEffect(() => {
     const unsubscribe = channel.userAuthorized.on((user) => {
       if (user.platformType !== 'discord') return;
-      if (channelTarget?.channelId && user.channelId !== channelTarget.channelId) return;
-      setAuthorizedUsers((prev) => (prev.some((u) => u.id === user.id) ? prev : [user, ...prev]));
+      if (channelTarget?.channelPluginId && user.channel_plugin_id !== channelTarget.channelPluginId) return;
+      setAuthorizedUsers((prev) => (prev.some((u) => u.channel_user_id === user.channel_user_id) ? prev : [user, ...prev]));
       setPendingPairings((prev) => prev.filter((p) => p.platformUserId !== user.platformUserId));
     });
     return () => unsubscribe();
-  }, [channelTarget?.channelId]);
+  }, [channelTarget?.channelPluginId]);
 
   const handleAutoEnable = async () => {
     try {
       const config = { credentials: { token: discordToken.trim() } };
-      const result = await channel.enablePlugin.invoke(channelTarget ? { plugin_id: channelTarget.channelId, plugin_type: 'discord', ...(channelTarget.publicAgentId ? { public_agent_id: channelTarget.publicAgentId } : { companion_id: channelTarget.companionId }), config } : { plugin_type: 'discord', config });
+      const result = await channel.enablePlugin.invoke(channelTarget ? { plugin_id: channelTarget.channelPluginId, plugin_type: 'discord', ...(channelTarget.publicAgentId ? { public_agent_id: channelTarget.publicAgentId } : { companion_id: channelTarget.companionId }), config } : { plugin_type: 'discord', config });
       if (!result.success) {
-        throw new Error(result.error || result.message || t('nomi.settings.remoteEnableFailed', { defaultValue: 'Failed to enable channel' }));
+        throw new Error(result.error || t('nomi.settings.remoteEnableFailed', { defaultValue: 'Failed to enable channel' }));
       }
       Message.success(t('settings.discord.pluginEnabled', 'Discord bot enabled'));
       const plugins = await channel.getPluginStatus.invoke();
       if (plugins) {
-        const discordPlugin = channelTarget ? (channelTarget.channelId ? plugins.find((p) => p.id === channelTarget.channelId) : plugins.find((p) => p.type === 'discord' && p.companionId === channelTarget.companionId)) : plugins.find((p) => p.type === 'discord');
+        const discordPlugin = channelTarget ? (channelTarget.channelPluginId ? plugins.find((p) => p.plugin_id === channelTarget.channelPluginId) : plugins.find((p) => p.type === 'discord' && p.companionId === channelTarget.companionId)) : plugins.find((p) => p.type === 'discord');
         onStatusChange(discordPlugin || null);
       }
     } catch (error: unknown) {
@@ -170,9 +170,9 @@ const DiscordConfigForm: React.FC<DiscordConfigFormProps> = ({ pluginStatus, cha
     }
   };
 
-  const handleRevokeUser = async (user_id: import('@/common/types/ids').ChannelUserId) => {
+  const handleRevokeUser = async (channel_user_id: import('@/common/types/ids').ChannelUserId) => {
     try {
-      await channel.revokeUser.invoke({ user_id });
+      await channel.revokeUser.invoke({ channel_user_id });
       Message.success(t('settings.channels.userRevoked', 'User access revoked'));
       await loadAuthorizedUsers();
     } catch (error: unknown) {
@@ -264,7 +264,7 @@ const DiscordConfigForm: React.FC<DiscordConfigFormProps> = ({ pluginStatus, cha
           ) : (
             <div className='flex flex-col gap-12px'>
               {authorizedUsers.map((user) => (
-                <div key={user.id} className='flex items-center justify-between bg-fill-2 rd-8px p-12px'>
+                <div key={user.channel_user_id} className='flex items-center justify-between bg-fill-2 rd-8px p-12px'>
                   <div className='flex-1'>
                     <div className='text-14px font-500 text-t-primary'>{user.display_name || t('common.unknownUser')}</div>
                     <div className='text-12px text-t-tertiary mt-4px'>
@@ -274,7 +274,7 @@ const DiscordConfigForm: React.FC<DiscordConfigFormProps> = ({ pluginStatus, cha
                     </div>
                   </div>
                   <Tooltip content={t('settings.channels.revokeAccess', 'Revoke access')}>
-                    <Button type='text' status='danger' size='small' icon={<Delete size={16} />} onClick={() => handleRevokeUser(user.id)} />
+                    <Button type='text' status='danger' size='small' icon={<Delete size={16} />} onClick={() => handleRevokeUser(user.channel_user_id)} />
                   </Tooltip>
                 </div>
               ))}

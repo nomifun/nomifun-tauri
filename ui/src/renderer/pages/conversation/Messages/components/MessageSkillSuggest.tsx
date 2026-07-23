@@ -15,7 +15,7 @@ const MessageSkillSuggest: React.FC<{ artifact: ISkillSuggestArtifact }> = ({ ar
   return (
     <div data-testid='message-skill-suggest' className='max-w-780px w-full mx-auto'>
       <SkillSuggestCard
-        artifact_id={artifact.id}
+        conversation_artifact_id={artifact.conversation_artifact_id}
         conversation_id={artifact.conversation_id}
         suggestion={{ name, description, content: skillContent }}
         cron_job_id={cron_job_id}

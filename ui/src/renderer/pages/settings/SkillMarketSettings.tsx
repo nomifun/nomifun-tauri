@@ -7,6 +7,7 @@ import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
 import { openExternalUrl } from '@/renderer/utils/platform';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
 import PresetTagFilterBar from './PresetSettings/PresetTagFilterBar';
+import type { TagFilterState } from './PresetSettings/presetUtils';
 import type { SkillTagFilterState } from './skill/skillFilter';
 import SkillMarketCard from './skill/SkillMarketCard';
 import {
@@ -54,7 +55,7 @@ const SkillMarketSettings: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchExpanded, setSearchExpanded] = useState(false);
-  const [tagFilter, setTagFilter] = useState<SkillTagFilterState>({ audience: [], scenario: [] });
+  const [tagFilter, setTagFilter] = useState<TagFilterState>({ audience: [], scenario: [] });
 
   useEffect(() => {
     try {
@@ -71,11 +72,11 @@ const SkillMarketSettings: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    const audKeys = new Set<string>(tags.audienceTags.map((tag) => tag.key));
-    const scnKeys = new Set<string>(tags.scenarioTags.map((tag) => tag.key));
+    const audienceIds = new Set(tags.audienceTags.map((tag) => tag.preset_tag_id));
+    const scenarioIds = new Set(tags.scenarioTags.map((tag) => tag.preset_tag_id));
     setTagFilter((prev) => {
-      const audience = prev.audience.filter((key) => audKeys.has(key));
-      const scenario = prev.scenario.filter((key) => scnKeys.has(key));
+      const audience = prev.audience.filter((presetTagId) => audienceIds.has(presetTagId));
+      const scenario = prev.scenario.filter((presetTagId) => scenarioIds.has(presetTagId));
       if (audience.length === prev.audience.length && scenario.length === prev.scenario.length) return prev;
       return { audience, scenario };
     });
@@ -128,9 +129,25 @@ const SkillMarketSettings: React.FC = () => {
     void syncMarket({ showToast: false });
   }, [syncMarket]);
 
+  const skillTagFilter = useMemo<SkillTagFilterState>(() => {
+    const keyById = new Map(
+      [...tags.audienceTags, ...tags.scenarioTags].map((tag) => [tag.preset_tag_id, tag.key] as const)
+    );
+    return {
+      audience: tagFilter.audience.flatMap((presetTagId) => {
+        const key = keyById.get(presetTagId);
+        return key ? [key] : [];
+      }),
+      scenario: tagFilter.scenario.flatMap((presetTagId) => {
+        const key = keyById.get(presetTagId);
+        return key ? [key] : [];
+      }),
+    };
+  }, [tagFilter, tags.audienceTags, tags.scenarioTags]);
+
   const filteredItems = useMemo(
-    () => filterSkillMarketItems(items, activeSource, searchQuery, tagFilter),
-    [items, activeSource, searchQuery, tagFilter]
+    () => filterSkillMarketItems(items, activeSource, searchQuery, skillTagFilter),
+    [items, activeSource, searchQuery, skillTagFilter]
   );
 
   const sourceCounts = useMemo(() => {

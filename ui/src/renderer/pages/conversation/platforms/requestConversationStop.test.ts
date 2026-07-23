@@ -9,7 +9,7 @@ import {
   waitForConversationTurnRelease,
 } from './requestConversationStop';
 
-const conversationId = parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000021');
+const conversationId = parseConversationId('0190f5fe-7c00-7a00-8000-000000000021');
 const runtime = (isProcessing: boolean) =>
   ({ runtime: { is_processing: isProcessing } }) as TChatConversation;
 

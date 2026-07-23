@@ -24,8 +24,7 @@ use nomifun_api_types::{
     REQUIREMENT_CAPABILITY_DOMAIN, RequirementCapabilityScope,
     RequirementMcpConfig,
 };
-use nomifun_common::{LoopbackCapabilityError, LoopbackCapabilityClaims};
-use nomifun_common::RequirementId;
+use nomifun_common::{LoopbackCapabilityError, LoopbackCapabilityClaims, RequirementId};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{schemars, service::ServiceExt, tool, tool_router, transport};
@@ -117,6 +116,21 @@ struct UpdateStatusParams {
     note: Option<String>,
 }
 
+fn complete_args(params: CompleteParams) -> serde_json::Value {
+    serde_json::json!({
+        "id": params.id,
+        "completion_note": params.completion_note,
+    })
+}
+
+fn update_status_args(params: UpdateStatusParams) -> serde_json::Value {
+    serde_json::json!({
+        "id": params.id,
+        "status": params.status,
+        "note": params.note,
+    })
+}
+
 #[tool_router]
 impl RequirementStdioServer {
     #[tool(
@@ -128,14 +142,8 @@ impl RequirementStdioServer {
         Parameters(params): Parameters<CompleteParams>,
     ) -> CallToolResult {
         eprintln!("[mcp-requirement-stdio] tools/call: requirement_complete");
-        self.forward_tool(
-            "requirement_complete",
-            &serde_json::json!({
-                "id": params.id,
-                "completion_note": params.completion_note,
-            }),
-        )
-        .await
+        self.forward_tool("requirement_complete", &complete_args(params))
+            .await
     }
 
     #[tool(
@@ -147,15 +155,8 @@ impl RequirementStdioServer {
         Parameters(params): Parameters<UpdateStatusParams>,
     ) -> CallToolResult {
         eprintln!("[mcp-requirement-stdio] tools/call: requirement_update_status");
-        self.forward_tool(
-            "requirement_update_status",
-            &serde_json::json!({
-                "id": params.id,
-                "status": params.status,
-                "note": params.note,
-            }),
-        )
-        .await
+        self.forward_tool("requirement_update_status", &update_status_args(params))
+            .await
     }
 }
 
@@ -234,6 +235,56 @@ mod tests {
         let names: Vec<String> = router.list_all().iter().map(|t| t.name.to_string()).collect();
         assert!(names.contains(&"requirement_complete".to_string()), "got {names:?}");
         assert!(names.contains(&"requirement_update_status".to_string()), "got {names:?}");
+    }
+
+    #[test]
+    fn requirement_ids_are_uuid_strings_in_schemas_and_forwarded_json() {
+        let id = RequirementId::new().into_string();
+        let complete = complete_args(
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "completion_note": "done",
+            }))
+            .unwrap(),
+        );
+        let update = update_status_args(
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "status": "failed",
+                "note": "blocked",
+            }))
+            .unwrap(),
+        );
+
+        assert_eq!(
+            complete,
+            serde_json::json!({"id": id, "completion_note": "done"})
+        );
+        assert_eq!(
+            update,
+            serde_json::json!({"id": id, "status": "failed", "note": "blocked"})
+        );
+        assert!(serde_json::from_value::<CompleteParams>(serde_json::json!({"id": 1})).is_err());
+        assert!(
+            serde_json::from_value::<UpdateStatusParams>(
+                serde_json::json!({"id": 1, "status": "done"})
+            )
+            .is_err()
+        );
+
+        for tool in RequirementStdioServer::tool_router().list_all() {
+            assert_eq!(
+                tool.input_schema
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|properties| properties.get("id"))
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|id_schema| id_schema.get("type")),
+                Some(&serde_json::json!("string")),
+                "Tool '{}' must advertise requirement id as a JSON string",
+                tool.name,
+            );
+        }
     }
 
     #[test]

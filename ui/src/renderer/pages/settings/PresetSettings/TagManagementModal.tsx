@@ -9,9 +9,9 @@
 import type {
   PresetTag,
   PresetTagDimension,
-  PresetTagReference,
   CreatePresetTagRequest,
 } from '@/common/types/agent/presetTypes';
+import type { PresetTagId } from '@/common/types/ids';
 import type { ArcoMessageInstance } from '@/renderer/utils/ui/useArcoMessage';
 import { Input, Modal } from '@arco-design/web-react';
 import { Check, Close, Delete, Lock, Plus } from '@icon-park/react';
@@ -25,8 +25,8 @@ type TagManagementModalProps = {
   scenarioTags: PresetTag[];
   localeKey: string;
   onCreate: (req: CreatePresetTagRequest) => Promise<unknown>;
-  onRename: (key: PresetTagReference, label: string) => Promise<void>;
-  onDelete: (key: PresetTagReference) => Promise<void>;
+  onRename: (presetTagId: PresetTagId, label: string) => Promise<void>;
+  onDelete: (presetTagId: PresetTagId) => Promise<void>;
   message: ArcoMessageInstance;
 };
 
@@ -41,7 +41,7 @@ const TagRow: React.FC<{
   tag: PresetTag;
   localeKey: string;
   busy: boolean;
-  onRename: (key: PresetTagReference, label: string) => void;
+  onRename: (presetTagId: PresetTagId, label: string) => void;
   onDelete: (tag: PresetTag) => void;
 }> = ({ tag, localeKey, busy, onRename, onDelete }) => {
   const { t } = useTranslation();
@@ -67,7 +67,7 @@ const TagRow: React.FC<{
   const commit = () => {
     const next = draft.trim();
     if (next && next !== label) {
-      onRename(tag.key, next);
+      onRename(tag.preset_tag_id, next);
     }
     setEditing(false);
   };
@@ -157,7 +157,7 @@ const TagColumn: React.FC<{
   localeKey: string;
   busy: boolean;
   onCreate: (label: string) => void;
-  onRename: (key: PresetTagReference, label: string) => void;
+  onRename: (presetTagId: PresetTagId, label: string) => void;
   onDelete: (tag: PresetTag) => void;
 }> = ({ title, dimension, tags, localeKey, busy, onCreate, onRename, onDelete }) => {
   const { t } = useTranslation();
@@ -186,7 +186,7 @@ const TagColumn: React.FC<{
         ) : (
           tags.map((tag) => (
             <TagRow
-              key={tag.key}
+              key={tag.preset_tag_id}
               tag={tag}
               localeKey={localeKey}
               busy={busy}
@@ -260,10 +260,10 @@ const TagManagementModal: React.FC<TagManagementModalProps> = ({
     }
   };
 
-  const handleRename = async (key: PresetTagReference, label: string) => {
+  const handleRename = async (presetTagId: PresetTagId, label: string) => {
     setBusy(true);
     try {
-      await onRename(key, label);
+      await onRename(presetTagId, label);
     } catch (error) {
       console.error('Failed to rename tag:', error);
       message.error(
@@ -288,7 +288,7 @@ const TagManagementModal: React.FC<TagManagementModalProps> = ({
       onOk: async () => {
         setBusy(true);
         try {
-          await onDelete(tag.key);
+          await onDelete(tag.preset_tag_id);
         } catch (error) {
           console.error('Failed to delete tag:', error);
           message.error(

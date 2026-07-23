@@ -78,17 +78,17 @@ const OverviewTab: React.FC<Props> = ({ companion, onGoTab }) => {
       .invoke({ limit: 10 })
       .then((runs) => setDiaries(runs.filter((r) => r.summary)))
       .catch(() => {});
-  }, [status?.last_learn?.id]);
+  }, [status?.last_learn?.learn_run_id]);
 
   const [digest, setDigest] = useState<ICompanionWeeklyDigest | null>(null);
   useEffect(() => {
-    const cid = companion.profile?.id;
+    const cid = companion.profile?.companion_id;
     if (!cid) return;
     void ipcBridge.companion.weeklyDigest
       .invoke({ companion_id: cid })
       .then(setDigest)
       .catch(() => {});
-  }, [companion.profile?.id, status?.last_learn?.id]);
+  }, [companion.profile?.companion_id, status?.last_learn?.learn_run_id]);
 
   // ── 自定义形象尺寸滑块（仅 custom 形象）──
   // cf 从 profile 解析（profile 可能为 null，customFigureMetaOf 已防御 → null）。
@@ -224,7 +224,7 @@ const OverviewTab: React.FC<Props> = ({ companion, onGoTab }) => {
           >
             <CompanionAvatar
               character={profile.character}
-              companionId={profile.id}
+              companionId={profile.companion_id}
               customFigure={cf}
               mood={(status.mood as CompanionMood) || 'content'}
               activity='idle'
@@ -324,7 +324,10 @@ const OverviewTab: React.FC<Props> = ({ companion, onGoTab }) => {
         ) : (
           <div className='flex flex-col gap-6px'>
             {diaries.map((run) => (
-              <div key={run.id} className='text-13px text-t-secondary bg-fill-2 rd-8px px-12px py-8px'>
+              <div
+                key={run.learn_run_id}
+                className='text-13px text-t-secondary bg-fill-2 rd-8px px-12px py-8px'
+              >
                 <span className='text-t-tertiary mr-8px'>{new Date(run.started_at).toLocaleString()}</span>
                 {run.summary}
               </div>

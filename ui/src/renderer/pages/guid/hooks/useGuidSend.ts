@@ -58,7 +58,7 @@ export type GuidSendDeps = {
   // Agent helpers
   findAgentByKey: (key: string) => AvailableAgent | undefined;
   getEffectiveAgentType: (
-    agentInfo: { agent_type: string; backend?: string; custom_agent_id?: string } | undefined,
+    agentInfo: { agent_type: string; backend?: string } | undefined,
   ) => EffectiveAgentInfo;
   guidDisabledBuiltinSkills: string[] | undefined;
   guidEnabledSkills: string[] | undefined;
@@ -176,13 +176,13 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
     const excludeBuiltinSkills = !is_preset ? guidDisabledBuiltinSkills : undefined;
     const selectedMcpServerIdSet = new Set(selectedMcpServerIds ?? []);
     const selectedUserMcpServerIds = availableMcpServers
-      .filter((server) => selectedMcpServerIdSet.has(server.id) && server.builtin !== true)
-      .map((server) => server.id);
+      .filter((server) => selectedMcpServerIdSet.has(server.mcp_server_id) && server.builtin !== true)
+      .map((server) => server.mcp_server_id);
     const selectedAllSessionMcpServers = availableMcpServers
-      .filter((server) => selectedMcpServerIdSet.has(server.id))
+      .filter((server) => selectedMcpServerIdSet.has(server.mcp_server_id))
       .map((server) => toSessionMcpServer(server));
     const selectedSessionMcpServers = availableMcpServers
-      .filter((server) => selectedMcpServerIdSet.has(server.id) && server.builtin === true)
+      .filter((server) => selectedMcpServerIdSet.has(server.mcp_server_id) && server.builtin === true)
       .map((server) => toSessionMcpServer(server));
 
     const finalEffectiveAgentType = effectiveAgentType;
@@ -198,7 +198,6 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
         workspace: finalWorkspace,
         model: current_model!,
         cli_path: openclawAgentInfo?.cli_path,
-        custom_agent_id: openclawAgentInfo?.custom_agent_id,
         custom_workspace: isCustomWorkspace,
         is_preset,
         extra: {
@@ -261,7 +260,6 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
         preset_id,
         workspace: finalWorkspace,
         model: current_model!,
-        custom_agent_id: nanobotAgentInfo?.custom_agent_id,
         custom_workspace: isCustomWorkspace,
         is_preset,
         extra: {
@@ -402,7 +400,6 @@ export const useGuidSend = (deps: GuidSendDeps): GuidSendResult => {
         workspace: finalWorkspace,
         model: current_model!,
         cli_path: acpAgentInfo?.cli_path,
-        custom_agent_id: acpAgentInfo?.custom_agent_id,
         remote_agent_id: acpAgentInfo?.remote_agent_id,
         custom_workspace: isCustomWorkspace,
         is_preset,

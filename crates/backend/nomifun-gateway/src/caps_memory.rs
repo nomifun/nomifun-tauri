@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use nomifun_companion::store::{MemoryFilter, MemoryScope};
+use nomifun_common::CompanionMemoryId;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -20,6 +21,7 @@ use crate::server::ok;
 const DEFAULT_LIST_LIMIT: i64 = 50;
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct MemoryListParams {
     /// Filter by kind: profile / preference / knowledge / episode / task / affective.
     #[serde(default)]
@@ -39,6 +41,7 @@ struct MemoryListParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct MemorySaveParams {
     /// The memory content — one self-contained fact.
     content: String,
@@ -51,9 +54,11 @@ struct MemorySaveParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct MemoryUpdateParams {
-    /// The id of the memory to update (from nomi_memory_list).
-    id: String,
+    /// The stable business id of the memory to update (from nomi_memory_list).
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    memory_id: CompanionMemoryId,
     /// New content (omit to keep).
     #[serde(default)]
     content: Option<String>,
@@ -66,10 +71,12 @@ struct MemoryUpdateParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct MemoryDeleteParams {
-    /// The id of the memory to permanently delete. Prefer archiving via
-    /// nomi_memory_update unless the user explicitly asked to delete.
-    id: String,
+    /// The stable business id of the memory to permanently delete. Prefer
+    /// archiving via nomi_memory_update unless the user explicitly asked to delete.
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    memory_id: CompanionMemoryId,
 }
 
 async fn list(deps: Arc<GatewayDeps>, p: MemoryListParams) -> Value {
@@ -111,17 +118,23 @@ async fn update(deps: Arc<GatewayDeps>, p: MemoryUpdateParams) -> Value {
     }
     match deps
         .companion_service
-        .update_memory(&p.id, p.content.as_deref(), p.pinned, p.status.as_deref(), None)
+        .update_memory(
+            p.memory_id.as_str(),
+            p.content.as_deref(),
+            p.pinned,
+            p.status.as_deref(),
+            None,
+        )
         .await
     {
-        Ok(()) => json!({ "result": format!("memory {} updated", p.id) }),
+        Ok(()) => json!({ "result": format!("memory {} updated", p.memory_id) }),
         Err(e) => json!({ "error": e.to_string() }),
     }
 }
 
 async fn delete(deps: Arc<GatewayDeps>, p: MemoryDeleteParams) -> Value {
-    match deps.companion_service.delete_memory(&p.id).await {
-        Ok(()) => json!({ "result": format!("memory {} deleted", p.id) }),
+    match deps.companion_service.delete_memory(p.memory_id.as_str()).await {
+        Ok(()) => json!({ "result": format!("memory {} deleted", p.memory_id) }),
         Err(e) => json!({ "error": e.to_string() }),
     }
 }
@@ -164,4 +177,53 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
         ),
         |deps, _ctx, p| delete(deps, p),
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::{Registry, Surface};
+    use serde_json::json;
+
+    const MEMORY_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678901";
+
+    #[test]
+    fn memory_mutation_params_use_named_business_ids() {
+        let update: MemoryUpdateParams = serde_json::from_value(json!({
+            "memory_id": MEMORY_ID,
+            "content": "updated"
+        }))
+        .unwrap();
+        assert_eq!(update.memory_id.as_str(), MEMORY_ID);
+
+        let delete: MemoryDeleteParams =
+            serde_json::from_value(json!({"memory_id": MEMORY_ID})).unwrap();
+        assert_eq!(delete.memory_id.as_str(), MEMORY_ID);
+
+        assert!(
+            serde_json::from_value::<MemoryUpdateParams>(json!({
+                "id": MEMORY_ID,
+                "content": "legacy field must be rejected"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<MemoryDeleteParams>(json!({"id": MEMORY_ID})).is_err()
+        );
+    }
+
+    #[test]
+    fn memory_mutation_tool_schemas_expose_named_business_ids() {
+        let specs = Registry::global().tool_specs(Surface::Desktop);
+        for name in ["nomi_memory_update", "nomi_memory_delete"] {
+            let spec = specs.iter().find(|spec| spec.name == name).expect("tool registered");
+            let properties = spec
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .expect("tool properties");
+            assert!(properties.contains_key("memory_id"), "{name}");
+            assert!(!properties.contains_key("id"), "{name}");
+        }
+    }
 }

@@ -59,13 +59,13 @@ const ExtensionSettingsPage: React.FC = () => {
 
     try {
       const mergedI18n = await extensionsIpc.getExtI18nForLocale.invoke({ locale: i18n.language });
-      const translations = (mergedI18n?.[tab.extensionName] as Record<string, unknown> | undefined) ?? {};
+      const translations = (mergedI18n?.[tab.extension_name] as Record<string, unknown> | undefined) ?? {};
 
       frameWindow.postMessage(
         {
           type: 'nomi:init',
           locale: i18n.language,
-          extensionName: tab.extensionName,
+          extensionName: tab.extension_name,
           translations,
         },
         '*'

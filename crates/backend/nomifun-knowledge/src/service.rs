@@ -14,8 +14,8 @@ use std::time::Duration;
 use futures_util::{StreamExt, stream};
 use nomifun_api_types::{ConnectorCredentialSummary, ConnectorSyncState, KnowledgeMountInfo, KnowledgeSource, KnowledgeSourceEntry, KnowledgeSourceMode, KnowledgeTag, UpdateKnowledgeTagRequest};
 use nomifun_common::{
-    AppError, CompanionId, ConnectorCredentialId, ConversationId, KnowledgeBaseId, TerminalId,
-    TimestampMs, now_ms,
+    AppError, CompanionId, ConnectorCredentialId, ConversationId, KnowledgeBaseId,
+    TerminalId, TimestampMs, UuidV7Error, now_ms,
 };
 use nomifun_db::models::{CreateKnowledgeTagParams, KnowledgeBaseRow, KnowledgeBindingRow};
 use nomifun_db::{IConnectorCredentialRepository, IKnowledgeRepository};
@@ -93,11 +93,7 @@ const SOURCE_FETCH_CONCURRENCY: usize = 4;
 /// A knowledge base plus directory statistics, as returned by the API.
 #[derive(Debug, Clone, Serialize)]
 pub struct KnowledgeBaseInfo {
-    pub id: KnowledgeBaseId,
-    /// Legacy display-only sequence number; no longer sourced from the
-    /// registry (the `seq` column was dropped in the primary-key rework) —
-    /// always `None`, kept on the wire until the frontend stops reading it.
-    pub seq: Option<i64>,
+    pub knowledge_base_id: KnowledgeBaseId,
     pub name: String,
     pub description: String,
     pub root_path: String,
@@ -527,6 +523,11 @@ pub struct KnowledgeService {
     /// secret — same key the provider api-key column uses) for encrypting
     /// credential payloads at rest. Late-wired alongside [`Self::cred_repo`].
     cred_key: RwLock<Option<[u8; 32]>>,
+    /// Serializes credential deletion with source creation/attachment. The
+    /// SQLite credential repository transactionally rejects already-persisted
+    /// references; this application-layer lock closes the check-then-persist
+    /// race for new `extra.source.credentialRef` values.
+    credential_reference_lock: AsyncMutex<()>,
 }
 
 /// One source entry's fetched-and-condensed body, ready to be slugged and
@@ -551,6 +552,7 @@ impl KnowledgeService {
             connectors: RwLock::new(HashMap::new()),
             cred_repo: RwLock::new(None),
             cred_key: RwLock::new(None),
+            credential_reference_lock: AsyncMutex::new(()),
         }
     }
 
@@ -634,17 +636,29 @@ impl KnowledgeService {
 
     /// Decrypt a stored credential into the in-memory [`ConnectorCredential`]
     /// the connector authenticates with.
-    async fn load_credential(&self, id: &ConnectorCredentialId) -> Result<ConnectorCredential, AppError> {
+    async fn load_credential(
+        &self,
+        credential_id: &ConnectorCredentialId,
+    ) -> Result<ConnectorCredential, AppError> {
         let repo = self.cred_repo()?;
         let key = self.cred_key()?;
         let row = repo
-            .get(id)
+            .get(credential_id)
             .await?
-            .ok_or_else(|| AppError::NotFound(format!("connector credential not found: {id}")))?;
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "connector credential not found: {credential_id}"
+                ))
+            })?;
         let plaintext = nomifun_common::decrypt_string(&row.payload_encrypted, &key)?;
         let payload: serde_json::Value = serde_json::from_str(&plaintext)
             .map_err(|e| AppError::Internal(format!("credential payload decode failed: {e}")))?;
-        Ok(ConnectorCredential { id: Some(row.id), kind: row.kind, name: row.name, payload })
+        Ok(ConnectorCredential {
+            credential_id: Some(row.credential_id),
+            kind: row.kind,
+            name: row.name,
+            payload,
+        })
     }
 
     /// All stored credentials (secret-free summaries).
@@ -653,7 +667,12 @@ impl KnowledgeService {
         let rows = repo.list().await?;
         Ok(rows
             .into_iter()
-            .map(|r| ConnectorCredentialSummary { id: r.id, kind: r.kind, name: r.name, created_at: r.created_at })
+            .map(|r| ConnectorCredentialSummary {
+                credential_id: r.credential_id,
+                kind: r.kind,
+                name: r.name,
+                created_at: r.created_at,
+            })
             .collect())
     }
 
@@ -675,7 +694,7 @@ impl KnowledgeService {
         }
         // Fail fast: never persist a credential that can't authenticate.
         let probe = ConnectorCredential {
-            id: None,
+            credential_id: None,
             kind: kind.to_owned(),
             name: name.to_owned(),
             payload: payload.clone(),
@@ -688,19 +707,31 @@ impl KnowledgeService {
             serde_json::to_string(&payload).map_err(|e| AppError::Internal(format!("payload encode failed: {e}")))?;
         let encrypted = nomifun_common::encrypt_string(&plaintext, &key)?;
         let row = repo.create(kind, name, &encrypted).await?;
-        Ok(ConnectorCredentialSummary { id: row.id, kind: row.kind, name: row.name, created_at: row.created_at })
+        Ok(ConnectorCredentialSummary {
+            credential_id: row.credential_id,
+            kind: row.kind,
+            name: row.name,
+            created_at: row.created_at,
+        })
     }
 
-    pub async fn delete_credential(&self, id: &ConnectorCredentialId) -> Result<(), AppError> {
+    pub async fn delete_credential(
+        &self,
+        credential_id: &ConnectorCredentialId,
+    ) -> Result<(), AppError> {
+        let _reference_guard = self.credential_reference_lock.lock().await;
         let repo = self.cred_repo()?;
-        repo.delete(id).await?;
+        repo.delete(credential_id).await?;
         Ok(())
     }
 
     /// Re-probe a stored credential against its remote (the UI "test
     /// connection" action). Returns the connector identity on success.
-    pub async fn test_credential(&self, id: &ConnectorCredentialId) -> Result<ConnectorIdentity, AppError> {
-        let cred = self.load_credential(id).await?;
+    pub async fn test_credential(
+        &self,
+        credential_id: &ConnectorCredentialId,
+    ) -> Result<ConnectorIdentity, AppError> {
+        let cred = self.load_credential(credential_id).await?;
         let connector = self
             .connector_for(&cred.kind)
             .ok_or_else(|| AppError::BadRequest(format!("no connector registered for kind \"{}\"", cred.kind)))?;
@@ -717,6 +748,7 @@ impl KnowledgeService {
     pub async fn sync_connector_source(&self, kb_id: &str) -> Result<RefreshSourceSummary, AppError> {
         let mut row = self.require_base(kb_id).await?;
         let mut source = source_from_extra(&row.extra)
+            .map_err(|error| knowledge_row_json_error(&row.knowledge_base_id, error))?
             .ok_or_else(|| AppError::BadRequest("knowledge base has no source to sync".into()))?;
         if source.kind == "url" {
             return Err(AppError::BadRequest(
@@ -728,9 +760,9 @@ impl KnowledgeService {
         })?;
         let cred_ref = source
             .credential_ref
-            .clone()
+            .as_ref()
             .ok_or_else(|| AppError::BadRequest("connector source is missing credential_ref".into()))?;
-        let cred = self.load_credential(&cred_ref).await?;
+        let cred = self.load_credential(cred_ref).await?;
         let scope = ConnectorScope(source.scope.clone().unwrap_or(serde_json::Value::Null));
 
         // Resume the incremental cursor from persisted sync state. The
@@ -877,7 +909,7 @@ impl KnowledgeService {
             source.last_fetched_at = last_sync_at;
         }
         self.persist_source(&mut row, &source).await?;
-        let info = self.row_to_info(row).await;
+        let info = self.row_to_info(row).await?;
         self.emitter.emit_base_updated(&info);
         Ok(RefreshSourceSummary {
             fetched,
@@ -931,7 +963,7 @@ impl KnowledgeService {
             .buffered(LIST_BASES_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
-        Ok(infos)
+        infos.into_iter().collect()
     }
 
     /// Registered base ids only, straight from the registry (DB) — performs NO
@@ -944,13 +976,13 @@ impl KnowledgeService {
             .list_bases()
             .await?
             .into_iter()
-            .map(|row| row.id.into_string())
+            .map(|row| row.knowledge_base_id)
             .collect())
     }
 
     pub async fn get_base_info(&self, id: &str) -> Result<KnowledgeBaseInfo, AppError> {
         let row = self.require_base(id).await?;
-        Ok(self.row_to_info(row).await)
+        self.row_to_info(row).await
     }
 
     /// Create a base. With `root_path = None` the directory is provisioned
@@ -1003,7 +1035,7 @@ impl KnowledgeService {
             // outlives the request.
             let service = Arc::clone(&self);
             tokio::spawn(async move {
-                let kb_id = row.id.clone();
+                let kb_id = row.knowledge_base_id.clone();
                 if let Err(e) = service.fetch_source_and_autogen(row, src).await {
                     tracing::warn!(kb_id = %kb_id, error = %e, "background knowledge source fetch failed");
                 }
@@ -1029,8 +1061,17 @@ impl KnowledgeService {
             return Err(AppError::BadRequest("knowledge base name must not be empty".into()));
         }
         let mut source = source;
+        let _credential_reference_guard = if source
+            .as_ref()
+            .is_some_and(|source| source.kind != "url")
+        {
+            Some(self.credential_reference_lock.lock().await)
+        } else {
+            None
+        };
         if let Some(src) = &mut source {
             validate_source(src)?;
+            self.ensure_source_credential_exists(src).await?;
             // Server-assigned; a client-sent value would lie until the first fetch.
             src.last_fetched_at = None;
         }
@@ -1067,7 +1108,8 @@ impl KnowledgeService {
         };
         let now = now_ms();
         let row = KnowledgeBaseRow {
-            id,
+            id: 0,
+            knowledge_base_id: id.into_string(),
             name: name.to_owned(),
             description: description.trim().to_owned(),
             root_path: root.to_string_lossy().to_string(),
@@ -1078,7 +1120,7 @@ impl KnowledgeService {
             tags: None,
         };
         self.repo.insert_base(&row).await?;
-        let info = self.row_to_info(row.clone()).await;
+        let info = self.row_to_info(row.clone()).await?;
         self.emitter.emit_base_created(&info);
         // Only URL sources owe a create-time snapshot fetch. Connector-backed
         // snapshot sources (empty URL `entries`) are populated by the explicit
@@ -1105,16 +1147,27 @@ impl KnowledgeService {
                 return;
             }
         };
-        let pending: Vec<(KnowledgeBaseRow, KnowledgeSource)> = rows
-            .into_iter()
-            .filter_map(|row| {
-                let src = source_from_extra(&row.extra)?;
-                (src.mode == KnowledgeSourceMode::Snapshot
-                    && !src.entries.is_empty()
-                    && src.last_fetched_at.is_none())
-                .then_some((row, src))
-            })
-            .collect();
+        let mut pending: Vec<(KnowledgeBaseRow, KnowledgeSource)> = Vec::new();
+        for row in rows {
+            let source = match source_from_extra(&row.extra) {
+                Ok(source) => source,
+                Err(error) => {
+                    tracing::warn!(
+                        knowledge_base_id = %row.knowledge_base_id,
+                        %error,
+                        "knowledge boot-resume: stored source JSON is invalid; skipping base"
+                    );
+                    continue;
+                }
+            };
+            let Some(src) = source else { continue };
+            if src.mode == KnowledgeSourceMode::Snapshot
+                && !src.entries.is_empty()
+                && src.last_fetched_at.is_none()
+            {
+                pending.push((row, src));
+            }
+        }
         if pending.is_empty() {
             return;
         }
@@ -1123,7 +1176,7 @@ impl KnowledgeService {
             "knowledge boot-resume: re-fetching interrupted snapshot sources"
         );
         for (row, src) in pending {
-            let kb_id = row.id.clone();
+            let kb_id = row.knowledge_base_id.clone();
             if let Err(e) = self.fetch_source_and_autogen(row, src).await {
                 tracing::warn!(kb_id = %kb_id, error = %e, "knowledge boot-resume fetch failed");
             }
@@ -1147,7 +1200,7 @@ impl KnowledgeService {
         let root = PathBuf::from(&row.root_path);
         let (fetched, errors) = self.fetch_source_snapshots(&root, &mut src.entries).await;
         if !errors.is_empty() {
-            tracing::warn!(kb_id = %row.id, ?errors, "some URL sources failed to fetch at create time");
+            tracing::warn!(kb_id = %row.knowledge_base_id, ?errors, "some URL sources failed to fetch at create time");
         }
         let prev_stamp = src.last_fetched_at;
         if fetched > 0 {
@@ -1160,7 +1213,7 @@ impl KnowledgeService {
         let persisted_stamp = match self.persist_source(&mut row, &src).await {
             Ok(()) => src.last_fetched_at,
             Err(e) => {
-                tracing::warn!(kb_id = %row.id, error = %e, "failed to persist source fetch state");
+                tracing::warn!(kb_id = %row.knowledge_base_id, error = %e, "failed to persist source fetch state");
                 prev_stamp
             }
         };
@@ -1171,13 +1224,13 @@ impl KnowledgeService {
         // `None`: server-driven background curation always uses the
         // completer's default model — never a transient UI model pick.
         if fetched > 0 && self.completer().is_some() {
-            if let Err(e) = self.generate_overview_opts(&row.id, false, true, None).await {
-                tracing::warn!(kb_id = %row.id, error = %e, "create-time knowledge autogen skipped");
+            if let Err(e) = self.generate_overview_opts(&row.knowledge_base_id, false, true, None).await {
+                tracing::warn!(kb_id = %row.knowledge_base_id, error = %e, "create-time knowledge autogen skipped");
             }
         }
         // Re-read + re-emit so clients see final stats/description.
-        let row = self.require_base(&row.id).await?;
-        let mut info = self.row_to_info(row).await;
+        let row = self.require_base(&row.knowledge_base_id).await?;
+        let mut info = self.row_to_info(row).await?;
         self.emitter.emit_base_updated(&info);
         // Surface the per-entry fetch outcome to the creating client
         // (response-only; events/list/get never carry it).
@@ -1217,31 +1270,55 @@ impl KnowledgeService {
         }
         row.updated_at = now_ms();
         self.repo.update_base(&row).await?;
-        let info = self.row_to_info(row).await;
+        let info = self.row_to_info(row).await?;
         self.emitter.emit_base_updated(&info);
         Ok(info)
     }
 
-    /// Delete a base registration. `purge` additionally removes the files on
-    /// disk — allowed only for managed bases (the guard re-checks the path is
-    /// really under `{data_dir}/knowledge/` so a corrupted row can never
-    /// point a purge at user data).
+    /// Delete a base registration and its logical binding references.
+    ///
+    /// `purge` additionally removes the files on disk, but only for managed
+    /// bases whose path is strictly below `{data_dir}/knowledge/`. The database
+    /// deletion is authoritative: if post-commit file cleanup fails, the
+    /// directory is logged as an orphan and the registration is not restored.
     pub async fn delete_base(&self, id: &str, purge: bool) -> Result<(), AppError> {
         let row = self.require_base(id).await?;
-        self.repo.delete_base(id).await?;
-
-        if purge && row.managed {
+        if purge && !row.managed {
+            return Err(AppError::BadRequest(
+                "cannot purge an external knowledge base; delete only removes its registration"
+                    .into(),
+            ));
+        }
+        if purge {
             let root = PathBuf::from(&row.root_path);
             let managed_parent = self.data_dir.join(KB_MANAGED_REL_DIR);
-            if root.starts_with(&managed_parent) && root != managed_parent {
-                if let Err(e) = tokio::fs::remove_dir_all(&root).await {
-                    tracing::warn!(path = %root.display(), error = %e, "failed to purge knowledge base dir");
-                }
-            } else {
-                tracing::warn!(path = %root.display(), "purge refused: root not under managed knowledge dir");
+            if !root.starts_with(&managed_parent) || root == managed_parent {
+                return Err(AppError::Internal(format!(
+                    "managed knowledge base {} has unsafe purge path '{}'",
+                    row.knowledge_base_id,
+                    root.display()
+                )));
             }
         }
-        self.emitter.emit_base_deleted(&row.id);
+        self.repo.delete_base(id).await?;
+
+        if purge {
+            let root = PathBuf::from(&row.root_path);
+            if let Err(error) = tokio::fs::remove_dir_all(&root).await {
+                tracing::warn!(
+                    knowledge_base_id = %row.knowledge_base_id,
+                    path = %root.display(),
+                    %error,
+                    "knowledge registration and logical references were deleted, but managed directory cleanup failed; directory remains as an orphan"
+                );
+            }
+        }
+        let id = KnowledgeBaseId::parse(&row.knowledge_base_id)
+            .map_err(|error| AppError::Internal(format!(
+                "stored knowledge base id '{}' is invalid: {error}",
+                row.knowledge_base_id
+            )))?;
+        self.emitter.emit_base_deleted(&id);
         Ok(())
     }
 
@@ -1392,7 +1469,7 @@ impl KnowledgeService {
         if let Some(parent) = inbox_abs.parent() {
             prune_empty_inbox_dirs(&root.join(KB_INBOX_REL_DIR), parent.to_path_buf()).await;
         }
-        let info = self.row_to_info(row).await;
+        let info = self.row_to_info(row).await?;
         self.emitter.emit_base_updated(&info);
         Ok(InboxMergeResult { merged_path: rel_path.replace('\\', "/") })
     }
@@ -1649,8 +1726,10 @@ impl KnowledgeService {
         }
         progress(TurnWritebackPhase::Writing).await;
 
-        let mounted_ids: HashSet<KnowledgeBaseId> = req.mounts.iter().map(|m| m.id.clone()).collect();
-        let bound_kb_ids: Vec<KnowledgeBaseId> = req.mounts.iter().map(|m| m.id.clone()).collect();
+        let mounted_ids: HashSet<KnowledgeBaseId> =
+            req.mounts.iter().map(|m| m.knowledge_base_id.clone()).collect();
+        let bound_kb_ids: Vec<KnowledgeBaseId> =
+            req.mounts.iter().map(|m| m.knowledge_base_id.clone()).collect();
         let mut seen = HashSet::new();
         let mut written = Vec::new();
         let mut failures = Vec::new();
@@ -2129,6 +2208,7 @@ impl KnowledgeService {
     pub async fn refresh_source(&self, kb_id: &str) -> Result<RefreshSourceSummary, AppError> {
         let mut row = self.require_base(kb_id).await?;
         let mut source = source_from_extra(&row.extra)
+            .map_err(|error| knowledge_row_json_error(&row.knowledge_base_id, error))?
             .ok_or_else(|| AppError::BadRequest("knowledge base has no URL source to refresh".into()))?;
         if source.entries.is_empty() {
             return Err(AppError::BadRequest("URL source has no entries".into()));
@@ -2149,7 +2229,7 @@ impl KnowledgeService {
         // frontmatter) are never touched.
         prune_orphan_snapshots(&root, &source.entries).await;
         let last_fetched_at = source.last_fetched_at;
-        let info = self.row_to_info(row).await;
+        let info = self.row_to_info(row).await?;
         self.emitter.emit_base_updated(&info);
         Ok(RefreshSourceSummary {
             fetched,
@@ -2278,10 +2358,17 @@ impl KnowledgeService {
     /// Write `source` back into the row's `extra.source` and persist the row
     /// (other `extra` keys are preserved).
     async fn persist_source(&self, row: &mut KnowledgeBaseRow, source: &KnowledgeSource) -> Result<(), AppError> {
-        let mut extra: serde_json::Value =
-            serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
+        let mut extra: serde_json::Value = serde_json::from_str(&row.extra).map_err(|error| {
+            AppError::Internal(format!(
+                "knowledge base {} has invalid extra JSON: {error}",
+                row.knowledge_base_id
+            ))
+        })?;
         if !extra.is_object() {
-            extra = serde_json::json!({});
+            return Err(AppError::Internal(format!(
+                "knowledge base {} extra must be a JSON object",
+                row.knowledge_base_id
+            )));
         }
         extra["source"] =
             serde_json::to_value(source).map_err(|e| AppError::Internal(format!("source serialize failed: {e}")))?;
@@ -2303,15 +2390,34 @@ impl KnowledgeService {
         source: Option<KnowledgeSource>,
     ) -> Result<KnowledgeBaseInfo, AppError> {
         let mut row = self.require_base(kb_id).await?;
+        let _credential_reference_guard = if source
+            .as_ref()
+            .is_some_and(|source| source.kind != "url")
+        {
+            Some(self.credential_reference_lock.lock().await)
+        } else {
+            None
+        };
         match source {
             Some(mut src) => {
                 validate_source(&src)?;
+                self.ensure_source_credential_exists(&src).await?;
                 src.last_fetched_at = None;
                 self.persist_source(&mut row, &src).await?;
             }
             None => {
-                let mut extra: serde_json::Value =
-                    serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
+                let mut extra: serde_json::Value = serde_json::from_str(&row.extra).map_err(|error| {
+                    AppError::Internal(format!(
+                        "knowledge base {} has invalid extra JSON: {error}",
+                        row.knowledge_base_id
+                    ))
+                })?;
+                if !extra.is_object() {
+                    return Err(AppError::Internal(format!(
+                        "knowledge base {} extra must be a JSON object",
+                        row.knowledge_base_id
+                    )));
+                }
                 if let Some(obj) = extra.as_object_mut() {
                     obj.remove("source");
                 }
@@ -2320,9 +2426,37 @@ impl KnowledgeService {
                 self.repo.update_base(&row).await?;
             }
         }
-        let info = self.row_to_info(row).await;
+        let info = self.row_to_info(row).await?;
         self.emitter.emit_base_updated(&info);
         Ok(info)
+    }
+
+    async fn ensure_source_credential_exists(
+        &self,
+        source: &KnowledgeSource,
+    ) -> Result<(), AppError> {
+        if source.kind == "url" {
+            return Ok(());
+        }
+        let credential_id = source.credential_ref.as_ref().ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "connector source \"{}\" requires a credential_ref",
+                source.kind
+            ))
+        })?;
+        let repo = self.cred_repo()?;
+        let credential = repo.get(credential_id).await?.ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "connector credential not found: {credential_id}"
+            ))
+        })?;
+        if credential.kind != source.kind {
+            return Err(AppError::BadRequest(format!(
+                "connector credential {credential_id} has kind \"{}\", expected \"{}\"",
+                credential.kind, source.kind
+            )));
+        }
+        Ok(())
     }
 
     // ── Bindings & mounting ─────────────────────────────────────────
@@ -2404,36 +2538,19 @@ impl KnowledgeService {
         Ok(())
     }
 
-    /// Workpath-first mount resolution for conversation/terminal sessions
-    /// (session-list unification spec §7): the binding belongs to the
-    /// workspace path, not to the individual session. Looks up the
-    /// `('workpath', workpath_key)` binding ROW first; only when no such
-    /// row exists at all does it fall back to the legacy per-session
-    /// binding `(legacy_kind, legacy_id)`, so pre-workpath local data keeps
-    /// mounting. An existing-but-disabled workpath row is an explicit user
-    /// choice — NOT a miss — and shadows the legacy binding. Companion sessions
-    /// never come through here (they keep `ensure_mounts_for_target` with
-    /// `('companion', companion_id)`).
+    /// Resolve conversation/terminal mounts exclusively through the canonical
+    /// workpath binding. The session-kind/id parameters remain in the method
+    /// shape for callers outside this crate, but v3 never reads per-session
+    /// binding rows as a fallback.
     pub async fn ensure_mounts_for_session(
         &self,
         workpath: &str,
-        legacy_kind: &str,
-        legacy_id: &str,
+        _session_kind: &str,
+        _session_id: &str,
         workspace: &Path,
     ) -> MountOutcome {
         let key = workpath_key(workpath);
-        let has_workpath_row = match self.repo.get_binding(WORKPATH_BINDING_KIND, &key).await {
-            Ok(row) => row.is_some(),
-            Err(e) => {
-                tracing::warn!(error = %e, workpath = %key, "workpath knowledge binding lookup failed");
-                false
-            }
-        };
-        if has_workpath_row {
-            self.ensure_mounts_for_target(WORKPATH_BINDING_KIND, &key, workspace).await
-        } else {
-            self.ensure_mounts_for_target(legacy_kind, legacy_id, workspace).await
-        }
+        self.ensure_mounts_for_target(WORKPATH_BINDING_KIND, &key, workspace).await
     }
 
     /// Synchronize workspace mounts for a target according to its binding.
@@ -2507,13 +2624,36 @@ impl KnowledgeService {
         let mut mounts = Vec::with_capacity(kept.len());
         for ((link_name, row), toc) in kept.into_iter().zip(tocs) {
             let summary = read_base_summary(Path::new(&row.root_path)).await;
+            let kb_id = match KnowledgeBaseId::parse(&row.knowledge_base_id) {
+                Ok(id) => id,
+                Err(error) => {
+                    tracing::warn!(
+                        knowledge_base_id = %row.knowledge_base_id,
+                        %error,
+                        "stored knowledge base id is invalid; skipping mount metadata"
+                    );
+                    continue;
+                }
+            };
             // Live-mode URL sources surface as realtime URLs in the context.
-            let live_sources = source_from_extra(&row.extra)
-                .filter(|s| s.mode == KnowledgeSourceMode::Live)
-                .map(|s| s.entries)
-                .unwrap_or_default();
+            // Corrupt persisted JSON is not reinterpreted as "no source":
+            // skip the base and leave an explicit diagnostic.
+            let live_sources = match source_from_extra(&row.extra) {
+                Ok(Some(source)) if source.mode == KnowledgeSourceMode::Live => {
+                    source.entries
+                }
+                Ok(_) => Vec::new(),
+                Err(error) => {
+                    tracing::warn!(
+                        knowledge_base_id = %row.knowledge_base_id,
+                        %error,
+                        "stored knowledge source JSON is invalid; skipping mount metadata"
+                    );
+                    continue;
+                }
+            };
             mounts.push(KnowledgeMountInfo {
-                id: row.id,
+                knowledge_base_id: kb_id,
                 name: row.name,
                 description: row.description,
                 rel_path: format!("{KB_MOUNT_REL_DIR}/{link_name}"),
@@ -2551,7 +2691,14 @@ impl KnowledgeService {
         let mut roots: Vec<(KnowledgeBaseId, String, PathBuf)> = Vec::new();
         for id in kb_ids {
             if let Ok(Some(row)) = self.repo.get_base(id.as_str()).await {
-                roots.push((row.id.clone(), row.name.clone(), PathBuf::from(&row.root_path)));
+                let Ok(kb_id) = KnowledgeBaseId::parse(&row.knowledge_base_id) else {
+                    tracing::warn!(
+                        knowledge_base_id = %row.knowledge_base_id,
+                        "stored knowledge base id is invalid; skipping search root"
+                    );
+                    continue;
+                };
+                roots.push((kb_id, row.name.clone(), PathBuf::from(&row.root_path)));
             }
         }
         if roots.is_empty() {
@@ -2715,7 +2862,20 @@ impl KnowledgeService {
     /// when no workpath binding narrows it.
     async fn all_base_ids(&self) -> Vec<KnowledgeBaseId> {
         match self.repo.list_bases().await {
-            Ok(rows) => rows.into_iter().map(|row| row.id).collect(),
+            Ok(rows) => rows
+                .into_iter()
+                .filter_map(|row| match KnowledgeBaseId::parse(&row.knowledge_base_id) {
+                    Ok(id) => Some(id),
+                    Err(error) => {
+                        tracing::warn!(
+                            knowledge_base_id = %row.knowledge_base_id,
+                            %error,
+                            "stored knowledge base id is invalid; omitting from scope"
+                        );
+                        None
+                    }
+                })
+                .collect(),
             Err(e) => {
                 tracing::warn!(error = %e, "failed to list knowledge bases for scope resolution");
                 Vec::new()
@@ -2803,8 +2963,9 @@ impl nomifun_common::OnConversationDelete for KnowledgeService {
 
 impl KnowledgeService {
 
-    async fn row_to_info(&self, row: KnowledgeBaseRow) -> KnowledgeBaseInfo {
-        let source = source_from_extra(&row.extra);
+    async fn row_to_info(&self, row: KnowledgeBaseRow) -> Result<KnowledgeBaseInfo, AppError> {
+        let source = source_from_extra(&row.extra)
+            .map_err(|error| knowledge_row_json_error(&row.knowledge_base_id, error))?;
         let root = PathBuf::from(&row.root_path);
         let root_for_inbox = root.clone();
         // Bounded so a slow/stale NAS mount degrades (assume present, counts
@@ -2832,17 +2993,17 @@ impl KnowledgeService {
         })
         .await;
 
-        let tags: Vec<String> = row
-            .tags
-            .as_deref()
-            .and_then(|t| serde_json::from_str(t).ok())
-            .unwrap_or_default();
+        let tags = tags_from_row(&row)?;
 
         let kind = derive_kind(row.managed, source.as_ref()).to_string();
 
-        KnowledgeBaseInfo {
-            id: row.id,
-            seq: None,
+        Ok(KnowledgeBaseInfo {
+            knowledge_base_id: KnowledgeBaseId::parse(&row.knowledge_base_id).map_err(|error| {
+                AppError::Internal(format!(
+                    "stored knowledge base id '{}' is invalid: {error}",
+                    row.knowledge_base_id
+                ))
+            })?,
             name: row.name,
             description: row.description,
             root_path: row.root_path,
@@ -2857,7 +3018,7 @@ impl KnowledgeService {
             tags,
             kind,
             pending_inbox,
-        }
+        })
     }
 }
 
@@ -2874,7 +3035,7 @@ fn validate_kind(kind: &str) -> Result<(), AppError> {
 /// client spelling of the same directory (trailing slash, backslashes)
 /// converges on one binding row; other kinds carry opaque ids unchanged.
 fn canonical_target_id(kind: &str, target_id: &str) -> Result<String, AppError> {
-    let invalid = |error: nomifun_common::PrefixedIdError| {
+    let invalid = |error: UuidV7Error| {
         AppError::BadRequest(format!("invalid {kind} target id '{target_id}': {error}"))
     };
     match kind {
@@ -2943,13 +3104,13 @@ fn binding_from_row((row, kb_ids): (KnowledgeBindingRow, Vec<String>)) -> Result
     if !WRITEBACK_MODES.contains(&row.writeback_mode.as_str()) {
         return Err(AppError::Internal(format!(
             "knowledge binding '{}' contains invalid writeback_mode '{}'",
-            row.binding_id, row.writeback_mode
+            row.id, row.writeback_mode
         )));
     }
     if !WRITEBACK_EAGERNESS.contains(&row.writeback_eagerness.as_str()) {
         return Err(AppError::Internal(format!(
             "knowledge binding '{}' contains invalid writeback_eagerness '{}'",
-            row.binding_id, row.writeback_eagerness
+            row.id, row.writeback_eagerness
         )));
     }
     let kb_ids = kb_ids
@@ -2957,7 +3118,7 @@ fn binding_from_row((row, kb_ids): (KnowledgeBindingRow, Vec<String>)) -> Result
         .map(|id| KnowledgeBaseId::parse(id.clone()).map_err(|error| {
             AppError::Internal(format!(
                 "knowledge binding '{}' contains invalid base id '{id}': {error}",
-                row.binding_id
+                row.id
             ))
         }))
         .collect::<Result<Vec<_>, _>>()?;
@@ -2971,10 +3132,60 @@ fn binding_from_row((row, kb_ids): (KnowledgeBindingRow, Vec<String>)) -> Result
     })
 }
 
-/// Deserialize `extra.source`, tolerating absent/corrupt extras (`None`).
-fn source_from_extra(extra: &str) -> Option<KnowledgeSource> {
-    let value: serde_json::Value = serde_json::from_str(extra).ok()?;
-    serde_json::from_value(value.get("source")?.clone()).ok()
+#[derive(Debug)]
+enum KnowledgeExtraError {
+    InvalidJson(serde_json::Error),
+    NotObject,
+    InvalidSource(serde_json::Error),
+}
+
+impl std::fmt::Display for KnowledgeExtraError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidJson(error) => write!(formatter, "extra is invalid JSON: {error}"),
+            Self::NotObject => formatter.write_str("extra must be a JSON object"),
+            Self::InvalidSource(error) => {
+                write!(formatter, "extra.source is invalid: {error}")
+            }
+        }
+    }
+}
+
+fn knowledge_row_json_error(knowledge_base_id: &str, error: KnowledgeExtraError) -> AppError {
+    AppError::Internal(format!(
+        "knowledge base {knowledge_base_id} has invalid persisted metadata: {error}"
+    ))
+}
+
+/// Deserialize the canonical `extra.source` field.
+///
+/// An absent field is a valid source-less base. Invalid JSON, a non-object
+/// `extra`, or a malformed `source` is persisted corruption and must not be
+/// silently reinterpreted as absence.
+fn source_from_extra(extra: &str) -> Result<Option<KnowledgeSource>, KnowledgeExtraError> {
+    let value: serde_json::Value =
+        serde_json::from_str(extra).map_err(KnowledgeExtraError::InvalidJson)?;
+    let object = value.as_object().ok_or(KnowledgeExtraError::NotObject)?;
+    object
+        .get("source")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(KnowledgeExtraError::InvalidSource)
+}
+
+fn tags_from_row(row: &KnowledgeBaseRow) -> Result<Vec<String>, AppError> {
+    row.tags
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "knowledge base {} has invalid tags JSON: {error}",
+                row.knowledge_base_id
+            ))
+        })
+        .map(Option::unwrap_or_default)
 }
 
 /// Derive the UI type discriminator for a knowledge base:
@@ -3017,7 +3228,7 @@ fn validate_source(source: &KnowledgeSource) -> Result<(), AppError> {
             source.kind
         )));
     }
-    if source.credential_ref.as_deref().map(str::trim).filter(|s| !s.is_empty()).is_none() {
+    if source.credential_ref.is_none() {
         return Err(AppError::BadRequest(format!(
             "connector source \"{}\" requires a credential_ref",
             source.kind
@@ -3875,7 +4086,7 @@ fn rename_tree_entry(root: &Path, rel_path: &str, new_name: &str) -> Result<KbTr
 /// Sanitize a base name into a directory-safe mount link name, deduplicating
 /// collisions (with other mounts AND with the platform-managed companion
 /// files inside the mount root, e.g. a base literally named `README.md`)
-/// via a short id suffix.
+/// via the complete canonical knowledge-base ID.
 fn unique_link_name(row: &KnowledgeBaseRow, used: &mut HashSet<String>) -> String {
     let mut name: String = row
         .name
@@ -3890,23 +4101,17 @@ fn unique_link_name(row: &KnowledgeBaseRow, used: &mut HashSet<String>) -> Strin
         .trim_end_matches('.')
         .to_owned();
     if name.is_empty() {
-        name = row.id.to_string();
+        name = row.knowledge_base_id.clone();
     }
     // `MANAGED_KEEP` entries (`.gitignore`, `README.md`) are exempt from the
     // mount sweep and owned by the platform — a link with such a name would
     // collide with them. Windows file names are case-insensitive, so compare
     // accordingly.
     if mount::MANAGED_KEEP.iter().any(|kept| kept.eq_ignore_ascii_case(&name)) || used.contains(&name) {
-        name = format!("{name}-{}", short_id_suffix(row.id.as_str()));
+        name = format!("{name}-{}", row.knowledge_base_id);
     }
     used.insert(name.clone());
     name
-}
-
-/// Last 6 chars of an id — the disambiguation suffix for link names.
-fn short_id_suffix(id: &str) -> String {
-    let chars: Vec<char> = id.chars().collect();
-    chars[chars.len().saturating_sub(6)..].iter().collect()
 }
 
 fn modified_ms(meta: &std::fs::Metadata) -> Option<TimestampMs> {
@@ -4102,29 +4307,34 @@ impl KnowledgeService {
         })
     }
 
-    /// Delete a tag by key. **Transactionally** strips the key from the `tags`
-    /// JSON array of every base that references it, then removes the tag row.
+    /// Delete a tag by key after explicitly removing every JSON reference.
+    ///
+    /// The repository boundary does not expose a cross-table transaction, so a
+    /// mid-operation failure can leave already-updated bases without the tag
+    /// while retaining the tag definition. That state is safe and retryable:
+    /// references are removed before the definition, never the reverse.
     pub async fn delete_tag(&self, key: &str) -> Result<(), AppError> {
         // 1. Strip the key from every base that references it.
         let bases = self.repo.list_bases().await?;
         for mut base in bases {
-            let tags: Vec<String> = base
-                .tags
-                .as_deref()
-                .and_then(|t| serde_json::from_str(t).ok())
-                .unwrap_or_default();
-            if tags.contains(&key.to_owned()) {
+            let tags = tags_from_row(&base)?;
+            if tags.iter().any(|tag| tag == key) {
                 let filtered: Vec<&String> = tags.iter().filter(|k| k.as_str() != key).collect();
                 base.tags = if filtered.is_empty() {
                     None
                 } else {
-                    Some(serde_json::to_string(&filtered).unwrap())
+                    Some(serde_json::to_string(&filtered).map_err(|error| {
+                        AppError::Internal(format!(
+                            "failed to serialize tags for knowledge base {}: {error}",
+                            base.knowledge_base_id
+                        ))
+                    })?)
                 };
                 base.updated_at = now_ms();
                 self.repo.update_base(&base).await?;
                 // The base's tag chips changed — refresh any base list/detail
                 // view (the tag-changed signal below only refreshes tag maps).
-                let info = self.row_to_info(base).await;
+                let info = self.row_to_info(base).await?;
                 self.emitter.emit_base_updated(&info);
             }
         }
@@ -4186,18 +4396,92 @@ fn deduplicate_slug(base: &str, existing: &HashSet<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nomifun_db::models::ConnectorCredentialRow;
 
-    const TEST_OWNER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
-    const TEST_CONVERSATION_ID: &str = "conv_0190f5fe-7c00-7a00-8000-000000000001";
-    const TEST_CONVERSATION_ID_2: &str = "conv_0190f5fe-7c00-7a00-8000-000000000002";
-    const TEST_CONVERSATION_ID_9: &str = "conv_0190f5fe-7c00-7a00-8000-000000000009";
-    const TEST_TERMINAL_ID_2: &str = "term_0190f5fe-7c00-7a00-8000-000000000002";
-    const TEST_TERMINAL_ID_9: &str = "term_0190f5fe-7c00-7a00-8000-000000000009";
-    const TEST_PROVIDER_ID_2: &str = "prov_0190f5fe-7c00-7a00-8000-000000000002";
-    const TEST_PROVIDER_ID_9: &str = "prov_0190f5fe-7c00-7a00-8000-000000000009";
-    const TEST_KB_PENDING: &str = "kb_0190f5fe-7c00-7a00-8000-000000000091";
-    const TEST_KB_LIVE: &str = "kb_0190f5fe-7c00-7a00-8000-000000000092";
-    const TEST_KB_STAMPED: &str = "kb_0190f5fe-7c00-7a00-8000-000000000093";
+    const TEST_OWNER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000011";
+    const TEST_CONVERSATION_ID_2: &str = "0190f5fe-7c00-7a00-8000-000000000012";
+    const TEST_CONVERSATION_ID_9: &str = "0190f5fe-7c00-7a00-8000-000000000019";
+    const TEST_TERMINAL_ID_2: &str = "0190f5fe-7c00-7a00-8000-000000000022";
+    const TEST_TERMINAL_ID_9: &str = "0190f5fe-7c00-7a00-8000-000000000029";
+    const TEST_PROVIDER_ID_2: &str = "0190f5fe-7c00-7a00-8000-000000000032";
+    const TEST_PROVIDER_ID_9: &str = "0190f5fe-7c00-7a00-8000-000000000039";
+    const TEST_KB_PENDING: &str = "0190f5fe-7c00-7a00-8000-000000000091";
+    const TEST_KB_LIVE: &str = "0190f5fe-7c00-7a00-8000-000000000092";
+    const TEST_KB_STAMPED: &str = "0190f5fe-7c00-7a00-8000-000000000093";
+
+    #[derive(Default)]
+    struct TestCredentialRepo {
+        rows: StdMutex<Vec<ConnectorCredentialRow>>,
+    }
+
+    #[async_trait::async_trait]
+    impl IConnectorCredentialRepository for TestCredentialRepo {
+        async fn list(&self) -> Result<Vec<ConnectorCredentialRow>, nomifun_db::DbError> {
+            Ok(self.rows.lock().unwrap().clone())
+        }
+
+        async fn get(
+            &self,
+            credential_id: &ConnectorCredentialId,
+        ) -> Result<Option<ConnectorCredentialRow>, nomifun_db::DbError> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|row| &row.credential_id == credential_id)
+                .cloned())
+        }
+
+        async fn create(
+            &self,
+            kind: &str,
+            name: &str,
+            payload_encrypted: &str,
+        ) -> Result<ConnectorCredentialRow, nomifun_db::DbError> {
+            let row = ConnectorCredentialRow {
+                credential_id: ConnectorCredentialId::new(),
+                kind: kind.to_owned(),
+                name: name.to_owned(),
+                payload_encrypted: payload_encrypted.to_owned(),
+                created_at: 1,
+                updated_at: 1,
+            };
+            self.rows.lock().unwrap().push(row.clone());
+            Ok(row)
+        }
+
+        async fn delete(
+            &self,
+            credential_id: &ConnectorCredentialId,
+        ) -> Result<(), nomifun_db::DbError> {
+            let mut rows = self.rows.lock().unwrap();
+            let before = rows.len();
+            rows.retain(|row| &row.credential_id != credential_id);
+            if rows.len() == before {
+                return Err(nomifun_db::DbError::NotFound(format!(
+                    "connector credential {credential_id}"
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn canonical_entity_target_id_accepts_bare_uuidv7_and_rejects_legacy_prefix() {
+        assert_eq!(
+            canonical_target_id("conversation", TEST_CONVERSATION_ID).unwrap(),
+            TEST_CONVERSATION_ID
+        );
+
+        let legacy = format!("conv_{TEST_CONVERSATION_ID}");
+        let error = canonical_target_id("conversation", &legacy).unwrap_err();
+        assert!(
+            matches!(error, AppError::BadRequest(ref message) if message.contains("invalid conversation target id")),
+            "{error}"
+        );
+    }
 
     /// **P3-K2 seam**: the render fetcher is an OPTIONAL, late-wired backend. By
     /// default it is absent (every source uses the HTTP `fetcher` — zero
@@ -4349,7 +4633,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
         std::fs::write(root.join("guide.md"), "# 使用指南\n正文").unwrap();
-        let inbox = root.join("_inbox/conv_0190f5fe-7c00-7a00-8000-000000000001");
+        let inbox = root.join("_inbox/0190f5fe-7c00-7a00-8000-000000000011");
         std::fs::create_dir_all(&inbox).unwrap();
         std::fs::write(inbox.join("draft.md"), "# 草稿").unwrap();
         std::fs::create_dir_all(root.join("sub")).unwrap();
@@ -4425,7 +4709,7 @@ mod tests {
             .await
             .unwrap();
 
-        let hits = service.search_bases(&[kb.id.clone()], "部署", 10).await.unwrap();
+        let hits = service.search_bases(&[kb.knowledge_base_id.clone()], "部署", 10).await.unwrap();
         let rels: Vec<&str> = hits.iter().map(|h| h.rel_path.as_str()).collect();
         assert_eq!(rels, vec!["real.md"], "machinery-dir files must not be searchable: {rels:?}");
     }
@@ -4524,7 +4808,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let service = make_service(&dir.path().join("data"));
         let kb = service.create_base("库", "", None, None).await.unwrap();
-        service.write_file(&kb.id, "a.md", "# A").await.unwrap();
+        service.write_file(&kb.knowledge_base_id, "a.md", "# A").await.unwrap();
         let root = PathBuf::from(&kb.root_path);
         std::fs::write(root.join("readme.md"), "# 手写 readme\n保留我").unwrap();
         service.set_completer(FakeCompleter::new(OVERVIEW_JSON, ""));
@@ -4541,14 +4825,14 @@ mod tests {
         };
 
         // overwrite=false: the lowercase README counts as existing → untouched.
-        let outcome = service.generate_overview(&kb.id, false, None).await.unwrap();
+        let outcome = service.generate_overview(&kb.knowledge_base_id, false, None).await.unwrap();
         assert!(!outcome.readme_written, "existing readme.md must block the non-overwrite write");
         let found = readmes(&root);
         assert_eq!(found.len(), 1, "no parallel README.md may appear: {found:?}");
         assert_eq!(std::fs::read_to_string(&found[0]).unwrap(), "# 手写 readme\n保留我");
 
         // overwrite=true: rewrites in place — still exactly one readme file.
-        let outcome = service.generate_overview(&kb.id, true, None).await.unwrap();
+        let outcome = service.generate_overview(&kb.knowledge_base_id, true, None).await.unwrap();
         assert!(outcome.readme_written);
         let found = readmes(&root);
         assert_eq!(found.len(), 1, "overwrite must hit the existing file: {found:?}");
@@ -4558,8 +4842,10 @@ mod tests {
     #[test]
     fn link_names_sanitize_and_dedupe() {
         let mut used = HashSet::new();
+        let knowledge_base_id_a = KnowledgeBaseId::new();
         let row_a = KnowledgeBaseRow {
-            id: KnowledgeBaseId::new(),
+            id: 1,
+            knowledge_base_id: knowledge_base_id_a.into_string(),
             name: "领域/知识:v1".into(),
             description: String::new(),
             root_path: String::new(),
@@ -4573,7 +4859,8 @@ mod tests {
         assert_eq!(name_a, "领域_知识_v1");
 
         let row_b = KnowledgeBaseRow {
-            id: KnowledgeBaseId::new(),
+            id: 2,
+            knowledge_base_id: KnowledgeBaseId::new().into_string(),
             ..row_a.clone()
         };
         let name_b = unique_link_name(&row_b, &mut used);
@@ -4590,7 +4877,8 @@ mod tests {
         for name in ["README.md", "readme.MD", ".gitignore"] {
             let mut used = HashSet::new();
             let row = KnowledgeBaseRow {
-                id: KnowledgeBaseId::new(),
+                id: 1,
+                knowledge_base_id: KnowledgeBaseId::new().into_string(),
                 name: name.into(),
                 description: String::new(),
                 root_path: String::new(),
@@ -4605,7 +4893,10 @@ mod tests {
                 !mount::MANAGED_KEEP.iter().any(|k| k.eq_ignore_ascii_case(&link)),
                 "{name} → {link}"
             );
-            assert_eq!(link, format!("{name}-{}", short_id_suffix(row.id.as_str())));
+            assert_eq!(
+                link,
+                format!("{name}-{}", row.knowledge_base_id)
+            );
         }
     }
 
@@ -4652,10 +4943,10 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let service = make_service(&dir.path().join("data"));
         let kb = service.create_base("接口库", "", None, None).await.unwrap();
-        service.write_file(&kb.id, "api.md", "# API\n说明").await.unwrap();
+        service.write_file(&kb.knowledge_base_id, "api.md", "# API\n说明").await.unwrap();
         service.set_completer(FakeCompleter::new(OVERVIEW_JSON, ""));
 
-        let outcome = service.generate_overview(&kb.id, false, None).await.unwrap();
+        let outcome = service.generate_overview(&kb.knowledge_base_id, false, None).await.unwrap();
         assert!(outcome.readme_written);
         assert!(outcome.description_updated);
         assert_eq!(outcome.description, "AI 生成的描述");
@@ -4666,7 +4957,7 @@ mod tests {
         // Long descriptions are clamped to DESCRIPTION_MAX_CHARS.
         let long = format!(r##"{{"description":"{}","readme_markdown":"# X"}}"##, "知".repeat(300));
         service.set_completer(FakeCompleter::new(&long, ""));
-        let outcome = service.generate_overview(&kb.id, true, None).await.unwrap();
+        let outcome = service.generate_overview(&kb.knowledge_base_id, true, None).await.unwrap();
         assert_eq!(outcome.description.chars().count(), autogen::DESCRIPTION_MAX_CHARS);
     }
 
@@ -4701,7 +4992,7 @@ mod tests {
         // markdown must never be counted or walked.
         assert_eq!(info.file_count, 2, "dot-dir markdown must not inflate file_count");
 
-        let files = service.list_files(&info.id).await.unwrap();
+        let files = service.list_files(&info.knowledge_base_id).await.unwrap();
         let rels: Vec<&str> = files.iter().map(|f| f.rel_path.as_str()).collect();
         assert_eq!(
             rels,
@@ -4719,7 +5010,7 @@ mod tests {
         std::fs::create_dir_all(vault.join("raw")).unwrap();
         std::fs::create_dir_all(vault.join("empty")).unwrap();
         std::fs::create_dir_all(vault.join("assets")).unwrap();
-        let inbox = vault.join("_inbox/conv_0190f5fe-7c00-7a00-8000-000000000001");
+        let inbox = vault.join("_inbox/0190f5fe-7c00-7a00-8000-000000000011");
         std::fs::create_dir_all(&inbox).unwrap();
         std::fs::create_dir_all(vault.join(".obsidian")).unwrap();
         std::fs::create_dir_all(vault.join("node_modules/pkg")).unwrap();
@@ -4735,7 +5026,7 @@ mod tests {
             .await
             .unwrap();
 
-        let root = service.list_tree(&info.id, "").await.unwrap();
+        let root = service.list_tree(&info.knowledge_base_id, "").await.unwrap();
         let root_names: Vec<(&str, bool, bool)> = root
             .iter()
             .map(|entry| (entry.name.as_str(), entry.is_dir, entry.is_file))
@@ -4750,17 +5041,17 @@ mod tests {
             ]
         );
 
-        let raw = service.list_tree(&info.id, "raw").await.unwrap();
+        let raw = service.list_tree(&info.knowledge_base_id, "raw").await.unwrap();
         assert_eq!(raw.len(), 1);
         assert_eq!(raw[0].rel_path, "raw/python3-type-conversion.md");
         assert!(raw[0].is_file);
 
-        let empty = service.list_tree(&info.id, "empty").await.unwrap();
+        let empty = service.list_tree(&info.knowledge_base_id, "empty").await.unwrap();
         assert!(
             empty.is_empty(),
             "empty folders should be expandable but list no children"
         );
-        assert!(service.list_tree(&info.id, "../escape").await.is_err());
+        assert!(service.list_tree(&info.knowledge_base_id, "../escape").await.is_err());
     }
 
     #[tokio::test]
@@ -4777,19 +5068,19 @@ mod tests {
             .await
             .unwrap();
 
-        service.create_folder(&info.id, "raw/tutorials").await.unwrap();
+        service.create_folder(&info.knowledge_base_id, "raw/tutorials").await.unwrap();
         assert!(vault.join("raw/tutorials").is_dir());
 
-        let raw = service.list_tree(&info.id, "raw").await.unwrap();
+        let raw = service.list_tree(&info.knowledge_base_id, "raw").await.unwrap();
         assert_eq!(raw.len(), 1);
         assert_eq!(raw[0].rel_path, "raw/tutorials");
         assert!(raw[0].is_dir);
 
-        assert!(service.create_folder(&info.id, "").await.is_err());
-        assert!(service.create_folder(&info.id, "../escape").await.is_err());
-        assert!(service.create_folder(&info.id, "_inbox/draft").await.is_err());
-        assert!(service.create_folder(&info.id, "node_modules/pkg").await.is_err());
-        assert!(service.create_folder(&info.id, "README.md/child").await.is_err());
+        assert!(service.create_folder(&info.knowledge_base_id, "").await.is_err());
+        assert!(service.create_folder(&info.knowledge_base_id, "../escape").await.is_err());
+        assert!(service.create_folder(&info.knowledge_base_id, "_inbox/draft").await.is_err());
+        assert!(service.create_folder(&info.knowledge_base_id, "node_modules/pkg").await.is_err());
+        assert!(service.create_folder(&info.knowledge_base_id, "README.md/child").await.is_err());
     }
 
     #[tokio::test]
@@ -4808,15 +5099,15 @@ mod tests {
             .await
             .unwrap();
 
-        service.delete_folder(&info.id, "docs").await.unwrap();
+        service.delete_folder(&info.knowledge_base_id, "docs").await.unwrap();
         assert!(!vault.join("docs").exists());
         assert!(vault.join("root.md").exists());
 
-        assert!(service.delete_folder(&info.id, "").await.is_err());
-        assert!(service.delete_folder(&info.id, "../escape").await.is_err());
-        assert!(service.delete_folder(&info.id, "root.md").await.is_err());
-        assert!(service.delete_folder(&info.id, "_inbox").await.is_err());
-        assert!(service.delete_folder(&info.id, "node_modules").await.is_err());
+        assert!(service.delete_folder(&info.knowledge_base_id, "").await.is_err());
+        assert!(service.delete_folder(&info.knowledge_base_id, "../escape").await.is_err());
+        assert!(service.delete_folder(&info.knowledge_base_id, "root.md").await.is_err());
+        assert!(service.delete_folder(&info.knowledge_base_id, "_inbox").await.is_err());
+        assert!(service.delete_folder(&info.knowledge_base_id, "node_modules").await.is_err());
     }
 
     #[tokio::test]
@@ -4837,7 +5128,7 @@ mod tests {
             .unwrap();
 
         let file = service
-            .rename_tree_entry(&info.id, "docs/old.md", "new.md")
+            .rename_tree_entry(&info.knowledge_base_id, "docs/old.md", "new.md")
             .await
             .unwrap();
         assert_eq!(file.rel_path, "docs/new.md");
@@ -4846,18 +5137,18 @@ mod tests {
         assert!(!vault.join("docs/old.md").exists());
 
         let folder = service
-            .rename_tree_entry(&info.id, "docs/nested", "renamed")
+            .rename_tree_entry(&info.knowledge_base_id, "docs/nested", "renamed")
             .await
             .unwrap();
         assert_eq!(folder.rel_path, "docs/renamed");
         assert!(folder.is_dir);
         assert!(vault.join("docs/renamed/topic.md").is_file());
 
-        assert!(service.rename_tree_entry(&info.id, "", "root").await.is_err());
-        assert!(service.rename_tree_entry(&info.id, "docs/new.md", "bad.txt").await.is_err());
-        assert!(service.rename_tree_entry(&info.id, "docs/new.md", "../escape.md").await.is_err());
-        assert!(service.rename_tree_entry(&info.id, "docs/new.md", "renamed").await.is_err());
-        assert!(service.rename_tree_entry(&info.id, "taken.md", "existing.md").await.is_err());
+        assert!(service.rename_tree_entry(&info.knowledge_base_id, "", "root").await.is_err());
+        assert!(service.rename_tree_entry(&info.knowledge_base_id, "docs/new.md", "bad.txt").await.is_err());
+        assert!(service.rename_tree_entry(&info.knowledge_base_id, "docs/new.md", "../escape.md").await.is_err());
+        assert!(service.rename_tree_entry(&info.knowledge_base_id, "docs/new.md", "renamed").await.is_err());
+        assert!(service.rename_tree_entry(&info.knowledge_base_id, "taken.md", "existing.md").await.is_err());
     }
 
     /// The per-base walk must be bounded: a walk that finishes within budget
@@ -4891,7 +5182,7 @@ mod tests {
 
         let mut got = service.list_base_ids().await.unwrap();
         got.sort();
-        let mut expected = vec![a.id.into_string(), b.id.into_string()];
+        let mut expected = vec![a.knowledge_base_id.into_string(), b.knowledge_base_id.into_string()];
         expected.sort();
         assert_eq!(got, expected);
     }
@@ -4908,8 +5199,8 @@ mod tests {
         let c = service.create_base("c", "", None, None).await.unwrap();
 
         let infos = service.list_bases().await.unwrap();
-        let ids: Vec<&str> = infos.iter().map(|i| i.id.as_str()).collect();
-        assert_eq!(ids, vec![a.id.as_str(), b.id.as_str(), c.id.as_str()]);
+        let ids: Vec<&str> = infos.iter().map(|i| i.knowledge_base_id.as_str()).collect();
+        assert_eq!(ids, vec![a.knowledge_base_id.as_str(), b.knowledge_base_id.as_str(), c.knowledge_base_id.as_str()]);
     }
 
     #[tokio::test]
@@ -4917,27 +5208,27 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let service = make_service(&dir.path().join("data"));
         let kb = service.create_base("库", "", None, None).await.unwrap();
-        service.write_file(&kb.id, "a.md", "# A").await.unwrap();
+        service.write_file(&kb.knowledge_base_id, "a.md", "# A").await.unwrap();
         let readme_path = PathBuf::from(&kb.root_path).join("README.md");
         std::fs::write(&readme_path, "# 手写 README\n保留我").unwrap();
         service.set_completer(FakeCompleter::new(OVERVIEW_JSON, ""));
 
         // overwrite_readme=false: README untouched, description refreshed.
-        let outcome = service.generate_overview(&kb.id, false, None).await.unwrap();
+        let outcome = service.generate_overview(&kb.knowledge_base_id, false, None).await.unwrap();
         assert!(!outcome.readme_written);
         assert!(outcome.description_updated);
         assert_eq!(std::fs::read_to_string(&readme_path).unwrap(), "# 手写 README\n保留我");
 
         // overwrite_readme=true replaces it.
-        let outcome = service.generate_overview(&kb.id, true, None).await.unwrap();
+        let outcome = service.generate_overview(&kb.knowledge_base_id, true, None).await.unwrap();
         assert!(outcome.readme_written);
         assert!(std::fs::read_to_string(&readme_path).unwrap().starts_with("# 接口库"));
 
         // preserve_existing_description (post-import mode) keeps a non-empty
         // description but can still write a (missing) README.
         std::fs::remove_file(&readme_path).unwrap();
-        service.update_base(&kb.id, None, Some("人工描述"), None).await.unwrap();
-        let outcome = service.generate_overview_opts(&kb.id, false, true, None).await.unwrap();
+        service.update_base(&kb.knowledge_base_id, None, Some("人工描述"), None).await.unwrap();
+        let outcome = service.generate_overview_opts(&kb.knowledge_base_id, false, true, None).await.unwrap();
         assert!(outcome.readme_written);
         assert!(!outcome.description_updated);
         assert_eq!(outcome.base.description, "人工描述");
@@ -4950,22 +5241,22 @@ mod tests {
         let kb = service.create_base("空库", "", None, None).await.unwrap();
 
         // No completer wired → explicit 409.
-        let err = service.generate_overview(&kb.id, false, None).await.unwrap_err();
+        let err = service.generate_overview(&kb.knowledge_base_id, false, None).await.unwrap_err();
         assert!(matches!(err, AppError::Conflict(_)), "{err:?}");
         assert!(err.to_string().contains("no AI completer"), "{err}");
 
         // Completer wired but the base has no documents → 400.
         service.set_completer(FakeCompleter::new(OVERVIEW_JSON, ""));
-        let err = service.generate_overview(&kb.id, false, None).await.unwrap_err();
+        let err = service.generate_overview(&kb.knowledge_base_id, false, None).await.unwrap_err();
         assert!(matches!(err, AppError::BadRequest(_)), "{err:?}");
 
         // Garbage model output (twice) → BadGateway, nothing persisted.
-        service.write_file(&kb.id, "a.md", "# A").await.unwrap();
+        service.write_file(&kb.knowledge_base_id, "a.md", "# A").await.unwrap();
         service.set_completer(FakeCompleter::new("我不会输出 JSON", ""));
-        let err = service.generate_overview(&kb.id, false, None).await.unwrap_err();
+        let err = service.generate_overview(&kb.knowledge_base_id, false, None).await.unwrap_err();
         assert!(matches!(err, AppError::BadGateway(_)), "{err:?}");
         assert!(!PathBuf::from(&kb.root_path).join("README.md").exists());
-        assert_eq!(service.get_base_info(&kb.id).await.unwrap().description, "");
+        assert_eq!(service.get_base_info(&kb.knowledge_base_id).await.unwrap().description, "");
     }
 
     // ── Stateless description endpoints ──────────────────────────────
@@ -5295,10 +5586,10 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .find(|r| r.id.as_str() == kb_id)
+            .find(|r| r.knowledge_base_id == kb_id)
             .cloned()
             .unwrap();
-        source_from_extra(&row.extra)
+        source_from_extra(&row.extra).expect("test fixture extra must be canonical JSON")
     }
 
     #[tokio::test]
@@ -5332,7 +5623,7 @@ mod tests {
         // create-time fetch summary.
         assert!(!PathBuf::from(&kb.root_path).join(source_url::SNAPSHOT_REL_DIR).exists());
         assert!(kb.source_fetch.is_none(), "live create must not report a fetch");
-        let stored = extra_source(&repo, kb.id.as_str()).expect("source stored in extra");
+        let stored = extra_source(&repo, kb.knowledge_base_id.as_str()).expect("source stored in extra");
         assert_eq!(stored.mode, KnowledgeSourceMode::Live);
         assert_eq!(stored.last_fetched_at, None, "client-sent stamp must be discarded");
 
@@ -5343,7 +5634,7 @@ mod tests {
                 TEST_CONVERSATION_ID,
                 KnowledgeBinding {
                     enabled: true,
-                    kb_ids: vec![kb.id.clone()],
+                    kb_ids: vec![kb.knowledge_base_id.clone()],
                     ..Default::default()
                 },
             )
@@ -5382,7 +5673,7 @@ mod tests {
             .create_base("有源库", "", None, Some(url_source(KnowledgeSourceMode::Snapshot, &[&url])))
             .await
             .unwrap();
-        let stamp = extra_source(&repo, kb.id.as_str())
+        let stamp = extra_source(&repo, kb.knowledge_base_id.as_str())
             .unwrap()
             .last_fetched_at
             .expect("snapshot create stamps last_fetched_at");
@@ -5390,7 +5681,7 @@ mod tests {
         // The create response is built from the re-read row → already stamped.
         assert_eq!(kb.source.as_ref().expect("create carries source").last_fetched_at, Some(stamp));
 
-        let got = service.get_base_info(&kb.id).await.unwrap();
+        let got = service.get_base_info(&kb.knowledge_base_id).await.unwrap();
         let src = got.source.as_ref().expect("get carries source");
         assert_eq!(src.mode, KnowledgeSourceMode::Snapshot);
         assert_eq!(src.entries.len(), 1);
@@ -5400,7 +5691,7 @@ mod tests {
         let listed = service.list_bases().await.unwrap();
         let src = listed
             .iter()
-            .find(|b| b.id == kb.id)
+            .find(|b| b.knowledge_base_id == kb.knowledge_base_id)
             .and_then(|b| b.source.as_ref())
             .expect("list carries source");
         assert_eq!(src.mode, KnowledgeSourceMode::Snapshot);
@@ -5422,7 +5713,7 @@ mod tests {
         let (service, _repo) = service_with_repo(&dir.path().join("data"));
         let kb = service.create_base("无源库", "", None, None).await.unwrap();
 
-        let got = service.get_base_info(&kb.id).await.unwrap();
+        let got = service.get_base_info(&kb.knowledge_base_id).await.unwrap();
         assert!(got.source.is_none());
         let v = serde_json::to_value(&got).unwrap();
         assert!(v.get("source").is_none(), "no-source base must not serialize the key: {v}");
@@ -5462,7 +5753,7 @@ mod tests {
         assert!(content.contains("# API"), "got: {content}");
 
         // Source stamped + entry title backfilled from <title>.
-        let stored = extra_source(&repo, kb.id.as_str()).unwrap();
+        let stored = extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap();
         assert!(stored.last_fetched_at.is_some());
         assert_eq!(stored.entries[0].title.as_deref(), Some("接口文档"));
 
@@ -5508,7 +5799,7 @@ mod tests {
         assert!(names.iter().any(|n| n.ends_with("-2.md")), "{names:?}");
         assert!(!PathBuf::from(&kb.root_path).join("README.md").exists(), "no completer → no README");
         assert_eq!(kb.description, "");
-        assert!(extra_source(&repo, kb.id.as_str()).unwrap().last_fetched_at.is_some());
+        assert!(extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap().last_fetched_at.is_some());
     }
 
     #[tokio::test]
@@ -5676,12 +5967,12 @@ mod tests {
             .create_base("刷新库", "", None, Some(url_source(KnowledgeSourceMode::Snapshot, &[&url])))
             .await
             .unwrap();
-        let first_stamp = extra_source(&repo, kb.id.as_str()).unwrap().last_fetched_at.unwrap();
+        let first_stamp = extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap().last_fetched_at.unwrap();
         let snap_dir = PathBuf::from(&kb.root_path).join(source_url::SNAPSHOT_REL_DIR);
         let snap_path = std::fs::read_dir(&snap_dir).unwrap().flatten().next().unwrap().path();
         assert!(std::fs::read_to_string(&snap_path).unwrap().contains("version-one"));
 
-        let summary = service.refresh_source(&kb.id).await.unwrap();
+        let summary = service.refresh_source(&kb.knowledge_base_id).await.unwrap();
         assert_eq!(summary.fetched, 1);
         assert_eq!(summary.failed, 0, "{:?}", summary.errors);
         let stamp = summary.last_fetched_at.expect("successful refresh must stamp");
@@ -5689,11 +5980,11 @@ mod tests {
         // Same slug → overwritten in place, not duplicated.
         assert_eq!(std::fs::read_dir(&snap_dir).unwrap().flatten().count(), 1);
         assert!(std::fs::read_to_string(&snap_path).unwrap().contains("version-two"));
-        assert_eq!(extra_source(&repo, kb.id.as_str()).unwrap().last_fetched_at, Some(stamp));
+        assert_eq!(extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap().last_fetched_at, Some(stamp));
 
         // A base without a source refuses to refresh.
         let plain = service.create_base("无源库", "", None, None).await.unwrap();
-        let err = service.refresh_source(&plain.id).await.unwrap_err();
+        let err = service.refresh_source(&plain.knowledge_base_id).await.unwrap_err();
         assert!(matches!(err, AppError::BadRequest(_)), "{err:?}");
     }
 
@@ -5726,13 +6017,13 @@ mod tests {
             .create_base("失败刷新库", "", None, Some(url_source(KnowledgeSourceMode::Snapshot, &[&url])))
             .await
             .unwrap();
-        let first_stamp = extra_source(&repo, kb.id.as_str()).unwrap().last_fetched_at.expect("create stamped");
+        let first_stamp = extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap().last_fetched_at.expect("create stamped");
 
-        let summary = service.refresh_source(&kb.id).await.unwrap();
+        let summary = service.refresh_source(&kb.knowledge_base_id).await.unwrap();
         assert_eq!((summary.fetched, summary.failed), (0, 1), "{:?}", summary.errors);
         assert_eq!(summary.last_fetched_at, Some(first_stamp), "summary must report the old stamp");
         assert_eq!(
-            extra_source(&repo, kb.id.as_str()).unwrap().last_fetched_at,
+            extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap().last_fetched_at,
             Some(first_stamp),
             "extra.source.lastFetchedAt must keep the old value"
         );
@@ -5874,7 +6165,7 @@ mod tests {
         assert!(v["source_fetch"]["last_fetched_at"].is_i64(), "{v}");
 
         // get/list re-reads never carry it (and None stays off the wire).
-        let info = service.get_base_info(&kb.id).await.unwrap();
+        let info = service.get_base_info(&kb.knowledge_base_id).await.unwrap();
         assert!(info.source_fetch.is_none());
         let v = serde_json::to_value(&info).unwrap();
         assert!(v.get("source_fetch").is_none(), "None must stay off the wire: {v}");
@@ -5919,13 +6210,16 @@ mod tests {
         // change, as the routes/gateway source-update path would do).
         {
             let mut bases = repo.bases.lock().unwrap();
-            let row = bases.iter_mut().find(|r| r.id == kb.id).unwrap();
+            let row = bases
+                .iter_mut()
+                .find(|r| r.knowledge_base_id == kb.knowledge_base_id.as_str())
+                .unwrap();
             let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
             extra["source"]["entries"] = serde_json::json!([{ "url": url_a }]);
             row.extra = extra.to_string();
         }
 
-        let summary = service.refresh_source(&kb.id).await.unwrap();
+        let summary = service.refresh_source(&kb.knowledge_base_id).await.unwrap();
         assert_eq!((summary.fetched, summary.failed), (1, 0), "{:?}", summary.errors);
 
         let names: Vec<String> = std::fs::read_dir(&snap_dir)
@@ -5955,7 +6249,10 @@ mod tests {
             self.0.insert_base(row).await
         }
         async fn update_base(&self, row: &KnowledgeBaseRow) -> Result<(), nomifun_db::DbError> {
-            Err(nomifun_db::DbError::NotFound(format!("simulated persist failure for {}", row.id)))
+            Err(nomifun_db::DbError::NotFound(format!(
+                "simulated persist failure for {}",
+                row.knowledge_base_id
+            )))
         }
         async fn delete_base(&self, id: &str) -> Result<(), nomifun_db::DbError> {
             self.0.delete_base(id).await
@@ -6052,7 +6349,7 @@ mod tests {
             "unpersisted stamp must not be reported as fresh"
         );
         // The registry row agrees: still unstamped.
-        assert_eq!(extra_source(&repo.0, &kb.id).unwrap().last_fetched_at, None);
+        assert_eq!(extra_source(&repo.0, &kb.knowledge_base_id).unwrap().last_fetched_at, None);
     }
 
     /// Boot-resume re-runs the fetch pipeline for snapshot-mode sources whose
@@ -6096,7 +6393,8 @@ mod tests {
                 sync: None,
             };
             repo.bases.lock().unwrap().push(KnowledgeBaseRow {
-                id: KnowledgeBaseId::parse(id).unwrap(),
+                id: 0,
+                knowledge_base_id: id.to_owned(),
                 name: id.into(),
                 description: String::new(),
                 root_path: root.to_string_lossy().into_owned(),
@@ -6228,7 +6526,7 @@ mod tests {
         // yet, description still the (empty) user-supplied one.
         assert!(kb.source_fetch.is_none(), "background create must not report a sync fetch");
         assert_eq!(kb.description, "");
-        let stored = extra_source(&repo, kb.id.as_str()).expect("extra.source persisted before the fetch");
+        let stored = extra_source(&repo, kb.knowledge_base_id.as_str()).expect("extra.source persisted before the fetch");
         assert_eq!(stored.entries[0].url, url);
         assert_eq!(stored.last_fetched_at, None, "stamp belongs to the background fetch");
         let snap_dir = PathBuf::from(&kb.root_path).join(source_url::SNAPSHOT_REL_DIR);
@@ -6238,13 +6536,13 @@ mod tests {
         // description backfilled, completion event emitted.
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            let stored = extra_source(&repo, kb.id.as_str()).unwrap();
+            let stored = extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap();
             let described = repo
                 .bases
                 .lock()
                 .unwrap()
                 .iter()
-                .find(|r| r.id == kb.id)
+                .find(|r| r.knowledge_base_id == kb.knowledge_base_id.as_str())
                 .is_some_and(|r| r.description == "AI 生成的描述");
             let snapshots = std::fs::read_dir(&snap_dir).map(|d| d.flatten().count()).unwrap_or(0);
             let updated_emitted =
@@ -6270,14 +6568,14 @@ mod tests {
         let data_dir = dir.path().join("data");
         let service = make_service(&data_dir);
         let kb = service.create_base("库", "", None, None).await.unwrap();
-        service.write_file(&kb.id, "a.md", "# A").await.unwrap();
+        service.write_file(&kb.knowledge_base_id, "a.md", "# A").await.unwrap();
         service
             .set_binding(
                 "conversation",
                 TEST_CONVERSATION_ID,
                 KnowledgeBinding {
                     enabled: true,
-                    kb_ids: vec![kb.id.clone()],
+                    kb_ids: vec![kb.knowledge_base_id.clone()],
                     ..Default::default()
                 },
             )
@@ -6325,24 +6623,23 @@ mod tests {
     /// target. Returns the kb id.
     async fn bind_new_base(service: &KnowledgeService, name: &str, kind: &str, target: &str) -> String {
         let kb = service.create_base(name, "", None, None).await.unwrap();
-        service.write_file(&kb.id, "a.md", "# A").await.unwrap();
+        service.write_file(&kb.knowledge_base_id, "a.md", "# A").await.unwrap();
         service
             .set_binding(
                 kind,
                 target,
                 KnowledgeBinding {
                     enabled: true,
-                    kb_ids: vec![kb.id.clone()],
+                    kb_ids: vec![kb.knowledge_base_id.clone()],
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
-        kb.id.into_string()
+        kb.knowledge_base_id.into_string()
     }
 
-    /// When a `workpath` row exists it wins over the legacy per-session
-    /// binding — no merge.
+    /// Session mounts use the canonical workpath binding only.
     #[tokio::test]
     async fn session_mounts_prefer_workpath_binding() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -6352,7 +6649,7 @@ mod tests {
         let key = workpath_key(&ws.to_string_lossy());
 
         let kb_workpath = bind_new_base(&service, "路径库", WORKPATH_BINDING_KIND, &key).await;
-        let _kb_legacy = bind_new_base(
+        let _kb_session = bind_new_base(
             &service,
             "会话库",
             "conversation",
@@ -6364,20 +6661,19 @@ mod tests {
             .ensure_mounts_for_session(&key, "conversation", TEST_CONVERSATION_ID, &ws)
             .await;
         assert_eq!(outcome.mounts.len(), 1, "{:?}", outcome.mounts);
-        assert_eq!(outcome.mounts[0].id.to_string(), kb_workpath);
+        assert_eq!(outcome.mounts[0].knowledge_base_id.to_string(), kb_workpath);
     }
 
-    /// No `workpath` row at all → the legacy `(conversation, id)` binding
-    /// keeps mounting (smooth upgrade for pre-workpath local data).
+    /// A per-session binding is never read when the workpath has no row.
     #[tokio::test]
-    async fn session_mounts_fall_back_to_legacy_binding_on_workpath_miss() {
+    async fn session_mounts_do_not_fall_back_to_session_binding() {
         let dir = tempfile::TempDir::new().unwrap();
         let service = make_service(&dir.path().join("data"));
         let ws = dir.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
         let key = workpath_key(&ws.to_string_lossy());
 
-        let kb_legacy = bind_new_base(
+        let _kb_session = bind_new_base(
             &service,
             "会话库",
             "conversation",
@@ -6388,29 +6684,27 @@ mod tests {
         let outcome = service
             .ensure_mounts_for_session(&key, "conversation", TEST_CONVERSATION_ID, &ws)
             .await;
-        assert_eq!(outcome.mounts.len(), 1, "{:?}", outcome.mounts);
-        assert_eq!(outcome.mounts[0].id.to_string(), kb_legacy);
+        assert!(outcome.mounts.is_empty(), "{:?}", outcome.mounts);
 
-        // Terminal sessions take the same path with their own legacy kind.
-        let kb_term = bind_new_base(&service, "终端库", "terminal", TEST_TERMINAL_ID_2).await;
+        // Terminal sessions follow the same workpath-only rule.
+        let _kb_term = bind_new_base(&service, "终端库", "terminal", TEST_TERMINAL_ID_2).await;
         let outcome = service
             .ensure_mounts_for_session(&key, "terminal", TEST_TERMINAL_ID_2, &ws)
             .await;
-        assert_eq!(outcome.mounts.len(), 1, "{:?}", outcome.mounts);
-        assert_eq!(outcome.mounts[0].id.to_string(), kb_term);
+        assert!(outcome.mounts.is_empty(), "{:?}", outcome.mounts);
     }
 
-    /// An existing-but-disabled workpath row is an explicit choice, not a
-    /// miss — it shadows the legacy binding instead of falling back.
+    /// A disabled workpath binding clears mounts regardless of any per-session
+    /// row that may exist.
     #[tokio::test]
-    async fn disabled_workpath_binding_shadows_legacy_binding() {
+    async fn disabled_workpath_binding_ignores_session_binding() {
         let dir = tempfile::TempDir::new().unwrap();
         let service = make_service(&dir.path().join("data"));
         let ws = dir.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
         let key = workpath_key(&ws.to_string_lossy());
 
-        let _kb_legacy = bind_new_base(
+        let _kb_session = bind_new_base(
             &service,
             "会话库",
             "conversation",
@@ -6453,7 +6747,7 @@ mod tests {
             )
             .await;
         assert_eq!(outcome.mounts.len(), 1, "{:?}", outcome.mounts);
-        assert_eq!(outcome.mounts[0].id.to_string(), kb);
+        assert_eq!(outcome.mounts[0].knowledge_base_id.to_string(), kb);
     }
 
     /// Workpath target ids are canonicalized server-side: every spelling of
@@ -6485,7 +6779,7 @@ mod tests {
             )
             .await;
         assert_eq!(outcome.mounts.len(), 1, "{:?}", outcome.mounts);
-        assert_eq!(outcome.mounts[0].id.to_string(), kb);
+        assert_eq!(outcome.mounts[0].knowledge_base_id.to_string(), kb);
 
         // delete_binding canonicalizes as well — the row really goes away.
         service
@@ -6512,15 +6806,15 @@ mod tests {
     async fn search_bases_finds_topic_in_managed_base_ignoring_gitignore() {
         let (svc, _tmp) = search_test_service().await;
         let info = svc.create_base("运维手册", "团队运维约定", None, None).await.unwrap();
-        let root = svc.data_dir().join("knowledge").join(info.id.as_str());
+        let root = svc.data_dir().join("knowledge").join(info.knowledge_base_id.as_str());
         std::fs::write(root.join(".gitignore"), "*\n").unwrap();
         std::fs::create_dir_all(root.join("deploy")).unwrap();
         std::fs::write(root.join("deploy/rollback.md"), "# 回滚流程\n\n生产环境回滚分三步：先停流量……\n").unwrap();
-        let inbox = root.join("_inbox/conv_0190f5fe-7c00-7a00-8000-000000000001");
+        let inbox = root.join("_inbox/0190f5fe-7c00-7a00-8000-000000000011");
         std::fs::create_dir_all(&inbox).unwrap();
         std::fs::write(inbox.join("draft.md"), "# 回滚草稿\n临时笔记\n").unwrap();
 
-        let hits = svc.search_bases(&[info.id.clone()], "回滚", 8).await.unwrap();
+        let hits = svc.search_bases(&[info.knowledge_base_id.clone()], "回滚", 8).await.unwrap();
         assert!(!hits.is_empty(), "must find topic despite .gitignore + hidden mount semantics");
         assert!(hits.iter().any(|h| h.rel_path == "deploy/rollback.md"));
         assert!(hits.iter().all(|h| !h.rel_path.starts_with("_inbox/")), "_inbox excluded");
@@ -6534,10 +6828,10 @@ mod tests {
     async fn search_bases_ranks_filename_and_heading_above_body() {
         let (svc, _tmp) = search_test_service().await;
         let info = svc.create_base("库", "", None, None).await.unwrap();
-        let root = svc.data_dir().join("knowledge").join(info.id.as_str());
+        let root = svc.data_dir().join("knowledge").join(info.knowledge_base_id.as_str());
         std::fs::write(root.join("payments.md"), "# Payments API\n\nrefund flow here\n").unwrap();
         std::fs::write(root.join("misc.md"), "# Misc\n\nthe word payments appears once\n").unwrap();
-        let hits = svc.search_bases(&[info.id.clone()], "payments", 8).await.unwrap();
+        let hits = svc.search_bases(&[info.knowledge_base_id.clone()], "payments", 8).await.unwrap();
         assert_eq!(hits[0].rel_path, "payments.md", "filename/heading match ranks first");
     }
 
@@ -6585,7 +6879,7 @@ mod tests {
                 &key,
                 KnowledgeBinding {
                     enabled: true,
-                    kb_ids: vec![kb1.id.clone()],
+                    kb_ids: vec![kb1.knowledge_base_id.clone()],
                     ..Default::default()
                 },
             )
@@ -6594,17 +6888,17 @@ mod tests {
 
         // cwd matching the bound workpath → only the bound base.
         let ids = service.resolve_kb_ids_for_cwd(ws).await;
-        assert_eq!(ids, vec![kb1.id.clone()]);
+        assert_eq!(ids, vec![kb1.knowledge_base_id.clone()]);
 
         // Trailing slash normalizes to the same key.
         let ids = service.resolve_kb_ids_for_cwd(&format!("{ws}/")).await;
-        assert_eq!(ids, vec![kb1.id.clone()]);
+        assert_eq!(ids, vec![kb1.knowledge_base_id.clone()]);
 
         // Unknown cwd → all bases.
         let ids = service.resolve_kb_ids_for_cwd("/unknown/path").await;
         assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&kb1.id));
-        assert!(ids.contains(&kb2.id));
+        assert!(ids.contains(&kb1.knowledge_base_id));
+        assert!(ids.contains(&kb2.knowledge_base_id));
 
         // Empty cwd → all bases.
         let ids = service.resolve_kb_ids_for_cwd("").await;
@@ -6629,7 +6923,7 @@ mod tests {
                 &key,
                 KnowledgeBinding {
                     enabled: false,
-                    kb_ids: vec![kb1.id.clone()],
+                    kb_ids: vec![kb1.knowledge_base_id.clone()],
                     ..Default::default()
                 },
             )
@@ -6639,8 +6933,8 @@ mod tests {
         let ids = service.resolve_kb_ids_for_cwd(ws).await;
         // Must return ALL mounted bases (kb1 + kb2), not just the binding's [kb1].
         assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&kb1.id));
-        assert!(ids.contains(&kb2.id));
+        assert!(ids.contains(&kb1.knowledge_base_id));
+        assert!(ids.contains(&kb2.knowledge_base_id));
     }
 
     #[tokio::test]
@@ -6656,7 +6950,7 @@ mod tests {
         let ids = service
             .resolve_kb_ids_for_cwd(&managed_cwd.to_string_lossy())
             .await;
-        assert_eq!(ids, vec![kb1.id]);
+        assert_eq!(ids, vec![kb1.knowledge_base_id]);
     }
 
     // ── document handle codec (P1 unified write stack) ────────────────
@@ -6695,8 +6989,8 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let service = crate::testutil::make_service(&dir.path().join("data"));
         let kb = service.create_base("库", "", None, None).await.unwrap();
-        service.write_file(&kb.id, rel, content).await.unwrap();
-        (service, kb.id, dir)
+        service.write_file(&kb.knowledge_base_id, rel, content).await.unwrap();
+        (service, kb.knowledge_base_id, dir)
     }
 
     #[test]
@@ -6837,14 +7131,14 @@ mod tests {
         let out = svc.write_document(req).await.unwrap();
         assert_eq!(
             out.final_rel_path,
-            "_inbox/conv_0190f5fe-7c00-7a00-8000-000000000001/terms.md"
+            "_inbox/0190f5fe-7c00-7a00-8000-000000000011/terms.md"
         );
         assert!(out.staged && out.op == WriteOp::Update);
         assert_eq!(svc.read_file(&kb_id, "terms.md").await.unwrap().content, "ORIGINAL");
         assert_eq!(
             svc.read_file(
                 &kb_id,
-                "_inbox/conv_0190f5fe-7c00-7a00-8000-000000000001/terms.md",
+                "_inbox/0190f5fe-7c00-7a00-8000-000000000011/terms.md",
             )
             .await
             .unwrap()
@@ -6896,7 +7190,7 @@ mod tests {
         let out = svc.write_document(req).await.unwrap();
         assert_eq!(
             out.final_rel_path,
-            "_inbox/conv_0190f5fe-7c00-7a00-8000-000000000009/terms.md",
+            "_inbox/0190f5fe-7c00-7a00-8000-000000000019/terms.md",
             "mirror original, not nest under .nomi/..."
         );
         assert_eq!(out.op, WriteOp::Update);
@@ -6917,7 +7211,7 @@ mod tests {
         let report = svc
             .finalize_turn_writeback(TurnWritebackRequest {
                 mounts: vec![KnowledgeMountInfo {
-                    id: KnowledgeBaseId::parse(kb_id.clone()).unwrap(),
+                    knowledge_base_id: KnowledgeBaseId::parse(kb_id.clone()).unwrap(),
                     name: "领域库".into(),
                     description: "项目复用知识".into(),
                     rel_path: ".nomi/knowledge/领域库".into(),
@@ -6944,13 +7238,13 @@ mod tests {
         assert_eq!(report.written.len(), 1);
         assert_eq!(
             report.written[0].final_rel_path,
-            "_inbox/conv_0190f5fe-7c00-7a00-8000-000000000001/patterns/finalizer.md"
+            "_inbox/0190f5fe-7c00-7a00-8000-000000000011/patterns/finalizer.md"
         );
         assert_eq!(svc.read_file(&kb_id, "terms.md").await.unwrap().content, "ORIGINAL");
         assert!(
             svc.read_file(
                 &kb_id,
-                "_inbox/conv_0190f5fe-7c00-7a00-8000-000000000001/patterns/finalizer.md",
+                "_inbox/0190f5fe-7c00-7a00-8000-000000000011/patterns/finalizer.md",
             )
                 .await
                 .unwrap()
@@ -6973,7 +7267,7 @@ mod tests {
         let report = svc
             .finalize_turn_writeback(TurnWritebackRequest {
                 mounts: vec![KnowledgeMountInfo {
-                    id: KnowledgeBaseId::parse(kb_id.clone()).unwrap(),
+                    knowledge_base_id: KnowledgeBaseId::parse(kb_id.clone()).unwrap(),
                     name: "领域库".into(),
                     description: String::new(),
                     rel_path: ".nomi/knowledge/领域库".into(),
@@ -7015,7 +7309,7 @@ mod tests {
         let report = svc
             .finalize_turn_writeback(TurnWritebackRequest {
                 mounts: vec![KnowledgeMountInfo {
-                    id: KnowledgeBaseId::parse(kb_id.clone()).unwrap(),
+                    knowledge_base_id: KnowledgeBaseId::parse(kb_id.clone()).unwrap(),
                     name: "领域库".into(),
                     description: String::new(),
                     rel_path: ".nomi/knowledge/领域库".into(),
@@ -7059,7 +7353,7 @@ mod tests {
         let report = svc
             .finalize_turn_writeback(TurnWritebackRequest {
                 mounts: vec![KnowledgeMountInfo {
-                    id: KnowledgeBaseId::parse(kb_id.clone()).unwrap(),
+                    knowledge_base_id: KnowledgeBaseId::parse(kb_id.clone()).unwrap(),
                     name: "领域库".into(),
                     description: String::new(),
                     rel_path: ".nomi/knowledge/领域库".into(),
@@ -7097,7 +7391,7 @@ mod tests {
 
         let request = |user_text: &str| TurnWritebackRequest {
             mounts: vec![KnowledgeMountInfo {
-                id: KnowledgeBaseId::parse(kb_id.clone()).unwrap(),
+                knowledge_base_id: KnowledgeBaseId::parse(kb_id.clone()).unwrap(),
                 name: "领域库".into(),
                 description: String::new(),
                 rel_path: ".nomi/knowledge/领域库".into(),
@@ -7142,7 +7436,7 @@ mod tests {
         let (svc, kb_id, _dir) = test_service_with_file("terms.md", "ORIGINAL").await;
         svc.write_file(
             &kb_id,
-            "_inbox/conv_0190f5fe-7c00-7a00-8000-000000000001/patterns/note.md",
+            "_inbox/0190f5fe-7c00-7a00-8000-000000000011/patterns/note.md",
             "FIRST",
         )
             .await
@@ -7155,7 +7449,7 @@ mod tests {
         let report = svc
             .finalize_turn_writeback(TurnWritebackRequest {
                 mounts: vec![KnowledgeMountInfo {
-                    id: KnowledgeBaseId::parse(kb_id.clone()).unwrap(),
+                    knowledge_base_id: KnowledgeBaseId::parse(kb_id.clone()).unwrap(),
                     name: "领域库".into(),
                     description: String::new(),
                     rel_path: ".nomi/knowledge/领域库".into(),
@@ -7181,7 +7475,7 @@ mod tests {
         assert_eq!(
             svc.read_file(
                 &kb_id,
-                "_inbox/conv_0190f5fe-7c00-7a00-8000-000000000001/patterns/note.md",
+                "_inbox/0190f5fe-7c00-7a00-8000-000000000011/patterns/note.md",
             )
                 .await
                 .unwrap()
@@ -7190,7 +7484,7 @@ mod tests {
         );
         assert_ne!(
             report.written[0].final_rel_path,
-            "_inbox/conv_0190f5fe-7c00-7a00-8000-000000000001/patterns/note.md"
+            "_inbox/0190f5fe-7c00-7a00-8000-000000000011/patterns/note.md"
         );
         assert!(
             svc.read_file(&kb_id, &report.written[0].final_rel_path)
@@ -7215,7 +7509,7 @@ mod tests {
         let (svc, kb_id, _dir) = test_service_with_file("terms.md", "ORIGINAL").await;
         svc.write_file(
             &kb_id,
-            "_inbox/conv_0190f5fe-7c00-7a00-8000-000000000001/patterns/note.md",
+            "_inbox/0190f5fe-7c00-7a00-8000-000000000011/patterns/note.md",
             "# Durable\n\nAlready staged by knowledge_write.",
         )
         .await
@@ -7228,7 +7522,7 @@ mod tests {
         let report = svc
             .finalize_turn_writeback(TurnWritebackRequest {
                 mounts: vec![KnowledgeMountInfo {
-                    id: KnowledgeBaseId::parse(kb_id.clone()).unwrap(),
+                    knowledge_base_id: KnowledgeBaseId::parse(kb_id.clone()).unwrap(),
                     name: "领域库".into(),
                     description: String::new(),
                     rel_path: ".nomi/knowledge/领域库".into(),
@@ -7244,7 +7538,7 @@ mod tests {
                     ..Default::default()
                 },
                 surface: WriteSurface::RegularChat,
-                scope: "conv_0190f5fe-7c00-7a00-8000-000000000001/msg_0190f5fe-7c00-7a00-8000-000000000001".into(),
+                scope: "0190f5fe-7c00-7a00-8000-000000000011/0190f5fe-7c00-7a00-8000-000000000041".into(),
                 user_text: "u".into(),
                 assistant_text: "a".into(),
             })
@@ -7255,7 +7549,7 @@ mod tests {
         assert!(
             svc.read_file(
                 &kb_id,
-                "_inbox/conv_0190f5fe-7c00-7a00-8000-000000000001/msg_0190f5fe-7c00-7a00-8000-000000000001/patterns/note.md",
+                "_inbox/0190f5fe-7c00-7a00-8000-000000000011/0190f5fe-7c00-7a00-8000-000000000041/patterns/note.md",
             )
                 .await
                 .is_err(),
@@ -7271,46 +7565,6 @@ mod tests {
     #[tokio::test]
     async fn connector_sync_writes_snapshots_persists_cursor_and_trashes_deletions() {
         use crate::connector::FetchedConnectorDoc;
-        use nomifun_db::DbError;
-        use nomifun_db::models::ConnectorCredentialRow;
-        use std::sync::Mutex as StdMutex;
-
-        #[derive(Default)]
-        struct MemCredRepo {
-            rows: StdMutex<Vec<ConnectorCredentialRow>>,
-        }
-        #[async_trait::async_trait]
-        impl IConnectorCredentialRepository for MemCredRepo {
-            async fn list(&self) -> Result<Vec<ConnectorCredentialRow>, DbError> {
-                Ok(self.rows.lock().unwrap().clone())
-            }
-            async fn get(&self, id: &ConnectorCredentialId) -> Result<Option<ConnectorCredentialRow>, DbError> {
-                Ok(self.rows.lock().unwrap().iter().find(|r| &r.id == id).cloned())
-            }
-            async fn create(
-                &self,
-                kind: &str,
-                name: &str,
-                payload_encrypted: &str,
-            ) -> Result<ConnectorCredentialRow, DbError> {
-                let mut rows = self.rows.lock().unwrap();
-                let row = ConnectorCredentialRow {
-                    id: ConnectorCredentialId::new(),
-                    kind: kind.to_owned(),
-                    name: name.to_owned(),
-                    payload_encrypted: payload_encrypted.to_owned(),
-                    created_at: 1,
-                    updated_at: 1,
-                };
-                rows.push(row.clone());
-                Ok(row)
-            }
-            async fn delete(&self, id: &ConnectorCredentialId) -> Result<(), DbError> {
-                self.rows.lock().unwrap().retain(|r| &r.id != id);
-                Ok(())
-            }
-        }
-
         struct MockConn {
             docs: StdMutex<Vec<RemoteDocRef>>,
             deleted: StdMutex<Vec<String>>,
@@ -7366,7 +7620,7 @@ mod tests {
             deleted: StdMutex::new(vec![]),
         });
         service.register_connector(conn.clone());
-        service.set_connector_credentials(Arc::new(MemCredRepo::default()), [7u8; 32]);
+        service.set_connector_credentials(Arc::new(TestCredentialRepo::default()), [7u8; 32]);
 
         // A bad payload is rejected and never stored.
         assert!(service.create_credential("mock", "bad", serde_json::json!({})).await.is_err());
@@ -7385,7 +7639,7 @@ mod tests {
             mode: KnowledgeSourceMode::Snapshot,
             entries: vec![],
             last_fetched_at: None,
-            credential_ref: Some(cred.id.clone()),
+            credential_ref: Some(cred.credential_id),
             scope: Some(serde_json::json!({ "space_id": "s1" })),
             sync: None,
         };
@@ -7393,7 +7647,7 @@ mod tests {
         let snap_dir = PathBuf::from(&kb.root_path).join(source_url::SNAPSHOT_REL_DIR);
 
         // First sync: 2 docs → 2 snapshots.
-        let summary = service.sync_connector_source(&kb.id).await.unwrap();
+        let summary = service.sync_connector_source(&kb.knowledge_base_id).await.unwrap();
         assert_eq!(summary.fetched, 2);
         assert_eq!(summary.failed, 0);
         let a = snap_dir.join("docaaa.md");
@@ -7405,7 +7659,7 @@ mod tests {
         assert!(a_body.contains("https://mock/DOCAAA"), "frontmatter carries web source_url");
 
         // Cursor + stamp persisted; no error.
-        let stored = extra_source(&repo, kb.id.as_str()).unwrap();
+        let stored = extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap();
         let sync = stored.sync.expect("sync state persisted");
         assert_eq!(sync.last_error, None);
         assert!(sync.last_sync_at.is_some());
@@ -7418,7 +7672,7 @@ mod tests {
         *conn.docs.lock().unwrap() =
             vec![RemoteDocRef { remote_id: "DOCAAA".into(), title: "Alpha".into(), edit_time: 10, doc_type: "docx".into() }];
         *conn.deleted.lock().unwrap() = vec!["DOCBBB".into()];
-        let summary2 = service.sync_connector_source(&kb.id).await.unwrap();
+        let summary2 = service.sync_connector_source(&kb.knowledge_base_id).await.unwrap();
         assert_eq!(summary2.fetched, 1);
         assert!(!b.exists(), "deleted doc removed from live snapshots");
         assert!(snap_dir.join("_trash").join("docbbb.md").exists(), "deleted doc moved to _trash");
@@ -7637,7 +7891,7 @@ mod tests {
         svc.set_binding(
             "terminal",
             TEST_TERMINAL_ID_9,
-            KnowledgeBinding { enabled: true, kb_ids: vec![other.id.clone()], ..Default::default() },
+            KnowledgeBinding { enabled: true, kb_ids: vec![other.knowledge_base_id.clone()], ..Default::default() },
         )
         .await
         .unwrap();
@@ -7698,13 +7952,13 @@ mod tests {
         svc.create_tag("研发", None).await.unwrap();
         let key = svc.list_tags().await.unwrap()[0].key.clone();
         let base = svc.create_base("库A", "", None, None).await.unwrap();
-        svc.update_base(&base.id, None, None, Some(vec![key.clone()])).await.unwrap();
+        svc.update_base(&base.knowledge_base_id, None, None, Some(vec![key.clone()])).await.unwrap();
         // Verify the tag was written.
-        let before = svc.list_bases().await.unwrap().into_iter().find(|b| b.id == base.id).unwrap();
+        let before = svc.list_bases().await.unwrap().into_iter().find(|b| b.knowledge_base_id == base.knowledge_base_id).unwrap();
         assert_eq!(before.tags, vec![key.clone()]);
         // Delete the tag — must strip from the base.
         svc.delete_tag(&key).await.unwrap();
-        let after = svc.list_bases().await.unwrap().into_iter().find(|b| b.id == base.id).unwrap();
+        let after = svc.list_bases().await.unwrap().into_iter().find(|b| b.knowledge_base_id == base.knowledge_base_id).unwrap();
         assert!(after.tags.is_empty(), "删除标签须从库上剔除");
     }
 
@@ -7752,7 +8006,13 @@ mod tests {
     async fn create_base_with_feishu_source_persists_kind_and_credential() {
         let dir = tempfile::TempDir::new().unwrap();
         let (service, repo) = service_with_repo(&dir.path().join("data"));
-        let credential_id = ConnectorCredentialId::new();
+        let credential_repo = Arc::new(TestCredentialRepo::default());
+        let credential_id = credential_repo
+            .create("feishu", "test", "ENC(payload)")
+            .await
+            .unwrap()
+            .credential_id;
+        service.set_connector_credentials(credential_repo, [7u8; 32]);
         let source = KnowledgeSource {
             kind: "feishu".into(),
             mode: KnowledgeSourceMode::Snapshot,
@@ -7765,7 +8025,7 @@ mod tests {
         let info = service.create_base("飞书库", "", None, Some(source)).await.unwrap();
         assert_eq!(info.kind, "feishu", "kind must derive to feishu");
         // Verify credential_ref persisted in extra.source
-        let stored = extra_source(&repo, info.id.as_str()).expect("source stored in extra");
+        let stored = extra_source(&repo, info.knowledge_base_id.as_str()).expect("source stored in extra");
         assert_eq!(stored.credential_ref, Some(credential_id));
         assert_eq!(stored.scope.unwrap()["space_id"], "sp1");
         assert_eq!(stored.kind, "feishu");
@@ -7822,10 +8082,10 @@ mod tests {
         // Create a base, then immediately assign tags (mimicking the route handler
         // pattern: create → update_base with tags).
         let info = svc.create_base("带标签库", "", None, None).await.unwrap();
-        let info = svc.update_base(&info.id, None, None, Some(vec![key.clone()])).await.unwrap();
+        let info = svc.update_base(&info.knowledge_base_id, None, None, Some(vec![key.clone()])).await.unwrap();
         assert_eq!(info.tags, vec![key.clone()], "tags must be persisted at create-time");
         // Verify via a fresh load
-        let reloaded = svc.get_base_info(&info.id).await.unwrap();
+        let reloaded = svc.get_base_info(&info.knowledge_base_id).await.unwrap();
         assert_eq!(reloaded.tags, vec![key]);
     }
 }

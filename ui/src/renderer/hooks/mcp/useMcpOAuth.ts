@@ -39,9 +39,9 @@ export const useMcpOAuth = () => {
 
       setOAuthStatus((prev) => ({
         ...prev,
-        [server.id]: {
-          isAuthenticated: prev[server.id]?.isAuthenticated ?? false,
-          needsLogin: prev[server.id]?.needsLogin ?? false,
+        [server.mcp_server_id]: {
+          isAuthenticated: prev[server.mcp_server_id]?.isAuthenticated ?? false,
+          needsLogin: prev[server.mcp_server_id]?.needsLogin ?? false,
           isChecking: true,
         },
       }));
@@ -52,9 +52,9 @@ export const useMcpOAuth = () => {
 
         setOAuthStatus((prev) => ({
           ...prev,
-          [server.id]: {
+          [server.mcp_server_id]: {
             isAuthenticated,
-            needsLogin: isAuthenticated ? false : (prev[server.id]?.needsLogin ?? false),
+            needsLogin: isAuthenticated ? false : (prev[server.mcp_server_id]?.needsLogin ?? false),
             isChecking: false,
           },
         }));
@@ -62,7 +62,7 @@ export const useMcpOAuth = () => {
         console.error('Failed to check OAuth status:', error);
         setOAuthStatus((prev) => ({
           ...prev,
-          [server.id]: {
+          [server.mcp_server_id]: {
             isAuthenticated: false,
             needsLogin: false,
             isChecking: false,
@@ -85,7 +85,7 @@ export const useMcpOAuth = () => {
         };
       }
 
-      setLoggingIn((prev) => ({ ...prev, [server.id]: true }));
+      setLoggingIn((prev) => ({ ...prev, [server.mcp_server_id]: true }));
 
       try {
         const result = await mcpService.loginMcpOAuth.invoke({ server_url: serverUrl });
@@ -94,7 +94,7 @@ export const useMcpOAuth = () => {
           // 登录成功，更新状态
           setOAuthStatus((prev) => ({
             ...prev,
-            [server.id]: {
+            [server.mcp_server_id]: {
               isAuthenticated: true,
               needsLogin: false,
               isChecking: false,
@@ -113,7 +113,7 @@ export const useMcpOAuth = () => {
           error: error instanceof Error ? error.message : 'Unknown error',
         };
       } finally {
-        setLoggingIn((prev) => ({ ...prev, [server.id]: false }));
+        setLoggingIn((prev) => ({ ...prev, [server.mcp_server_id]: false }));
       }
     },
     [getOAuthServerUrl]
@@ -136,7 +136,7 @@ export const useMcpOAuth = () => {
         // 登出成功，更新状态
         setOAuthStatus((prev) => ({
           ...prev,
-          [server.id]: {
+          [server.mcp_server_id]: {
             isAuthenticated: false,
             needsLogin: false,
             isChecking: false,

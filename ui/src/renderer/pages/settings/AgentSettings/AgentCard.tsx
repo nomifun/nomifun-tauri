@@ -10,13 +10,14 @@ import { Delete, EditTwo, Robot } from '@icon-park/react';
 import { useTranslation } from 'react-i18next';
 import { resolveAgentLogo } from '@/renderer/utils/model/agentLogo';
 import { resolveExtensionAssetUrl } from '@/renderer/utils/platform';
+import type { AgentId } from '@/common/types/ids';
 
 type DetectedAgent = {
   agent_type: string;
   backend?: string;
+  agent_id?: string;
   icon?: string;
   name: string;
-  custom_agent_id?: string;
   isExtension?: boolean;
   avatar?: string;
 };
@@ -32,7 +33,7 @@ type InstallableAgentCardData = {
 
 /** Minimal custom-agent fields consumed by the 'custom' card variant. */
 type CustomAgentCardData = {
-  id: string;
+  agent_id: AgentId;
   name: string;
   /** User-picked emoji or avatar URL (maps to `AgentMetadata.icon`). */
   icon?: string;
@@ -77,7 +78,7 @@ const AgentCard: React.FC<AgentCardProps> = (props) => {
       resolveAgentLogo({
         icon: agent.icon,
         backend: agent.backend || agent.agent_type,
-        custom_agent_id: agent.custom_agent_id,
+        agentId: agent.agent_id,
         isExtension: agent.isExtension,
       });
 

@@ -87,7 +87,7 @@ pub(super) async fn build(
     };
     let config = RemoteAgentConfig {
         // The runtime keeps the canonical entity ID as its stable identity.
-        remote_agent_id: row.id.clone(),
+        remote_agent_id: extra.remote_agent_id.clone(),
         protocol: serde_json::from_value(serde_json::Value::String(row.protocol.clone()))
             .unwrap_or(RemoteAgentProtocol::Acp),
         url: row.url.clone(),
@@ -104,7 +104,7 @@ pub(super) async fn build(
     if let Some(device_token) = issued_device_token {
         let encrypted = nomifun_common::encrypt_string(&device_token, &deps.encryption_key)?;
         deps.remote_agent_repo
-            .update_device_token(&row.id, Some(&encrypted))
+            .update_device_token(&extra.remote_agent_id, Some(&encrypted))
             .await
             .map_err(|e| AppError::Internal(format!("Failed to persist remote device token: {e}")))?;
     }

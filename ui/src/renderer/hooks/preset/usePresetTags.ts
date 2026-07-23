@@ -2,7 +2,6 @@ import { ipcBridge } from '@/common';
 import type {
   PresetTag,
   PresetTagDimension,
-  PresetTagReference,
   CreatePresetTagRequest,
 } from '@/common/types/agent/presetTypes';
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -37,7 +36,9 @@ export const usePresetTags = () => {
     [tags]
   );
 
-  /** key → PresetTag, for resolving labels on cards. */
+  /** UUIDv7 business ID → PresetTag, for preset wire references. */
+  const tagById = useMemo(() => new Map(tags.map((t) => [t.preset_tag_id, t])), [tags]);
+  /** Readable catalog key → PresetTag, retained for skill-tag side stores. */
   const tagByKey = useMemo(() => new Map(tags.map((t) => [t.key, t])), [tags]);
 
   const createTag = useCallback(
@@ -50,22 +51,33 @@ export const usePresetTags = () => {
   );
 
   const renameTag = useCallback(
-    async (key: PresetTagReference, label: string) => {
-      await ipcBridge.presetTags.update.invoke({ key, label });
+    async (preset_tag_id: PresetTag['preset_tag_id'], label: string) => {
+      await ipcBridge.presetTags.update.invoke({ preset_tag_id, label });
       await loadTags();
     },
     [loadTags]
   );
 
   const deleteTag = useCallback(
-    async (key: PresetTagReference) => {
-      await ipcBridge.presetTags.delete.invoke({ key });
+    async (preset_tag_id: PresetTag['preset_tag_id']) => {
+      await ipcBridge.presetTags.delete.invoke({ preset_tag_id });
       await loadTags();
     },
     [loadTags]
   );
 
-  return { tags, audienceTags, scenarioTags, tagByKey, loading, loadTags, createTag, renameTag, deleteTag };
+  return {
+    tags,
+    audienceTags,
+    scenarioTags,
+    tagById,
+    tagByKey,
+    loading,
+    loadTags,
+    createTag,
+    renameTag,
+    deleteTag,
+  };
 };
 
 export type TagDimension = PresetTagDimension;

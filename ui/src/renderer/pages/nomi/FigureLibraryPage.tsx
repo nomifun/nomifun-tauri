@@ -63,7 +63,7 @@ const FigureTile: React.FC<{
 
         <div className='figure-library-card-preview h-190px flex shrink-0 items-center justify-center overflow-hidden' style={CHECKER_BG}>
           <img
-            src={figureImageUrlOf(baseUrl, fig.id, fig.created_at)}
+            src={figureImageUrlOf(baseUrl, fig.figure_id, fig.created_at)}
             alt={fig.name}
             draggable={false}
             className='max-h-[88%] max-w-[88%] object-contain drop-shadow-[0_6px_14px_rgba(0,0,0,0.18)]'
@@ -101,7 +101,7 @@ const FigureLibraryPage: React.FC = () => {
       okButtonProps: { status: 'danger' },
       onOk: async () => {
         try {
-          await remove(fig.id);
+          await remove(fig.figure_id);
         } catch (e) {
           // The backend refuses an in-use figure (409 Conflict) — covers the
           // rare case the roster was momentarily stale when the tile rendered.
@@ -150,7 +150,14 @@ const FigureLibraryPage: React.FC = () => {
       ) : (
         <div className='grid justify-start gap-14px' style={{ gridTemplateColumns: 'repeat(auto-fill, 184px)' }}>
           {figures.map((fig) => (
-            <FigureTile key={fig.id} fig={fig} baseUrl={base} inUse={inUse.has(fig.id)} onUpdate={update} onDelete={confirmDelete} />
+            <FigureTile
+              key={fig.figure_id}
+              fig={fig}
+              baseUrl={base}
+              inUse={inUse.has(fig.figure_id)}
+              onUpdate={update}
+              onDelete={confirmDelete}
+            />
           ))}
           {/* trailing create tile keeps creation in-reach next to the assets */}
           <button

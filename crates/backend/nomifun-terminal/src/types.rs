@@ -88,7 +88,7 @@ pub fn row_to_response(
     let is_default_workpath =
         !row.cwd.is_empty() && !work_dir.as_os_str().is_empty() && Path::new(&row.cwd).starts_with(work_dir);
     TerminalSessionResponse {
-        id: row.id.clone(),
+        terminal_id: row.terminal_id.clone(),
         name: row.name.clone(),
         cwd: row.cwd.clone(),
         is_default_workpath,
@@ -114,7 +114,8 @@ mod tests {
 
     fn sample_row() -> TerminalSessionRow {
         TerminalSessionRow {
-            id: nomifun_common::TerminalId::new(),
+            id: 1,
+            terminal_id: nomifun_common::TerminalId::new(),
             name: "shell".into(),
             cwd: "/tmp".into(),
             command: "$SHELL".into(),
@@ -221,7 +222,7 @@ mod tests {
     #[test]
     fn row_to_response_parses_args_and_maps_fields() {
         let resp = row_to_response(&sample_row(), Some("c2I=".into()), Path::new("/work"));
-        assert!(resp.id.starts_with("term_"));
+        assert!(nomifun_common::validate_uuidv7(resp.terminal_id.as_str()).is_ok());
         assert_eq!(resp.args, vec!["-l".to_owned()]);
         assert_eq!((resp.cols, resp.rows), (100, 30));
         assert_eq!(resp.scrollback_b64.as_deref(), Some("c2I="));

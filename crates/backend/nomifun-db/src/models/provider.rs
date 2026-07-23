@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 /// as TEXT in SQLite and deserialized by the service layer.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Provider {
-    pub id: String,
+    pub id: i64,
+    pub provider_id: String,
     pub platform: String,
     pub name: String,
     pub base_url: String,
@@ -18,7 +19,6 @@ pub struct Provider {
     pub enabled: bool,
     /// JSON array of capability objects.
     pub capabilities: String,
-    pub context_limit: Option<i64>,
     /// JSON object: model_id -> context window token count.
     pub model_context_limits: Option<String>,
     /// JSON object: model_id -> protocol string.

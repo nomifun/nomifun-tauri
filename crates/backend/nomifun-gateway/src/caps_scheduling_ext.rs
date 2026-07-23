@@ -9,38 +9,55 @@
 
 use std::sync::Arc;
 
+use nomifun_api_types::IdmmTargetKind;
+use nomifun_common::{CronJobId, ProviderId, RequirementId};
 use nomifun_cron::types::cron_job_to_response;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::caps_idmm::{
+    parse_target_id as parse_idmm_target_id, verify_target as verify_idmm_target,
+};
 use crate::deps::{CallerCtx, GatewayDeps};
-use crate::caps_idmm::{parse_kind as parse_idmm_kind, verify_target as verify_idmm_target};
+use crate::id_schema::{CanonicalEntityId, SessionTargetKind};
 use crate::registry::{Capability, CapabilityMeta, DangerTier, Surface};
 use crate::server::ok;
 
 // CRON DOMAIN (extensions)
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CronGetJobParams {
     /// The id of the cron job to retrieve (from nomi_cron_list).
-    job_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    cron_job_id: CronJobId,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CronRunNowParams {
     /// The id of the cron job to trigger immediately.
-    job_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    cron_job_id: CronJobId,
 }
 
 async fn cron_get_job(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: CronGetJobParams) -> Value {
-    match deps.cron_service.get_job(ctx.user_id.as_str(), &p.job_id).await {
+    match deps
+        .cron_service
+        .get_job(ctx.user_id.as_str(), p.cron_job_id.as_str())
+        .await
+    {
         Ok(job) => ok(cron_job_to_response(&job)),
         Err(e) => json!({"error": e.to_string()}),
     }
 }
 
 async fn cron_run_now(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: CronRunNowParams) -> Value {
-    match deps.cron_service.run_now(ctx.user_id.as_str(), &p.job_id).await {
+    match deps
+        .cron_service
+        .run_now(ctx.user_id.as_str(), p.cron_job_id.as_str())
+        .await
+    {
         Ok(resp) => ok(json!({
             "triggered": true,
             "conversation_id": resp.conversation_id,
@@ -51,12 +68,15 @@ async fn cron_run_now(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: CronRunNowParam
 
 // REQUIREMENT DOMAIN (extensions)
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RequirementGetParams {
-    /// The id of the requirement to fetch.
-    id: String,
+    /// Stable business id of the requirement to fetch.
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    requirement_id: RequirementId,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RequirementListTagsParams {
     // Intentionally empty — tags() takes no arguments.
     // A unit struct would also work, but an empty object is friendlier to
@@ -64,12 +84,14 @@ struct RequirementListTagsParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RequirementGetBoardParams {
     /// The tag whose kanban board to retrieve.
     tag: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RequirementResumeTagParams {
     /// The tag to resume (un-pause).
     tag: String,
@@ -78,11 +100,16 @@ struct RequirementResumeTagParams {
     requeue_failed: bool,
     /// Re-queue these specific failed requirement ids back to pending.
     #[serde(default)]
-    requeue_ids: Vec<String>,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_array_schema")]
+    requeue_ids: Vec<RequirementId>,
 }
 
 async fn requirement_get(deps: Arc<GatewayDeps>, p: RequirementGetParams) -> Value {
-    match deps.requirement_service.get(&p.id).await {
+    match deps
+        .requirement_service
+        .get(p.requirement_id.as_str())
+        .await
+    {
         Ok(req) => ok(req),
         Err(e) => json!({"error": e.to_string()}),
     }
@@ -105,11 +132,15 @@ async fn requirement_get_board(deps: Arc<GatewayDeps>, p: RequirementGetBoardPar
 async fn requirement_resume_tag(deps: Arc<GatewayDeps>, p: RequirementResumeTagParams) -> Value {
     // Mirror the REST route: if `requeue_failed`, collect all failed ids from
     // the board and merge with explicit ids.
-    let mut requeue_ids = p.requeue_ids;
+    let mut requeue_ids = p
+        .requeue_ids
+        .into_iter()
+        .map(RequirementId::into_string)
+        .collect::<Vec<_>>();
     if p.requeue_failed {
         match deps.requirement_service.board(&p.tag).await {
             Ok(board) => {
-                requeue_ids.extend(board.failed.into_iter().map(|r| r.id));
+                requeue_ids.extend(board.failed.into_iter().map(|r| r.requirement_id));
             }
             Err(e) => return json!({"error": e.to_string()}),
         }
@@ -133,17 +164,19 @@ async fn requirement_resume_tag(deps: Arc<GatewayDeps>, p: RequirementResumeTagP
 
 // IDMM DOMAIN (extensions)
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct IdmmGetLogParams {
     /// Target kind: "conversation" or "terminal".
-    kind: String,
+    kind: SessionTargetKind,
     /// The conversation id or terminal id to inspect.
-    target_id: String,
+    target_id: CanonicalEntityId,
     /// Maximum rows to return (default 50, clamped to 1..=500).
     #[serde(default)]
     limit: Option<i64>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct IdmmGetActivityParams {
     /// Maximum rows to return (default 50, clamped to 1..=500).
     #[serde(default)]
@@ -151,53 +184,80 @@ struct IdmmGetActivityParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct IdmmInterveneParams {
     /// Target kind: "conversation" or "terminal".
-    kind: String,
+    kind: SessionTargetKind,
     /// The conversation id or terminal id to intervene on.
-    target_id: String,
+    target_id: CanonicalEntityId,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct IdmmGetSettingsParams {
     // No parameters — global settings.
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct IdmmSetSettingsParams {
-    /// Backup provider id for sidecar model fallback (omit to clear).
+    /// Backup provider/model pair. Omit to leave unchanged.
     #[serde(default)]
-    backup_provider_id: Option<String>,
-    /// Backup model id for sidecar fallback (omit to clear).
+    backup_model: Option<IdmmBackupModelParam>,
+    /// Explicitly clear the backup pair.
     #[serde(default)]
-    backup_model: Option<String>,
+    clear_backup_model: bool,
     /// Default steering prompt injected into new IDMM supervision configs.
     #[serde(default)]
     default_steering_prompt: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct IdmmBackupModelParam {
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    provider_id: ProviderId,
+    #[serde(deserialize_with = "deserialize_model_name")]
+    model: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct IdmmClearLogParams {
     /// Target kind: "conversation" or "terminal".
-    kind: String,
+    kind: SessionTargetKind,
     /// The conversation id or terminal id whose log to clear.
-    target_id: String,
+    target_id: CanonicalEntityId,
 }
 
 // --- Helpers ---------------------------------------------------------------
 
+fn deserialize_model_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() || value.trim() != value {
+        return Err(serde::de::Error::custom(
+            "model must be a non-empty trimmed natural key",
+        ));
+    }
+    Ok(value)
+}
+
 // --- Handlers --------------------------------------------------------------
 
 async fn idmm_get_log(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: IdmmGetLogParams) -> Value {
-    let kind = match parse_idmm_kind(&p.kind) {
-        Ok(k) => k,
-        Err(e) => return e,
+    let kind = IdmmTargetKind::from(p.kind);
+    let target_id = match parse_idmm_target_id(kind, p.target_id.into_string()) {
+        Ok(target_id) => target_id,
+        Err(error) => return error,
     };
-    if let Some(err) = verify_idmm_target(&deps, &ctx, kind, &p.target_id).await {
+    if let Some(err) = verify_idmm_target(&deps, &ctx, kind, &target_id).await {
         return err;
     }
     let limit = p.limit.unwrap_or(50).clamp(1, 500);
-    match deps.idmm_service.log(ctx.user_id.as_str(), kind, &p.target_id, limit).await {
+    match deps.idmm_service.log(ctx.user_id.as_str(), kind, &target_id, limit).await {
         Ok(records) => ok(records),
         Err(e) => json!({"error": e.to_string()}),
     }
@@ -215,23 +275,24 @@ async fn idmm_get_activity(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: IdmmGetAct
 }
 
 async fn idmm_intervene(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: IdmmInterveneParams) -> Value {
-    let kind = match parse_idmm_kind(&p.kind) {
-        Ok(k) => k,
-        Err(e) => return e,
+    let kind = IdmmTargetKind::from(p.kind);
+    let target_id = match parse_idmm_target_id(kind, p.target_id.into_string()) {
+        Ok(target_id) => target_id,
+        Err(error) => return error,
     };
-    if let Some(err) = verify_idmm_target(&deps, &ctx, kind, &p.target_id).await {
+    if let Some(err) = verify_idmm_target(&deps, &ctx, kind, &target_id).await {
         return err;
     }
     match deps
         .idmm_service
-        .intervene_now(ctx.user_id.as_str(), kind, &p.target_id)
+        .intervene_now(ctx.user_id.as_str(), kind, &target_id)
         .await
     {
         Ok(()) => {
             // Return the updated state (same as the REST route).
             match deps
                 .idmm_service
-                .build_state(ctx.user_id.as_str(), kind, &p.target_id)
+                .build_state(ctx.user_id.as_str(), kind, &target_id)
                 .await
             {
                 Ok(state) => ok(json!({
@@ -259,11 +320,15 @@ async fn idmm_set_settings(deps: Arc<GatewayDeps>, p: IdmmSetSettingsParams) -> 
         Ok(s) => s,
         Err(e) => return json!({"error": e.to_string()}),
     };
-    if p.backup_provider_id.is_some() {
-        settings.backup_provider_id = p.backup_provider_id;
+    if p.clear_backup_model && p.backup_model.is_some() {
+        return json!({"error":"backup_model and clear_backup_model cannot both be set"});
     }
-    if p.backup_model.is_some() {
-        settings.backup_model = p.backup_model;
+    if p.clear_backup_model {
+        settings.backup_provider_id = None;
+        settings.backup_model = None;
+    } else if let Some(backup) = p.backup_model {
+        settings.backup_provider_id = Some(backup.provider_id.into_string());
+        settings.backup_model = Some(backup.model);
     }
     if let Some(prompt) = p.default_steering_prompt {
         settings.default_steering_prompt = prompt;
@@ -276,14 +341,15 @@ async fn idmm_set_settings(deps: Arc<GatewayDeps>, p: IdmmSetSettingsParams) -> 
 }
 
 async fn idmm_clear_log(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: IdmmClearLogParams) -> Value {
-    let kind = match parse_idmm_kind(&p.kind) {
-        Ok(k) => k,
-        Err(e) => return e,
+    let kind = IdmmTargetKind::from(p.kind);
+    let target_id = match parse_idmm_target_id(kind, p.target_id.into_string()) {
+        Ok(target_id) => target_id,
+        Err(error) => return error,
     };
-    if let Some(err) = verify_idmm_target(&deps, &ctx, kind, &p.target_id).await {
+    if let Some(err) = verify_idmm_target(&deps, &ctx, kind, &target_id).await {
         return err;
     }
-    match deps.idmm_service.clear_log(ctx.user_id.as_str(), kind, &p.target_id).await {
+    match deps.idmm_service.clear_log(ctx.user_id.as_str(), kind, &target_id).await {
         Ok(count) => json!({"result": format!("cleared {count} intervention records")}),
         Err(e) => json!({"error": e.to_string()}),
     }
@@ -317,7 +383,7 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
         CapabilityMeta::new(
             "nomi_requirement_get",
             "requirement",
-            "Fetch a single requirement by id (full detail including attachments, timestamps, status).",
+            "Fetch a single requirement by requirement_id (full detail including attachments, timestamps, status).",
             DangerTier::Read,
         )
         .instance_owner(),
@@ -412,4 +478,84 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
         .deny_on(&[Surface::Channel]),
         idmm_clear_log,
     ));
+}
+
+// --- Tests -----------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nomifun_api_types::InterventionRecord;
+    use nomifun_common::IdmmInterventionId;
+    use serde_json::json;
+
+    const REQUIREMENT_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678901";
+
+    #[test]
+    fn requirement_get_uses_named_wire_field() {
+        let params: RequirementGetParams =
+            serde_json::from_value(json!({"requirement_id": REQUIREMENT_ID}))
+                .expect("requirement_id should deserialize");
+        assert_eq!(params.requirement_id.as_str(), REQUIREMENT_ID);
+
+        assert!(
+            serde_json::from_value::<RequirementGetParams>(json!({"id": REQUIREMENT_ID}))
+                .is_err(),
+            "the generic id wire field must not be accepted"
+        );
+        assert!(
+            serde_json::from_value::<RequirementGetParams>(json!({
+                "id": REQUIREMENT_ID,
+                "requirement_id": REQUIREMENT_ID
+            }))
+            .is_err(),
+            "legacy and canonical fields must not coexist"
+        );
+    }
+
+    #[test]
+    fn requirement_get_schema_uses_named_wire_field() {
+        let schema = serde_json::to_value(schemars::schema_for!(RequirementGetParams))
+            .expect("requirement get schema should serialize");
+        let properties = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("requirement get schema should have properties");
+
+        assert!(properties.contains_key("requirement_id"));
+        assert!(!properties.contains_key("id"));
+        assert!(
+            schema
+                .get("required")
+                .and_then(Value::as_array)
+                .is_some_and(|required| required.iter().any(|field| field == "requirement_id")),
+            "requirement_id must be required"
+        );
+    }
+
+    #[test]
+    fn idmm_gateway_result_uses_named_intervention_id() {
+        let intervention_id = IdmmInterventionId::new();
+        let result = ok(InterventionRecord {
+            intervention_id: intervention_id.clone(),
+            target_kind: "conversation".into(),
+            target_id: "0190f5fe-7c00-7a00-8000-000000000001".into(),
+            watch: "decision".into(),
+            at: 1,
+            stall_class: "decision".into(),
+            tier_used: "rule".into(),
+            category: None,
+            action: "wait".into(),
+            detail: None,
+            outcome: "skipped".into(),
+            reason: None,
+            confidence: None,
+            bypass_model: None,
+        });
+        assert_eq!(
+            result["result"]["intervention_id"],
+            intervention_id.as_str()
+        );
+        assert!(result["result"].get("id").is_none());
+    }
 }

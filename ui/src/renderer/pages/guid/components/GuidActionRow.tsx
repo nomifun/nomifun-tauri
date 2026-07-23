@@ -200,17 +200,17 @@ const GuidActionRow: React.FC<GuidActionRowProps> = ({
         >
           {mcpServers.map((server) => (
             <Menu.Item
-              key={`mcp-${server.id}`}
+              key={`mcp-${server.mcp_server_id}`}
               onClick={(e) => {
                 e.stopPropagation();
-                onToggleMcpServer(server.id);
+                onToggleMcpServer(server.mcp_server_id);
               }}
             >
               <Checkbox
-                checked={selectedMcpServerIds.includes(server.id)}
+                checked={selectedMcpServerIds.includes(server.mcp_server_id)}
                 className='guid-mcp-selection-checkbox'
                 onClick={(e: React.MouseEvent) => e.stopPropagation()}
-                onChange={() => onToggleMcpServer(server.id)}
+                onChange={() => onToggleMcpServer(server.mcp_server_id)}
               >
                 <span className='text-13px'>
                   {server.name}

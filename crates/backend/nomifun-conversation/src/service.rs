@@ -22,16 +22,16 @@ use nomifun_api_types::{
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse,
     ConversationMcpStatus, ConversationMcpStatusKind,
     ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest, KnowledgeMountInfo, ListConversationsQuery,
-    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
+    ListMessagesQuery, McpServerId, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
     ExecutionModelPool, ExecutionModelRef, SendMessageRequest, SessionMcpServer, SessionMcpTransport, UpdateConversationArtifactRequest,
     UpdateConversationRequest, WebSocketMessage,
 };
 use nomifun_common::{
-    AgentExecutionTemplateId, AgentKillReason, McpServerId, AgentType, AppError, CompanionId, ConversationArtifactId, ConversationId, ConversationSource,
-    ConversationStatus, DecisionPolicy, DelegationPolicy, ErrorChain, ExecutionAuthority, MessageId, MessageType, OnConversationDelete, PaginatedResult, ProviderId, ProviderWithModel,
-    CronJobId, generate_prefixed_id, now_ms, validate_prefixed_id, workspace_path_has_edge_whitespace_segment,
+    AgentExecutionTemplateId, AgentKillReason, AgentType, AppError, CompanionId, ConversationId, ConversationSource,
+    ConversationStatus, CronJobId, DecisionPolicy, DelegationPolicy, ErrorChain, ExecutionAuthority, MessageId, MessageType, OnConversationDelete, PaginatedResult, ProviderId, ProviderWithModel,
+    generate_id, now_ms, validate_uuidv7, workspace_path_has_edge_whitespace_segment,
 };
-use nomifun_db::models::{ConversationRow, MessageRow};
+use nomifun_db::models::{AgentMetadataRow, ConversationRow, MessageRow};
 use nomifun_db::{
     ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IConversationRepository,
@@ -52,7 +52,7 @@ use crate::convert::{
     row_to_response, row_to_response_with_extra, search_row_to_item, string_to_enum,
 };
 use crate::skill_resolver::SkillResolver;
-use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
+use crate::skill_snapshot::compute_initial_skills;
 use crate::stream_relay::{RelayTerminal, StreamRelay, run_turn_writeback_report};
 use std::sync::RwLock;
 
@@ -74,6 +74,19 @@ const POST_TERMINAL_TRANSITION_GRACE: Duration = Duration::from_secs(10);
 const DELETE_CORE_GRACE: Duration = Duration::from_secs(5);
 const DELETE_CLEANUP_ITEM_GRACE: Duration = Duration::from_secs(5);
 const DELETE_STOP_GRACE: Duration = Duration::from_secs(30);
+
+tokio::task_local! {
+    static DELETED_CRON_JOB_IDS: Arc<[String]>;
+}
+
+/// Cron IDs deleted atomically with the Conversation currently being
+/// dispatched to post-commit lifecycle hooks.
+///
+/// This is intentionally task-scoped: hooks cannot query the deleted database
+/// rows, and a global handoff would permit cross-delete races or leaks.
+pub fn current_deleted_cron_job_ids() -> Option<Arc<[String]>> {
+    DELETED_CRON_JOB_IDS.try_with(Arc::clone).ok()
+}
 
 /// Remove state that identifies or resumes the source conversation instance.
 ///
@@ -254,6 +267,99 @@ fn validate_conversation_model_authority(
     Ok(())
 }
 
+fn required_trimmed_extra_string<'a>(
+    extra: &'a serde_json::Value,
+    key: &str,
+    context: &str,
+) -> Result<&'a str, AppError> {
+    let value = extra
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| AppError::BadRequest(format!("{context} requires extra.{key}")))?;
+    if value.is_empty() || value.trim() != value {
+        return Err(AppError::BadRequest(format!(
+            "{context} extra.{key} must be a non-empty trimmed string"
+        )));
+    }
+    Ok(value)
+}
+
+fn optional_trimmed_extra_string<'a>(
+    extra: &'a serde_json::Value,
+    key: &str,
+    context: &str,
+) -> Result<Option<&'a str>, AppError> {
+    match extra.get(key) {
+        None => Ok(None),
+        Some(serde_json::Value::String(value))
+            if !value.is_empty() && value.trim() == value =>
+        {
+            Ok(Some(value))
+        }
+        Some(_) => Err(AppError::BadRequest(format!(
+            "{context} extra.{key} must be a non-empty trimmed string"
+        ))),
+    }
+}
+
+fn validate_acp_agent_metadata_row(
+    row: &AgentMetadataRow,
+    extra: &serde_json::Value,
+) -> Result<(), AppError> {
+    if row.agent_type != AgentType::Acp.serde_name() {
+        return Err(AppError::BadRequest(format!(
+            "ACP extra.agent_id '{}' resolves to agent type '{}'",
+            row.agent_id, row.agent_type
+        )));
+    }
+    if !row.enabled {
+        return Err(AppError::BadRequest(format!(
+            "ACP extra.agent_id '{}' is disabled",
+            row.agent_id
+        )));
+    }
+    if !matches!(row.agent_source.as_str(), "builtin" | "extension" | "custom") {
+        return Err(AppError::BadRequest(format!(
+            "ACP extra.agent_id '{}' has unsupported agent_source '{}'",
+            row.agent_id, row.agent_source
+        )));
+    }
+    if let Some(backend) = optional_trimmed_extra_string(extra, "backend", "ACP conversation")?
+        && row.backend.as_deref() != Some(backend)
+    {
+        return Err(AppError::BadRequest(format!(
+            "ACP extra.backend '{backend}' does not match agent '{}'",
+            row.agent_id
+        )));
+    }
+    if let Some(agent_source) =
+        optional_trimmed_extra_string(extra, "agent_source", "ACP conversation")?
+        && row.agent_source != agent_source
+    {
+        return Err(AppError::BadRequest(format!(
+            "ACP extra.agent_source '{agent_source}' does not match agent '{}'",
+            row.agent_id
+        )));
+    }
+    Ok(())
+}
+
+fn reject_acp_identity_patch(extra: &serde_json::Value) -> Result<(), AppError> {
+    let Some(object) = extra.as_object() else {
+        return Ok(());
+    };
+    const IDENTITY_KEYS: [&str; 3] = ["agent_id", "backend", "agent_source"];
+    if let Some(key) = IDENTITY_KEYS
+        .into_iter()
+        .find(|key| object.contains_key(*key))
+    {
+        return Err(AppError::BadRequest(format!(
+            "ACP extra.{key} is immutable after creation; create a new conversation to change the agent"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 struct McpSupportPolicy {
     stdio: bool,
@@ -410,7 +516,7 @@ impl ConversationService {
             Ok(false) => {
                 if matches!(repo.get(conversation_id).await, Ok(None)) {
                     // The only legal receipt deletion is an owning account or
-                    // Conversation cascade. With no addressable receiver,
+                    // Repository-owned logical-reference cleanup. With no addressable receiver,
                     // replay is impossible and compensation is unnecessary.
                     return true;
                 }
@@ -698,8 +804,8 @@ impl ConversationService {
     /// Register a hook to be notified when a conversation is deleted.
     ///
     /// Hooks are dispatched sequentially in registration order from
-    /// `delete()`. Used by `nomifun-app` to wire up `InMemoryAgentRuntimeRegistry`
-    /// (terminate the Agent process) and `CronService` (cascade-delete cron jobs).
+    /// `delete()`. Used by `nomifun-app` to wire up process/filesystem cleanup
+    /// that is independent from repository-owned logical-reference deletion.
     pub fn with_delete_hook(&self, hook: Arc<dyn OnConversationDelete>) {
         if let Ok(mut guard) = self.delete_hooks.write() {
             guard.push(hook);
@@ -717,7 +823,7 @@ impl ConversationService {
     /// function so callers that hold only `ConversationService::mint_msg_id`
     /// (or none of the service at all, via re-export) can use it.
     pub fn mint_msg_id() -> String {
-        generate_prefixed_id("msg")
+        generate_id()
     }
 
     pub fn conversation_repo(&self) -> &Arc<dyn IConversationRepository> {
@@ -746,6 +852,68 @@ impl ConversationService {
         self.runtime_state.clone()
     }
 
+    async fn compensate_failed_creation(
+        &self,
+        conversation_id: &str,
+        managed_workspace: Option<&Path>,
+        original_error: AppError,
+    ) -> AppError {
+        let mut cleanup_errors = Vec::new();
+        let aggregate_deleted = match self.conversation_repo.delete(conversation_id).await {
+            Ok(()) | Err(nomifun_db::DbError::NotFound(_)) => true,
+            Err(error) => {
+                warn!(
+                    conversation_id,
+                    error = %ErrorChain(&error),
+                    original_error = %original_error,
+                    "failed to roll back conversation row after creation failed; retained aggregate remains addressable"
+                );
+                cleanup_errors.push(format!("database rollback failed: {error}"));
+                false
+            }
+        };
+
+        if aggregate_deleted {
+            // SQLite's Conversation repository owns this logical child
+            // cleanup. Keep the explicit repository call for alternate
+            // repository implementations and tests; deleting a missing row is
+            // intentionally a no-op.
+            if let Err(error) = self.acp_session_repo.delete(conversation_id).await {
+                warn!(
+                    conversation_id,
+                    error = %ErrorChain(&error),
+                    "conversation rollback committed, but ACP session cleanup failed; session row may be orphaned"
+                );
+                cleanup_errors.push(format!("ACP session cleanup failed: {error}"));
+            }
+
+            if let Some(path) = managed_workspace
+                && path.exists()
+                && let Err(error) = std::fs::remove_dir_all(path)
+            {
+                warn!(
+                    conversation_id,
+                    workspace = %path.display(),
+                    error = %ErrorChain(&error),
+                    "conversation rollback committed, but managed workspace cleanup failed; directory remains as an orphan"
+                );
+                cleanup_errors.push(format!(
+                    "managed workspace '{}' cleanup failed: {error}",
+                    path.display()
+                ));
+            }
+        }
+
+        if cleanup_errors.is_empty() {
+            original_error
+        } else {
+            AppError::Internal(format!(
+                "conversation creation failed ({original_error}); compensation was incomplete: {}",
+                cleanup_errors.join("; ")
+            ))
+        }
+    }
+
     /// Read AND remove the conversation's accumulated token total (`input +
     /// output` summed across the turns the stream relay saw complete). Returns
     /// `None` when nothing was recorded — e.g. a turn that errored before
@@ -764,7 +932,7 @@ impl ConversationService {
     ) -> Result<(), AppError> {
         let projection = self
             .execution_conversation_boundary
-            .projection(user_id, &response.id)
+            .projection(user_id, &response.conversation_id)
             .await?;
         response.linked_execution_id = projection.linked_execution_id;
         response.execution_step_id = projection.execution_step_id;
@@ -1013,7 +1181,7 @@ impl ConversationService {
 impl ConversationService {
     /// Create a new conversation.
     ///
-    /// Generates a `conv_{uuidv7}` ID, sets status to `pending`, defaults
+    /// Generates a canonical bare UUIDv7 ID, sets status to `pending`, defaults
     /// source to `nomifun`, and broadcasts `conversation.listChanged(created)`.
     pub async fn create(
         &self,
@@ -1080,7 +1248,7 @@ impl ConversationService {
         else {
             return Ok(());
         };
-        self.delete(user_id, &conversation.id.to_string()).await
+        self.delete(user_id, &conversation.conversation_id).await
     }
 
     #[tracing::instrument(skip_all, fields(user_id = %user_id, agent_type = ?req.r#type))]
@@ -1122,10 +1290,9 @@ impl ConversationService {
         }
         let source = req.source.unwrap_or(ConversationSource::Nomifun);
 
-        // Type-aware rule: top-level `model` is nomi-only. Other agent types
-        // carry model/mode via `extra` (see spec 2026-05-12). Reject early so
-        // clients that still ship the legacy shape get a loud 400 instead of
-        // a silent write to a column nobody reads.
+        // Type-aware v3 rule: top-level `model` is nomi-only. Other agent types
+        // carry model/mode via `extra` (see spec 2026-05-12). Reject the
+        // noncanonical wire shape instead of silently writing an unused column.
         if req.r#type != AgentType::Nomi && req.model.is_some() {
             return Err(AppError::BadRequest(format!(
                 "top-level `model` is only accepted for nomi conversations; pass model via `extra` for {}",
@@ -1135,6 +1302,7 @@ impl ConversationService {
 
         let mut extra = req.extra;
         reject_execution_policy_extra_keys(&extra)?;
+        reject_retired_skill_extra_keys(&extra)?;
         let preset_id = req.preset_id.take().map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
         let preset_overrides = req.preset_overrides.take().unwrap_or_default();
         let mut resolved_preset_snapshot = authority
@@ -1171,16 +1339,27 @@ impl ConversationService {
         }
 
         if let Some(snapshot) = resolved_preset_snapshot.as_ref() {
-            if let Some(agent_id) = snapshot.resolved_agent_id.as_ref()
-                && let Some(agent) = self.agent_metadata_repo.get(agent_id).await?
-            {
+            if let Some(agent_id) = snapshot.resolved_agent_id.as_ref() {
+                let agent = self
+                    .agent_metadata_repo
+                    .get(agent_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::BadRequest(format!(
+                            "preset resolved missing agent '{agent_id}'"
+                        ))
+                    })?;
                 req.r#type = serde_json::from_value(serde_json::Value::String(agent.agent_type.clone()))
                     .map_err(|_| AppError::BadRequest(format!("preset resolved unknown agent type '{}'", agent.agent_type)))?;
                 if let Some(obj) = extra.as_object_mut() {
-                    obj.insert("agent_id".into(), serde_json::Value::String(agent.id));
+                    obj.insert("agent_id".into(), serde_json::Value::String(agent.agent_id));
                     if let Some(backend) = agent.backend {
                         obj.insert("backend".into(), serde_json::Value::String(backend));
                     }
+                    obj.insert(
+                        "agent_source".into(),
+                        serde_json::Value::String(agent.agent_source),
+                    );
                 }
             }
             if let Some(model) = snapshot.resolved_model.as_ref() {
@@ -1220,18 +1399,62 @@ impl ConversationService {
             }
         }
 
-        // nomi source-of-truth rule: top-level `model` wins. If an older client
-        // still packs `extra.model`, strip it before persist so the stored row
-        // has a single canonical model representation.
+        // Nomi has exactly one model source: the typed top-level `model`.
+        // Reject a second representation instead of normalizing an obsolete
+        // payload shape.
         if req.r#type == AgentType::Nomi
-            && let Some(obj) = extra.as_object_mut()
-            && obj.remove("model").is_some()
+            && extra
+                .as_object()
+                .is_some_and(|object| object.contains_key("model"))
         {
-            warn!("nomi create: stripped legacy `extra.model`; top-level `model` is canonical");
+            return Err(AppError::BadRequest(
+                "extra.model is not part of the v3 Nomi contract; use top-level model".to_owned(),
+            ));
         }
 
+        // V3 ACP identity is row-scoped and explicit. A backend label is
+        // descriptive metadata, never a lookup key or a substitute for the
+        // catalog business ID. Validate the logical parent before creating the
+        // Conversation row so an invalid agent cannot leave a half-created
+        // aggregate behind.
+        let acp_agent = if req.r#type == AgentType::Acp {
+            let agent_id =
+                required_trimmed_extra_string(&extra, "agent_id", "ACP conversation")?;
+            let agent = self
+                .agent_metadata_repo
+                .get(agent_id)
+                .await
+                .map_err(|error| AppError::Internal(format!("agent_metadata lookup: {error}")))?
+                .ok_or_else(|| {
+                    AppError::BadRequest(format!(
+                        "ACP extra.agent_id '{agent_id}' does not exist"
+                    ))
+                })?;
+            validate_acp_agent_metadata_row(&agent, &extra)?;
+            if let Some(object) = extra.as_object_mut() {
+                match agent.backend.as_ref() {
+                    Some(backend) => {
+                        object.insert(
+                            "backend".to_owned(),
+                            serde_json::Value::String(backend.clone()),
+                        );
+                    }
+                    None => {
+                        object.remove("backend");
+                    }
+                }
+                object.insert(
+                    "agent_source".to_owned(),
+                    serde_json::Value::String(agent.agent_source.clone()),
+                );
+            }
+            Some(agent)
+        } else {
+            None
+        };
+
         // Determine whether the user chose this workspace ("custom") or we
-        // auto-provision one under `{data_dir}/conversations/{label}-temp-{token}/`.
+        // auto-provision one under `{work_dir}/conversations/{uuidv7}/`.
         // `is_custom_workspace` is the authoritative signal consumed later to
         // decide whether we should wire skill symlinks (temp workspaces only
         // — user-chosen paths must not be mutated).
@@ -1253,12 +1476,12 @@ impl ConversationService {
         // conversation ID. Directory creation and the `extra.workspace` write
         // remain deferred until after the row exists.
         let auto_workspace = if user_supplied_workspace.is_none() {
-            let label = conversation_label(&req.r#type, extra.get("backend"));
-            let (temp_workspace_id, probe_path) = allocate_temp_workspace_id(&self.workspace_root, &label);
+            let (temp_workspace_id, probe_path) =
+                allocate_temp_workspace_id(&self.workspace_root);
             if workspace_path_has_edge_whitespace_segment(&probe_path) {
                 return Err(AppError::WorkspacePathEdgeWhitespace(probe_path.display().to_string()));
             }
-            Some((label, temp_workspace_id))
+            Some(temp_workspace_id)
         } else {
             None
         };
@@ -1269,7 +1492,7 @@ impl ConversationService {
             obj.remove("custom_workspace");
             obj.remove("is_temporary_workspace");
             obj.remove(TEMP_WORKSPACE_ID_EXTRA_KEY);
-            if let Some((_, temp_workspace_id)) = auto_workspace.as_ref() {
+            if let Some(temp_workspace_id) = auto_workspace.as_ref() {
                 obj.insert(
                     TEMP_WORKSPACE_ID_EXTRA_KEY.to_owned(),
                     serde_json::Value::String(temp_workspace_id.clone()),
@@ -1277,28 +1500,13 @@ impl ConversationService {
             }
         }
 
-        // Consume transient skill-shaping inputs and freeze the initial
-        // `skills` snapshot into `extra.skills`. These request-only fields
-        // must not land in the stored row. Legacy names (`enabled_skills`,
-        // `exclude_builtin_skills`) are accepted as aliases for compatibility
-        // with older frontend builds and pre-snapshot presets (§7.1).
-        fn take_string_array(obj: &mut serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Vec<String> {
-            for key in keys {
-                if let Some(v) = obj.remove(*key)
-                    && let Ok(arr) = serde_json::from_value::<Vec<String>>(v)
-                {
-                    return arr;
-                }
-            }
-            Vec::new()
-        }
-
+        // Consume the canonical transient skill-shaping inputs and freeze the
+        // initial immutable snapshot into `extra.skills`. No historical aliases
+        // are accepted or normalized in the v3 contract.
         let (preset_enabled, exclude_auto_inject) = match extra.as_object_mut() {
             Some(obj) => {
-                let preset = take_string_array(obj, &["preset_enabled_skills", "enabled_skills"]);
-                let exclude = take_string_array(obj, &["exclude_auto_inject_skills", "exclude_builtin_skills"]);
-                // Strip the stale cache field if a clone copied it in.
-                obj.remove("loaded_skills");
+                let preset = take_string_array(obj, "preset_enabled_skills")?;
+                let exclude = take_string_array(obj, "exclude_auto_inject_skills")?;
                 (preset, exclude)
             }
             None => (Vec::new(), Vec::new()),
@@ -1327,8 +1535,8 @@ impl ConversationService {
         // Selection arrives from the client as `extra.selected_mcp_server_ids`.
         // Parsing lives in `parse_selected_mcp_server_ids`. The selection is no
         // longer persisted to `extra` — it lands in the `conversation_mcp_servers`
-        // junction after the row exists (FK requires the parent first).
-        let selected_mcp_server_ids: Option<Vec<McpServerId>> = match extra.as_object_mut() {
+        // junction after the row exists so the logical parent is already addressable.
+        let selected_mcp_server_ids: Option<Vec<String>> = match extra.as_object_mut() {
             Some(obj) => parse_selected_mcp_server_ids(obj)?,
             None => None,
         };
@@ -1344,7 +1552,7 @@ impl ConversationService {
         };
 
         let mcp_support = self.resolve_mcp_support_policy(&req.r#type, &extra).await?;
-        let mut selected_row_ids: Vec<McpServerId> = Vec::new();
+        let mut resolved_mcp_server_ids: Vec<String> = Vec::new();
         let mut selected_mcp_names: Vec<String> = Vec::new();
         let mut selected_mcp_statuses: Vec<ConversationMcpStatus> = Vec::new();
         let mut seen_mcp_names = HashSet::new();
@@ -1369,11 +1577,14 @@ impl ConversationService {
                 .into_iter()
                 .filter(|row| !row.builtin)
                 .filter(|row| match selected_mcp_server_ids.as_ref() {
-                    Some(ids) => ids.iter().any(|id| *id == row.id),
+                    Some(ids) => ids.iter().any(|id| id == &row.mcp_server_id),
                     None => row.enabled,
                 })
                 .collect::<Vec<_>>();
-            selected_row_ids = selected_rows.iter().map(|row| row.id.clone()).collect();
+            resolved_mcp_server_ids = selected_rows
+                .iter()
+                .map(|row| row.mcp_server_id.clone())
+                .collect();
             for row in &selected_rows {
                 if seen_mcp_names.insert(row.name.clone()) {
                     selected_mcp_names.push(row.name.clone());
@@ -1401,13 +1612,14 @@ impl ConversationService {
 
         if let Some(obj) = extra.as_object_mut() {
             // Build-extra contract: the ai-agent factory's `load_user_mcp_servers`
-            // reads `extra.mcp_server_ids` as canonical `McpServerId` strings.
+            // reads stable UUIDv7 business IDs from `extra.mcp_server_ids`.
             obj.insert(
                 "mcp_server_ids".to_owned(),
                 serde_json::Value::Array(
-                    selected_row_ids
+                    resolved_mcp_server_ids
                         .iter()
-                        .map(|id| serde_json::Value::String(id.to_string()))
+                        .cloned()
+                        .map(serde_json::Value::String)
                         .collect(),
                 ),
             );
@@ -1429,15 +1641,39 @@ impl ConversationService {
             }
         }
 
-        // `cron_job_id` is now a first-class column (was `extra.cronJobId`).
-        // Promote it off `extra` at create time so the FK column is the single
-        // source of truth; the cron executor's atomic backfill (§9.A) clears or
-        // sets it later for `new_conversation`.
-        let cron_job_id = extra
-            .get("cron_job_id")
-            .and_then(|value| value.as_str())
-            .or_else(|| extra.get("cronJobId").and_then(|value| value.as_str()))
-            .map(ToOwned::to_owned);
+        // `cron_job_id` is a request-only logical reference. Consume the one
+        // canonical snake_case field and persist it only in the typed column;
+        // aliases and non-canonical IDs are rejected rather than creating a
+        // second durable representation in `extra`.
+        let cron_job_id = match extra.as_object_mut() {
+            Some(object) => {
+                if object.contains_key("cronJobId") {
+                    return Err(AppError::BadRequest(
+                        "cronJobId is not supported; use cron_job_id".to_owned(),
+                    ));
+                }
+                match object.remove("cron_job_id") {
+                    None => None,
+                    Some(value) => {
+                        let value = value.as_str().ok_or_else(|| {
+                            AppError::BadRequest(
+                                "cron_job_id must be a canonical UUIDv7 string".to_owned(),
+                            )
+                        })?;
+                        Some(
+                            CronJobId::parse(value)
+                                .map_err(|error| {
+                                    AppError::BadRequest(format!(
+                                        "cron_job_id must be a canonical UUIDv7 string: {error}"
+                                    ))
+                                })?
+                                .into_string(),
+                        )
+                    }
+                }
+            }
+            None => None,
+        };
         let preset_snapshot_value = resolved_preset_snapshot
             .as_ref()
             .map(serde_json::to_value)
@@ -1469,8 +1705,10 @@ impl ConversationService {
             req.execution_model_pool.as_ref(),
         )?;
 
+        let conversation_id = ConversationId::new().into_string();
         let row = nomifun_db::models::ConversationRow {
-            id: ConversationId::new().into_string(),
+            id: 0,
+            conversation_id: conversation_id.clone(),
             user_id: user_id.to_owned(),
             name: req.name.unwrap_or_default(),
             r#type: enum_to_db(&req.r#type)?,
@@ -1526,118 +1764,136 @@ impl ConversationService {
             return Ok(response);
         }
 
-        // Materialize the preset's knowledge policy as an explicit target
-        // binding. This deliberately bypasses workpath inheritance at runtime:
-        // selecting a preset must reproduce its KB scope without mutating or
-        // silently sharing the user's general workspace binding.
-        if let Some(snapshot_value) = preset_snapshot_value.as_ref()
-            && let Ok(snapshot) = serde_json::from_value::<nomifun_api_types::ResolvedPresetSnapshot>(
-                snapshot_value.clone(),
-            )
-            && let Some(service) = self
-                .knowledge_service
-                .read()
-                .ok()
-                .and_then(|guard| guard.as_ref().cloned())
-        {
-            let (target_kind, target_id) = knowledge_binding_target(&extra, &new_id)?;
-            let mode = match snapshot.knowledge_policy.mode.as_str() {
-                "direct" => "direct",
-                _ => "staged",
-            };
-            service
-                .set_binding(
-                    target_kind,
-                    target_id,
-                    nomifun_knowledge::KnowledgeBinding {
-                        enabled: snapshot.knowledge_policy.enabled,
-                        writeback: snapshot.knowledge_policy.writeback,
-                        writeback_mode: mode.to_owned(),
-                        writeback_eagerness: snapshot
-                            .knowledge_policy
-                            .eagerness
-                            .unwrap_or_else(|| "conservative".to_owned()),
-                        // Presets never self-authorize unattended channel writes.
-                        channel_write_enabled: false,
-                        kb_ids: snapshot.knowledge_base_ids,
-                    },
-                )
-                .await?;
-        }
+        let managed_workspace = auto_workspace
+            .as_ref()
+            .map(|temp_workspace_id| auto_temp_workspace_path(&self.workspace_root, temp_workspace_id));
+        let materialized = async {
+            // Now that the row exists, provision the auto (temp) workspace:
+            // create the tokenized directory, wire skill symlinks (temp
+            // workspaces only), record the path in `extra`, and persist the
+            // updated `extra` back. User-supplied workspaces are left
+            // untouched.
+            if let Some(ws_path) = managed_workspace.as_ref() {
+                std::fs::create_dir_all(ws_path)
+                    .map_err(|e| AppError::Internal(format!("Failed to create workspace: {e}")))?;
 
-        // Now that the row exists, provision the auto (temp) workspace: create
-        // the tokenized directory, wire skill symlinks (temp workspaces only),
-        // record the path in `extra`, and persist the updated `extra` back.
-        // User-supplied workspaces are left untouched (already in `extra` and
-        // validated above).
-        if let Some((label, temp_workspace_id)) = auto_workspace.as_ref() {
-            let ws_path = auto_temp_workspace_path(&self.workspace_root, label, temp_workspace_id);
-            std::fs::create_dir_all(&ws_path)
-                .map_err(|e| AppError::Internal(format!("Failed to create workspace: {e}")))?;
-
-            // Wire skill symlinks into the auto-provisioned workspace so the
-            // agent CLI picks them up via its native skills dir (e.g.
-            // `.claude/skills/`). Runs only for temp workspaces — a user-chosen
-            // path must not be mutated.
-            if !is_custom_workspace
-                && !skills_for_links.is_empty()
-                && let Some(rel_dirs) =
-                    native_skills_dirs(&self.agent_metadata_repo, &req.r#type, extra.get("backend")).await
-            {
-                let resolved = self.skill_resolver.resolve_skills(&skills_for_links).await;
-                if !resolved.is_empty() {
-                    let rel_dirs_refs: Vec<&str> = rel_dirs.iter().map(String::as_str).collect();
-                    let n = self
-                        .skill_resolver
-                        .link_workspace_skills(&ws_path, &rel_dirs_refs, &resolved)
-                        .await;
-                    debug!(
-                        conversation_id = new_id,
-                        workspace = %ws_path.display(),
-                        links = n,
-                        "wired skill symlinks into workspace"
-                    );
+                if !is_custom_workspace
+                    && !skills_for_links.is_empty()
+                    && let Some(rel_dirs) =
+                        native_skills_dirs(&req.r#type, acp_agent.as_ref())
+                {
+                    let resolved = self.skill_resolver.resolve_skills(&skills_for_links).await;
+                    if !resolved.is_empty() {
+                        let rel_dirs_refs: Vec<&str> =
+                            rel_dirs.iter().map(String::as_str).collect();
+                        let n = self
+                            .skill_resolver
+                            .link_workspace_skills(ws_path, &rel_dirs_refs, &resolved)
+                            .await;
+                        debug!(
+                            conversation_id = new_id,
+                            workspace = %ws_path.display(),
+                            links = n,
+                            "wired skill symlinks into workspace"
+                        );
+                    }
                 }
+
+                extra["workspace"] =
+                    serde_json::Value::String(ws_path.to_string_lossy().into_owned());
+                let extra_json = serde_json::to_string(&extra)
+                    .map_err(|e| AppError::Internal(format!("Failed to serialize extra: {e}")))?;
+                let workspace_update = ConversationRowUpdate {
+                    extra: Some(extra_json),
+                    updated_at: Some(now),
+                    ..Default::default()
+                };
+                self.conversation_repo
+                    .update(&new_id, &workspace_update)
+                    .await?;
             }
 
-            extra["workspace"] = serde_json::Value::String(ws_path.to_string_lossy().into_owned());
-            let extra_json = serde_json::to_string(&extra)
-                .map_err(|e| AppError::Internal(format!("Failed to serialize extra: {e}")))?;
-            let workspace_update = ConversationRowUpdate {
-                extra: Some(extra_json),
-                updated_at: Some(now),
-                ..Default::default()
+            // The v3 junction is the only durable MCP selection store. A
+            // failed write invalidates the aggregate; warning-and-continuing
+            // would return a Conversation whose runtime snapshot and database
+            // selection disagree.
+            if selected_mcp_server_ids.is_some() {
+                self.conversation_repo
+                    .set_mcp_server_ids(&new_id, &resolved_mcp_server_ids)
+                    .await?;
+            }
+
+            // ACP conversations own one logical 1:1 acp_session child.
+            if let Some(agent) = acp_agent.as_ref() {
+                self.create_acp_session_row(&new_id, &extra, agent).await?;
+            }
+
+            // Build the response before the final cross-domain binding write
+            // so no fallible Conversation operation remains after a
+            // companion-scoped preset binding is updated.
+            let response_row = nomifun_db::models::ConversationRow {
+                id: row.id,
+                conversation_id: new_id.clone(),
+                extra: serde_json::to_string(&extra)
+                    .map_err(|e| AppError::Internal(format!("Failed to serialize extra: {e}")))?,
+                ..row
             };
-            self.conversation_repo.update(&new_id, &workspace_update).await?;
-        }
+            let mut response = row_to_response(response_row, &self.workspace_root)?;
+            self.project_execution_relation(user_id, &mut response).await?;
 
-        // Persist the MCP selection into the `conversation_mcp_servers` junction
-        // now that the parent row exists (the junction FK requires it). The
-        // build-extra `mcp_server_ids` snapshot above already feeds the agent
-        // factory; this write is the durable selection store that replaces the
-        // retired `extra.selected_mcp_server_ids` array.
-        if selected_mcp_server_ids.is_some()
-            && let Err(e) = self.conversation_repo.set_mcp_server_ids(&new_id, &selected_row_ids).await
-        {
-            warn!(error = %ErrorChain(&e), conversation_id = new_id, "failed to persist MCP server selection");
-        }
-        // ACP conversations own one `acp_session` row (1:1 by
-        // conversation_id). Other agent types have no session-level
-        // state so we only create it for ACP.
-        if req.r#type == AgentType::Acp {
-            self.create_acp_session_row(&new_id, &extra).await?;
-        }
+            // Materialize the preset's knowledge policy last. This
+            // deliberately bypasses workpath inheritance at runtime:
+            // selecting a preset must reproduce its KB scope without silently
+            // sharing the user's general workspace binding.
+            if let Some(snapshot) = resolved_preset_snapshot.as_ref()
+                && let Some(service) = self
+                    .knowledge_service
+                    .read()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().cloned())
+            {
+                let (target_kind, target_id) = knowledge_binding_target(&extra, &new_id)?;
+                let mode = match snapshot.knowledge_policy.mode.as_str() {
+                    "direct" => "direct",
+                    _ => "staged",
+                };
+                service
+                    .set_binding(
+                        target_kind,
+                        target_id,
+                        nomifun_knowledge::KnowledgeBinding {
+                            enabled: snapshot.knowledge_policy.enabled,
+                            writeback: snapshot.knowledge_policy.writeback,
+                            writeback_mode: mode.to_owned(),
+                            writeback_eagerness: snapshot
+                                .knowledge_policy
+                                .eagerness
+                                .clone()
+                                .unwrap_or_else(|| "conservative".to_owned()),
+                            // Presets never self-authorize unattended channel writes.
+                            channel_write_enabled: false,
+                            kb_ids: snapshot.knowledge_base_ids.clone(),
+                        },
+                    )
+                    .await?;
+            }
 
-        // Build the response from a row carrying the real id and the final
-        // `extra` (with the resolved workspace, if any).
-        let response_row = nomifun_db::models::ConversationRow {
-            id: new_id.clone(),
-            extra: serde_json::to_string(&extra)
-                .map_err(|e| AppError::Internal(format!("Failed to serialize extra: {e}")))?,
-            ..row
+            Ok(response)
+        }
+        .await;
+        let response = match materialized {
+            Ok(response) => response,
+            Err(error) => {
+                return Err(
+                    self.compensate_failed_creation(
+                        &new_id,
+                        managed_workspace.as_deref(),
+                        error,
+                    )
+                    .await,
+                );
+            }
         };
-        let mut response = row_to_response(response_row, &self.workspace_root)?;
-        self.project_execution_relation(user_id, &mut response).await?;
 
         self.broadcast_list_changed(user_id, &new_id, "created", response.source.as_ref());
 
@@ -1647,43 +1903,22 @@ impl ConversationService {
     }
 
     #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id))]
-    async fn create_acp_session_row(&self, conversation_id: &str, extra: &serde_json::Value) -> Result<(), AppError> {
+    async fn create_acp_session_row(
+        &self,
+        conversation_id: &str,
+        extra: &serde_json::Value,
+        agent: &AgentMetadataRow,
+    ) -> Result<(), AppError> {
         debug!("Creating acp_session row");
 
         let conv_id = parse_conv_id(conversation_id)?;
-
-        // Identity comes from the user's agent choice in `extra`.
-        // `agent_id` is the catalog row id; `backend` is the vendor
-        // label; `agent_source` says builtin/extension/custom. The
-        // frontend always posts agent_id for picked rows, but older
-        // payloads may only carry `backend`, so we resolve defensively.
-        let agent_id_from_extra = extra.get("agent_id").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
-        let backend = extra.get("backend").and_then(|v| v.as_str()).unwrap_or_default();
-        let agent_source = extra.get("agent_source").and_then(|v| v.as_str()).unwrap_or("builtin");
-
-        // Fallback: older clients (electron main, legacy webhooks) only
-        // post `backend` without `agent_id`. Resolve the builtin row for
-        // that vendor so the session still has a concrete catalog
-        // reference. Non-builtin agents must provide `agent_id`
-        // explicitly — custom/extension rows have no unique lookup key
-        // from `(backend, agent_source)` alone.
-        let resolved_agent_id = match agent_id_from_extra {
-            Some(id) => id.to_owned(),
-            None if !backend.is_empty() && agent_source == "builtin" => self
-                .agent_metadata_repo
-                .find_builtin_by_backend(backend)
-                .await
-                .map_err(|e| AppError::Internal(format!("agent_metadata lookup: {e}")))?
-                .map(|row| row.id)
-                .unwrap_or_default(),
-            None => String::new(),
-        };
+        validate_acp_agent_metadata_row(agent, extra)?;
 
         let params = CreateAcpSessionParams {
             conversation_id: conv_id,
-            agent_backend: backend,
-            agent_source,
-            agent_id: &resolved_agent_id,
+            agent_backend: agent.backend.as_deref().unwrap_or_default(),
+            agent_source: &agent.agent_source,
+            agent_id: &agent.agent_id,
         };
         self.acp_session_repo
             .create(&params)
@@ -1731,9 +1966,8 @@ impl ConversationService {
             .ok_or_else(|| AppError::NotFound(format!("Conversation {id} not found")))?;
         rebase_managed_workspace_in_row(&mut row, &self.workspace_root)?;
 
-        let mut extra: serde_json::Value =
+        let extra: serde_json::Value =
             serde_json::from_str(&row.extra).map_err(|e| AppError::Internal(format!("Invalid extra JSON: {e}")))?;
-        self.backfill_extra_inplace(&row.id, &mut extra).await;
         let mut response = row_to_response_with_extra(row, extra, &self.workspace_root)?;
         response.runtime = Some(self.runtime_summary_for(id).await);
         self.project_execution_relation(user_id, &mut response).await?;
@@ -1755,11 +1989,6 @@ impl ConversationService {
         query: ListConversationsQuery,
         exclude_companion_companion: bool,
     ) -> Result<ConversationListResponse, AppError> {
-        if let Some(cron_job_id) = query.cron_job_id.as_deref() {
-            CronJobId::try_from(cron_job_id).map_err(|error| {
-                AppError::BadRequest(format!("invalid cron_job_id: {error}"))
-            })?;
-        }
         let filters = ConversationFilters {
             // The cursor arrives as a query-string parameter and remains the
             // canonical conversation ID used by keyset pagination. Malformed
@@ -1780,37 +2009,22 @@ impl ConversationService {
 
         let result = self.conversation_repo.list_paginated(user_id, &filters).await?;
 
-        // Tolerate per-row deserialization failures — a single legacy row
-        // (e.g. an abandoned agent_type='gemini' conversation post-migration)
-        // must not take down the whole listing. Skip-and-log is the
-        // explicit resilience contract from the Gemini→ACP migration spec.
+        // V3 is reset-only and has no historical-row compatibility path.
+        // Persisted corruption fails the request instead of silently dropping
+        // rows while still reporting the repository's original total.
         let mut items = Vec::with_capacity(result.items.len());
         for mut row in result.items {
             rebase_managed_workspace_in_row(&mut row, &self.workspace_root)?;
-            let row_id = row.id.clone();
-            let mut extra: serde_json::Value = match serde_json::from_str(&row.extra) {
-                Ok(v) => v,
-                Err(err) => {
-                    warn!(
-                        conversation_id = %row_id,
-                        error = %ErrorChain(&err),
-                        "Skipping unreadable conversation row in list"
-                    );
-                    continue;
-                }
-            };
-            self.backfill_extra_inplace(&row_id, &mut extra).await;
-            match row_to_response_with_extra(row, extra, &self.workspace_root) {
-                Ok(mut response) => {
-                    self.project_execution_relation(user_id, &mut response).await?;
-                    items.push(response);
-                }
-                Err(err) => warn!(
-                    conversation_id = %row_id,
-                    error = %ErrorChain(&err),
-                    "Skipping unreadable conversation row in list"
-                ),
-            }
+            let conversation_id = row.conversation_id.clone();
+            let extra: serde_json::Value = serde_json::from_str(&row.extra).map_err(|error| {
+                AppError::Internal(format!(
+                    "Conversation {conversation_id} has invalid extra JSON: {error}"
+                ))
+            })?;
+            let mut response =
+                row_to_response_with_extra(row, extra, &self.workspace_root)?;
+            self.project_execution_relation(user_id, &mut response).await?;
+            items.push(response);
         }
 
         Ok(PaginatedResult {
@@ -1860,7 +2074,7 @@ impl ConversationService {
         // Public PATCH cannot mutate or recycle the runtime snapshot owned by
         // an Execution Attempt. Backend-only metadata seams such as
         // `update_extra` remain separate and intentionally bypass this API.
-        self.ensure_not_retained_execution_attempt(user_id, &existing.id)
+        self.ensure_not_retained_execution_attempt(user_id, &existing.conversation_id)
             .await?;
 
         // Snapshot invariant: once written at create time, `extra.skills`
@@ -1868,6 +2082,8 @@ impl ConversationService {
         // conversation to produce a new snapshot.
         if let Some(incoming) = &req.extra
             && (incoming.get("skills").is_some()
+                || incoming.get("preset_enabled_skills").is_some()
+                || incoming.get("exclude_auto_inject_skills").is_some()
                 || incoming.get("mcp_server_ids").is_some()
                 || incoming.get("mcp_servers").is_some()
                 || incoming.get("mcp_statuses").is_some()
@@ -1879,6 +2095,7 @@ impl ConversationService {
         }
         if let Some(incoming) = &req.extra {
             reject_execution_policy_extra_keys(incoming)?;
+            reject_retired_skill_extra_keys(incoming)?;
         }
 
         // Type-aware rule: top-level `model` is nomi-only. For non-nomi
@@ -1891,21 +2108,44 @@ impl ConversationService {
                 existing.r#type
             )));
         }
+        if existing_type == AgentType::Acp
+            && let Some(incoming) = req.extra.as_ref()
+        {
+            // The conversation row and its 1:1 acp_session row must always
+            // point at the same logical agent parent. Agent replacement is an
+            // aggregate replacement, not a JSON patch.
+            reject_acp_identity_patch(incoming)?;
+        }
 
         let now = now_ms();
 
-        // Merge extra if provided. For nomi, strip `extra.model` post-merge
-        // so the row keeps a single canonical model source (top-level column).
+        if existing_type == AgentType::Nomi
+            && req
+                .extra
+                .as_ref()
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|object| object.contains_key("model"))
+        {
+            return Err(AppError::BadRequest(
+                "extra.model is not part of the v3 Nomi contract; use top-level model".to_owned(),
+            ));
+        }
+
+        // Merge canonical extra fields. Nomi model selection is never carried
+        // in this open JSON object.
         let merged_extra = if let Some(new_extra) = &req.extra {
             let mut existing_extra: serde_json::Value =
-                serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
-            merge_json(&mut existing_extra, new_extra);
-            if existing_type == AgentType::Nomi
-                && let Some(obj) = existing_extra.as_object_mut()
-                && obj.remove("model").is_some()
-            {
-                warn!("nomi update: stripped legacy `extra.model` from merged extra");
+                serde_json::from_str(&existing.extra).map_err(|error| {
+                    AppError::Internal(format!(
+                        "Conversation {id} has invalid extra JSON: {error}"
+                    ))
+                })?;
+            if !existing_extra.is_object() {
+                return Err(AppError::Internal(format!(
+                    "Conversation {id} extra must be a JSON object"
+                )));
             }
+            merge_json(&mut existing_extra, new_extra);
             if new_extra.get("workspace").is_some() {
                 normalize_workspace_extra(&mut existing_extra)?;
             }
@@ -1920,10 +2160,17 @@ impl ConversationService {
         // Handle pinned_at: set timestamp on pin, clear on unpin
         let pinned_at = req.pinned.map(|p| if p { Some(now) } else { None });
 
-        let model_changed = req.model.as_ref().is_some_and(|new_model| {
-            let new_json = serde_json::to_string(new_model).unwrap_or_default();
-            existing.model.as_deref() != Some(new_json.as_str())
-        });
+        let requested_model_json = req
+            .model
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| {
+                AppError::Internal(format!("Failed to serialize model: {error}"))
+            })?;
+        let model_changed = requested_model_json
+            .as_deref()
+            .is_some_and(|new_json| existing.model.as_deref() != Some(new_json));
 
         // A workspace repoint (e.g. binding a temporary session to a real
         // project directory) changes the agent's cwd — and, via the surface
@@ -1931,24 +2178,40 @@ impl ConversationService {
         // old cwd at build time, so it must be recycled for the change to take
         // effect on the next message (same rationale as the model-change termination
         // below). Detected by comparing the pre/post merged `extra.workspace`.
-        let workspace_changed = req.extra.as_ref().is_some_and(|e| e.get("workspace").is_some()) && {
-            let ws_of = |raw: &str| -> Option<String> {
-                serde_json::from_str::<serde_json::Value>(raw)
-                    .ok()
-                    .and_then(|v| v.get("workspace").and_then(|w| w.as_str()).map(str::to_owned))
+        let existing_extra_value: serde_json::Value =
+            serde_json::from_str(&existing.extra).map_err(|error| {
+                AppError::Internal(format!(
+                    "Conversation {id} has invalid extra JSON: {error}"
+                ))
+            })?;
+        let merged_extra_value = merged_extra
+            .as_deref()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .transpose()
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "Conversation {id} merged extra is invalid JSON: {error}"
+                ))
+            })?;
+        let workspace_changed = req
+            .extra
+            .as_ref()
+            .is_some_and(|extra| extra.get("workspace").is_some())
+            && {
+                let ws_of = |value: &serde_json::Value| {
+                    value
+                        .get("workspace")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                };
+                ws_of(&existing_extra_value)
+                    != merged_extra_value.as_ref().and_then(ws_of)
             };
-            let old_ws = ws_of(&existing.extra);
-            let new_ws = merged_extra.as_deref().and_then(ws_of);
-            old_ws != new_ws
-        };
         let preset_changed = req
             .extra
             .as_ref()
             .is_some_and(|extra| extra.get("preset_snapshot").is_some())
             && merged_extra.as_deref() != Some(existing.extra.as_str());
-        let merged_extra_value = merged_extra
-            .as_deref()
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
         let preset_id_update = req.extra.as_ref().and_then(|extra| {
             extra.get("preset_id").map(|_| {
                 merged_extra_value
@@ -1966,25 +2229,26 @@ impl ConversationService {
                     .and_then(serde_json::Value::as_i64)
             })
         });
-        let preset_snapshot_update = req.extra.as_ref().and_then(|extra| {
-            extra.get("preset_snapshot").map(|_| {
+        let preset_snapshot_update = req
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.get("preset_snapshot"))
+            .map(|_| {
                 merged_extra_value
                     .as_ref()
                     .and_then(|value| value.get("preset_snapshot"))
                     .filter(|value| !value.is_null())
-                    .and_then(|value| serde_json::to_string(value).ok())
-            })
-        });
-
-        let model_json = req
-            .model
-            .as_ref()
-            .map(|m| {
-                serde_json::to_string(m)
-                    .map(Some)
-                    .map_err(|e| AppError::Internal(format!("Failed to serialize model: {e}")))
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|error| {
+                        AppError::Internal(format!(
+                            "Failed to serialize preset snapshot: {error}"
+                        ))
+                    })
             })
             .transpose()?;
+
+        let model_json = requested_model_json.map(Some);
 
         let delegation_policy_changed = req
             .delegation_policy
@@ -2090,15 +2354,28 @@ impl ConversationService {
     #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id))]
     pub async fn update_extra(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), AppError> {
         reject_execution_policy_extra_keys(&patch)?;
+        reject_retired_skill_extra_keys(&patch)?;
 
         let existing = self
             .conversation_repo
             .get(parse_conv_id(conversation_id)?)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+        if string_to_enum::<AgentType>(&existing.r#type)? == AgentType::Acp {
+            reject_acp_identity_patch(&patch)?;
+        }
 
         let mut merged: serde_json::Value =
-            serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
+            serde_json::from_str(&existing.extra).map_err(|error| {
+                AppError::Internal(format!(
+                    "Conversation {conversation_id} has invalid extra JSON: {error}"
+                ))
+            })?;
+        if !merged.is_object() {
+            return Err(AppError::Internal(format!(
+                "Conversation {conversation_id} extra must be a JSON object"
+            )));
+        }
         merge_json(&mut merged, &patch);
         if patch.get("workspace").is_some() {
             normalize_workspace_extra(&mut merged)?;
@@ -2200,61 +2477,21 @@ impl ConversationService {
                 );
             }
 
-            let delete_timed_out = match tokio::time::timeout(
-                DELETE_CORE_GRACE,
-                service.conversation_repo.delete(&conversation_id),
-            )
-            .await
+            // The request waiter has its own hard bound, but this detached
+            // owner must let the explicit database transaction finish. Dropping
+            // the repository future on an inner timeout would lose the
+            // captured Cron IDs needed for post-commit scheduler/file cleanup.
+            let delete_cleanup = match service
+                .conversation_repo
+                .delete_with_cleanup(&conversation_id)
+                .await
             {
-                Ok(Ok(())) => false,
-                Ok(Err(error)) => {
+                Ok(cleanup) => cleanup,
+                Err(error) => {
                     let _ = result_tx.send(Err(error.into()));
                     return;
                 }
-                Err(_) => {
-                    warn!(
-                        conversation_id,
-                        "Core conversation delete timed out; verifying the serialized result in background"
-                    );
-                    true
-                }
             };
-
-            if delete_timed_out {
-                // SQLite may already have queued a command whose response
-                // future timed out. Keep the deletion tombstone owned until a
-                // later read, serialized behind that command, establishes
-                // whether deletion committed. This prevents a late delete from
-                // racing a newly admitted turn.
-                let mut retry_delay = Duration::from_millis(100);
-                loop {
-                    match tokio::time::timeout(
-                        DELETE_CLEANUP_ITEM_GRACE,
-                        service.conversation_repo.get(&conversation_id),
-                    )
-                    .await
-                    {
-                        Ok(Ok(None)) => break,
-                        Ok(Ok(Some(_))) => {
-                            let _ = result_tx.send(Err(AppError::Timeout(
-                                "conversation delete timed out without deleting the row".to_owned(),
-                            )));
-                            return;
-                        }
-                        Ok(Err(error)) => warn!(
-                            conversation_id,
-                            error = %ErrorChain(&error),
-                            "Failed to verify timed-out conversation delete"
-                        ),
-                        Err(_) => warn!(
-                            conversation_id,
-                            "Timed out verifying timed-out conversation delete; retaining the deletion fence and retrying"
-                        ),
-                    }
-                    tokio::time::sleep(retry_delay).await;
-                    retry_delay = (retry_delay * 2).min(Duration::from_secs(2));
-                }
-            }
 
             deletion_guard.commit();
             service.runtime_state.clear_knowledge_signature(&conversation_id);
@@ -2349,14 +2586,19 @@ impl ConversationService {
                 ),
             }
 
+            let deleted_cron_job_ids: Arc<[String]> = delete_cleanup.into();
             for hook in hooks {
-                if tokio::time::timeout(
-                    DELETE_CLEANUP_ITEM_GRACE,
-                    hook.on_conversation_deleted(&user_id, &conversation_id),
-                )
-                .await
-                .is_err()
-                {
+                let hook_timed_out = DELETED_CRON_JOB_IDS
+                    .scope(Arc::clone(&deleted_cron_job_ids), async {
+                        tokio::time::timeout(
+                            DELETE_CLEANUP_ITEM_GRACE,
+                            hook.on_conversation_deleted(&user_id, &conversation_id),
+                        )
+                        .await
+                        .is_err()
+                    })
+                    .await;
+                if hook_timed_out {
                     warn!(conversation_id, "Conversation delete hook exceeded its hard bound");
                 }
             }
@@ -2365,7 +2607,7 @@ impl ConversationService {
         result_rx
     }
 
-    /// Delete a conversation (messages cascade via FK).
+    /// Delete a conversation and run repository-owned logical-reference cleanup.
     ///
     /// Broadcasts `conversation.listChanged(deleted)`.
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
@@ -2400,9 +2642,10 @@ impl ConversationService {
         let source: Option<ConversationSource> = existing
             .source
             .as_deref()
-            .and_then(|s| string_to_enum::<ConversationSource>(s).ok());
+            .map(string_to_enum::<ConversationSource>)
+            .transpose()?;
         let managed_temp_workspace =
-            managed_temp_workspace_path_from_row(&self.workspace_root, &existing);
+            managed_temp_workspace_path_from_row(&self.workspace_root, &existing)?;
 
         let delete_rx = self.spawn_conversation_delete_owner(
             deletion_guard,
@@ -2442,12 +2685,10 @@ impl ConversationService {
 
     /// Create a conversation from a `CloneConversationRequest`.
     ///
-    /// Historically this method supported cloning from a source conversation
-    /// (inheriting name / extra / cron binding). That use case has been
-    /// removed — the method is retained only because `POST
-    /// /api/conversations/clone` has three active callers
-    /// (`_AddNewConversation`, Agent runtime registry, legacy repo shim) that
-    /// send a pre-built payload shape. New code should prefer `create`.
+    /// Source-conversation inheritance (name, `extra`, or cron binding) is not
+    /// supported. This method remains the boundary for active callers of
+    /// `POST /api/conversations/clone` that already provide a complete payload;
+    /// new code should prefer `create`.
     pub async fn clone_create(
         &self,
         user_id: &str,
@@ -2510,7 +2751,12 @@ impl ConversationService {
         user_id: &str,
         cron_job_id: &str,
     ) -> Result<Vec<ConversationResponse>, AppError> {
-        let rows = self.conversation_repo.list_by_cron_job(user_id, cron_job_id).await?;
+        let cron_job_id = CronJobId::parse(cron_job_id)
+            .map_err(|error| AppError::BadRequest(format!("invalid cron_job_id: {error}")))?;
+        let rows = self
+            .conversation_repo
+            .list_by_cron_job(user_id, cron_job_id.as_str())
+            .await?;
         let mut responses = Vec::with_capacity(rows.len());
         for row in rows {
             let mut response = row_to_response(row, &self.workspace_root)?;
@@ -2545,14 +2791,14 @@ impl ConversationService {
                 // green local-artifact projection. Passing `None` below
                 // deterministically downgrades every affected tool message.
                 warn!(
-                    conversation_id = %conversation.id,
+                    conversation_id = %conversation.conversation_id,
                     %reason,
                     "Conversation history has local artifact receipts without a usable workspace"
                 );
                 None
             }
         };
-        let conversation_id = conversation.id.clone();
+        let conversation_id = conversation.conversation_id.clone();
         let (projected, invalidated) = tokio::task::spawn_blocking(move || {
             let store = workspace.map(ArtifactStore::new);
             let mut invalidated = 0usize;
@@ -2606,8 +2852,8 @@ impl ConversationService {
         // loaded message) to page older. page/page_size offset pagination is
         // bypassed; `page_size` is the window size. `total` is not computed —
         // the client drives "load older" off `has_more` and derives the next
-        // cursor from items[0]. `cursor: None` keeps the legacy offset path so
-        // other callers are unaffected.
+        // cursor from items[0]. `cursor: None` keeps the offset-pagination path
+        // for callers that have not opted into keyset pagination.
         if let Some(cursor) = query.cursor.as_deref() {
             let limit = query.page_size.unwrap_or(40);
             let before = if cursor.trim().is_empty() {
@@ -2773,7 +3019,10 @@ impl ConversationService {
         items.sort_by(|left, right| {
             left.created_at
                 .cmp(&right.created_at)
-                .then_with(|| left.id.cmp(&right.id))
+                .then_with(|| {
+                    left.conversation_artifact_id
+                        .cmp(&right.conversation_artifact_id)
+                })
         });
 
         Ok(items)
@@ -2784,11 +3033,14 @@ impl ConversationService {
         &self,
         user_id: &str,
         conversation_id: &str,
-        artifact_id: &str,
+        conversation_artifact_id: &str,
         req: UpdateConversationArtifactRequest,
     ) -> Result<ConversationArtifactResponse, AppError> {
-        let artifact_id = ConversationArtifactId::try_from(artifact_id)
-            .map_err(|_| AppError::BadRequest(format!("invalid artifact id: {artifact_id}")))?;
+        validate_uuidv7(conversation_artifact_id).map_err(|error| {
+            AppError::BadRequest(format!(
+                "invalid conversation_artifact_id '{conversation_artifact_id}': {error}"
+            ))
+        })?;
         self.conversation_repo
             .get(parse_conv_id(conversation_id)?)
             .await?
@@ -2804,12 +3056,16 @@ impl ConversationService {
             .conversation_repo
             .update_artifact_status(
                 parse_conv_id(conversation_id)?,
-                artifact_id.as_ref(),
+                conversation_artifact_id,
                 &status,
                 now_ms(),
             )
             .await?
-            .ok_or_else(|| AppError::NotFound(format!("Artifact {artifact_id} not found")))?;
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "Conversation artifact {conversation_artifact_id} not found"
+                ))
+            })?;
 
         let response = row_to_artifact_response(row)?;
         self.user_events.send_to_user(
@@ -3183,7 +3439,8 @@ impl ConversationService {
         })
         .to_string();
         let candidate = MessageRow {
-            id: message_id.clone(),
+            id: 0,
+            message_id: message_id.clone(),
             conversation_id: conversation_id.to_owned(),
             msg_id: Some(message_id),
             r#type: "text".to_owned(),
@@ -3216,7 +3473,10 @@ impl ConversationService {
         let row = projected.message;
         let data = serde_json::from_str::<serde_json::Value>(&row.content)
             .unwrap_or_else(|_| serde_json::json!({ "content": row.content }));
-        let stable_message_id = row.msg_id.clone().unwrap_or_else(|| row.id.clone());
+        let stable_message_id = row
+            .msg_id
+            .clone()
+            .unwrap_or_else(|| row.message_id.clone());
         self.user_events.send_to_user(
             user_id,
             WebSocketMessage::new(
@@ -3239,7 +3499,7 @@ impl ConversationService {
                 }),
             ),
         );
-        Ok(row.id)
+        Ok(row.message_id)
     }
 
     pub(crate) async fn idempotent_delivery_result(
@@ -3297,7 +3557,7 @@ impl ConversationService {
             .await?
             .filter(|r| r.user_id == user_id)
             .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
-        let conversation_key = row.id.clone();
+        let conversation_key = row.conversation_id.clone();
         if let Some(lease) = runtime_build_lease.as_ref() {
             lease.ensure_active()?;
         }
@@ -3326,22 +3586,8 @@ impl ConversationService {
                 .await?;
         }
 
-        // Short-circuit for legacy Gemini conversations: the dedicated Gemini
-        // runtime has been removed, so we cannot build an agent for this row.
-        // Emit CONVERSATION_ARCHIVED (HTTP 410 Gone) without touching the
-        // legacy `model` column, which may hold shapes the new parser can't
-        // deserialize. The client identifies this case by `code` and renders
-        // a dedicated archived-conversation UI rather than a generic banner.
-        if row.r#type == "gemini" {
-            return Err(AppError::ConversationArchived(
-                "This conversation was created with the legacy Gemini runtime, which has been \
-                 removed. Please start a new conversation with the Gemini ACP backend to continue."
-                    .into(),
-            ));
-        }
-
         let track_execution_tokens = self
-            .is_active_execution_attempt_conversation(user_id, &row.id)
+            .is_active_execution_attempt_conversation(user_id, &row.conversation_id)
             .await?;
 
         let user_msg_id = durable_delivery
@@ -3350,7 +3596,7 @@ impl ConversationService {
             .unwrap_or_else(Self::mint_msg_id);
         let existing_user_message = self
             .conversation_repo
-            .get_message(&row.id, &user_msg_id)
+            .get_message(&row.conversation_id, &user_msg_id)
             .await?;
         if let Some(existing) = existing_user_message.as_ref() {
             let expected_content = serde_json::json!({ "content": &req.content }).to_string();
@@ -3466,12 +3712,11 @@ impl ConversationService {
         let turn_cancellation = turn_handle.turn_cancellation();
         let turn_token = turn_handle.cancellation_token();
 
-        // Store user message. `msg_id` is server-generated so the WebSocket
-        // stream, DB row, and client-side message index all agree on the same
-        // key. We reuse the same value for `id` (primary key) and `msg_id`
-        // to preserve legacy callers that still rely on `id == msg_id`.
+        // Store the user message. SQLite allocates the technical `id`; the
+        // server-generated UUIDv7 `message_id` is the stable external key.
         let user_msg = nomifun_db::models::MessageRow {
-            id: user_msg_id.clone(),
+            id: 0,
+            message_id: user_msg_id.clone(),
             conversation_id: conversation_id.to_owned(),
             msg_id: Some(user_msg_id.clone()),
             r#type: "text".into(),
@@ -3720,8 +3965,9 @@ impl ConversationService {
                 hook.on_turn_start(&conv_id);
             }
 
-            // If the factory resolved a different workspace (e.g. auto-created temp
-            // dir for a legacy conversation with empty workspace), persist it back.
+            // If the factory resolved a different workspace (for example, an
+            // auto-created temp directory for a row with no stored workspace),
+            // persist it back.
             if let Err(err) = service
                 .maybe_persist_workspace(&conv_id, &stored_workspace, agent.workspace())
                 .await
@@ -4555,7 +4801,8 @@ impl ConversationService {
         }
 
         let message = nomifun_db::models::MessageRow {
-            id: message_id.clone(),
+            id: 0,
+            message_id: message_id.clone(),
             conversation_id: conv_id.to_owned(),
             msg_id: Some(message_id.clone()),
             r#type: "text".into(),
@@ -4701,7 +4948,8 @@ impl ConversationService {
         // `send_message`.
         let user_msg_id = Self::mint_msg_id();
         let user_msg = nomifun_db::models::MessageRow {
-            id: user_msg_id.clone(),
+            id: 0,
+            message_id: user_msg_id.clone(),
             conversation_id: conv_id.to_owned(),
             msg_id: Some(user_msg_id.clone()),
             r#type: "text".into(),
@@ -4756,7 +5004,10 @@ impl ConversationService {
             return;
         };
 
-        let msg_id = row.msg_id.clone().unwrap_or_else(|| row.id.clone());
+        let msg_id = row
+            .msg_id
+            .clone()
+            .unwrap_or_else(|| row.message_id.clone());
         let content_value: serde_json::Value =
             serde_json::from_str(&row.content).unwrap_or_else(|_| serde_json::Value::String(row.content.clone()));
         self.user_events.send_to_user(
@@ -4830,12 +5081,12 @@ impl ConversationService {
         let Some(target) = latest_user else {
             return Err(AppError::BadRequest("No editable user message found".into()));
         };
-        if target.id != message_id {
+        if target.message_id != message_id {
             return Err(AppError::BadRequest(
                 "Only the most recent user message can be edited".into(),
             ));
         }
-        let (from_created_at, from_id) = (target.created_at, target.id.clone());
+        let (from_created_at, from_id) = (target.created_at, target.message_id.clone());
 
         // 4. 取在飞 agent 并回退最后一个 turn（内部会先停掉在飞 turn）。
         let agent = self.runtime_handle(conversation_id)?;
@@ -5264,7 +5515,7 @@ impl ConversationService {
             if origin == CancelOrigin::User {
                 tokio::time::timeout(
                     CANCEL_AUTH_PREFLIGHT_GRACE,
-                    self.ensure_not_retained_execution_attempt(user_id, &conversation.id),
+                    self.ensure_not_retained_execution_attempt(user_id, &conversation.conversation_id),
                 )
                 .await
                 .map_err(|_| {
@@ -5454,7 +5705,7 @@ impl ConversationService {
             .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
         lease.ensure_active()?;
 
-        self.ensure_not_retained_execution_attempt(user_id, &row.id)
+        self.ensure_not_retained_execution_attempt(user_id, &row.conversation_id)
             .await?;
         lease.ensure_active()?;
 
@@ -5530,7 +5781,7 @@ impl ConversationService {
             // into execution. Preserve only the server-minted managed-workspace
             // identity; dropping it would force the factory to invent or reuse
             // an unowned fallback path.
-            let temp_workspace_id = require_temp_workspace_id(&extra, &row.id)?;
+            let temp_workspace_id = require_temp_workspace_id(&extra, &row.conversation_id)?;
             extra = serde_json::json!({
                 TEMP_WORKSPACE_ID_EXTRA_KEY: temp_workspace_id,
             });
@@ -5560,7 +5811,7 @@ impl ConversationService {
                 _ => {
                     return Err(AppError::Internal(format!(
                         "conversation {} has neither a custom workspace nor a canonical temp_workspace_id",
-                        row.id
+                        row.conversation_id
                     )));
                 }
             }
@@ -5571,7 +5822,7 @@ impl ConversationService {
             agent_type,
             workspace,
             model,
-            conversation_id: row.id.to_string(),
+            conversation_id: row.conversation_id.clone(),
             delegation_policy,
             extra,
             // Stamp/validate the nomi session against this conversation instance.
@@ -5605,7 +5856,7 @@ impl ConversationService {
             if workspace != expected_workspace {
                 return Err(AppError::Internal(format!(
                     "conversation {} resolved a managed workspace outside the current work root",
-                    row.id
+                    row.conversation_id
                 )));
             }
             workspace
@@ -5621,12 +5872,19 @@ impl ConversationService {
             return Ok(());
         }
 
-        let Some(rel_dirs) = native_skills_dirs(
-            &self.agent_metadata_repo,
-            &runtime_options.agent_type,
-            runtime_options.extra.get("backend"),
-        )
-        .await
+        let acp_agent = if runtime_options.agent_type == AgentType::Acp {
+            Some(
+                resolve_acp_agent_metadata(
+                    &self.agent_metadata_repo,
+                    &runtime_options.extra,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let Some(rel_dirs) =
+            native_skills_dirs(&runtime_options.agent_type, acp_agent.as_ref())
         else {
             return Ok(());
         };
@@ -5645,7 +5903,7 @@ impl ConversationService {
             .link_workspace_skills(&workspace, &rel_dirs_refs, &resolved)
             .await;
         debug!(
-            conversation_id = %row.id,
+            conversation_id = %row.conversation_id,
             workspace = %workspace.display(),
             links = n,
             "ensured skill symlinks in auto workspace"
@@ -5712,7 +5970,7 @@ impl ConversationService {
         // `is_temporary_workspace` flag — to the `__default__` sentinel, and
         // every user-chosen directory to its normalized key. The knowledge
         // service looks up the `('workpath', key)` row first and only falls
-        // back to the legacy `('conversation', id)` binding on a full miss.
+        // back to the supported conversation-scoped binding on a full miss.
         // Companion sessions keep their `('companion', companion_id)` binding unchanged — they
         // are not per-workspace.
         let preset_binding = runtime_options
@@ -5800,7 +6058,7 @@ impl ConversationService {
             return;
         }
         debug!(
-            conversation_id = %row.id,
+            conversation_id = %row.conversation_id,
             target_kind,
             target_id = %target_id,
             mounts = outcome.mounts.len(),
@@ -5902,7 +6160,7 @@ impl ConversationService {
                 writeback_mode,
                 writeback_eagerness,
                 channel_write_enabled,
-                kb_ids: mounts.iter().map(|m| m.id.clone()).collect(),
+                kb_ids: mounts.iter().map(|m| m.knowledge_base_id.clone()).collect(),
                 ..Default::default()
             },
             surface,
@@ -5917,9 +6175,9 @@ impl ConversationService {
     /// Write the resolved workspace back to `conversation.extra.workspace` when
     /// the factory picked a different (auto-generated) path than what was stored.
     ///
-    /// This handles legacy conversations whose `extra.workspace` was empty:
-    /// the factory creates a temp dir at task-build time, and we persist that
-    /// path here so the frontend can display the workspace panel correctly.
+    /// This handles any accepted row whose `extra.workspace` is empty: the
+    /// factory creates a temp directory at task-build time, and this persists
+    /// the resolved path for subsequent runtime and frontend reads.
     async fn maybe_persist_workspace(
         &self,
         conversation_id: &str,
@@ -5937,7 +6195,16 @@ impl ConversationService {
             .await?
             .ok_or_else(|| AppError::Internal("Conversation vanished during workspace sync".into()))?;
 
-        let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
+        let mut extra: serde_json::Value = serde_json::from_str(&row.extra).map_err(|error| {
+            AppError::Internal(format!(
+                "Conversation {conversation_id} has invalid extra JSON: {error}"
+            ))
+        })?;
+        if !extra.is_object() {
+            return Err(AppError::Internal(format!(
+                "Conversation {conversation_id} extra must be a JSON object"
+            )));
+        }
         extra["workspace"] = serde_json::Value::String(resolved_workspace.to_owned());
 
         let extra_json =
@@ -5989,38 +6256,16 @@ impl ConversationService {
         }
     }
 
-    /// Backfill `extra.skills` if the row predates the snapshot model.
-    /// Persists the mutation asynchronously; failures are logged and
-    /// swallowed so a read path never 500s because of a backfill write
-    /// failure.
-    async fn backfill_extra_inplace(&self, conversation_id: &str, extra: &mut serde_json::Value) {
-        let auto_inject = self.skill_resolver.auto_inject_names().await;
-        let mutated = backfill_skills_if_missing(extra, &auto_inject);
-        if !mutated {
-            return;
-        }
-        let serialized = match serde_json::to_string(extra) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(
-                    conversation_id,
-                    error = %ErrorChain(&e),
-                    "backfill serialize failed; returning in-memory value"
-                );
-                return;
-            }
-        };
-        let update = ConversationRowUpdate {
-            extra: Some(serialized),
-            ..Default::default()
-        };
-        if let Err(e) = self.conversation_repo.update(conversation_id, &update).await {
-            warn!(
-                conversation_id,
-                error = %ErrorChain(&e),
-                "backfill persist failed; returning in-memory value"
-            );
-        }
+}
+
+fn take_string_array(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Vec<String>, AppError> {
+    match object.remove(key) {
+        Some(value) => serde_json::from_value(value)
+            .map_err(|error| AppError::BadRequest(format!("Invalid extra.{key}: {error}"))),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -6078,20 +6323,20 @@ fn validate_runtime_workspace_path(workspace: &str) -> Result<String, AppError> 
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-fn allocate_temp_workspace_id(workspace_root: &Path, label: &str) -> (String, PathBuf) {
+fn allocate_temp_workspace_id(workspace_root: &Path) -> (String, PathBuf) {
     loop {
-        let temp_workspace_id = generate_prefixed_id("ws");
-        let path = auto_temp_workspace_path(workspace_root, label, &temp_workspace_id);
+        let temp_workspace_id = generate_id();
+        let path = auto_temp_workspace_path(workspace_root, &temp_workspace_id);
         if !path.exists() {
             return (temp_workspace_id, path);
         }
     }
 }
 
-fn auto_temp_workspace_path(workspace_root: &Path, label: &str, temp_workspace_id: &str) -> PathBuf {
+fn auto_temp_workspace_path(workspace_root: &Path, temp_workspace_id: &str) -> PathBuf {
     workspace_root
         .join("conversations")
-        .join(format!("{label}-temp-{temp_workspace_id}"))
+        .join(temp_workspace_id)
 }
 
 fn temp_workspace_id_from_extra(extra: &serde_json::Value) -> Option<&str> {
@@ -6116,7 +6361,7 @@ fn require_temp_workspace_id<'a>(
             "conversation {conversation_id} has no canonical temp_workspace_id for its managed workspace"
         ))
     })?;
-    validate_prefixed_id(value, "ws").map_err(|error| {
+    validate_uuidv7(value).map_err(|error| {
         AppError::Internal(format!(
             "conversation {conversation_id} has invalid temp_workspace_id '{value}': {error}"
         ))
@@ -6130,13 +6375,9 @@ fn auto_workspace_path_for_row(
     agent_type: &AgentType,
     extra: &serde_json::Value,
 ) -> Result<PathBuf, AppError> {
-    let label = conversation_label(agent_type, extra.get("backend"));
-    let temp_workspace_id = require_temp_workspace_id(extra, &row.id)?;
-    Ok(auto_temp_workspace_path(
-        workspace_root,
-        &label,
-        temp_workspace_id,
-    ))
+    let temp_workspace_id = require_temp_workspace_id(extra, &row.conversation_id)?;
+    let _ = agent_type;
+    Ok(auto_temp_workspace_path(workspace_root, temp_workspace_id))
 }
 
 /// Resolve the authoritative workspace used to validate host-local receipts in
@@ -6167,13 +6408,24 @@ fn history_artifact_workspace(
         .map_err(|error| error.to_string())
 }
 
-fn managed_temp_workspace_path_from_row(workspace_root: &Path, row: &ConversationRow) -> Option<PathBuf> {
-    let extra: serde_json::Value = serde_json::from_str(&row.extra).ok()?;
-    let temp_workspace_id = require_temp_workspace_id(&extra, &row.id).ok()?;
-    let agent_type: AgentType = string_to_enum(&row.r#type).ok()?;
-    let label = conversation_label(&agent_type, extra.get("backend"));
-    let expected = auto_temp_workspace_path(workspace_root, &label, temp_workspace_id);
-    Some(expected)
+fn managed_temp_workspace_path_from_row(
+    workspace_root: &Path,
+    row: &ConversationRow,
+) -> Result<Option<PathBuf>, AppError> {
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).map_err(|error| {
+        AppError::Internal(format!(
+            "Conversation {} has invalid extra JSON: {error}",
+            row.conversation_id
+        ))
+    })?;
+    if !temp_workspace_marker_present(&extra) {
+        return Ok(None);
+    }
+    let temp_workspace_id = require_temp_workspace_id(&extra, &row.conversation_id)?;
+    Ok(Some(auto_temp_workspace_path(
+        workspace_root,
+        temp_workspace_id,
+    )))
 }
 
 fn rebase_managed_workspace_in_row(
@@ -6195,22 +6447,6 @@ fn rebase_managed_workspace_in_row(
     Ok(())
 }
 
-/// Compute the label used in auto-provisioned workspace directory names.
-///
-/// For ACP conversations the label is the vendor string from
-/// `extra.backend` (e.g. `"claude"`); otherwise the `AgentType` serde
-/// name (e.g. `"nomi"`). Falls back to the agent type's serde name
-/// when the backend field is missing or not a string.
-fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value>) -> String {
-    if *agent_type == AgentType::Acp
-        && let Some(serde_json::Value::String(s)) = backend
-        && !s.is_empty()
-    {
-        return s.clone();
-    }
-    agent_type.serde_name().to_owned()
-}
-
 /// Resolve the native skills directory list for an agent by looking it
 /// up in the `agent_metadata` catalog (ACP vendors) or the bundled
 /// `AgentType` table (non-ACP built-ins).
@@ -6218,18 +6454,14 @@ fn conversation_label(agent_type: &AgentType, backend: Option<&serde_json::Value
 /// Returns `None` when the agent does not support native skill
 /// discovery — callers should then skip the workspace-symlink step and
 /// rely on prompt injection instead.
-async fn native_skills_dirs(
-    repo: &Arc<dyn IAgentMetadataRepository>,
+fn native_skills_dirs(
     agent_type: &AgentType,
-    backend: Option<&serde_json::Value>,
+    acp_agent: Option<&AgentMetadataRow>,
 ) -> Option<Vec<String>> {
-    if *agent_type == AgentType::Acp
-        && let Some(serde_json::Value::String(vendor)) = backend
-        && !vendor.is_empty()
-    {
-        let row = repo.find_builtin_by_backend(vendor).await.ok().flatten()?;
-        let raw = row.native_skills_dirs?;
-        return serde_json::from_str::<Vec<String>>(&raw).ok();
+    if *agent_type == AgentType::Acp {
+        let row = acp_agent?;
+        let raw = row.native_skills_dirs.as_deref()?;
+        return serde_json::from_str::<Vec<String>>(raw).ok();
     }
     agent_type
         .native_skills_dirs()
@@ -6254,42 +6486,33 @@ async fn resolve_acp_mcp_support_policy(
     repo: &Arc<dyn IAgentMetadataRepository>,
     extra: &serde_json::Value,
 ) -> Result<McpSupportPolicy, AppError> {
-    let agent_id = extra
-        .get("agent_id")
-        .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.is_empty());
-    let backend = extra
-        .get("backend")
-        .and_then(serde_json::Value::as_str)
-        .filter(|s| !s.is_empty());
-    let agent_source = extra
-        .get("agent_source")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("builtin");
-
-    let row = match agent_id {
-        Some(id) => repo
-            .get(id)
-            .await
-            .map_err(|e| AppError::Internal(format!("agent_metadata lookup: {e}")))?,
-        None if agent_source == "builtin" => match backend {
-            Some(vendor) => repo
-                .find_builtin_by_backend(vendor)
-                .await
-                .map_err(|e| AppError::Internal(format!("agent_metadata lookup: {e}")))?,
-            None => None,
-        },
-        None => None,
-    };
-
-    let capabilities = row
-        .as_ref()
+    let row = resolve_acp_agent_metadata(repo, extra).await?;
+    let capabilities = Some(&row)
         .and_then(|row| row.agent_capabilities.as_deref())
         .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
         .map(|value| parse_acp_mcp_capabilities(&value))
         .unwrap_or_default();
 
     Ok(McpSupportPolicy::from_acp_capabilities(capabilities))
+}
+
+async fn resolve_acp_agent_metadata(
+    repo: &Arc<dyn IAgentMetadataRepository>,
+    extra: &serde_json::Value,
+) -> Result<AgentMetadataRow, AppError> {
+    let agent_id =
+        required_trimmed_extra_string(extra, "agent_id", "ACP conversation")?;
+    let row = repo
+        .get(agent_id)
+        .await
+        .map_err(|error| AppError::Internal(format!("agent_metadata lookup: {error}")))?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "ACP extra.agent_id '{agent_id}' does not exist"
+            ))
+        })?;
+    validate_acp_agent_metadata_row(&row, extra)?;
+    Ok(row)
 }
 
 fn upsert_conversation_mcp_status(
@@ -6311,7 +6534,8 @@ fn classify_repo_mcp_status(
 ) -> ConversationMcpStatus {
     if !support.supports_row_transport(&row.transport_type) {
         return ConversationMcpStatus {
-            id: row.id.to_string(),
+            mcp_server_id: McpServerId::parse(row.mcp_server_id.clone())
+                .expect("repository MCP IDs must be canonical UUIDv7"),
             name: row.name.clone(),
             status: ConversationMcpStatusKind::Unsupported,
             reason: Some(format!(
@@ -6323,13 +6547,15 @@ fn classify_repo_mcp_status(
 
     match validate_repo_transport(row.transport_type.as_str(), &row.transport_config) {
         Ok(()) => ConversationMcpStatus {
-            id: row.id.to_string(),
+            mcp_server_id: McpServerId::parse(row.mcp_server_id.clone())
+                .expect("repository MCP IDs must be canonical UUIDv7"),
             name: row.name.clone(),
             status: ConversationMcpStatusKind::Loaded,
             reason: None,
         },
         Err(reason) => ConversationMcpStatus {
-            id: row.id.to_string(),
+            mcp_server_id: McpServerId::parse(row.mcp_server_id.clone())
+                .expect("repository MCP IDs must be canonical UUIDv7"),
             name: row.name.clone(),
             status: ConversationMcpStatusKind::Failed,
             reason: Some(reason),
@@ -6346,7 +6572,7 @@ fn classify_session_mcp_status(server: &SessionMcpServer, support: McpSupportPol
             SessionMcpTransport::StreamableHttp { .. } => "streamable_http",
         };
         return ConversationMcpStatus {
-            id: server.id.clone(),
+            mcp_server_id: server.mcp_server_id.clone(),
             name: server.name.clone(),
             status: ConversationMcpStatusKind::Unsupported,
             reason: Some(format!("transport '{transport}' is not supported by this agent")),
@@ -6355,13 +6581,13 @@ fn classify_session_mcp_status(server: &SessionMcpServer, support: McpSupportPol
 
     match validate_session_transport(&server.transport) {
         Ok(()) => ConversationMcpStatus {
-            id: server.id.clone(),
+            mcp_server_id: server.mcp_server_id.clone(),
             name: server.name.clone(),
             status: ConversationMcpStatusKind::Loaded,
             reason: None,
         },
         Err(reason) => ConversationMcpStatus {
-            id: server.id.clone(),
+            mcp_server_id: server.mcp_server_id.clone(),
             name: server.name.clone(),
             status: ConversationMcpStatusKind::Failed,
             reason: Some(reason),
@@ -6441,10 +6667,9 @@ fn enum_to_db<T: serde::Serialize>(val: &T) -> Result<String, AppError> {
         .ok_or_else(|| AppError::Internal("Expected string enum value".into()))
 }
 
-/// Execution preferences and execution identity are typed columns/relations,
-/// never open-ended Agent factory data. Rejecting these keys prevents clients
-/// from recreating the retired dual-source contract after migration 037 has
-/// removed it from every existing row.
+/// Execution preferences and execution identity are typed v3 columns/relations,
+/// never open-ended Agent factory data. Rejecting these keys preserves one
+/// canonical durable source of truth.
 fn reject_execution_policy_extra_keys(extra: &serde_json::Value) -> Result<(), AppError> {
     let Some(object) = extra.as_object() else {
         return Ok(());
@@ -6470,6 +6695,29 @@ fn reject_execution_policy_extra_keys(extra: &serde_json::Value) -> Result<(), A
     }
 }
 
+/// The v3 skill snapshot contract has no aliases or cache payload. These keys
+/// are rejected at every service write boundary rather than interpreted,
+/// persisted, or silently removed.
+fn reject_retired_skill_extra_keys(extra: &serde_json::Value) -> Result<(), AppError> {
+    let Some(object) = extra.as_object() else {
+        return Ok(());
+    };
+    let retired = [
+        "enabled_skills",
+        "exclude_builtin_skills",
+        "loaded_skills",
+    ]
+    .into_iter()
+    .find(|key| object.contains_key(*key));
+
+    match retired {
+        Some(key) => Err(AppError::BadRequest(format!(
+            "`extra.{key}` is not part of the v3 conversation skill contract"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Persist the agent's session key into `conversation.extra.sessionKey`.
 ///
 /// Called after send_message completes so the session can be resumed
@@ -6483,7 +6731,22 @@ async fn persist_session_key(repo: &Arc<dyn IConversationRepository>, conversati
         _ => return,
     };
 
-    let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
+    let mut extra: serde_json::Value =
+        match serde_json::from_str::<serde_json::Value>(&row.extra) {
+        Ok(extra) if extra.is_object() => extra,
+        Ok(_) => {
+            warn!(conversation_id, "Refusing to persist session key: conversation extra is not an object");
+            return;
+        }
+        Err(error) => {
+            warn!(
+                conversation_id,
+                error = %ErrorChain(&error),
+                "Refusing to persist session key over invalid conversation extra JSON"
+            );
+            return;
+        }
+    };
 
     if extra.get("sessionKey").and_then(|v| v.as_str()) == Some(session_key) {
         return;
@@ -6521,7 +6784,7 @@ fn merge_json(base: &mut serde_json::Value, patch: &serde_json::Value) {
 }
 
 /// Parse a message keyset cursor `"<created_at_ms>:<id>"` — the oldest message
-/// currently loaded in the client. The id (`msg_{uuidv7}`) contains no `:`, so
+/// currently loaded in the client. The UUIDv7 message ID contains no `:`, so
 /// splitting on the first `:` is unambiguous.
 fn parse_message_cursor(cursor: &str) -> Result<(i64, String), AppError> {
     let (created_at, id) = cursor
@@ -6673,7 +6936,7 @@ fn log_conversation_created(response: &ConversationResponse, extra: &serde_json:
     let lineage = PresetLineage::from_response_and_extra(response, extra);
     if lineage.has_any_identity() {
         info!(
-            conversation_id = %response.id,
+            conversation_id = %response.conversation_id,
             agent_type = lineage.agent_type,
             preset_id = lineage.preset_id,
             custom_agent_id = lineage.custom_agent_id,
@@ -6686,7 +6949,7 @@ fn log_conversation_created(response: &ConversationResponse, extra: &serde_json:
         );
     } else {
         info!(
-            conversation_id = %response.id,
+            conversation_id = %response.conversation_id,
             agent_type = lineage.agent_type,
             "Conversation created (no preset)"
         );
@@ -6704,26 +6967,28 @@ fn is_tool_message_type(message_type: MessageType) -> bool {
 /// is rejected instead of silently becoming an empty selection.
 fn parse_selected_mcp_server_ids(
     obj: &mut serde_json::Map<String, serde_json::Value>,
-) -> Result<Option<Vec<McpServerId>>, AppError> {
+) -> Result<Option<Vec<String>>, AppError> {
     let Some(value) = obj.remove("selected_mcp_server_ids") else {
         return Ok(None);
     };
     let serde_json::Value::Array(items) = value else {
         return Err(AppError::BadRequest(
-            "selected_mcp_server_ids must be an array of canonical MCP server IDs".into(),
+            "selected_mcp_server_ids must be an array of canonical lowercase UUIDv7 MCP server IDs".into(),
         ));
     };
     let ids = items
         .into_iter()
         .enumerate()
         .map(|(index, value)| match value {
-            serde_json::Value::String(id) => McpServerId::parse(id).map_err(|error| {
-                AppError::BadRequest(format!(
-                    "selected_mcp_server_ids[{index}] is invalid: {error}"
-                ))
-            }),
+            serde_json::Value::String(id) => McpServerId::parse(id)
+                .map(McpServerId::into_string)
+                .map_err(|error| {
+                    AppError::BadRequest(format!(
+                        "selected_mcp_server_ids[{index}] must be a canonical lowercase UUIDv7: {error}"
+                    ))
+                }),
             _ => Err(AppError::BadRequest(format!(
-                "selected_mcp_server_ids[{index}] must be a string"
+                "selected_mcp_server_ids[{index}] must be a UUIDv7 string"
             ))),
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -6735,8 +7000,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const PROVIDER_ID_1: &str = "prov_0190f5fe-7c00-7a00-8000-000000000001";
-    const PROVIDER_ID_2: &str = "prov_0190f5fe-7c00-7a00-8000-000000000002";
+    const PROVIDER_ID_1: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const PROVIDER_ID_2: &str = "0190f5fe-7c00-7a00-8000-000000000002";
 
     #[test]
     fn enum_to_db_agent_type() {
@@ -6809,22 +7074,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_selected_mcp_ids_accepts_canonical_string_array() {
-        let first = McpServerId::new();
-        let second = McpServerId::new();
+    fn parse_selected_mcp_ids_accepts_canonical_uuidv7_array() {
+        let first = "0190f5fe-7c00-7a00-8000-000000000123";
+        let second = "0190f5fe-7c00-7a00-8000-000000000999";
         let mut obj = json!({ "selected_mcp_server_ids": [first, second] })
             .as_object()
             .unwrap()
             .clone();
         assert_eq!(
             parse_selected_mcp_server_ids(&mut obj).unwrap(),
-            Some(vec![first, second])
+            Some(vec![first.to_owned(), second.to_owned()])
         );
     }
 
     #[test]
-    fn parse_selected_mcp_ids_rejects_numbers_and_invalid_strings() {
-        for value in [json!([1]), json!(["4"]), json!("not-an-array")] {
+    fn parse_selected_mcp_ids_rejects_legacy_and_non_canonical_values() {
+        for value in [
+            json!([4]),
+            json!(["4"]),
+            json!(["550e8400-e29b-41d4-a716-446655440000"]),
+            json!(["0190F5FE-7C00-7A00-8000-000000000123"]),
+            json!(["mcp_0190f5fe-7c00-7a00-8000-000000000123"]),
+            json!("not-an-array"),
+        ] {
             let mut obj = json!({ "selected_mcp_server_ids": value })
                 .as_object()
                 .unwrap()
@@ -6882,8 +7154,8 @@ mod tests {
 
     #[test]
     fn knowledge_binding_target_companion_id_routes_to_companion() {
-        let companion_id = "companion_0190f5fe-7c00-7a00-8abc-012345678901";
-        let conversation_id = "conv_0190f5fe-7c00-7a00-8abc-012345678902";
+        let companion_id = "0190f5fe-7c00-7a00-8abc-012345678901";
+        let conversation_id = "0190f5fe-7c00-7a00-8abc-012345678902";
         let extra = json!({"companion_id": companion_id});
         assert_eq!(
             knowledge_binding_target(&extra, conversation_id).unwrap(),
@@ -6893,10 +7165,10 @@ mod tests {
 
     #[test]
     fn knowledge_binding_target_rejects_untrimmed_companion_id() {
-        let extra = json!({"companion_id": "  companion_0190f5fe-7c00-7a00-8abc-012345678901  "});
+        let extra = json!({"companion_id": "  0190f5fe-7c00-7a00-8abc-012345678901  "});
         assert!(knowledge_binding_target(
             &extra,
-            "conv_0190f5fe-7c00-7a00-8abc-012345678902"
+            "0190f5fe-7c00-7a00-8abc-012345678902"
         )
         .is_err());
     }
@@ -6906,7 +7178,7 @@ mod tests {
         let extra = json!({"companion_id": ""});
         assert!(knowledge_binding_target(
             &extra,
-            "conv_0190f5fe-7c00-7a00-8abc-012345678902"
+            "0190f5fe-7c00-7a00-8abc-012345678902"
         )
         .is_err());
     }
@@ -6916,7 +7188,7 @@ mod tests {
         let extra = json!({"companion_id": "   \t "});
         assert!(knowledge_binding_target(
             &extra,
-            "conv_0190f5fe-7c00-7a00-8abc-012345678902"
+            "0190f5fe-7c00-7a00-8abc-012345678902"
         )
         .is_err());
     }
@@ -6924,7 +7196,7 @@ mod tests {
     #[test]
     fn knowledge_binding_target_missing_companion_id_falls_back() {
         let extra = json!({"workspace": "/tmp/ws"});
-        let conversation_id = "conv_0190f5fe-7c00-7a00-8abc-012345678902";
+        let conversation_id = "0190f5fe-7c00-7a00-8abc-012345678902";
         assert_eq!(
             knowledge_binding_target(&extra, conversation_id).unwrap(),
             ("conversation", conversation_id)
@@ -6936,7 +7208,7 @@ mod tests {
         // build_runtime_options can yield a non-object extra only in degenerate
         // cases, but the helper must still not panic on them.
         let extra = serde_json::Value::Null;
-        let conversation_id = "conv_0190f5fe-7c00-7a00-8abc-012345678902";
+        let conversation_id = "0190f5fe-7c00-7a00-8abc-012345678902";
         assert_eq!(
             knowledge_binding_target(&extra, conversation_id).unwrap(),
             ("conversation", conversation_id)
@@ -6948,14 +7220,14 @@ mod tests {
         let extra = json!({"companion_id": 42});
         assert!(knowledge_binding_target(
             &extra,
-            "conv_0190f5fe-7c00-7a00-8abc-012345678902"
+            "0190f5fe-7c00-7a00-8abc-012345678902"
         )
         .is_err());
     }
 
     fn response_with_type(agent_type: nomifun_common::AgentType) -> ConversationResponse {
         ConversationResponse {
-            id: nomifun_common::ConversationId::new().into_string(),
+            conversation_id: nomifun_common::ConversationId::new().into_string(),
             name: "test".into(),
             r#type: agent_type,
             model: None,
@@ -6986,7 +7258,7 @@ mod tests {
         use nomifun_common::AgentType;
         let response = response_with_type(AgentType::Acp);
         let extra = json!({
-            "agent_id": "abc-123",
+            "agent_id": "0190f5fe-7c00-7a00-8000-000000000101",
             "agent_name": "Claude Code",
             "backend": "claude",
             "current_model_id": "opus",
@@ -6994,7 +7266,10 @@ mod tests {
         });
         let lineage = PresetLineage::from_response_and_extra(&response, &extra);
         assert_eq!(lineage.agent_type, "acp");
-        assert_eq!(lineage.agent_id, "abc-123");
+        assert_eq!(
+            lineage.agent_id,
+            "0190f5fe-7c00-7a00-8000-000000000101"
+        );
         assert_eq!(lineage.agent_name, "Claude Code");
         assert_eq!(lineage.backend, "claude");
         assert_eq!(lineage.current_model_id, "opus");
@@ -7058,7 +7333,7 @@ mod tests {
     fn classify_session_mcp_status_marks_unsupported_transport() {
         let status = classify_session_mcp_status(
             &SessionMcpServer {
-                id: "mcp-http".into(),
+                mcp_server_id: McpServerId::new(),
                 name: "remote-http".into(),
                 transport: SessionMcpTransport::Http {
                     url: "https://example.com/mcp".into(),
@@ -7080,7 +7355,7 @@ mod tests {
     fn classify_session_mcp_status_marks_missing_stdio_command_failed() {
         let status = classify_session_mcp_status(
             &SessionMcpServer {
-                id: "mcp-stdio".into(),
+                mcp_server_id: McpServerId::new(),
                 name: "broken-stdio".into(),
                 transport: SessionMcpTransport::Stdio {
                     command: "__definitely_missing_nomifun_mcp_command__".into(),

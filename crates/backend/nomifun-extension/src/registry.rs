@@ -310,16 +310,25 @@ impl ExtensionRegistry {
         guard.contributions.presets.clone()
     }
 
-    /// Return `true` if any extension contributes an preset with this id.
-    pub async fn has_preset(&self, id: &str) -> bool {
+    /// Return `true` if any extension contributes a preset with this source key.
+    pub async fn has_preset(&self, source_key: &str) -> bool {
         let guard = self.inner.read().await;
-        guard.contributions.presets.iter().any(|a| a.id == id)
+        guard
+            .contributions
+            .presets
+            .iter()
+            .any(|preset| preset.source_key == source_key)
     }
 
-    /// Lookup a single extension-contributed preset by id.
-    pub async fn get_preset_by_id(&self, id: &str) -> Option<ResolvedPreset> {
+    /// Lookup a single extension-contributed preset by global source key.
+    pub async fn get_preset_by_source_key(&self, source_key: &str) -> Option<ResolvedPreset> {
         let guard = self.inner.read().await;
-        guard.contributions.presets.iter().find(|a| a.id == id).cloned()
+        guard
+            .contributions
+            .presets
+            .iter()
+            .find(|preset| preset.source_key == source_key)
+            .cloned()
     }
 
     pub async fn get_acp_adapters(&self) -> Vec<ResolvedAcpAdapter> {

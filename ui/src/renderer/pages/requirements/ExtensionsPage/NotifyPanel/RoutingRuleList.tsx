@@ -1,4 +1,4 @@
-import type { WebhookId } from '@/common/types/ids';
+import { tryParseEntityId, type WebhookId } from '@/common/types/ids';
 import React, { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Checkbox, Empty, Select, Table, Tag } from '@arco-design/web-react';
@@ -12,6 +12,7 @@ import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
  * and the `requirements.status.*` i18n keys. */
 const EVENT_KINDS = ['done', 'failed', 'needs_review'] as const;
 const DEFAULT_EVENTS: string[] = [...EVENT_KINDS];
+const CLEAR_WEBHOOK_VALUE = '__clear_webhook__';
 
 type RuleRow = ITagSummary & {
   setting?: ITagSetting;
@@ -120,8 +121,8 @@ const RoutingRuleList: React.FC = () => {
   }));
 
   const channelOptions = [
-    { label: t('requirements.notify.clearChannel'), value: -1 },
-    ...channels.map((c) => ({ label: c.name, value: c.id })),
+    { label: t('requirements.notify.clearChannel'), value: CLEAR_WEBHOOK_VALUE },
+    ...channels.map((c) => ({ label: c.name, value: c.webhook_id })),
   ];
 
   const columns = [
@@ -156,7 +157,14 @@ const RoutingRuleList: React.FC = () => {
               value={boundId}
               style={{ width: 180 }}
               options={channelOptions}
-              onChange={(v) => void handleChannelChange(row.tag, v === undefined ? undefined : (v as WebhookId))}
+              onChange={(value) => {
+                if (value === undefined || value === CLEAR_WEBHOOK_VALUE) {
+                  void handleChannelChange(row.tag, undefined);
+                  return;
+                }
+                const webhookId = tryParseEntityId('webhook', value);
+                if (webhookId != null) void handleChannelChange(row.tag, webhookId);
+              }}
             />
 
             {/* Gentle hint: bound channel but no events => never fires. */}

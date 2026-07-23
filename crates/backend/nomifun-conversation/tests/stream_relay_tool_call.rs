@@ -20,7 +20,8 @@ async fn setup_repo() -> (Arc<SqliteConversationRepository>, nomifun_db::Databas
     let now = now_ms();
     let conversation_id = ConversationId::new().into_string();
     repo.create(&ConversationRow {
-        id: conversation_id.clone(),
+        id: 0,
+        conversation_id: conversation_id.clone(),
         user_id: installation_owner.clone(),
         name: "Tool call test".into(),
         r#type: "nomi".into(),

@@ -272,7 +272,7 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
           const { msg_id } = res;
           markLocalTurnAccepted();
           const userMessage: TMessage = {
-            id: msg_id,
+            id: uuid(),
             msg_id,
             conversation_id,
             type: 'text',
@@ -351,7 +351,7 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
         msg_id = res.msg_id;
         markLocalTurnAccepted();
         const userMessage: TMessage = {
-          id: msg_id,
+          id: uuid(),
           msg_id,
           conversation_id,
           type: 'text',
@@ -493,7 +493,7 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
         markLocalTurnAccepted();
 
         const userMessage: TMessage = {
-          id: msg_id,
+          id: uuid(),
           msg_id,
           conversation_id,
           type: 'text',

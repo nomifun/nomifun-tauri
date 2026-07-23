@@ -159,7 +159,9 @@ export function useDetachedMemoryPanel(options: {
       }),
       listenCurrentWindow<MemoryPanelActivatePayload>(MEMORY_PANEL_EVENTS.activate, (payload) => {
         if (payload.requestId !== stateRef.current.requestId) return;
-        const suggestion = suggestionsRef.current.find((item) => item.id === payload.suggestionId);
+        const suggestion = suggestionsRef.current.find(
+          (item) => item.suggestion_id === payload.suggestionId
+        );
         void (async () => {
           let ok = false;
           try {

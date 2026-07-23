@@ -399,9 +399,7 @@ async fn repl_loop(
 }
 
 fn print_skills_paths() {
-    use nomi_skills::paths::{
-        project_commands_dirs, project_skills_dirs, user_commands_dir, user_skills_dir,
-    };
+    use nomi_skills::paths::{project_commands_dirs, project_skills_dirs, user_skills_dir};
 
     fn status(p: &Path) -> &'static str {
         if p.is_dir() { "exists" } else { "not found" }
@@ -424,14 +422,9 @@ fn print_skills_paths() {
         }
     }
 
-    // Legacy commands
+    // Project-owned legacy commands. v3 intentionally has no second
+    // user-global commands root outside the managed application data set.
     let mut has_legacy = false;
-    if let Some(dir) = user_commands_dir()
-        && dir.is_dir()
-    {
-        println!("Legacy:  {}  ({})", dir.display(), status(&dir));
-        has_legacy = true;
-    }
     for dir in project_commands_dirs(&cwd) {
         println!("Legacy:  {}  ({})", dir.display(), status(&dir));
         has_legacy = true;

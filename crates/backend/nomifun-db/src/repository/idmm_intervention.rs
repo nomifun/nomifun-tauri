@@ -1,12 +1,14 @@
 use crate::error::DbError;
-use crate::models::IdmmInterventionRow;
+use crate::models::{IdmmInterventionRow, NewIdmmInterventionRow};
 
 /// Data access for `idmm_interventions`. Aggressive eviction lives here:
 /// `insert` prunes the target down to PER_TARGET_CAP after writing.
 #[async_trait::async_trait]
 pub trait IIdmmInterventionRepository: Send + Sync {
-    /// Insert one record, then prune this target to the most-recent PER_TARGET_CAP.
-    async fn insert(&self, row: &IdmmInterventionRow) -> Result<(), DbError>;
+    /// Insert one record with an application-issued UUIDv7 business ID and a
+    /// SQLite-assigned technical ID, then prune this target to the most-recent
+    /// PER_TARGET_CAP.
+    async fn insert(&self, row: &NewIdmmInterventionRow) -> Result<IdmmInterventionRow, DbError>;
 
     /// Most-recent-first, capped at `limit`.
     async fn list_for_target(

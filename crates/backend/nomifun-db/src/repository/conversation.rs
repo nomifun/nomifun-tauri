@@ -1,4 +1,4 @@
-use nomifun_common::{McpServerId, MessageId, PaginatedResult, TimestampMs};
+use nomifun_common::{MessageId, PaginatedResult, TimestampMs};
 use serde::{Deserialize, Serialize};
 
 use crate::error::DbError;
@@ -27,7 +27,7 @@ pub struct ConversationMessageProjection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnArtifactMessageCommit {
     /// Canonical durable message identity claimed for the provider tool call.
-    pub id: String,
+    pub message_id: String,
     /// Exactly `tool_call` or `acp_tool_call`.
     pub message_type: String,
     /// Final JSON object containing a committed, completed artifact delivery.
@@ -46,7 +46,7 @@ pub trait IConversationRepository: Send + Sync {
     // ── Conversation CRUD ───────────────────────────────────────────
 
     /// Returns a conversation by ID, or `None` if not found.
-    async fn get(&self, id: &str) -> Result<Option<ConversationRow>, DbError>;
+    async fn get(&self, conversation_id: &str) -> Result<Option<ConversationRow>, DbError>;
 
     /// Inserts a new conversation row using its caller-minted global ID.
     async fn create(&self, row: &ConversationRow) -> Result<String, DbError>;
@@ -64,8 +64,8 @@ pub trait IConversationRepository: Send + Sync {
         Ok((id, true))
     }
 
-    /// Resolve a trusted internal creation identity.  Public conversation
-    /// reads continue to address rows by their server-allocated integer id.
+    /// Resolve a trusted internal creation identity. Public conversation reads
+    /// continue to address rows by their stable `conversation_id`.
     async fn find_by_creation_key(
         &self,
         _user_id: &str,
@@ -132,11 +132,43 @@ pub trait IConversationRepository: Send + Sync {
     }
 
     /// Partially updates a conversation. Returns `DbError::NotFound` if ID is missing.
-    async fn update(&self, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError>;
+    async fn update(
+        &self,
+        conversation_id: &str,
+        updates: &ConversationRowUpdate,
+    ) -> Result<(), DbError>;
 
-    /// Deletes a conversation (messages cascade via FK).
+    /// Atomically replaces the persisted IDMM configuration inside
+    /// `conversation.extra`. Implementations must validate and logically lock
+    /// every per-watch `bypass_model.provider_id` before writing the JSON.
+    async fn update_idmm(
+        &self,
+        _conversation_id: &str,
+        _idmm: Option<&str>,
+    ) -> Result<(), DbError> {
+        Err(DbError::Init(
+            "conversation IDMM persistence is not supported".to_owned(),
+        ))
+    }
+
+    /// Deletes a conversation and explicitly removes repository-owned
+    /// dependent rows.
     /// Returns `DbError::NotFound` if ID is missing.
-    async fn delete(&self, id: &str) -> Result<(), DbError>;
+    async fn delete(&self, conversation_id: &str) -> Result<(), DbError>;
+
+    /// Deletes a Conversation aggregate and returns identities needed for
+    /// non-database cleanup after the transaction commits.
+    ///
+    /// The default preserves compatibility for repositories whose aggregate
+    /// has no process-local dependents. SQLite overrides this to capture and
+    /// delete linked Cron jobs and runs atomically with the Conversation.
+    async fn delete_with_cleanup(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<String>, DbError> {
+        self.delete(conversation_id).await?;
+        Ok(Vec::new())
+    }
 
     /// Lists conversations with cursor-based pagination and optional filters.
     async fn list_paginated(
@@ -157,15 +189,23 @@ pub trait IConversationRepository: Send + Sync {
     ) -> Result<Option<ConversationRow>, DbError>;
 
     /// Lists conversations created by the given cron job (`cron_job_id` column).
-    async fn list_by_cron_job(&self, user_id: &str, cron_job_id: &str) -> Result<Vec<ConversationRow>, DbError>;
+    async fn list_by_cron_job(
+        &self,
+        user_id: &str,
+        cron_job_id: &str,
+    ) -> Result<Vec<ConversationRow>, DbError>;
 
     /// Lists conversations sharing the same `extra.workspace` value.
     /// The conversation identified by `conversation_id` is excluded.
-    async fn list_associated(&self, user_id: &str, conversation_id: &str) -> Result<Vec<ConversationRow>, DbError>;
+    async fn list_associated(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<ConversationRow>, DbError>;
 
     /// Lists every retained Conversation whose top-level current model is
-    /// bound to `provider_id`. These are hard references: deleting the
-    /// provider would leave the Conversation lead unrunnable.
+    /// logically bound to `provider_id`. Deletion policy is enforced by the
+    /// service layer.
     async fn list_conversations_using_model_provider(
         &self,
         _provider_id: &str,
@@ -178,15 +218,20 @@ pub trait IConversationRepository: Send + Sync {
     // ── conversation_mcp_servers junction ───────────────────────────
 
     /// Returns the MCP server IDs selected for a conversation, ordered by
-    /// `sort_order`. Replaces the legacy `extra.selected_mcp_server_ids` array.
-    async fn list_mcp_server_ids(&self, _conversation_id: &str) -> Result<Vec<McpServerId>, DbError> {
+    /// `sort_order`. The v3 junction table is the only durable source of truth.
+    async fn list_mcp_server_ids(&self, _conversation_id: &str) -> Result<Vec<String>, DbError> {
         Ok(Vec::new())
     }
 
     /// Replaces the conversation's selected MCP server set with `ids`, preserving
     /// order via `sort_order`. Implemented as a single DELETE + ordered INSERT
-    /// transaction. Replaces writes to `extra.selected_mcp_server_ids`.
-    async fn set_mcp_server_ids(&self, _conversation_id: &str, _ids: &[McpServerId]) -> Result<(), DbError> {
+    /// transaction; open-ended `extra` data is never used as durable selection
+    /// storage.
+    async fn set_mcp_server_ids(
+        &self,
+        _conversation_id: &str,
+        _mcp_server_ids: &[String],
+    ) -> Result<(), DbError> {
         Ok(())
     }
 
@@ -195,14 +240,15 @@ pub trait IConversationRepository: Send + Sync {
     /// Returns paginated messages for a conversation, ordered by `created_at`.
     async fn get_messages(
         &self,
-        conv_id: &str,
+        conversation_id: &str,
         page: u32,
         page_size: u32,
         order: SortOrder,
     ) -> Result<PaginatedResult<MessageRow>, DbError>;
 
     /// Keyset (cursor) pagination: returns up to `limit` messages strictly OLDER
-    /// than `before` `(created_at, id)`, newest-first (`created_at DESC, id DESC`);
+    /// than `before` `(created_at, message_id)`, newest-first
+    /// (`created_at DESC, message_id DESC`);
     /// `before: None` returns the newest `limit`. `has_more` means an older page
     /// exists. Used to incrementally load an ever-growing conversation (e.g. a
     /// companion's single session) without fetching the whole transcript, and is
@@ -211,7 +257,7 @@ pub trait IConversationRepository: Send + Sync {
     /// repo overrides it.
     async fn get_messages_keyset(
         &self,
-        _conv_id: &str,
+        _conversation_id: &str,
         _before: Option<(i64, String)>,
         _limit: u32,
     ) -> Result<PaginatedResult<MessageRow>, DbError> {
@@ -223,7 +269,11 @@ pub trait IConversationRepository: Send + Sync {
     }
 
     /// Returns a single message scoped to a conversation.
-    async fn get_message(&self, _conv_id: &str, _message_id: &str) -> Result<Option<MessageRow>, DbError> {
+    async fn get_message(
+        &self,
+        _conversation_id: &str,
+        _message_id: &str,
+    ) -> Result<Option<MessageRow>, DbError> {
         Ok(None)
     }
 
@@ -251,8 +301,9 @@ pub trait IConversationRepository: Send + Sync {
     }
 
     /// Atomically resolves a protocol correlation key to one durable canonical
-    /// message ID. Correlation keys are scoped by Conversation, parent turn,
-    /// and message type; they never become entity IDs themselves.
+    /// message ID. Correlation keys are scoped by Conversation, wire prompt
+    /// owner token, and message type; neither the key nor the owner token is a
+    /// parent-row identity.
     async fn claim_message_correlation(
         &self,
         _conversation_id: &str,
@@ -264,19 +315,27 @@ pub trait IConversationRepository: Send + Sync {
     }
 
     /// Partially updates a message. Returns `DbError::NotFound` if ID is missing.
-    async fn update_message(&self, id: &str, updates: &MessageRowUpdate) -> Result<(), DbError>;
+    async fn update_message(
+        &self,
+        message_id: &str,
+        updates: &MessageRowUpdate,
+    ) -> Result<(), DbError>;
 
     /// Deletes all messages belonging to a conversation.
-    async fn delete_messages_by_conversation(&self, conv_id: &str) -> Result<(), DbError>;
+    async fn delete_messages_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(), DbError>;
 
-    /// Deletes the message at the `(created_at, id)` keyset cursor (inclusive)
-    /// and every newer message in the conversation. Returns the number of rows
-    /// deleted. Default no-op so mock repos compile; SQLite overrides it.
+    /// Deletes the message at the `(created_at, message_id)` keyset cursor
+    /// (inclusive) and every newer message in the conversation. Returns the
+    /// number of rows deleted. Default no-op so mock repos compile; SQLite
+    /// overrides it.
     async fn delete_messages_from(
         &self,
-        _conv_id: &str,
+        _conversation_id: &str,
         _from_created_at: i64,
-        _from_id: &str,
+        _from_message_id: &str,
     ) -> Result<u64, DbError> {
         Ok(0)
     }
@@ -284,7 +343,7 @@ pub trait IConversationRepository: Send + Sync {
     /// Finds a message by (conversation_id, msg_id, type) triple.
     async fn get_message_by_msg_id(
         &self,
-        conv_id: &str,
+        conversation_id: &str,
         msg_id: &str,
         msg_type: &str,
     ) -> Result<Option<MessageRow>, DbError>;
@@ -299,7 +358,10 @@ pub trait IConversationRepository: Send + Sync {
     ) -> Result<PaginatedResult<MessageSearchRow>, DbError>;
 
     /// Returns persisted conversation artifacts ordered by `created_at`.
-    async fn list_artifacts(&self, _conversation_id: &str) -> Result<Vec<ConversationArtifactRow>, DbError> {
+    async fn list_artifacts(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Vec<ConversationArtifactRow>, DbError> {
         Ok(Vec::new())
     }
 
@@ -307,7 +369,7 @@ pub trait IConversationRepository: Send + Sync {
     async fn get_artifact(
         &self,
         _conversation_id: &str,
-        _artifact_id: &str,
+        _conversation_artifact_id: &str,
     ) -> Result<Option<ConversationArtifactRow>, DbError> {
         Ok(None)
     }
@@ -316,12 +378,16 @@ pub trait IConversationRepository: Send + Sync {
     ///
     /// Idempotency is keyed by `kind`:
     /// - `cron_trigger`: always a fresh INSERT (one row per trigger), returning
-    ///   the row with its auto-assigned `id`.
+    ///   the row with its caller-minted `conversation_artifact_id`.
     /// - `skill_suggest`: upsert against the partial UNIQUE
     ///   `(conversation_id, cron_job_id) WHERE kind = 'skill_suggest'`.
     ///
-    /// The `id` field of the input is ignored (it is allocated by SQLite).
-    async fn upsert_artifact(&self, artifact: &ConversationArtifactRow) -> Result<ConversationArtifactRow, DbError> {
+    /// The existing business UUID is preserved when a `skill_suggest` row is
+    /// updated. SQLite's AUTOINCREMENT `id` remains repository-internal.
+    async fn upsert_artifact(
+        &self,
+        artifact: &ConversationArtifactRow,
+    ) -> Result<ConversationArtifactRow, DbError> {
         Ok(artifact.clone())
     }
 
@@ -329,7 +395,7 @@ pub trait IConversationRepository: Send + Sync {
     async fn update_artifact_status(
         &self,
         _conversation_id: &str,
-        _artifact_id: &str,
+        _conversation_artifact_id: &str,
         _status: &str,
         _updated_at: TimestampMs,
     ) -> Result<Option<ConversationArtifactRow>, DbError> {
@@ -349,14 +415,11 @@ pub trait IConversationRepository: Send + Sync {
     }
 
     /// Deletes all artifacts belonging to a conversation.
-    async fn delete_artifacts_by_conversation(&self, _conversation_id: &str) -> Result<(), DbError> {
+    async fn delete_artifacts_by_conversation(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<(), DbError> {
         Ok(())
-    }
-
-    /// Returns legacy persisted cron trigger rows so callers can synthesize
-    /// artifact cards for historical conversations created before artifact migration.
-    async fn list_legacy_cron_trigger_messages(&self, _conversation_id: &str) -> Result<Vec<MessageRow>, DbError> {
-        Ok(Vec::new())
     }
 }
 
@@ -422,7 +485,7 @@ pub struct ConversationRowUpdate {
     pub execution_template_id: Option<Option<String>>,
     pub status: Option<String>,
     /// Set/clear the owning cron job. `Some(Some(id))` sets, `Some(None)` clears
-    /// (used by the cron executor's atomic backfill on `new_conversation`).
+    /// (used by the cron executor's post-create binding for `new_conversation`).
     pub cron_job_id: Option<Option<String>>,
     pub preset_id: Option<Option<String>>,
     pub preset_revision: Option<Option<i64>>,

@@ -35,6 +35,9 @@ describe('AddPlatformModal context window control', () => {
       false
     );
     expect(editSource.includes('<ContextLimitSelect')).toBe(false);
+    expect(/\bcontext_limit\b/.test(editSource)).toBe(false);
+    expect(modelListSource.includes('platform.context_limit')).toBe(false);
+    expect(modelListSource.includes('inheritedContextLimit')).toBe(false);
     expect(addSource.includes('<InputNumber')).toBe(false);
     expect(editSource.includes('<InputNumber')).toBe(false);
   });

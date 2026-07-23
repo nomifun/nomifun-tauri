@@ -8,12 +8,12 @@ use tracing::warn;
 
 use nomifun_api_types::{
     ApiResponse, ApprovePairingRequest, BridgeResponse, ChannelSessionResponse, ChannelUserResponse,
-    DisablePluginRequest, EnablePluginRequest, PairingRequestResponse, PluginStatusResponse, RejectPairingRequest,
-    RevokeUserRequest, SyncChannelSettingsRequest, TestPluginRequest, TestPluginResponse,
+    DisablePluginRequest, EnablePluginRequest, EnablePluginResponse, PairingRequestResponse,
+    PluginStatusResponse, RejectPairingRequest, RevokeUserRequest, SyncChannelSettingsRequest,
+    TestPluginRequest, TestPluginResponse,
 };
 use nomifun_common::{
-    AppError, ChannelId, ChannelSessionId, ChannelUserId, CompanionId, ConversationId,
-    PublicAgentId,
+    AppError, ChannelPluginId, CompanionId, ConversationId, PublicAgentId, UuidV7Error,
 };
 use nomifun_db::IChannelRepository;
 use nomifun_extension::{ExtensionRegistry, ResolvedChannelPlugin};
@@ -249,7 +249,7 @@ impl From<&ResolvedChannelPlugin> for ChannelExtensionMetaView {
 async fn enable_plugin(
     State(state): State<ChannelRouterState>,
     body: Result<Json<EnablePluginRequest>, JsonRejection>,
-) -> Result<Json<ApiResponse<BridgeResponse>>, AppError> {
+) -> Result<Json<ApiResponse<EnablePluginResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
 
     if req.plugin_id.is_none()
@@ -262,18 +262,18 @@ async fn enable_plugin(
             .enable_extension_plugin(plugin_type, &extension_plugin.name, &config)
             .await
         {
-            Ok(_) => {
-                return Ok(Json(ApiResponse::ok(BridgeResponse {
+            Ok(plugin_id) => {
+                return Ok(Json(ApiResponse::ok(EnablePluginResponse {
                     success: true,
-                    message: Some("Plugin enabled".into()),
+                    plugin_id: Some(plugin_id),
                     error: None,
                 })));
             }
             Err(e) => {
                 warn!(plugin_type = %plugin_type, error = %e, "enable extension plugin failed");
-                return Ok(Json(ApiResponse::ok(BridgeResponse {
+                return Ok(Json(ApiResponse::ok(EnablePluginResponse {
                     success: false,
-                    message: None,
+                    plugin_id: None,
                     error: Some(e.to_string()),
                 })));
             }
@@ -281,7 +281,7 @@ async fn enable_plugin(
     }
 
     if let Some(plugin_id) = req.plugin_id.as_deref() {
-        ChannelId::parse(plugin_id)
+        ChannelPluginId::parse(plugin_id)
             .map_err(|error| AppError::BadRequest(format!("invalid plugin_id: {error}")))?;
     }
 
@@ -322,9 +322,9 @@ async fn enable_plugin(
         .enable_plugin(&spec, &req.config, state.plugin_factory.as_ref())
         .await
     {
-        Ok(channel_id) => Ok(Json(ApiResponse::ok(BridgeResponse {
+        Ok(plugin_id) => Ok(Json(ApiResponse::ok(EnablePluginResponse {
             success: true,
-            message: Some(channel_id),
+            plugin_id: Some(plugin_id),
             error: None,
         }))),
         Err(e) => {
@@ -335,9 +335,9 @@ async fn enable_plugin(
                 ChannelError::BotAlreadyBound(owner) => already_bound_message(&state, owner).await,
                 _ => e.to_string(),
             };
-            Ok(Json(ApiResponse::ok(BridgeResponse {
+            Ok(Json(ApiResponse::ok(EnablePluginResponse {
                 success: false,
-                message: None,
+                plugin_id: None,
                 error: Some(error),
             })))
         }
@@ -472,16 +472,11 @@ async fn get_pending_pairings(
     let responses: Vec<PairingRequestResponse> = rows
         .into_iter()
         .map(|r| {
-            if let Some(id) = r.channel_id.as_deref() {
-                ChannelId::parse(id).map_err(|error| {
-                    corrupt_channel_id("channel_pairing_codes.channel_id", id, error)
-                })?;
-            }
             Ok(PairingRequestResponse {
                 code: r.code,
                 platform_user_id: r.platform_user_id,
                 platform_type: r.platform_type,
-                channel_id: r.channel_id,
+                channel_plugin_id: r.channel_plugin_id,
                 display_name: r.display_name,
                 requested_at: r.requested_at,
                 expires_at: r.expires_at,
@@ -535,17 +530,11 @@ async fn get_authorized_users(
     let responses: Vec<ChannelUserResponse> = rows
         .into_iter()
         .map(|r| {
-            ChannelUserId::parse(&r.id)
-                .map_err(|error| corrupt_channel_id("channel_users.id", &r.id, error))?;
-            if let Some(id) = r.channel_id.as_deref() {
-                ChannelId::parse(id)
-                    .map_err(|error| corrupt_channel_id("channel_users.channel_id", id, error))?;
-            }
             Ok(ChannelUserResponse {
-                id: r.id,
+                channel_user_id: r.channel_user_id,
                 platform_user_id: r.platform_user_id,
                 platform_type: r.platform_type,
-                channel_id: r.channel_id,
+                channel_plugin_id: r.channel_plugin_id,
                 display_name: r.display_name,
                 authorized_at: r.authorized_at,
                 last_active: r.last_active,
@@ -565,10 +554,13 @@ async fn revoke_user(
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
 
     // Clean up sessions first
-    state.session_manager.cleanup_user_sessions(&req.user_id).await?;
+    state
+        .session_manager
+        .cleanup_user_sessions(&req.channel_user_id)
+        .await?;
 
     // Delete user record
-    state.repo.delete_user(&req.user_id).await?;
+    state.repo.delete_user(&req.channel_user_id).await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
@@ -589,29 +581,19 @@ async fn get_active_sessions(
     let responses: Vec<ChannelSessionResponse> = rows
         .into_iter()
         .map(|r| {
-            ChannelSessionId::parse(&r.id)
-                .map_err(|error| corrupt_channel_id("channel_sessions.id", &r.id, error))?;
-            ChannelUserId::parse(&r.user_id).map_err(|error| {
-                corrupt_channel_id("channel_sessions.user_id", &r.user_id, error)
-            })?;
             if let Some(id) = r.conversation_id.as_deref() {
                 ConversationId::parse(id).map_err(|error| {
                     corrupt_channel_id("channel_sessions.conversation_id", id, error)
                 })?;
             }
-            if let Some(id) = r.channel_id.as_deref() {
-                ChannelId::parse(id).map_err(|error| {
-                    corrupt_channel_id("channel_sessions.channel_id", id, error)
-                })?;
-            }
             Ok(ChannelSessionResponse {
-                id: r.id,
-                user_id: r.user_id,
+                channel_session_id: r.channel_session_id,
+                channel_user_id: r.channel_user_id,
                 agent_type: r.agent_type,
                 conversation_id: r.conversation_id,
                 workspace: r.workspace,
                 chat_id: r.chat_id,
-                channel_id: r.channel_id,
+                channel_plugin_id: r.channel_plugin_id,
                 created_at: r.created_at,
                 last_activity: r.last_activity,
             })
@@ -693,9 +675,12 @@ async fn set_channel_companion(
     let companion_id = req.companion_id.as_deref();
 
     if let Some(plugin_id) = req.plugin_id.as_deref() {
-        ChannelId::parse(plugin_id)
+        ChannelPluginId::parse(plugin_id)
             .map_err(|error| AppError::BadRequest(format!("invalid plugin_id: {error}")))?;
-        state.manager.rebind_channel_companion(plugin_id, companion_id).await?;
+        state
+            .manager
+            .rebind_channel_companion(plugin_id, companion_id)
+            .await?;
         return Ok(Json(ApiResponse::ok(BridgeResponse {
             success: true,
             message: Some(format!("Companion binding updated for channel {plugin_id}; channel sessions cleared")),
@@ -735,7 +720,6 @@ async fn set_channel_companion(
 /// the per-bot companion binding; row-level mutually exclusive with it.
 #[derive(Debug, Deserialize)]
 struct SetChannelPublicAgentRequest {
-    #[serde(default)]
     plugin_id: String,
     #[serde(default)]
     public_agent_id: Option<String>,
@@ -753,8 +737,8 @@ async fn set_channel_public_agent(
 ) -> Result<Json<ApiResponse<BridgeResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
 
-    let plugin_id = req.plugin_id.as_str();
-    ChannelId::parse(plugin_id)
+    let plugin_id = req.plugin_id;
+    ChannelPluginId::parse(&plugin_id)
         .map_err(|error| AppError::BadRequest(format!("invalid plugin_id: {error}")))?;
 
     // Validate a binding against the live public-agent roster: a typo'd
@@ -771,7 +755,10 @@ async fn set_channel_public_agent(
     }
 
     let public_agent_id = req.public_agent_id.as_deref();
-    state.manager.rebind_channel_public_agent(plugin_id, public_agent_id).await?;
+    state
+        .manager
+        .rebind_channel_public_agent(&plugin_id, public_agent_id)
+        .await?;
 
     Ok(Json(ApiResponse::ok(BridgeResponse {
         success: true,
@@ -978,7 +965,7 @@ fn field_key(value: &serde_json::Value) -> Option<&str> {
 fn corrupt_channel_id(
     field: &str,
     value: &str,
-    error: nomifun_common::PrefixedIdError,
+    error: UuidV7Error,
 ) -> AppError {
     AppError::Internal(format!(
         "stored {field} contains noncanonical entity ID '{value}': {error}"

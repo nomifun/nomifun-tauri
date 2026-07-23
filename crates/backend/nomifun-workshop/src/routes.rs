@@ -11,7 +11,7 @@
 //! no custom-header API, so under the desktop's `TrustLocalToken` policy they
 //! cannot present the `x-nomi-local-trust` header — the authenticated router
 //! would 403 every asset thumbnail and canvas gallery image. They are GET-only,
-//! serve opaque unguessable ids (`wsa_`/`wsc_` + uuidv7 — a capability URL, not
+//! serve opaque unguessable UUIDv7 ids (a capability URL, not
 //! an enumeration surface), keep the service's traversal sandbox, and never
 //! extract `CurrentUser` (see the note on the public router).
 
@@ -28,7 +28,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 use nomifun_api_types::ApiResponse;
 use nomifun_auth::CurrentUser;
-use nomifun_common::AppError;
+use nomifun_common::{AppError, WorkshopAssetId, WorkshopCanvasId};
 
 use crate::MAX_ASSET_BYTES;
 use crate::agent_ops::PendingOp;
@@ -50,22 +50,25 @@ pub fn workshop_routes(state: WorkshopRouterState) -> Router {
     Router::new()
         .route("/api/workshop/canvases", get(list_canvases).post(create_canvas))
         .route(
-            "/api/workshop/canvases/{id}",
+            "/api/workshop/canvases/{canvas_id}",
             get(get_canvas).patch(patch_canvas).delete(delete_canvas),
         )
-        .route("/api/workshop/canvases/{id}/doc", axum::routing::put(put_doc))
-        .route("/api/workshop/canvases/{id}/export", get(export_canvas))
+        .route("/api/workshop/canvases/{canvas_id}/doc", axum::routing::put(put_doc))
+        .route("/api/workshop/canvases/{canvas_id}/export", get(export_canvas))
         .route(
-            "/api/workshop/canvases/{id}/pending-ops",
+            "/api/workshop/canvases/{canvas_id}/pending-ops",
             get(get_pending_ops),
         )
         .route(
-            "/api/workshop/canvases/{id}/pending-ops/ack",
+            "/api/workshop/canvases/{canvas_id}/pending-ops/ack",
             post(ack_pending_ops),
         )
         .route("/api/workshop/gc", post(run_gc))
         .route("/api/workshop/assets", get(list_assets).post(create_text_asset))
-        .route("/api/workshop/assets/{id}", axum::routing::patch(patch_asset).delete(delete_asset))
+        .route(
+            "/api/workshop/assets/{asset_id}",
+            axum::routing::patch(patch_asset).delete(delete_asset),
+        )
         .route("/api/workshop/collections/rename", post(rename_collection))
         .with_state(state)
         .merge(upload_router)
@@ -84,7 +87,7 @@ pub fn workshop_routes(state: WorkshopRouterState) -> Router {
 pub fn workshop_public_routes(state: WorkshopRouterState) -> Router {
     Router::new()
         .route("/api/workshop/files/{asset_id}", get(serve_file))
-        .route("/api/workshop/canvas-thumbs/{id}", get(serve_canvas_thumb))
+        .route("/api/workshop/canvas-thumbs/{canvas_id}", get(serve_canvas_thumb))
         .with_state(state)
 }
 
@@ -134,16 +137,16 @@ struct CanvasDetailResponse {
 async fn get_canvas(
     State(state): State<WorkshopRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
+    Path(canvas_id): Path<WorkshopCanvasId>,
 ) -> Result<Json<ApiResponse<CanvasDetailResponse>>, AppError> {
-    let c = state.service.get_canvas(&id).await?;
+    let c = state.service.get_canvas(canvas_id.as_str()).await?;
     // This REST route is the editor's canvas-doc load path (CanvasPage). Mark
     // the canvas "open" now so an agent's concurrent apply_ops in the gap before
     // the first pending-ops poll is queued for this editor rather than written
     // straight to canvas.json and then clobbered by the editor's first autosave.
     // The gateway agent reads via `service.get_canvas` directly and never hits
     // this handler, so it is not falsely marked open.
-    state.service.mark_canvas_open(&id);
+    state.service.mark_canvas_open(canvas_id.as_str());
     Ok(Json(ApiResponse::ok(CanvasDetailResponse { meta: c.meta, doc: c.doc })))
 }
 
@@ -160,11 +163,11 @@ struct PutDocResponse {
 async fn put_doc(
     State(state): State<WorkshopRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
+    Path(canvas_id): Path<WorkshopCanvasId>,
     body: Result<Json<PutDocRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PutDocResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let updated_at = state.service.save_doc(&id, &req.doc).await?;
+    let updated_at = state.service.save_doc(canvas_id.as_str(), &req.doc).await?;
     Ok(Json(ApiResponse::ok(PutDocResponse { updated_at })))
 }
 
@@ -181,9 +184,9 @@ struct PendingOpsResponse {
 async fn get_pending_ops(
     State(state): State<WorkshopRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
+    Path(canvas_id): Path<WorkshopCanvasId>,
 ) -> Result<Json<ApiResponse<PendingOpsResponse>>, AppError> {
-    let ops = state.service.take_pending_ops(&id).await?;
+    let ops = state.service.take_pending_ops(canvas_id.as_str()).await?;
     Ok(Json(ApiResponse::ok(PendingOpsResponse { ops })))
 }
 
@@ -202,11 +205,11 @@ struct AckOpsResponse {
 async fn ack_pending_ops(
     State(state): State<WorkshopRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
+    Path(canvas_id): Path<WorkshopCanvasId>,
     body: Result<Json<AckOpsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AckOpsResponse>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    state.service.ack_agent_ops(&id, &req.op_ids);
+    state.service.ack_agent_ops(canvas_id.as_str(), &req.op_ids);
     Ok(Json(ApiResponse::ok(AckOpsResponse { acked: req.op_ids.len() })))
 }
 
@@ -223,20 +226,23 @@ struct PatchCanvasRequest {
 async fn patch_canvas(
     State(state): State<WorkshopRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
+    Path(canvas_id): Path<WorkshopCanvasId>,
     body: Result<Json<PatchCanvasRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<WorkshopCanvasMeta>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
-    let meta = state.service.patch_canvas(&id, req.title, req.thumbnail_asset_id).await?;
+    let meta = state
+        .service
+        .patch_canvas(canvas_id.as_str(), req.title, req.thumbnail_asset_id)
+        .await?;
     Ok(Json(ApiResponse::ok(meta)))
 }
 
 async fn delete_canvas(
     State(state): State<WorkshopRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
+    Path(canvas_id): Path<WorkshopCanvasId>,
 ) -> Result<StatusCode, AppError> {
-    state.service.delete_canvas(&id).await?;
+    state.service.delete_canvas(canvas_id.as_str()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -245,10 +251,10 @@ async fn delete_canvas(
 async fn export_canvas(
     State(state): State<WorkshopRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
+    Path(canvas_id): Path<WorkshopCanvasId>,
 ) -> Result<Response, AppError> {
-    let zip = state.service.export_canvas(&id).await?;
-    let filename = format!("workshop-canvas-{id}.zip");
+    let zip = state.service.export_canvas(canvas_id.as_str()).await?;
+    let filename = format!("workshop-canvas-{canvas_id}.zip");
     Ok((
         [
             (header::CONTENT_TYPE, "application/zip".to_string()),
@@ -308,9 +314,12 @@ async fn run_gc(
 /// extractor. Serves a canvas gallery thumbnail (JPEG).
 async fn serve_canvas_thumb(
     State(state): State<WorkshopRouterState>,
-    Path(id): Path<String>,
+    Path(canvas_id): Path<WorkshopCanvasId>,
 ) -> Result<Response, AppError> {
-    let served = state.service.serve_canvas_thumbnail(&id).await?;
+    let served = state
+        .service
+        .serve_canvas_thumbnail(canvas_id.as_str())
+        .await?;
     Ok((
         [
             (header::CONTENT_TYPE, served.mime),
@@ -539,14 +548,14 @@ struct PatchAssetRequest {
 async fn patch_asset(
     State(state): State<WorkshopRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
+    Path(asset_id): Path<WorkshopAssetId>,
     body: Result<Json<PatchAssetRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<WorkshopAsset>>, AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     let patched = state
         .service
         .patch_asset(
-            &id,
+            asset_id.as_str(),
             AssetPatch {
                 title: req.title,
                 collection: req.collection,
@@ -561,9 +570,9 @@ async fn patch_asset(
 async fn delete_asset(
     State(state): State<WorkshopRouterState>,
     Extension(_user): Extension<CurrentUser>,
-    Path(id): Path<String>,
+    Path(asset_id): Path<WorkshopAssetId>,
 ) -> Result<StatusCode, AppError> {
-    state.service.delete_asset(&id).await?;
+    state.service.delete_asset(asset_id.as_str()).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -603,11 +612,11 @@ struct FileQuery {
 /// thumbnail). Traversal-safe via the service; missing → 404.
 async fn serve_file(
     State(state): State<WorkshopRouterState>,
-    Path(asset_id): Path<String>,
+    Path(asset_id): Path<WorkshopAssetId>,
     Query(query): Query<FileQuery>,
 ) -> Result<Response, AppError> {
     let thumb = query.thumb.as_deref().map(parse_bool_flag).unwrap_or(false);
-    let served = state.service.serve_file(&asset_id, thumb).await?;
+    let served = state.service.serve_file(asset_id.as_str(), thumb).await?;
     Ok((
         [
             (header::CONTENT_TYPE, served.mime),

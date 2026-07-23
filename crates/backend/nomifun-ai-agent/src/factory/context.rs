@@ -2,7 +2,7 @@
 //! builders. Produced by `FactoryContext::resolve` at the top of
 //! `build_agent`, then passed into the per-agent `build(..)` functions.
 
-use nomifun_common::{AgentType, AppError, ConversationId, validate_prefixed_id};
+use nomifun_common::{AppError, ConversationId, validate_uuidv7};
 
 use crate::factory::AgentFactoryDeps;
 use crate::types::AgentRuntimeBuildOptions;
@@ -38,11 +38,10 @@ impl FactoryContext {
             || options.workspace.trim().is_empty()
         {
             let temp_workspace_id = temp_workspace_id_for_options(options)?;
-            let label = workspace_label(&options.agent_type, options.extra.get("backend"));
             let dir = deps
                 .work_dir
                 .join("conversations")
-                .join(format!("{label}-temp-{temp_workspace_id}"));
+                .join(temp_workspace_id);
             std::fs::create_dir_all(&dir)
                 .map_err(|e| AppError::Internal(format!("Failed to create temp workspace: {e}")))?;
             (dir.to_string_lossy().into_owned(), false)
@@ -56,22 +55,6 @@ impl FactoryContext {
             is_custom_workspace,
         })
     }
-}
-
-/// Label used in auto-provisioned temp workspace directory names.
-///
-/// For ACP conversations the label is the vendor string from
-/// `extra.backend` (e.g. `"claude"`); otherwise the agent type's serde
-/// name (e.g. `"nomi"`). Must stay in sync with
-/// `ConversationService::create`'s `conversation_label`.
-fn workspace_label(agent_type: &AgentType, backend: Option<&serde_json::Value>) -> String {
-    if *agent_type == AgentType::Acp
-        && let Some(serde_json::Value::String(s)) = backend
-        && !s.is_empty()
-    {
-        return s.clone();
-    }
-    agent_type.serde_name().to_owned()
 }
 
 fn temp_workspace_id_for_options(
@@ -89,7 +72,7 @@ fn temp_workspace_id_for_options(
                 options.conversation_id
             ))
         })?;
-    validate_prefixed_id(value, "ws").map_err(|error| {
+    validate_uuidv7(value).map_err(|error| {
         AppError::Internal(format!(
             "conversation {} has invalid temp_workspace_id '{value}': {error}",
             options.conversation_id
@@ -101,17 +84,18 @@ fn temp_workspace_id_for_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nomifun_common::AgentType;
     use serde_json::json;
 
-    const WORKSPACE_ID: &str = "ws_0190f5fe-7c00-7a00-8abc-012345678901";
+    const WORKSPACE_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678901";
 
     fn options(extra: serde_json::Value) -> AgentRuntimeBuildOptions {
         AgentRuntimeBuildOptions {
-            user_id: "user_0190f5fe-7c00-7a00-8000-000000000001".into(),
+            user_id: "0190f5fe-7c00-7a00-8000-000000000001".into(),
             agent_type: AgentType::Acp,
             workspace: String::new(),
             model: None,
-            conversation_id: "conv_0190f5fe-7c00-7a00-8abc-012345678901".into(),
+            conversation_id: "0190f5fe-7c00-7a00-8abc-012345678901".into(),
             delegation_policy: Default::default(),
             extra,
             conversation_created_at: Some(10),
@@ -147,24 +131,19 @@ mod tests {
         let mut opts = options(json!({
             "backend": "claude",
             "temp_workspace_id": WORKSPACE_ID,
-            "workspace": "/source-install/conversations/claude-temp-stale"
+            "workspace": "/source-install/conversations/0190f5fe-7c00-7a00-8abc-000000000000"
         }));
         opts.workspace =
-            "/source-install/conversations/claude-temp-stale".to_owned();
+            "/source-install/conversations/0190f5fe-7c00-7a00-8abc-000000000000".to_owned();
 
         let temp_workspace_id = temp_workspace_id_for_options(&opts).unwrap();
-        let workspace = work_dir
-            .join("conversations")
-            .join(format!(
-                "{}-temp-{temp_workspace_id}",
-                workspace_label(&opts.agent_type, opts.extra.get("backend"))
-            ));
+        let workspace = work_dir.join("conversations").join(temp_workspace_id);
 
         assert_eq!(
             workspace,
             work_dir
                 .join("conversations")
-                .join(format!("claude-temp-{WORKSPACE_ID}"))
+                .join(WORKSPACE_ID)
         );
         assert!(!workspace.starts_with("/source-install"));
     }

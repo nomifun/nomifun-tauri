@@ -12,7 +12,7 @@ use tower::ServiceExt;
 use common::{body_json, build_app, get_with_token, json_with_token, setup_and_login};
 
 const MISSING_CONVERSATION_ID: &str =
-    "conv_0190f5fe-7c00-7a00-8000-000000000099";
+    "0190f5fe-7c00-7a00-8000-000000000099";
 
 // ── Global ACP routes ────────────────────────────────────────────
 
@@ -31,6 +31,12 @@ async fn list_agents_returns_array() {
     assert!(body["data"].is_array());
     let agents = body["data"].as_array().unwrap();
     assert!(agents.iter().any(|a| a["agent_type"] == "nomi"));
+    assert!(
+        agents
+            .iter()
+            .all(|agent| agent["agent_id"].is_string() && agent.get("id").is_none()),
+        "AgentMetadata wire rows must expose agent_id and reject legacy id"
+    );
 }
 
 #[tokio::test]

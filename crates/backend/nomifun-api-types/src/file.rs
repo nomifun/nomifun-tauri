@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 /// Request body for `POST /api/fs/dir` — get files by directory.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GetFilesByDirRequest {
     pub dir: String,
     pub root: String,
@@ -14,12 +15,14 @@ pub struct GetFilesByDirRequest {
 
 /// Request body for `POST /api/fs/list` — list workspace files.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListWorkspaceFilesRequest {
     pub root: String,
 }
 
 /// Request body for `POST /api/fs/metadata` — get file metadata.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GetFileMetadataRequest {
     pub path: String,
     #[serde(default)]
@@ -28,6 +31,7 @@ pub struct GetFileMetadataRequest {
 
 /// Request body for `POST /api/fs/read` — read file.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadFileRequest {
     pub path: String,
     #[serde(default)]
@@ -36,6 +40,7 @@ pub struct ReadFileRequest {
 
 /// Request body for `POST /api/fs/read-buffer` — read file as binary.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadFileBufferRequest {
     pub path: String,
     #[serde(default)]
@@ -44,6 +49,7 @@ pub struct ReadFileBufferRequest {
 
 /// Request body for `POST /api/fs/write` — write file.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WriteFileRequest {
     pub path: String,
     pub data: String,
@@ -56,6 +62,7 @@ pub struct WriteFileRequest {
 
 /// Request body for `POST /api/fs/copy` — copy files to workspace.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CopyFilesRequest {
     pub file_paths: Vec<String>,
     pub workspace: String,
@@ -65,6 +72,7 @@ pub struct CopyFilesRequest {
 
 /// Request body for `POST /api/fs/remove` — remove file or directory.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RemoveEntryRequest {
     pub path: String,
     /// Workspace root, used to compute `relativePath` in the
@@ -76,6 +84,7 @@ pub struct RemoveEntryRequest {
 
 /// Request body for `POST /api/fs/rename` — rename file or directory.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RenameRequest {
     pub path: String,
     pub new_name: String,
@@ -83,12 +92,14 @@ pub struct RenameRequest {
 
 /// Request body for `POST /api/fs/temp` — create temp file.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateTempFileRequest {
     pub file_name: String,
 }
 
 /// Request body for `POST /api/fs/image-base64` — get image as base64.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GetImageBase64Request {
     pub path: String,
     #[serde(default)]
@@ -97,6 +108,7 @@ pub struct GetImageBase64Request {
 
 /// Request body for `POST /api/fs/fetch-remote-image` — fetch remote image.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FetchRemoteImageRequest {
     pub url: String,
 }
@@ -113,6 +125,7 @@ pub struct ZipFileEntry {
 
 /// Request body for `POST /api/fs/zip` — create ZIP archive.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ZipRequest {
     pub path: String,
     #[serde(default)]
@@ -122,6 +135,7 @@ pub struct ZipRequest {
 
 /// Request body for `POST /api/fs/zip/cancel` — cancel ZIP creation.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancelZipRequest {
     pub request_id: String,
 }
@@ -133,6 +147,7 @@ pub struct CancelZipRequest {
 /// directory level, surfaces navigation hints (`can_go_up`, `parent_path`),
 /// and on Windows supports a `__ROOT__` sentinel for the drive-list screen.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BrowseDirectoryQuery {
     /// Directory to list. Empty string means "use default" (Windows: drive
     /// list; Unix: current working directory). `"__ROOT__"` on Windows is
@@ -240,12 +255,14 @@ pub struct RenameResponse {
 
 /// Request body for `POST /api/fs/watch/start` and `/stop`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileWatchRequest {
     pub file_path: String,
 }
 
 /// Request body for `POST /api/fs/office-watch/start` and `/stop`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceOfficeWatchRequest {
     pub workspace: String,
 }
@@ -256,12 +273,14 @@ pub struct WorkspaceOfficeWatchRequest {
 
 /// Request body for snapshot init / getInfo / compare / stageAll / unstageAll / dispose.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SnapshotWorkspaceRequest {
     pub workspace: String,
 }
 
 /// Request body for snapshot getBaselineContent.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SnapshotBaselineRequest {
     pub workspace: String,
     pub file_path: String,
@@ -269,6 +288,7 @@ pub struct SnapshotBaselineRequest {
 
 /// Request body for snapshot stageFile / unstageFile.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SnapshotStageRequest {
     pub workspace: String,
     pub file_path: String,
@@ -276,6 +296,7 @@ pub struct SnapshotStageRequest {
 
 /// Request body for snapshot discardFile / resetFile.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SnapshotDiscardRequest {
     pub workspace: String,
     pub file_path: String,

@@ -17,6 +17,7 @@ use std::sync::Arc;
 use nomifun_api_types::{
     CreateProviderRequest, FetchModelsRequest, UpdateProviderRequest, UpdateSettingsRequest,
 };
+use nomifun_common::ProviderId;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -28,9 +29,11 @@ use crate::server::ok;
 // ── param structs (single source: schema + runtime) ──────────────────────
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetSettingsParams {}
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct UpdateSettingsParams {
     /// System language code. Allowed: "en-US" or "zh-CN".
     #[serde(default)]
@@ -50,6 +53,7 @@ struct UpdateSettingsParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetPreferencesParams {
     /// Optional list of preference keys to fetch (omit to return all).
     /// Common keys: "theme", "ui.zoomFactor", "system.closeToTray",
@@ -59,6 +63,7 @@ struct GetPreferencesParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct UpdatePreferencesParams {
     /// Map of key → JSON value to set. A `null` value deletes the key.
     /// Keys must be non-empty and at most 255 characters.
@@ -74,6 +79,7 @@ struct UpdatePreferencesParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CreateProviderParams {
     /// Provider platform identifier (e.g. "openai", "anthropic", "gemini",
     /// "new-api", "bedrock", "vertex-ai", "minimax", "dashscope-coding", etc.).
@@ -93,9 +99,6 @@ struct CreateProviderParams {
     /// Whether the provider is enabled (default true).
     #[serde(default)]
     enabled: Option<bool>,
-    /// Optional context-window limit override (token count).
-    #[serde(default)]
-    context_limit: Option<i64>,
     /// Optional per-model context-window overrides.
     #[serde(default)]
     model_context_limits: Option<HashMap<String, i64>>,
@@ -106,9 +109,11 @@ struct CreateProviderParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct UpdateProviderParams {
-    /// Provider id (from nomi_list_providers).
-    id: String,
+    /// Provider ID (from nomi_list_providers).
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    provider_id: ProviderId,
     /// New platform identifier (omit to keep).
     #[serde(default)]
     platform: Option<String>,
@@ -127,9 +132,6 @@ struct UpdateProviderParams {
     /// Enable or disable (omit to keep).
     #[serde(default)]
     enabled: Option<bool>,
-    /// Override context-window limit (omit to keep).
-    #[serde(default)]
-    context_limit: Option<i64>,
     /// Replace per-model context-window overrides (omit to keep).
     #[serde(default)]
     model_context_limits: Option<HashMap<String, i64>>,
@@ -139,15 +141,19 @@ struct UpdateProviderParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct DeleteProviderParams {
-    /// Provider id to permanently delete.
-    id: String,
+    /// Provider ID to permanently delete.
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    provider_id: ProviderId,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct FetchModelsParams {
-    /// Provider id whose models to fetch from the remote API.
-    id: String,
+    /// Provider ID whose models to fetch from the remote API.
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    provider_id: ProviderId,
     /// If true, attempt automatic URL correction on failure for
     /// OpenAI-compatible providers (probes common URL suffixes).
     #[serde(default)]
@@ -155,6 +161,7 @@ struct FetchModelsParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetInfoParams {}
 
 // ── handlers ──────────────────────────────────────────────────────────────
@@ -213,7 +220,7 @@ async fn create_provider(deps: Arc<GatewayDeps>, p: CreateProviderParams) -> Val
         None => None,
     };
     let req = CreateProviderRequest {
-        id: None,
+        provider_id: None,
         platform: p.platform,
         name: p.name,
         base_url: p.base_url,
@@ -221,7 +228,6 @@ async fn create_provider(deps: Arc<GatewayDeps>, p: CreateProviderParams) -> Val
         models: p.models.unwrap_or_default(),
         enabled: p.enabled.unwrap_or(true),
         capabilities: vec![],
-        context_limit: p.context_limit,
         model_context_limits: p.model_context_limits,
         model_protocols: None,
         model_descriptions: None,
@@ -233,7 +239,7 @@ async fn create_provider(deps: Arc<GatewayDeps>, p: CreateProviderParams) -> Val
     };
     match deps.provider_service.create(req).await {
         Ok(resp) => ok(json!({
-            "id": resp.id,
+            "provider_id": resp.provider_id,
             "platform": resp.platform,
             "name": resp.name,
             "base_url": resp.base_url,
@@ -261,7 +267,6 @@ async fn update_provider(deps: Arc<GatewayDeps>, p: UpdateProviderParams) -> Val
         models: p.models,
         enabled: p.enabled,
         capabilities: None,
-        context_limit: p.context_limit,
         model_context_limits: p.model_context_limits,
         model_protocols: None,
         model_descriptions: None,
@@ -271,9 +276,9 @@ async fn update_provider(deps: Arc<GatewayDeps>, p: UpdateProviderParams) -> Val
         is_full_url: None,
         sort_order: None,
     };
-    match deps.provider_service.update(&p.id, req).await {
+    match deps.provider_service.update(p.provider_id.as_str(), req).await {
         Ok(resp) => ok(json!({
-            "id": resp.id,
+            "provider_id": resp.provider_id,
             "platform": resp.platform,
             "name": resp.name,
             "base_url": resp.base_url,
@@ -285,8 +290,8 @@ async fn update_provider(deps: Arc<GatewayDeps>, p: UpdateProviderParams) -> Val
 }
 
 async fn delete_provider(deps: Arc<GatewayDeps>, p: DeleteProviderParams) -> Value {
-    match deps.provider_service.delete(&p.id).await {
-        Ok(()) => json!({ "result": format!("provider {} deleted", p.id) }),
+    match deps.provider_service.delete(p.provider_id.as_str()).await {
+        Ok(()) => json!({ "result": format!("provider {} deleted", p.provider_id) }),
         Err(e) => json!({ "error": e.to_string() }),
     }
 }
@@ -295,7 +300,11 @@ async fn fetch_models(deps: Arc<GatewayDeps>, p: FetchModelsParams) -> Value {
     let req = FetchModelsRequest {
         try_fix: p.try_fix.unwrap_or(false),
     };
-    match deps.model_fetch_service.fetch_models(&p.id, &req).await {
+    match deps
+        .model_fetch_service
+        .fetch_models(p.provider_id.as_str(), &req)
+        .await
+    {
         Ok(resp) => {
             let mut result = json!({
                 "models": resp.models,
@@ -431,5 +440,5 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
 //
 // 11. `nomi_system_factory_reset` (Destructive, deny_on Channel+Remote)
 //     Needs: `deps.data_dir: PathBuf`
-//     Method: `nomifun_common::factory_reset::write_marker(&data_dir, &ResetMarker::new(ResetScope::Full))`
+//     Method: `nomifun_common::factory_reset::request_v3_dataset_reset(&data_dir)`
 //     Not wired because data_dir is not in the assumed GatewayDeps.

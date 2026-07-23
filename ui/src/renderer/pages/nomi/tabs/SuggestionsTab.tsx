@@ -77,7 +77,10 @@ const SuggestionsTab: React.FC = () => {
   const decide = useCallback(
     async (s: ICompanionSuggestion, accept: boolean) => {
       try {
-        await ipcBridge.companion.decideSuggestion.invoke({ id: s.id, accept });
+        await ipcBridge.companion.decideSuggestion.invoke({
+          suggestion_id: s.suggestion_id,
+          accept,
+        });
         void refresh();
         if (accept && s.action?.type === 'navigate' && s.action.to) {
           void navigate(s.action.to);
@@ -121,7 +124,7 @@ const SuggestionsTab: React.FC = () => {
       ) : (
         <div className='flex flex-col gap-8px transition-opacity duration-150' style={{ opacity: loading ? 0.6 : 1 }}>
           {items.map((s) => (
-            <div key={s.id} className='flex items-start gap-10px bg-fill-2 rd-10px px-12px py-10px'>
+            <div key={s.suggestion_id} className='flex items-start gap-10px bg-fill-2 rd-10px px-12px py-10px'>
               <span className='text-18px leading-none mt-2px'>{KIND_EMOJI[s.kind] || '🐰'}</span>
               <div className='flex-1 min-w-0'>
                 <div className='flex items-center gap-8px'>

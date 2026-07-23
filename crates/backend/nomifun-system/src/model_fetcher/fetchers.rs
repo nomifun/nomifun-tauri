@@ -74,7 +74,14 @@ pub(super) async fn fetch_openai_compatible(
         .await
         .map_err(|e| AppError::BadGateway(format!("Failed to parse models response: {e}")))?;
 
-    Ok(body.data.into_iter().map(|m| ModelInfo::Id(m.id)).collect())
+    Ok(body
+        .data
+        .into_iter()
+        .map(|m| ModelInfo {
+            id: m.id,
+            name: None,
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -117,7 +124,14 @@ async fn fetch_anthropic(
             let body: AnthropicModelsResponse = resp.json().await.map_err(|e| {
                 AppError::BadGateway(format!("Failed to parse Anthropic response: {e}"))
             })?;
-            Ok(body.data.into_iter().map(|m| ModelInfo::Id(m.id)).collect())
+            Ok(body
+                .data
+                .into_iter()
+                .map(|m| ModelInfo {
+                    id: m.id,
+                    name: None,
+                })
+                .collect())
         }
         Ok(resp) => {
             warn!(
@@ -171,7 +185,7 @@ async fn fetch_gemini(
                 .map(|m| {
                     // Strip "models/" prefix: "models/gemini-2.5-pro" -> "gemini-2.5-pro"
                     let id = m.name.strip_prefix("models/").unwrap_or(&m.name).to_owned();
-                    ModelInfo::Id(id)
+                    ModelInfo { id, name: None }
                 })
                 .collect();
             Ok(models)
@@ -246,7 +260,10 @@ async fn fetch_bedrock(config: &FetchConfig) -> Result<Vec<ModelInfo>, AppError>
     let models: Vec<ModelInfo> = profiles
         .iter()
         .filter(|p| p.inference_profile_id().starts_with("anthropic.claude"))
-        .map(|p| ModelInfo::Id(p.inference_profile_id().to_string()))
+        .map(|p| ModelInfo {
+            id: p.inference_profile_id().to_string(),
+            name: None,
+        })
         .collect();
 
     Ok(models)
@@ -258,8 +275,14 @@ async fn fetch_bedrock(config: &FetchConfig) -> Result<Vec<ModelInfo>, AppError>
 
 fn vertex_ai_models() -> Vec<ModelInfo> {
     vec![
-        ModelInfo::Id("gemini-2.5-pro".into()),
-        ModelInfo::Id("gemini-2.5-flash".into()),
+        ModelInfo {
+            id: "gemini-2.5-pro".into(),
+            name: None,
+        },
+        ModelInfo {
+            id: "gemini-2.5-flash".into(),
+            name: None,
+        },
     ]
 }
 
@@ -440,7 +463,10 @@ async fn fetch_dashscope_coding(
 
 fn fallback_models(ids: &[&str]) -> Vec<ModelInfo> {
     ids.iter()
-        .map(|id| ModelInfo::Id((*id).to_string()))
+        .map(|id| ModelInfo {
+            id: (*id).to_string(),
+            name: None,
+        })
         .collect()
 }
 
@@ -502,40 +528,58 @@ mod tests {
     fn vertex_ai_returns_expected_models() {
         let models = vertex_ai_models();
         assert_eq!(models.len(), 2);
-        assert_eq!(models[0], ModelInfo::Id("gemini-2.5-pro".into()));
-        assert_eq!(models[1], ModelInfo::Id("gemini-2.5-flash".into()));
+        assert_eq!(
+            models[0],
+            ModelInfo {
+                id: "gemini-2.5-pro".into(),
+                name: None
+            }
+        );
+        assert_eq!(
+            models[1],
+            ModelInfo {
+                id: "gemini-2.5-flash".into(),
+                name: None
+            }
+        );
     }
 
     #[test]
     fn minimax_returns_expected_models() {
         let models = minimax_models();
-        assert!(models.contains(&ModelInfo::Id("MiniMax-M3".into())));
-        assert!(models.contains(&ModelInfo::Id("MiniMax-M2.7".into())));
-        assert!(models.contains(&ModelInfo::Id("MiniMax-M2.5".into())));
-        assert!(models.contains(&ModelInfo::Id("MiniMax-Text-01".into())));
+        assert!(models.contains(&ModelInfo { id: "MiniMax-M3".into(), name: None }));
+        assert!(models.contains(&ModelInfo { id: "MiniMax-M2.7".into(), name: None }));
+        assert!(models.contains(&ModelInfo { id: "MiniMax-M2.5".into(), name: None }));
+        assert!(models.contains(&ModelInfo { id: "MiniMax-Text-01".into(), name: None }));
     }
 
     #[test]
     fn mimo_models_include_current_chat_and_agent_models() {
         let models = mimo_models();
-        assert!(models.contains(&ModelInfo::Id("mimo-v2.5-pro".into())));
-        assert!(models.contains(&ModelInfo::Id("mimo-v2.5".into())));
+        assert!(models.contains(&ModelInfo { id: "mimo-v2.5-pro".into(), name: None }));
+        assert!(models.contains(&ModelInfo { id: "mimo-v2.5".into(), name: None }));
     }
 
     #[test]
     fn minimax_code_plan_models_include_current_coding_models() {
-        assert!(minimax_code_models().contains(&ModelInfo::Id("MiniMax-M3".into())));
-        assert!(minimax_code_models().contains(&ModelInfo::Id("MiniMax-M2.7-highspeed".into())));
-        assert!(minimax_code_models().contains(&ModelInfo::Id("MiniMax-M2.1".into())));
+        assert!(minimax_code_models().contains(&ModelInfo { id: "MiniMax-M3".into(), name: None }));
+        assert!(minimax_code_models().contains(&ModelInfo {
+            id: "MiniMax-M2.7-highspeed".into(),
+            name: None
+        }));
+        assert!(minimax_code_models().contains(&ModelInfo { id: "MiniMax-M2.1".into(), name: None }));
     }
 
     #[test]
     fn coding_plan_fallbacks_include_default_router_models() {
-        assert!(ark_coding_plan_models().contains(&ModelInfo::Id("ark-code-latest".into())));
-        assert!(stepfun_plan_models().contains(&ModelInfo::Id("step-router-v1".into())));
-        assert!(glm_coding_plan_models().contains(&ModelInfo::Id("glm-5.2".into())));
+        assert!(ark_coding_plan_models().contains(&ModelInfo { id: "ark-code-latest".into(), name: None }));
+        assert!(stepfun_plan_models().contains(&ModelInfo { id: "step-router-v1".into(), name: None }));
+        assert!(glm_coding_plan_models().contains(&ModelInfo { id: "glm-5.2".into(), name: None }));
         assert!(
-            qianfan_coding_plan_models().contains(&ModelInfo::Id("qianfan-code-latest".into()))
+            qianfan_coding_plan_models().contains(&ModelInfo {
+                id: "qianfan-code-latest".into(),
+                name: None
+            })
         );
     }
 
@@ -543,16 +587,25 @@ mod tests {
     fn ark_agent_plan_fallback_includes_router_alias_and_families() {
         let models = fallback_models(ARK_AGENT_PLAN_FALLBACK_MODELS);
         // Router alias must be present — it is the recommended, console-switchable entry.
-        assert!(models.contains(&ModelInfo::Id("ark-code-latest".into())));
+        assert!(models.contains(&ModelInfo { id: "ark-code-latest".into(), name: None }));
         // A couple of the concrete IDs verified against the live Agent Plan endpoint.
-        assert!(models.contains(&ModelInfo::Id("glm-5.2".into())));
-        assert!(models.contains(&ModelInfo::Id("deepseek-v4-flash".into())));
+        assert!(models.contains(&ModelInfo { id: "glm-5.2".into(), name: None }));
+        assert!(models.contains(&ModelInfo {
+            id: "deepseek-v4-flash".into(),
+            name: None
+        }));
     }
 
     #[test]
     fn fallback_models_builds_model_info_list() {
         let models = fallback_models(&["a", "b", "c"]);
         assert_eq!(models.len(), 3);
-        assert_eq!(models[0], ModelInfo::Id("a".into()));
+        assert_eq!(
+            models[0],
+            ModelInfo {
+                id: "a".into(),
+                name: None
+            }
+        );
     }
 }

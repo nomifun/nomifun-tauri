@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use nomi_protocol::events::ToolCategory;
 use nomi_tools::Tool;
 use nomi_types::tool::{JsonSchema, ToolResult};
+use nomifun_common::RequirementId;
 
 /// Backend seam for requirement self-updates. Implemented by the backend over
 /// its `RequirementService`; `nomi-agent` only depends on this trait.
@@ -56,7 +57,8 @@ impl Tool for RequirementCompleteTool {
             "properties": {
                 "id": {
                     "type": "string",
-                    "description": "The requirement id you were given in the AutoWork prompt"
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                    "description": "The canonical bare UUIDv7 requirement id you were given in the AutoWork prompt"
                 },
                 "completion_note": {
                     "type": "string",
@@ -80,11 +82,11 @@ impl Tool for RequirementCompleteTool {
     }
 
     async fn execute(&self, input: Value) -> ToolResult {
-        let id = match input.get("id").and_then(|v| v.as_str()) {
-            Some(s) if !s.is_empty() => s,
+        let id = match input.get("id").and_then(Value::as_str) {
+            Some(id) if RequirementId::parse(id).is_ok() => id,
             _ => {
                 return ToolResult {
-                    content: "Missing required 'id' string".to_string(),
+                    content: "Missing or invalid canonical UUIDv7 'id'".to_string(),
                     is_error: true,
                     images: Vec::new(),
                 };
@@ -139,7 +141,11 @@ impl Tool for RequirementUpdateStatusTool {
         json!({
             "type": "object",
             "properties": {
-                "id": { "type": "string", "description": "The requirement id" },
+                "id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+                    "description": "The canonical bare UUIDv7 requirement id"
+                },
                 "status": {
                     "type": "string",
                     "enum": ["in_progress", "done", "failed"],
@@ -164,11 +170,11 @@ impl Tool for RequirementUpdateStatusTool {
     }
 
     async fn execute(&self, input: Value) -> ToolResult {
-        let id = match input.get("id").and_then(|v| v.as_str()) {
-            Some(s) if !s.is_empty() => s,
+        let id = match input.get("id").and_then(Value::as_str) {
+            Some(id) if RequirementId::parse(id).is_ok() => id,
             _ => {
                 return ToolResult {
-                    content: "Missing required 'id' string".to_string(),
+                    content: "Missing or invalid canonical UUIDv7 'id'".to_string(),
                     is_error: true,
                     images: Vec::new(),
                 };
@@ -250,13 +256,14 @@ mod tests {
     async fn complete_calls_sink() {
         let sink = Arc::new(FakeSink::default());
         let tool = RequirementCompleteTool::new(sink.clone());
+        let id = RequirementId::new().into_string();
         let res = tool
-            .execute(json!({ "id": "req_1", "completion_note": "done it" }))
+            .execute(json!({ "id": id, "completion_note": "done it" }))
             .await;
         assert!(!res.is_error, "content: {}", res.content);
         let completed = sink.completed.lock().unwrap();
         assert_eq!(completed.len(), 1);
-        assert_eq!(completed[0], ("req_1".to_string(), "done it".to_string()));
+        assert_eq!(completed[0], (id, "done it".to_string()));
     }
 
     #[tokio::test]
@@ -268,22 +275,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_rejects_non_uuid_string_id() {
+        let sink = Arc::new(FakeSink::default());
+        let tool = RequirementCompleteTool::new(sink);
+        let res = tool
+            .execute(json!({ "id": "1", "completion_note": "done it" }))
+            .await;
+        assert!(res.is_error);
+    }
+
+    #[tokio::test]
     async fn update_status_validates_enum() {
         let sink = Arc::new(FakeSink::default());
         let tool = RequirementUpdateStatusTool::new(sink.clone());
+        let id = RequirementId::new().into_string();
         let bad = tool
-            .execute(json!({ "id": "req_1", "status": "weird" }))
+            .execute(json!({ "id": id, "status": "weird" }))
             .await;
         assert!(bad.is_error);
         let good = tool
-            .execute(json!({ "id": "req_1", "status": "failed", "note": "blocked" }))
+            .execute(json!({ "id": id, "status": "failed", "note": "blocked" }))
             .await;
         assert!(!good.is_error, "content: {}", good.content);
         let statuses = sink.statuses.lock().unwrap();
         assert_eq!(
             statuses[0],
             (
-                "req_1".to_string(),
+                id,
                 "failed".to_string(),
                 Some("blocked".to_string())
             )
@@ -297,8 +315,9 @@ mod tests {
             ..Default::default()
         });
         let tool = RequirementCompleteTool::new(sink);
+        let id = RequirementId::new().into_string();
         let res = tool
-            .execute(json!({ "id": "req_1", "completion_note": "x" }))
+            .execute(json!({ "id": id, "completion_note": "x" }))
             .await;
         assert!(res.is_error);
         assert!(res.content.contains("boom"));

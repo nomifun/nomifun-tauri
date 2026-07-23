@@ -5,6 +5,7 @@ use crate::models::{AgentExecutionTemplateDetailRows, AgentExecutionTemplateRow}
 
 #[derive(Debug, Clone)]
 pub struct NewAgentExecutionTemplateParticipant {
+    pub template_participant_id: String,
     pub source_agent_id: String,
     pub preset_id: Option<String>,
     pub preset_revision: Option<i64>,

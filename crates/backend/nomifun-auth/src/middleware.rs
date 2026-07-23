@@ -93,7 +93,7 @@ pub async fn auth_middleware(
         .ok_or_else(|| AppError::Forbidden("User not found".into()))?;
 
     request.extensions_mut().insert(CurrentUser {
-        id: user.id,
+        id: user.user_id,
         username: user.username,
     });
 
@@ -129,7 +129,7 @@ mod instance_owner_tests {
     use super::{InstanceOwnerState, UserId};
     use std::sync::Arc;
 
-    const TEST_OWNER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_OWNER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 
     #[test]
     fn owner_identity_is_exact_and_username_independent() {

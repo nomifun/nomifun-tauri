@@ -30,6 +30,7 @@ const DEFAULT_ROWS: u16 = 30;
 // ─── Params ────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CreateTerminalParams {
     /// Optional display name (defaults to the preset/backend name).
     #[serde(default)]
@@ -56,11 +57,12 @@ struct CreateTerminalParams {
     /// (bind-on-create); they are mounted into `.nomi/knowledge/` inside the
     /// cwd when the terminal starts. Use nomi_knowledge_list_bases for ids.
     #[serde(default)]
-    #[schemars(with = "Option<Vec<String>>")]
+    #[schemars(schema_with = "crate::id_schema::optional_canonical_uuid_v7_array_schema")]
     knowledge_base_ids: Option<Vec<KnowledgeBaseId>>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ListTerminalsParams {
     /// Filter by status: "running" | "exited" (default: all).
     #[serde(default)]
@@ -135,7 +137,7 @@ async fn create(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: CreateTerminalParams)
 
     match deps.terminal_service.create(user_id.as_str(), req).await {
         Ok(resp) => ok(json!({
-            "id": resp.id,
+            "terminal_id": resp.terminal_id,
             "name": resp.name,
             "status": resp.last_status,
             "cwd": resp.cwd,
@@ -165,7 +167,7 @@ async fn list(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: ListTerminalsParams) ->
                 .filter(|t| p.status.as_deref().is_none_or(|s| t.last_status == s))
                 .map(|t| {
                     json!({
-                        "id": t.id,
+                        "terminal_id": t.terminal_id,
                         "name": t.name,
                         "status": t.last_status,
                         "cwd": t.cwd,

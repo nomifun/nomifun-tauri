@@ -16,28 +16,19 @@ pub const ENTRYPOINT_NAME: &str = "MEMORY.md";
 /// Maximum length for sanitized directory names before truncation.
 const MAX_SANITIZED_LENGTH: usize = 200;
 
-/// Environment variable to override the memory base directory.
-const MEMORY_DIR_ENV: &str = "NOMI_MEMORY_DIR";
-
 // ---------------------------------------------------------------------------
 // Base directory resolution
 // ---------------------------------------------------------------------------
 
 /// Returns the base directory for memory storage.
 ///
-/// Resolution order:
-///   1. `NOMI_MEMORY_DIR` environment variable (explicit override)
-///   2. `app_config_dir()` from `nomi-config` (platform-aware default)
-///
-/// Returns `None` only when both the env var is unset AND the platform
-/// cannot determine a config directory (e.g. no home directory).
+/// Hosted Nomi resolves this to the effective Nomifun application data root,
+/// exported as `NOMIFUN_DATA_DIR`. Standalone callers use
+/// `nomi_config::config::app_data_dir()`'s platform fallback. v3 deliberately
+/// has no independent memory-root override: otherwise auto-memory could escape
+/// the reset/backup-managed dataset and survive a hard reset unexpectedly.
 pub fn memory_base_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var(MEMORY_DIR_ENV)
-        && !dir.is_empty()
-    {
-        return Some(PathBuf::from(dir));
-    }
-    nomi_config::config::app_config_dir()
+    Some(nomi_config::config::app_data_dir())
 }
 
 // ---------------------------------------------------------------------------
@@ -415,35 +406,20 @@ mod tests {
         assert!(dir.is_dir());
     }
 
-    // -- memory_base_dir (env override) ---------------------------------------
+    // -- memory_base_dir ------------------------------------------------------
 
     #[test]
     #[serial(env)]
-    fn base_dir_env_override() {
-        let key = MEMORY_DIR_ENV;
-        let original = std::env::var(key).ok();
+    fn base_dir_uses_host_data_dir() {
+        const KEY: &str = "NOMIFUN_DATA_DIR";
+        let original = std::env::var(KEY).ok();
 
         // SAFETY: #[serial(env)] ensures no concurrent env mutation.
-        unsafe { std::env::set_var(key, "/custom/memory") };
+        unsafe { std::env::set_var(KEY, "/custom/nomifun-data") };
         let result = memory_base_dir();
-        assert_eq!(result, Some(PathBuf::from("/custom/memory")));
+        assert_eq!(result, Some(PathBuf::from("/custom/nomifun-data")));
 
-        restore_env(key, original);
-    }
-
-    #[test]
-    #[serial(env)]
-    fn base_dir_empty_env_falls_through() {
-        let key = MEMORY_DIR_ENV;
-        let original = std::env::var(key).ok();
-
-        // SAFETY: #[serial(env)] ensures no concurrent env mutation.
-        unsafe { std::env::set_var(key, "") };
-        let result = memory_base_dir();
-        // Should fall through to app_config_dir
-        assert_ne!(result, Some(PathBuf::from("")));
-
-        restore_env(key, original);
+        restore_env(KEY, original);
     }
 
     // -- auto_memory_dir ------------------------------------------------------
@@ -451,7 +427,7 @@ mod tests {
     #[test]
     #[serial(env)]
     fn auto_memory_dir_structure() {
-        let key = MEMORY_DIR_ENV;
+        let key = "NOMIFUN_DATA_DIR";
         let original = std::env::var(key).ok();
 
         // SAFETY: #[serial(env)] ensures no concurrent env mutation.

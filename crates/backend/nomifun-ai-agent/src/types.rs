@@ -72,8 +72,9 @@ pub struct AgentRuntimeBuildOptions {
     #[serde(default)]
     pub extra: serde_json::Value,
     /// Owning conversation row's `created_at` (ms). Stable per conversation
-    /// INSTANCE — used to stamp/validate the nomi session's `owner_token` so a
-    /// reused integer id never resumes a stale session. `None` skips validation.
+    /// instance and mandatory for persisted Nomi runtimes. It stamps and
+    /// validates the session owner token so derived state never crosses an
+    /// entity lifetime.
     #[serde(default)]
     pub conversation_created_at: Option<i64>,
 }
@@ -174,11 +175,10 @@ pub struct NomiResolvedConfig {
     /// unrestricted egress (current behavior). The raw key is carried (not a
     /// `nomi_browser` type) so this crate needs no `nomi-browser` dependency.
     pub browser_secret_vault: Option<BrowserSecretVault>,
-    /// Stable identity of the owning conversation INSTANCE (the conversation
-    /// row's `created_at`, stringified). Threaded to the nomi manager so it can
-    /// stamp/validate the session's `owner_token` and refuse to resume a stale
-    /// session left by a prior conversation that reused this integer id. `None`
-    /// = caller did not supply it (validation skipped — legacy/safe).
+    /// Stable identity of the owning conversation instance (the conversation
+    /// row's `created_at`, stringified). Persisted Nomi runtimes always provide
+    /// it; probe-only runtimes may leave it absent because they do not resume a
+    /// conversation session.
     pub owner_token: Option<String>,
     /// Backend-authoritative host composition switch. Platform Gateway,
     /// secondary-user, and PublicService sessions leave embedded AgentExecution
@@ -276,24 +276,24 @@ mod tests {
     #[test]
     fn agent_runtime_build_options_serde() {
         let opts = AgentRuntimeBuildOptions {
-            user_id: "user_0190f5fe-7c00-7a00-8000-000000000001".into(),
+            user_id: "0190f5fe-7c00-7a00-8000-000000000001".into(),
             agent_type: AgentType::Acp,
             workspace: "/project".into(),
             model: Some(ProviderWithModel {
-                provider_id: "prov_0190f5fe-7c00-7a00-8000-000000000001".into(),
+                provider_id: "0190f5fe-7c00-7a00-8000-000000000001".into(),
                 model: "claude-sonnet".into(),
                 use_model: None,
             }),
-            conversation_id: "conv_0190f5fe-7c00-7a00-8000-000000000001".into(),
+            conversation_id: "0190f5fe-7c00-7a00-8000-000000000001".into(),
             delegation_policy: DelegationPolicy::Automatic,
             extra: json!({ "backend": "claude" }),
             conversation_created_at: None,
         };
         let json = serde_json::to_value(&opts).unwrap();
         assert_eq!(json["agent_type"], "acp");
-        assert_eq!(json["user_id"], "user_0190f5fe-7c00-7a00-8000-000000000001");
+        assert_eq!(json["user_id"], "0190f5fe-7c00-7a00-8000-000000000001");
         assert_eq!(json["workspace"], "/project");
-        assert_eq!(json["conversation_id"], "conv_0190f5fe-7c00-7a00-8000-000000000001");
+        assert_eq!(json["conversation_id"], "0190f5fe-7c00-7a00-8000-000000000001");
         assert_eq!(json["delegation_policy"], "automatic");
     }
 
@@ -365,11 +365,11 @@ mod tests {
     #[test]
     fn runtime_options_deserialization_rejects_noncanonical_entity_ids() {
         let base = serde_json::json!({
-            "user_id": "user_0190f5fe-7c00-7a00-8000-000000000001",
+            "user_id": "0190f5fe-7c00-7a00-8000-000000000001",
             "agent_type": "nomi",
             "workspace": "/tmp",
             "model": null,
-            "conversation_id": "conv_0190f5fe-7c00-7a00-8000-000000000001"
+            "conversation_id": "0190f5fe-7c00-7a00-8000-000000000001"
         });
         assert!(serde_json::from_value::<AgentRuntimeBuildOptions>(base.clone()).is_ok());
         let mut invalid_user = base.clone();

@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::{KB_LEGACY_MOUNT_REL_DIR, KB_MOUNT_REL_DIR};
+use crate::KB_MOUNT_REL_DIR;
 
 /// One desired mount: `{workspace}/.nomi/knowledge/{link_name}` → `target`.
 #[derive(Debug, Clone)]
@@ -44,9 +44,7 @@ pub async fn sync_mounts(workspace: &Path, specs: Vec<MountSpec>) -> Vec<String>
 }
 
 fn sync_mounts_blocking(workspace: &Path, specs: &[MountSpec]) -> Vec<String> {
-    let present = sync_mounts_inner(workspace, specs);
-    cleanup_legacy_mount_root(workspace);
-    present
+    sync_mounts_inner(workspace, specs)
 }
 
 fn sync_mounts_inner(workspace: &Path, specs: &[MountSpec]) -> Vec<String> {
@@ -151,36 +149,6 @@ fn sync_mounts_inner(workspace: &Path, specs: &[MountSpec]) -> Vec<String> {
         }
     }
     present
-}
-
-/// Best-effort sweep of the pre-`.nomi` mount scaffolding left in workspaces
-/// created before the rename: `{ws}/.nomifun/knowledge/*` links (deleted as
-/// links — never followed into the knowledge bases) plus the self-ignore we
-/// used to write at `{ws}/.nomifun/.gitignore`. The `.nomifun/` directory
-/// itself is only removed when empty, so unrelated user files keep both the
-/// file and the directory alive. Idempotent; failures only warn.
-fn cleanup_legacy_mount_root(workspace: &Path) {
-    let legacy_mount = workspace.join(KB_LEGACY_MOUNT_REL_DIR);
-    if legacy_mount.exists() {
-        if let Ok(entries) = std::fs::read_dir(&legacy_mount) {
-            for entry in entries.flatten() {
-                remove_mount_entry(&entry.path());
-            }
-        }
-        if let Err(e) = std::fs::remove_dir(&legacy_mount) {
-            tracing::warn!(path = %legacy_mount.display(), error = %e, "failed to remove legacy knowledge mount dir");
-        }
-    }
-    let Some(legacy_root) = legacy_mount.parent() else { return };
-    let gitignore = legacy_root.join(".gitignore");
-    // Only delete the ignore file we wrote (content `*`) — anything else is
-    // the user's and stays.
-    if matches!(std::fs::read_to_string(&gitignore), Ok(content) if content.trim() == "*") {
-        if let Err(e) = std::fs::remove_file(&gitignore) {
-            tracing::warn!(path = %gitignore.display(), error = %e, "failed to remove legacy mount .gitignore");
-        }
-    }
-    let _ = std::fs::remove_dir(legacy_root);
 }
 
 /// Remove one entry inside the mount dir without ever touching the link
@@ -363,60 +331,6 @@ mod tests {
         // Never at the `.nomi/` root: that would shadow committable sibling
         // trees like `.nomi/skills` out of the user's git repository.
         assert!(!ws.path().join(".nomi").join(".gitignore").exists());
-    }
-
-    #[tokio::test]
-    async fn legacy_nomifun_mounts_cleaned() {
-        let bases = TempDir::new().unwrap();
-        let ws = TempDir::new().unwrap();
-        let kb = make_base(&bases, "kb_legacy");
-
-        // Scenario 1: `.nomifun/` holds only our scaffolding (a mounted link
-        // + the self-ignore) → the whole legacy dir disappears.
-        let legacy_root = ws.path().join(".nomifun");
-        let legacy_knowledge = legacy_root.join("knowledge");
-        std::fs::create_dir_all(&legacy_knowledge).unwrap();
-        std::fs::write(legacy_root.join(".gitignore"), "*\n").unwrap();
-        let legacy_link = legacy_knowledge.join("旧库");
-        if create_link(&kb, &legacy_link).is_err() {
-            // Platform refused the link (CI sandbox): a plain dir still
-            // exercises the cleanup path (copy-fallback leftovers are dirs).
-            std::fs::create_dir_all(&legacy_link).unwrap();
-        }
-
-        sync_mounts(
-            ws.path(),
-            vec![MountSpec {
-                link_name: "甲".into(),
-                target: kb.clone(),
-            }],
-        )
-        .await;
-
-        assert!(!legacy_root.exists(), "legacy .nomifun scaffolding must be fully removed");
-        assert!(
-            kb.join("note.md").exists(),
-            "legacy cleanup must delete links as links, never follow into the base"
-        );
-
-        // Scenario 2: `.nomifun/` also holds an unrelated user file → only
-        // our pieces go; the directory and the user file survive.
-        std::fs::create_dir_all(&legacy_knowledge).unwrap();
-        std::fs::write(legacy_root.join(".gitignore"), "*\n").unwrap();
-        std::fs::write(legacy_root.join("user-note.txt"), "keep me").unwrap();
-
-        sync_mounts(
-            ws.path(),
-            vec![MountSpec {
-                link_name: "甲".into(),
-                target: kb.clone(),
-            }],
-        )
-        .await;
-
-        assert!(!legacy_knowledge.exists());
-        assert!(!legacy_root.join(".gitignore").exists());
-        assert_eq!(std::fs::read_to_string(legacy_root.join("user-note.txt")).unwrap(), "keep me");
     }
 
     #[tokio::test]

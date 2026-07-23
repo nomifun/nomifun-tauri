@@ -65,12 +65,10 @@ async fn create_offline_backup(
     // Keep the lock alive until the snapshot and manifest have been fully
     // verified. This is the same lock the server holds for its lifetime.
     let _lock = crate::bootstrap::acquire_offline_server_lock(data_dir)?;
+    nomifun_common::factory_reset::require_current_v3_dataset(data_dir)
+        .map_err(|error| anyhow::anyhow!("backup requires a finalized v3 dataset: {error}"))?;
     let generation_path = data_dir.join("storage-generation");
-    match fs::symlink_metadata(&generation_path) {
-        Ok(_) => ensure_regular_source_file(&generation_path, "storage generation")?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
+    ensure_regular_source_file(&generation_path, "storage generation")?;
     let generation = load_or_create_storage_generation(data_dir)
         .with_context(|| format!("read storage generation in {}", data_dir.display()))?;
     let encryption_key_path = data_dir.join(DATA_ENCRYPTION_KEY_FILE);
@@ -252,7 +250,7 @@ mod tests {
         let conversation_id = ConversationId::new().into_string();
         nomifun_db::sqlx::query(
             "INSERT INTO conversations \
-             (id, user_id, name, type, extra, status, created_at, updated_at) \
+             (conversation_id, user_id, name, type, extra, status, created_at, updated_at) \
              VALUES (?, ?, 'backup command', 'nomi', '{}', 'pending', 1, 1)",
         )
         .bind(&conversation_id)
@@ -291,7 +289,7 @@ mod tests {
             .await
             .unwrap();
         let restored_id: String = nomifun_db::sqlx::query_scalar(
-            "SELECT id FROM conversations WHERE name = 'backup command'",
+            "SELECT conversation_id FROM conversations WHERE name = 'backup command'",
         )
         .fetch_one(restored.pool())
         .await
@@ -344,8 +342,8 @@ mod tests {
             .unwrap();
         nomifun_db::sqlx::query(
             "INSERT INTO providers \
-             (id, platform, name, base_url, api_key_encrypted, models, enabled, capabilities, created_at, updated_at) \
-             VALUES ('prov_0190f5fe-7c00-7a00-8abc-012345678901', 'openai', 'encrypted', \
+             (provider_id, platform, name, base_url, api_key_encrypted, models, enabled, capabilities, created_at, updated_at) \
+             VALUES ('0190f5fe-7c00-7a00-8abc-012345678901', 'openai', 'encrypted', \
                      'https://example.invalid', 'ciphertext', '[]', 1, '[]', 1, 1)",
         )
         .execute(database.pool())

@@ -63,7 +63,9 @@ impl AttachmentStore {
     }
 
     fn requirement_dir(&self, requirement_id: &str) -> PathBuf {
-        self.data_dir.join(ATTACHMENTS_REL_DIR).join(requirement_id)
+        self.data_dir
+            .join(ATTACHMENTS_REL_DIR)
+            .join(requirement_id)
     }
 
     pub fn abs_path(&self, row: &AttachmentRow) -> PathBuf {
@@ -72,7 +74,7 @@ impl AttachmentStore {
 
     pub fn to_dto(&self, row: &AttachmentRow) -> AttachmentDto {
         AttachmentDto {
-            id: row.id.clone(),
+            attachment_id: row.attachment_id.clone(),
             file_name: row.file_name.clone(),
             mime: row.mime.clone(),
             size_bytes: row.size_bytes,
@@ -137,7 +139,15 @@ impl AttachmentStore {
         let mut copied: Vec<PathBuf> = Vec::with_capacity(refs.len());
         for (r, (source, ext)) in refs.iter().zip(validated) {
             let result = self
-                .ingest_one(requirement_id, r, &source, &ext, created_by, &mut used_names, &dir)
+                .ingest_one(
+                    requirement_id,
+                    r,
+                    &source,
+                    &ext,
+                    created_by,
+                    &mut used_names,
+                    &dir,
+                )
                 .await;
             match result {
                 Ok((row, abs)) => {
@@ -147,8 +157,8 @@ impl AttachmentStore {
                 Err(e) => {
                     // Roll back THIS call's work: rows then files (best-effort).
                     for row in &inserted {
-                        if let Err(de) = self.repo.delete(&row.id).await {
-                            warn!(error = %de, id = %row.id, "attachment rollback: row delete failed");
+                        if let Err(de) = self.repo.delete(row.id).await {
+                            warn!(error = %de, id = row.id, "attachment rollback: row delete failed");
                         }
                     }
                     for p in &copied {
@@ -175,8 +185,8 @@ impl AttachmentStore {
         used_names: &mut Vec<String>,
         dir: &Path,
     ) -> Result<(AttachmentRow, PathBuf), AppError> {
-        let id = AttachmentId::new().into_string();
-        let disk_name = format!("{id}.{ext}");
+        let attachment_id = AttachmentId::new().into_string();
+        let disk_name = format!("{attachment_id}.{ext}");
         let abs = dir.join(&disk_name);
         // A missing source is the caller's fault (stale temp ref → BadRequest);
         // anything else (disk full, permissions) is a server-side failure.
@@ -197,8 +207,9 @@ impl AttachmentStore {
         let file_name = unique_name(&r.file_name, used_names);
         used_names.push(file_name.clone());
         let row = AttachmentRow {
-            id,
-            requirement_id: requirement_id.to_string(),
+            id: 0,
+            attachment_id,
+            requirement_id: requirement_id.to_owned(),
             file_name,
             rel_path: format!("{ATTACHMENTS_REL_DIR}/{requirement_id}/{disk_name}"),
             mime: mime_for_ext(ext).to_string(),
@@ -206,61 +217,195 @@ impl AttachmentStore {
             created_by: created_by.map(|s| s.to_string()),
             created_at: now_ms(),
         };
-        if let Err(e) = self.repo.insert(&row).await {
-            let _ = tokio::fs::remove_file(&abs).await;
-            return Err(e.into());
+        match self.repo.insert(&row).await {
+            Ok(inserted) => Ok((inserted, abs)),
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&abs).await;
+                Err(e.into())
+            }
         }
-        Ok((row, abs))
     }
 
     /// Remove specific attachments (rows + files). Ids that don't exist or
     /// belong to a different requirement are skipped —scope guard.
-    pub async fn remove(&self, requirement_id: &str, ids: &[String]) -> Result<(), AppError> {
+    pub async fn remove(
+        &self,
+        requirement_id: &str,
+        attachment_ids: &[String],
+    ) -> Result<(), AppError> {
         validate_requirement_id(requirement_id)?;
-        for id in ids {
-            AttachmentId::try_from(id.as_str())
+        for attachment_id in attachment_ids {
+            AttachmentId::try_from(attachment_id.as_str())
                 .map_err(|error| AppError::BadRequest(format!("invalid attachment id: {error}")))?;
         }
-        for id in ids {
-            let Some(row) = self.repo.get_by_id(id).await? else { continue };
+        for attachment_id in attachment_ids {
+            let Some(row) = self.repo.get_by_attachment_id(attachment_id).await? else {
+                continue;
+            };
             if row.requirement_id != requirement_id {
-                warn!(id = %id, "attachment remove skipped: requirement mismatch");
+                warn!(
+                    attachment_id,
+                    "attachment remove skipped: requirement mismatch"
+                );
                 continue;
             }
-            self.repo.delete(id).await?;
             let abs = self.abs_path(&row);
-            if let Err(e) = tokio::fs::remove_file(&abs).await {
-                warn!(error = %e, path = %abs.display(), "attachment file delete failed (row removed)");
-            }
+            let staged = self.stage_file_for_delete(&abs).await?;
+            match self.repo.delete(row.id).await {
+                Ok(_) => {
+                    self.finish_staged_delete(staged).await;
+                }
+                Err(error) => {
+                    self.restore_staged_file(staged).await?;
+                    return Err(error.into());
+                }
+            };
         }
         Ok(())
     }
 
-    /// Delete every attachment of a requirement (rows + files + dir). File
-    /// failures are logged, not raised —used from requirement deletion which
-    /// must not block.
+    /// Delete every attachment of a requirement (rows + files + dir).
+    ///
+    /// Files are first renamed into a same-filesystem quarantine. Only after
+    /// every file is safely staged are all database rows deleted. A DB failure
+    /// restores the original paths; a filesystem staging failure leaves the DB
+    /// untouched. This is the strongest atomicity available across SQLite and
+    /// the filesystem without a distributed transaction manager.
     pub async fn delete_all(&self, requirement_id: &str) -> Result<(), AppError> {
-        validate_requirement_id(requirement_id)?;
-        let rows = self.repo.list_for_requirement(requirement_id).await?;
-        for row in &rows {
-            self.repo.delete(&row.id).await?;
-            let abs = self.abs_path(row);
-            if let Err(e) = tokio::fs::remove_file(&abs).await
-                && abs.exists()
-            {
-                warn!(error = %e, path = %abs.display(), "attachment file delete failed");
+        let prepared = self.prepare_delete_all(requirement_id).await?;
+        match self.repo.delete_for_requirement(requirement_id).await {
+            Ok(_) => {
+                self.finish_prepared_delete(prepared).await;
+                Ok(())
+            }
+            Err(error) => {
+                self.restore_prepared_delete(prepared).await?;
+                Err(error.into())
             }
         }
-        let _ = tokio::fs::remove_dir(self.requirement_dir(requirement_id)).await;
+    }
+
+    pub(crate) async fn prepare_delete_all(
+        &self,
+        requirement_id: &str,
+    ) -> Result<PreparedAttachmentDelete, AppError> {
+        validate_requirement_id(requirement_id)?;
+        let rows = self.repo.list_for_requirement(requirement_id).await?;
+        let mut staged_files = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let abs = self.abs_path(row);
+            match self.stage_file_for_delete(&abs).await {
+                Ok(staged) => staged_files.push(staged),
+                Err(error) => {
+                    for staged in staged_files.into_iter().rev() {
+                        if let Err(restore_error) = self.restore_staged_file(staged).await {
+                            warn!(error = %restore_error, "attachment rollback failed after staging error");
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(PreparedAttachmentDelete {
+            requirement_dir: self.requirement_dir(requirement_id),
+            staged_files,
+        })
+    }
+
+    pub(crate) async fn restore_prepared_delete(
+        &self,
+        prepared: PreparedAttachmentDelete,
+    ) -> Result<(), AppError> {
+        for staged in prepared.staged_files.into_iter().rev() {
+            self.restore_staged_file(staged).await?;
+        }
         Ok(())
+    }
+
+    pub(crate) async fn finish_prepared_delete(&self, prepared: PreparedAttachmentDelete) {
+        for staged in prepared.staged_files {
+            self.finish_staged_delete(staged).await;
+        }
+        if let Err(error) = remove_dir_if_empty(&prepared.requirement_dir).await {
+            warn!(error = %error, path = %prepared.requirement_dir.display(), "attachment directory cleanup failed after committed delete");
+        }
+    }
+
+    async fn stage_file_for_delete(&self, original: &Path) -> Result<Option<StagedFileDelete>, AppError> {
+        match tokio::fs::symlink_metadata(original).await {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                return Err(AppError::Internal(format!(
+                    "attachment path is not a regular file: {}",
+                    original.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(AppError::Internal(format!(
+                    "inspect attachment file '{}' failed: {error}",
+                    original.display()
+                )));
+            }
+        }
+
+        let file_name = original
+            .file_name()
+            .ok_or_else(|| AppError::Internal(format!(
+                "attachment path has no file name: {}",
+                original.display()
+            )))?
+            .to_string_lossy();
+        let staged = original.with_file_name(format!(".{file_name}.deleting-{}", generate_id()));
+        tokio::fs::rename(original, &staged).await.map_err(|error| {
+            AppError::Internal(format!(
+                "stage attachment file '{}' for deletion failed: {error}",
+                original.display()
+            ))
+        })?;
+        Ok(Some(StagedFileDelete {
+            original: original.to_path_buf(),
+            staged,
+        }))
+    }
+
+    async fn restore_staged_file(&self, staged: Option<StagedFileDelete>) -> Result<(), AppError> {
+        let Some(staged) = staged else {
+            return Ok(());
+        };
+        tokio::fs::rename(&staged.staged, &staged.original)
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "restore attachment file '{}' failed: {error}",
+                    staged.original.display()
+                ))
+            })
+    }
+
+    async fn finish_staged_delete(&self, staged: Option<StagedFileDelete>) {
+        let Some(staged) = staged else {
+            return;
+        };
+        if let Err(error) = tokio::fs::remove_file(&staged.staged).await {
+            warn!(
+                error = %error,
+                path = %staged.staged.display(),
+                "staged attachment file cleanup failed after committed database delete"
+            );
+        }
     }
 
     /// Build prompt entries for a requirement's attachments, copying each into
     /// `{workspace}/.nomi/requirement-attachments/{req_id}/{file_name}` when a
     /// workspace is given. Best-effort and infallible: a failed copy falls back
     /// to the absolute original path; a vanished original is flagged `missing`.
-    pub async fn stage_for_prompt(&self, req_id: &str, workspace: Option<&Path>) -> Vec<PromptAttachment> {
-        if RequirementId::try_from(req_id).is_err() {
+    pub async fn stage_for_prompt(
+        &self,
+        req_id: &str,
+        workspace: Option<&Path>,
+    ) -> Vec<PromptAttachment> {
+        if validate_requirement_id(req_id).is_err() {
             warn!(req_id, "refusing to stage attachments for an invalid requirement id");
             return Vec::new();
         }
@@ -318,8 +463,30 @@ impl AttachmentStore {
     }
 }
 
+#[derive(Debug)]
+struct StagedFileDelete {
+    original: PathBuf,
+    staged: PathBuf,
+}
+
+pub(crate) struct PreparedAttachmentDelete {
+    requirement_dir: PathBuf,
+    staged_files: Vec<Option<StagedFileDelete>>,
+}
+
+async fn remove_dir_if_empty(path: &Path) -> Result<(), AppError> {
+    match tokio::fs::remove_dir(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(AppError::Internal(format!(
+            "remove empty attachment directory '{}' failed: {error}",
+            path.display()
+        ))),
+    }
+}
+
 fn validate_requirement_id(requirement_id: &str) -> Result<(), AppError> {
-    RequirementId::try_from(requirement_id)
+    RequirementId::parse(requirement_id)
         .map(|_| ())
         .map_err(|error| AppError::BadRequest(format!("invalid requirement id: {error}")))
 }
@@ -367,20 +534,20 @@ mod tests {
     use nomifun_db::{SqliteAttachmentRepository, init_database_memory};
     use std::sync::Arc;
 
-    const REQ_1: &str = "req_0190f5fe-7c00-7a00-8000-000000000001";
-    const REQ_2: &str = "req_0190f5fe-7c00-7a00-8000-000000000002";
+    const REQ_1: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const REQ_2: &str = "0190f5fe-7c00-7a00-8000-000000000002";
 
     async fn store() -> (AttachmentStore, tempfile::TempDir, tempfile::TempDir) {
         let db = init_database_memory().await.unwrap();
-        // attachments.requirement_id FKs requirements(id) (CASCADE) under
-        // foreign_keys=ON, so seed the parent requirements these tests bind to.
-        for (index, id) in [REQ_1, REQ_2].into_iter().enumerate() {
+        // Seed the parent rows used by the logical attachments.requirement_id
+        // references. SQLite does not enforce or cascade these links.
+        for (index, requirement_id) in [REQ_1, REQ_2].into_iter().enumerate() {
             sqlx::query(
                 "INSERT INTO requirements \
-                 (id, display_no, title, content, tag, order_key, sort_seq, status, priority, attempt_count, created_by, extra, created_at, updated_at) \
+                 (requirement_id, display_no, title, content, tag, order_key, sort_seq, status, priority, attempt_count, created_by, extra, created_at, updated_at) \
                  VALUES (?, ?, 'T', '', 't', '', '', 'pending', 0, 0, 'user', '{}', 0, 0)",
             )
-            .bind(id)
+            .bind(requirement_id)
             .bind((index + 1) as i64)
             .execute(db.pool())
             .await
@@ -412,7 +579,7 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
-        assert!(row.id.starts_with("att_"));
+        assert!(AttachmentId::try_from(row.attachment_id.as_str()).is_ok());
         assert_eq!(row.file_name, "设计稿.png");
         assert_eq!(row.mime, "image/png");
         assert_eq!(row.size_bytes, 9);
@@ -500,12 +667,19 @@ mod tests {
             )
             .await
             .unwrap();
-        // remove one by id —row + file gone
-        store.remove(REQ_1, &[rows[0].id.clone()]).await.unwrap();
+        // Remove by stable attachment business ID; the local row ID stays
+        // internal to persistence.
+        store
+            .remove(REQ_1, &[rows[0].attachment_id.clone()])
+            .await
+            .unwrap();
         assert_eq!(store.list(REQ_1).await.unwrap().len(), 1);
         assert!(!data_dir.path().join(&rows[0].rel_path).exists());
         // remove with an id belonging to ANOTHER requirement is a no-op (scope guard)
-        store.remove(REQ_2, &[rows[1].id.clone()]).await.unwrap();
+        store
+            .remove(REQ_2, &[rows[1].attachment_id.clone()])
+            .await
+            .unwrap();
         assert_eq!(store.list(REQ_1).await.unwrap().len(), 1);
         // delete_all —everything gone including the dir
         store.delete_all(REQ_1).await.unwrap();

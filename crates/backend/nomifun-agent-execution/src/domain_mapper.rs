@@ -5,11 +5,10 @@ use nomifun_api_types::{
     ExecutionStep, ExecutionStepDependency, ParticipantConstraints,
 };
 use nomifun_common::{
-    AgentExecutionActorType, AgentExecutionAttemptId, AgentExecutionEventId,
-    AgentExecutionEventKind, AgentExecutionId, AgentExecutionParticipantId, AgentExecutionStepId,
-    AgentStepMode, AppError, CompanionId, ConversationId, EntityId, ExecutionAttemptStatus,
-    ExecutionStepKind, ExecutionStepStatus, MAX_AGENT_EXECUTION_PARALLELISM,
-    ParticipantAssignmentSource, ProviderId, StepFailurePolicy, UserId,
+    AgentExecutionActorType, AgentExecutionEventKind, AgentExecutionId, AgentStepMode, AppError,
+    CompanionId, ConversationId, EntityId, ExecutionAttemptStatus, ExecutionStepKind,
+    ExecutionStepStatus, MAX_AGENT_EXECUTION_PARALLELISM, ParticipantAssignmentSource, ProviderId,
+    StepFailurePolicy, UserId, validate_uuidv7,
 };
 use nomifun_db::models::{
     AgentExecutionAttemptDetailRow, AgentExecutionDetailRows, AgentExecutionParticipantRow,
@@ -43,6 +42,19 @@ fn require_optional_id<T: EntityId>(
     Ok(())
 }
 
+fn require_uuidv7(field: &str, value: &str) -> Result<(), AppError> {
+    validate_uuidv7(value)
+        .map(|_| ())
+        .map_err(|error| persisted_error(field, error))
+}
+
+fn require_optional_uuidv7(field: &str, value: Option<&str>) -> Result<(), AppError> {
+    value
+        .map(|value| require_uuidv7(field, value))
+        .transpose()?;
+    Ok(())
+}
+
 pub(crate) fn event_kind(value: &str) -> Result<AgentExecutionEventKind, AppError> {
     parse_enum("event.event_type", value)
 }
@@ -64,7 +76,7 @@ pub(crate) fn execution(
     row: AgentExecutionRow,
     lead_conversation_id: Option<String>,
 ) -> Result<AgentExecution, AppError> {
-    require_id::<AgentExecutionId>("execution.id", &row.id)?;
+    require_id::<AgentExecutionId>("execution.execution_id", &row.execution_id)?;
     require_optional_id::<ConversationId>(
         "execution.lead_conversation_id",
         lead_conversation_id.as_deref(),
@@ -76,7 +88,7 @@ pub(crate) fn execution(
         ));
     }
     Ok(AgentExecution {
-        id: row.id,
+        execution_id: row.execution_id,
         goal: row.goal,
         lead_conversation_id,
         work_dir: row.work_dir,
@@ -99,7 +111,7 @@ pub(crate) fn execution(
 pub(crate) fn participant(
     row: AgentExecutionParticipantRow,
 ) -> Result<ExecutionParticipant, AppError> {
-    require_id::<AgentExecutionParticipantId>("participant.id", &row.id)?;
+    require_uuidv7("participant.participant_id", &row.participant_id)?;
     require_id::<AgentExecutionId>("participant.execution_id", &row.execution_id)?;
     match (row.provider_id.as_deref(), row.model.as_deref()) {
         (Some(provider_id), Some(model))
@@ -122,7 +134,7 @@ pub(crate) fn participant(
         })?;
     }
     Ok(ExecutionParticipant {
-        id: row.id,
+        participant_id: row.participant_id,
         execution_id: row.execution_id,
         source_agent_id: row.source_agent_id,
         preset_id: row.preset_id,
@@ -148,14 +160,14 @@ pub(crate) fn participant(
 }
 
 pub(crate) fn step(row: AgentExecutionStepRow) -> Result<ExecutionStep, AppError> {
-    require_id::<AgentExecutionStepId>("step.id", &row.id)?;
+    require_uuidv7("step.step_id", &row.step_id)?;
     require_id::<AgentExecutionId>("step.execution_id", &row.execution_id)?;
-    require_optional_id::<AgentExecutionParticipantId>(
+    require_optional_uuidv7(
         "step.assigned_participant_id",
         row.assigned_participant_id.as_deref(),
     )?;
     Ok(ExecutionStep {
-        id: row.id,
+        step_id: row.step_id,
         execution_id: row.execution_id,
         title: row.title,
         spec: row.spec,
@@ -197,8 +209,8 @@ pub(crate) fn dependency(
     row: AgentExecutionStepDependencyRow,
 ) -> Result<ExecutionStepDependency, AppError> {
     require_id::<AgentExecutionId>("dependency.execution_id", &row.execution_id)?;
-    require_id::<AgentExecutionStepId>("dependency.blocker_step_id", &row.blocker_step_id)?;
-    require_id::<AgentExecutionStepId>("dependency.blocked_step_id", &row.blocked_step_id)?;
+    require_uuidv7("dependency.blocker_step_id", &row.blocker_step_id)?;
+    require_uuidv7("dependency.blocked_step_id", &row.blocked_step_id)?;
     Ok(ExecutionStepDependency {
         execution_id: row.execution_id,
         blocker_step_id: row.blocker_step_id,
@@ -212,10 +224,10 @@ pub(crate) fn attempt(
     row: AgentExecutionAttemptDetailRow,
 ) -> Result<ExecutionAttempt, AppError> {
     let attempt = row.attempt;
-    require_id::<AgentExecutionAttemptId>("attempt.id", &attempt.id)?;
+    require_uuidv7("attempt.attempt_id", &attempt.attempt_id)?;
     require_id::<AgentExecutionId>("attempt.execution_id", &attempt.execution_id)?;
-    require_id::<AgentExecutionStepId>("attempt.step_id", &attempt.step_id)?;
-    require_optional_id::<AgentExecutionParticipantId>(
+    require_uuidv7("attempt.step_id", &attempt.step_id)?;
+    require_optional_uuidv7(
         "attempt.participant_id",
         attempt.participant_id.as_deref(),
     )?;
@@ -224,7 +236,7 @@ pub(crate) fn attempt(
         row.conversation_id.as_deref(),
     )?;
     Ok(ExecutionAttempt {
-        id: attempt.id,
+        attempt_id: attempt.attempt_id,
         execution_id: attempt.execution_id,
         step_id: attempt.step_id,
         attempt_no: attempt.attempt_no,
@@ -271,18 +283,14 @@ pub(crate) fn detail(rows: AgentExecutionDetailRows) -> Result<AgentExecutionDet
 }
 
 pub(crate) fn event(row: AgentExecutionEventRow) -> Result<AgentExecutionEvent, AppError> {
-    require_id::<AgentExecutionEventId>("event.id", &row.id)?;
     require_id::<AgentExecutionId>("event.execution_id", &row.execution_id)?;
-    require_optional_id::<AgentExecutionStepId>("event.step_id", row.step_id.as_deref())?;
-    require_optional_id::<AgentExecutionAttemptId>(
-        "event.attempt_id",
-        row.attempt_id.as_deref(),
-    )?;
+    require_optional_uuidv7("event.step_id", row.step_id.as_deref())?;
+    require_optional_uuidv7("event.attempt_id", row.attempt_id.as_deref())?;
     require_optional_id::<ConversationId>(
         "event.actor_conversation_id",
         row.actor_conversation_id.as_deref(),
     )?;
-    require_optional_id::<AgentExecutionAttemptId>(
+    require_optional_uuidv7(
         "event.actor_attempt_id",
         row.actor_attempt_id.as_deref(),
     )?;
@@ -335,7 +343,6 @@ pub(crate) fn event(row: AgentExecutionEventRow) -> Result<AgentExecutionEvent, 
         }
     }
     Ok(AgentExecutionEvent {
-        id: row.id,
         execution_id: row.execution_id,
         sequence: row.sequence,
         event_type: event_kind(&row.event_type)?,
@@ -357,8 +364,7 @@ mod tests {
 
     fn event_row(event_type: &str) -> AgentExecutionEventRow {
         AgentExecutionEventRow {
-            id: "aevt_0190f5fe-7c00-7a00-8000-000000000001".to_owned(),
-            execution_id: "exec_0190f5fe-7c00-7a00-8000-000000000001".to_owned(),
+            execution_id: "0190f5fe-7c00-7a00-8000-000000000001".to_owned(),
             sequence: 1,
             event_type: event_type.to_owned(),
             step_id: None,
@@ -367,7 +373,7 @@ mod tests {
             actor_id: None,
             actor_conversation_id: None,
             actor_attempt_id: None,
-            on_behalf_of_user_id: "user_0190f5fe-7c00-7a00-8000-000000000001".to_owned(),
+            on_behalf_of_user_id: "0190f5fe-7c00-7a00-8000-000000000002".to_owned(),
             payload: "{}".to_owned(),
             created_at: 1,
             published_at: None,

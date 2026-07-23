@@ -20,7 +20,7 @@ pub struct ListRequirementsParams {
     /// Substring search over title + content (case-insensitive).
     pub q: Option<String>,
     /// Sort column (whitelisted in the repository). Recognized values:
-    /// `"display_no" | "id" | "created_at" | "updated_at" | "status"`. Any other value — or
+    /// `"display_no" | "requirement_id" | "created_at" | "updated_at" | "status"`. Any other value — or
     /// `None` — falls back to the default queue order
     /// (`sort_seq ASC, priority DESC, created_at ASC`). User input is never
     /// interpolated into SQL; it only selects a fixed, hard-coded column.
@@ -38,17 +38,25 @@ pub struct ListRequirementsParams {
 #[async_trait::async_trait]
 pub trait IRequirementRepository: Send + Sync {
     /// Atomically allocate an immutable human-facing display number and insert
-    /// a new requirement with its caller-supplied canonical `req_<UUIDv7>` ID.
+    /// a new requirement with both a generated stable UUIDv7 business ID and a
+    /// SQLite-allocated local technical ID.
     async fn insert(&self, row: &NewRequirementRow) -> Result<RequirementRow, DbError>;
 
-    /// Partial update by ID. Returns `DbError::NotFound` if absent.
-    async fn update(&self, id: &str, params: &RequirementRowUpdate) -> Result<(), DbError>;
+    /// Partial update by stable requirement ID. Returns `DbError::NotFound` if absent.
+    async fn update(
+        &self,
+        requirement_id: &str,
+        params: &RequirementRowUpdate,
+    ) -> Result<(), DbError>;
 
-    /// Delete by ID. Returns `DbError::NotFound` if absent.
-    async fn delete(&self, id: &str) -> Result<(), DbError>;
+    /// Delete by stable requirement ID. Returns `DbError::NotFound` if absent.
+    async fn delete(&self, requirement_id: &str) -> Result<(), DbError>;
 
-    /// Fetch a single requirement by ID.
-    async fn get_by_id(&self, id: &str) -> Result<Option<RequirementRow>, DbError>;
+    /// Fetch a single requirement by stable requirement ID.
+    async fn get_by_requirement_id(
+        &self,
+        requirement_id: &str,
+    ) -> Result<Option<RequirementRow>, DbError>;
 
     /// List with filters + pagination. Returns `(rows, total_matching)`.
     async fn list(&self, params: &ListRequirementsParams) -> Result<(Vec<RequirementRow>, u64), DbError>;
@@ -80,7 +88,7 @@ pub trait IRequirementRepository: Send + Sync {
     /// against `owner_session_id`). Returns true if a row was renewed.
     async fn renew_lease(
         &self,
-        id: &str,
+        requirement_id: &str,
         owner_conversation_id: Option<&str>,
         owner_terminal_id: Option<&str>,
         lease_ms: i64,
@@ -109,7 +117,7 @@ pub trait IRequirementRepository: Send + Sync {
         &self,
         tag: &str,
         reason: &str,
-        req_id: Option<&str>,
+        requirement_id: Option<&str>,
         now: TimestampMs,
     ) -> Result<(), DbError>;
 
@@ -132,7 +140,7 @@ pub trait IRequirementRepository: Send + Sync {
     /// the consumed attempt.
     async fn unclaim(
         &self,
-        id: &str,
+        requirement_id: &str,
         owner_conversation_id: Option<&str>,
         owner_terminal_id: Option<&str>,
     ) -> Result<bool, DbError>;

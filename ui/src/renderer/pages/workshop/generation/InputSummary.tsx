@@ -18,7 +18,7 @@ import { CloseSmall, FileText, Link, Pic, VideoTwo } from '@icon-park/react';
 import type { WorkshopFlowEdge, WorkshopFlowNode } from '../canvas/model';
 import type { WorkshopAssetKind } from '../types';
 import { collectNodeCandidates, parseMentionRef } from './pipeline';
-import type { WorkshopNodeId } from '@/common/types/ids';
+import { tryParseEntityId, type WorkshopNodeId } from '@/common/types/ids';
 
 export interface InputSummaryProps {
   selfId: WorkshopNodeId;
@@ -34,12 +34,14 @@ const KIND_ICON: Record<WorkshopAssetKind, React.ReactNode> = {
 
 /** Map a source node's { type, data } to the asset kind it contributes. */
 function sourceKind(type: string | undefined, data: Record<string, unknown> | undefined): WorkshopAssetKind | null {
-  if (type === 'image') return typeof data?.assetId === 'string' ? 'image' : null;
-  if (type === 'video') return typeof data?.assetId === 'string' ? 'video' : null;
+  if (type === 'image') return tryParseEntityId('asset', data?.assetId) ? 'image' : null;
+  if (type === 'video') return tryParseEntityId('asset', data?.assetId) ? 'video' : null;
   if (type === 'text') return typeof data?.content === 'string' && data.content.trim() ? 'text' : null;
   if (type === 'generator') {
-    const results = Array.isArray(data?.resultAssetIds) ? (data.resultAssetIds as string[]) : [];
-    if (!results.length) return null;
+    const hasResult =
+      Array.isArray(data?.resultAssetIds) &&
+      data.resultAssetIds.some((value) => tryParseEntityId('asset', value) !== null);
+    if (!hasResult) return null;
     const mode = typeof data?.mode === 'string' ? data.mode : 'image';
     return mode === 'video' ? 'video' : mode === 'text' ? 'text' : 'image';
   }

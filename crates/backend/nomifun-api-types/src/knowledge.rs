@@ -36,7 +36,7 @@ pub enum KnowledgeSourceMode {
 /// registry row's forward-compatible `extra` column under the `source` key —
 /// every field added later MUST be `#[serde(default)]`-compatible.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct KnowledgeSource {
     /// Source kind discriminator; `"url"` is the only kind today (connector
     /// kinds like `feishu`/`notion` are design-stage).
@@ -72,9 +72,9 @@ fn default_source_kind() -> String {
 /// Wire-safe summary of a stored connector credential. **Never** carries the
 /// secret payload — only the fields the UI needs to list/pick credentials.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConnectorCredentialSummary {
-    pub id: ConnectorCredentialId,
+    pub credential_id: ConnectorCredentialId,
     /// Connector discriminator: "feishu", "notion", …
     pub kind: String,
     pub name: String,
@@ -117,8 +117,9 @@ pub struct ConnectorSyncState {
 /// initial shape MUST be `#[serde(default)]`-compatible so old persisted
 /// extras keep deserializing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KnowledgeMountInfo {
-    pub id: KnowledgeBaseId,
+    pub knowledge_base_id: KnowledgeBaseId,
     pub name: String,
     pub description: String,
     /// Workspace-relative mount path, e.g. `.nomi/knowledge/领域知识`.
@@ -156,6 +157,7 @@ pub struct KnowledgeTag {
 
 /// Request body for creating a new knowledge tag.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateKnowledgeTagRequest {
     pub label: String,
@@ -165,6 +167,7 @@ pub struct CreateKnowledgeTagRequest {
 
 /// Request body for partially updating an existing knowledge tag.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateKnowledgeTagRequest {
     #[serde(default)]
@@ -180,22 +183,123 @@ mod tests {
     use super::*;
 
     #[test]
-    fn durable_knowledge_dtos_reject_noncanonical_ids() {
+    fn connector_credential_summary_uses_named_id_and_rejects_legacy_id() {
+        let credential_id = ConnectorCredentialId::new();
         let credential = serde_json::json!({
-            "id": "conn_1",
+            "credentialId": credential_id,
             "kind": "feishu",
             "name": "tenant",
             "createdAt": 1
         });
-        assert!(serde_json::from_value::<ConnectorCredentialSummary>(credential).is_err());
+        let summary: ConnectorCredentialSummary =
+            serde_json::from_value(credential).expect("named credential id should deserialize");
+        assert_eq!(summary.credential_id, credential_id);
+        let wire = serde_json::to_value(summary).unwrap();
+        assert_eq!(wire["credentialId"], credential_id.as_str());
+        assert!(wire.get("id").is_none(), "legacy generic id must stay off the wire: {wire}");
 
+        let legacy = serde_json::json!({
+            "id": credential_id,
+            "kind": "feishu",
+            "name": "tenant",
+            "createdAt": 1
+        });
+        assert!(serde_json::from_value::<ConnectorCredentialSummary>(legacy).is_err());
+    }
+
+    #[test]
+    fn connector_credential_ids_reject_noncanonical_values() {
+        let valid = ConnectorCredentialId::new();
+        for invalid in [
+            serde_json::json!(7),
+            serde_json::json!("7"),
+            serde_json::json!("550e8400-e29b-41d4-a716-446655440000"),
+            serde_json::json!(valid.as_str().to_ascii_uppercase()),
+            serde_json::json!(format!("conn_{valid}")),
+        ] {
+            let summary = serde_json::json!({
+                "credentialId": invalid,
+                "kind": "feishu",
+                "name": "tenant",
+                "createdAt": 1
+            });
+            assert!(
+                serde_json::from_value::<ConnectorCredentialSummary>(summary).is_err()
+            );
+        }
+
+        let generic_id = serde_json::json!({
+            "id": valid,
+            "kind": "feishu",
+            "name": "tenant",
+            "createdAt": 1
+        });
+        assert!(serde_json::from_value::<ConnectorCredentialSummary>(generic_id).is_err());
+    }
+
+    #[test]
+    fn knowledge_source_credential_ref_rejects_legacy_and_noncanonical_ids() {
+        let valid = ConnectorCredentialId::new();
+        let valid_source = serde_json::json!({
+            "kind": "feishu",
+            "mode": "snapshot",
+            "credentialRef": valid,
+            "scope": { "space_id": "space" }
+        });
+        assert!(
+            serde_json::from_value::<KnowledgeSource>(valid_source).is_ok()
+        );
+
+        for invalid in [
+            serde_json::json!(7),
+            serde_json::json!("7"),
+            serde_json::json!("550e8400-e29b-41d4-a716-446655440000"),
+            serde_json::json!(valid.as_str().to_ascii_uppercase()),
+            serde_json::json!(format!("conn_{valid}")),
+        ] {
+            let source = serde_json::json!({
+                "kind": "feishu",
+                "mode": "snapshot",
+                "credentialRef": invalid,
+                "scope": { "space_id": "space" }
+            });
+            assert!(serde_json::from_value::<KnowledgeSource>(source).is_err());
+        }
+
+        for generic_key in ["id", "credential_id", "credential_ref"] {
+            let source = serde_json::json!({
+                "kind": "feishu",
+                "mode": "snapshot",
+                generic_key: valid,
+                "scope": { "space_id": "space" }
+            });
+            assert!(serde_json::from_value::<KnowledgeSource>(source).is_err());
+        }
+    }
+
+    #[test]
+    fn knowledge_mount_info_uses_named_id_and_rejects_legacy_id() {
+        let knowledge_base_id = KnowledgeBaseId::new();
         let mount = serde_json::json!({
-            "id": 42,
+            "knowledge_base_id": knowledge_base_id,
             "name": "docs",
             "description": "",
             "rel_path": ".nomi/knowledge/docs"
         });
-        assert!(serde_json::from_value::<KnowledgeMountInfo>(mount).is_err());
+        let info: KnowledgeMountInfo =
+            serde_json::from_value(mount).expect("named knowledge base id should deserialize");
+        assert_eq!(info.knowledge_base_id, knowledge_base_id);
+        let wire = serde_json::to_value(info).unwrap();
+        assert_eq!(wire["knowledge_base_id"], knowledge_base_id.as_str());
+        assert!(wire.get("id").is_none(), "legacy generic id must stay off the wire: {wire}");
+
+        let legacy = serde_json::json!({
+            "id": knowledge_base_id,
+            "name": "docs",
+            "description": "",
+            "rel_path": ".nomi/knowledge/docs"
+        });
+        assert!(serde_json::from_value::<KnowledgeMountInfo>(legacy).is_err());
     }
 
     /// The `extra.source` wire shape (camelCase + lowercase mode) is a

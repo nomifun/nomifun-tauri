@@ -35,7 +35,6 @@ const NomiChat: React.FC<{
   readOnly?: boolean;
   emptySlot?: React.ReactNode;
   loadedSkills?: string[];
-  loadedMcpServers?: string[];
   loadedMcpStatuses?: IConversationMcpStatus[];
   agent_name?: string;
   isProcessing?: boolean;
@@ -55,7 +54,6 @@ const NomiChat: React.FC<{
   readOnly,
   emptySlot,
   loadedSkills,
-  loadedMcpServers,
   loadedMcpStatuses,
   agent_name,
   isProcessing,
@@ -93,7 +91,6 @@ const NomiChat: React.FC<{
       readOnly,
       isProcessing: isProcessing === true || turnActivity.running,
       loadedSkills,
-      loadedMcpServers,
       loadedMcpStatuses,
     };
   }, [
@@ -105,7 +102,6 @@ const NomiChat: React.FC<{
     isProcessing,
     turnActivity.running,
     loadedSkills,
-    loadedMcpServers,
     loadedMcpStatuses,
   ]);
 

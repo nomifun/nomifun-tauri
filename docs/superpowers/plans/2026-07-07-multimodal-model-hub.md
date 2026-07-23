@@ -1,5 +1,13 @@
 # 统一多模态模型能力中心 — 实施计划
 
+> **⚠️ SUPERSEDED / LEGACY 历史计划（禁止直接执行）**
+>
+> 本计划形成于 v3 ID / schema hard cut 之前。多模态能力中心的业务目标仍可
+> 参考，但本文关于追加 `033_model_profiles.sql`、保留旧 baseline、回填历史行
+> 和增量 migration 的步骤已失效。当前实现必须修改唯一
+> `001_v3_baseline.sql`，所有产品表包含
+> `id INTEGER PRIMARY KEY AUTOINCREMENT`，使用逻辑外键，并且不迁移历史数据。
+>
 > **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development / executing-plans。步骤用 `- [ ]` 跟踪。
 
 **Goal:** 让模型管理对模态一等感知,修好 StepFun 图像模型探测 404,并把多模态(图像/TTS/ASR/embedding/视频)模型的管理、探测、分发、服务配置统一到一套权威能力档案 + 端点解析器上。
@@ -11,7 +19,10 @@
 ## Global Constraints
 
 - **无 ts-rs**:provider/模型类型手工镜像。任何 schema 改动须同步:`crates/backend/nomifun-api-types/src/provider.rs`(或新 `model_task.rs`)+ `ui/src/common/config/storage.ts` + `ui/src/common/types/provider/providerApi.ts`。
-- **迁移**:下一个编号 `033`;仅追加;绝不改 `001_baseline` 校验和。`sqlx::migrate!()` 自动发现(`database.rs:28`)。
+- **Legacy 迁移说明（非当前执行步骤）**：原计划使用下一个编号 `033`
+  增量 migration；该步骤已被 v3 唯一 `001_v3_baseline.sql` 和 hard reset
+  取代，当前不得追加 migration、修改旧 baseline 校验和或回填历史数据。
+  当前 v3 启动只初始化/校验新的 baseline。
 - **前端**:Arco Design;`@icon-park/react` 具名导入**禁起别名**;toast 用 `useArcoMessage`(遵循所在文件既有模式);真 `<button>` 露 WebView2 黑框——用 Arco `<Button>` 或 `<div onClick>`;Arco Popover 外壳内边距清零;locale 改动后跑根 `bun run gen:i18n`;`bun run typecheck` 必 exit 0 零新错;`bun run check:icons` 门禁。**UI 必须漂亮**。
 - **测试**:nextest 只跑触碰 crate,全量收尾;前端无 vitest,靠 typecheck。
 - **提交**:每任务一提交;分支 `feat/multimodal-model-hub`。
@@ -115,7 +126,9 @@ export interface ModelProfile { provider_id: string; model: string; tasks: Model
 ### Phase A — 地基(串行,阻塞后续)
 - **A1** 词表 + 派生:`model_task.rs`(枚举 + `derive_tasks_and_traits`);`nomifun-api-types/src/lib.rs` 导出。测试:派生映射(gpt-4o→[Chat]+[VisionInput];dall-e→[ImageGeneration];whisper→[SpeechRecognition];tts→[SpeechSynthesis];embed→[Embedding];text-only→[Chat])。
 - **A2** 解析器:`dispatch_target.rs` + 测试(StepFun-plan ImageGeneration 得 `/step_plan/v1/images/generations`;is_full_url 原样;params.endpoint 覆盖;Chat 得 `/chat/completions`)。
-- **A3** 迁移 `033_model_profiles.sql` + 模型 `models/model_profile.rs`(`ModelProfileRow` + `UpsertModelProfileParams<'a>`)。
+- **A3（legacy 计划，不执行）** 迁移 `033_model_profiles.sql` + 模型 `models/model_profile.rs`；
+  v3 当前实现已将 `model_profiles` 纳入唯一 baseline，并通过逻辑关联
+  `provider_id` 管理 provider 生命周期。
 - **A4** repo:`repository/model_profile.rs`(trait `IModelProfileRepository`)+ `sqlite_model_profile.rs`(仿 `sqlite_skill_tag.rs` upsert + `conversation_mcp_servers` 复合键);`repository/mod.rs`/`models/mod.rs`/`lib.rs` 导出。测试:upsert/get/list/delete round-trip。
 - **A5** 目录纯函数:`model_catalog.rs` + 测试。
 - **A6** 装配 + reconcile:`AppServices::from_config` 构造 `Arc<dyn IModelProfileRepository>`;`ModelProfileReconciler` 启动时为所有 provider models 无档案者按派生插入 `source=inferred`;provider create/update 后补档。

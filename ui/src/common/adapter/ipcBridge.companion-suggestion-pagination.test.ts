@@ -20,4 +20,13 @@ describe('companion suggestion pagination bridge', () => {
     expect(source.includes('raw.items.map(fromApiCompanionSuggestion)')).toBe(true);
     expect(source.includes('offset?: number')).toBe(true);
   });
+
+  test('uses suggestion_id for suggestion wire identity and decision calls', () => {
+    expect(source.includes('suggestion_id: CompanionSuggestionId;')).toBe(true);
+    expect(source.includes('suggestion_id: parseCompanionSuggestionId(value.suggestion_id)')).toBe(true);
+    expect(source.includes('{ suggestion_id: CompanionSuggestionId; accept: boolean }')).toBe(true);
+    expect(source.includes('/api/companion/suggestions/${p.suggestion_id}/decide')).toBe(true);
+    expect(source.includes('id: CompanionSuggestionId;')).toBe(false);
+    expect(source.includes('parseCompanionSuggestionId(value.id)')).toBe(false);
+  });
 });

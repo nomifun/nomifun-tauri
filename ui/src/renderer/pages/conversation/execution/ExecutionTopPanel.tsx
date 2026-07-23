@@ -158,7 +158,7 @@ const ExecutionTopPanel: React.FC = () => {
       setReplanSubmitting(true);
       try {
         await ipcBridge.agentExecution.replan.invoke({
-          id: executionId,
+          execution_id: executionId,
           updates: {
             goal: goal.trim(),
             model_pool: modelPool,
@@ -189,7 +189,13 @@ const ExecutionTopPanel: React.FC = () => {
   );
 
   const latestAttemptByStep = useMemo(
-    () => new Map((detail?.steps ?? []).map((step) => [step.id, latestAttemptForStep(detail?.attempts ?? [], step.id)])),
+    () =>
+      new Map(
+        (detail?.steps ?? []).map((step) => [
+          step.step_id,
+          latestAttemptForStep(detail?.attempts ?? [], step.step_id),
+        ]),
+      ),
     [detail?.attempts, detail?.steps],
   );
 
@@ -212,7 +218,7 @@ const ExecutionTopPanel: React.FC = () => {
   const completionPercent = steps.length > 0 ? Math.round((completedCount / steps.length) * 100) : 0;
   const offersReusableProfiles = status === 'completed' || status === 'completed_with_failures';
   const waitingSteps = steps.filter(
-    (step) => step.status === 'waiting_input' && Boolean(latestAttemptByStep.get(step.id)?.question?.trim()),
+    (step) => step.status === 'waiting_input' && Boolean(latestAttemptByStep.get(step.step_id)?.question?.trim()),
   );
   const maxPanelWidth = getAvailableMaxWidth();
 
@@ -294,21 +300,21 @@ const ExecutionTopPanel: React.FC = () => {
           </div>
 
           {waitingSteps.map((step) => {
-            const question = latestAttemptByStep.get(step.id)?.question;
+            const question = latestAttemptByStep.get(step.step_id)?.question;
             return (
               <button
-                key={step.id}
+                key={step.step_id}
                 type='button'
                 className={styles.questionBanner}
                 onClick={() => {
                   const participant = step.assigned_participant_id
-                    ? detail?.participants.find((item) => item.id === step.assigned_participant_id)
+                    ? detail?.participants.find((item) => item.participant_id === step.assigned_participant_id)
                     : undefined;
                   openStep({
                     step,
                     participant,
                     participants: detail?.participants ?? [],
-                    attempt: latestAttemptByStep.get(step.id),
+                    attempt: latestAttemptByStep.get(step.step_id),
                     executionId,
                     refetch,
                   });

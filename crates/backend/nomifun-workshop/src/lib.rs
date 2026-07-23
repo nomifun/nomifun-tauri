@@ -10,7 +10,7 @@
 //! `state`/`routes` (the `/api/workshop/*` surface). The canvas *doc*
 //! (nodes/edges/viewport/settings) is a frontend-owned JSON contract. The
 //! backend does not duplicate its presentation schema, but it does enforce the
-//! durable identity envelope (`wsn_` nodes, `wse_` edges, and node references),
+//! durable identity envelope (bare UUIDv7 nodes, edges, and node references),
 //! caps its size, and derives `node_count` from it.
 
 mod archive;

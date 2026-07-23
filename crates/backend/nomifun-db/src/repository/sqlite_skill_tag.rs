@@ -42,7 +42,12 @@ impl ISkillTagRepository for SqliteSkillTagRepository {
         .bind(now)
         .execute(&self.pool)
         .await?;
+        let id: i64 = sqlx::query_scalar("SELECT id FROM skill_tags WHERE skill_name = ?")
+            .bind(params.skill_name)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(SkillTagRow {
+            id,
             skill_name: params.skill_name.to_string(),
             audience_tags: params.audience_tags.map(String::from),
             scenario_tags: params.scenario_tags.map(String::from),

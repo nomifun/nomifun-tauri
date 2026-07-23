@@ -53,18 +53,18 @@ pub fn agent_execution_routes(engine: Arc<AgentExecutionEngine>) -> Router {
             get(list_executions).post(create_execution),
         )
         .route(
-            "/api/agent-executions/{id}",
+            "/api/agent-executions/{execution_id}",
             get(get_execution).delete(delete_execution),
         )
-        .route("/api/agent-executions/{id}/rename", patch(rename_execution))
-        .route("/api/agent-executions/{id}/replan", post(replan_execution))
-        .route("/api/agent-executions/{id}/adjust", post(adjust_execution))
-        .route("/api/agent-executions/{id}/approve", post(approve_execution))
-        .route("/api/agent-executions/{id}/pause", post(pause_execution))
-        .route("/api/agent-executions/{id}/resume", post(resume_execution))
-        .route("/api/agent-executions/{id}/cancel", post(cancel_execution))
+        .route("/api/agent-executions/{execution_id}/rename", patch(rename_execution))
+        .route("/api/agent-executions/{execution_id}/replan", post(replan_execution))
+        .route("/api/agent-executions/{execution_id}/adjust", post(adjust_execution))
+        .route("/api/agent-executions/{execution_id}/approve", post(approve_execution))
+        .route("/api/agent-executions/{execution_id}/pause", post(pause_execution))
+        .route("/api/agent-executions/{execution_id}/resume", post(resume_execution))
+        .route("/api/agent-executions/{execution_id}/cancel", post(cancel_execution))
         .route(
-            "/api/agent-executions/{id}/steps",
+            "/api/agent-executions/{execution_id}/steps",
             post(add_execution_steps),
         )
         .route(
@@ -95,9 +95,9 @@ pub fn agent_execution_routes(engine: Arc<AgentExecutionEngine>) -> Router {
             "/api/agent-executions/{execution_id}/steps/{step_id}/attempts/{attempt_id}/answer",
             post(answer_execution_decision),
         )
-        .route("/api/agent-executions/{id}/events", get(list_execution_events))
+        .route("/api/agent-executions/{execution_id}/events", get(list_execution_events))
         .route(
-            "/api/agent-executions/{id}/workspace",
+            "/api/agent-executions/{execution_id}/workspace",
             get(browse_execution_workspace),
         )
         .with_state(engine)
@@ -127,24 +127,24 @@ async fn create_execution(
 async fn get_execution(
     State(engine): State<Arc<AgentExecutionEngine>>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<AgentExecutionId>,
+    Path(execution_id): Path<AgentExecutionId>,
 ) -> Result<Json<ApiResponse<AgentExecutionDetail>>, AppError> {
     Ok(Json(ApiResponse::ok(
-        engine.get(&user.id, id.as_str()).await?,
+        engine.get(&user.id, execution_id.as_str()).await?,
     )))
 }
 
 async fn delete_execution(
     State(engine): State<Arc<AgentExecutionEngine>>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<AgentExecutionId>,
+    Path(execution_id): Path<AgentExecutionId>,
     Query(query): Query<DeleteQuery>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     engine
         .delete(
             &user.id,
             &user_actor(&user),
-            id.as_str(),
+            execution_id.as_str(),
             VersionedAgentExecutionCommand {
                 expected_version: query.expected_version,
             },
@@ -156,13 +156,13 @@ async fn delete_execution(
 async fn rename_execution(
     State(engine): State<Arc<AgentExecutionEngine>>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<AgentExecutionId>,
+    Path(execution_id): Path<AgentExecutionId>,
     body: Result<Json<RenameAgentExecutionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentExecution>>, AppError> {
     let Json(request) = json_body(body)?;
     Ok(Json(ApiResponse::ok(
         engine
-            .rename(&user.id, &user_actor(&user), id.as_str(), request)
+            .rename(&user.id, &user_actor(&user), execution_id.as_str(), request)
             .await?,
     )))
 }
@@ -170,13 +170,13 @@ async fn rename_execution(
 async fn replan_execution(
     State(engine): State<Arc<AgentExecutionEngine>>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<AgentExecutionId>,
+    Path(execution_id): Path<AgentExecutionId>,
     body: Result<Json<ReplanAgentExecutionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentExecutionDetail>>, AppError> {
     let Json(request) = json_body(body)?;
     Ok(Json(ApiResponse::ok(
         engine
-            .replan(&user.id, &user_actor(&user), id.as_str(), request)
+            .replan(&user.id, &user_actor(&user), execution_id.as_str(), request)
             .await?,
     )))
 }
@@ -184,13 +184,13 @@ async fn replan_execution(
 async fn adjust_execution(
     State(engine): State<Arc<AgentExecutionEngine>>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<AgentExecutionId>,
+    Path(execution_id): Path<AgentExecutionId>,
     body: Result<Json<AdjustAgentExecutionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentExecutionDetail>>, AppError> {
     let Json(request) = json_body(body)?;
     Ok(Json(ApiResponse::ok(
         engine
-            .adjust(&user.id, &user_actor(&user), id.as_str(), request)
+            .adjust(&user.id, &user_actor(&user), execution_id.as_str(), request)
             .await?,
     )))
 }
@@ -198,13 +198,13 @@ async fn adjust_execution(
 async fn approve_execution(
     State(engine): State<Arc<AgentExecutionEngine>>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<AgentExecutionId>,
+    Path(execution_id): Path<AgentExecutionId>,
     body: Result<Json<VersionedAgentExecutionCommand>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentExecution>>, AppError> {
     let Json(command) = json_body(body)?;
     Ok(Json(ApiResponse::ok(
         engine
-            .approve(&user.id, &user_actor(&user), id.as_str(), command)
+            .approve(&user.id, &user_actor(&user), execution_id.as_str(), command)
             .await?,
     )))
 }
@@ -212,13 +212,13 @@ async fn approve_execution(
 async fn pause_execution(
     State(engine): State<Arc<AgentExecutionEngine>>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<AgentExecutionId>,
+    Path(execution_id): Path<AgentExecutionId>,
     body: Result<Json<VersionedAgentExecutionCommand>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentExecution>>, AppError> {
     let Json(command) = json_body(body)?;
     Ok(Json(ApiResponse::ok(
         engine
-            .pause(&user.id, &user_actor(&user), id.as_str(), command)
+            .pause(&user.id, &user_actor(&user), execution_id.as_str(), command)
             .await?,
     )))
 }
@@ -226,13 +226,13 @@ async fn pause_execution(
 async fn resume_execution(
     State(engine): State<Arc<AgentExecutionEngine>>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<AgentExecutionId>,
+    Path(execution_id): Path<AgentExecutionId>,
     body: Result<Json<VersionedAgentExecutionCommand>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentExecution>>, AppError> {
     let Json(command) = json_body(body)?;
     Ok(Json(ApiResponse::ok(
         engine
-            .resume(&user.id, &user_actor(&user), id.as_str(), command)
+            .resume(&user.id, &user_actor(&user), execution_id.as_str(), command)
             .await?,
     )))
 }
@@ -240,13 +240,13 @@ async fn resume_execution(
 async fn cancel_execution(
     State(engine): State<Arc<AgentExecutionEngine>>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<AgentExecutionId>,
+    Path(execution_id): Path<AgentExecutionId>,
     body: Result<Json<VersionedAgentExecutionCommand>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentExecutionDetail>>, AppError> {
     let Json(command) = json_body(body)?;
     Ok(Json(ApiResponse::ok(
         engine
-            .cancel(&user.id, &user_actor(&user), id.as_str(), command)
+            .cancel(&user.id, &user_actor(&user), execution_id.as_str(), command)
             .await?,
     )))
 }
@@ -254,13 +254,13 @@ async fn cancel_execution(
 async fn add_execution_steps(
     State(engine): State<Arc<AgentExecutionEngine>>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<AgentExecutionId>,
+    Path(execution_id): Path<AgentExecutionId>,
     body: Result<Json<AddExecutionStepsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AgentExecutionDetail>>, AppError> {
     let Json(request) = json_body(body)?;
     Ok(Json(ApiResponse::ok(
         engine
-            .add_steps(&user.id, &user_actor(&user), id.as_str(), request)
+            .add_steps(&user.id, &user_actor(&user), execution_id.as_str(), request)
             .await?,
     )))
 }
@@ -412,12 +412,12 @@ async fn answer_execution_decision(
 async fn list_execution_events(
     State(engine): State<Arc<AgentExecutionEngine>>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<AgentExecutionId>,
+    Path(execution_id): Path<AgentExecutionId>,
     Query(query): Query<AgentExecutionEventsQuery>,
 ) -> Result<Json<ApiResponse<Vec<AgentExecutionEvent>>>, AppError> {
     Ok(Json(ApiResponse::ok(
         engine
-            .events(&user.id, id.as_str(), query.after_sequence, query.limit)
+            .events(&user.id, execution_id.as_str(), query.after_sequence, query.limit)
             .await?,
     )))
 }
@@ -425,14 +425,14 @@ async fn list_execution_events(
 async fn browse_execution_workspace(
     State(engine): State<Arc<AgentExecutionEngine>>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<AgentExecutionId>,
+    Path(execution_id): Path<AgentExecutionId>,
     Query(query): Query<WorkspaceQuery>,
 ) -> Result<Json<ApiResponse<Vec<WorkspaceEntry>>>, AppError> {
     Ok(Json(ApiResponse::ok(
         engine
             .browse_workspace(
                 &user.id,
-                id.as_str(),
+                execution_id.as_str(),
                 &query.path,
                 query.search.as_deref(),
             )

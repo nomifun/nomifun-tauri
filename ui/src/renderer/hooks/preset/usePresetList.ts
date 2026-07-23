@@ -28,8 +28,8 @@ export const usePresetList = () => {
       const sorted = sortPresetsUtil(list);
       setPresets(sorted);
       setActivePresetId((prev) => {
-        if (prev && sorted.some((a) => a.id === prev)) return prev;
-        return sorted[0]?.id ?? null;
+        if (prev && sorted.some((preset) => preset.preset_id === prev)) return prev;
+        return sorted[0]?.preset_id ?? null;
       });
     } catch (error) {
       console.error('Failed to load presets:', error);
@@ -40,7 +40,7 @@ export const usePresetList = () => {
     void loadPresets();
   }, [loadPresets]);
 
-  const activePreset = presets.find((a) => a.id === activePresetId) ?? null;
+  const activePreset = presets.find((preset) => preset.preset_id === activePresetId) ?? null;
 
   return {
     presets,

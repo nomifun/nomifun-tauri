@@ -192,7 +192,7 @@ const KnowledgeControl: React.FC<KnowledgeControlProps> = ({ target, draft, disa
       return { kind: 'workpath', id: workpathKeyForConversation(conv.extra as Record<string, unknown>) };
     }
     if (target.kind === 'terminal') {
-      const session = terminalSessions.find((s) => s.id === target.id);
+      const session = terminalSessions.find((s) => s.terminal_id === target.id);
       if (!session) return null;
       return { kind: 'workpath', id: workpathKeyForTerminal(session) };
     }
@@ -404,7 +404,7 @@ const KnowledgeControl: React.FC<KnowledgeControlProps> = ({ target, draft, disa
 
   // One mounted base row.
   const renderBaseRow = (base: IKnowledgeBase) => {
-    const isSelected = binding.kb_ids.includes(base.id);
+    const isSelected = binding.kb_ids.includes(base.knowledge_base_id);
     const rootMissing = !base.root_exists;
     const cannotSelect = rootMissing && !isSelected;
     const badge = getKindBadge(base.kind);
@@ -412,7 +412,7 @@ const KnowledgeControl: React.FC<KnowledgeControlProps> = ({ target, draft, disa
     const firstTag = baseTags[0];
     return (
       <div
-        key={base.id}
+        key={base.knowledge_base_id}
         className={[
           'flex items-center gap-9px rounded-8px border border-solid bg-[var(--color-bg-1)] px-8px py-7px cursor-pointer transition-colors',
           isSelected ? 'border-[rgba(var(--primary-6),0.38)]' : 'border-[var(--color-border-2)] hover:bg-fill-2',
@@ -422,7 +422,7 @@ const KnowledgeControl: React.FC<KnowledgeControlProps> = ({ target, draft, disa
           .filter(Boolean)
           .join(' ')}
         style={isSelected ? { background: tintBg('var(--primary-6)', 7) } : undefined}
-        onClick={() => !targetUnresolved && (!rootMissing || isSelected) && handleToggleBase(base.id)}
+        onClick={() => !targetUnresolved && (!rootMissing || isSelected) && handleToggleBase(base.knowledge_base_id)}
       >
         {/* Checkbox */}
         <span

@@ -27,6 +27,9 @@ use tower::ServiceExt;
 
 use common::{body_json, build_app, get_with_token, json_with_token, setup_and_login};
 
+const CLAUDE_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000101";
+const UNKNOWN_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-0000000001ff";
+
 // ── Global lock for env-var mutation ─────────────────────────────────────────
 //
 // Any test that reads or writes NOMIFUN_BYPASS_PROBE must hold this lock for
@@ -102,7 +105,11 @@ async fn custom_agent_full_roundtrip() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["success"], true);
-    let id = json["data"]["id"].as_str().expect("id in response").to_owned();
+    let agent_id = json["data"]["agent_id"]
+        .as_str()
+        .expect("agent_id in response")
+        .to_owned();
+    assert!(json["data"].get("id").is_none(), "legacy id must not cross the API boundary");
     assert_eq!(json["data"]["name"], "My Claude");
     assert_eq!(json["data"]["agent_source"], "custom");
     assert_eq!(json["data"]["icon"], "🤖");
@@ -111,14 +118,14 @@ async fn custom_agent_full_roundtrip() {
     let listed = list_agents(&mut app, &token).await;
     let agents = listed["data"].as_array().expect("array");
     assert!(
-        agents.iter().any(|a| a["id"] == id),
+        agents.iter().any(|a| a["agent_id"] == agent_id),
         "newly created agent should appear in GET /api/agents"
     );
 
     // Keep the platform-native command so the row stays available after rehydrate.
     let req = json_with_token(
         "PUT",
-        &format!("/api/agents/custom/{id}"),
+        &format!("/api/agents/custom/{agent_id}"),
         json!({
             "name": "My Claude v2",
             "command": available_test_command(),
@@ -132,14 +139,15 @@ async fn custom_agent_full_roundtrip() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["data"]["id"], id, "id must survive update");
+    assert_eq!(json["data"]["agent_id"], agent_id, "agent_id must survive update");
+    assert!(json["data"].get("id").is_none(), "legacy id must not cross the API boundary");
     assert_eq!(json["data"]["name"], "My Claude v2");
     assert_eq!(json["data"]["icon"], "🚀");
 
     // Toggle disabled
     let req = json_with_token(
         "PATCH",
-        &format!("/api/agents/{id}/enabled"),
+        &format!("/api/agents/{agent_id}/enabled"),
         json!({ "enabled": false }),
         &token,
         &csrf,
@@ -152,7 +160,7 @@ async fn custom_agent_full_roundtrip() {
     // Re-enable
     let req = json_with_token(
         "PATCH",
-        &format!("/api/agents/{id}/enabled"),
+        &format!("/api/agents/{agent_id}/enabled"),
         json!({ "enabled": true }),
         &token,
         &csrf,
@@ -163,7 +171,7 @@ async fn custom_agent_full_roundtrip() {
     // Delete
     let req = json_with_token(
         "DELETE",
-        &format!("/api/agents/custom/{id}"),
+        &format!("/api/agents/custom/{agent_id}"),
         json!(null),
         &token,
         &csrf,
@@ -177,7 +185,7 @@ async fn custom_agent_full_roundtrip() {
     let listed = list_agents(&mut app, &token).await;
     let agents = listed["data"].as_array().unwrap();
     assert!(
-        agents.iter().all(|a| a["id"] != id),
+        agents.iter().all(|a| a["agent_id"] != agent_id),
         "deleted agent should disappear from GET /api/agents"
     );
 
@@ -208,8 +216,7 @@ async fn custom_agent_advanced_overrides_persist() {
             "advanced": {
                 "yolo_id": "bypassPermissions",
                 "native_skills_dirs": [".claude/skills"],
-                "description": "test",
-                "unknown_ignored_key": 42
+                "description": "test"
             }
         }),
     )
@@ -222,6 +229,32 @@ async fn custom_agent_advanced_overrides_persist() {
     unsafe {
         std::env::remove_var("NOMIFUN_BYPASS_PROBE");
     }
+}
+
+#[tokio::test]
+async fn custom_agent_advanced_rejects_unknown_fields() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let (status, json) = create_agent(
+        &mut app,
+        &token,
+        &csrf,
+        json!({
+            "name": "Invalid Advanced",
+            "command": available_test_command(),
+            "advanced": {
+                "unknown_ignored_key": 42
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        json["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("unknown_ignored_key"))
+    );
 }
 
 // ── Bad path: validation ──────────────────────────────────────────────────────
@@ -270,7 +303,7 @@ async fn update_unknown_id_returns_404() {
 
     let req = json_with_token(
         "PUT",
-        "/api/agents/custom/does-not-exist",
+        &format!("/api/agents/custom/{UNKNOWN_AGENT_ID}"),
         json!({ "name": "x", "command": available_test_command() }),
         &token,
         &csrf,
@@ -293,10 +326,10 @@ async fn update_builtin_id_returns_403() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    // agent_builtin_claude is the seeded Claude id (builtin) from the baseline schema.
+    // This is the seeded Claude business ID (builtin) from the baseline schema.
     let req = json_with_token(
         "PUT",
-        "/api/agents/custom/agent_builtin_claude",
+        &format!("/api/agents/custom/{CLAUDE_AGENT_ID}"),
         json!({ "name": "hacked", "command": available_test_command() }),
         &token,
         &csrf,
@@ -318,7 +351,7 @@ async fn delete_builtin_id_returns_403() {
 
     let req = json_with_token(
         "DELETE",
-        "/api/agents/custom/agent_builtin_claude",
+        &format!("/api/agents/custom/{CLAUDE_AGENT_ID}"),
         json!(null),
         &token,
         &csrf,
@@ -334,7 +367,7 @@ async fn set_enabled_unknown_id_returns_404() {
 
     let req = json_with_token(
         "PATCH",
-        "/api/agents/missing-id/enabled",
+        &format!("/api/agents/{UNKNOWN_AGENT_ID}/enabled"),
         json!({ "enabled": false }),
         &token,
         &csrf,

@@ -105,7 +105,7 @@ const EditModeModal = ModalHOC<{ data?: IProvider; onChange(data: IProvider): vo
         onOk={async () => {
           try {
             const values = await form.validate();
-            const { context_limit: _contextLimit, model_context_limits: _modelContextLimits, ...formValues } = values;
+            const { model_context_limits: _modelContextLimits, ...formValues } = values;
             const nextModels = Array.isArray(values.model) ? values.model : [values.model];
             const providerBaseUrl = values.base_url ?? data?.base_url ?? '';
             let normalizedApiKey = isBedrock ? '' : normalizeApiKeyList(values.api_key);
@@ -132,7 +132,6 @@ const EditModeModal = ModalHOC<{ data?: IProvider; onChange(data: IProvider): vo
               api_key: normalizedApiKey,
               // Ensure models is always an array
               models: nextModels,
-              context_limit: data?.context_limit,
               model_context_limits: data?.model_context_limits,
             };
 

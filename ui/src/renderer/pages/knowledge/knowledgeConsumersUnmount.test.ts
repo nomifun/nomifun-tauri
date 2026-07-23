@@ -3,9 +3,9 @@ import type { IKnowledgeBinding } from '@/common/adapter/ipcBridge';
 import { removeBaseFromBinding } from './KnowledgeConsumersSection';
 import { parseKnowledgeBaseId } from '@/common/types/ids';
 
-const KB_A = parseKnowledgeBaseId('kb_019b0000-0000-7000-8000-000000000001');
-const KB_B = parseKnowledgeBaseId('kb_019b0000-0000-7000-8000-000000000002');
-const KB_MISSING = parseKnowledgeBaseId('kb_019b0000-0000-7000-8000-000000000003');
+const KB_A = parseKnowledgeBaseId('019b0000-0000-7000-8000-000000000001');
+const KB_B = parseKnowledgeBaseId('019b0000-0000-7000-8000-000000000002');
+const KB_MISSING = parseKnowledgeBaseId('019b0000-0000-7000-8000-000000000003');
 
 const binding = (overrides: Partial<IKnowledgeBinding> = {}): IKnowledgeBinding => ({
   enabled: true,

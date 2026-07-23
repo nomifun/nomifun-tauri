@@ -18,7 +18,8 @@ import type { PublicAgentId } from '@/common/types/ids';
  * 对外伙伴（/public-companions）—— 面向陌生人的企业级客服控制台首页（花名册）。
  *
  * 与「桌面伙伴」完全分离的一级域：只做问答 + 知识库检索，高危能力一律关闭。
- * 卡片网格 + 创建 + 空态；点击卡片进入专属管理页 /public-companions/:id。
+ * 卡片网格 + 创建 + 空态；点击卡片进入专属管理页
+ * /public-companions/:public_agent_id。
  */
 const PublicCompanionRosterPage: React.FC = () => {
   const { t } = useTranslation();
@@ -26,7 +27,8 @@ const PublicCompanionRosterPage: React.FC = () => {
   const { agents, loading, create } = usePublicAgents();
   const [createOpen, setCreateOpen] = useState(false);
 
-  const openAgent = (id: PublicAgentId) => void navigate(`/public-companions/${id}`);
+  const openAgent = (publicAgentId: PublicAgentId) =>
+    void navigate(`/public-companions/${publicAgentId}`);
 
   return (
     <div className='w-full min-h-full box-border overflow-y-auto px-16px py-20px'>
@@ -120,7 +122,11 @@ const PublicCompanionRosterPage: React.FC = () => {
         ) : (
           <div className='grid gap-16px' style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(min(320px, 100%), 1fr))' }}>
             {agents.map((a) => (
-              <PublicAgentCard key={a.id} agent={a} onOpen={() => openAgent(a.id)} />
+              <PublicAgentCard
+                key={a.public_agent_id}
+                agent={a}
+                onOpen={() => openAgent(a.public_agent_id)}
+              />
             ))}
           </div>
         )}
@@ -129,7 +135,7 @@ const PublicCompanionRosterPage: React.FC = () => {
       <CreatePublicAgentModal
         visible={createOpen}
         onClose={() => setCreateOpen(false)}
-        onCreated={(agent) => openAgent(agent.id)}
+        onCreated={(agent) => openAgent(agent.public_agent_id)}
         create={create}
       />
     </div>

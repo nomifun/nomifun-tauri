@@ -108,10 +108,10 @@ impl LiveProgress {
     }
 }
 
-/// Domain-qualified key for the per-target loop maps. After integerization a
-/// conversation and a terminal can share a numeric id (`conv#5` vs `term#5`), so
-/// the loop registry MUST key on `(kind, target_id)` —a bare id would let one
-/// domain's `start`/`stop` clobber the other's loop (spec §2.2 C4).
+/// Domain-qualified key for the per-target loop maps. Business identifiers are
+/// intentionally unprefixed UUIDv7 values, so the loop registry MUST key on
+/// `(kind, target_id)` rather than assuming the identifier alone conveys its
+/// domain.
 type TargetKey = (AutoWorkTargetKind, String);
 
 struct AutoWorkHandle {
@@ -181,8 +181,6 @@ impl AutoWorkRunner {
     }
 
     /// Live progress for a running loop: `(current_requirement_id, completed_count)`.
-    /// `current_requirement_id` is stringified at this API boundary (the AutoWork
-    /// DTO carries it as a canonical string ID.
     pub fn live_progress(&self, kind: AutoWorkTargetKind, target_id: &str) -> Option<(Option<String>, u32)> {
         if !valid_target_id(kind, target_id) {
             return None;
@@ -596,9 +594,9 @@ async fn run_loop(
                 }
             }
         };
-        let req_id = claimed.id.clone();
+        let req_id = claimed.requirement_id.clone();
         progress.set_current(Some(req_id.clone()));
-        info!(target_id, tag, requirement_id = req_id, "AutoWork claimed requirement");
+        info!(target_id, tag, requirement_id = %req_id, "AutoWork claimed requirement");
         // active: a requirement is now in flight → broadcast so the session-list
         // icon turns active-coloured in step with the per-session control.
         emit_autowork_progress(&deps, kind, target_id, tag, &progress, true);
@@ -631,11 +629,11 @@ async fn run_loop(
                             info!(
                                 target_id,
                                 tag,
-                                requirement_id = req_id,
+                                requirement_id = %req_id,
                                 "AutoWork turn stopped by user —pausing tag"
                             );
                             if let Err(e) = deps.service.user_interrupt(&req_id, owner_id, tag).await {
-                                error!(target_id, requirement_id = req_id, error = %e, "AutoWork user-interrupt failed");
+                                error!(target_id, requirement_id = %req_id, error = %e, "AutoWork user-interrupt failed");
                             }
                             TurnResult::UserInterrupted
                         } else {
@@ -647,7 +645,7 @@ async fn run_loop(
                                 .finalize_if_needed(&req_id, turn_errored, note, expects_verdict)
                                 .await
                             {
-                                error!(target_id, requirement_id = req_id, error = %e, "AutoWork finalize failed");
+                                error!(target_id, requirement_id = %req_id, error = %e, "AutoWork finalize failed");
                             }
                             if turn_errored { TurnResult::Errored } else { TurnResult::Done }
                         }
@@ -665,21 +663,21 @@ async fn run_loop(
                             info!(
                                 target_id,
                                 tag,
-                                requirement_id = req_id,
+                                requirement_id = %req_id,
                                 "AutoWork preparation was stopped by user —pausing tag"
                             );
                             if let Err(e) = deps.service.user_interrupt(&req_id, owner_id, tag).await {
-                                error!(target_id, requirement_id = req_id, error = %e, "AutoWork user-interrupt failed");
+                                error!(target_id, requirement_id = %req_id, error = %e, "AutoWork user-interrupt failed");
                             }
                             TurnResult::UserInterrupted
                         } else {
                         warn!(
                             target_id,
-                            requirement_id = req_id,
+                            requirement_id = %req_id,
                             "AutoWork inject hit a busy session —unclaiming without consuming an attempt"
                         );
                         if let Err(e) = deps.service.unclaim_busy(&req_id, owner_id, kind).await {
-                            error!(target_id, requirement_id = req_id, error = %e, "AutoWork unclaim_busy failed");
+                            error!(target_id, requirement_id = %req_id, error = %e, "AutoWork unclaim_busy failed");
                         }
                         TurnResult::Busy
                         }
@@ -695,19 +693,19 @@ async fn run_loop(
                     Err(AppError::NotFound(_)) => {
                         warn!(
                             target_id,
-                            requirement_id = req_id,
+                            requirement_id = %req_id,
                             "AutoWork target conversation is gone —unclaiming (no attempt) and stopping loop"
                         );
                         if let Err(e) = deps.service.unclaim_busy(&req_id, owner_id, kind).await {
-                            error!(target_id, requirement_id = req_id, error = %e, "AutoWork unclaim_busy failed");
+                            error!(target_id, requirement_id = %req_id, error = %e, "AutoWork unclaim_busy failed");
                         }
                         break;
                     }
                     Err(e) => {
-                        error!(target_id, requirement_id = req_id, error = %e, "AutoWork inject failed");
+                        error!(target_id, requirement_id = %req_id, error = %e, "AutoWork inject failed");
                         // errored turn → expects_verdict is irrelevant (re-pend / fail).
                         if let Err(e) = deps.service.finalize_if_needed(&req_id, true, None, false).await {
-                            error!(target_id, requirement_id = req_id, error = %e, "AutoWork finalize failed");
+                            error!(target_id, requirement_id = %req_id, error = %e, "AutoWork finalize failed");
                         }
                         TurnResult::Errored
                     }
@@ -717,7 +715,7 @@ async fn run_loop(
                 let outcome = match inject_and_wait_terminal(&deps, owner_id, tag, &claimed).await {
                     Ok(o) => o,
                     Err(e) => {
-                        error!(target_id, requirement_id = req_id, error = %e, "AutoWork terminal inject failed");
+                        error!(target_id, requirement_id = %req_id, error = %e, "AutoWork terminal inject failed");
                         TerminalTurnEnd::Errored
                     }
                 };
@@ -729,7 +727,7 @@ async fn run_loop(
                 // hard timeout) re-pends or fails after max attempts.
                 let expects_verdict = crate::prompt::terminal_expects_verdict(deps.requirement_mcp_enabled);
                 if let Err(e) = deps.service.finalize_if_needed(&req_id, errored, None, expects_verdict).await {
-                    error!(target_id, requirement_id = req_id, error = %e, "AutoWork finalize failed");
+                    error!(target_id, requirement_id = %req_id, error = %e, "AutoWork finalize failed");
                 }
                 if errored { TurnResult::Errored } else { TurnResult::Done }
             }
@@ -843,7 +841,16 @@ async fn inject_and_wait(
     let model = nomifun_conversation::runtime_options::provider_model_from_conversation_row(&row)?;
     let delegation_policy =
         nomifun_conversation::runtime_options::delegation_policy_from_conversation_row(&row)?;
-    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_default();
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).map_err(|error| {
+        AppError::Internal(format!(
+            "conversation {conversation_id} has invalid extra JSON: {error}"
+        ))
+    })?;
+    if !extra.is_object() {
+        return Err(AppError::Internal(format!(
+            "conversation {conversation_id} extra must be a JSON object"
+        )));
+    }
     let workspace = extra
         .get("workspace")
         .and_then(|v| v.as_str())
@@ -897,7 +904,10 @@ async fn inject_and_wait(
     // `get_or_create_runtime` could interfere with the runtime's own
     // workspace-initialization checks (e.g. "does the workspace exist yet").
     let ws_path = (!workspace_for_stage.is_empty()).then(|| std::path::Path::new(workspace_for_stage.as_str()));
-    let attachments = deps.service.stage_attachments_for_prompt(&req.id, ws_path).await;
+    let attachments = deps
+        .service
+        .stage_attachments_for_prompt(&req.requirement_id, ws_path)
+        .await;
     if build_lease.is_cancelled() {
         let _ = agent.kill(Some(AgentKillReason::UserCancelled));
         return Err(AppError::Conflict(format!(
@@ -924,7 +934,14 @@ async fn inject_and_wait(
         )
         .await?;
 
-    let outcome = wait_for_terminal_with_renewal(deps, conversation_id, conv_id, req.id.clone(), rx).await;
+    let outcome = wait_for_terminal_with_renewal(
+        deps,
+        conversation_id,
+        conv_id,
+        &req.requirement_id,
+        rx,
+    )
+    .await;
     // The session has a declaration channel when it exposes the requirement
     // tools: Nomi natively, or ACP once the requirement MCP is injected
     // (`requirement_mcp_enabled`). Driven by the same bootstrap flag that gates
@@ -942,7 +959,7 @@ async fn wait_for_terminal_with_renewal(
     deps: &Arc<AutoWorkRunnerDeps>,
     conversation_id: &str,
     conv_id: &str,
-    req_id: String,
+    req_id: &str,
     mut rx: broadcast::Receiver<AgentStreamEvent>,
 ) -> (TurnEnd, Option<String>) {
     let mut renew = interval(LEASE_RENEW_INTERVAL);
@@ -974,7 +991,7 @@ async fn wait_for_terminal_with_renewal(
                     if let Err(e) = deps
                         .service
                         .renew_lease(
-                            &req_id,
+                            req_id,
                             conv_id,
                             AutoWorkTargetKind::Conversation,
                             DEFAULT_LEASE_MS,
@@ -1240,7 +1257,10 @@ async fn inject_and_wait_terminal(
 
     // Terminals have no workspace concept —the prompt carries absolute paths
     // into the data dir and the CLI reads them directly.
-    let attachments = deps.service.stage_attachments_for_prompt(&req.id, None).await;
+    let attachments = deps
+        .service
+        .stage_attachments_for_prompt(&req.requirement_id, None)
+        .await;
     let prompt = build_terminal_requirement_prompt(tag, req, &attachments);
     // Inject the prompt and submit it. The bracketed-paste body and the submit CR
     // go out as SEPARATE writes (see `submit_terminal_prompt`) so the CR is not
@@ -1263,7 +1283,7 @@ async fn inject_and_wait_terminal(
         deps,
         driver,
         terminal_id,
-        req.id.clone(),
+        &req.requirement_id,
         lifecycle_rx,
     )
     .await)
@@ -1275,7 +1295,7 @@ async fn wait_terminal_turn_end(
     deps: &Arc<AutoWorkRunnerDeps>,
     driver: &Arc<dyn TerminalDriver>,
     terminal_id: &str,
-    req_id: String,
+    req_id: &str,
     lifecycle_rx: Option<broadcast::Receiver<nomifun_terminal::TerminalLifecycleEvent>>,
 ) -> TerminalTurnEnd {
     let mut renew = interval(LEASE_RENEW_INTERVAL);
@@ -1293,7 +1313,7 @@ async fn wait_terminal_turn_end(
                             if let Err(e) = deps
                                 .service
                                 .renew_lease(
-                                    &req_id,
+                                    req_id,
                                     terminal_id,
                                     AutoWorkTargetKind::Terminal,
                                     DEFAULT_LEASE_MS,
@@ -1344,7 +1364,7 @@ async fn wait_terminal_turn_end(
                             if let Err(e) = deps
                                 .service
                                 .renew_lease(
-                                    &req_id,
+                                    req_id,
                                     terminal_id,
                                     AutoWorkTargetKind::Terminal,
                                     DEFAULT_LEASE_MS,
@@ -1563,9 +1583,8 @@ mod tests {
     // -- C4 (spec §2.2): cross-domain loop-registry isolation ----------------
     //
     // The AutoWork loop registry keys on `TargetKey = (AutoWorkTargetKind,
-    // canonical entity ID)`. Conversation and terminal prefixes already make
-    // the ID spaces disjoint; retaining the explicit kind also keeps dispatch
-    // and lookup domain-scoped without sniffing prefixes.
+    // canonical entity ID)`. The explicit kind keeps dispatch and lookup
+    // domain-scoped even when two domains happen to carry equal UUID text.
 
     #[test]
     fn c4_target_key_distinguishes_canonical_session_domains() {

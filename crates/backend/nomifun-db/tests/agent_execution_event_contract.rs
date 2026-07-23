@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use nomifun_common::AgentExecutionEventKind;
 use ts_rs::{Config, TS};
 
-const BASELINE: &str = include_str!("../migrations/001_id_contract_v2.sql");
+const BASELINE: &str = include_str!("../migrations/001_v3_baseline.sql");
 const TYPESCRIPT_BINDING: &str = include_str!(
     "../../../../ui/src/common/protocolBindings/AgentExecutionEventKind.ts"
 );
@@ -32,11 +32,11 @@ fn rust_sql_and_typescript_share_one_exact_event_vocabulary() {
     );
 
     let sql_start = BASELINE
-        .find("event_type       TEXT NOT NULL CHECK (event_type IN (")
-        .expect("event_type CHECK must exist");
+        .find("event_type            TEXT NOT NULL CHECK (event_type IN (")
+        .expect("event_type CHECK must exist in the v3 baseline");
     let sql_check = &BASELINE[sql_start..];
     let sql_end = sql_check
-        .find("    )),")
+        .find(")),")
         .expect("event_type CHECK must remain bounded");
     let sql_values = quoted_values(&sql_check[..sql_end], '\'');
 
@@ -49,8 +49,9 @@ fn rust_sql_and_typescript_share_one_exact_event_vocabulary() {
         .expect("generated TypeScript alias must be terminated");
     let typescript_values = quoted_values(&binding[..binding_end], '"');
 
-    assert_eq!(sql_values.len(), 9, "durable event vocabulary changed");
+    assert_eq!(sql_values.len(), 8, "durable event vocabulary changed");
     assert_eq!(typescript_values, sql_values);
+    assert!(!sql_values.contains("migrated"));
 
     for wire in sql_values {
         let kind: AgentExecutionEventKind = wire
@@ -62,31 +63,38 @@ fn rust_sql_and_typescript_share_one_exact_event_vocabulary() {
 }
 
 #[test]
-fn local_agent_actor_contract_is_string_native() {
+fn v3_agent_event_actor_contract_is_named_and_local_integer_free() {
     let start = BASELINE
-        .find("-- table: agent_execution_events")
+        .find("CREATE TABLE agent_execution_events")
         .expect("agent execution event table must exist");
     let end = BASELINE[start..]
-        .find("-- table: agent_execution_participants")
+        .find("CREATE TABLE agent_execution_template_participants")
         .map(|offset| start + offset)
         .expect("agent execution event table must remain bounded");
     let event_table = &BASELINE[start..end];
 
-    assert!(
-        event_table.contains("actor_conversation_id TEXT"),
-        "conversation-backed actor IDs must be stored as TEXT"
-    );
-    assert!(
-        event_table.contains("actor_id = actor_conversation_id"),
-        "a local Agent actor must use its canonical conversation ID unchanged"
-    );
+    for required_column in [
+        "id                    INTEGER PRIMARY KEY AUTOINCREMENT",
+        "execution_id          TEXT NOT NULL",
+        "actor_id              TEXT",
+        "actor_conversation_id TEXT",
+        "actor_attempt_id      TEXT",
+    ] {
+        assert!(
+            event_table.contains(required_column),
+            "v3 agent event contract is missing `{required_column}`"
+        );
+    }
     for retired_numeric_contract in [
         "actor_conversation_id > 0",
         "CAST(actor_conversation_id AS TEXT)",
+        "CAST(conversation.id AS TEXT)",
+        "FOREIGN KEY",
+        "REFERENCES",
     ] {
         assert!(
             !event_table.contains(retired_numeric_contract),
-            "numeric actor-ID contract survived: {retired_numeric_contract}"
+            "retired physical/numeric actor-ID contract survived: {retired_numeric_contract}"
         );
     }
 }

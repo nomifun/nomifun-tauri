@@ -82,8 +82,8 @@ const TerminalRow: React.FC<TerminalRowProps> = ({
 
   // Pin/unpin: PATCH the top-level `pinned` field, same call as the original row.
   const handlePin = useCallback(async () => {
-    await ipcBridge.terminal.update.invoke({ id: session.id, pinned: !session.pinned });
-  }, [session.id, session.pinned]);
+    await ipcBridge.terminal.update.invoke({ terminal_id: session.terminal_id, pinned: !session.pinned });
+  }, [session.terminal_id, session.pinned]);
 
   const handleRenameOpen = useCallback(() => {
     setRenameName(session.name);
@@ -93,10 +93,10 @@ const TerminalRow: React.FC<TerminalRowProps> = ({
   const handleRenameConfirm = useCallback(async () => {
     const trimmed = renameName.trim();
     if (trimmed && trimmed !== session.name) {
-      await ipcBridge.terminal.update.invoke({ id: session.id, name: trimmed });
+      await ipcBridge.terminal.update.invoke({ terminal_id: session.terminal_id, name: trimmed });
     }
     setRenameVisible(false);
-  }, [renameName, session.id, session.name]);
+  }, [renameName, session.terminal_id, session.name]);
 
   const handleDelete = useCallback(() => {
     Modal.confirm({
@@ -104,24 +104,24 @@ const TerminalRow: React.FC<TerminalRowProps> = ({
       content: t('terminal.deleteConfirmContent'),
       okButtonProps: { status: 'danger' },
       onOk: async () => {
-        await ipcBridge.terminal.remove.invoke({ id: session.id });
+        await ipcBridge.terminal.remove.invoke({ terminal_id: session.terminal_id });
         // Navigate away if the deleted session is currently open
         if (active) {
           navigate('/guid');
         }
       },
     });
-  }, [session.id, active, navigate, t]);
+  }, [session.terminal_id, active, navigate, t]);
 
   // 关闭 (close): kill the running process; the session row stays (status → exited).
   const handleClose = useCallback(async () => {
-    await ipcBridge.terminal.kill.invoke({ id: session.id });
-  }, [session.id]);
+    await ipcBridge.terminal.kill.invoke({ terminal_id: session.terminal_id });
+  }, [session.terminal_id]);
 
   // 唤醒 / 重启 (wake / restart): respawn the PTY in place for the same session id.
   const handleRelaunch = useCallback(async () => {
-    await ipcBridge.terminal.relaunch.invoke({ id: session.id });
-  }, [session.id]);
+    await ipcBridge.terminal.relaunch.invoke({ terminal_id: session.terminal_id });
+  }, [session.terminal_id]);
 
   const handleRowClick = () => {
     if (selectionMode) {
@@ -152,7 +152,7 @@ const TerminalRow: React.FC<TerminalRowProps> = ({
         triggerProps={{ mouseEnterDelay: 400 }}
       >
         <div
-          id={`terminal-${session.id}`}
+          id={`terminal-${session.terminal_id}`}
         className={classNames(
           'chat-history__item h-34px rd-8px flex items-center group cursor-pointer relative overflow-hidden shrink-0 min-w-0 transition-colors justify-start gap-8px pr-16px',
           indent ? 'pl-34px' : 'pl-10px',

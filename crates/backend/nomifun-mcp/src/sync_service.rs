@@ -167,7 +167,7 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn find_by_id(&self, _id: &nomifun_common::McpServerId) -> Result<Option<McpServerRow>, DbError> {
+        async fn find_by_id(&self, _mcp_server_id: &str) -> Result<Option<McpServerRow>, DbError> {
             Ok(None)
         }
 
@@ -179,11 +179,11 @@ mod tests {
             unimplemented!("not needed for detection tests")
         }
 
-        async fn update(&self, _id: &nomifun_common::McpServerId, _params: UpdateMcpServerParams<'_>) -> Result<McpServerRow, DbError> {
+        async fn update(&self, _mcp_server_id: &str, _params: UpdateMcpServerParams<'_>) -> Result<McpServerRow, DbError> {
             unimplemented!("not needed for detection tests")
         }
 
-        async fn delete(&self, _id: &nomifun_common::McpServerId) -> Result<(), DbError> {
+        async fn delete(&self, _mcp_server_id: &str) -> Result<(), DbError> {
             unimplemented!("not needed for detection tests")
         }
 
@@ -193,14 +193,14 @@ mod tests {
 
         async fn update_status(
             &self,
-            _id: &nomifun_common::McpServerId,
+            _mcp_server_id: &str,
             _status: &str,
             _last_connected: Option<TimestampMs>,
         ) -> Result<(), DbError> {
             unimplemented!("not needed for detection tests")
         }
 
-        async fn update_tools(&self, _id: &nomifun_common::McpServerId, _tools: Option<&str>) -> Result<(), DbError> {
+        async fn update_tools(&self, _mcp_server_id: &str, _tools: Option<&str>) -> Result<(), DbError> {
             unimplemented!("not needed for detection tests")
         }
     }

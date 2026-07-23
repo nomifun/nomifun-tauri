@@ -7,9 +7,9 @@ use nomifun_ai_agent::protocol::events::{
 };
 use nomifun_api_types::{ConversationArtifactResponse, ConversationResponse, MessageResponse, MessageSearchItem};
 use nomifun_common::{
-    AgentExecutionTemplateId, AgentType, AppError, ConversationArtifactId, ConversationId,
-    ConversationSource, ConversationStatus, CronJobId, MessageId, MessagePosition, MessageStatus,
-    MessageType, ProviderId, ProviderWithModel, now_ms,
+    AgentExecutionTemplateId, AgentType, AppError, ConversationId, ConversationSource,
+    ConversationStatus, CronJobId, MessageId, MessagePosition, MessageStatus, MessageType,
+    ProviderId, ProviderWithModel, now_ms, validate_uuidv7,
 };
 use nomifun_db::MessageSearchRow;
 use nomifun_db::models::{ConversationArtifactRow, ConversationRow, MessageRow};
@@ -30,23 +30,24 @@ pub fn row_to_response(row: ConversationRow, data_dir: &Path) -> Result<Conversa
     row_to_response_with_extra(row, extra, data_dir)
 }
 
-/// Same as [`row_to_response`] but takes a pre-parsed `extra` value. Used
-/// by callers that need to mutate `extra` (e.g. lazy `skills` backfill)
-/// before building the response DTO.
+/// Same as [`row_to_response`] but takes a pre-parsed `extra` value. Used by
+/// callers that need to enrich `extra` before building the response DTO.
 ///
 /// Injects a derived `is_temporary_workspace: bool` into the returned
 /// `extra` blob by checking whether `extra.workspace` sits under the
 /// backend-managed `data_dir`. The flag is not persisted — it is
-/// computed on every read so the frontend never has to pattern-match
-/// the directory name. Old rows that have no such flag on disk
-/// automatically gain it on read, which means no migration is needed.
+/// computed on every read so the frontend never has to pattern-match the
+/// directory name.
 pub fn row_to_response_with_extra(
     row: ConversationRow,
     mut extra: serde_json::Value,
     data_dir: &Path,
 ) -> Result<ConversationResponse, AppError> {
-    ConversationId::try_from(row.id.as_str()).map_err(|error| {
-        AppError::Internal(format!("Invalid persisted conversation id '{}': {error}", row.id))
+    ConversationId::try_from(row.conversation_id.as_str()).map_err(|error| {
+        AppError::Internal(format!(
+            "Invalid persisted conversation_id '{}': {error}",
+            row.conversation_id
+        ))
     })?;
     if let Some(template_id) = row.execution_template_id.as_deref() {
         AgentExecutionTemplateId::try_from(template_id).map_err(|error| {
@@ -101,7 +102,7 @@ pub fn row_to_response_with_extra(
     let decision_policy = string_to_enum(&row.decision_policy)?;
 
     Ok(ConversationResponse {
-        id: row.id,
+        conversation_id: row.conversation_id,
         name: row.name,
         r#type: agent_type,
         model,
@@ -129,9 +130,9 @@ pub fn row_to_response_with_extra(
 
 /// Parse the model JSON column into `ProviderWithModel`.
 ///
-/// Only the canonical persisted shape is accepted. Provider IDs use the
-/// `prov_{uuid-v7}` entity grammar; model strings and optional overrides must
-/// already be trimmed and non-empty.
+/// Only the canonical persisted shape is accepted. Provider IDs are bare
+/// UUIDv7 values; model strings and optional overrides must already be trimmed
+/// and non-empty.
 pub(crate) fn parse_provider_with_model(s: &str) -> Result<ProviderWithModel, AppError> {
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -178,8 +179,11 @@ pub fn string_to_enum<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, AppE
 
 /// Convert a message database row into an API response DTO.
 pub fn row_to_message_response(row: MessageRow) -> Result<MessageResponse, AppError> {
-    MessageId::try_from(row.id.as_str()).map_err(|error| {
-        AppError::Internal(format!("Invalid persisted message id '{}': {error}", row.id))
+    MessageId::try_from(row.message_id.as_str()).map_err(|error| {
+        AppError::Internal(format!(
+            "Invalid persisted message_id '{}': {error}",
+            row.message_id
+        ))
     })?;
     ConversationId::try_from(row.conversation_id.as_str()).map_err(|error| {
         AppError::Internal(format!(
@@ -203,7 +207,7 @@ pub fn row_to_message_response(row: MessageRow) -> Result<MessageResponse, AppEr
     project_interrupted_writeback_state(&mut content);
 
     Ok(MessageResponse {
-        id: row.id,
+        message_id: row.message_id,
         conversation_id: row.conversation_id,
         msg_id: row.msg_id,
         r#type: msg_type,
@@ -733,10 +737,10 @@ fn truncate_large_strings(value: &mut serde_json::Value, max_chars: usize, trunc
 
 /// Convert an artifact database row into an API response DTO.
 pub fn row_to_artifact_response(row: ConversationArtifactRow) -> Result<ConversationArtifactResponse, AppError> {
-    ConversationArtifactId::try_from(row.id.as_str()).map_err(|error| {
+    validate_uuidv7(&row.conversation_artifact_id).map_err(|error| {
         AppError::Internal(format!(
-            "Invalid persisted conversation artifact id '{}': {error}",
-            row.id
+            "Invalid persisted conversation_artifact_id '{}': {error}",
+            row.conversation_artifact_id
         ))
     })?;
     ConversationId::try_from(row.conversation_id.as_str()).map_err(|error| {
@@ -745,22 +749,52 @@ pub fn row_to_artifact_response(row: ConversationArtifactRow) -> Result<Conversa
             row.conversation_id
         ))
     })?;
-    if let Some(cron_job_id) = row.cron_job_id.as_deref() {
-        CronJobId::try_from(cron_job_id).map_err(|error| {
-            AppError::Internal(format!(
-                "Invalid persisted artifact cron_job_id '{cron_job_id}': {error}"
-            ))
-        })?;
-    }
     let kind = string_to_enum(&row.kind)?;
     let status = string_to_enum(&row.status)?;
+    let cron_job_id = row
+        .cron_job_id
+        .as_deref()
+        .map(CronJobId::parse)
+        .transpose()
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "Invalid persisted artifact cron_job_id: {error}"
+            ))
+        })?
+        .map(CronJobId::into_string);
     let payload: serde_json::Value = serde_json::from_str(&row.payload)
         .map_err(|e| AppError::Internal(format!("Invalid artifact payload JSON: {e}")))?;
+    if matches!(row.kind.as_str(), "cron_trigger" | "skill_suggest") {
+        let payload_cron_job_id = payload
+            .get("cron_job_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                AppError::Internal(format!(
+                    "Persisted {} artifact payload is missing cron_job_id",
+                    row.kind
+                ))
+            })?;
+        CronJobId::parse(payload_cron_job_id).map_err(|error| {
+            AppError::Internal(format!(
+                "Persisted {} artifact payload has invalid cron_job_id: {error}",
+                row.kind
+            ))
+        })?;
+        if cron_job_id
+            .as_deref()
+            .is_some_and(|row_cron_job_id| payload_cron_job_id != row_cron_job_id)
+        {
+            return Err(AppError::Internal(format!(
+                "Persisted {} artifact payload cron_job_id does not match row",
+                row.kind
+            )));
+        }
+    }
 
     Ok(ConversationArtifactResponse {
-        id: row.id,
+        conversation_artifact_id: row.conversation_artifact_id,
         conversation_id: row.conversation_id,
-        cron_job_id: row.cron_job_id,
+        cron_job_id,
         kind,
         status,
         payload,
@@ -822,7 +856,8 @@ pub fn search_row_to_item(row: MessageSearchRow, data_dir: &Path) -> Result<Mess
         ))
     })?;
     let conversation_row = ConversationRow {
-        id: row.conversation_id,
+        id: 0,
+        conversation_id: row.conversation_id,
         user_id: String::new(),
         name: row.conversation_name,
         r#type: row.conversation_type,
@@ -865,8 +900,8 @@ mod tests {
     use nomifun_common::{AgentType, ConversationId, ConversationSource, ConversationStatus};
     use serde_json::json;
 
-    const PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000001";
-    const MESSAGE_ID: &str = "msg_0190f5fe-7c00-7a00-8000-000000000001";
+    const PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const MESSAGE_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 
     fn make_row(
         agent_type: &str,
@@ -875,8 +910,10 @@ mod tests {
         model_json: Option<&str>,
         extra_json: &str,
     ) -> ConversationRow {
+        let conversation_id = ConversationId::new().into_string();
         ConversationRow {
-            id: ConversationId::new().into_string(),
+            id: 0,
+            conversation_id,
             user_id: "user_1".into(),
             name: "Test".into(),
             r#type: agent_type.into(),
@@ -902,7 +939,8 @@ mod tests {
 
     fn make_message_row(content: serde_json::Value) -> MessageRow {
         MessageRow {
-            id: MESSAGE_ID.into(),
+            id: 0,
+            message_id: MESSAGE_ID.into(),
             conversation_id: ConversationId::new().into_string(),
             msg_id: Some(MESSAGE_ID.into()),
             r#type: "text".into(),
@@ -925,7 +963,7 @@ mod tests {
             r#"{"workspace": "/project"}"#,
         );
         let resp = row_to_response(row, Path::new("/tmp/data")).unwrap();
-        assert!(ConversationId::try_from(resp.id.as_str()).is_ok());
+        assert!(ConversationId::try_from(resp.conversation_id.as_str()).is_ok());
         assert_eq!(resp.r#type, AgentType::Acp);
         assert_eq!(resp.status, ConversationStatus::Pending);
         assert_eq!(resp.source, Some(ConversationSource::Nomifun));
@@ -951,8 +989,10 @@ mod tests {
 
     #[test]
     fn row_to_response_invalid_extra_json() {
+        let conversation_id = ConversationId::new().into_string();
         let row = ConversationRow {
-            id: ConversationId::new().into_string(),
+            id: 0,
+            conversation_id,
             user_id: "user_1".into(),
             name: "Test".into(),
             r#type: "acp".into(),
@@ -1068,8 +1108,10 @@ mod tests {
 
     #[test]
     fn row_with_pinned_at() {
+        let conversation_id = ConversationId::new().into_string();
         let row = ConversationRow {
-            id: ConversationId::new().into_string(),
+            id: 0,
+            conversation_id,
             user_id: "user_1".into(),
             name: "Pinned".into(),
             r#type: "acp".into(),
@@ -1200,7 +1242,7 @@ mod tests {
         assert_eq!(item.message_created_at, 5000);
         assert_eq!(item.preview_text, "hello world");
 
-        assert_eq!(item.conversation.id, conversation_id);
+        assert_eq!(item.conversation.conversation_id, conversation_id);
         assert_eq!(item.conversation.name, "Test Conv");
         assert_eq!(item.conversation.r#type, AgentType::Acp);
         assert_eq!(item.conversation.source, Some(ConversationSource::Nomifun));
@@ -1281,5 +1323,59 @@ mod tests {
 
         let err = search_row_to_item(row, Path::new("/tmp/data")).unwrap_err();
         assert!(matches!(err, AppError::Internal(_)));
+    }
+
+    #[test]
+    fn artifact_response_rejects_payload_cron_job_id_mismatch() {
+        let conversation_id = ConversationId::new().into_string();
+        let cron_job_id = nomifun_common::CronJobId::new().into_string();
+        let row = ConversationArtifactRow {
+            conversation_artifact_id: nomifun_common::generate_id(),
+            conversation_id,
+            cron_job_id: Some(cron_job_id.clone()),
+            kind: "cron_trigger".into(),
+            status: "active".into(),
+            payload: json!({
+                "cron_job_id": nomifun_common::CronJobId::new().into_string(),
+                "cron_job_name": "Daily Report",
+                "triggered_at": 1000,
+            })
+            .to_string(),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+
+        let error = row_to_artifact_response(row).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("payload cron_job_id does not match row")
+        );
+        assert!(CronJobId::parse(cron_job_id).is_ok());
+    }
+
+    #[test]
+    fn artifact_response_keeps_history_after_cron_relation_is_cleared() {
+        let conversation_id = ConversationId::new().into_string();
+        let cron_job_id = CronJobId::new().into_string();
+        let row = ConversationArtifactRow {
+            conversation_artifact_id: nomifun_common::generate_id(),
+            conversation_id,
+            cron_job_id: None,
+            kind: "cron_trigger".into(),
+            status: "active".into(),
+            payload: json!({
+                "cron_job_id": cron_job_id,
+                "cron_job_name": "Daily Report",
+                "triggered_at": 1000,
+            })
+            .to_string(),
+            created_at: 1000,
+            updated_at: 1000,
+        };
+
+        let response = row_to_artifact_response(row).unwrap();
+        assert_eq!(response.cron_job_id, None);
+        assert!(CronJobId::parse(response.payload["cron_job_id"].as_str().unwrap()).is_ok());
     }
 }

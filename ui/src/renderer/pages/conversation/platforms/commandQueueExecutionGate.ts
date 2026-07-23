@@ -1,4 +1,4 @@
-import type { MessageId } from '@/common/types/ids';
+import type { ConversationId, MessageId } from '@/common/types/ids';
 
 export type CommandQueueExecutionGate =
   | { phase: 'idle' }
@@ -7,7 +7,7 @@ export type CommandQueueExecutionGate =
 
 export type CommandQueueExecutionGateEvent =
   | { type: 'begin' }
-  | { type: 'turnStarted'; turnId?: MessageId }
+  | { type: 'turnStarted'; turnId: MessageId }
   | { type: 'turnCompleted'; turnId?: MessageId; runtimeIsProcessing: boolean }
   | { type: 'runtimeReconciled'; purpose: 'start' | 'completion'; runtimeIsProcessing: boolean }
   | { type: 'stop' }
@@ -33,8 +33,8 @@ export const isCommandQueueExecutionCurrent = ({
   expectedGeneration,
 }: {
   mounted: boolean;
-  currentConversationId: string;
-  expectedConversationId: string;
+  currentConversationId: ConversationId;
+  expectedConversationId: ConversationId;
   currentGeneration: number;
   expectedGeneration: number;
 }): boolean =>

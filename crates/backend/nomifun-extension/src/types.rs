@@ -8,17 +8,45 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 /// Network access permission — either unrestricted (`true`) or domain-scoped.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum NetworkPermission {
     /// Unrestricted network access (dangerous).
     Unrestricted(bool),
     /// Domain-scoped network access (moderate).
     Scoped {
-        #[serde(rename = "allowedDomains")]
         allowed_domains: Vec<String>,
         reasoning: String,
     },
+}
+
+impl<'de> Deserialize<'de> for NetworkPermission {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ScopedWire {
+            allowed_domains: Vec<String>,
+            reasoning: String,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Unrestricted(bool),
+            Scoped(ScopedWire),
+        }
+
+        match Wire::deserialize(deserializer)? {
+            Wire::Unrestricted(value) => Ok(Self::Unrestricted(value)),
+            Wire::Scoped(value) => Ok(Self::Scoped {
+                allowed_domains: value.allowed_domains,
+                reasoning: value.reasoning,
+            }),
+        }
+    }
 }
 
 /// Filesystem access scope.
@@ -32,6 +60,7 @@ pub enum FilesystemScope {
 
 /// Extension permission declarations.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ExtPermissions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<bool>,
@@ -89,6 +118,7 @@ pub struct PermissionSummary {
 
 /// ACP adapter contributed by an extension.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ExtAcpAdapter {
     pub id: String,
     pub name: String,
@@ -123,9 +153,10 @@ pub struct ExtAcpAdapter {
 }
 
 /// MCP server contributed by an extension.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ExtMcpServer {
-    pub id: String,
+    /// Extension-local catalog identity. This is not a product `mcp_server_id`.
+    pub source_key: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -133,10 +164,59 @@ pub struct ExtMcpServer {
     pub config: serde_json::Value,
 }
 
+impl<'de> Deserialize<'de> for ExtMcpServer {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let mut fields = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        for legacy_key in ["id", "sourceKey", "contributionKey", "contribution_key"] {
+            if fields.contains_key(legacy_key) {
+                return Err(D::Error::custom(format!(
+                    "legacy MCP contribution field '{legacy_key}' is not accepted; use 'source_key'"
+                )));
+            }
+        }
+
+        let source_key = take_required_string::<D::Error>(&mut fields, "source_key")?;
+        let name = take_required_string::<D::Error>(&mut fields, "name")?;
+        let description = match fields.remove("description") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(value)) => Some(value),
+            Some(_) => return Err(D::Error::custom("MCP contribution field 'description' must be a string or null")),
+        };
+
+        Ok(Self {
+            source_key,
+            name,
+            description,
+            config: serde_json::Value::Object(fields),
+        })
+    }
+}
+
+fn take_required_string<E>(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+) -> Result<String, E>
+where
+    E: serde::de::Error,
+{
+    match fields.remove(field) {
+        Some(serde_json::Value::String(value)) => Ok(value),
+        Some(_) => Err(E::custom(format!("MCP contribution field '{field}' must be a string"))),
+        None => Err(E::missing_field(field)),
+    }
+}
+
 /// Preset contributed by an extension.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ExtPreset {
-    pub id: String,
+    /// Extension-local catalog identity. This is not a product `preset_id`.
+    pub source_key: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -148,7 +228,7 @@ pub struct ExtPreset {
     pub context: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_agent_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "enabledSkills")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enabled_skills: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prompts: Vec<String>,
@@ -158,8 +238,10 @@ pub struct ExtPreset {
 
 /// Autonomous agent contributed by an extension.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ExtAgent {
-    pub id: String,
+    /// Extension-local catalog identity. This is not a product `agent_id`.
+    pub source_key: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -169,7 +251,7 @@ pub struct ExtAgent {
     pub context: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "enabledSkills")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enabled_skills: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prompts: Vec<String>,
@@ -179,6 +261,7 @@ pub struct ExtAgent {
 
 /// Skill contributed by an extension.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ExtSkill {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -189,6 +272,7 @@ pub struct ExtSkill {
 
 /// Theme contributed by an extension.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ExtTheme {
     pub id: String,
     pub name: String,
@@ -202,6 +286,7 @@ pub struct ExtTheme {
 
 /// Channel plugin contributed by an extension.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ExtChannelPlugin {
     pub id: String,
     pub name: String,
@@ -213,14 +298,15 @@ pub struct ExtChannelPlugin {
     pub entry_point: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "credentialFields")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credential_fields: Vec<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "configFields")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config_fields: Vec<serde_json::Value>,
 }
 
 /// WebUI route definition.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ExtWebuiRoute {
     pub path: String,
     pub method: String,
@@ -229,6 +315,7 @@ pub struct ExtWebuiRoute {
 
 /// WebUI contribution from an extension.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ExtWebui {
     pub id: String,
     pub directory: String,
@@ -238,8 +325,8 @@ pub struct ExtWebui {
 
 /// Settings tab position relative to a built-in tab.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SettingsTabPosition {
-    #[serde(rename = "relativeTo", alias = "anchor", alias = "relative_to")]
     pub relative_to: String,
     pub placement: String,
 }
@@ -250,13 +337,12 @@ fn default_settings_tab_order() -> u32 {
 
 /// Settings tab contributed by an extension.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ExtSettingsTab {
     pub id: String,
-    #[serde(alias = "name")]
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
-    #[serde(alias = "entryPoint")]
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<SettingsTabPosition>,
@@ -266,6 +352,7 @@ pub struct ExtSettingsTab {
 
 /// Model provider contributed by an extension.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ExtModelProvider {
     pub id: String,
     pub name: String,
@@ -281,6 +368,7 @@ pub struct ExtModelProvider {
 
 /// All contributions declared by an extension.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ExtContributes {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acp_adapters: Vec<ExtAcpAdapter>,
@@ -310,6 +398,7 @@ pub struct ExtContributes {
 
 /// i18n configuration block.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct I18nConfig {
     pub locales: Vec<String>,
     #[serde(default = "default_i18n_directory")]
@@ -322,6 +411,7 @@ fn default_i18n_directory() -> String {
 
 /// Engine compatibility declaration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct EngineConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nomifun: Option<String>,
@@ -329,6 +419,7 @@ pub struct EngineConfig {
 
 /// Lifecycle hook declarations (paths relative to extension root).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LifecycleHooks {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_install: Option<String>,
@@ -342,6 +433,7 @@ pub struct LifecycleHooks {
 
 /// Complete extension manifest parsed from `nomi-extension.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ExtensionManifest {
     pub name: String,
     pub version: String,
@@ -514,7 +606,8 @@ pub struct ResolvedAcpAdapter {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolvedMcpServer {
     pub extension_name: String,
-    pub id: String,
+    /// Global catalog identity in `<extension-name>:<local-key>` form.
+    pub source_key: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -526,7 +619,8 @@ pub struct ResolvedMcpServer {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolvedPreset {
     pub extension_name: String,
-    pub id: String,
+    /// Global catalog identity in `<extension-name>:<local-key>` form.
+    pub source_key: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -550,7 +644,8 @@ pub struct ResolvedPreset {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolvedAgent {
     pub extension_name: String,
-    pub id: String,
+    /// Global catalog identity in `<extension-name>:<local-key>` form.
+    pub source_key: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -625,7 +720,6 @@ pub struct WebuiContribution {
 /// Resolved settings tab (after position parsing).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolvedSettingsTab {
-    #[serde(rename = "extensionName")]
     pub extension_name: String,
     pub id: String,
     pub label: String,

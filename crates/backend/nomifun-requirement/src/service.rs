@@ -6,8 +6,7 @@ use nomifun_api_types::{
     UpdateRequirementRequest,
 };
 use nomifun_common::{
-    AppError, AttachmentId, ConversationId, PaginatedResult, RequirementId, TerminalId, UserId,
-    now_ms,
+    AppError, AttachmentId, ConversationId, PaginatedResult, RequirementId, TerminalId, UserId, now_ms,
 };
 use nomifun_db::models::{RequirementRowUpdate, RequirementTagRow};
 use nomifun_db::{
@@ -40,8 +39,8 @@ fn parse_terminal_id(target_id: &str) -> Result<&str, AppError> {
         .map_err(|_| AppError::NotFound(format!("terminal {target_id}")))
 }
 
-fn parse_requirement_id(id: &str) -> Result<&str, AppError> {
-    RequirementId::try_from(id)
+fn validate_requirement_id(id: &str) -> Result<&str, AppError> {
+    RequirementId::parse(id)
         .map(|_| id)
         .map_err(|error| AppError::BadRequest(format!("invalid requirement id: {error}")))
 }
@@ -202,15 +201,15 @@ impl RequirementService {
         let order_key = req.order_key.unwrap_or_default();
         let status = req.status.unwrap_or(RequirementStatus::Pending);
         let new_row = nomifun_db::models::NewRequirementRow {
-            id: RequirementId::new().into_string(),
             title: req.title,
             content: req.content,
             tag: req.tag,
             sort_seq: to_sort_seq(&order_key),
             order_key,
             status: status.as_db().to_string(),
-            // `priority` column is retained in the DB for compatibility but is no
-            // longer user-facing —`order_key` is the sole ordering dimension.
+            // `priority` is a reserved technical column. V3 ordering is
+            // exclusively defined by `order_key`; callers cannot supply a
+            // second ordering representation.
             priority: 0,
             completion_note: None,
             owner_conversation_id: None,
@@ -229,15 +228,18 @@ impl RequirementService {
         let mut dto = row_to_dto(&row);
         if !new_attachments.is_empty() {
             let Some(store) = &self.attachments else {
-                let _ = self.repo.delete(&row.id).await;
+                let _ = self.repo.delete(&row.requirement_id).await;
                 return Err(AppError::Internal("attachment store not attached".into()));
             };
-            match store.ingest(&row.id, &new_attachments, Some(&row.created_by)).await {
+            match store
+                .ingest(&row.requirement_id, &new_attachments, Some(&row.created_by))
+                .await
+            {
                 Ok(rows) => dto.attachments = rows.iter().map(|r| store.to_dto(r)).collect(),
                 Err(e) => {
                     // Keep create atomic for the caller: drop the row we just inserted.
-                    if let Err(de) = self.repo.delete(&row.id).await {
-                        warn!(error = %de, requirement_id = row.id, "rollback after attachment ingest failure failed");
+                    if let Err(de) = self.repo.delete(&row.requirement_id).await {
+                        warn!(error = %de, requirement_id = row.requirement_id, "rollback after attachment ingest failure failed");
                     }
                     return Err(e);
                 }
@@ -252,10 +254,10 @@ impl RequirementService {
     }
 
     pub async fn get(&self, id: &str) -> Result<Requirement, AppError> {
-        let id = parse_requirement_id(id)?;
+        let id = validate_requirement_id(id)?;
         let row = self
             .repo
-            .get_by_id(id)
+            .get_by_requirement_id(id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("requirement {id}")))?;
         let mut dto = row_to_dto(&row);
@@ -289,12 +291,12 @@ impl RequirementService {
     }
 
     pub async fn update(&self, id: &str, req: UpdateRequirementRequest) -> Result<Requirement, AppError> {
-        let id = parse_requirement_id(id)?;
+        let id = validate_requirement_id(id)?;
         validate_attachment_ids(&req.remove_attachment_ids)?;
         // Ensure it exists for a clean 404 (update() also returns NotFound).
         let row = self
             .repo
-            .get_by_id(id)
+            .get_by_requirement_id(id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("requirement {id}")))?;
 
@@ -344,7 +346,7 @@ impl RequirementService {
 
         let row = self
             .repo
-            .get_by_id(id)
+            .get_by_requirement_id(id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("requirement {id}")))?;
         let mut dto = row_to_dto(&row);
@@ -354,18 +356,26 @@ impl RequirementService {
     }
 
     pub async fn delete(&self, id: &str) -> Result<(), AppError> {
-        let id = parse_requirement_id(id)?;
-        // Clean attachment files+rows BEFORE deleting the requirement: the
-        // `attachments.requirement_id` FK is `ON DELETE CASCADE`, so deleting the
-        // row first would cascade-drop the attachment rows and leave `delete_all`
-        // (which lists rows to find their files) nothing to remove —orphaning the
-        // files on disk. File failures are logged, not raised.
-        if let Some(store) = &self.attachments
-            && let Err(e) = store.delete_all(id).await
-        {
-            warn!(error = %e, requirement_id = id, "attachment cleanup failed on requirement delete");
+        let id = validate_requirement_id(id)?;
+        let prepared = match &self.attachments {
+            Some(store) => Some((Arc::clone(store), store.prepare_delete_all(id).await?)),
+            None => None,
+        };
+        if let Err(error) = self.repo.delete(id).await {
+            if let Some((store, prepared)) = prepared
+                && let Err(restore_error) = store.restore_prepared_delete(prepared).await
+            {
+                warn!(
+                    error = %restore_error,
+                    requirement_id = id,
+                    "attachment rollback failed after requirement delete transaction failed"
+                );
+            }
+            return Err(error.into());
         }
-        self.repo.delete(id).await?;
+        if let Some((store, prepared)) = prepared {
+            store.finish_prepared_delete(prepared).await;
+        }
         self.emitter.emit_deleted(id);
         Ok(())
     }
@@ -374,24 +384,39 @@ impl RequirementService {
     /// Returns the number actually deleted; emits `requirement.deleted` per row.
     pub async fn delete_many(&self, ids: &[String]) -> Result<u64, AppError> {
         for id in ids {
-            parse_requirement_id(id)?;
+            validate_requirement_id(id)?;
         }
         let mut deleted = 0u64;
         for id in ids {
-            // Files first —the requirement_id FK cascades and would otherwise
-            // drop the attachment rows before delete_all can find their files.
-            if let Some(store) = &self.attachments
-                && let Err(e) = store.delete_all(id).await
-            {
-                warn!(error = %e, requirement_id = id, "attachment cleanup failed on requirement delete");
-            }
+            let prepared = match &self.attachments {
+                Some(store) => Some((Arc::clone(store), store.prepare_delete_all(id).await?)),
+                None => None,
+            };
             match self.repo.delete(id).await {
                 Ok(()) => {
+                    if let Some((store, prepared)) = prepared {
+                        store.finish_prepared_delete(prepared).await;
+                    }
                     self.emitter.emit_deleted(id);
                     deleted += 1;
                 }
-                Err(nomifun_db::DbError::NotFound(_)) => {}
-                Err(e) => return Err(e.into()),
+                Err(nomifun_db::DbError::NotFound(_)) => {
+                    if let Some((store, prepared)) = prepared {
+                        store.restore_prepared_delete(prepared).await?;
+                    }
+                }
+                Err(error) => {
+                    if let Some((store, prepared)) = prepared
+                        && let Err(restore_error) = store.restore_prepared_delete(prepared).await
+                    {
+                        warn!(
+                            error = %restore_error,
+                            requirement_id = id,
+                            "attachment rollback failed after batch requirement delete failed"
+                        );
+                    }
+                    return Err(error.into());
+                }
             }
         }
         Ok(deleted)
@@ -498,7 +523,7 @@ impl RequirementService {
         kind: AutoWorkTargetKind,
         lease_ms: i64,
     ) -> Result<bool, AppError> {
-        let id = parse_requirement_id(id)?;
+        let id = validate_requirement_id(id)?;
         let owners = match kind {
             AutoWorkTargetKind::Conversation => (Some(parse_conversation_id(owner_id)?), None),
             AutoWorkTargetKind::Terminal => (None, Some(parse_terminal_id(owner_id)?)),
@@ -545,9 +570,9 @@ impl RequirementService {
     /// terminal columns. A conversation caller can therefore never release a
     /// terminal-owned requirement, even if a malformed caller reuses its text.
     pub async fn release_claim(&self, id: &str, conversation_id: &str) -> Result<(), AppError> {
-        let id = parse_requirement_id(id)?;
+        let id = validate_requirement_id(id)?;
         let conversation_id = parse_conversation_id(conversation_id)?;
-        let Some(row) = self.repo.get_by_id(id).await? else {
+        let Some(row) = self.repo.get_by_requirement_id(id).await? else {
             return Ok(());
         };
         if row.status != "in_progress"
@@ -564,7 +589,7 @@ impl RequirementService {
             ..Default::default()
         };
         self.repo.update(id, &params).await?;
-        if let Some(updated) = self.repo.get_by_id(id).await? {
+        if let Some(updated) = self.repo.get_by_requirement_id(id).await? {
             self.emitter.emit_status_changed(&row_to_dto(&updated));
         }
         // Released back to pending —another bound session may claim it now.
@@ -583,12 +608,12 @@ impl RequirementService {
     /// claim SQL skips paused tags). Best-effort on the pause write: a failure
     /// must not block the claim release.
     pub async fn user_interrupt(&self, id: &str, conversation_id: &str, tag: &str) -> Result<(), AppError> {
-        let id = parse_requirement_id(id)?;
+        let id = validate_requirement_id(id)?;
         match self.repo.pause_tag(tag, "user_interrupted", Some(id), now_ms()).await {
             Ok(()) => self.emitter.emit_tag_paused(&nomifun_api_types::TagPausedPayload {
                 tag: tag.to_string(),
                 reason: "user_interrupted".to_string(),
-                requirement_id: Some(id.to_string()),
+                requirement_id: Some(id.to_owned()),
             }),
             Err(e) => warn!(
                 tag,
@@ -610,10 +635,10 @@ impl RequirementService {
         status: RequirementStatus,
         note: Option<String>,
     ) -> Result<Requirement, AppError> {
-        let id = parse_requirement_id(id)?;
+        let id = validate_requirement_id(id)?;
         let row = self
             .repo
-            .get_by_id(id)
+            .get_by_requirement_id(id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("requirement {id}")))?;
 
@@ -665,7 +690,7 @@ impl RequirementService {
 
         let updated = self
             .repo
-            .get_by_id(id)
+            .get_by_requirement_id(id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("requirement {id}")))?;
         let dto = row_to_dto(&updated);
@@ -693,7 +718,7 @@ impl RequirementService {
 
     /// Convenience: mark done with a completion note.
     pub async fn complete(&self, id: &str, completion_note: Option<String>) -> Result<Requirement, AppError> {
-        let id = parse_requirement_id(id)?;
+        let id = validate_requirement_id(id)?;
         self.set_status(id, RequirementStatus::Done, completion_note).await
     }
 
@@ -762,7 +787,16 @@ impl RequirementService {
                 let Some(row) = conv_repo.get(parse_conversation_id(target_id)?).await? else {
                     return Ok((false, None, None));
                 };
-                let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_default();
+                let extra: serde_json::Value = serde_json::from_str(&row.extra).map_err(|error| {
+                    AppError::Internal(format!(
+                        "conversation {target_id} has invalid extra JSON: {error}"
+                    ))
+                })?;
+                if !extra.is_object() {
+                    return Err(AppError::Internal(format!(
+                        "conversation {target_id} extra must be a JSON object"
+                    )));
+                }
                 extra.get("autowork").cloned()
             }
             AutoWorkTargetKind::Terminal => {
@@ -770,7 +804,11 @@ impl RequirementService {
                     return Ok((false, None, None));
                 };
                 match driver.read_autowork(parse_terminal_id(target_id)?).await? {
-                    Some(s) => serde_json::from_str(&s).ok(),
+                    Some(s) => Some(serde_json::from_str(&s).map_err(|error| {
+                        AppError::Internal(format!(
+                            "terminal {target_id} has invalid autowork JSON: {error}"
+                        ))
+                    })?),
                     None => None,
                 }
             }
@@ -859,8 +897,8 @@ impl RequirementService {
         note: Option<String>,
         expects_verdict: bool,
     ) -> Result<Option<Requirement>, AppError> {
-        let id = parse_requirement_id(id)?;
-        let Some(row) = self.repo.get_by_id(id).await? else {
+        let id = validate_requirement_id(id)?;
+        let Some(row) = self.repo.get_by_requirement_id(id).await? else {
             return Ok(None);
         };
         // Agent already reached a terminal state itself —respect it (its own
@@ -897,7 +935,7 @@ impl RequirementService {
                 ..Default::default()
             };
             self.repo.update(id, &params).await?;
-            let updated = self.repo.get_by_id(id).await?;
+            let updated = self.repo.get_by_requirement_id(id).await?;
             // Back to pending —wake idle loops (this or a sibling session retries).
             self.wake_autowork();
             return Ok(updated.map(|r| {
@@ -918,7 +956,7 @@ impl RequirementService {
             Ok(()) => self.emitter.emit_tag_paused(&nomifun_api_types::TagPausedPayload {
                 tag: row.tag.clone(),
                 reason: "requirement_failed".to_string(),
-                requirement_id: Some(id.to_string()),
+                requirement_id: Some(id.to_owned()),
             }),
             Err(e) => warn!(
                 tag = %row.tag,
@@ -945,12 +983,12 @@ impl RequirementService {
     /// scratch. Wakes idle AutoWork loops so the tag's work resumes immediately.
     pub async fn resume_tag(&self, tag: &str, requeue_ids: &[String]) -> Result<(), AppError> {
         for id in requeue_ids {
-            parse_requirement_id(id)?;
+            validate_requirement_id(id)?;
         }
         self.repo.resume_tag(tag).await?;
         for id in requeue_ids {
             // Only re-pend rows that are genuinely failed AND belong to this tag.
-            let Some(row) = self.repo.get_by_id(id).await? else { continue };
+            let Some(row) = self.repo.get_by_requirement_id(id).await? else { continue };
             if row.tag != tag || row.status != "failed" {
                 continue;
             }
@@ -966,7 +1004,7 @@ impl RequirementService {
                 ..Default::default()
             };
             self.repo.update(id, &params).await?;
-            if let Some(updated) = self.repo.get_by_id(id).await? {
+            if let Some(updated) = self.repo.get_by_requirement_id(id).await? {
                 self.emitter.emit_status_changed(&row_to_dto(&updated));
             }
         }
@@ -1007,8 +1045,12 @@ impl RequirementService {
                 attempt_count: Some(0),
                 ..Default::default()
             };
-            self.repo.update(&row.id, &params).await?;
-            if let Some(updated) = self.repo.get_by_id(&row.id).await? {
+            self.repo.update(&row.requirement_id, &params).await?;
+            if let Some(updated) = self
+                .repo
+                .get_by_requirement_id(&row.requirement_id)
+                .await?
+            {
                 self.emitter.emit_status_changed(&row_to_dto(&updated));
             }
         }
@@ -1024,13 +1066,13 @@ impl RequirementService {
         owner_id: &str,
         kind: AutoWorkTargetKind,
     ) -> Result<(), AppError> {
-        let id = parse_requirement_id(id)?;
+        let id = validate_requirement_id(id)?;
         let owners = match kind {
             AutoWorkTargetKind::Conversation => (Some(parse_conversation_id(owner_id)?), None),
             AutoWorkTargetKind::Terminal => (None, Some(parse_terminal_id(owner_id)?)),
         };
         if self.repo.unclaim(id, owners.0, owners.1).await? {
-            if let Some(updated) = self.repo.get_by_id(id).await? {
+            if let Some(updated) = self.repo.get_by_requirement_id(id).await? {
                 self.emitter.emit_status_changed(&row_to_dto(&updated));
             }
             self.wake_autowork();
@@ -1039,8 +1081,8 @@ impl RequirementService {
     }
 
     /// §9.B — clear the owner of every requirement bound to a now-deleted
-    /// session, unblocking requirements whose
-    /// `conv_*`/`term_*` executing session was deleted.
+    /// session, unblocking requirements whose conversation/terminal UUIDv7
+    /// executing session was deleted.
     ///
     /// The owner columns intentionally have no cross-table FK, so a deleted
     /// conversation/terminal does not cascade-clear them. Without this hook a requirement claimed by a
@@ -1101,8 +1143,12 @@ impl RequirementService {
                     update.lease_expires_at = Some(None);
                     woke = true;
                 }
-                self.repo.update(&row.id, &update).await?;
-                if let Some(updated) = self.repo.get_by_id(&row.id).await? {
+                self.repo.update(&row.requirement_id, &update).await?;
+                if let Some(updated) = self
+                    .repo
+                    .get_by_requirement_id(&row.requirement_id)
+                    .await?
+                {
                     self.emitter.emit_status_changed(&row_to_dto(&updated));
                 }
                 cleared += 1;
@@ -1155,7 +1201,18 @@ impl RequirementService {
                     break;
                 }
                 for row in &page.items {
-                    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_default();
+                    let extra: serde_json::Value = serde_json::from_str(&row.extra).map_err(|error| {
+                        AppError::Internal(format!(
+                            "conversation {} has invalid extra JSON: {error}",
+                            row.conversation_id
+                        ))
+                    })?;
+                    if !extra.is_object() {
+                        return Err(AppError::Internal(format!(
+                            "conversation {} extra must be a JSON object",
+                            row.conversation_id
+                        )));
+                    }
                     let aw = extra.get("autowork");
                     let Some(aw) = aw else { continue };
                     let enabled = aw.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1163,9 +1220,9 @@ impl RequirementService {
                     if let (true, Some(tag)) = (enabled, tag) {
                         by_tag.entry(tag).or_default().push(TagBinding {
                             kind: AutoWorkTargetKind::Conversation,
-                            target_id: row.id.clone(),
+                            target_id: row.conversation_id.clone(),
                             name: if row.name.is_empty() {
-                                row.id.clone()
+                                row.conversation_id.clone()
                             } else {
                                 row.name.clone()
                             },
@@ -1176,7 +1233,7 @@ impl RequirementService {
                 if !page.has_more {
                     break;
                 }
-                cursor = page.items.last().map(|r| r.id.clone());
+                cursor = page.items.last().map(|r| r.conversation_id.clone());
             }
         }
 
@@ -1184,15 +1241,20 @@ impl RequirementService {
         if let Some(term_repo) = &self.terminal_repo {
             for row in term_repo.list_by_user(user_id).await? {
                 let Some(blob) = row.autowork.as_deref() else { continue };
-                let aw: serde_json::Value = serde_json::from_str(blob).unwrap_or_default();
+                let aw: serde_json::Value = serde_json::from_str(blob).map_err(|error| {
+                    AppError::Internal(format!(
+                        "terminal {} has invalid autowork JSON: {error}",
+                        row.terminal_id
+                    ))
+                })?;
                 let enabled = aw.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
                 let tag = aw.get("tag").and_then(|v| v.as_str()).map(|s| s.to_string());
                 if let (true, Some(tag)) = (enabled, tag) {
                     by_tag.entry(tag).or_default().push(TagBinding {
                         kind: AutoWorkTargetKind::Terminal,
-                        target_id: row.id.to_string(),
+                        target_id: row.terminal_id.to_string(),
                         name: if row.name.is_empty() {
-                            row.id.to_string()
+                            row.terminal_id.to_string()
                         } else {
                             row.name.clone()
                         },
@@ -1209,7 +1271,7 @@ impl RequirementService {
     }
 }
 
-/// Conversation-delete hook (spec §9.B): when an owning `conv_*` conversation is
+/// Conversation-delete hook (spec §9.B): when an owning conversation UUIDv7 is
 /// deleted, clear the conversation owner of every requirement it owned. There
 /// is no FK cascade, so the deletion path drives this explicitly. Wired in `nomifun-app` via
 /// `ConversationService::with_delete_hook`.
@@ -1230,7 +1292,7 @@ impl nomifun_common::OnConversationDelete for RequirementService {
 }
 
 /// Terminal-delete hook (spec §9.B): mirror of `OnConversationDelete` for the
-/// `term_*` owner domain. Wired in `nomifun-app` via
+/// terminal owner domain. Wired in `nomifun-app` via
 /// `TerminalService::with_delete_hook`.
 #[async_trait::async_trait]
 impl nomifun_common::OnTerminalDelete for RequirementService {
@@ -1251,7 +1313,7 @@ impl nomifun_common::OnTerminalDelete for RequirementService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nomifun_common::{ConversationId, RequirementId, TerminalId, UserId};
+    use nomifun_common::{ConversationId, TerminalId, UserId};
     use nomifun_db::{
         IAttachmentRepository, SqliteAttachmentRepository, SqliteRequirementRepository,
         init_database_memory,
@@ -1278,7 +1340,7 @@ mod tests {
         let terminal_id = TerminalId::new().into_string();
         sqlx::query(
             "INSERT INTO conversations \
-                (id, user_id, name, type, created_at, updated_at) \
+                (conversation_id, user_id, name, type, created_at, updated_at) \
              VALUES (?1, ?2, 'Requirement Conversation', 'nomi', 0, 0)",
         )
         .bind(&conversation_id)
@@ -1288,7 +1350,7 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO terminal_sessions \
-                (id, user_id, name, cwd, command, args, cols, rows, last_status, created_at, updated_at) \
+                (terminal_id, user_id, name, cwd, command, args, cols, rows, last_status, created_at, updated_at) \
              VALUES (?1, ?2, 'Requirement Terminal', '/tmp', '$SHELL', '[]', 80, 24, 'running', 0, 0)",
         )
         .bind(&terminal_id)
@@ -1394,7 +1456,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(created.id.parse::<RequirementId>().is_ok());
+        assert!(RequirementId::parse(&created.requirement_id).is_ok());
         assert_eq!(created.attachments.len(), 1);
         assert_eq!(created.attachments[0].file_name, "a.png");
         assert!(std::path::Path::new(&created.attachments[0].abs_path).exists());
@@ -1403,7 +1465,15 @@ mod tests {
                 .abs_path
                 .starts_with(data_dir.path().to_string_lossy().as_ref())
         );
-        assert_eq!(service.get(&created.id).await.unwrap().attachments.len(), 1);
+        assert_eq!(
+            service
+                .get(&created.requirement_id)
+                .await
+                .unwrap()
+                .attachments
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1450,10 +1520,10 @@ mod tests {
             .await
             .unwrap();
         let removed_path = created.attachments[0].abs_path.clone();
-        let removed_id = created.attachments[0].id.clone();
+        let removed_id = created.attachments[0].attachment_id.clone();
         let updated = service
             .update(
-                &created.id,
+                &created.requirement_id,
                 UpdateRequirementRequest {
                     title: None,
                     content: None,
@@ -1494,7 +1564,7 @@ mod tests {
         let original = created.attachments[0].clone();
         let error = service
             .update(
-                &created.id,
+                &created.requirement_id,
                 UpdateRequirementRequest {
                     title: None,
                     content: None,
@@ -1506,16 +1576,19 @@ mod tests {
                         upload_file(upload_root.path(), "bad.txt"),
                         "bad.txt",
                     )],
-                    remove_attachment_ids: vec![original.id.clone()],
+                    remove_attachment_ids: vec![original.attachment_id.clone()],
                 },
             )
             .await
             .unwrap_err();
 
         assert!(matches!(error, AppError::BadRequest(_)));
-        let after = service.get(&created.id).await.unwrap();
+        let after = service.get(&created.requirement_id).await.unwrap();
         assert_eq!(after.attachments.len(), 1);
-        assert_eq!(after.attachments[0].id, original.id);
+        assert_eq!(
+            after.attachments[0].attachment_id,
+            original.attachment_id
+        );
         assert!(std::path::Path::new(&original.abs_path).exists());
     }
 
@@ -1537,7 +1610,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         let updated = service
             .update(
-                &created.id,
+                &created.requirement_id,
                 UpdateRequirementRequest {
                     title: None,
                     content: None,
@@ -1573,22 +1646,25 @@ mod tests {
             })
             .await
             .unwrap();
-        let requirement_id = created.id.clone();
+        let requirement_id = created.requirement_id;
         service.delete(&requirement_id).await.unwrap();
 
-        assert!(!data_dir.path().join("attachments").join(requirement_id).exists());
+        assert!(!data_dir.path().join("attachments").join(&requirement_id).exists());
     }
 
     #[tokio::test]
-    async fn create_get_update_list_and_delete_use_string_ids() {
+    async fn create_get_update_list_and_delete_use_business_ids() {
         let (service, _conversation_id, _terminal_id) = service_with_owners().await;
         let req = create_req(&service, "alpha").await;
-        assert!(req.id.parse::<RequirementId>().is_ok());
-        assert_eq!(service.get(&req.id).await.unwrap().id, req.id);
+        assert!(RequirementId::parse(&req.requirement_id).is_ok());
+        assert_eq!(
+            service.get(&req.requirement_id).await.unwrap().requirement_id,
+            req.requirement_id
+        );
 
         let updated = service
             .update(
-                &req.id,
+                &req.requirement_id,
                 UpdateRequirementRequest {
                     title: Some("Updated".into()),
                     content: None,
@@ -1612,9 +1688,9 @@ mod tests {
             .unwrap();
         assert_eq!(page.total, 1);
 
-        service.delete(&req.id).await.unwrap();
+        service.delete(&req.requirement_id).await.unwrap();
         assert!(matches!(
-            service.get(&req.id).await.unwrap_err(),
+            service.get(&req.requirement_id).await.unwrap_err(),
             AppError::NotFound(_)
         ));
     }
@@ -1640,7 +1716,7 @@ mod tests {
             Some(conversation_id.as_str())
         );
         assert!(claimed.owner_terminal_id.is_none());
-        assert_eq!(claimed.id, conversation_req.id);
+        assert_eq!(claimed.requirement_id, conversation_req.requirement_id);
 
         let term_claimed = service
             .claim_next(
@@ -1657,12 +1733,12 @@ mod tests {
             Some(terminal_id.as_str())
         );
         assert!(term_claimed.owner_conversation_id.is_none());
-        assert_eq!(term_claimed.id, terminal_req.id);
+        assert_eq!(term_claimed.requirement_id, terminal_req.requirement_id);
 
         assert!(
             !service
                 .renew_lease(
-                    &terminal_req.id,
+                    &terminal_req.requirement_id,
                     &conversation_id,
                     AutoWorkTargetKind::Conversation,
                     DEFAULT_LEASE_MS,
@@ -1674,7 +1750,7 @@ mod tests {
         assert!(
             service
                 .renew_lease(
-                    &terminal_req.id,
+                    &terminal_req.requirement_id,
                     &terminal_id,
                     AutoWorkTargetKind::Terminal,
                     DEFAULT_LEASE_MS,
@@ -1698,7 +1774,12 @@ mod tests {
             .await
             .unwrap();
         let done = service
-            .finalize_if_needed(&clean.id, false, Some("finished".into()), false)
+            .finalize_if_needed(
+                &clean.requirement_id,
+                false,
+                Some("finished".into()),
+                false,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -1716,7 +1797,7 @@ mod tests {
             .await
             .unwrap();
         let parked = service
-            .finalize_if_needed(&review.id, false, None, true)
+            .finalize_if_needed(&review.requirement_id, false, None, true)
             .await
             .unwrap()
             .unwrap();
@@ -1733,7 +1814,7 @@ mod tests {
             .await
             .unwrap();
         let pending = service
-            .finalize_if_needed(&retry.id, true, None, false)
+            .finalize_if_needed(&retry.requirement_id, true, None, false)
             .await
             .unwrap()
             .unwrap();
@@ -1756,12 +1837,12 @@ mod tests {
             .await
             .unwrap();
         service
-            .complete(&requirement.id, Some("agent did it".into()))
+            .complete(&requirement.requirement_id, Some("agent did it".into()))
             .await
             .unwrap();
 
         let finalized = service
-            .finalize_if_needed(&requirement.id, false, None, true)
+            .finalize_if_needed(&requirement.requirement_id, false, None, true)
             .await
             .unwrap()
             .unwrap();
@@ -1769,14 +1850,18 @@ mod tests {
         assert_eq!(finalized.completion_note.as_deref(), Some("agent did it"));
         assert!(matches!(
             service
-                .set_status(&requirement.id, RequirementStatus::InProgress, None)
+                .set_status(
+                    &requirement.requirement_id,
+                    RequirementStatus::InProgress,
+                    None,
+                )
                 .await
                 .unwrap_err(),
             AppError::BadRequest(_)
         ));
         assert_eq!(
             service
-                .set_status(&requirement.id, RequirementStatus::Done, None)
+                .set_status(&requirement.requirement_id, RequirementStatus::Done, None)
                 .await
                 .unwrap()
                 .completion_note
@@ -1792,7 +1877,7 @@ mod tests {
         let requirement = create_req(&service, "stale-note").await;
         service
             .set_status(
-                &requirement.id,
+                &requirement.requirement_id,
                 RequirementStatus::NeedsReview,
                 Some("unable to declare a verdict".into()),
             )
@@ -1800,7 +1885,7 @@ mod tests {
             .unwrap();
 
         let done = service
-            .set_status(&requirement.id, RequirementStatus::Done, None)
+            .set_status(&requirement.requirement_id, RequirementStatus::Done, None)
             .await
             .unwrap();
         assert_eq!(done.status, RequirementStatus::Done);
@@ -1822,7 +1907,7 @@ mod tests {
             .unwrap();
         let review = service
             .finalize_if_needed(
-                &requirement.id,
+                &requirement.requirement_id,
                 false,
                 Some("please verify".into()),
                 true,
@@ -1848,7 +1933,7 @@ mod tests {
         );
         assert_eq!(
             service
-                .set_status(&requirement.id, RequirementStatus::Done, None)
+                .set_status(&requirement.requirement_id, RequirementStatus::Done, None)
                 .await
                 .unwrap()
                 .status,
@@ -1860,21 +1945,33 @@ mod tests {
     async fn exhausted_retries_pause_tag_and_explicit_resume_requeues() {
         let (service, conversation_id, _terminal_id) = service_with_owners().await;
         let requirement = create_req(&service, "retry-pause").await;
-        exhaust_requirement(&service, &requirement.id, "retry-pause", &conversation_id).await;
+        exhaust_requirement(
+            &service,
+            &requirement.requirement_id,
+            "retry-pause",
+            &conversation_id,
+        )
+        .await;
 
-        let failed = service.get(&requirement.id).await.unwrap();
+        let failed = service.get(&requirement.requirement_id).await.unwrap();
         assert_eq!(failed.status, RequirementStatus::Failed);
         assert_eq!(failed.attempt_count, MAX_ATTEMPTS);
         assert!(service.is_tag_paused("retry-pause").await.unwrap());
         let state = service.tag_state("retry-pause").await.unwrap().unwrap();
         assert_eq!(state.paused_reason.as_deref(), Some("requirement_failed"));
-        assert_eq!(state.paused_req_id.as_deref(), Some(requirement.id.as_str()));
+        assert_eq!(
+            state.paused_requirement_id,
+            Some(requirement.requirement_id.clone())
+        );
 
         service
-            .resume_tag("retry-pause", std::slice::from_ref(&requirement.id))
+            .resume_tag(
+                "retry-pause",
+                std::slice::from_ref(&requirement.requirement_id),
+            )
             .await
             .unwrap();
-        let requeued = service.get(&requirement.id).await.unwrap();
+        let requeued = service.get(&requirement.requirement_id).await.unwrap();
         assert_eq!(requeued.status, RequirementStatus::Pending);
         assert_eq!(requeued.attempt_count, 0);
         assert!(!service.is_tag_paused("retry-pause").await.unwrap());
@@ -1896,9 +1993,15 @@ mod tests {
     async fn enable_resume_refreshes_paused_work_but_not_healthy_work() {
         let (service, conversation_id, _terminal_id) = service_with_owners().await;
         let stuck = create_req(&service, "enable-resume").await;
-        exhaust_requirement(&service, &stuck.id, "enable-resume", &conversation_id).await;
+        exhaust_requirement(
+            &service,
+            &stuck.requirement_id,
+            "enable-resume",
+            &conversation_id,
+        )
+        .await;
         service.resume_tag_for_enable("enable-resume").await.unwrap();
-        let refreshed = service.get(&stuck.id).await.unwrap();
+        let refreshed = service.get(&stuck.requirement_id).await.unwrap();
         assert_eq!(refreshed.status, RequirementStatus::Pending);
         assert_eq!(refreshed.attempt_count, 0);
         assert!(!service.is_tag_paused("enable-resume").await.unwrap());
@@ -1914,13 +2017,24 @@ mod tests {
             .await
             .unwrap();
         service
-            .finalize_if_needed(&healthy.id, true, None, false)
+            .finalize_if_needed(&healthy.requirement_id, true, None, false)
             .await
             .unwrap();
-        assert_eq!(service.get(&healthy.id).await.unwrap().attempt_count, 1);
+        assert_eq!(
+            service
+                .get(&healthy.requirement_id)
+                .await
+                .unwrap()
+                .attempt_count,
+            1
+        );
         service.resume_tag_for_enable("healthy-enable").await.unwrap();
         assert_eq!(
-            service.get(&healthy.id).await.unwrap().attempt_count,
+            service
+                .get(&healthy.requirement_id)
+                .await
+                .unwrap()
+                .attempt_count,
             1,
             "enabling an unpaused tag must not reset a healthy retry budget"
         );
@@ -1944,13 +2058,13 @@ mod tests {
 
         service
             .unclaim_busy(
-                &requirement.id,
+                &requirement.requirement_id,
                 &conversation_id,
                 AutoWorkTargetKind::Conversation,
             )
             .await
             .unwrap();
-        let requeued = service.get(&requirement.id).await.unwrap();
+        let requeued = service.get(&requirement.requirement_id).await.unwrap();
         assert_eq!(requeued.status, RequirementStatus::Pending);
         assert_eq!(requeued.attempt_count, 0);
     }
@@ -1969,11 +2083,15 @@ mod tests {
             .await
             .unwrap();
         service
-            .user_interrupt(&requirement.id, &conversation_id, "interrupted")
+            .user_interrupt(
+                &requirement.requirement_id,
+                &conversation_id,
+                "interrupted",
+            )
             .await
             .unwrap();
 
-        let interrupted = service.get(&requirement.id).await.unwrap();
+        let interrupted = service.get(&requirement.requirement_id).await.unwrap();
         assert_eq!(interrupted.status, RequirementStatus::Pending);
         assert_eq!(interrupted.attempt_count, 1);
         assert!(service.is_tag_paused("interrupted").await.unwrap());
@@ -2036,10 +2154,10 @@ mod tests {
                 .unwrap(),
             1
         );
-        let conv_after = service.get(&conv_req.id).await.unwrap();
+        let conv_after = service.get(&conv_req.requirement_id).await.unwrap();
         assert_eq!(conv_after.status, RequirementStatus::Pending);
         assert!(conv_after.owner_conversation_id.is_none());
-        let term_after = service.get(&term_req.id).await.unwrap();
+        let term_after = service.get(&term_req.requirement_id).await.unwrap();
         assert_eq!(
             term_after.owner_terminal_id.as_deref(),
             Some(terminal_id.as_str())
@@ -2061,10 +2179,13 @@ mod tests {
             .unwrap();
 
         service
-            .release_claim(&terminal_requirement.id, &conversation_id)
+            .release_claim(&terminal_requirement.requirement_id, &conversation_id)
             .await
             .unwrap();
-        let terminal_after = service.get(&terminal_requirement.id).await.unwrap();
+        let terminal_after = service
+            .get(&terminal_requirement.requirement_id)
+            .await
+            .unwrap();
         assert_eq!(terminal_after.status, RequirementStatus::InProgress);
         assert_eq!(
             terminal_after.owner_terminal_id.as_deref(),
@@ -2083,10 +2204,13 @@ mod tests {
             .await
             .unwrap();
         service
-            .release_claim(&conversation_requirement.id, &conversation_id)
+            .release_claim(&conversation_requirement.requirement_id, &conversation_id)
             .await
             .unwrap();
-        let conversation_after = service.get(&conversation_requirement.id).await.unwrap();
+        let conversation_after = service
+            .get(&conversation_requirement.requirement_id)
+            .await
+            .unwrap();
         assert_eq!(conversation_after.status, RequirementStatus::Pending);
         assert!(conversation_after.owner_conversation_id.is_none());
         assert!(conversation_after.owner_terminal_id.is_none());

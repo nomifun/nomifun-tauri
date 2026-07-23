@@ -6,7 +6,7 @@ use nomifun_api_types::{
 };
 use nomifun_common::{
     AgentStepMode, AgentToolPolicy, AppError, ExecutionStepKind, ExecutionStepStatus,
-    ParticipantAssignmentSource, MAX_AGENT_EXECUTION_STEPS, generate_prefixed_id,
+    ParticipantAssignmentSource, MAX_AGENT_EXECUTION_STEPS, generate_id,
 };
 use nomifun_db::{NewAgentExecutionStep, NewAgentExecutionStepDependency};
 
@@ -45,11 +45,7 @@ pub(crate) fn materialize(
         ));
     }
 
-    let ids: Vec<String> = plan
-        .steps
-        .iter()
-        .map(|_| generate_prefixed_id("execstep"))
-        .collect();
+    let step_ids: Vec<String> = (0..plan.steps.len()).map(|_| generate_id()).collect();
     let mut steps = Vec::with_capacity(plan.steps.len());
     let mut dependencies = Vec::new();
     for (index, planned) in plan.steps.into_iter().enumerate() {
@@ -61,12 +57,12 @@ pub(crate) fn materialize(
         };
         for blocker in planned.depends_on.iter().copied() {
             dependencies.push(NewAgentExecutionStepDependency {
-                blocker_step_id: ids[blocker].clone(),
-                blocked_step_id: ids[index].clone(),
+                blocker_step_id: step_ids[blocker].clone(),
+                blocked_step_id: step_ids[index].clone(),
             });
         }
         steps.push(NewAgentExecutionStep {
-            id: ids[index].clone(),
+            step_id: step_ids[index].clone(),
             title: planned.title.trim().to_owned(),
             spec: planned.spec.trim().to_owned(),
             role: planned.role.map(|value| value.trim().to_owned()),
@@ -108,7 +104,15 @@ pub(crate) fn materialize(
 fn route(
     step: &PlannedExecutionStep,
     participants: &[&ExecutionParticipant],
-) -> Result<(Option<String>, Option<ParticipantAssignmentSource>, Option<f64>, Option<String>), AppError> {
+) -> Result<
+    (
+        Option<String>,
+        Option<ParticipantAssignmentSource>,
+        Option<f64>,
+        Option<String>,
+    ),
+    AppError,
+> {
     if let Some(index) = step.participant_index {
         let participant = participants.get(index).ok_or_else(|| {
             AppError::BadRequest(format!(
@@ -127,7 +131,7 @@ fn route(
             )));
         }
         return Ok((
-            Some(participant.id.clone()),
+            Some(participant.participant_id.clone()),
             Some(ParticipantAssignmentSource::Planner),
             None,
             step.assignment_rationale.clone(),
@@ -141,7 +145,7 @@ fn route(
             .collect();
         if let Some(candidate) = rank_participants(&owned, profile).first() {
             return Ok((
-                Some(owned[candidate.participant_index].id.clone()),
+                Some(owned[candidate.participant_index].participant_id.clone()),
                 Some(ParticipantAssignmentSource::Automatic),
                 Some(candidate.score),
                 Some(candidate.rationale.clone()),
@@ -157,7 +161,7 @@ fn route(
         .next()
         .ok_or_else(|| AppError::BadRequest("no participant can execute this step".to_owned()))?;
     Ok((
-        Some(participant.id.clone()),
+        Some(participant.participant_id.clone()),
         Some(ParticipantAssignmentSource::Automatic),
         None,
         Some("default active participant".to_owned()),

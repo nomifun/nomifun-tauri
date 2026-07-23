@@ -376,7 +376,7 @@ mod tests {
 
     fn metadata_with_backend(backend: Option<&str>) -> AgentMetadata {
         AgentMetadata {
-            id: "agent-1".into(),
+            agent_id: "0190f5fe-7c00-7a00-8000-000000000102".into(),
             icon: None,
             name: "Codex CLI".into(),
             name_i18n: None,

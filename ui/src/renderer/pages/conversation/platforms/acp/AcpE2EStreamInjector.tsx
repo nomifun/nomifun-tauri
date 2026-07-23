@@ -4,7 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 import { parseMessageId, type ConversationId } from '@/common/types/ids';
-import { prefixedId } from '@/common/utils/prefixedId';
+import { uuidv7 } from '@/common/utils/uuidv7';
+import { uuid } from '@/common/utils';
 
 import type { TMessage } from '@/common/chat/chatLib';
 import { useAddOrUpdateMessage } from '@/renderer/pages/conversation/Messages/hooks';
@@ -38,7 +39,7 @@ const createSeedMessages = (conversationId: ConversationId, historyPairs: number
   const messages: TMessage[] = [];
 
   for (let index = 0; index < historyPairs; index += 1) {
-    const userMessageId = parseMessageId(prefixedId('msg'));
+    const userMessageId = parseMessageId(uuidv7());
     messages.push({
       id: `e2e-seed-user-${index}`,
       msg_id: userMessageId,
@@ -51,7 +52,7 @@ const createSeedMessages = (conversationId: ConversationId, historyPairs: number
       },
     });
 
-    const assistantMessageId = parseMessageId(prefixedId('msg'));
+    const assistantMessageId = parseMessageId(uuidv7());
     messages.push({
       id: `e2e-seed-assistant-${index}`,
       msg_id: assistantMessageId,
@@ -65,7 +66,7 @@ const createSeedMessages = (conversationId: ConversationId, historyPairs: number
     });
   }
 
-  const finalUserMessageId = parseMessageId(prefixedId('msg'));
+  const finalUserMessageId = parseMessageId(uuidv7());
   messages.push({
     id: 'e2e-seed-user-final',
     msg_id: finalUserMessageId,
@@ -95,18 +96,18 @@ const AcpE2EStreamInjector: React.FC<{ conversationId: ConversationId }> = ({ co
   useEffect(() => {
     const enabledConversationId =
       typeof window !== 'undefined' ? window.sessionStorage.getItem(ENABLED_CONVERSATION_KEY) : null;
-    if (enabledConversationId !== String(conversationId)) {
+    if (enabledConversationId !== conversationId) {
       return;
     }
 
     const registry = (window.__NOMIFUN_E2E_MESSAGE_STREAM__ ??= { controllers: {} });
-    const registryKey = String(conversationId);
+    const registryKey = conversationId;
 
     registry.controllers[registryKey] = {
       runScenario: async (options?: RunScenarioOptions) => {
         const historyPairs = options?.historyPairs ?? 18;
         const lines = options?.lines ?? 160;
-        const streamMsgId = parseMessageId(prefixedId('msg'));
+        const streamMsgId = parseMessageId(uuidv7());
 
         if (historyPairs > 0) {
           createSeedMessages(conversationId, historyPairs).forEach((message) => addOrUpdateMessage(message, true));
@@ -127,7 +128,7 @@ const AcpE2EStreamInjector: React.FC<{ conversationId: ConversationId }> = ({ co
             }
 
             addOrUpdateMessage({
-              id: `${streamMsgId}-${chunkIndex}`,
+              id: uuid(),
               msg_id: streamMsgId,
               conversation_id: conversationId,
               type: 'text',

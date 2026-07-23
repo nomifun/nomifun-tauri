@@ -16,10 +16,21 @@ use nomifun_ai_agent::manager::acp::{
 };
 use nomifun_ai_agent::registry::AgentRegistry;
 use nomifun_ai_agent::session::ModelId;
-use nomifun_ai_agent::{AcpBuildExtra, AcpSkillManager, AgentRuntimeState};
+use nomifun_ai_agent::{AcpBuildExtra, AcpSkillManager};
 use nomifun_db::{SqliteAgentMetadataRepository, init_database_memory};
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
+
+const CLAUDE_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000101";
+const CODEX_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000102";
+
+fn baseline_agent_id(backend: &str) -> &'static str {
+    match backend {
+        "claude" => CLAUDE_AGENT_ID,
+        "codex" => CODEX_AGENT_ID,
+        other => panic!("unsupported ACP fixture backend: {other}"),
+    }
+}
 
 async fn fixture_params(
     backend: &str,
@@ -32,9 +43,9 @@ async fn fixture_params(
     registry.hydrate().await.unwrap();
 
     let metadata = registry
-        .find_builtin_by_backend(backend)
+        .get(baseline_agent_id(backend))
         .await
-        .expect("seeded backend row must exist");
+        .expect("seeded agent row must exist");
 
     let config = AcpBuildExtra {
         gateway_mcp_config: None,
@@ -42,7 +53,7 @@ async fn fixture_params(
         open_mcp_config: None,
         computer_mcp_config: None,
         browser_mcp_config: None,
-        agent_id: None,
+        agent_id: Some(baseline_agent_id(backend).to_owned()),
         backend: Some(backend.to_owned()),
         cli_path: None,
         agent_name: None,
@@ -98,14 +109,15 @@ async fn fixture_params_with_knowledge(backend: &str) -> Arc<AcpSessionParams> {
     let registry = AgentRegistry::new(repo);
     registry.hydrate().await.unwrap();
     let metadata = registry
-        .find_builtin_by_backend(backend)
+        .get(baseline_agent_id(backend))
         .await
-        .expect("seeded backend row must exist");
+        .expect("seeded agent row must exist");
 
     let config = AcpBuildExtra {
+        agent_id: Some(baseline_agent_id(backend).to_owned()),
         backend: Some(backend.to_owned()),
         knowledge_mounts: vec![nomifun_api_types::KnowledgeMountInfo {
-            id: nomifun_common::KnowledgeBaseId::new(),
+            knowledge_base_id: nomifun_common::KnowledgeBaseId::new(),
             name: "领域知识".into(),
             description: "团队约定".into(),
             rel_path: ".nomi/knowledge/领域知识".into(),
@@ -148,10 +160,6 @@ fn fixture_skill_manager() -> Arc<AcpSkillManager> {
     AcpSkillManager::new(paths)
 }
 
-fn fixture_runtime() -> AgentRuntimeState {
-    AgentRuntimeState::new("conv-pp-test", "/tmp", 64)
-}
-
 fn make_pipeline() -> PromptPipeline {
     // Mirror the real registration order in AcpAgentManager::new.
     PromptPipeline::new(vec![
@@ -163,12 +171,27 @@ fn make_pipeline() -> PromptPipeline {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+#[tokio::test(flavor = "current_thread")]
+async fn empty_pipeline_is_identity() {
+    let params = fixture_params("claude", None, true).await;
+    let skill_manager = fixture_skill_manager();
+    let mut session = AcpSession::new(None, None, HashMap::new());
+    let pipeline = PromptPipeline::new(vec![]);
+    let mut ctx = PromptCtx {
+        session: &mut session,
+        params: &params,
+        skill_manager: &skill_manager,
+    };
+
+    let out = pipeline.pre_send(&mut ctx, "hello".into()).await;
+    assert_eq!(out, "hello");
+}
+
 /// First prompt after session/new: prelude block injected, flag consumed.
 #[tokio::test(flavor = "current_thread")]
 async fn brand_new_first_prompt_injects_preset_context() {
     let params = fixture_params("claude", Some("Rule A"), true).await;
     let skill_manager = fixture_skill_manager();
-    let runtime = fixture_runtime();
     let mut session = AcpSession::new(None, None, HashMap::new());
 
     // Simulate: open_session_new just succeeded.
@@ -180,7 +203,6 @@ async fn brand_new_first_prompt_injects_preset_context() {
         session: &mut session,
         params: &params,
         skill_manager: &skill_manager,
-        runtime: &runtime,
     };
 
     let out = pipeline.pre_send(&mut ctx, "hello".into()).await;
@@ -200,7 +222,6 @@ async fn brand_new_first_prompt_injects_preset_context() {
 async fn second_prompt_is_passthrough() {
     let params = fixture_params("claude", Some("Rule A"), true).await;
     let skill_manager = fixture_skill_manager();
-    let runtime = fixture_runtime();
     let mut session = AcpSession::new(None, None, HashMap::new());
     session.mark_pending_session_new_prelude();
 
@@ -212,8 +233,7 @@ async fn second_prompt_is_passthrough() {
             session: &mut session,
             params: &params,
             skill_manager: &skill_manager,
-            runtime: &runtime,
-        };
+            };
         let _ = pipeline.pre_send(&mut ctx, "first".into()).await;
     }
 
@@ -222,7 +242,6 @@ async fn second_prompt_is_passthrough() {
         session: &mut session,
         params: &params,
         skill_manager: &skill_manager,
-        runtime: &runtime,
     };
     let out = pipeline.pre_send(&mut ctx, "second".into()).await;
     assert_eq!(out, "second", "no prelude / no reminder expected on second turn");
@@ -233,7 +252,6 @@ async fn second_prompt_is_passthrough() {
 async fn resume_path_does_not_inject() {
     let params = fixture_params("claude", Some("Rule A"), true).await;
     let skill_manager = fixture_skill_manager();
-    let runtime = fixture_runtime();
 
     // Resume: session opened by open_session_resume which does NOT call
     // mark_pending_session_new_prelude. The flag stays false.
@@ -245,7 +263,6 @@ async fn resume_path_does_not_inject() {
         session: &mut session,
         params: &params,
         skill_manager: &skill_manager,
-        runtime: &runtime,
     };
 
     let out = pipeline.pre_send(&mut ctx, "continue the story".into()).await;
@@ -261,7 +278,6 @@ async fn resume_path_does_not_inject() {
 async fn knowledge_section_delivered_on_resume() {
     let params = fixture_params_with_knowledge("claude").await;
     let skill_manager = fixture_skill_manager();
-    let runtime = fixture_runtime();
     let mut session = AcpSession::new(None, None, HashMap::new());
 
     // Resume: open_session_resume marks the knowledge prelude but NOT the
@@ -273,7 +289,6 @@ async fn knowledge_section_delivered_on_resume() {
         session: &mut session,
         params: &params,
         skill_manager: &skill_manager,
-        runtime: &runtime,
     };
 
     let out = pipeline.pre_send(&mut ctx, "用领域知识回答".into()).await;
@@ -293,7 +308,6 @@ async fn knowledge_section_delivered_on_resume() {
         session: &mut session,
         params: &params,
         skill_manager: &skill_manager,
-        runtime: &runtime,
     };
     let out2 = pipeline.pre_send(&mut ctx2, "再问一句".into()).await;
     assert_eq!(out2, "再问一句", "knowledge section must be one-shot per session open");
@@ -305,7 +319,6 @@ async fn knowledge_section_delivered_on_resume() {
 async fn knowledge_section_skipped_without_flag() {
     let params = fixture_params_with_knowledge("claude").await;
     let skill_manager = fixture_skill_manager();
-    let runtime = fixture_runtime();
     let mut session = AcpSession::new(None, None, HashMap::new());
 
     let pipeline = make_pipeline();
@@ -313,7 +326,6 @@ async fn knowledge_section_skipped_without_flag() {
         session: &mut session,
         params: &params,
         skill_manager: &skill_manager,
-        runtime: &runtime,
     };
 
     let out = pipeline.pre_send(&mut ctx, "hello".into()).await;
@@ -325,7 +337,6 @@ async fn knowledge_section_skipped_without_flag() {
 async fn pending_model_notice_triggers_reminder_prepend() {
     let params = fixture_params("claude", None, true).await;
     let skill_manager = fixture_skill_manager();
-    let runtime = fixture_runtime();
     let mut session = AcpSession::new(None, None, HashMap::new());
 
     // Simulate set_model reconciled successfully and stuck the notice.
@@ -337,7 +348,6 @@ async fn pending_model_notice_triggers_reminder_prepend() {
         session: &mut session,
         params: &params,
         skill_manager: &skill_manager,
-        runtime: &runtime,
     };
 
     let out = pipeline.pre_send(&mut ctx, "go".into()).await;
@@ -349,7 +359,6 @@ async fn pending_model_notice_triggers_reminder_prepend() {
         session: &mut session,
         params: &params,
         skill_manager: &skill_manager,
-        runtime: &runtime,
     };
     let out2 = pipeline.pre_send(&mut ctx2, "next".into()).await;
     assert_eq!(out2, "next");
@@ -360,7 +369,6 @@ async fn pending_model_notice_triggers_reminder_prepend() {
 async fn both_flags_prepend_reminder_outermost() {
     let params = fixture_params("claude", Some("Rule A"), true).await;
     let skill_manager = fixture_skill_manager();
-    let runtime = fixture_runtime();
     let mut session = AcpSession::new(None, None, HashMap::new());
     session.mark_pending_session_new_prelude();
     session.set_pending_model_notice(ModelId::new("claude-opus-4"));
@@ -371,7 +379,6 @@ async fn both_flags_prepend_reminder_outermost() {
         session: &mut session,
         params: &params,
         skill_manager: &skill_manager,
-        runtime: &runtime,
     };
 
     let out = pipeline.pre_send(&mut ctx, "hi".into()).await;
@@ -382,17 +389,4 @@ async fn both_flags_prepend_reminder_outermost() {
         "reminder must sit outside (before) the assistant rules block:\n{out}"
     );
     assert!(out.ends_with("hi"));
-}
-
-/// Skeleton: unlock once inject_first_message_prefix surfaces errors.
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "SessionNewPreludeHook relies on inject_first_message_prefix which currently swallows I/O errors internally; unlocking this test requires surfacing a fallible boundary"]
-async fn prelude_io_failure_emits_prompt_hook_warning() {
-    // When inject_first_message_prefix exposes an error path, the hook
-    // should call emit_hook_warning("session_new_prelude", ...) and
-    // return the user content unchanged. Subscribers on runtime.subscribe()
-    // must then receive an AgentStreamEvent::AcpPromptHookWarning whose
-    // payload deserializes to AcpPromptHookWarningPayload with
-    // hook == "session_new_prelude".
-    let _ = fixture_params("claude", Some("ctx"), true).await;
 }

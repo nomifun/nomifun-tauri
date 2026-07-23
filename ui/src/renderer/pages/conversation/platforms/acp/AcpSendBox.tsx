@@ -1,9 +1,9 @@
 import type { ConversationId } from '@/common/types/ids';
 import { ipcBridge } from '@/common';
-import type { IConversationMcpStatus } from '@/common/config/storage';
 import { isBackendHttpError } from '@/common/adapter/httpBridge';
 import { isSideQuestionSupported } from '@/common/chat/sideQuestion';
 import { parseError } from '@/common/utils';
+import { uuid } from '@/common/utils';
 import AgentModeSelector from '@/renderer/components/agent/AgentModeSelector';
 import AcpModelSelector from '@/renderer/components/agent/AcpModelSelector';
 import CommandQueuePanel from '@/renderer/components/chat/CommandQueuePanel';
@@ -124,13 +124,7 @@ const AcpSendBox: React.FC<{
   const isMobile = Boolean(layout?.isMobile);
   const conversationContext = useConversationContextSafe();
   const loadedSkills = conversationContext?.loadedSkills ?? [];
-  const loadedMcpStatuses =
-    conversationContext?.loadedMcpStatuses ??
-    (conversationContext?.loadedMcpServers ?? []).map<IConversationMcpStatus>((name) => ({
-      id: `legacy:${name}`,
-      name,
-      status: 'loaded',
-    }));
+  const loadedMcpStatuses = conversationContext?.loadedMcpStatuses ?? [];
   const [isMobileSheetOpen, setIsMobileSheetOpen] = useState(false);
   const [currentMode, setCurrentMode] = useState<string | undefined>(session_mode);
   const prepareRuntimeSync = useCallback(async () => {
@@ -269,7 +263,7 @@ const AcpSendBox: React.FC<{
         // by msg_id — this prevents a duplicate bubble if useMessageLstCache
         // already inserted the DB row for this same msg_id.
         addOrUpdateMessageRef.current({
-          id: msg_id,
+          id: uuid(),
           msg_id,
           type: 'text',
           position: 'right',

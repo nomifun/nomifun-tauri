@@ -19,7 +19,8 @@ async fn t2_1_create_user_returns_user_with_populated_fields() {
     let r = repo().await;
     let user = r.create_user("testuser", "$2b$12$fakehash").await.unwrap();
 
-    assert!(!user.id.is_empty(), "id should be non-empty");
+    assert!(user.id > 0, "technical id should be positive");
+    nomifun_common::validate_uuidv7(user.user_id.as_str()).unwrap();
     assert_eq!(user.username, "testuser");
     assert_eq!(user.password_hash, "$2b$12$fakehash");
     assert!(user.created_at > 0);
@@ -60,9 +61,11 @@ async fn t2_3_find_by_id_existing() {
     let r = repo().await;
     let user = r.create_user("byid", "h").await.unwrap();
 
-    let found = r.find_by_id(&user.id).await.unwrap();
+    let found = r.find_by_id(user.user_id.as_str()).await.unwrap();
     assert!(found.is_some());
-    assert_eq!(found.unwrap().id, user.id);
+    let found = found.unwrap();
+    assert_eq!(found.id, user.id);
+    assert_eq!(found.user_id, user.user_id);
 }
 
 #[tokio::test]
@@ -119,7 +122,7 @@ async fn t2_7_get_system_user_returns_default() {
     assert!(user.is_some());
 
     let user = user.unwrap();
-    assert!(user.id.as_str().starts_with("user_"));
+    nomifun_common::validate_uuidv7(user.user_id.as_str()).unwrap();
 }
 
 // -- T2.8 Get primary WebUI user --
@@ -128,7 +131,7 @@ async fn t2_7_get_system_user_returns_default() {
 async fn t2_8_primary_webui_user_is_system_user_when_only_system() {
     let r = repo().await;
     let user = r.get_primary_webui_user().await.unwrap().unwrap();
-    assert!(user.id.as_str().starts_with("user_"));
+    nomifun_common::validate_uuidv7(user.user_id.as_str()).unwrap();
 }
 
 #[tokio::test]
@@ -169,7 +172,7 @@ async fn t2_9_set_system_user_password_if_uninitialized_preserves_username() {
     let r = repo().await;
     // Rename the installation owner while its password is still empty (WebUI-off edit).
     let owner = r.get_system_user().await.unwrap().unwrap();
-    r.update_username(&owner.id, "renamed").await.unwrap();
+    r.update_username(owner.user_id.as_str(), "renamed").await.unwrap();
 
     let wrote = r.set_system_user_password_if_uninitialized("hash1").await.unwrap();
     assert!(wrote, "should provision the password when empty");
@@ -193,9 +196,9 @@ async fn t2_10_update_password_changes_hash_and_updated_at() {
     let r = repo().await;
     let user = r.create_user("pwduser", "old").await.unwrap();
 
-    r.update_password(&user.id, "new_hash").await.unwrap();
+    r.update_password(user.user_id.as_str(), "new_hash").await.unwrap();
 
-    let updated = r.find_by_id(&user.id).await.unwrap().unwrap();
+    let updated = r.find_by_id(user.user_id.as_str()).await.unwrap().unwrap();
     assert_eq!(updated.password_hash, "new_hash");
     assert!(updated.updated_at >= user.updated_at);
 }
@@ -207,9 +210,9 @@ async fn t2_11_update_username_succeeds() {
     let r = repo().await;
     let user = r.create_user("oldname", "h").await.unwrap();
 
-    r.update_username(&user.id, "newname").await.unwrap();
+    r.update_username(user.user_id.as_str(), "newname").await.unwrap();
 
-    let updated = r.find_by_id(&user.id).await.unwrap().unwrap();
+    let updated = r.find_by_id(user.user_id.as_str()).await.unwrap().unwrap();
     assert_eq!(updated.username, "newname");
 }
 
@@ -219,7 +222,10 @@ async fn t2_11_update_username_conflict_with_existing() {
     r.create_user("taken", "h").await.unwrap();
     let other = r.create_user("free", "h").await.unwrap();
 
-    let err = r.update_username(&other.id, "taken").await.unwrap_err();
+    let err = r
+        .update_username(other.user_id.as_str(), "taken")
+        .await
+        .unwrap_err();
     assert!(matches!(err, DbError::Conflict(_)), "expected Conflict, got: {err:?}");
 }
 
@@ -231,9 +237,9 @@ async fn t2_12_update_last_login_sets_timestamp() {
     let user = r.create_user("loginuser", "h").await.unwrap();
     assert!(user.last_login.is_none());
 
-    r.update_last_login(&user.id).await.unwrap();
+    r.update_last_login(user.user_id.as_str()).await.unwrap();
 
-    let updated = r.find_by_id(&user.id).await.unwrap().unwrap();
+    let updated = r.find_by_id(user.user_id.as_str()).await.unwrap().unwrap();
     assert!(updated.last_login.is_some());
     assert!(updated.last_login.unwrap() > 0);
 }
@@ -246,8 +252,8 @@ async fn t2_13_update_jwt_secret_sets_value() {
     let user = r.create_user("jwtuser", "h").await.unwrap();
     assert!(user.jwt_secret.is_none());
 
-    r.update_jwt_secret(&user.id, "my_secret").await.unwrap();
+    r.update_jwt_secret(user.user_id.as_str(), "my_secret").await.unwrap();
 
-    let updated = r.find_by_id(&user.id).await.unwrap().unwrap();
+    let updated = r.find_by_id(user.user_id.as_str()).await.unwrap().unwrap();
     assert_eq!(updated.jwt_secret.as_deref(), Some("my_secret"));
 }

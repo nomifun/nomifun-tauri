@@ -7,6 +7,7 @@
 import { describe, expect, test } from 'bun:test';
 import { conversationTarget, parseConversationId, terminalTarget } from '@/common/types/ids';
 import {
+  browserStorageGenerationKey,
   browserStorageKey,
   sessionStorageKey,
   setBrowserStorageGeneration,
@@ -17,11 +18,11 @@ describe('browser storage keys', () => {
     setBrowserStorageGeneration('01900000-0000-7000-8000-000000000000');
     const conversationKey = sessionStorageKey(
       'workspace-panel-tab',
-      conversationTarget('conv_0190f5fe-7c00-7a00-8000-000000000001'),
+      conversationTarget('0190f5fe-7c00-7a00-8000-000000000001'),
     );
     const terminalKey = sessionStorageKey(
       'workspace-panel-tab',
-      terminalTarget('term_0190f5fe-7c00-7a00-8000-000000000001'),
+      terminalTarget('0190f5fe-7c00-7a00-8000-000000000001'),
     );
 
     expect(conversationKey.includes('|v1|')).toBe(true);
@@ -32,12 +33,12 @@ describe('browser storage keys', () => {
     const left = browserStorageKey(
       'ab',
       'conversation',
-      parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000001'),
+      parseConversationId('0190f5fe-7c00-7a00-8000-000000000001'),
     );
     const right = browserStorageKey(
       'a',
       'conversation',
-      parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000002'),
+      parseConversationId('0190f5fe-7c00-7a00-8000-000000000002'),
     );
 
     expect(left).not.toBe(right);
@@ -47,15 +48,24 @@ describe('browser storage keys', () => {
     setBrowserStorageGeneration('01900000-0000-7000-8000-000000000001');
     const before = sessionStorageKey(
       'draft',
-      conversationTarget('conv_0190f5fe-7c00-7a00-8000-000000000001'),
+      conversationTarget('0190f5fe-7c00-7a00-8000-000000000001'),
     );
     setBrowserStorageGeneration('01900000-0000-7000-8000-000000000002');
     const after = sessionStorageKey(
       'draft',
-      conversationTarget('conv_0190f5fe-7c00-7a00-8000-000000000001'),
+      conversationTarget('0190f5fe-7c00-7a00-8000-000000000002'),
     );
 
     expect(before).not.toBe(after);
+  });
+
+  test('provides generation-scoped global feature keys without reading old keys', () => {
+    setBrowserStorageGeneration('01900000-0000-7000-8000-000000000003');
+    const key = browserStorageGenerationKey('cron-unread');
+
+    expect(key.includes('|v1|')).toBe(true);
+    expect(key.includes('cron-unread')).toBe(true);
+    expect(key).not.toBe('nomifun_cron_unread');
   });
 
   test('rejects malformed or non-v7 storage generations', () => {

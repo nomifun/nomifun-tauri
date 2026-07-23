@@ -5,8 +5,9 @@
  */
 
 import type { IProvider, TProviderWithModel } from '@/common/config/storage';
+import type { ConfigKeyMap } from '@/common/config/configKeys';
 
-type SavedDefault = { id: string; use_model: string } | undefined;
+type SavedDefault = ConfigKeyMap['nomi.defaultModel'];
 
 /**
  * If `bound` points at a provider/model no longer available, resolve a
@@ -29,9 +30,9 @@ export function resolveHealModel(
   if (!bound?.id) return null;
 
   if (savedDefault) {
-    const dp = providers.find((p) => p.id === savedDefault.id);
-    if (dp && getAvailableModels(dp).includes(savedDefault.use_model)) {
-      return { provider: dp, use_model: savedDefault.use_model };
+    const dp = providers.find((p) => p.id === savedDefault.provider_id);
+    if (dp && getAvailableModels(dp).includes(savedDefault.model)) {
+      return { provider: dp, use_model: savedDefault.model };
     }
   }
   const first = providers[0];

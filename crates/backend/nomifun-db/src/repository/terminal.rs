@@ -4,8 +4,8 @@ use nomifun_common::{TerminalId, UserId};
 
 /// Parameters for creating a terminal session row.
 ///
-/// `id` is a caller-minted canonical `term_<uuid-v7>` key and is returned
-/// on the resulting row; it is not supplied by the caller.
+/// `id` is the caller-minted bare UUIDv7 business key stored as
+/// `terminal_sessions.terminal_id`; SQLite allocates the row's integer `id`.
 #[derive(Debug, Clone)]
 pub struct CreateTerminalParams {
     pub id: TerminalId,
@@ -36,6 +36,11 @@ pub trait ITerminalRepository: Send + Sync {
     /// Returns all sessions for a user, newest first.
     async fn list_by_user(&self, user_id: &str) -> Result<Vec<TerminalSessionRow>, DbError>;
 
+    /// Returns every terminal session. Used only by coordinated application
+    /// shutdown so `delete_all` can still dispatch each session's lifecycle
+    /// hooks after the database transaction commits.
+    async fn list_all(&self) -> Result<Vec<TerminalSessionRow>, DbError>;
+
     /// Updates the run status (and optional exit code) of a session.
     /// Returns `DbError::NotFound` if absent.
     async fn update_status(&self, id: &str, last_status: &str, exit_code: Option<i64>) -> Result<(), DbError>;
@@ -61,8 +66,8 @@ pub trait ITerminalRepository: Send + Sync {
 
     /// Drop the persisted scrollback for a session (idempotent —absent is OK).
     /// Called on relaunch so a fresh process does not show pre-relaunch history
-    /// after a subsequent restart. (Session deletion is handled by the FK
-    /// `ON DELETE CASCADE`, so `delete` needs no extra call.)
+    /// after a subsequent restart. Session deletion performs the same logical
+    /// cleanup explicitly in the repository transaction.
     async fn clear_scrollback(&self, id: &str) -> Result<(), DbError>;
 
     /// Updates the stored terminal dimensions.
@@ -105,6 +110,8 @@ pub trait ITerminalRepository: Send + Sync {
     async fn update_autowork(&self, id: &str, autowork: Option<&str>) -> Result<(), DbError>;
 
     /// Writes (or clears with `None`) the IDMM config JSON blob for a session.
+    /// Implementations validate and logically lock every per-watch
+    /// `bypass_model.provider_id` in the same transaction as the write.
     /// Returns `DbError::NotFound` if absent.
     async fn update_idmm(&self, id: &str, idmm: Option<&str>) -> Result<(), DbError>;
 
@@ -112,14 +119,18 @@ pub trait ITerminalRepository: Send + Sync {
     /// Returns `None` if the column is NULL or the session is not found.
     async fn get_idmm(&self, id: &str) -> Result<Option<String>, DbError>;
 
-    /// Deletes a session row. Returns `DbError::NotFound` if absent.
+    /// Deletes a session row plus repository-owned logical dependents.
+    ///
+    /// `terminal_scrollback` and terminal-scoped knowledge bindings (including
+    /// their junction rows) are removed in the same database transaction.
+    /// Returns `DbError::NotFound` if absent.
     async fn delete(&self, id: &str) -> Result<(), DbError>;
 
-    /// Deletes EVERY terminal session row (whole table). The
-    /// `terminal_scrollback` rows are dropped by the FK `ON DELETE CASCADE`, so
-    /// no second call is needed. Returns the number of rows deleted. Used only on
-    /// real app exit (desktop quit) to wipe the dirty sessions a crashed/closed
-    /// run would otherwise leave behind —never on close-to-tray. A clean exit
-    /// with zero rows is normal and must NOT error.
+    /// Deletes EVERY terminal session row (whole table) and explicitly removes
+    /// all logical `terminal_scrollback` and terminal knowledge-binding
+    /// dependents. Returns the number of rows deleted. Used only on real app
+    /// exit (desktop quit) to wipe the dirty sessions a crashed/closed run
+    /// would otherwise leave behind —never on close-to-tray. A clean exit with
+    /// zero rows is normal and must NOT error.
     async fn delete_all(&self) -> Result<u64, DbError>;
 }

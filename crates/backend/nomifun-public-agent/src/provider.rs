@@ -20,7 +20,8 @@ use crate::service::PublicAgentService;
 impl PublicAgentConfig {
     /// Project the persisted config into the runtime DTO the factory consumes.
     fn to_runtime(&self) -> Option<PublicAgentRuntime> {
-        let provider_id = self.model.provider_id.as_ref()?.to_string();
+        let model = self.model.as_ref()?;
+        let provider_id = model.provider_id.to_string();
         Some(PublicAgentRuntime {
             name: self.name.clone(),
             greeting: self.greeting.clone(),
@@ -35,8 +36,8 @@ impl PublicAgentConfig {
             knowledge_base_ids: self.knowledge_base_ids.clone(),
             model: ProviderWithModel {
                 provider_id,
-                model: self.model.model.clone(),
-                use_model: self.model.use_model.clone(),
+                model: model.model.clone(),
+                use_model: None,
             },
         })
     }
@@ -44,21 +45,28 @@ impl PublicAgentConfig {
 
 #[async_trait]
 impl PublicAgentProvider for PublicAgentService {
-    async fn resolve_public_agent(&self, id: &str) -> Option<PublicAgentRuntime> {
+    async fn resolve_public_agent(
+        &self,
+        public_agent_id: &str,
+    ) -> Option<PublicAgentRuntime> {
         // A disabled agent still resolves (so the owner can preview it); the
         // channel layer decides whether to serve. Unknown id → None.
-        self.get(id).await.ok().and_then(|cfg| cfg.to_runtime())
+        self.get(public_agent_id)
+            .await
+            .ok()
+            .and_then(|cfg| cfg.to_runtime())
     }
 
     async fn record_public_agent_turn(
         &self,
-        id: &str,
+        public_agent_id: &str,
         surface: &str,
         platform: Option<&str>,
         text: &str,
     ) {
         // Best-effort audit (never fails the turn).
-        self.record_turn(id, surface, platform, text).await;
+        self.record_turn(public_agent_id, surface, platform, text)
+            .await;
     }
 }
 
@@ -76,27 +84,36 @@ mod tests {
         let second_kb = KnowledgeBaseId::new();
         let provider_id = ProviderId::new();
         svc.patch(
-            a.id.as_str(),
+            a.public_agent_id.as_str(),
             serde_json::json!({
                 "greeting": "您好",
                 "grounded_mode": true,
                 "knowledge_base_ids": [first_kb, second_kb],
-                "model": { "provider_id": provider_id, "model": "m", "use_model": "m-2" }
+                "model": { "provider_id": provider_id, "model": "m" }
             }),
         )
         .await
         .unwrap();
 
-        let rt = PublicAgentProvider::resolve_public_agent(&*svc, a.id.as_str()).await.unwrap();
+        let rt = PublicAgentProvider::resolve_public_agent(
+            &*svc,
+            a.public_agent_id.as_str(),
+        )
+        .await
+        .unwrap();
         assert_eq!(rt.name, "客服台");
         assert_eq!(rt.greeting, "您好");
         assert!(rt.grounded_mode);
         assert_eq!(rt.knowledge_base_ids, vec![first_kb, second_kb]);
         assert_eq!(rt.model.provider_id, provider_id.to_string());
-        assert_eq!(rt.model.use_model.as_deref(), Some("m-2"));
+        assert_eq!(rt.model.use_model, None);
 
         // Unknown id → None.
-        assert!(PublicAgentProvider::resolve_public_agent(&*svc, "pubagent_nope").await.is_none());
+        assert!(
+            PublicAgentProvider::resolve_public_agent(&*svc, "not-a-public-agent-id")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -105,7 +122,10 @@ mod tests {
         let svc = PublicAgentService::start(d.path());
         let agent = svc.create("未配置").await.unwrap();
         assert!(
-            PublicAgentProvider::resolve_public_agent(&*svc, agent.id.as_str())
+            PublicAgentProvider::resolve_public_agent(
+                &*svc,
+                agent.public_agent_id.as_str(),
+            )
                 .await
                 .is_none()
         );

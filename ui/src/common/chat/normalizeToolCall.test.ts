@@ -7,7 +7,7 @@ import {
   normalizeToolGroup,
 } from './normalizeToolCall';
 
-const CONVERSATION_ID = parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000001');
+const CONVERSATION_ID = parseConversationId('0190f5fe-7c00-7a00-8000-000000000001');
 
 describe('normalizeToolCall', () => {
   it('ignores tool_call messages without call_id', () => {

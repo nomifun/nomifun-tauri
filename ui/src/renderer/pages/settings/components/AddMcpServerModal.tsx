@@ -9,9 +9,9 @@ interface AddMcpServerModalProps {
   server?: IMcpServer;
   existingServerNames?: string[];
   onCancel: () => void;
-  onSubmit: (server: Omit<IMcpServer, 'id' | 'created_at' | 'updated_at'>) => Promise<void> | void;
+  onSubmit: (server: Omit<IMcpServer, 'mcp_server_id' | 'created_at' | 'updated_at'>) => Promise<void> | void;
   onBatchImport?: (
-    servers: Omit<IMcpServer, 'id' | 'created_at' | 'updated_at'>[]
+    servers: Omit<IMcpServer, 'mcp_server_id' | 'created_at' | 'updated_at'>[]
   ) => Promise<IMcpServer[] | void> | IMcpServer[] | void;
   importMode?: 'json' | 'oneclick';
 }

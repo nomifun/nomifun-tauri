@@ -390,7 +390,7 @@ export const useAcpModelInfo = ({
       void (async () => {
         try {
           await prepareRuntime?.();
-          await ipcBridge.acpConversation.setModel.invoke({ conversation_id, model_id });
+          await ipcBridge.acpConversation.setModel.invoke({ conversation_id, model: model_id });
         } catch (error) {
           hasUserChangedModel.current = false;
           logAcpModelInfo('select_model_failed', {
@@ -447,7 +447,7 @@ export const useAcpModelInfo = ({
           void savePreferredModelId(backend, model_id);
         }
         await ipcBridge.conversation.update.invoke({
-          id: conversation_id,
+          conversation_id: conversation_id,
           updates: { extra: { current_model_id: model_id } as TChatConversation['extra'] },
           merge_extra: true,
         });

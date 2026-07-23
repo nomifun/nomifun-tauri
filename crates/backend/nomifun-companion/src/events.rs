@@ -60,7 +60,7 @@ impl CompanionEventEmitter {
     /// A suggestion was accepted/dismissed. Lets every open surface (panel,
     /// desktop bubble, console) drop the now-decided card live instead of
     /// leaving a stale `new` snapshot that 404s on the next decide. Payload is
-    /// the decided suggestion (carries `id` + new `status`).
+    /// the decided suggestion (carries `suggestion_id` + new `status`).
     pub fn emit_suggestion_decided(&self, suggestion: &crate::store::CompanionSuggestion) {
         self.broadcast("companion.suggestion-decided", suggestion);
     }
@@ -77,9 +77,9 @@ impl CompanionEventEmitter {
         self.broadcast("companion.mood-changed", &serde_json::json!({ "companion_id": companion_id, "mood": mood }));
     }
 
-    /// Shared (cross-companion) config changed. Same event name the legacy single
-    /// config used; the payload carries `"scope": "shared"` so listeners can
-    /// tell it apart from per-companion profile updates.
+    /// Shared (cross-companion) config changed. The payload carries
+    /// `"scope": "shared"` so listeners can distinguish it from per-companion
+    /// profile updates.
     pub fn emit_shared_config_updated(&self, config: &crate::profile::SharedCompanionConfig) {
         let mut payload = match serde_json::to_value(config) {
             Ok(serde_json::Value::Object(map)) => map,
@@ -104,11 +104,9 @@ impl CompanionEventEmitter {
 
     pub fn emit_companion_created(&self, profile: &crate::profile::CompanionProfileConfig) {
         // Wire shape matches the frontend ICompanionCreatedEvent { companion_id, profile }.
-        // The raw profile carries `id` but no `companion_id`, so useCompanions.refreshOne
-        // (which reads evt.companion_id) silently no-op'd on the incremental roster add.
         self.broadcast(
             "companion.created",
-            &serde_json::json!({ "companion_id": profile.id.clone(), "profile": profile }),
+            &serde_json::json!({ "companion_id": profile.companion_id.clone(), "profile": profile }),
         );
     }
 
@@ -129,33 +127,63 @@ impl CompanionEventEmitter {
         self.broadcast("companion.memory-updated", memory);
     }
 
-    /// A memory was hard-deleted. Payload carries the `id` so listeners can drop
+    /// A memory was hard-deleted. Payload carries the `memory_id` so listeners can drop
     /// the row without a refetch.
-    pub fn emit_memory_deleted(&self, id: &str) {
-        self.broadcast("companion.memory-deleted", &serde_json::json!({ "id": id }));
+    pub fn emit_memory_deleted(&self, memory_id: &str) {
+        self.broadcast(
+            "companion.memory-deleted",
+            &serde_json::json!({ "memory_id": memory_id }),
+        );
     }
 
     /// A skill draft was auto-generated and is awaiting review.
-    pub fn emit_skill_drafted(&self, companion_id: &str, skill_name: &str) {
+    pub fn emit_skill_drafted(
+        &self,
+        companion_id: &str,
+        companion_skill_id: &str,
+        skill_name: &str,
+    ) {
         self.broadcast(
             "companion.skill-drafted",
-            &serde_json::json!({ "companion_id": companion_id, "skill_name": skill_name }),
+            &serde_json::json!({
+                "companion_id": companion_id,
+                "companion_skill_id": companion_skill_id,
+                "skill_name": skill_name
+            }),
         );
     }
 
     /// A skill was accepted/activated — the companion just "learned" it.
-    pub fn emit_skill_learned(&self, companion_id: &str, skill_name: &str) {
+    pub fn emit_skill_learned(
+        &self,
+        companion_id: &str,
+        companion_skill_id: &str,
+        skill_name: &str,
+    ) {
         self.broadcast(
             "companion.skill-learned",
-            &serde_json::json!({ "companion_id": companion_id, "skill_name": skill_name }),
+            &serde_json::json!({
+                "companion_id": companion_id,
+                "companion_skill_id": companion_skill_id,
+                "skill_name": skill_name
+            }),
         );
     }
 
     /// A skill was auto-archived by the decay pass (unused too long).
-    pub fn emit_skill_archived(&self, companion_id: &str, skill_name: &str) {
+    pub fn emit_skill_archived(
+        &self,
+        companion_id: &str,
+        companion_skill_id: &str,
+        skill_name: &str,
+    ) {
         self.broadcast(
             "companion.skill-archived",
-            &serde_json::json!({ "companion_id": companion_id, "skill_name": skill_name }),
+            &serde_json::json!({
+                "companion_id": companion_id,
+                "companion_skill_id": companion_skill_id,
+                "skill_name": skill_name
+            }),
         );
     }
 }

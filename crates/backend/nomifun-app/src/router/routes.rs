@@ -257,14 +257,18 @@ pub async fn create_router(services: &AppServices) -> Router {
                 .list_companions()
                 .await
                 .into_iter()
-                .map(|c| c.id)
+                .map(|c| c.companion_id)
                 .filter(|id| !id.is_empty())
                 .collect();
             let live_public_agents: std::collections::HashSet<String> = public_agent_service
                 .list()
                 .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "reconcile_orphaned_owners: public-agent roster unavailable");
+                    Vec::new()
+                })
                 .into_iter()
-                .map(|a| a.id.into_string())
+                .map(|a| a.public_agent_id.into_string())
                 .collect();
             // Safety valve: never mass-unbind on an ambiguous "no owners at all"
             // signal (e.g. a roster that failed to load). If the user genuinely
@@ -742,8 +746,8 @@ pub fn create_router_with_all_state(
     // 创意工坊 asset/thumbnail serving — exempt from auth for the same reason as
     // companion figure images: `<img>`/`<video>` subresource loads can't carry
     // the local-trust header, so an authenticated route would 403 every asset
-    // preview and canvas gallery thumbnail. GET-only, opaque unguessable ids
-    // (`wsa_`/`wsc_` + uuidv7); listing/upload/mutation stay authenticated.
+    // preview and canvas gallery thumbnail. GET-only, opaque bare UUIDv7 asset
+    // and canvas ids; listing/upload/mutation stay authenticated.
     let workshop_public = workshop_public_routes(states.workshop);
 
     // WebSocket upgrade route — exempt from CSRF (no cookie-based
@@ -760,11 +764,8 @@ pub fn create_router_with_all_state(
     // 仅 browser-use 构建(需 CDP 引擎);面向桌面(headful 需显示器)。auth 中间件保护(与其它诊断端点同)。
     #[cfg(feature = "browser-use")]
     let browser_login_authenticated = {
-        let browser_data_dir = nomi_config::config::app_config_dir()
-            .map(|d| d.join("browser-data"))
-            .unwrap_or_else(|| std::env::temp_dir().join("nomifun-browser-data"));
         let login_state = crate::router::browser_login::BrowserLoginState::new(
-            browser_data_dir,
+            services.data_dir.clone(),
             crate::commands::bundled_chrome_dir(),
             services.encryption_key,
         );

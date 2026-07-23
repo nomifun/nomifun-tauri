@@ -101,7 +101,7 @@ impl AcpSessionSyncService {
     /// the first prompt.
     pub async fn load_session_id(&self, conversation_id: &str) -> Option<String> {
         match self.repo.get(conversation_id).await {
-            Ok(Some(row)) => row.session_id,
+            Ok(Some(row)) => row.acp_session_id,
             Ok(None) => None,
             Err(err) => {
                 warn!(
@@ -278,14 +278,13 @@ mod tests {
     async fn setup() -> (Arc<AcpSessionSyncService>, Arc<dyn IAcpSessionRepository>) {
         let db = init_database_memory().await.unwrap();
         let installation_owner = nomifun_db::installation_owner_id(db.pool()).await.unwrap();
-        // Satisfy the `acp_session.conversation_id` FK (REFERENCES
-        // conversations(id) ON DELETE CASCADE) before create() inserts the
+        // Seed the logical conversation target before create() inserts the
         // session row. The dynamically resolved installation owner satisfies
-        // conversations.user_id; `agent_builtin_claude` is likewise seeded and
-        // satisfies acp_session.agent_id.
+        // the test's owner-scoping checks. The session linkage is resolved
+        // logically and cleanup is repository-owned.
         sqlx::query(
-            "INSERT INTO conversations (id, user_id, name, type, status, created_at, updated_at) \
-             VALUES ('conv_0190f5fe-7c00-7a00-8000-000000000001', ?, 'c', 'normal', 'pending', 1, 1)",
+            "INSERT INTO conversations (conversation_id, user_id, name, type, status, created_at, updated_at) \
+             VALUES ('0190f5fe-7c00-7a00-8000-000000000001', ?, 'c', 'normal', 'pending', 1, 1)",
         )
         .bind(&installation_owner)
         .execute(db.pool())
@@ -293,10 +292,10 @@ mod tests {
         .unwrap();
         let repo: Arc<dyn IAcpSessionRepository> = Arc::new(SqliteAcpSessionRepository::new(db.pool().clone()));
         repo.create(&CreateAcpSessionParams {
-            conversation_id: "conv_0190f5fe-7c00-7a00-8000-000000000001",
+            conversation_id: "0190f5fe-7c00-7a00-8000-000000000001",
             agent_backend: "claude",
             agent_source: "builtin",
-            agent_id: "agent_builtin_claude",
+            agent_id: "0190f5fe-7c00-7a00-8000-000000000101",
         })
         .await
         .unwrap();
@@ -308,7 +307,7 @@ mod tests {
     async fn load_persisted_round_trips() {
         let (svc, repo) = setup().await;
         repo.save_runtime_state(
-            "conv_0190f5fe-7c00-7a00-8000-000000000001",
+            "0190f5fe-7c00-7a00-8000-000000000001",
             &SaveRuntimeStateParams {
                 current_mode_id: Some(Some("plan")),
                 ..Default::default()
@@ -317,7 +316,7 @@ mod tests {
         .await
         .unwrap();
 
-        let state = svc.load_persisted("conv_0190f5fe-7c00-7a00-8000-000000000001").await.unwrap();
+        let state = svc.load_persisted("0190f5fe-7c00-7a00-8000-000000000001").await.unwrap();
         assert_eq!(state.current_mode_id.as_deref(), Some("plan"));
     }
 
@@ -327,7 +326,7 @@ mod tests {
         let (_svc, repo) = setup().await;
         let (tx, rx) = mpsc::channel(64);
 
-        let cid = "conv_0190f5fe-7c00-7a00-8000-000000000001".to_owned();
+        let cid = "0190f5fe-7c00-7a00-8000-000000000001".to_owned();
         tokio::spawn(domain_event_consumer(cid, rx, repo.clone()));
 
         tx.send(AcpSessionEvent::ObservedModeSynced { mode: "plan".into() })
@@ -335,11 +334,11 @@ mod tests {
             .unwrap();
 
         sleep(Duration::from_millis(200)).await;
-        let state = repo.load_runtime_state(&"conv_0190f5fe-7c00-7a00-8000-000000000001").await.unwrap().unwrap();
+        let state = repo.load_runtime_state(&"0190f5fe-7c00-7a00-8000-000000000001").await.unwrap().unwrap();
         assert!(state.current_mode_id.is_none(), "debounce not yet elapsed");
 
         sleep(Duration::from_millis(400)).await;
-        let state = repo.load_runtime_state(&"conv_0190f5fe-7c00-7a00-8000-000000000001").await.unwrap().unwrap();
+        let state = repo.load_runtime_state(&"0190f5fe-7c00-7a00-8000-000000000001").await.unwrap().unwrap();
         assert_eq!(state.current_mode_id.as_deref(), Some("plan"));
     }
 
@@ -349,7 +348,7 @@ mod tests {
         let (_svc, repo) = setup().await;
         let (tx, rx) = mpsc::channel(64);
 
-        let cid = "conv_0190f5fe-7c00-7a00-8000-000000000001".to_owned();
+        let cid = "0190f5fe-7c00-7a00-8000-000000000001".to_owned();
         tokio::spawn(domain_event_consumer(cid, rx, repo.clone()));
 
         for label in ["code", "plan", "ask"] {
@@ -360,7 +359,7 @@ mod tests {
         }
         sleep(Duration::from_millis(600)).await;
 
-        let state = repo.load_runtime_state(&"conv_0190f5fe-7c00-7a00-8000-000000000001").await.unwrap().unwrap();
+        let state = repo.load_runtime_state(&"0190f5fe-7c00-7a00-8000-000000000001").await.unwrap().unwrap();
         assert_eq!(state.current_mode_id.as_deref(), Some("ask"));
     }
 
@@ -370,13 +369,13 @@ mod tests {
         let (_svc, repo) = setup().await;
         let (tx, rx) = mpsc::channel(64);
 
-        let cid = "conv_0190f5fe-7c00-7a00-8000-000000000001".to_owned();
+        let cid = "0190f5fe-7c00-7a00-8000-000000000001".to_owned();
         tokio::spawn(domain_event_consumer(cid, rx, repo.clone()));
 
         tx.send(AcpSessionEvent::SessionOpened).await.unwrap();
         sleep(Duration::from_millis(600)).await;
 
-        let state = repo.load_runtime_state(&"conv_0190f5fe-7c00-7a00-8000-000000000001").await.unwrap().unwrap();
+        let state = repo.load_runtime_state(&"0190f5fe-7c00-7a00-8000-000000000001").await.unwrap().unwrap();
         assert!(state.current_mode_id.is_none());
     }
 
@@ -386,7 +385,7 @@ mod tests {
         let (_svc, repo) = setup().await;
         let (tx, rx) = mpsc::channel(64);
 
-        let cid = "conv_0190f5fe-7c00-7a00-8000-000000000001".to_owned();
+        let cid = "0190f5fe-7c00-7a00-8000-000000000001".to_owned();
         tokio::spawn(domain_event_consumer(cid, rx, repo.clone()));
 
         tx.send(AcpSessionEvent::ObservedModeSynced { mode: "plan".into() })
@@ -395,7 +394,7 @@ mod tests {
         drop(tx);
         sleep(Duration::from_millis(50)).await;
 
-        let state = repo.load_runtime_state(&"conv_0190f5fe-7c00-7a00-8000-000000000001").await.unwrap().unwrap();
+        let state = repo.load_runtime_state(&"0190f5fe-7c00-7a00-8000-000000000001").await.unwrap().unwrap();
         assert_eq!(
             state.current_mode_id.as_deref(),
             Some("plan"),
@@ -412,7 +411,7 @@ mod tests {
         let (_svc, repo) = setup().await;
         let (tx, rx) = mpsc::channel(64);
 
-        let cid = "conv_0190f5fe-7c00-7a00-8000-000000000001".to_owned();
+        let cid = "0190f5fe-7c00-7a00-8000-000000000001".to_owned();
         tokio::spawn(domain_event_consumer(cid, rx, repo.clone()));
 
         tx.send(AcpSessionEvent::ObservedModelSynced {
@@ -422,7 +421,7 @@ mod tests {
         .unwrap();
 
         sleep(Duration::from_millis(700)).await;
-        let state = repo.load_runtime_state(&"conv_0190f5fe-7c00-7a00-8000-000000000001").await.unwrap().unwrap();
+        let state = repo.load_runtime_state(&"0190f5fe-7c00-7a00-8000-000000000001").await.unwrap().unwrap();
         assert_eq!(state.current_model_id.as_deref(), Some("claude-opus-4"));
     }
 
@@ -431,7 +430,7 @@ mod tests {
         let (_svc, repo) = setup().await;
         let (tx, rx) = mpsc::channel(64);
 
-        let cid = "conv_0190f5fe-7c00-7a00-8000-000000000001".to_owned();
+        let cid = "0190f5fe-7c00-7a00-8000-000000000001".to_owned();
         tokio::spawn(domain_event_consumer(cid, rx, repo.clone()));
 
         tx.send(AcpSessionEvent::DesiredModelChanged {
@@ -441,7 +440,7 @@ mod tests {
         .unwrap();
 
         sleep(Duration::from_millis(700)).await;
-        let state = repo.load_runtime_state(&"conv_0190f5fe-7c00-7a00-8000-000000000001").await.unwrap().unwrap();
+        let state = repo.load_runtime_state(&"0190f5fe-7c00-7a00-8000-000000000001").await.unwrap().unwrap();
         assert!(
             state.current_model_id.is_none(),
             "DesiredModelChanged is reconcile/UI-only; persistence only follows Observed*",
@@ -456,7 +455,7 @@ mod tests {
         let (_svc, repo) = setup().await;
         let (tx, rx) = mpsc::channel(64);
 
-        let cid = "conv_0190f5fe-7c00-7a00-8000-000000000001".to_owned();
+        let cid = "0190f5fe-7c00-7a00-8000-000000000001".to_owned();
         tokio::spawn(domain_event_consumer(cid, rx, repo.clone()));
 
         tx.send(AcpSessionEvent::ObservedContextUsageChanged {
@@ -466,7 +465,7 @@ mod tests {
         .unwrap();
 
         sleep(Duration::from_millis(700)).await;
-        let state = repo.load_runtime_state(&"conv_0190f5fe-7c00-7a00-8000-000000000001").await.unwrap().unwrap();
+        let state = repo.load_runtime_state(&"0190f5fe-7c00-7a00-8000-000000000001").await.unwrap().unwrap();
         let raw = state.context_usage_json.expect("usage must be persisted");
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed["used"], 12345);
@@ -480,7 +479,7 @@ mod tests {
         let (_svc, repo) = setup().await;
         let (tx, rx) = mpsc::channel(64);
 
-        let cid = "conv_0190f5fe-7c00-7a00-8000-000000000001".to_owned();
+        let cid = "0190f5fe-7c00-7a00-8000-000000000001".to_owned();
         tokio::spawn(domain_event_consumer(cid, rx, repo.clone()));
 
         tx.send(AcpSessionEvent::SessionAssigned {
@@ -492,7 +491,7 @@ mod tests {
         // Well under the debounce window —the event must have already
         // been written.
         sleep(Duration::from_millis(100)).await;
-        let row = repo.get(&"conv_0190f5fe-7c00-7a00-8000-000000000001").await.unwrap().unwrap();
-        assert_eq!(row.session_id.as_deref(), Some("sess-42"));
+        let row = repo.get(&"0190f5fe-7c00-7a00-8000-000000000001").await.unwrap().unwrap();
+        assert_eq!(row.acp_session_id.as_deref(), Some("sess-42"));
     }
 }

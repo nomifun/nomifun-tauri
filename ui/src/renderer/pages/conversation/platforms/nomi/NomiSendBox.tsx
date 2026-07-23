@@ -7,7 +7,7 @@
 import { conversationTarget, type ConversationId, type MessageId } from '@/common/types/ids';
 import { sessionStorageKey } from '@/common/utils/browserStorageKey';
 import { ipcBridge } from '@/common';
-import type { IConversationMcpStatus } from '@/common/config/storage';
+import { uuid } from '@/common/utils';
 import AgentModeSelector from '@/renderer/components/agent/AgentModeSelector';
 import CommandQueuePanel from '@/renderer/components/chat/CommandQueuePanel';
 import MobileActionSheet, {
@@ -142,13 +142,7 @@ const NomiSendBox: React.FC<{
   const isMobile = Boolean(layout?.isMobile);
   const conversationContext = useConversationContextSafe();
   const loadedSkills = conversationContext?.loadedSkills ?? [];
-  const loadedMcpStatuses =
-    conversationContext?.loadedMcpStatuses ??
-    (conversationContext?.loadedMcpServers ?? []).map<IConversationMcpStatus>((name) => ({
-      id: `legacy:${name}`,
-      name,
-      status: 'loaded',
-    }));
+  const loadedMcpStatuses = conversationContext?.loadedMcpStatuses ?? [];
   const { t } = useTranslation();
   const providerLabel = useModelSelectorProviderLabel();
   const { checkAndUpdateTitle } = useAutoTitle();
@@ -290,7 +284,7 @@ const NomiSendBox: React.FC<{
         // by msg_id — this prevents a duplicate bubble if useMessageLstCache
         // already inserted the DB row for this same msg_id.
         addOrUpdateMessage({
-          id: msg_id,
+          id: uuid(),
           msg_id,
           type: 'text',
           position: 'right',
@@ -439,7 +433,7 @@ const NomiSendBox: React.FC<{
         markTurnAccepted();
         // 乐观插入新用户气泡（compose 模式按 msg_id 去重，避免 DB 行重复）。
         addOrUpdateMessage({
-          id: res.msg_id,
+          id: uuid(),
           msg_id: res.msg_id,
           type: 'text',
           position: 'right',
@@ -495,7 +489,7 @@ const NomiSendBox: React.FC<{
         msg_id = res.msg_id;
         setActiveMsgId(msg_id);
         addOrUpdateMessage({
-          id: msg_id,
+          id: uuid(),
           msg_id,
           type: 'text',
           position: 'right',

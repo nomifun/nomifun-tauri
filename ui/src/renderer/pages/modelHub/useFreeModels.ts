@@ -112,7 +112,9 @@ export const useFreeModels = () => {
 
   const setModelEnabled = useCallback(
     (id: string, enabled: boolean) =>
-      runAction(`model:${id}`, () => ipcBridge.managedModelService.free.setModelEnabled.invoke({ id, enabled })),
+      runAction(`model:${id}`, () =>
+        ipcBridge.managedModelService.free.setModelEnabled.invoke({ model_id: id, enabled })
+      ),
     [runAction]
   );
 
@@ -152,7 +154,7 @@ export const useFreeModels = () => {
       healthCheckPendingRef.current = id;
       setHealthCheckPending(id);
       try {
-        const result = await ipcBridge.managedModelService.free.checkModelHealth.invoke({ id });
+        const result = await ipcBridge.managedModelService.free.checkModelHealth.invoke({ model_id: id });
         installHealthResults([result]);
         return result;
       } finally {

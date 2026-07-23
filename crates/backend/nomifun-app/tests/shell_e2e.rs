@@ -108,9 +108,9 @@ async fn create_provider(
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let body = body_json(resp).await;
-    body["data"]["id"]
+    body["data"]["provider_id"]
         .as_str()
-        .expect("created provider has a canonical id")
+        .expect("created provider has a canonical provider_id")
         .to_owned()
 }
 

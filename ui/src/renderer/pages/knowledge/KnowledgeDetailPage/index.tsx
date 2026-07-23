@@ -221,7 +221,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({ base, allTags, createTag, onR
     setSaving(true);
     try {
       await ipcBridge.knowledge.updateBase.invoke({
-        id: base.id,
+        knowledge_base_id: base.knowledge_base_id,
         name: editName.trim() || base.name,
         description: editDesc,
         tags: editTags,
@@ -242,7 +242,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({ base, allTags, createTag, onR
     if (sourceLoading) return;
     setSourceLoading(true);
     try {
-      const summary = await ipcBridge.knowledge.refreshSource.invoke({ id: base.id });
+      const summary = await ipcBridge.knowledge.refreshSource.invoke({ knowledge_base_id: base.knowledge_base_id });
       notifySourceFetchResult(t, summary, t('knowledge.source.refreshOk', { defaultValue: '刷新完成，获取 {{fetched}} 条', fetched: summary.fetched }));
       onRefresh();
     } catch (e) {
@@ -256,7 +256,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({ base, allTags, createTag, onR
     if (sourceLoading) return;
     setSourceLoading(true);
     try {
-      const summary = await ipcBridge.knowledge.syncSource.invoke({ id: base.id });
+      const summary = await ipcBridge.knowledge.syncSource.invoke({ knowledge_base_id: base.knowledge_base_id });
       notifySourceFetchResult(t, summary, t('knowledge.source.syncOk', { defaultValue: '同步完成，获取 {{fetched}} 条', fetched: summary.fetched }));
       onRefresh();
     } catch (e) {
@@ -277,7 +277,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({ base, allTags, createTag, onR
     setExporting(true);
     try {
       const { dest_path } = await ipcBridge.knowledge.exportBase.invoke({
-        id: base.id,
+        knowledge_base_id: base.knowledge_base_id,
         dest_path: destDir,
       });
       Message.success(t('knowledge.detail.settings.exportOk', { defaultValue: '已导出至 {{path}}', path: dest_path }));
@@ -296,7 +296,7 @@ const SettingsTab: React.FC<SettingsTabProps> = ({ base, allTags, createTag, onR
   const handleDelete = async () => {
     setDeleting(true);
     try {
-      await ipcBridge.knowledge.deleteBase.invoke({ id: base.id, purge });
+      await ipcBridge.knowledge.deleteBase.invoke({ knowledge_base_id: base.knowledge_base_id, purge });
       Message.success(t('knowledge.detail.settings.deleteOk', { defaultValue: '已删除' }));
       navigate('/knowledge');
     } catch (e) {
@@ -600,7 +600,7 @@ const KnowledgeDetailPage: React.FC = () => {
     setFileLoading(true);
     setEditMode(false);
     ipcBridge.knowledge.readFile
-      .invoke({ id, path: selectedPath })
+      .invoke({ knowledge_base_id: id, path: selectedPath })
       .then((res) => {
         if (!cancelled) setContent(res.content);
       })
@@ -624,7 +624,7 @@ const KnowledgeDetailPage: React.FC = () => {
     if (!id || !selectedPath) return;
     setSaving(true);
     try {
-      await ipcBridge.knowledge.writeFile.invoke({ id, path: selectedPath, content: draft });
+      await ipcBridge.knowledge.writeFile.invoke({ knowledge_base_id: id, path: selectedPath, content: draft });
       setContent(draft);
       setEditMode(false);
       Message.success(t('knowledge.actions.saveOk'));
@@ -639,7 +639,7 @@ const KnowledgeDetailPage: React.FC = () => {
   const handleLoadTreeChildren = useCallback(
     async (node: IKnowledgeTreeEntry) => {
       if (!id || node.is_file || isTreeSearch) return;
-      const children = await ipcBridge.knowledge.listTree.invoke({ id, path: node.rel_path });
+      const children = await ipcBridge.knowledge.listTree.invoke({ knowledge_base_id: id, path: node.rel_path });
       setTreeData((prev) => mergeKnowledgeTreeChildren(prev, node.rel_path, children));
     },
     [id, isTreeSearch]
@@ -648,12 +648,12 @@ const KnowledgeDetailPage: React.FC = () => {
   const reloadTreePath = useCallback(
     async (folderPath: string) => {
       if (!id) return;
-      const rootChildren = await ipcBridge.knowledge.listTree.invoke({ id });
+      const rootChildren = await ipcBridge.knowledge.listTree.invoke({ knowledge_base_id: id });
       setTreeData(rootChildren);
 
       const branchesToReload = knowledgeFolderPathChain(folderPath);
       for (const branchPath of branchesToReload) {
-        const children = await ipcBridge.knowledge.listTree.invoke({ id, path: branchPath });
+        const children = await ipcBridge.knowledge.listTree.invoke({ knowledge_base_id: id, path: branchPath });
         setTreeData((prev) => mergeKnowledgeTreeChildren(prev, branchPath, children));
       }
       if (branchesToReload.length > 0) {
@@ -689,7 +689,7 @@ const KnowledgeDetailPage: React.FC = () => {
     const parent = parentDirOfKnowledgePath(path);
     const fileTitle = path.split('/').filter(Boolean).at(-1)?.replace(/\.md$/i, '') || path.replace(/\.md$/i, '');
     try {
-      await ipcBridge.knowledge.writeFile.invoke({ id, path, content: `# ${fileTitle}\n` });
+      await ipcBridge.knowledge.writeFile.invoke({ knowledge_base_id: id, path, content: `# ${fileTitle}\n` });
       setNewFileVisible(false);
       setNewFilePath('');
       await refresh();
@@ -709,7 +709,7 @@ const KnowledgeDetailPage: React.FC = () => {
     if (!path) return;
     const parent = parentDirOfKnowledgePath(path);
     try {
-      await ipcBridge.knowledge.createFolder.invoke({ id, path });
+      await ipcBridge.knowledge.createFolder.invoke({ knowledge_base_id: id, path });
       setNewFolderVisible(false);
       setNewFolderPath('');
       setFileSearch('');
@@ -730,7 +730,7 @@ const KnowledgeDetailPage: React.FC = () => {
     const oldPath = renameTarget.rel_path;
     const parent = parentDirOfKnowledgePath(oldPath);
     try {
-      const renamed = await ipcBridge.knowledge.renameTreeEntry.invoke({ id, path: oldPath, newName });
+      const renamed = await ipcBridge.knowledge.renameTreeEntry.invoke({ knowledge_base_id: id, path: oldPath, newName });
       setRenameVisible(false);
       setRenameTarget(null);
       setRenameName('');
@@ -753,7 +753,7 @@ const KnowledgeDetailPage: React.FC = () => {
     if (!id) return;
     const parent = parentDirOfKnowledgePath(path);
     try {
-      await ipcBridge.knowledge.deleteFile.invoke({ id, path });
+      await ipcBridge.knowledge.deleteFile.invoke({ knowledge_base_id: id, path });
       Message.success(t('knowledge.actions.deleteOk'));
       if (selectedPath === path) {
         setSelectedPath(null);
@@ -770,7 +770,7 @@ const KnowledgeDetailPage: React.FC = () => {
     if (!id) return;
     const parent = parentDirOfKnowledgePath(path);
     try {
-      await ipcBridge.knowledge.deleteFolder.invoke({ id, path });
+      await ipcBridge.knowledge.deleteFolder.invoke({ knowledge_base_id: id, path });
       Message.success(t('knowledge.actions.deleteFolderOk', { defaultValue: '目录已删除' }));
       setFileSearch('');
       setExpandedTreeKeys((prev) => prev.filter((key) => !isKnowledgePathWithin(key, path)));
@@ -855,7 +855,7 @@ const KnowledgeDetailPage: React.FC = () => {
     if (!id || autogenLoading) return;
     setAutogenLoading(true);
     try {
-      const res = await ipcBridge.knowledge.autogenBase.invoke({ id, ...(modelChoice ?? {}) });
+      const res = await ipcBridge.knowledge.autogenBase.invoke({ knowledge_base_id: id, ...(modelChoice ?? {}) });
       Message.success(
         t(res.readme_written ? 'knowledge.actions.autogenOkReadme' : 'knowledge.actions.autogenOkNoReadme')
       );
@@ -871,7 +871,7 @@ const KnowledgeDetailPage: React.FC = () => {
     if (!id || refreshingSource) return;
     setRefreshingSource(true);
     try {
-      const summary = await ipcBridge.knowledge.refreshSource.invoke({ id });
+      const summary = await ipcBridge.knowledge.refreshSource.invoke({ knowledge_base_id: id });
       notifySourceFetchResult(t, summary, t('knowledge.source.refreshOk', { fetched: summary.fetched }));
       void refresh();
     } catch (e) {
@@ -1361,7 +1361,7 @@ const KnowledgeDetailPage: React.FC = () => {
           >
             <div className='pt-16px'>
               {base && (inboxLoading || inboxItems.length > 0) ? (
-                <InboxReviewPanel baseId={base.id} items={inboxItems} loading={inboxLoading} onChanged={handleInboxChanged} />
+                <InboxReviewPanel baseId={base.knowledge_base_id} items={inboxItems} loading={inboxLoading} onChanged={handleInboxChanged} />
               ) : (
                 <Empty description={t('knowledge.detail.inboxEmpty', { defaultValue: '暂无待审内容' })} />
               )}
@@ -1432,7 +1432,7 @@ const KnowledgeDetailPage: React.FC = () => {
                     </span>
                   </div>
                 </div>
-                {base ? <KnowledgeConsumersSection baseId={base.id} /> : null}
+                {base ? <KnowledgeConsumersSection baseId={base.knowledge_base_id} /> : null}
               </div>
 
               {/* ── Writeback explanation (honest: per-binding, no fake global toggle) ── */}

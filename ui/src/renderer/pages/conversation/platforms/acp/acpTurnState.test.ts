@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { parseMessageId } from '@/common/types/ids';
 
 import {
   acpTurnReducer,
@@ -7,6 +8,9 @@ import {
   type AcpTurnEvent,
   type AcpTurnState,
 } from './acpTurnState';
+
+const STARTED_TURN_ID = parseMessageId('0190f5fe-7c00-7a00-8000-000000000001');
+const STOPPED_TURN_ID = parseMessageId('0190f5fe-7c00-7a00-8000-000000000002');
 
 function run(events: AcpTurnEvent[], from: AcpTurnState = initialAcpTurnState): AcpTurnState {
   return events.reduce(acpTurnReducer, from);
@@ -33,19 +37,19 @@ describe('acpTurnReducer - turn busy lifecycle', () => {
   test('turnStarted raises authoritative backend state and keeps backend timestamp', () => {
     const s = acpTurnReducer(initialAcpTurnState, {
       type: 'turnStarted',
-      turnId: 'msg_1',
+      turnId: STARTED_TURN_ID,
       processingStartedAt: 456,
     });
 
     expect(s.phase).toBe('starting');
-    expect(s.turnId).toBe('msg_1');
+    expect(s.turnId).toBe(STARTED_TURN_ID);
     expect(s.processingStartedAt).toBe(456);
     expect(isAcpTurnBusy(s)).toBe(true);
   });
 
   test('known-root stop is not revived by a late raw stream start', () => {
     const stopped = run([
-      { type: 'turnStarted', turnId: 'msg_stopped', processingStartedAt: 456 },
+      { type: 'turnStarted', turnId: STOPPED_TURN_ID, processingStartedAt: 456 },
       { type: 'reset' },
     ]);
     const afterLateRawStart = acpTurnReducer(stopped, { type: 'rawStreamStarted' });
@@ -55,7 +59,11 @@ describe('acpTurnReducer - turn busy lifecycle', () => {
   });
 
   test('thinking and content keep the turn busy', () => {
-    const thinking = run([{ type: 'submit' }, { type: 'turnStarted' }, { type: 'thinking' }]);
+    const thinking = run([
+      { type: 'submit' },
+      { type: 'turnStarted', turnId: STARTED_TURN_ID },
+      { type: 'thinking' },
+    ]);
     expect(thinking.phase).toBe('thinking');
     expect(isAcpTurnBusy(thinking)).toBe(true);
 
@@ -65,7 +73,10 @@ describe('acpTurnReducer - turn busy lifecycle', () => {
   });
 
   test('permission and tooling keep the turn busy', () => {
-    const permission = run([{ type: 'turnStarted' }, { type: 'permission' }]);
+    const permission = run([
+      { type: 'turnStarted', turnId: STARTED_TURN_ID },
+      { type: 'permission' },
+    ]);
     expect(permission.phase).toBe('waiting_permission');
     expect(isAcpTurnBusy(permission)).toBe(true);
 

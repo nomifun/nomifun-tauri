@@ -8,6 +8,7 @@ import type { MessageId, RemoteAgentId } from '@/common/types/ids';
 import { conversationTarget, type ConversationId } from '@/common/types/ids';
 import { sessionStorageKey } from '@/common/utils/browserStorageKey';
 import { ipcBridge } from '@/common';
+import { uuid } from '@/common/utils';
 import type { TMessage } from '@/common/chat/chatLib';
 import CommandQueuePanel from '@/renderer/components/chat/CommandQueuePanel';
 import SendBox from '@/renderer/components/chat/SendBox';
@@ -224,10 +225,9 @@ const RemoteSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conversa
   useEffect(() => {
     void getConversationOrNull(conversation_id).then(async (res) => {
       if (res?.extra?.workspace) setWorkspacePath(res.extra.workspace);
-      const extra = res?.extra as { remote_agent_id?: RemoteAgentId; remoteAgentId?: RemoteAgentId } | undefined;
-      const remoteAgentId = extra?.remote_agent_id ?? extra?.remoteAgentId;
-      if (remoteAgentId != null) {
-        const agent = await ipcBridge.remoteAgent.get.invoke({ id: remoteAgentId });
+      const extra = res?.extra as { remote_agent_id?: RemoteAgentId } | undefined;
+      if (extra?.remote_agent_id != null) {
+        const agent = await ipcBridge.remoteAgent.get.invoke({ remote_agent_id: extra.remote_agent_id });
         if (agent?.name) setAgentName(agent.name);
       }
     });
@@ -265,7 +265,7 @@ const RemoteSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conversa
         markLocalTurnAccepted();
 
         const userMessage: TMessage = {
-          id: msg_id,
+          id: uuid(),
           msg_id,
           conversation_id,
           type: 'text',
@@ -352,7 +352,7 @@ const RemoteSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conversa
         msg_id = res.msg_id;
         markLocalTurnAccepted();
         const userMessage: TMessage = {
-          id: msg_id,
+          id: uuid(),
           msg_id,
           conversation_id,
           type: 'text',

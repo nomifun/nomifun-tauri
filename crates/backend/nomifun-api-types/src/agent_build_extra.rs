@@ -1,14 +1,13 @@
 use std::collections::HashMap;
 
 use nomifun_common::{
-    CompanionId, CronJobId, DelegationPolicy, McpServerId, PresetId, PublicAgentId,
-    RemoteAgentId, UserId,
+    CompanionId, CronJobId, DelegationPolicy, PublicAgentId, RemoteAgentId, UserId,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
     BrowserMcpConfig, ComputerMcpConfig, GatewayMcpConfig, KnowledgeMcpConfig,
-    KnowledgeMountInfo, OpenMcpConfig, RequirementMcpConfig,
+    KnowledgeMountInfo, McpServerId, OpenMcpConfig, RequirementMcpConfig,
 };
 
 macro_rules! optional_id_deserializer {
@@ -30,23 +29,12 @@ macro_rules! optional_id_deserializer {
 }
 
 optional_id_deserializer!(deserialize_companion_id, CompanionId);
-optional_id_deserializer!(deserialize_cron_job_id, CronJobId);
-optional_id_deserializer!(deserialize_preset_id, PresetId);
 optional_id_deserializer!(deserialize_public_agent_id, PublicAgentId);
 optional_id_deserializer!(deserialize_user_id, UserId);
-
-fn deserialize_mcp_server_id<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    McpServerId::parse(value.clone())
-        .map(|_| value)
-        .map_err(serde::de::Error::custom)
-}
+optional_id_deserializer!(deserialize_cron_job_id, CronJobId);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionMcpTransport {
     Stdio {
         command: String,
@@ -73,9 +61,9 @@ pub enum SessionMcpTransport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionMcpServer {
-    #[serde(deserialize_with = "deserialize_mcp_server_id")]
-    pub id: String,
+    pub mcp_server_id: McpServerId,
     pub name: String,
     pub transport: SessionMcpTransport,
 }
@@ -98,12 +86,16 @@ pub struct AcpBuildExtra {
     pub preset_context: Option<String>,
     #[serde(default)]
     pub skills: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_preset_id")]
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_util::deserialize_optional_preset_id"
+    )]
     pub preset_id: Option<String>,
     #[serde(default)]
     pub session_mode: Option<String>,
     #[serde(default)]
     pub current_model_id: Option<String>,
+    /// Stable `cron_jobs.cron_job_id`.
     #[serde(default, deserialize_with = "deserialize_cron_job_id")]
     pub cron_job_id: Option<String>,
     /// Requirement MCP stdio bridge config. When `Some`, the ACP assembler
@@ -167,6 +159,7 @@ pub struct AcpBuildExtra {
     #[serde(default)]
     pub channel_platform: Option<String>,
     #[serde(default)]
+    /// Stable MCP server business IDs.
     pub mcp_server_ids: Option<Vec<McpServerId>>,
     #[serde(default)]
     pub session_mcp_servers: Vec<SessionMcpServer>,
@@ -220,11 +213,15 @@ pub struct OpenClawBuildExtra {
     pub gateway: OpenClawGatewayConfig,
     #[serde(default)]
     pub skills: Vec<String>,
-    #[serde(default, deserialize_with = "deserialize_preset_id")]
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_util::deserialize_optional_preset_id"
+    )]
     pub preset_id: Option<String>,
+    /// Stable `cron_jobs.cron_job_id`.
     #[serde(default, deserialize_with = "deserialize_cron_job_id")]
     pub cron_job_id: Option<String>,
-    #[serde(default, rename = "sessionKey")]
+    #[serde(default)]
     pub session_key: Option<String>,
 }
 
@@ -234,7 +231,7 @@ pub struct RemoteBuildExtra {
     /// Canonical global ID of the configured remote-agent entity.
     pub remote_agent_id: RemoteAgentId,
     /// Remote gateway session key persisted after a successful turn.
-    #[serde(default, rename = "sessionKey", alias = "session_key")]
+    #[serde(default)]
     pub session_key: Option<String>,
 }
 
@@ -267,6 +264,7 @@ pub struct NomiBuildExtra {
     #[serde(default)]
     pub session_mode: Option<String>,
     #[serde(default)]
+    /// Stable MCP server business IDs.
     pub mcp_server_ids: Option<Vec<McpServerId>>,
     #[serde(default)]
     pub session_mcp_servers: Vec<SessionMcpServer>,
@@ -393,6 +391,8 @@ pub struct SlashCommandItem {
 mod tests {
     use super::*;
 
+    const MCP_SERVER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000123";
+
     /// P4-2: the `browser_mcp_config` field on `AcpBuildExtra` round-trips
     /// symmetrically with `computer_mcp_config` (both `Some`, both preserved).
     #[test]
@@ -445,7 +445,18 @@ mod tests {
     }
 
     #[test]
-    fn session_mcp_server_id_rejects_json_number() {
+    fn session_mcp_server_id_accepts_canonical_uuidv7() {
+        let value = serde_json::json!({
+            "mcp_server_id": MCP_SERVER_ID,
+            "name": "temporary",
+            "transport": { "type": "stdio", "command": "server" }
+        });
+        let parsed: SessionMcpServer = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.mcp_server_id.as_str(), MCP_SERVER_ID);
+    }
+
+    #[test]
+    fn session_mcp_server_rejects_legacy_id() {
         let value = serde_json::json!({
             "id": 42,
             "name": "temporary",
@@ -455,13 +466,19 @@ mod tests {
     }
 
     #[test]
-    fn catalog_mcp_ids_require_canonical_mcp_strings() {
-        let id = McpServerId::new();
+    fn catalog_mcp_ids_require_canonical_uuidv7_strings() {
+        let id = McpServerId::parse(MCP_SERVER_ID).unwrap();
         let parsed: NomiBuildExtra =
-            serde_json::from_value(serde_json::json!({ "mcp_server_ids": [id] })).unwrap();
+            serde_json::from_value(serde_json::json!({ "mcp_server_ids": [id.clone()] })).unwrap();
         assert_eq!(parsed.mcp_server_ids, Some(vec![id]));
 
-        for invalid in [serde_json::json!([42]), serde_json::json!(["42"])] {
+        for invalid in [
+            serde_json::json!([42]),
+            serde_json::json!(["42"]),
+            serde_json::json!(["550e8400-e29b-41d4-a716-446655440000"]),
+            serde_json::json!([format!("mcp_{MCP_SERVER_ID}")]),
+            serde_json::json!([true]),
+        ] {
             assert!(
                 serde_json::from_value::<NomiBuildExtra>(
                     serde_json::json!({ "mcp_server_ids": invalid })

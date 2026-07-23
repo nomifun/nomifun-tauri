@@ -421,7 +421,7 @@ async fn persist_turn_writeback_state(
         status: None,
         hidden: None,
     };
-    if let Err(e) = repo.update_message(&row.id, &update).await {
+    if let Err(e) = repo.update_message(&row.message_id, &update).await {
         warn!(
             conversation_id,
             msg_id,
@@ -2335,7 +2335,6 @@ impl StreamRelay {
             AgentStreamEvent::AcpConfigOption(_) => "AcpConfigOption",
             AgentStreamEvent::AcpSessionInfo(_) => "AcpSessionInfo",
             AgentStreamEvent::AcpContextUsage(_) => "AcpContextUsage",
-            AgentStreamEvent::AcpPromptHookWarning(_) => "AcpPromptHookWarning",
             AgentStreamEvent::SlashCommandsUpdated(_) => "SlashCommandsUpdated",
             AgentStreamEvent::AvailableCommands(_) => "AvailableCommands",
             AgentStreamEvent::TurnCompleted(_) => "TurnCompleted",
@@ -2472,13 +2471,17 @@ impl StreamRelay {
             Err(error) => error,
         };
 
-        let existing = match self.repo.get_message(&row.conversation_id, &row.id).await {
+        let existing = match self
+            .repo
+            .get_message(&row.conversation_id, &row.message_id)
+            .await
+        {
             Ok(Some(existing)) => existing,
             Ok(None) => {
                 error!(
                     error = %ErrorChain(&insert_error),
                     operation,
-                    message_id = %row.id,
+                    message_id = %row.message_id,
                     "Failed to insert stream segment and no committed row was found to reconcile"
                 );
                 return false;
@@ -2488,7 +2491,7 @@ impl StreamRelay {
                     error = %ErrorChain(&insert_error),
                     reconcile_error = %ErrorChain(&reconcile_error),
                     operation,
-                    message_id = %row.id,
+                    message_id = %row.message_id,
                     "Failed to inspect an ambiguous stream-segment insert"
                 );
                 return false;
@@ -2505,7 +2508,7 @@ impl StreamRelay {
             error!(
                 error = %ErrorChain(&insert_error),
                 operation,
-                message_id = %row.id,
+                message_id = %row.message_id,
                 stored_type = %existing.r#type,
                 expected_type = %row.r#type,
                 stored_msg_id = ?existing.msg_id,
@@ -2520,12 +2523,12 @@ impl StreamRelay {
             status: Some(row.status.clone()),
             hidden: Some(row.hidden),
         };
-        match self.repo.update_message(&row.id, &update).await {
+        match self.repo.update_message(&row.message_id, &update).await {
             Ok(()) => {
                 warn!(
                     error = %ErrorChain(&insert_error),
                     operation,
-                    message_id = %row.id,
+                    message_id = %row.message_id,
                     "Reconciled an ambiguous stream-segment insert against its committed row"
                 );
                 true
@@ -2535,7 +2538,7 @@ impl StreamRelay {
                     error = %ErrorChain(&insert_error),
                     reconcile_error = %ErrorChain(&reconcile_error),
                     operation,
-                    message_id = %row.id,
+                    message_id = %row.message_id,
                     "Failed to reconcile an ambiguous stream-segment insert"
                 );
                 false
@@ -2567,7 +2570,8 @@ impl StreamRelay {
             }
         } else {
             let row = MessageRow {
-                id: segment.id.clone(),
+                id: 0,
+                message_id: segment.id.clone(),
                 conversation_id: self.conversation_id.clone(),
                 msg_id: Some(segment.id.clone()),
                 r#type: "text".into(),
@@ -2613,7 +2617,8 @@ impl StreamRelay {
             }
         } else {
             let row = MessageRow {
-                id: segment.id.clone(),
+                id: 0,
+                message_id: segment.id.clone(),
                 conversation_id: self.conversation_id.clone(),
                 msg_id: Some(segment.id.clone()),
                 r#type: "text".into(),
@@ -2766,7 +2771,8 @@ impl StreamRelay {
                 }
             } else if !hidden {
                 let row = MessageRow {
-                    id: self.msg_id.clone(),
+                    id: 0,
+                    message_id: self.msg_id.clone(),
                     conversation_id: self.conversation_id.clone(),
                     msg_id: Some(self.msg_id.clone()),
                     r#type: "text".into(),
@@ -2781,7 +2787,7 @@ impl StreamRelay {
                     created_at: now_ms(),
                 };
                 match self.repo.insert_message(&row).await {
-                    Ok(()) => outcome.final_text_msg_id = Some(row.id.clone()),
+                    Ok(()) => outcome.final_text_msg_id = Some(row.message_id.clone()),
                     Err(e) => {
                         outcome.final_text = None;
                         error!(error = %ErrorChain(&e), "Failed to create final fallback message");
@@ -2821,7 +2827,8 @@ impl StreamRelay {
         })
         .to_string();
         let row = MessageRow {
-            id: message_id.to_owned(),
+            id: 0,
+            message_id: message_id.to_owned(),
             conversation_id: self.conversation_id.clone(),
             msg_id: Some(message_id.to_owned()),
             r#type: "tips".into(),
@@ -2880,7 +2887,8 @@ impl StreamRelay {
         }
 
         let row = MessageRow {
-            id: id.clone(),
+            id: 0,
+            message_id: id.clone(),
             conversation_id: self.conversation_id.clone(),
             msg_id: Some(self.root_turn_id.clone()),
             r#type: "agent_status".into(),
@@ -2975,7 +2983,8 @@ impl StreamRelay {
         }
 
         let row = MessageRow {
-            id: plan_id.clone(),
+            id: 0,
+            message_id: plan_id.clone(),
             conversation_id: self.conversation_id.clone(),
             msg_id: Some(plan_id),
             r#type: "plan".into(),
@@ -3014,7 +3023,8 @@ impl StreamRelay {
         }
 
         let row = MessageRow {
-            id: segment.id.clone(),
+            id: 0,
+            message_id: segment.id.clone(),
             conversation_id: self.conversation_id.clone(),
             msg_id: Some(segment.id.clone()),
             r#type: "thinking".into(),
@@ -3261,7 +3271,8 @@ impl StreamRelay {
             }
         } else {
             let row = MessageRow {
-                id: message_id.clone(),
+                id: 0,
+                message_id: message_id.clone(),
                 conversation_id: self.conversation_id.clone(),
                 msg_id: Some(self.root_turn_id.clone()),
                 r#type: "tool_call".into(),
@@ -3446,7 +3457,7 @@ impl StreamRelay {
         let mut commits = Vec::with_capacity(generic_calls.len() + acp_calls.len());
         for data in generic_calls {
             commits.push(TurnArtifactMessageCommit {
-                id: self
+                message_id: self
                     .try_derived_message_id("tool_call", &data.call_id)
                     .await?,
                 message_type: "tool_call".to_owned(),
@@ -3455,7 +3466,7 @@ impl StreamRelay {
         }
         for data in acp_calls {
             commits.push(TurnArtifactMessageCommit {
-                id: self
+                message_id: self
                     .try_derived_message_id("acp_tool_call", &data.update.tool_call_id)
                     .await?,
                 message_type: "acp_tool_call".to_owned(),
@@ -3465,7 +3476,7 @@ impl StreamRelay {
 
         let expected_ids = commits
             .iter()
-            .map(|message| message.id.as_str())
+            .map(|message| message.message_id.as_str())
             .collect::<HashSet<_>>();
         let committed = self
             .repo
@@ -3479,7 +3490,7 @@ impl StreamRelay {
         if committed.len() != commits.len()
             || committed
                 .iter()
-                .any(|row| !expected_ids.contains(row.id.as_str()))
+                .any(|row| !expected_ids.contains(row.message_id.as_str()))
         {
             return Err(nomifun_db::DbError::Conflict(
                 "artifact commit returned an incomplete or mismatched durable batch".to_owned(),
@@ -3847,7 +3858,8 @@ impl StreamRelay {
         }
 
         let row = MessageRow {
-            id: message_id.clone(),
+            id: 0,
+            message_id: message_id.clone(),
             conversation_id: self.conversation_id.clone(),
             msg_id: Some(self.root_turn_id.clone()),
             r#type: "acp_tool_call".into(),
@@ -3969,7 +3981,8 @@ impl StreamRelay {
             }
         } else {
             let row = MessageRow {
-                id: group_id.clone(),
+                id: 0,
+                message_id: group_id.clone(),
                 conversation_id: self.conversation_id.clone(),
                 msg_id: Some(self.root_turn_id.clone()),
                 r#type: "tool_group".into(),
@@ -4232,17 +4245,17 @@ mod tests {
     use nomifun_ai_agent::protocol::events::{
         ErrorEventData, FinishEventData, PlanEventData, TextEventData, ThinkingEventData,
     };
-    use nomifun_common::{ConversationId, MessageId};
+    use nomifun_common::{ConversationId, MessageId, PersistedArtifactId};
     use nomifun_db::DbError;
     use std::sync::{
         Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
     };
 
-    const TEST_ASSISTANT_MESSAGE_ID: &str = "msg_0190f5fe-7c00-7a00-8abc-012345678941";
-    const TEST_TURN_A: &str = "msg_0190f5fe-7c00-7a00-8abc-012345678942";
-    const TEST_TURN_B: &str = "msg_0190f5fe-7c00-7a00-8abc-012345678943";
-    const TEST_USER_ID: &str = "user_0190f5fe-7c00-7a00-8abc-012345678944";
+    const TEST_ASSISTANT_MESSAGE_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678941";
+    const TEST_TURN_A: &str = "0190f5fe-7c00-7a00-8abc-012345678942";
+    const TEST_TURN_B: &str = "0190f5fe-7c00-7a00-8abc-012345678943";
+    const TEST_USER_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678944";
 
     fn test_conversation_id() -> String {
         ConversationId::new().into_string()
@@ -4250,7 +4263,7 @@ mod tests {
 
     fn test_artifact(id: &str) -> nomifun_ai_agent::artifact_store::PersistedArtifact {
         nomifun_ai_agent::artifact_store::PersistedArtifact {
-            id: id.into(),
+            id: PersistedArtifactId::new().into_string(),
             kind: nomifun_ai_agent::artifact_store::ArtifactKind::Image,
             mime_type: "image/png".into(),
             path: format!("/workspace/{id}.png"),
@@ -4337,7 +4350,7 @@ mod tests {
         assert_eq!(inserts.len(), 1);
         let msg = &inserts[0];
         assert_eq!(msg.conversation_id, conversation_id);
-        assert_eq!(msg.id, TEST_ASSISTANT_MESSAGE_ID);
+        assert_eq!(msg.message_id, TEST_ASSISTANT_MESSAGE_ID);
         assert_eq!(msg.r#type, "text");
         assert_eq!(msg.status.as_deref(), Some("finish"));
 
@@ -4724,7 +4737,7 @@ mod tests {
         assert_eq!(tool_row.status.as_deref(), Some("work"));
         assert!(
             repo.take_updates().iter().all(|(id, update)| {
-                id != &tool_row.id
+                id != &tool_row.message_id
                     || update.status.as_ref().and_then(|status| status.as_deref())
                         != Some("finish")
             }),
@@ -5085,8 +5098,8 @@ mod tests {
 
         let inserts = repo.take_inserts();
         let plan_msg = inserts.iter().find(|m| m.r#type == "plan").expect("plan message must be persisted");
-        MessageId::parse(&plan_msg.id).expect("plan row has a canonical message ID");
-        assert_eq!(plan_msg.msg_id.as_deref(), Some(plan_msg.id.as_str()));
+        MessageId::parse(&plan_msg.message_id).expect("plan row has a canonical message ID");
+        assert_eq!(plan_msg.msg_id.as_deref(), Some(plan_msg.message_id.as_str()));
         assert_eq!(plan_msg.status.as_deref(), Some("work"));
 
         let content: serde_json::Value = serde_json::from_str(&plan_msg.content).unwrap();
@@ -5096,7 +5109,7 @@ mod tests {
         let updates = repo.take_updates();
         let (_, terminal_update) = updates
             .iter()
-            .find(|(id, _)| id == &plan_msg.id)
+            .find(|(id, _)| id == &plan_msg.message_id)
             .expect("incomplete plan must be closed with the turn");
         assert_eq!(
             terminal_update.status.as_ref().map(|status| status.as_deref()),
@@ -5149,7 +5162,7 @@ mod tests {
             .into_iter()
             .find(|row| row.r#type == "tool_call")
             .expect("source tool must be persisted")
-            .id;
+            .message_id;
         MessageId::parse(&source_id).expect("tool row has a canonical message ID");
         let updates = repo.take_updates();
         let source_updates: Vec<_> = updates
@@ -5198,7 +5211,7 @@ mod tests {
             .into_iter()
             .find(|row| row.r#type == "agent_status")
             .expect("agent status must be persisted")
-            .id;
+            .message_id;
         MessageId::parse(&status_id).expect("agent status has a canonical message ID");
         let updates = repo.take_updates();
         let (_, update) = updates
@@ -5254,8 +5267,8 @@ mod tests {
         let inserts = repo.take_inserts();
         let text_msgs: Vec<_> = inserts.iter().filter(|msg| msg.r#type == "text").collect();
         assert_eq!(text_msgs.len(), 2, "text should split across tool boundaries");
-        assert_eq!(text_msgs[0].id, TEST_ASSISTANT_MESSAGE_ID);
-        assert_ne!(text_msgs[0].id, text_msgs[1].id);
+        assert_eq!(text_msgs[0].message_id, TEST_ASSISTANT_MESSAGE_ID);
+        assert_ne!(text_msgs[0].message_id, text_msgs[1].message_id);
 
         let mut text_event_msg_ids = Vec::new();
         while let Ok(evt) = ws_rx.try_recv() {
@@ -5312,7 +5325,7 @@ mod tests {
         let updates = repo.take_updates();
         assert!(
             updates.iter().all(|(id, update)| {
-                id != &text_rows[0].id
+                id != &text_rows[0].message_id
                     || update.status.as_ref().map(|status| status.as_deref()) != Some(Some("error"))
             }),
             "a later provider error must not corrupt an earlier completed text segment"
@@ -5361,8 +5374,8 @@ mod tests {
         let msg = &inserts[0];
         assert_eq!(msg.r#type, "tips");
         assert_eq!(msg.status.as_deref(), Some("error"));
-        assert_eq!(msg.msg_id.as_deref(), Some(msg.id.as_str()));
-        assert_ne!(msg.id, TEST_ASSISTANT_MESSAGE_ID);
+        assert_eq!(msg.msg_id.as_deref(), Some(msg.message_id.as_str()));
+        assert_ne!(msg.message_id, TEST_ASSISTANT_MESSAGE_ID);
 
         let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
         assert_eq!(content["content"], "Something went wrong");
@@ -5372,7 +5385,7 @@ mod tests {
         let live_error = std::iter::from_fn(|| ws_rx.try_recv().ok())
             .find(|event| event.name == "message.stream" && event.data["type"] == "error")
             .expect("terminal error must be broadcast");
-        assert_eq!(live_error.data["msg_id"], msg.id);
+        assert_eq!(live_error.data["msg_id"], msg.message_id);
         assert_eq!(live_error.data["turn_id"], TEST_ASSISTANT_MESSAGE_ID);
     }
 
@@ -5404,8 +5417,8 @@ mod tests {
         let error = inserts.iter().find(|row| row.r#type == "tips").expect("error tips row");
         assert_eq!(text.status.as_deref(), Some("error"));
         assert_eq!(error.status.as_deref(), Some("error"));
-        assert_ne!(text.id, error.id, "text and terminal error need independent identities");
-        assert_eq!(error.msg_id.as_deref(), Some(error.id.as_str()));
+        assert_ne!(text.message_id, error.message_id, "text and terminal error need independent identities");
+        assert_eq!(error.msg_id.as_deref(), Some(error.message_id.as_str()));
         let content: serde_json::Value = serde_json::from_str(&error.content).unwrap();
         assert_eq!(content["turn_id"], TEST_ASSISTANT_MESSAGE_ID);
     }
@@ -5503,7 +5516,7 @@ mod tests {
             .into_iter()
             .find(|row| row.r#type == "tool_call")
             .expect("tool call must be persisted")
-            .id;
+            .message_id;
         MessageId::parse(&tool_id).expect("tool row has a canonical message ID");
         let updates = repo.take_updates();
         let (_, update) = updates
@@ -5552,7 +5565,7 @@ mod tests {
         let ids: Vec<_> = inserts
             .iter()
             .filter(|row| row.r#type == "tool_call")
-            .map(|row| row.id.as_str())
+            .map(|row| row.message_id.as_str())
             .collect();
         assert_eq!(ids.len(), 2);
         assert!(ids.iter().all(|id| MessageId::parse(*id).is_ok()));
@@ -5644,7 +5657,7 @@ mod tests {
         tx.send(event(
             ToolCallStatus::Completed,
             vec![PersistedArtifact {
-                id: "stale".into(),
+                id: PersistedArtifactId::new().into_string(),
                 kind: ArtifactKind::Image,
                 mime_type: "image/png".into(),
                 path: "/workspace/old.png".into(),
@@ -5732,7 +5745,7 @@ mod tests {
             .iter()
             .rev()
             .find(|(id, update)| {
-                id == &row.id
+                id == &row.message_id
                     && update.status.as_ref().map(|s| s.as_deref()) == Some(Some("finish"))
             })
             .expect("successful enclosing turn promotes the artifact receipt");
@@ -5991,7 +6004,7 @@ mod tests {
         let correction = updates
             .iter()
             .rev()
-            .find(|(id, _)| id == &row.id)
+            .find(|(id, _)| id == &row.message_id)
             .expect("global turn error must correct the completed artifact row");
         assert_eq!(
             correction.1.status.as_ref().map(|status| status.as_deref()),
@@ -6161,7 +6174,7 @@ mod tests {
         let correction = updates
             .iter()
             .rev()
-            .find(|(id, _)| id == &row.id)
+            .find(|(id, _)| id == &row.message_id)
             .expect("global turn error must correct the completed ACP artifact row");
         assert_eq!(
             correction.1.status.as_ref().map(|status| status.as_deref()),
@@ -6260,13 +6273,13 @@ mod tests {
             .iter()
             .find(|row| row.r#type == "tool_call")
             .expect("generic artifact row")
-            .id
+            .message_id
             .clone();
         let acp_id = rows
             .iter()
             .find(|row| row.r#type == "acp_tool_call")
             .expect("ACP artifact row")
-            .id
+            .message_id
             .clone();
         let updates = repo.take_updates();
         for id in [generic_id, acp_id] {
@@ -6863,8 +6876,8 @@ mod tests {
 
         assert_eq!(thinking_msgs.len(), 1);
         assert_eq!(text_msgs.len(), 1);
-        assert_eq!(thinking_msgs[0].id, TEST_ASSISTANT_MESSAGE_ID);
-        assert_ne!(thinking_msgs[0].id, text_msgs[0].id);
+        assert_eq!(thinking_msgs[0].message_id, TEST_ASSISTANT_MESSAGE_ID);
+        assert_ne!(thinking_msgs[0].message_id, text_msgs[0].message_id);
 
         let mut text_msg_ids = Vec::new();
         let mut thinking_done_ids = Vec::new();
@@ -6928,7 +6941,7 @@ mod tests {
         assert_eq!(error.status.as_deref(), Some("error"));
         let text_content: serde_json::Value = serde_json::from_str(&text.content).unwrap();
         assert_eq!(text_content["content"], "partial");
-        assert_eq!(error.msg_id.as_deref(), Some(error.id.as_str()));
+        assert_eq!(error.msg_id.as_deref(), Some(error.message_id.as_str()));
         let mut ws_events = Vec::new();
         while let Ok(event) = ws_rx.try_recv() {
             ws_events.push(event);
@@ -6937,7 +6950,7 @@ mod tests {
             .iter()
             .find(|event| event.name == "message.stream" && event.data["type"] == "error")
             .expect("unexpected channel closure must be visible as a terminal error");
-        assert_eq!(live_error.data["msg_id"], error.id);
+        assert_eq!(live_error.data["msg_id"], error.message_id);
     }
 
     #[tokio::test]
@@ -7144,7 +7157,7 @@ mod tests {
         .with_companion_context(
             true,
             Some(
-                CompanionId::parse("companion_0190f5fe-7c00-7a00-8abc-012345678942")
+                CompanionId::parse("0190f5fe-7c00-7a00-8abc-012345678942")
                     .unwrap(),
             ),
         );
@@ -7167,7 +7180,7 @@ mod tests {
         assert_eq!(stream_evt.data["companion"], true);
         assert_eq!(
             stream_evt.data["companion_id"],
-            "companion_0190f5fe-7c00-7a00-8abc-012345678942"
+            "0190f5fe-7c00-7a00-8abc-012345678942"
         );
         let turn_evt = ws_events
             .iter()
@@ -7176,7 +7189,7 @@ mod tests {
         assert_eq!(turn_evt.data["companion"], true);
         assert_eq!(
             turn_evt.data["companion_id"],
-            "companion_0190f5fe-7c00-7a00-8abc-012345678942"
+            "0190f5fe-7c00-7a00-8abc-012345678942"
         );
     }
 
@@ -7197,7 +7210,7 @@ mod tests {
         .with_companion_context(
             true,
             Some(
-                CompanionId::parse("companion_0190f5fe-7c00-7a00-8abc-012345678942")
+                CompanionId::parse("0190f5fe-7c00-7a00-8abc-012345678942")
                     .unwrap(),
             ),
         )
@@ -7499,7 +7512,7 @@ mod tests {
         assert_eq!(text_rows.len(), 2);
         let updates = repo.take_updates();
         assert_eq!(updates.len(), 1, "only the acknowledged primary rewrite is recorded");
-        assert_eq!(updates[0].0, text_rows[0].id);
+        assert_eq!(updates[0].0, text_rows[0].message_id);
 
         let replacements: Vec<_> = std::iter::from_fn(|| ws_rx.try_recv().ok())
             .filter(|event| {
@@ -7509,11 +7522,11 @@ mod tests {
             })
             .collect();
         assert_eq!(replacements.len(), 1);
-        assert_eq!(replacements[0].data["msg_id"], text_rows[0].id);
+        assert_eq!(replacements[0].data["msg_id"], text_rows[0].message_id);
         assert!(
             replacements
                 .iter()
-                .all(|event| event.data["msg_id"] != text_rows[1].id),
+                .all(|event| event.data["msg_id"] != text_rows[1].message_id),
             "a failed hide must remain visible both live and after reload"
         );
     }
@@ -7571,12 +7584,12 @@ mod tests {
         let tool_msg = inserts.iter().find(|m| m.r#type == "tool_call");
         assert!(tool_msg.is_some());
         let msg = tool_msg.unwrap();
-        MessageId::parse(&msg.id).expect("tool row has a canonical message ID");
+        MessageId::parse(&msg.message_id).expect("tool row has a canonical message ID");
         assert_eq!(msg.msg_id.as_deref(), Some(TEST_ASSISTANT_MESSAGE_ID));
         assert_eq!(msg.status.as_deref(), Some("work"));
 
         let updates = repo.take_updates();
-        let tool_update = updates.iter().find(|(id, _)| id == &msg.id);
+        let tool_update = updates.iter().find(|(id, _)| id == &msg.message_id);
         assert!(tool_update.is_some());
         let (_, upd) = tool_update.unwrap();
         assert_eq!(upd.status, Some(Some("finish".to_owned())));
@@ -7647,7 +7660,7 @@ mod tests {
         let final_tool_update = updates
             .iter()
             .rev()
-            .find(|(id, _)| id == &tool_row.id)
+            .find(|(id, _)| id == &tool_row.message_id)
             .expect("tool terminal update");
         assert_eq!(final_tool_update.1.status.as_ref().and_then(|s| s.as_deref()), Some("error"));
         let content: serde_json::Value =
@@ -7725,14 +7738,14 @@ mod tests {
         let acp_msg = inserts.iter().find(|m| m.r#type == "acp_tool_call");
         assert!(acp_msg.is_some());
         let msg = acp_msg.unwrap();
-        MessageId::parse(&msg.id).expect("ACP tool row has a canonical message ID");
+        MessageId::parse(&msg.message_id).expect("ACP tool row has a canonical message ID");
         assert_eq!(msg.msg_id.as_deref(), Some(TEST_ASSISTANT_MESSAGE_ID));
         assert_eq!(msg.status.as_deref(), Some("work"));
 
         let updates = repo.take_updates();
         let acp_update = updates
             .iter()
-            .find(|(id, _)| id == &msg.id);
+            .find(|(id, _)| id == &msg.message_id);
         assert!(acp_update.is_some());
         let (_, upd) = acp_update.unwrap();
         assert_eq!(upd.status, Some(Some("finish".to_owned())));
@@ -7830,7 +7843,7 @@ mod tests {
         let (_, terminal) = updates
             .iter()
             .rev()
-            .find(|(id, _)| id == &row.id)
+            .find(|(id, _)| id == &row.message_id)
             .expect("external ACP terminal correction");
         assert_eq!(
             terminal.status.as_ref().and_then(|status| status.as_deref()),
@@ -7877,7 +7890,7 @@ mod tests {
 
         let first = test_artifact("external-duplicate");
         let mut duplicate = first.clone();
-        duplicate.id = "external-duplicate-alias".into();
+        duplicate.id = PersistedArtifactId::new().into_string();
         tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
             session_id: "external-session".into(),
             update: AcpToolCallUpdateData {
@@ -8020,7 +8033,7 @@ mod tests {
             .iter()
             .find(|row| row.r#type == "acp_tool_call")
             .expect("terminal ACP update must survive a missing start event");
-        MessageId::parse(&row.id).expect("ACP tool row has a canonical message ID");
+        MessageId::parse(&row.message_id).expect("ACP tool row has a canonical message ID");
         assert_eq!(row.status.as_deref(), Some("finish"));
         let content: serde_json::Value = serde_json::from_str(&row.content).unwrap();
         assert_eq!(content["turn_id"], TEST_TURN_A);
@@ -8068,17 +8081,17 @@ mod tests {
 
         relay.consume(rx).await;
 
-        let tool_id = repo
+        let tool_message_id = repo
             .take_inserts()
             .into_iter()
             .find(|row| row.r#type == "acp_tool_call")
             .expect("ACP tool must be persisted")
-            .id;
-        MessageId::parse(&tool_id).expect("ACP tool row has a canonical message ID");
+            .message_id;
+        MessageId::parse(&tool_message_id).expect("ACP tool row has a canonical message ID");
         let updates = repo.take_updates();
         let (_, update) = updates
             .iter()
-            .find(|(id, _)| id == &tool_id)
+            .find(|(message_id, _)| message_id == &tool_message_id)
             .expect("active ACP tool must be terminalized");
         assert_eq!(update.status.as_ref().map(|s| s.as_deref()), Some(Some("error")));
         let content: serde_json::Value = serde_json::from_str(update.content.as_deref().unwrap()).unwrap();
@@ -8131,7 +8144,7 @@ mod tests {
         let group_msg = inserts.iter().find(|m| m.r#type == "tool_group");
         assert!(group_msg.is_some());
         let msg = group_msg.unwrap();
-        MessageId::parse(&msg.id).expect("tool-group row has a canonical message ID");
+        MessageId::parse(&msg.message_id).expect("tool-group row has a canonical message ID");
         assert_eq!(msg.msg_id.as_deref(), Some(TEST_ASSISTANT_MESSAGE_ID));
         assert_eq!(msg.status.as_deref(), Some("finish"));
 
@@ -8212,7 +8225,7 @@ mod tests {
 
         let first = test_artifact("group-count-duplicate");
         let mut duplicate = first.clone();
-        duplicate.id = "group-count-alias".into();
+        duplicate.id = PersistedArtifactId::new().into_string();
         let paired = ToolCallEventData {
             call_id: "group-count".into(),
             name: "image_gen".into(),
@@ -8437,7 +8450,7 @@ mod tests {
 
         let inserts = repo.take_inserts();
         let row = inserts.iter().find(|row| row.r#type == "tool_group").unwrap();
-        MessageId::parse(&row.id).expect("tool-group row has a canonical message ID");
+        MessageId::parse(&row.message_id).expect("tool-group row has a canonical message ID");
         assert_eq!(row.msg_id.as_deref(), Some(TEST_TURN_A));
         assert_eq!(row.status.as_deref(), Some("error"));
     }
@@ -8474,7 +8487,7 @@ mod tests {
             .into_iter()
             .find(|row| row.r#type == "tool_group")
             .expect("tool group must be persisted")
-            .id;
+            .message_id;
         MessageId::parse(&group_id).expect("tool-group row has a canonical message ID");
         let updates = repo.take_updates();
         let (_, update) = updates
@@ -8648,7 +8661,7 @@ mod tests {
             Ok(None)
         }
         async fn create(&self, row: &nomifun_db::models::ConversationRow) -> Result<String, DbError> {
-            Ok(row.id.clone())
+            Ok(row.conversation_id.clone())
         }
         async fn update(&self, _id: &str, _updates: &nomifun_db::ConversationRowUpdate) -> Result<(), DbError> {
             Ok(())
@@ -8709,7 +8722,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .find(|row| row.id == message_id)
+                .find(|row| row.message_id == message_id)
                 .cloned())
         }
         async fn insert_message(&self, row: &MessageRow) -> Result<(), DbError> {
@@ -8734,7 +8747,12 @@ mod tests {
             if self
                 .reject_duplicate_message_inserts
                 .load(AtomicOrdering::SeqCst)
-                && self.inserts.lock().unwrap().iter().any(|existing| existing.id == row.id)
+                && self
+                    .inserts
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|existing| existing.message_id == row.message_id)
             {
                 return Err(DbError::Conflict("injected duplicate message insert".to_owned()));
             }
@@ -8760,7 +8778,7 @@ mod tests {
             let mut inserts = self.inserts.lock().unwrap();
             let mut updates = self.updates.lock().unwrap();
             for message in messages {
-                if let Some(existing) = inserts.iter().find(|row| row.id == message.id)
+                if let Some(existing) = inserts.iter().find(|row| row.message_id == message.message_id)
                     && (existing.conversation_id != conversation_id
                         || existing.msg_id.as_deref() != Some(turn_message_id)
                         || existing.r#type != message.message_type
@@ -8774,9 +8792,9 @@ mod tests {
             }
             let mut committed = Vec::with_capacity(messages.len());
             for message in messages {
-                if let Some(existing) = inserts.iter().find(|row| row.id == message.id) {
+                if let Some(existing) = inserts.iter().find(|row| row.message_id == message.message_id) {
                     updates.push((
-                        message.id.clone(),
+                        message.message_id.clone(),
                         nomifun_db::MessageRowUpdate {
                             content: Some(message.content.clone()),
                             status: Some(Some("finish".to_owned())),
@@ -8789,7 +8807,8 @@ mod tests {
                     committed.push(row);
                 } else {
                     let row = MessageRow {
-                        id: message.id.clone(),
+                        id: 0,
+                        message_id: message.message_id.clone(),
                         conversation_id: conversation_id.to_owned(),
                         msg_id: Some(turn_message_id.to_owned()),
                         r#type: message.message_type.clone(),

@@ -73,12 +73,14 @@ impl ChannelMessageLoop {
     }
 
     async fn handle_message(&self, incoming: ChannelIncoming) {
-        let ChannelIncoming { channel_id, message: msg } = incoming;
+        let ChannelIncoming {
+            channel_plugin_id,
+            message: msg,
+        } = incoming;
         let platform = msg.platform;
         let chat_id = msg.chat_id.clone();
-        // Outgoing routing is per channel row — the manager keys running
-        // bot instances by their `channel_plugins` row id.
-        let plugin_id = channel_id.clone();
+        // Outgoing routing is per channel business identity.
+        let plugin_id = channel_plugin_id;
         let text = msg.content.text.clone();
 
         let executor = Arc::clone(&self.action_executor);
@@ -87,7 +89,7 @@ impl ChannelMessageLoop {
         let sender = Arc::clone(&self.sender);
 
         tokio::spawn(async move {
-            match executor.handle_incoming_message(&msg, &channel_id).await {
+            match executor.handle_incoming_message(&msg, &plugin_id).await {
                 Ok(MessageResult::Action(response)) => {
                     send_action_response(&sender, &plugin_id, &chat_id, &response).await;
                 }
@@ -182,7 +184,7 @@ async fn send_action_response(
         match response.behavior {
             ActionBehavior::Edit => {
                 if let Some(ref edit_id) = response.edit_message_id {
-                    let _ = sender.edit_message(plugin_id, chat_id, edit_id, outgoing).await;
+                let _ = sender.edit_message(plugin_id, chat_id, edit_id, outgoing).await;
                 }
             }
             _ => {

@@ -10,18 +10,18 @@ mod common;
 
 use common::build_app;
 
-const TEST_CONV_1: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678901";
-const TEST_CONV_2: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678902";
-const TEST_OWNER_CALLER: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678903";
-const TEST_SECONDARY_CALLER: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678904";
-const TEST_COMPANION_CALLER: &str = "conv_0190f5fe-7c00-7a00-8abc-012345678905";
-const TEST_USER_GATEWAY: &str = "user_0190f5fe-7c00-7a00-8abc-012345678911";
-const TEST_USER_COMPANION: &str = "user_0190f5fe-7c00-7a00-8abc-012345678912";
-const TEST_USER_A: &str = "user_0190f5fe-7c00-7a00-8abc-012345678913";
-const TEST_USER_B: &str = "user_0190f5fe-7c00-7a00-8abc-012345678914";
-const TEST_USER_SECONDARY: &str = "user_0190f5fe-7c00-7a00-8abc-012345678915";
-const TEST_COMPANION: &str = "companion_0190f5fe-7c00-7a00-8abc-012345678921";
-const TEST_PROVIDER: &str = "prov_0190f5fe-7c00-7a00-8abc-012345678931";
+const TEST_CONV_1: &str = "0190f5fe-7c00-7a00-8abc-012345678901";
+const TEST_CONV_2: &str = "0190f5fe-7c00-7a00-8abc-012345678902";
+const TEST_OWNER_CALLER: &str = "0190f5fe-7c00-7a00-8abc-012345678903";
+const TEST_SECONDARY_CALLER: &str = "0190f5fe-7c00-7a00-8abc-012345678904";
+const TEST_COMPANION_CALLER: &str = "0190f5fe-7c00-7a00-8abc-012345678905";
+const TEST_USER_GATEWAY: &str = "0190f5fe-7c00-7a00-8abc-012345678911";
+const TEST_USER_COMPANION: &str = "0190f5fe-7c00-7a00-8abc-012345678912";
+const TEST_USER_A: &str = "0190f5fe-7c00-7a00-8abc-012345678913";
+const TEST_USER_B: &str = "0190f5fe-7c00-7a00-8abc-012345678914";
+const TEST_USER_SECONDARY: &str = "0190f5fe-7c00-7a00-8abc-012345678915";
+const TEST_COMPANION: &str = "0190f5fe-7c00-7a00-8abc-012345678921";
+const TEST_PROVIDER: &str = "0190f5fe-7c00-7a00-8abc-012345678931";
 
 use serde_json::{Value, json};
 
@@ -122,7 +122,7 @@ async fn seed_user_and_conversation_with_extra(
 async fn seed_provider(services: &nomifun_app::AppServices, provider_id: &str, model: &str) {
     sqlx::query(
         "INSERT OR IGNORE INTO providers \
-         (id, platform, name, base_url, api_key_encrypted, models, enabled, created_at, updated_at) \
+         (provider_id, platform, name, base_url, api_key_encrypted, models, enabled, created_at, updated_at) \
          VALUES (?, 'openai', ?, 'http://127.0.0.1:1', 'k', ?, 1, 0, 0)",
     )
     .bind(provider_id)
@@ -248,14 +248,14 @@ async fn gw_list_conversations_excludes_companion_sessions() {
     assert_eq!(convs.len(), 1, "companion session excluded, got {convs:?}");
     assert_eq!(result["total"], json!(1));
     assert!(
-        convs.iter().all(|c| c["id"] != json!(TEST_CONV_1)),
+        convs.iter().all(|c| c["conversation_id"] != json!(TEST_CONV_1)),
         "companion-bound conversation must be absent"
     );
 
     // The surviving entry is the plain session, with no companion binding.
     // Conversation IDs cross the gateway boundary as canonical strings.
     let plain = &convs[0];
-    assert_eq!(plain["id"], json!(TEST_CONV_2));
+    assert_eq!(plain["conversation_id"], json!(TEST_CONV_2));
     assert_eq!(plain["companion_id"], json!(null), "no binding → null, got {plain}");
     assert_eq!(plain["is_companion_companion"], json!(false));
 }
@@ -375,7 +375,7 @@ async fn gw_conversation_status_reports_idle_and_messages() {
         )
         .await;
     let result = result_of(&body);
-    assert_eq!(result["id"], json!(TEST_CONV_1));
+    assert_eq!(result["conversation_id"], json!(TEST_CONV_1));
     assert_eq!(result["runtime"]["state"], json!("idle"));
     assert!(result.get("recent_messages").is_some());
 }
@@ -441,7 +441,7 @@ async fn gw_cron_create_list_update_delete_roundtrip() {
     let body = gw.call("nomi_cron_list", TEST_CONV_1, TEST_USER_GATEWAY, json!({})).await;
     let jobs = result_of(&body).as_array().unwrap();
     assert_eq!(jobs.len(), 1);
-    let job_id = jobs[0]["id"].as_str().unwrap().to_owned();
+    let cron_job_id = jobs[0]["cron_job_id"].as_str().unwrap().to_owned();
     assert_eq!(jobs[0]["name"], json!("晨报"));
 
     let body = gw
@@ -449,13 +449,13 @@ async fn gw_cron_create_list_update_delete_roundtrip() {
             "nomi_cron_update",
             TEST_CONV_1,
             TEST_USER_GATEWAY,
-            json!({"job_id": job_id, "name": "晚报", "cron": "0 21 * * *", "message": "写晚报"}),
+            json!({"cron_job_id": cron_job_id, "name": "晚报", "cron": "0 21 * * *", "message": "写晚报"}),
         )
         .await;
     assert!(result_of(&body).as_str().unwrap().contains("晚报"));
 
     let body = gw
-        .call("nomi_cron_delete", TEST_CONV_1, TEST_USER_GATEWAY, json!({"job_id": job_id, "confirm": true}))
+        .call("nomi_cron_delete", TEST_CONV_1, TEST_USER_GATEWAY, json!({"cron_job_id": cron_job_id, "confirm": true}))
         .await;
     assert!(result_of(&body).as_str().unwrap().contains("Deleted"));
 
@@ -478,7 +478,8 @@ async fn gw_memory_save_list_update_delete_roundtrip() {
             json!({"content": "主人喜欢深色主题", "kind": "preference", "tags": ["ui"]}),
         )
         .await;
-    let memory_id = result_of(&body)["id"].as_str().unwrap().to_owned();
+    let memory_id = result_of(&body)["memory_id"].as_str().unwrap().to_owned();
+    assert!(result_of(&body).get("id").is_none());
 
     let body = gw
         .call(
@@ -491,13 +492,15 @@ async fn gw_memory_save_list_update_delete_roundtrip() {
     let memories = result_of(&body).as_array().unwrap();
     assert_eq!(memories.len(), 1);
     assert_eq!(memories[0]["kind"], json!("preference"));
+    assert!(memories[0].get("memory_id").is_some());
+    assert!(memories[0].get("id").is_none());
 
     let body = gw
         .call(
             "nomi_memory_update",
             TEST_OWNER_CALLER,
             services.authoritative_user_id.as_ref(),
-            json!({"id": memory_id, "pinned": true}),
+            json!({"memory_id": memory_id, "pinned": true}),
         )
         .await;
     assert!(result_of(&body).as_str().unwrap().contains("updated"));
@@ -507,7 +510,7 @@ async fn gw_memory_save_list_update_delete_roundtrip() {
             "nomi_memory_delete",
             TEST_OWNER_CALLER,
             services.authoritative_user_id.as_ref(),
-            json!({"id": memory_id, "confirm": true}),
+            json!({"memory_id": memory_id, "confirm": true}),
         )
         .await;
     assert!(result_of(&body).as_str().unwrap().contains("deleted"));
@@ -532,7 +535,7 @@ async fn gw_memory_update_with_no_fields_is_rejected() {
             "nomi_memory_update",
             TEST_OWNER_CALLER,
             services.authoritative_user_id.as_ref(),
-            json!({"id": "mem_x"}),
+            json!({"memory_id": "0190f5fe-7c00-7a00-8abc-012345678999"}),
         )
         .await;
     assert!(error_of(&body).contains("nothing to update"));
@@ -553,7 +556,8 @@ async fn gw_requirement_create_list_update_delete_roundtrip() {
             json!({"title": "修复登录页样式", "content": "按钮溢出", "tag": "前端"}),
         )
         .await;
-    let req_id = result_of(&body)["id"].as_str().unwrap().to_owned();
+    let req_id = result_of(&body)["requirement_id"].as_str().unwrap().to_owned();
+    assert!(result_of(&body).get("id").is_none());
     assert_eq!(result_of(&body)["created_by"], json!("agent"));
 
     let body = gw
@@ -566,13 +570,15 @@ async fn gw_requirement_create_list_update_delete_roundtrip() {
         .await;
     let items = result_of(&body)["items"].as_array().unwrap().clone();
     assert_eq!(items.len(), 1);
+    assert!(items[0].get("requirement_id").is_some());
+    assert!(items[0].get("id").is_none());
 
     let body = gw
         .call(
             "nomi_requirement_update",
             TEST_OWNER_CALLER,
             services.authoritative_user_id.as_ref(),
-            json!({"id": req_id, "title": "修复登录页按钮溢出"}),
+            json!({"requirement_id": req_id, "title": "修复登录页按钮溢出"}),
         )
         .await;
     assert_eq!(result_of(&body)["title"], json!("修复登录页按钮溢出"));
@@ -582,7 +588,7 @@ async fn gw_requirement_create_list_update_delete_roundtrip() {
             "nomi_requirement_delete",
             TEST_OWNER_CALLER,
             services.authoritative_user_id.as_ref(),
-            json!({"id": req_id, "confirm": true}),
+            json!({"requirement_id": req_id, "confirm": true}),
         )
         .await;
     assert!(result_of(&body).as_str().unwrap().contains("deleted"));

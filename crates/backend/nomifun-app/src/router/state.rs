@@ -103,7 +103,7 @@ fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::P
         dirs::home_dir().unwrap_or_else(std::env::temp_dir),
     ];
     // Auto-provisioned per-conversation workspaces live under
-    // `{work_dir}/conversations/{label}-temp-{token}/`. On Windows the
+    // `{work_dir}/conversations/{uuidv7}/`. On Windows the
     // operator may put `work_dir` on a separate drive (e.g. `X:\Nomi`)
     // that's neither under `temp_dir` nor `home_dir`, which previously
     // caused `/api/fs/list` to 403 every Hermes-mode session
@@ -295,8 +295,10 @@ pub fn build_system_state(services: &AppServices) -> SystemRouterState {
     let execution_template_repo: Arc<dyn IAgentExecutionTemplateRepository> =
         Arc::new(SqliteAgentExecutionTemplateRepository::new(pool.clone()));
     let deletion_coordinator = Arc::new(crate::provider_deletion::AppProviderDeletionCoordinator {
+        provider_lifecycle: services.provider_lifecycle.clone(),
         companion: services.companion_service.clone(),
         public_agent: services.public_agent_service.clone(),
+        workshop: services.workshop_service.clone(),
         client_prefs: client_pref_repo,
         execution_repo,
         execution_template_repo,
@@ -367,9 +369,9 @@ pub fn build_conversation_state(
         records: Arc::new(SqliteIdmmInterventionRepository::new(services.database.pool().clone())),
     }) as Arc<dyn OnConversationDelete>);
     // Remove the conversation's on-disk nomi session file + auto-provisioned
-    // temp workspace so a future conversation reusing this integer id cannot
-    // resume stale state (cross-conversation memory bleed). Pairs with the
-    // per-session `owner_token` validation in the nomi factory.
+    // temp workspace so no future conversation can resume stale state
+    // (cross-conversation memory bleed). The per-session `owner_token` binds
+    // any surviving residue to the owning conversation UUIDv7.
     conversation_service.with_delete_hook(Arc::new(
         nomifun_ai_agent::runtime_registry::NomiSessionFilesCascade {
             data_dir: services.data_dir.clone(),
@@ -539,39 +541,42 @@ impl nomifun_channel::message_service::ChannelAgentProfile for CompanionChannelA
         }
     }
 
-    async fn public_agent_servable(&self, id: &str) -> bool {
+    async fn public_agent_servable(&self, public_agent_id: &str) -> bool {
         // Servable = the public agent exists AND is enabled. A deleted agent or a
         // disabled/paused one is NOT servable, so the channel layer refuses the
         // turn rather than serving a dead agent. The bot→agent binding itself is
         // per-bot (the channel row's `public_agent_id`); this is a pure by-id
         // liveness check.
-        matches!(self.public_agent_service.get(id).await, Ok(cfg) if cfg.enabled)
+        matches!(
+            self.public_agent_service.get(public_agent_id).await,
+            Ok(cfg) if cfg.enabled
+        )
     }
 
-    async fn public_agent_exists(&self, id: &str) -> bool {
-        self.public_agent_service.exists(id).await
+    async fn public_agent_exists(&self, public_agent_id: &str) -> bool {
+        self.public_agent_service.exists(public_agent_id).await
     }
 
-    async fn public_agent_name(&self, id: &str) -> Option<String> {
+    async fn public_agent_name(&self, public_agent_id: &str) -> Option<String> {
         self.public_agent_service
-            .get(id)
+            .get(public_agent_id)
             .await
             .ok()
             .map(|a| a.name)
             .filter(|n| !n.trim().is_empty())
     }
 
-    async fn public_agent_model(&self, id: &str) -> Option<nomifun_common::ProviderWithModel> {
+    async fn public_agent_model(
+        &self,
+        public_agent_id: &str,
+    ) -> Option<nomifun_common::ProviderWithModel> {
         // The agent's OWN configured model wins.
-        if let Ok(cfg) = self.public_agent_service.get(id).await {
-            if cfg.model.is_configured() {
-                let provider_id = cfg.model.provider_id.clone()?.into_string();
+        if let Ok(cfg) = self.public_agent_service.get(public_agent_id).await {
+            if let Some(model) = cfg.model {
                 return Some(nomifun_common::ProviderWithModel {
-                    provider_id,
-                    model: cfg.model.model.clone(),
-                    // Prefer the explicit concrete model id; fall back to the label so a
-                    // usable id always reaches the provider.
-                    use_model: cfg.model.use_model.clone().or_else(|| Some(cfg.model.model.clone())),
+                    provider_id: model.provider_id.into_string(),
+                    model: model.model.clone(),
+                    use_model: Some(model.model),
                 });
             }
         }
@@ -588,11 +593,16 @@ impl nomifun_channel::message_service::ChannelAgentProfile for CompanionChannelA
         })
     }
 
-    async fn record_public_agent_turn(&self, id: &str, platform: &str, text: &str) {
+    async fn record_public_agent_turn(
+        &self,
+        public_agent_id: &str,
+        platform: &str,
+        text: &str,
+    ) {
         // Best-effort audit into the public agent's own day-partitioned log
         // (never fails the turn).
         self.public_agent_service
-            .record_turn(id, "channel", Some(platform), text)
+            .record_turn(public_agent_id, "channel", Some(platform), text)
             .await;
     }
 }
@@ -731,8 +741,8 @@ pub async fn build_channel_state(
         // resolution falls back to the bound companion when the
         // platform has no config of its own.
         .with_channel_agent_profile(Arc::clone(&channel_agent_profile))
-        // Outbound media: resolve `wsa_...` IDs to bytes so channel replies can
-        // send AI-generated images/files.
+        // Outbound media: resolve bare Workshop asset UUIDv7 values to bytes so
+        // channel replies can send AI-generated images/files.
         .with_asset_resolver(Arc::new(crate::channel_asset_resolver::ChannelAssetResolver::new(
             services.workshop_service.clone(),
         ))),

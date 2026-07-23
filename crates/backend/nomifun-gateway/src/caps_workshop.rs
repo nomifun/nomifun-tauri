@@ -11,7 +11,9 @@
 
 use std::sync::Arc;
 
-use nomifun_common::{WorkshopAssetId, WorkshopNodeId};
+use nomifun_common::{
+    ProviderId, WorkshopAssetId, WorkshopCanvasId, WorkshopNodeId,
+};
 use nomifun_creation::{CreationInput, NewCreationTask};
 use nomifun_workshop::AgentOp;
 use nomifun_workshop::service::AssetQuery;
@@ -22,6 +24,19 @@ use serde_json::{Value, json};
 use crate::deps::{CallerCtx, GatewayDeps};
 use crate::registry::{Capability, CapabilityMeta, DangerTier};
 use crate::server::ok;
+
+fn deserialize_model_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() || value.trim() != value {
+        return Err(serde::de::Error::custom(
+            "model must be a non-empty trimmed natural key",
+        ));
+    }
+    Ok(value)
+}
 
 /// Max chars of prompt/caption/text folded into a node summary.
 const SUMMARY_TEXT_MAX: usize = 120;
@@ -37,6 +52,7 @@ const LIST_CANVASES_MAX: i64 = 200;
 // ── param structs (single source: schema + runtime) ──────────────────────────
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ListCanvasesParams {
     /// Optional case-insensitive substring filter over canvas titles.
     #[serde(default)]
@@ -47,12 +63,15 @@ struct ListCanvasesParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetCanvasParams {
-    /// Canvas id (`wsc_…`) from nomi_workshop_list_canvases.
-    canvas_id: String,
+    /// Canvas id (bare UUIDv7) from nomi_workshop_list_canvases.
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    canvas_id: WorkshopCanvasId,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ListAssetsParams {
     /// Optional case-insensitive title search.
     #[serde(default)]
@@ -66,9 +85,11 @@ struct ListAssetsParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ApplyOpsParams {
-    /// Target canvas id (`wsc_…`).
-    canvas_id: String,
+    /// Target canvas id (bare UUIDv7).
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    canvas_id: WorkshopCanvasId,
     /// Ordered operations to apply. Each is tagged by `type`:
     /// `add_node` (create a node), `connect` (link two EXISTING node ids),
     /// `update_node_data` (shallow-merge a node's data), `delete_node`.
@@ -79,33 +100,50 @@ struct ApplyOpsParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GenerateParams {
     /// Provider id (from the providers catalog) to run the generation on.
-    provider_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    provider_id: ProviderId,
     /// Model id/name available on that provider.
+    #[serde(deserialize_with = "deserialize_model_name")]
     model: String,
     /// Capability: `t2i` | `i2i` | `inpaint` | `t2v` | `i2v` | `v2v` | `tts` | `text`.
     capability: String,
     /// The generation prompt.
     prompt: String,
-    /// Optional reference asset ids (`wsa_…`) fed as `reference` inputs.
+    /// Optional reference asset ids (bare UUIDv7) fed as `reference` inputs.
     #[serde(default)]
-    ref_asset_ids: Option<Vec<String>>,
+    #[schemars(schema_with = "crate::id_schema::optional_canonical_uuid_v7_array_schema")]
+    ref_asset_ids: Option<Vec<WorkshopAssetId>>,
     /// Optional canvas id to associate the produced asset(s) with.
     #[serde(default)]
-    canvas_id: Option<String>,
+    #[schemars(schema_with = "crate::id_schema::optional_canonical_uuid_v7_schema")]
+    canvas_id: Option<WorkshopCanvasId>,
     /// Extra provider params (`width`/`height`/`quality`/`count`/`seconds`/…).
     #[serde(default)]
     params: Option<Value>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetTaskParams {
-    /// Generation task id (`wst_…`) from nomi_workshop_generate.
-    task_id: String,
+    /// Creation task business id (bare UUIDv7) returned by nomi_workshop_generate.
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    #[serde(deserialize_with = "deserialize_creation_task_id")]
+    creation_task_id: String,
 }
 
 // ── handlers ──────────────────────────────────────────────────────────────
+
+fn deserialize_creation_task_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    nomifun_common::validate_uuidv7(&value).map_err(serde::de::Error::custom)?;
+    Ok(value)
+}
 
 async fn list_canvases(deps: Arc<GatewayDeps>, p: ListCanvasesParams) -> Value {
     let query = p.query.map(|q| q.trim().to_lowercase()).filter(|q| !q.is_empty());
@@ -123,7 +161,7 @@ async fn list_canvases(deps: Arc<GatewayDeps>, p: ListCanvasesParams) -> Value {
                 .take(limit)
                 .map(|c| {
                     json!({
-                        "id": c.id,
+                        "canvas_id": c.canvas_id,
                         "title": c.title,
                         "node_count": c.node_count,
                     })
@@ -136,7 +174,7 @@ async fn list_canvases(deps: Arc<GatewayDeps>, p: ListCanvasesParams) -> Value {
 }
 
 async fn get_canvas(deps: Arc<GatewayDeps>, p: GetCanvasParams) -> Value {
-    match deps.workshop_service.get_canvas(&p.canvas_id).await {
+    match deps.workshop_service.get_canvas(p.canvas_id.as_str()).await {
         Ok(c) => ok(summarize_canvas(&c.meta, &c.doc)),
         Err(e) => json!({ "error": e.to_string() }),
     }
@@ -158,7 +196,7 @@ async fn list_assets(deps: Arc<GatewayDeps>, p: ListAssetsParams) -> Value {
                 .iter()
                 .map(|a| {
                     json!({
-                        "id": a.id,
+                        "asset_id": a.asset_id,
                         "kind": a.kind,
                         "title": a.title,
                         "collection": a.collection,
@@ -185,7 +223,11 @@ async fn apply_ops(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: ApplyOpsParams) ->
     } else {
         "remote".to_owned()
     };
-    match deps.workshop_service.apply_agent_ops(&p.canvas_id, p.ops, &source).await {
+    match deps
+        .workshop_service
+        .apply_agent_ops(p.canvas_id.as_str(), p.ops, &source)
+        .await
+    {
         Ok(applied) => ok(json!({ "ops": applied })),
         Err(e) => json!({ "error": e.to_string() }),
     }
@@ -203,12 +245,15 @@ async fn generate(deps: Arc<GatewayDeps>, p: GenerateParams) -> Value {
         .ref_asset_ids
         .unwrap_or_default()
         .into_iter()
-        .map(|asset_id| CreationInput { asset_id, role: "reference".into() })
+        .map(|asset_id| CreationInput {
+            asset_id: asset_id.into_string(),
+            role: "reference".into(),
+        })
         .collect();
     let task = NewCreationTask {
-        canvas_id: p.canvas_id,
+        canvas_id: p.canvas_id.map(WorkshopCanvasId::into_string),
         node_id: None,
-        provider_id: p.provider_id,
+        provider_id: p.provider_id.into_string(),
         model: p.model,
         capability: p.capability,
         params: Value::Object(params),
@@ -216,7 +261,7 @@ async fn generate(deps: Arc<GatewayDeps>, p: GenerateParams) -> Value {
     };
     match deps.creation_service.create_task(task).await {
         Ok(t) => ok(json!({
-            "task_id": t.id,
+            "creation_task_id": t.creation_task_id,
             "status": t.status,
             "capability": t.capability,
             "provider_id": t.provider_id,
@@ -227,9 +272,9 @@ async fn generate(deps: Arc<GatewayDeps>, p: GenerateParams) -> Value {
 }
 
 async fn get_task(deps: Arc<GatewayDeps>, p: GetTaskParams) -> Value {
-    match deps.creation_service.get_task(&p.task_id).await {
+    match deps.creation_service.get_task(&p.creation_task_id).await {
         Ok(t) => ok(json!({
-            "id": t.id,
+            "creation_task_id": t.creation_task_id,
             "status": t.status,
             "capability": t.capability,
             "provider_id": t.provider_id,
@@ -272,7 +317,7 @@ fn summarize_canvas(meta: &nomifun_workshop::WorkshopCanvasMeta, doc: &Value) ->
         })
         .unwrap_or_default();
     json!({
-        "id": meta.id,
+        "canvas_id": meta.canvas_id,
         "title": meta.title,
         "node_count": meta.node_count,
         "updated_at": meta.updated_at,
@@ -380,7 +425,7 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
         CapabilityMeta::new(
             "nomi_workshop_generate",
             "workshop",
-            "Submit a 创意工坊 generation task (image/video/text) via a provider+model, with an optional prompt, reference assets, and canvas association. Returns a task id to poll.",
+            "Submit a 创意工坊 generation task (image/video/text) via a provider+model, with an optional prompt, reference assets, and canvas association. Returns a creation_task_id UUIDv7 to poll.",
             DangerTier::Write,
         ),
         |deps, _ctx, p| generate(deps, p),
@@ -389,7 +434,7 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
         CapabilityMeta::new(
             "nomi_workshop_get_task",
             "workshop",
-            "Inspect a 创意工坊 generation task by id: status, produced asset ids, and any error.",
+            "Inspect a 创意工坊 generation task by creation_task_id UUIDv7: status, produced asset ids, and any error.",
             DangerTier::Read,
         ),
         |deps, _ctx, p| get_task(deps, p),
@@ -399,11 +444,15 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::{Registry, Surface};
     use nomifun_common::WorkshopCanvasId;
+
+    const CREATION_TASK_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678901";
+    const PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678902";
 
     fn meta() -> nomifun_workshop::WorkshopCanvasMeta {
         nomifun_workshop::WorkshopCanvasMeta {
-            id: WorkshopCanvasId::new().into_string(),
+            canvas_id: WorkshopCanvasId::new().into_string(),
             title: "c".into(),
             thumbnail_url: None,
             node_count: 250,
@@ -442,5 +491,97 @@ mod tests {
         assert_eq!(summary["edges_truncated"], false);
         assert_eq!(summary["total_nodes"], 1);
         assert_eq!(summary["nodes"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn get_task_params_require_named_canonical_uuidv7() {
+        let params: GetTaskParams =
+            serde_json::from_value(json!({ "creation_task_id": CREATION_TASK_ID })).unwrap();
+        assert_eq!(params.creation_task_id, CREATION_TASK_ID);
+
+        for invalid in [
+            json!({ "creation_task_id": 1 }),
+            json!({ "creation_task_id": "1" }),
+            json!({ "creation_task_id": "task_0190f5fe-7c00-7a00-8abc-012345678901" }),
+            json!({ "creation_task_id": "0190f5fe-7c00-4a00-8abc-012345678901" }),
+            json!({ "creation_task_id": "0190F5FE-7C00-7A00-8ABC-012345678901" }),
+            json!({ "creation_task_id": "0190f5fe7c007a008abc012345678901" }),
+            json!({ "creation_task_id": "0190f5fe-7c00-7a00-8abc-012345678901 " }),
+            json!({ "task_id": CREATION_TASK_ID }),
+            json!({ "id": CREATION_TASK_ID }),
+            json!({
+                "creation_task_id": CREATION_TASK_ID,
+                "task_id": CREATION_TASK_ID
+            }),
+        ] {
+            assert!(
+                serde_json::from_value::<GetTaskParams>(invalid.clone()).is_err(),
+                "accepted invalid get-task arguments: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_params_require_provider_id_and_trimmed_model() {
+        let params: GenerateParams = serde_json::from_value(json!({
+            "provider_id": PROVIDER_ID,
+            "model": "image-model",
+            "capability": "t2i",
+            "prompt": "cat"
+        }))
+        .unwrap();
+        assert_eq!(params.provider_id.as_str(), PROVIDER_ID);
+        assert_eq!(params.model, "image-model");
+
+        for invalid in [
+            json!({
+                "backend": "openai",
+                "model": "image-model",
+                "capability": "t2i",
+                "prompt": "cat"
+            }),
+            json!({
+                "provider_id": PROVIDER_ID,
+                "model": " image-model ",
+                "capability": "t2i",
+                "prompt": "cat"
+            }),
+            json!({
+                "provider_id": "openai",
+                "model": "image-model",
+                "capability": "t2i",
+                "prompt": "cat"
+            }),
+        ] {
+            assert!(serde_json::from_value::<GenerateParams>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn workshop_task_schema_exposes_only_creation_task_id() {
+        let specs = Registry::global().tool_specs(Surface::Desktop);
+        let spec = specs
+            .iter()
+            .find(|spec| spec.name == "nomi_workshop_get_task")
+            .expect("nomi_workshop_get_task registered");
+        let properties = spec
+            .input_schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("get-task properties");
+        let id_schema = properties
+            .get("creation_task_id")
+            .expect("creation_task_id schema");
+
+        assert_eq!(properties.len(), 1);
+        assert!(!properties.contains_key("task_id"));
+        assert!(!properties.contains_key("id"));
+        assert_eq!(id_schema.get("type"), Some(&json!("string")));
+        assert_eq!(
+            id_schema.get("pattern"),
+            Some(&json!(
+                "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            ))
+        );
     }
 }

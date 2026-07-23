@@ -41,7 +41,7 @@ type PresetListPanelProps = {
   // Tag facets
   audienceTags: PresetTag[];
   scenarioTags: PresetTag[];
-  tagByKey: Map<string, PresetTag>;
+  tagById: Map<string, PresetTag>;
   onManageTags: () => void;
 };
 
@@ -59,7 +59,7 @@ const PresetListPanel: React.FC<PresetListPanelProps> = ({
   onHighlightConsumed,
   audienceTags,
   scenarioTags,
-  tagByKey,
+  tagById,
   onManageTags,
 }) => {
   const { t } = useTranslation();
@@ -103,11 +103,11 @@ const PresetListPanel: React.FC<PresetListPanelProps> = ({
   // facet. Drop any selected key that no longer exists. The `return prev`
   // no-change guard prevents render loops.
   useEffect(() => {
-    const audKeys = new Set<string>(audienceTags.map((t) => t.key));
-    const scnKeys = new Set<string>(scenarioTags.map((t) => t.key));
+    const audIds = new Set<string>(audienceTags.map((tag) => tag.preset_tag_id));
+    const scnIds = new Set<string>(scenarioTags.map((tag) => tag.preset_tag_id));
     setTagFilter((prev) => {
-      const audience = prev.audience.filter((k) => audKeys.has(k));
-      const scenario = prev.scenario.filter((k) => scnKeys.has(k));
+      const audience = prev.audience.filter((id) => audIds.has(id));
+      const scenario = prev.scenario.filter((id) => scnIds.has(id));
       if (audience.length === prev.audience.length && scenario.length === prev.scenario.length) return prev;
       return { audience, scenario };
     });
@@ -200,20 +200,20 @@ const PresetListPanel: React.FC<PresetListPanelProps> = ({
           <div className='grid gap-12px' style={{ gridTemplateColumns: CARD_GRID_COLS }}>
             {filteredPresets.map((preset) => (
               <PresetCard
-                key={preset.id}
+                key={preset.preset_id}
                 preset={preset}
                 localeKey={localeKey}
                 avatarImageMap={avatarImageMap}
-                tagByKey={tagByKey}
+                tagById={tagById}
                 isExtensionPreset={isExtensionPreset}
                 onEdit={(a) => {
-                  setActivePresetId(a.id);
+                  setActivePresetId(a.preset_id);
                   onEdit(a);
                 }}
                 onDuplicate={onDuplicate}
                 onToggleEnabled={onToggleEnabled}
-                highlighted={highlightedId === preset.id}
-                cardRef={cardRefSetter(preset.id)}
+                highlighted={highlightedId === preset.preset_id}
+                cardRef={cardRefSetter(preset.preset_id)}
               />
             ))}
           </div>

@@ -29,7 +29,8 @@ impl ProviderService {
     }
 
     /// Inject a deletion coordinator so `delete` returns friendly labeled
-    /// conflicts before SQLite enforces the same hard bindings atomically.
+    /// conflicts before the repository transaction enforces the same logical
+    /// bindings atomically.
     pub fn with_deletion_coordinator(mut self, coordinator: SharedProviderDeletionCoordinator) -> Self {
         self.coordinator = Some(coordinator);
         self
@@ -43,7 +44,7 @@ impl ProviderService {
 
     /// Create a new provider. The API key is encrypted before storage.
     ///
-    /// If `req.id` is `Some`, the caller-supplied canonical `prov_<uuid-v7>` is
+    /// If `req.provider_id` is `Some`, the caller-supplied canonical UUIDv7 is
     /// used after strict validation; otherwise the repository generates one.
     pub async fn create(&self, req: CreateProviderRequest) -> Result<ProviderResponse, AppError> {
         reject_managed_create(&req)?;
@@ -59,7 +60,7 @@ impl ProviderService {
         let model_health_json = serialize_opt(&req.model_health, "model_health")?;
         let bedrock_json = serialize_opt(&req.bedrock_config, "bedrock_config")?;
         let params = CreateProviderParams {
-            id: req.id.as_deref(),
+            provider_id: req.provider_id.as_deref(),
             platform: &req.platform,
             name: &req.name,
             base_url: &req.base_url,
@@ -67,7 +68,6 @@ impl ProviderService {
             models: &models_json,
             enabled: req.enabled,
             capabilities: &capabilities_json,
-            context_limit: req.context_limit,
             model_context_limits: model_context_limits_json.as_deref(),
             model_protocols: model_protocols_json.as_deref(),
             model_descriptions: model_descriptions_json.as_deref(),
@@ -111,7 +111,6 @@ impl ProviderService {
             models: models_json.as_deref(),
             enabled: req.enabled,
             capabilities: capabilities_json.as_deref(),
-            context_limit: req.context_limit.map(Some),
             model_context_limits: model_context_limits_json.as_ref().map(|s| Some(s.as_str())),
             model_protocols: model_protocols_json.as_ref().map(|s| Some(s.as_str())),
             model_descriptions: model_descriptions_json.as_ref().map(|s| Some(s.as_str())),
@@ -130,16 +129,26 @@ impl ProviderService {
     ///
     /// When a deletion coordinator is configured, deletion is refused with
     /// `AppError::ProviderInUse` if any feature still holds a hard binding to
-    /// the provider. SQLite owns atomic soft-reference cleanup in the provider
-    /// DELETE transaction; there is no post-commit cleanup phase.
+    /// the provider. SQLite references are handled in the repository DELETE
+    /// transaction; side stores are cleaned under the lifecycle write guard.
     pub async fn delete(&self, id: &str) -> Result<(), AppError> {
         validate_id(id)?;
         self.reject_persisted_managed_provider(id).await?;
+        let lifecycle_barrier = self
+            .coordinator
+            .as_ref()
+            .and_then(|coord| coord.provider_lifecycle_barrier());
+        let _lifecycle_guard = if let Some(barrier) = lifecycle_barrier.as_ref() {
+            Some(barrier.write().await)
+        } else {
+            None
+        };
         if let Some(coord) = &self.coordinator {
             let usages = coord.usages(id).await?;
             if !usages.is_empty() {
                 return Err(AppError::ProviderInUse(ProviderInUseDetails { usages }));
             }
+            coord.cleanup_soft_references(id).await?;
         }
         self.repo.delete(id).await?;
         Ok(())
@@ -161,17 +170,14 @@ impl ProviderService {
         Ok(())
     }
 
-    /// Convert a DB row into a response DTO with the plaintext API key
-    /// (decrypted) and deserialized JSON fields.
-    ///
-    /// Pre-launch: the response returns the API key in plaintext so the
-    /// frontend can migrate its local store to the backend without losing
-    /// the key on re-read. Storage remains encrypted at rest.
+    /// Convert a DB row into the v3 response DTO with the plaintext API key
+    /// (decrypted) and deserialized JSON fields. The named `provider_id`
+    /// business identity crosses the wire; the SQLite technical `id` does not.
     fn row_to_response(&self, row: Provider) -> Result<ProviderResponse, AppError> {
-        ProviderId::parse(&row.id).map_err(|error| {
+        ProviderId::parse(&row.provider_id).map_err(|error| {
             AppError::Internal(format!(
-                "stored providers.id '{}' is not canonical: {error}",
-                row.id
+                "stored providers.provider_id '{}' is not canonical: {error}",
+                row.provider_id
             ))
         })?;
         let managed = is_managed_provider_platform(&row.platform);
@@ -188,9 +194,11 @@ impl ProviderService {
         let model_protocols: Option<HashMap<String, String>> =
             deserialize_opt(&row.model_protocols, "model_protocols")?;
         let model_context_limits: Option<HashMap<String, i64>> =
-            deserialize_opt(&row.model_context_limits, "model_context_limits")?;
-        let model_context_limits =
-            merge_legacy_model_context_limits(&models, row.context_limit, model_context_limits);
+            deserialize_opt::<HashMap<String, i64>>(
+                &row.model_context_limits,
+                "model_context_limits",
+            )?
+                .filter(|limits| !limits.is_empty());
         let model_descriptions: Option<HashMap<String, String>> =
             deserialize_opt(&row.model_descriptions, "model_descriptions")?;
         let model_enabled: Option<HashMap<String, bool>> = deserialize_opt(&row.model_enabled, "model_enabled")?;
@@ -198,7 +206,7 @@ impl ProviderService {
         let bedrock_config = deserialize_opt(&row.bedrock_config, "bedrock_config")?;
 
         Ok(ProviderResponse {
-            id: row.id,
+            provider_id: row.provider_id,
             platform: row.platform,
             name: row.name,
             base_url: row.base_url,
@@ -206,7 +214,6 @@ impl ProviderService {
             models,
             enabled: row.enabled,
             capabilities,
-            context_limit: row.context_limit,
             model_context_limits,
             model_protocols,
             model_descriptions,
@@ -238,22 +245,6 @@ fn serialize_json<T: serde::Serialize>(val: &T, field: &str) -> Result<String, A
     serde_json::to_string(val).map_err(|e| AppError::Internal(format!("Failed to serialize {field}: {e}")))
 }
 
-fn merge_legacy_model_context_limits(
-    models: &[String],
-    legacy_context_limit: Option<i64>,
-    model_context_limits: Option<HashMap<String, i64>>,
-) -> Option<HashMap<String, i64>> {
-    let mut limits = model_context_limits.unwrap_or_default();
-    if limits.is_empty()
-        && let Some(limit) = legacy_context_limit.filter(|value| *value > 0)
-    {
-        for model in models {
-            limits.insert(model.clone(), limit);
-        }
-    }
-    if limits.is_empty() { None } else { Some(limits) }
-}
-
 /// Deserialize an optional JSON string into a typed value.
 pub(crate) fn deserialize_opt<T: DeserializeOwned>(json: &Option<String>, field: &str) -> Result<Option<T>, AppError> {
     json.as_deref()
@@ -267,7 +258,7 @@ pub(crate) fn deserialize_opt<T: DeserializeOwned>(json: &Option<String>, field:
 // ---------------------------------------------------------------------------
 
 fn validate_create_request(req: &CreateProviderRequest) -> Result<(), AppError> {
-    if let Some(ref id) = req.id {
+    if let Some(ref id) = req.provider_id {
         validate_id(id)?;
     }
     if req.platform.trim().is_empty() {
@@ -386,7 +377,7 @@ mod tests {
 
     fn sample_create_request() -> CreateProviderRequest {
         CreateProviderRequest {
-            id: None,
+            provider_id: None,
             platform: "anthropic".into(),
             name: "Anthropic".into(),
             base_url: "https://api.anthropic.com".into(),
@@ -394,7 +385,6 @@ mod tests {
             models: vec!["claude-sonnet-4-20250514".into()],
             enabled: true,
             capabilities: vec![],
-            context_limit: None,
             model_context_limits: None,
             model_protocols: None,
             model_descriptions: None,
@@ -411,13 +401,13 @@ mod tests {
     #[test]
     fn validate_id_accepts_canonical_provider_uuid_v7() {
         assert!(
-            validate_id("prov_0190f5fe-7c00-7a00-8abc-012345678901").is_ok()
+            validate_id("0190f5fe-7c00-7a00-8abc-012345678901").is_ok()
         );
     }
 
     #[test]
     fn validate_id_rejects_uuid_v4() {
-        assert!(validate_id("prov_11111111-1111-4111-8111-111111111111").is_err());
+        assert!(validate_id("11111111-1111-4111-8111-111111111111").is_err());
     }
 
     #[test]
@@ -436,9 +426,7 @@ mod tests {
         assert!(
             validate_id("provider_0190f5fe-7c00-7a00-8abc-012345678901").is_err()
         );
-        assert!(
-            validate_id("prov_019ABCDEF012-7ABC-8ABC-0123-456789ABCDEF").is_err()
-        );
+        assert!(validate_id("0190F5FE-7C00-7A00-8ABC-012345678901").is_err());
         assert!(validate_id("bad/slash").is_err());
     }
 
@@ -497,7 +485,7 @@ mod tests {
     #[test]
     fn generic_create_rejects_managed_platform() {
         let by_id = CreateProviderRequest {
-            id: Some(nomifun_common::ProviderId::new().into_string()),
+            provider_id: Some(nomifun_common::ProviderId::new().into_string()),
             ..sample_create_request()
         };
         assert!(reject_managed_create(&by_id).is_ok());
@@ -616,7 +604,7 @@ mod tests {
         let svc = setup().await;
         let created = svc.create(sample_create_request()).await.unwrap();
 
-        assert!(created.id.starts_with("prov_"));
+        assert!(ProviderId::parse(&created.provider_id).is_ok());
         assert_eq!(created.platform, "anthropic");
         assert_eq!(created.name, "Anthropic");
         assert_eq!(created.base_url, "https://api.anthropic.com");
@@ -627,7 +615,7 @@ mod tests {
 
         let all = svc.list().await.unwrap();
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].id, created.id);
+        assert_eq!(all[0].provider_id, created.provider_id);
         assert_eq!(all[0].api_key, "sk-ant-api03-test1234");
     }
 
@@ -636,18 +624,18 @@ mod tests {
         let svc = setup().await;
         let provider_id = ProviderId::new().into_string();
         let req = CreateProviderRequest {
-            id: Some(provider_id.clone()),
+            provider_id: Some(provider_id.clone()),
             ..sample_create_request()
         };
         let created = svc.create(req).await.unwrap();
-        assert_eq!(created.id, provider_id);
+        assert_eq!(created.provider_id, provider_id);
     }
 
     #[tokio::test]
     async fn create_with_provided_id_rejects_invalid() {
         let svc = setup().await;
         let req = CreateProviderRequest {
-            id: Some("   ".into()),
+            provider_id: Some("   ".into()),
             ..sample_create_request()
         };
         let err = svc.create(req).await.unwrap_err();
@@ -659,13 +647,13 @@ mod tests {
         let svc = setup().await;
         let provider_id = ProviderId::new().into_string();
         let req1 = CreateProviderRequest {
-            id: Some(provider_id.clone()),
+            provider_id: Some(provider_id.clone()),
             ..sample_create_request()
         };
         svc.create(req1).await.unwrap();
 
         let req2 = CreateProviderRequest {
-            id: Some(provider_id),
+            provider_id: Some(provider_id),
             ..sample_create_request()
         };
         let err = svc.create(req2).await.unwrap_err();
@@ -724,7 +712,7 @@ mod tests {
         // update changes the description
         let updated = svc
             .update(
-                &created.id,
+                &created.provider_id,
                 UpdateProviderRequest {
                     model_descriptions: Some(HashMap::from([("m1".into(), "擅长后端".into())])),
                     ..Default::default()
@@ -762,7 +750,7 @@ mod tests {
 
         let updated = svc
             .update(
-                &created.id,
+                &created.provider_id,
                 UpdateProviderRequest {
                     model_context_limits: Some(HashMap::from([("m2".into(), 200_000)])),
                     ..Default::default()
@@ -778,7 +766,7 @@ mod tests {
 
         let cleared = svc
             .update(
-                &created.id,
+                &created.provider_id,
                 UpdateProviderRequest {
                     model_context_limits: Some(HashMap::new()),
                     ..Default::default()
@@ -810,7 +798,7 @@ mod tests {
         let encrypted = encrypt_string("internal-loopback-token", &TEST_KEY).unwrap();
         let provider_id = nomifun_common::ProviderId::new().into_string();
         repo.create(CreateProviderParams {
-            id: Some(&provider_id),
+            provider_id: Some(&provider_id),
             platform: crate::managed_model::FREE_MODEL_PLATFORM,
             name: "NomiFun Free Model",
             base_url: "http://127.0.0.1:12345/v1",
@@ -818,7 +806,6 @@ mod tests {
             models: r#"["big-pickle"]"#,
             enabled: true,
             capabilities: "[]",
-            context_limit: None,
             model_context_limits: None,
             model_protocols: None,
             model_descriptions: None,
@@ -833,7 +820,7 @@ mod tests {
         let svc = ProviderService::new(repo, TEST_KEY);
         let providers = svc.list().await.unwrap();
         assert_eq!(providers.len(), 1);
-        assert_eq!(providers[0].id, provider_id);
+        assert_eq!(providers[0].provider_id, provider_id);
         assert!(providers[0].api_key.is_empty());
     }
 
@@ -844,7 +831,7 @@ mod tests {
         let encrypted = encrypt_string("internal-loopback-token", &TEST_KEY).unwrap();
         let provider_id = nomifun_common::ProviderId::new().into_string();
         repo.create(CreateProviderParams {
-            id: Some(&provider_id),
+            provider_id: Some(&provider_id),
             platform: crate::managed_model::FREE_MODEL_PLATFORM,
             name: "Managed provider",
             base_url: "http://127.0.0.1:12345/v1",
@@ -852,7 +839,6 @@ mod tests {
             models: r#"["big-pickle"]"#,
             enabled: true,
             capabilities: "[]",
-            context_limit: None,
             model_context_limits: None,
             model_protocols: None,
             model_descriptions: None,
@@ -901,7 +887,7 @@ mod tests {
 
         let updated = svc
             .update(
-                &created.id,
+                &created.provider_id,
                 UpdateProviderRequest {
                     name: Some("New Name".into()),
                     ..Default::default()
@@ -921,7 +907,7 @@ mod tests {
 
         let updated = svc
             .update(
-                &created.id,
+                &created.provider_id,
                 UpdateProviderRequest {
                     api_key: Some("new-key-abcdefgh".into()),
                     ..Default::default()
@@ -939,7 +925,7 @@ mod tests {
         let svc = setup().await;
         let err = svc
             .update(
-                "prov_0190f5fe-7c00-7a00-8000-000000000099",
+                "0190f5fe-7c00-7a00-8000-000000000099",
                 UpdateProviderRequest::default(),
             )
             .await
@@ -952,7 +938,7 @@ mod tests {
         let svc = setup().await;
         let created = svc.create(sample_create_request()).await.unwrap();
 
-        svc.delete(&created.id).await.unwrap();
+        svc.delete(&created.provider_id).await.unwrap();
         let all = svc.list().await.unwrap();
         assert!(all.is_empty());
     }
@@ -961,7 +947,7 @@ mod tests {
     async fn delete_nonexistent_returns_not_found() {
         let svc = setup().await;
         let err = svc
-            .delete("prov_0190f5fe-7c00-7a00-8000-000000000099")
+            .delete("0190f5fe-7c00-7a00-8000-000000000099")
             .await
             .unwrap_err();
         assert_eq!(err.status_code(), axum::http::StatusCode::NOT_FOUND);
@@ -975,7 +961,7 @@ mod delete_guard_tests {
     use nomifun_db::{SqliteProviderRepository, init_database_memory, models::Provider};
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    const PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000098";
+    const PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000098";
 
     struct CountingRepo {
         deleted: AtomicBool,
@@ -1018,14 +1004,14 @@ mod delete_guard_tests {
     impl crate::provider_deletion::ProviderDeletionCoordinator for RacingCoord {
         async fn usages(&self, provider_id: &str) -> Result<Vec<ProviderUsage>, AppError> {
             // Simulate a hard binding committed immediately after the friendly
-            // application scan observed no usages. The provider DELETE trigger
-            // remains the authoritative race barrier.
+            // application scan observed no usages. The repository transaction
+            // guard remains the authoritative race barrier.
             nomifun_db::sqlx::query(
                 "INSERT INTO conversations (\
-                    id, user_id, name, type, extra, model, status, pinned, created_at, updated_at\
+                    conversation_id, user_id, name, type, extra, model, status, pinned, created_at, updated_at\
                  ) VALUES (\
-                    'conv_0190f5fe-7c00-7a00-8000-000000000098', \
-                    (SELECT owner_user_id FROM installation_identity WHERE key = 'installation'), \
+                    '0190f5fe-7c00-7a00-8000-000000000098', \
+                    (SELECT owner_user_id FROM installation_identity WHERE singleton_key = 'installation'), \
                     'racing conversation', 'nomi', '{}', ?,\
                     'pending', 0, 1, 1\
                  )",
@@ -1076,10 +1062,10 @@ mod delete_guard_tests {
         let database = init_database_memory().await.unwrap();
         nomifun_db::sqlx::query(
             "INSERT INTO providers (\
-                id, platform, name, base_url, api_key_encrypted, models, enabled,\
+                provider_id, platform, name, base_url, api_key_encrypted, models, enabled,\
                 capabilities, created_at, updated_at\
              ) VALUES (\
-                'prov_0190f5fe-7c00-7a00-8000-000000000097', 'openai', 'Race provider', 'https://example.invalid',\
+                '0190f5fe-7c00-7a00-8000-000000000097', 'openai', 'Race provider', 'https://example.invalid',\
                 'encrypted', '[]', 1, '[]', 1, 1\
              )",
         )
@@ -1094,7 +1080,7 @@ mod delete_guard_tests {
         let service =
             ProviderService::new(repo.clone(), [0u8; 32]).with_deletion_coordinator(coordinator);
 
-        let provider_id = "prov_0190f5fe-7c00-7a00-8000-000000000097";
+        let provider_id = "0190f5fe-7c00-7a00-8000-000000000097";
         let error = service.delete(provider_id).await.unwrap_err();
         assert!(
             matches!(

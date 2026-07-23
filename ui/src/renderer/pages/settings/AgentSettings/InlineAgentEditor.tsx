@@ -32,8 +32,6 @@ export interface EnvVar {
  * IPC contract avoids a legacy intermediate conversion step.
  */
 export interface CustomAgentDraft {
-  /** Preserved across edits; new drafts receive a fresh uuid. */
-  id: string;
   name: string;
   /** User-picked emoji or avatar URL — backend field name is `icon`. */
   icon?: string;
@@ -278,7 +276,6 @@ const InlineAgentEditor: React.FC<InlineAgentEditorProps> = ({ agent, onSave, on
       Boolean(advanced.behavior_policy && Object.keys(advanced.behavior_policy).length > 0);
     const envEntries = Object.entries(envObj).map(([envName, value]) => ({ name: envName, value }));
     const draft: CustomAgentDraft = {
-      id: agent?.id || uuid(),
       name: name.trim() || t('settings.agentManagement.customEngineDefaultName'),
       icon: avatar,
       command: command.trim(),

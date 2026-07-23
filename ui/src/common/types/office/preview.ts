@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import type { ConversationId } from '@/common/types/ids';
+import type { ConversationId, PreviewSnapshotId } from '@/common/types/ids';
+
+export type { PreviewSnapshotId };
 
 export type PreviewContentType =
   | 'markdown'
@@ -29,11 +31,11 @@ export interface PreviewHistoryTarget {
 }
 
 export interface PreviewSnapshotInfo {
-  id: string;
+  snapshot_id: PreviewSnapshotId;
   label: string;
   created_at: number;
   size: number;
-  contentType: PreviewContentType;
+  content_type: PreviewContentType;
   file_name?: string;
   file_path?: string;
 }

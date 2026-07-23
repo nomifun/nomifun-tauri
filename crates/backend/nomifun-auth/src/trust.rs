@@ -157,7 +157,7 @@ pub async fn require_local_trust_middleware(request: Request, next: Next) -> Res
 mod tests {
     use super::*;
 
-    const TEST_OWNER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_OWNER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 
     fn hdrs(secret: Option<&str>) -> HeaderMap {
         let mut h = HeaderMap::new();

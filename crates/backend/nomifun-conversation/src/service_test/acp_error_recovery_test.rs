@@ -7,16 +7,16 @@ async fn send_message_evicts_acp_task_after_terminal_error() {
     let conv = svc.create(TEST_USER_1, make_create_req()).await.unwrap();
 
     let scripted_agent = Arc::new(ScriptedAgent::new(
-        &conv.id,
+        &conv.conversation_id,
         vec![vec![AgentStreamEvent::Error(ErrorEventData::legacy(
             "Agent completed the turn without producing visible output.",
             Some(AgentErrorCode::UnknownUpstreamError),
         ))]],
     ));
-    runtime_registry.insert_agent(&conv.id, AgentRuntimeHandle::Mock(scripted_agent));
+    runtime_registry.insert_agent(&conv.conversation_id, AgentRuntimeHandle::Mock(scripted_agent));
 
     let runtime_registry_dyn: Arc<dyn AgentRuntimeRegistry> = runtime_registry.clone();
-    svc.send_message(TEST_USER_1, &conv.id, make_send_req(), &runtime_registry_dyn)
+    svc.send_message(TEST_USER_1, &conv.conversation_id, make_send_req(), &runtime_registry_dyn)
         .await
         .unwrap();
 
@@ -30,12 +30,12 @@ async fn send_message_evicts_acp_task_after_terminal_error() {
     })
     .await
     .expect("ACP terminal error should evict the cached runtime");
-    wait_for_turn_released(&svc, &conv.id).await;
+    wait_for_turn_released(&svc, &conv.conversation_id).await;
 
     assert_eq!(runtime_registry.active_runtime_count(), 0);
     assert_eq!(
         runtime_registry.termination_records(),
-        vec![(conv.id.clone(), Some(AgentKillReason::AgentErrorRecovery))]
+        vec![(conv.conversation_id.clone(), Some(AgentKillReason::AgentErrorRecovery))]
     );
 }
 
@@ -49,7 +49,7 @@ async fn send_message_clears_persisted_acp_model_after_model_not_found() {
     let runtime_registry = Arc::new(MockAgentRuntimeRegistry::new());
     let conv = svc.create(TEST_USER_1, make_create_req()).await.unwrap();
     repo.update(
-        &conv.id,
+        &conv.conversation_id,
         &ConversationRowUpdate {
             extra: Some(
                 serde_json::to_string(&json!({
@@ -65,16 +65,16 @@ async fn send_message_clears_persisted_acp_model_after_model_not_found() {
     .unwrap();
 
     let scripted_agent = Arc::new(ScriptedAgent::new(
-        &conv.id,
+        &conv.conversation_id,
         vec![vec![AgentStreamEvent::Error(ErrorEventData::legacy(
             "The configured model was not found by the provider.",
             Some(AgentErrorCode::UserLlmProviderModelNotFound),
         ))]],
     ));
-    runtime_registry.insert_agent(&conv.id, AgentRuntimeHandle::Mock(scripted_agent));
+    runtime_registry.insert_agent(&conv.conversation_id, AgentRuntimeHandle::Mock(scripted_agent));
 
     let runtime_registry_dyn: Arc<dyn AgentRuntimeRegistry> = runtime_registry.clone();
-    svc.send_message(TEST_USER_1, &conv.id, make_send_req(), &runtime_registry_dyn)
+    svc.send_message(TEST_USER_1, &conv.conversation_id, make_send_req(), &runtime_registry_dyn)
         .await
         .unwrap();
 
@@ -83,7 +83,7 @@ async fn send_message_clears_persisted_acp_model_after_model_not_found() {
             let saves = acp_session_repo.runtime_state_saves();
             if saves
                 .iter()
-                .any(|call| call.conversation_id == conv.id.clone() && call.current_model_id == Some(None))
+                .any(|call| call.conversation_id == conv.conversation_id.clone() && call.current_model_id == Some(None))
             {
                 break;
             }
@@ -92,18 +92,18 @@ async fn send_message_clears_persisted_acp_model_after_model_not_found() {
     })
     .await
     .expect("model_not_found should clear persisted ACP model");
-    wait_for_turn_released(&svc, &conv.id).await;
+    wait_for_turn_released(&svc, &conv.conversation_id).await;
 
     assert_eq!(runtime_registry.active_runtime_count(), 0);
     assert_eq!(
         acp_session_repo.runtime_state_saves(),
         vec![RuntimeStateSaveCall {
-            conversation_id: conv.id.clone(),
+            conversation_id: conv.conversation_id.clone(),
             current_model_id: Some(None),
         }]
     );
 
-    let row = repo.get(&conv.id).await.unwrap().unwrap();
+    let row = repo.get(&conv.conversation_id).await.unwrap().unwrap();
     let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
     assert!(extra.get("workspace").is_some());
     assert!(
@@ -123,19 +123,19 @@ async fn send_message_does_not_clear_persisted_acp_model_for_other_terminal_erro
     let conv = svc.create(TEST_USER_1, make_create_req()).await.unwrap();
 
     let scripted_agent = Arc::new(ScriptedAgent::new(
-        &conv.id,
+        &conv.conversation_id,
         vec![vec![AgentStreamEvent::Error(ErrorEventData::legacy(
             "Unknown upstream error.",
             Some(AgentErrorCode::UnknownUpstreamError),
         ))]],
     ));
-    runtime_registry.insert_agent(&conv.id, AgentRuntimeHandle::Mock(scripted_agent));
+    runtime_registry.insert_agent(&conv.conversation_id, AgentRuntimeHandle::Mock(scripted_agent));
 
     let runtime_registry_dyn: Arc<dyn AgentRuntimeRegistry> = runtime_registry.clone();
-    svc.send_message(TEST_USER_1, &conv.id, make_send_req(), &runtime_registry_dyn)
+    svc.send_message(TEST_USER_1, &conv.conversation_id, make_send_req(), &runtime_registry_dyn)
         .await
         .unwrap();
-    wait_for_turn_released(&svc, &conv.id).await;
+    wait_for_turn_released(&svc, &conv.conversation_id).await;
 
     assert_eq!(runtime_registry.active_runtime_count(), 0);
     assert!(acp_session_repo.runtime_state_saves().is_empty());

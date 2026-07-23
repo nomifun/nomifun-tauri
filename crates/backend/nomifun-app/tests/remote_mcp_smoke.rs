@@ -22,7 +22,7 @@ use tower::ServiceExt;
 use nomifun_gateway::{Registry, Surface};
 use nomifun_common::CompanionId;
 
-const TEST_COMPANION_ID: &str = "companion_0190f5fe-7c00-7a00-8abc-012345678951";
+const TEST_COMPANION_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678951";
 
 fn test_companion_id() -> CompanionId {
     CompanionId::parse(TEST_COMPANION_ID).unwrap()

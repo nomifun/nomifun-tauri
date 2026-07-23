@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 /// Row mapping for the `agent_metadata` table.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AgentMetadataRow {
-    pub id: String,
+    pub id: i64,
+    /// Bare UUIDv7 business ID for every agent row.
+    pub agent_id: String,
     pub icon: Option<String>,
     pub name: String,
     pub name_i18n: Option<String>,
@@ -22,6 +24,11 @@ pub struct AgentMetadataRow {
     pub agent_type: String,
     pub agent_source: String,
     pub agent_source_info: Option<String>,
+    /// Stable catalog/install lineage, such as `agent_builtin_claude`.
+    ///
+    /// This is deliberately separate from `agent_id`; the latter is always a
+    /// bare UUIDv7, including for builtin rows.
+    pub source_key: Option<String>,
 
     pub enabled: bool,
 
@@ -44,8 +51,7 @@ pub struct AgentMetadataRow {
     pub available_models: Option<String>,
     pub available_commands: Option<String>,
 
-    /// Display ordering key — smaller values appear first. See the
-    /// `007_agent_metadata_sort_order` migration for the range scheme.
+    /// Display ordering key — smaller values appear first.
     pub sort_order: i64,
 
     pub created_at: TimestampMs,
@@ -55,10 +61,11 @@ pub struct AgentMetadataRow {
 /// Insert / upsert parameters for the full row.
 ///
 /// JSON fields are pre-serialized strings; the caller is responsible for
-/// encoding.
+/// encoding. `source_key` is catalog-owned: custom inserts leave it `NULL`,
+/// while the repository preserves existing builtin lineage on conflict.
 #[derive(Debug, Clone)]
 pub struct UpsertAgentMetadataParams<'a> {
-    pub id: &'a str,
+    pub agent_id: &'a str,
     pub icon: Option<&'a str>,
     pub name: &'a str,
     pub name_i18n: Option<&'a str>,

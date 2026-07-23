@@ -34,7 +34,10 @@ pub use agent_metadata::{AgentMetadataRow, UpdateAgentHandshakeParams, UpsertAge
 pub use agent_execution::*;
 pub use agent_execution_template::*;
 pub use attachment::AttachmentRow;
-pub use channel::{ChannelSessionRow, ChannelUserRow, ChannelPluginRow, ChannelPairingCodeRow};
+pub use channel::{
+    ChannelPairingCodeRow, ChannelPluginRow, ChannelSessionRow, ChannelUserRow,
+    NewChannelPairingCodeRow, NewChannelPluginRow, NewChannelSessionRow, NewChannelUserRow,
+};
 pub use client_preference::ClientPreference;
 pub use companion_token::CompanionApiTokenRow;
 pub use connector_credential::ConnectorCredentialRow;
@@ -42,7 +45,7 @@ pub use conversation::{ConversationDeliveryReceiptRow, ConversationRow};
 pub use conversation_artifact::ConversationArtifactRow;
 pub use cron_job::CronJobRow;
 pub use cron_job_run::CronJobRunRow;
-pub use idmm_intervention::IdmmInterventionRow;
+pub use idmm_intervention::{IdmmInterventionRow, NewIdmmInterventionRow};
 pub use knowledge::{
     CreateKnowledgeTagParams, KnowledgeBaseRow, KnowledgeBindingRow, KnowledgeTagRow,
     UpdateKnowledgeTagParams,

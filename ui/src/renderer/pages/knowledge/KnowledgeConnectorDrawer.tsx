@@ -68,7 +68,7 @@ const KnowledgeConnectorDrawer: React.FC<KnowledgeConnectorDrawerProps> = ({ vis
 
   // Default the attach selector to the first credential.
   useEffect(() => {
-    if (!credId && creds.length > 0) setCredId(creds[0].id);
+    if (!credId && creds.length > 0) setCredId(creds[0].credentialId);
   }, [creds, credId]);
 
   const handleCreateCredential = async () => {
@@ -90,7 +90,7 @@ const KnowledgeConnectorDrawer: React.FC<KnowledgeConnectorDrawerProps> = ({ vis
       setAppId('');
       setAppSecret('');
       await refreshCreds();
-      setCredId(created.id);
+      setCredId(created.credentialId);
     } catch (e) {
       Message.error(knowledgeErrorText(e));
     } finally {
@@ -101,7 +101,7 @@ const KnowledgeConnectorDrawer: React.FC<KnowledgeConnectorDrawerProps> = ({ vis
   const handleTest = async (id: ConnectorCredentialId) => {
     setTestingId(id);
     try {
-      const identity = await ipcBridge.knowledge.testCredential.invoke({ id });
+      const identity = await ipcBridge.knowledge.testCredential.invoke({ credential_id: id });
       Message.success(
         t('knowledge.connector.testOk', { scopes: identity.scopes_available.join(', ') || '—' })
       );
@@ -114,7 +114,7 @@ const KnowledgeConnectorDrawer: React.FC<KnowledgeConnectorDrawerProps> = ({ vis
 
   const handleDeleteCredential = async (id: ConnectorCredentialId) => {
     try {
-      await ipcBridge.knowledge.deleteCredential.invoke({ id });
+      await ipcBridge.knowledge.deleteCredential.invoke({ credential_id: id });
       if (credId === id) setCredId(undefined);
       await refreshCreds();
     } catch (e) {
@@ -131,7 +131,7 @@ const KnowledgeConnectorDrawer: React.FC<KnowledgeConnectorDrawerProps> = ({ vis
     setAttaching(true);
     try {
       await ipcBridge.knowledge.setSource.invoke({
-        id: base.id,
+        knowledge_base_id: base.knowledge_base_id,
         source: {
           kind: FEISHU,
           mode: 'snapshot',
@@ -154,7 +154,7 @@ const KnowledgeConnectorDrawer: React.FC<KnowledgeConnectorDrawerProps> = ({ vis
     if (syncing) return;
     setSyncing(true);
     try {
-      const summary = await ipcBridge.knowledge.syncSource.invoke({ id: base.id });
+      const summary = await ipcBridge.knowledge.syncSource.invoke({ knowledge_base_id: base.knowledge_base_id });
       notifySourceFetchResult(t, summary, t('knowledge.connector.syncOk', { fetched: summary.fetched }));
       onChanged();
     } catch (e) {
@@ -166,7 +166,7 @@ const KnowledgeConnectorDrawer: React.FC<KnowledgeConnectorDrawerProps> = ({ vis
 
   const handleDetach = async () => {
     try {
-      await ipcBridge.knowledge.setSource.invoke({ id: base.id, source: null });
+      await ipcBridge.knowledge.setSource.invoke({ knowledge_base_id: base.knowledge_base_id, source: null });
       Message.success(t('knowledge.connector.detachOk'));
       onChanged();
     } catch (e) {
@@ -238,17 +238,17 @@ const KnowledgeConnectorDrawer: React.FC<KnowledgeConnectorDrawerProps> = ({ vis
               <div className='flex flex-col gap-6px'>
                 {creds.map((c) => (
                   <div
-                    key={c.id}
+                    key={c.credentialId}
                     className='flex items-center justify-between gap-8px rd-6px bg-fill-1 px-10px py-6px text-13px'
                   >
                     <span className='truncate text-t-secondary' title={c.name}>
                       {c.name}
                     </span>
                     <span className='flex shrink-0 gap-4px'>
-                      <Button size='mini' loading={testingId === c.id} onClick={() => void handleTest(c.id)}>
+                      <Button size='mini' loading={testingId === c.credentialId} onClick={() => void handleTest(c.credentialId)}>
                         {t('knowledge.connector.test')}
                       </Button>
-                      <Popconfirm title={t('knowledge.connector.credDeleteConfirm')} onOk={() => void handleDeleteCredential(c.id)}>
+                      <Popconfirm title={t('knowledge.connector.credDeleteConfirm')} onOk={() => void handleDeleteCredential(c.credentialId)}>
                         <Button size='mini' status='danger' type='text' icon={<Delete theme='outline' size='12' />} />
                       </Popconfirm>
                     </span>
@@ -284,7 +284,7 @@ const KnowledgeConnectorDrawer: React.FC<KnowledgeConnectorDrawerProps> = ({ vis
               placeholder={t('knowledge.connector.selectCredential')}
               value={credId}
               onChange={setCredId}
-              options={creds.map((c) => ({ label: c.name, value: c.id }))}
+              options={creds.map((c) => ({ label: c.name, value: c.credentialId }))}
             />
             <Input
               size='small'

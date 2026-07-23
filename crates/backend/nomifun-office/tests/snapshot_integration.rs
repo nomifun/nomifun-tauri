@@ -1,5 +1,5 @@
 use nomifun_api_types::{PreviewHistoryTargetDto, PreviewSnapshotInfoDto};
-use nomifun_common::{ConversationId, PreviewContentType};
+use nomifun_common::{ConversationId, PreviewContentType, PreviewSnapshotId};
 use nomifun_office::SnapshotService;
 
 fn make_target(content_type: PreviewContentType, file_path: Option<&str>) -> PreviewHistoryTargetDto {
@@ -40,7 +40,7 @@ async fn sh1_save_snapshot() {
 
     let info = svc.save(&target, "# Hello").await.unwrap();
 
-    assert!(!info.id.is_empty(), "id must not be empty");
+    assert!(!info.snapshot_id.is_empty(), "snapshot_id must not be empty");
     assert!(info.created_at > 0, "createdAt must be current timestamp");
     assert_eq!(info.size, 7, "size must be content byte count");
     assert_eq!(info.content_type, PreviewContentType::Markdown);
@@ -61,9 +61,9 @@ async fn sh2_list_snapshots_ordered() {
     let list = svc.list(&target).await.unwrap();
     assert_eq!(list.len(), 3);
 
-    assert_eq!(list[0].id, s1.id);
-    assert_eq!(list[1].id, s2.id);
-    assert_eq!(list[2].id, s3.id);
+    assert_eq!(list[0].snapshot_id, s1.snapshot_id);
+    assert_eq!(list[1].snapshot_id, s2.snapshot_id);
+    assert_eq!(list[2].snapshot_id, s3.snapshot_id);
     assert!(list[0].created_at <= list[1].created_at);
     assert!(list[1].created_at <= list[2].created_at);
 }
@@ -76,12 +76,12 @@ async fn sh3_get_snapshot_content() {
     let target = make_target(PreviewContentType::Markdown, Some("/a.md"));
 
     let info = svc.save(&target, "# Hello").await.unwrap();
-    let resp = svc.get_content(&target, &info.id).await.unwrap();
+    let resp = svc.get_content(&target, &info.snapshot_id).await.unwrap();
 
     assert!(resp.is_some());
     let resp = resp.unwrap();
     assert_eq!(resp.content, "# Hello");
-    assert_eq!(resp.snapshot.id, info.id);
+    assert_eq!(resp.snapshot.snapshot_id, info.snapshot_id);
     assert_eq!(resp.snapshot.size, info.size);
     assert_eq!(resp.snapshot.content_type, PreviewContentType::Markdown);
 }
@@ -93,7 +93,8 @@ async fn sh4_get_nonexistent_snapshot() {
     let svc = SnapshotService::new(tmp.path());
     let target = make_target(PreviewContentType::Markdown, Some("/a.md"));
 
-    let resp = svc.get_content(&target, "nonexistent").await.unwrap();
+    let nonexistent = PreviewSnapshotId::new();
+    let resp = svc.get_content(&target, &nonexistent).await.unwrap();
     assert!(resp.is_none());
 }
 
@@ -105,7 +106,8 @@ async fn sh4b_get_nonexistent_snapshot_with_existing() {
     let target = make_target(PreviewContentType::Markdown, Some("/a.md"));
 
     svc.save(&target, "some content").await.unwrap();
-    let resp = svc.get_content(&target, "does-not-exist").await.unwrap();
+    let nonexistent = PreviewSnapshotId::new();
+    let resp = svc.get_content(&target, &nonexistent).await.unwrap();
     assert!(resp.is_none());
 }
 
@@ -116,11 +118,11 @@ async fn sh5_trim_over_limit() {
     let svc = SnapshotService::new(tmp.path());
     let target = make_target(PreviewContentType::Code, Some("/c.rs"));
 
-    let mut first_ids: Vec<String> = Vec::new();
+    let mut first_ids: Vec<PreviewSnapshotId> = Vec::new();
     for i in 0..51 {
         let info = svc.save(&target, &format!("content-{i}")).await.unwrap();
         if i == 0 {
-            first_ids.push(info.id.clone());
+            first_ids.push(info.snapshot_id.clone());
         }
     }
 
@@ -128,7 +130,7 @@ async fn sh5_trim_over_limit() {
     assert_eq!(list.len(), 50, "must trim to 50 snapshots");
 
     assert!(
-        !list.iter().any(|s| s.id == first_ids[0]),
+        !list.iter().any(|s| s.snapshot_id == first_ids[0]),
         "oldest snapshot must be removed"
     );
 }
@@ -145,7 +147,7 @@ async fn sh5b_trim_deletes_files() {
         svc.save(&target, &format!("content-{i}")).await.unwrap();
     }
 
-    let resp = svc.get_content(&target, &first.id).await.unwrap();
+    let resp = svc.get_content(&target, &first.snapshot_id).await.unwrap();
     assert!(resp.is_none(), "trimmed snapshot file must not be readable");
 }
 
@@ -196,7 +198,7 @@ async fn sh7_target_field_combination_different_hash() {
         Some("/a.md"),
         Some("/ws"),
         Some(
-            ConversationId::try_from("conv_0190f5fe-7c00-7a00-8abc-012345678901")
+            ConversationId::try_from("0190f5fe-7c00-7a00-8abc-012345678901")
                 .unwrap(),
         ),
     );
@@ -209,8 +211,16 @@ async fn sh7_target_field_combination_different_hash() {
     assert_eq!(list1.len(), 1);
     assert_eq!(list2.len(), 1);
 
-    let r1 = svc.get_content(&t1, &list1[0].id).await.unwrap().unwrap();
-    let r2 = svc.get_content(&t2, &list2[0].id).await.unwrap().unwrap();
+    let r1 = svc
+        .get_content(&t1, &list1[0].snapshot_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let r2 = svc
+        .get_content(&t2, &list2[0].snapshot_id)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(r1.content, "content-1");
     assert_eq!(r2.content, "content-2");
 }

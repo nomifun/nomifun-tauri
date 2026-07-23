@@ -735,9 +735,9 @@ impl AgentBootstrap {
             // the store). Root is GLOBAL (browser identity is globally shared, NOT per-session) —
             // same `browser-data` root the gateway/engine use. OFF → no sink (zero behavior change).
             if self.config.tools.browser.site_memory {
-                let sm_root = nomi_config::config::app_config_dir()
-                    .map(|d| d.join("browser-data").join("site-memory"))
-                    .unwrap_or_else(|| std::env::temp_dir().join("nomi-browser-data").join("site-memory"));
+                let sm_root = nomi_config::config::app_data_dir()
+                    .join("browser-state")
+                    .join("site-memory");
                 let sink = nomi_browser::site_memory::FileSiteMemorySink::new(sm_root);
                 let store = std::sync::Arc::new(nomi_browser::site_memory::SiteMemoryStore::new(
                     Box::new(sink),

@@ -60,11 +60,9 @@ describe('workpath section toolbar structure', () => {
     expect(createBarSource.includes('ConversationSiderActions')).toBe(false);
   });
 
-  test('backfills the project registry from existing non-default workpaths', () => {
+  test('does not backfill the project registry from existing session workpaths', () => {
     const source = readLocalSource('index.tsx');
 
-    expect(source.includes('migrateProjectWorkpaths')).toBe(true);
-    expect(source.includes("node.key !== DEFAULT_WORKPATH_KEY")).toBe(true);
-    expect(source.includes('setEmptyProjectWorkpaths')).toBe(true);
+    expect(source.includes('migrateProjectWorkpaths')).toBe(false);
   });
 });

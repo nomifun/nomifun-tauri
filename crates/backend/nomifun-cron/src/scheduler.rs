@@ -111,7 +111,7 @@ pub fn validate_schedule(schedule: &CronSchedule) -> Result<(), CronError> {
 // CronScheduler — manages tokio timers for scheduled jobs
 // ---------------------------------------------------------------------------
 
-/// Scheduler callbacks carry both the opaque job id and the owner captured
+/// Scheduler callbacks carry both the local job id and the owner captured
 /// when the timer was installed. `CronService::tick` re-verifies the pair
 /// against the current row before execution, closing delete/recreate races.
 pub type TickCallback = Arc<dyn Fn(String, String) + Send + Sync>;
@@ -135,13 +135,13 @@ impl CronScheduler {
     }
 
     pub fn schedule_job(&self, job: &CronJob) {
-        if CronJobId::try_from(job.id.as_str()).is_err()
+        if CronJobId::parse(&job.cron_job_id).is_err()
             || UserId::try_from(job.user_id.as_str()).is_err()
         {
-            tracing::error!(job_id = %job.id, user_id = %job.user_id, "Refusing to schedule a cron job with invalid durable ids");
+            tracing::error!(job_id = %job.cron_job_id, user_id = %job.user_id, "Refusing to schedule a cron job with invalid durable ids");
             return;
         }
-        self.cancel_job(&job.id);
+        self.cancel_job(&job.cron_job_id);
 
         if !job.enabled {
             return;
@@ -151,7 +151,7 @@ impl CronScheduler {
             return;
         };
 
-        let job_id = job.id.clone();
+        let job_id = job.cron_job_id.clone();
         let user_id = job.user_id.clone();
         let handle_owner = user_id.clone();
         let schedule = job.schedule.clone();
@@ -177,7 +177,7 @@ impl CronScheduler {
         };
 
         self.handles.insert(
-            job.id.clone(),
+            job.cron_job_id.clone(),
             ScheduledHandle {
                 user_id: handle_owner,
                 task: handle,
@@ -186,7 +186,7 @@ impl CronScheduler {
     }
 
     pub fn cancel_job(&self, job_id: &str) {
-        if CronJobId::try_from(job_id).is_err() {
+        if CronJobId::parse(job_id).is_err() {
             return;
         }
         if let Some((_, scheduled)) = self.handles.remove(job_id) {
@@ -198,7 +198,7 @@ impl CronScheduler {
     /// deleted job must never abort a newer same-id timer belonging to someone
     /// else merely because its database verification failed.
     pub fn cancel_job_for_owner(&self, job_id: &str, user_id: &str) {
-        if CronJobId::try_from(job_id).is_err() || UserId::try_from(user_id).is_err() {
+        if CronJobId::parse(job_id).is_err() || UserId::try_from(user_id).is_err() {
             return;
         }
         if let Entry::Occupied(entry) = self.handles.entry(job_id.to_owned())
@@ -224,7 +224,7 @@ impl CronScheduler {
     }
 
     pub fn is_scheduled(&self, job_id: &str) -> bool {
-        CronJobId::try_from(job_id).is_ok() && self.handles.contains_key(job_id)
+        CronJobId::parse(job_id).is_ok() && self.handles.contains_key(job_id)
     }
 }
 
@@ -320,14 +320,14 @@ fn delay_until(target_ms: TimestampMs) -> i64 {
 mod tests {
     use super::*;
 
-    const JOB_1: &str = "cron_0190f5fe-7c00-7a00-8000-000000000001";
-    const JOB_2: &str = "cron_0190f5fe-7c00-7a00-8000-000000000002";
-    const JOB_3: &str = "cron_0190f5fe-7c00-7a00-8000-000000000003";
-    const JOB_AT: &str = "cron_0190f5fe-7c00-7a00-8000-000000000004";
-    const JOB_EVERY: &str = "cron_0190f5fe-7c00-7a00-8000-000000000005";
-    const USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
-    const FOREIGN_USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000002";
-    const CONVERSATION_ID: &str = "conv_0190f5fe-7c00-7a00-8000-000000000001";
+    const JOB_1: &str = "0190f5fe-7c00-7a00-8abc-012345678901";
+    const JOB_2: &str = "0190f5fe-7c00-7a00-8abc-012345678902";
+    const JOB_3: &str = "0190f5fe-7c00-7a00-8abc-012345678903";
+    const JOB_AT: &str = "0190f5fe-7c00-7a00-8abc-012345678904";
+    const JOB_EVERY: &str = "0190f5fe-7c00-7a00-8abc-012345678905";
+    const USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const FOREIGN_USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+    const CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 
     // -- compute_next_run ----------------------------------------------------
 
@@ -660,7 +660,7 @@ mod tests {
     #[tokio::test]
     async fn scheduler_cancel_nonexistent_no_panic() {
         let scheduler = CronScheduler::new(Arc::new(|_, _| {}));
-        scheduler.cancel_job("nonexistent");
+        scheduler.cancel_job("0190f5fe-7c00-7a00-8abc-012345678999");
     }
 
     #[tokio::test]
@@ -721,7 +721,7 @@ mod tests {
     fn make_test_job(id: &str, enabled: bool, next_run_at: Option<TimestampMs>) -> CronJob {
         use crate::types::{CreatedBy, ExecutionMode};
         CronJob {
-            id: id.to_owned(),
+            cron_job_id: id.to_owned(),
             user_id: USER_ID.into(),
             name: "Test".into(),
             enabled,

@@ -84,17 +84,17 @@ export const useCustomAgentsLoader = ({
   // same `DETECTED_AGENTS_SWR_KEY` so we make at most one network request.
   const { agents, revalidate } = useAgents();
   const customAgents = useMemo(
-    () => agents.filter((a) => a.agent_source === 'custom' && availableCustomAgentIds.has(a.id)),
+    () => agents.filter((a) => a.agent_source === 'custom' && availableCustomAgentIds.has(a.agent_id)),
     [agents, availableCustomAgentIds]
   );
 
   const customAgentAvatarMap = useMemo(() => {
     const map = new Map<string, string | undefined>();
     for (const preset of presets) {
-      map.set(preset.id, preset.avatar);
+      map.set(preset.preset_id, preset.avatar);
     }
     for (const agent of customAgents) {
-      map.set(agent.id, agent.icon);
+      map.set(agent.agent_id, agent.icon);
     }
     return map;
   }, [presets, customAgents]);

@@ -19,7 +19,7 @@ describe('Guid collaboration templates', () => {
     const searchMapper = readSource(new URL('../../../common/adapter/searchMapper.ts', import.meta.url));
     const conversation = readSource(new URL('../conversation/components/ChatConversation.tsx', import.meta.url));
 
-    expect(page.includes('selectedCollaborationTemplate?.id')).toBe(true);
+    expect(page.includes('selectedCollaborationTemplate?.execution_template_id')).toBe(true);
     expect(send.includes('execution_template_id: executionTemplateId')).toBe(true);
     expect(
       /decision_policy: decisionPolicy,\s*execution_template_id: executionTemplateId,\s*extra: \{/.test(send),

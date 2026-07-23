@@ -163,8 +163,8 @@ const KnowledgeListPage: React.FC = () => {
     setStudioVisible(false);
     void refresh();
     // Navigate to the new base detail
-    if (base && typeof base === 'object' && 'id' in base) {
-      navigate(`/knowledge/${(base as IKnowledgeBase).id}`);
+    if (base && typeof base === 'object' && 'knowledge_base_id' in base) {
+      navigate(`/knowledge/${(base as IKnowledgeBase).knowledge_base_id}`);
     }
   };
 
@@ -193,7 +193,7 @@ const KnowledgeListPage: React.FC = () => {
       if (!editing) return;
       setSaving(true);
       await ipcBridge.knowledge.updateBase.invoke({
-        id: editing.id,
+        knowledge_base_id: editing.knowledge_base_id,
         name: values.name,
         description: values.description ?? '',
       });
@@ -218,7 +218,7 @@ const KnowledgeListPage: React.FC = () => {
 
   const handleDelete = async (base: IKnowledgeBase) => {
     try {
-      await ipcBridge.knowledge.deleteBase.invoke({ id: base.id, purge: base.managed && purgeRef.current });
+      await ipcBridge.knowledge.deleteBase.invoke({ knowledge_base_id: base.knowledge_base_id, purge: base.managed && purgeRef.current });
       Message.success(t('knowledge.actions.deleteOk'));
       purgeRef.current = false;
       void refresh();
@@ -363,10 +363,10 @@ const KnowledgeListPage: React.FC = () => {
             <div className='grid gap-16px' style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(330px, 1fr))' }}>
               {displayBases.map((base) => (
                 <KnowledgeCard
-                  key={base.id}
+                  key={base.knowledge_base_id}
                   base={base}
                   tagMap={tagMap}
-                  onOpen={(b) => navigate(`/knowledge/${b.id}`)}
+                  onOpen={(b) => navigate(`/knowledge/${b.knowledge_base_id}`)}
                   onEdit={(b) => openEdit(b)}
                   onDelete={handleCardDelete}
                 />

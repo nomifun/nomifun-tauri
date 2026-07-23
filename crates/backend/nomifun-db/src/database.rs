@@ -7,7 +7,7 @@ use fs2::FileExt;
 use sqlx::migrate::Migrator;
 use sqlx::pool::PoolOptions;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
-use sqlx::{Connection, Row, Sqlite, SqlitePool};
+use sqlx::{Row, Sqlite, SqlitePool};
 use tracing::{info, warn};
 
 use crate::error::DbError;
@@ -17,15 +17,9 @@ const MAX_CONNECTIONS: u32 = 5;
 
 /// SQLite busy timeout in milliseconds.
 const BUSY_TIMEOUT_MS: u64 = 5000;
-const STARTUP_FILE_RETRY_DELAYS: [Duration; 5] = [
-    Duration::from_millis(50),
-    Duration::from_millis(100),
-    Duration::from_millis(200),
-    Duration::from_millis(400),
-    Duration::from_millis(800),
-];
 
 static DB_MIGRATOR: Migrator = sqlx::migrate!();
+const V3_BASELINE_MIGRATION_VERSION: i64 = 1;
 
 /// Wraps a SQLite connection pool with lifecycle management.
 #[derive(Clone, Debug)]
@@ -107,7 +101,7 @@ pub(crate) async fn validate_sqlite_snapshot(path: &Path) -> Result<(), DbError>
     result
 }
 
-/// Open an existing ID-v2 database for an offline snapshot without running
+/// Open an existing v3 database for an offline snapshot without running
 /// migrations, recovery, or quarantine/rebuild logic against the source.
 ///
 /// Backup is a preservation operation: an unsupported or invalid source must
@@ -135,35 +129,25 @@ pub async fn open_database_for_backup(path: &Path) -> Result<Database, DbError> 
 }
 
 async fn validate_restorable_database_contract(pool: &SqlitePool) -> Result<(), DbError> {
+    validate_exact_v3_migration_lineage(pool).await?;
     crate::id_schema_contract::validate_id_schema_contract(pool).await?;
     crate::id_schema_contract::validate_id_value_contract(pool).await?;
-    if let Some(violation) = sqlx::query("PRAGMA foreign_key_check")
-        .fetch_optional(pool)
-        .await
-        .map_err(DbError::Query)?
-    {
-        let table: String = violation
-            .try_get("table")
-            .unwrap_or_else(|_| "<unknown>".into());
-        let parent: String = violation
-            .try_get("parent")
-            .unwrap_or_else(|_| "<unknown>".into());
-        return Err(DbError::Init(format!(
-            "backup foreign_key_check failed: table={table}, parent={parent}"
-        )));
-    }
+    validate_no_logical_reference_orphans(pool, "backup").await?;
 
-    let identities = sqlx::query("SELECT key, owner_user_id FROM installation_identity")
-        .fetch_all(pool)
-        .await
-        .map_err(DbError::Query)?;
+    let identities =
+        sqlx::query("SELECT singleton_key, owner_user_id FROM installation_identity")
+            .fetch_all(pool)
+            .await
+            .map_err(DbError::Query)?;
     if identities.len() != 1 {
         return Err(DbError::Init(format!(
             "backup installation_identity must contain exactly one row, found {}",
             identities.len()
         )));
     }
-    let key: String = identities[0].try_get("key").map_err(DbError::Query)?;
+    let key: String = identities[0]
+        .try_get("singleton_key")
+        .map_err(DbError::Query)?;
     let owner_user_id: String = identities[0]
         .try_get("owner_user_id")
         .map_err(DbError::Query)?;
@@ -177,7 +161,7 @@ async fn validate_restorable_database_contract(pool: &SqlitePool) -> Result<(), 
             "backup installation owner ID is not canonical: {owner_user_id}: {error}"
         ))
     })?;
-    let owner_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = ?")
+    let owner_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE user_id = ?")
         .bind(&owner_user_id)
         .fetch_one(pool)
         .await
@@ -190,18 +174,77 @@ async fn validate_restorable_database_contract(pool: &SqlitePool) -> Result<(), 
     Ok(())
 }
 
+async fn validate_exact_v3_migration_lineage(pool: &SqlitePool) -> Result<(), DbError> {
+    let expected = DB_MIGRATOR
+        .iter()
+        .find(|migration| migration.version == V3_BASELINE_MIGRATION_VERSION)
+        .ok_or_else(|| DbError::Init("v3 baseline migration is not embedded in this build".into()))?;
+    if DB_MIGRATOR.iter().count() != 1 {
+        return Err(DbError::Init(
+            "v3 hard-cut build must embed exactly one baseline migration".into(),
+        ));
+    }
+
+    let rows = sqlx::query("SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version")
+        .fetch_all(pool)
+        .await
+        .map_err(DbError::Query)?;
+    if rows.len() != 1 {
+        return Err(DbError::Init(format!(
+            "database must contain exactly one v3 baseline migration row, found {}",
+            rows.len()
+        )));
+    }
+
+    let version: i64 = rows[0].try_get("version").map_err(DbError::Query)?;
+    let success: bool = rows[0].try_get("success").map_err(DbError::Query)?;
+    let checksum: Vec<u8> = rows[0].try_get("checksum").map_err(DbError::Query)?;
+    if version != V3_BASELINE_MIGRATION_VERSION
+        || !success
+        || checksum.as_slice() != expected.checksum.as_ref()
+    {
+        return Err(DbError::Init(
+            "database migration lineage is not the exact v3 baseline".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_no_logical_reference_orphans(
+    pool: &SqlitePool,
+    context: &str,
+) -> Result<(), DbError> {
+    let findings = crate::id_schema_contract::audit_logical_reference_orphans(pool).await?;
+    if findings.is_empty() {
+        return Ok(());
+    }
+    let details = findings
+        .iter()
+        .map(|finding| {
+            format!(
+                "{}.{} -> {}.{}: {} orphan(s), delete={}, rebuild={}",
+                finding.child_table,
+                finding.child_column,
+                finding.parent_table,
+                finding.parent_column,
+                finding.count,
+                finding.delete_policy,
+                finding.rebuild_policy,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(DbError::Init(format!(
+        "{context} logical-reference orphan audit failed: {details}"
+    )))
+}
+
 /// Initialize a file-backed SQLite database.
 ///
 /// Creates the database file and parent directories if they don't exist,
-/// configures pragmas (foreign_keys, busy_timeout, journal_mode=WAL),
-/// runs migrations, and ensures the canonical installation owner exists.
-///
-/// If an existing database belongs to the retired numeric-ID migration
-/// lineage, its complete SQLite file family is quarantined as
-/// `*.pre-id-v2.bak*` and a clean ID-contract-v2 database is created. This is
-/// an intentional pre-release hard cut: rows with integer entity keys are not
-/// imported into the new lineage. Explicit corruption-like failures retain a
-/// separate recovery path.
+/// configures the busy timeout and WAL journal mode, runs migrations, and
+/// ensures the canonical installation owner exists. Migration-lineage errors
+/// fail fast; the app bootstrap owns any explicit dataset reset.
 pub async fn init_database(path: &Path) -> Result<Database, DbError> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -210,17 +253,11 @@ pub async fn init_database(path: &Path) -> Result<Database, DbError> {
             .map_err(|e| DbError::Init(format!("Failed to create database directory: {e}")))?;
     }
 
-    match try_init_file(path).await {
-        Ok(db) => Ok(db),
-        Err(e) if path.exists() && is_retired_schema_lineage_error(&e) => {
-            quarantine_retired_schema_database(path, e).await
-        }
-        Err(e) if path.exists() && should_attempt_recovery(&e) => {
-            warn!("Database initialization failed, attempting recovery: {e}");
-            recover_and_retry(path, e).await
-        }
-        Err(e) => Err(e),
-    }
+    // The database crate never renames, repairs, migrates, or replaces an
+    // existing dataset. The app bootstrap owns the v3 hard-reset lifecycle
+    // before any pool is opened; direct callers fail closed on corruption or
+    // unsupported lineage.
+    try_init_file(path).await
 }
 
 /// Initialize an in-memory SQLite database (for testing).
@@ -247,7 +284,6 @@ pub async fn init_database_memory_with_owner(
 async fn init_database_memory_inner(requested_owner_user_id: Option<String>) -> Result<Database, DbError> {
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")
         .map_err(|e| DbError::Init(format!("Invalid memory connection string: {e}")))?
-        .foreign_keys(true)
         .busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS));
 
     let pool = PoolOptions::<Sqlite>::new()
@@ -261,6 +297,7 @@ async fn init_database_memory_inner(requested_owner_user_id: Option<String>) -> 
     run_migrations(&pool).await?;
     crate::id_schema_contract::validate_id_schema_contract(&pool).await?;
     ensure_installation_owner(&pool, requested_owner_user_id.as_deref()).await?;
+    validate_no_logical_reference_orphans(&pool, "post-initialization").await?;
 
     info!("In-memory database initialized");
     Ok(Database { pool })
@@ -285,7 +322,6 @@ async fn try_init_file(path: &Path) -> Result<Database, DbError> {
     let opts = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
-        .foreign_keys(true)
         .busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))
         .journal_mode(SqliteJournalMode::Wal);
 
@@ -298,7 +334,8 @@ async fn try_init_file(path: &Path) -> Result<Database, DbError> {
     let setup = async {
         run_migrations(&pool).await?;
         crate::id_schema_contract::validate_id_schema_contract(&pool).await?;
-        ensure_installation_owner(&pool, None).await
+        ensure_installation_owner(&pool, None).await?;
+        validate_no_logical_reference_orphans(&pool, "post-initialization").await
     }
     .await;
     if let Err(e) = setup {
@@ -329,41 +366,6 @@ fn migrate_lock_path(db_path: &Path) -> PathBuf {
     p
 }
 
-fn retry_startup_file_op<T, F>(operation: &str, path: &Path, mut op: F) -> std::io::Result<T>
-where
-    F: FnMut() -> std::io::Result<T>,
-{
-    for (attempt, delay) in STARTUP_FILE_RETRY_DELAYS.iter().enumerate() {
-        match op() {
-            Ok(value) => return Ok(value),
-            Err(e) if is_retryable_startup_file_error(&e) => {
-                warn!(
-                    operation,
-                    path = %path.display(),
-                    attempt = attempt + 1,
-                    retry_after_ms = delay.as_millis(),
-                    raw_os_error = ?e.raw_os_error(),
-                    error = %e,
-                    "Startup file operation failed; retrying"
-                );
-                std::thread::sleep(*delay);
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    op()
-}
-
-fn is_retryable_startup_file_error(error: &std::io::Error) -> bool {
-    match error.kind() {
-        std::io::ErrorKind::Interrupted
-        | std::io::ErrorKind::PermissionDenied
-        | std::io::ErrorKind::TimedOut
-        | std::io::ErrorKind::WouldBlock => true,
-        _ => matches!(error.raw_os_error(), Some(5 | 32 | 33)),
-    }
-}
-
 async fn run_migrations(pool: &SqlitePool) -> Result<(), DbError> {
     // File-backed callers hold a cross-process startup lock before opening the
     // SQLite pool. sqlx-sqlite's Migrate impl has no-op
@@ -373,44 +375,10 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), DbError> {
     // still shutting down, or `nomicore doctor` racing the server) can both
     // decide to apply the same version and the slower one's INSERT into
     // `_sqlx_migrations` blows up with `UNIQUE constraint failed:
-    // _sqlx_migrations.version`. The outer startup lock also covers
-    // connection PRAGMAs before migration execution.
-    //
-    // Any future table-rebuild migration (CREATE new + INSERT SELECT + DROP
-    // old + ALTER RENAME) needs two pragmas:
-    // - foreign_keys=OFF: prevents DROP TABLE from triggering ON DELETE CASCADE
-    // - legacy_alter_table=ON: prevents ALTER TABLE RENAME from rewriting FK
-    //   references in other tables (SQLite 3.26+ rewrites them by default)
-    // Both must be set outside a transaction (sqlx wraps each migration in
-    // one), so they are applied here for every migration run.
+    // _sqlx_migrations.version`. The outer startup lock also covers connection
+    // setup before migration execution.
     let mut conn = pool.acquire().await.map_err(DbError::Query)?;
-    sqlx::query("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON")
-        .execute(&mut *conn)
-        .await
-        .map_err(DbError::Query)?;
-
-    let migration_result = run_migrations_with_retry(&mut conn).await;
-
-    let pragma_result = sqlx::query("PRAGMA foreign_keys = ON; PRAGMA legacy_alter_table = OFF")
-        .execute(&mut *conn)
-        .await
-        .map_err(DbError::Query);
-
-    migration_result?;
-    pragma_result?;
-
-    if let Some(violation) = sqlx::query("PRAGMA foreign_key_check")
-        .fetch_optional(&mut *conn)
-        .await
-        .map_err(DbError::Query)?
-    {
-        let table: String = violation.try_get("table").unwrap_or_else(|_| "<unknown>".into());
-        let parent: String = violation.try_get("parent").unwrap_or_else(|_| "<unknown>".into());
-        let row_id: Option<i64> = violation.try_get("rowid").ok();
-        return Err(DbError::Init(format!(
-            "post-migration foreign_key_check failed: table={table}, rowid={row_id:?}, parent={parent}"
-        )));
-    }
+    run_migrations_with_retry(&mut conn).await?;
     validate_quick_check_on_connection(&mut conn).await
 }
 
@@ -453,13 +421,8 @@ fn require_quick_check_ok(rows: Vec<String>) -> Result<(), DbError> {
 /// rolled back, so re-running `sqlx::migrate!().run` is safe: the second
 /// pass sees the row that the winner committed, checksum matches (same
 /// shipped binary), and the migration is treated as already applied.
-///
-/// Migration 003 also has one narrowly detected compatibility retry for the
-/// disabled-foreign-key behavior documented by
-/// [`prepare_pending_local_model_decommission`].
 async fn run_migrations_with_retry(conn: &mut sqlx::SqliteConnection) -> Result<(), DbError> {
     let mut retried_unique_conflict = false;
-    let mut retried_local_model_cleanup = false;
 
     loop {
         match DB_MIGRATOR.run(&mut *conn).await {
@@ -470,17 +433,6 @@ async fn run_migrations_with_retry(conn: &mut sqlx::SqliteConnection) -> Result<
                 retried_unique_conflict = true;
                 warn!(
                     "Concurrent migrator detected (UNIQUE conflict on _sqlx_migrations); retrying"
-                );
-            }
-            Err(e)
-                if !retried_local_model_cleanup
-                    && is_local_model_decommission_compatibility_conflict(&e)
-                    && prepare_pending_local_model_decommission(conn).await? =>
-            {
-                retried_local_model_cleanup = true;
-                warn!(
-                    "Migration 003 encountered a retired local-model template binding; \
-                     removed the retired live configuration and retrying"
                 );
             }
             Err(e) => return Err(DbError::Migration(e)),
@@ -496,98 +448,6 @@ async fn run_migrations_with_retry(conn: &mut sqlx::SqliteConnection) -> Result<
 fn is_migrations_table_unique_conflict(err: &sqlx::migrate::MigrateError) -> bool {
     let msg = err.to_string();
     msg.contains("UNIQUE constraint failed: _sqlx_migrations.version")
-}
-
-fn is_local_model_decommission_compatibility_conflict(
-    err: &sqlx::migrate::MigrateError,
-) -> bool {
-    let message = err.to_string();
-    message.contains("provider is still referenced by an executable Agent binding")
-        || message.contains(
-            "Conversation execution template must be executable, owner-scoped, and contain the lead model",
-        )
-}
-
-/// Migration 003 deletes local-model templates before deleting their provider.
-/// With foreign keys disabled, template participants do not cascade away and
-/// conversation template references are not set to NULL. Existing integrity
-/// triggers can therefore abort the migration before it reaches its final
-/// foreign-key check. This compatibility path runs only after one of those
-/// exact trigger failures and only while 003 is still pending, then lets the
-/// immutable shipped migration retry normally.
-async fn prepare_pending_local_model_decommission(
-    conn: &mut sqlx::SqliteConnection,
-) -> Result<bool, DbError> {
-    let migration_applied: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 3 AND success = 1")
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(DbError::Query)?;
-    if migration_applied != 0 {
-        return Ok(false);
-    }
-
-    let local_provider_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM providers WHERE platform = 'nomifun-local-model'")
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(DbError::Query)?;
-    if local_provider_count == 0 {
-        return Ok(false);
-    }
-
-    let mut transaction = conn.begin().await.map_err(DbError::Query)?;
-    sqlx::query(
-        "CREATE TEMP TABLE pending_local_model_templates (id TEXT PRIMARY KEY NOT NULL)",
-    )
-    .execute(&mut *transaction)
-    .await
-    .map_err(DbError::Query)?;
-    sqlx::query(
-        "INSERT INTO pending_local_model_templates (id) \
-         SELECT DISTINCT participant.template_id \
-         FROM agent_execution_template_participants participant \
-         JOIN providers provider ON provider.id = participant.provider_id \
-         WHERE provider.platform = 'nomifun-local-model'",
-    )
-    .execute(&mut *transaction)
-    .await
-    .map_err(DbError::Query)?;
-    sqlx::query(
-        "UPDATE conversations SET execution_template_id = NULL \
-         WHERE execution_template_id IN (SELECT id FROM pending_local_model_templates)",
-    )
-    .execute(&mut *transaction)
-    .await
-    .map_err(DbError::Query)?;
-    sqlx::query(
-        "DELETE FROM agent_execution_template_participants \
-         WHERE template_id IN (SELECT id FROM pending_local_model_templates)",
-    )
-    .execute(&mut *transaction)
-    .await
-    .map_err(DbError::Query)?;
-    sqlx::query(
-        "DELETE FROM agent_execution_templates \
-         WHERE id IN (SELECT id FROM pending_local_model_templates)",
-    )
-    .execute(&mut *transaction)
-    .await
-    .map_err(DbError::Query)?;
-    sqlx::query(
-        "DELETE FROM model_profiles WHERE provider_id IN (\
-             SELECT id FROM providers WHERE platform = 'nomifun-local-model'\
-         )",
-    )
-    .execute(&mut *transaction)
-    .await
-    .map_err(DbError::Query)?;
-    sqlx::query("DROP TABLE pending_local_model_templates")
-        .execute(&mut *transaction)
-        .await
-        .map_err(DbError::Query)?;
-    transaction.commit().await.map_err(DbError::Query)?;
-    Ok(true)
 }
 
 /// RAII guard that holds an exclusive file lock for the lifetime of the
@@ -625,10 +485,10 @@ impl Drop for MigrateLockGuard {
 
 /// Ensure exactly one canonical installation owner exists.
 ///
-/// The owner is a normal `user_<uuidv7>` entity. The singleton
+/// The owner is a normal UUIDv7-addressed user entity. The singleton
 /// `installation_identity` row is the durable indirection used by
-/// repositories and SQL triggers; restoring a database therefore preserves
-/// the same owner ID, while a fresh dataset mints an unrelated one.
+/// repositories and logical-reference checks; restoring a database therefore
+/// preserves the same owner ID, while a fresh dataset mints an unrelated one.
 async fn ensure_installation_owner(
     pool: &SqlitePool,
     requested_owner_user_id: Option<&str>,
@@ -636,7 +496,8 @@ async fn ensure_installation_owner(
     let mut transaction = pool.begin().await.map_err(DbError::Query)?;
 
     let existing: Option<String> = sqlx::query_scalar(
-        "SELECT owner_user_id FROM installation_identity WHERE key = 'installation'",
+        "SELECT owner_user_id FROM installation_identity \
+         WHERE singleton_key = 'installation'",
     )
     .fetch_optional(&mut *transaction)
     .await
@@ -655,11 +516,12 @@ async fn ensure_installation_owner(
                 "installation owner ID is not canonical: {owner_user_id}: {error}"
             ))
         })?;
-        let owner_exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = ?")
-            .bind(&owner_user_id)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(DbError::Query)?;
+        let owner_exists: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE user_id = ?")
+                .bind(&owner_user_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(DbError::Query)?;
         if owner_exists != 1 {
             return Err(DbError::Init(format!(
                 "installation identity references missing owner user {owner_user_id}"
@@ -686,7 +548,7 @@ async fn ensure_installation_owner(
         })?;
         let now = nomifun_common::now_ms();
         sqlx::query(
-            "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
+            "INSERT INTO users (user_id, username, password_hash, created_at, updated_at) \
              VALUES (?, 'admin', '', ?, ?)",
         )
         .bind(&owner_user_id)
@@ -696,7 +558,7 @@ async fn ensure_installation_owner(
         .await
         .map_err(DbError::Query)?;
         sqlx::query(
-            "INSERT INTO installation_identity (key, owner_user_id) \
+            "INSERT INTO installation_identity (singleton_key, owner_user_id) \
              VALUES ('installation', ?)",
         )
         .bind(&owner_user_id)
@@ -710,216 +572,9 @@ async fn ensure_installation_owner(
     Ok(owner_user_id)
 }
 
-// ---------------------------------------------------------------------------
-// Pre-ID-v2 bootstrap salvage
-//
-// NOTE: pre-launch convenience; remove before release, restoring fail-fast.
-//
-// The 2026-06-12 clean-baseline refactor squashed migrations 001-021 into a
-// single 001_baseline.sql, resetting the migration chain. Any dev database
-// created before the squash fails sqlx validation: version 1's checksum no
-// longer matches, and applied versions 2-021 are missing from the resolved
-// set. The system has not shipped and every dev database is disposable, so
-// instead of making each machine delete the file by hand we rename the old
-// database (plus its -wal/-shm sidecars) to `*.pre-id-v2.bak` and rebuild
-// an empty database from the baseline.
-// ---------------------------------------------------------------------------
-
-/// Classify migration failures caused by a database whose `_sqlx_migrations`
-/// history does not line up with the shipped (squashed) migration set.
-fn is_retired_schema_lineage_error(err: &DbError) -> bool {
-    use sqlx::migrate::MigrateError;
-    matches!(
-        err,
-        DbError::Migration(
-            MigrateError::VersionMismatch(_)
-                | MigrateError::VersionMissing(_)
-                | MigrateError::VersionTooOld(_, _)
-                | MigrateError::VersionTooNew(_, _)
-        )
-    )
-}
-
-/// `{file_name}.pre-id-v2.bak`, with a numeric suffix when a previous
-/// backup already occupies the name.
-fn retired_schema_backup_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("nomifun-backend.db");
-    let base = path.with_file_name(format!("{file_name}.pre-id-v2.bak"));
-    if !base.exists() {
-        return base;
-    }
-    for n in 1..10_000 {
-        let candidate = path.with_file_name(format!("{file_name}.pre-id-v2.bak.{n}"));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    // Practically unreachable; fall back to a timestamped name.
-    path.with_file_name(format!(
-        "{file_name}.pre-id-v2.bak.{}",
-        nomifun_common::now_ms()
-    ))
-}
-
-/// `{file_name}{suffix}` next to `path` (SQLite sidecars append to the full
-/// file name: `nomifun-backend.db-wal`, `nomifun-backend.db-shm`).
-fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.file_name().map(|s| s.to_os_string()).unwrap_or_default();
-    name.push(suffix);
-    path.with_file_name(name)
-}
-
-async fn quarantine_retired_schema_database(path: &Path, original_error: DbError) -> Result<Database, DbError> {
-    let backup = retired_schema_backup_path(path);
-    info!(
-        db = %path.display(),
-        backup = %backup.display(),
-        original_error = %original_error,
-        "Database uses the retired numeric-ID migration lineage; \
-         renaming it aside and rebuilding an empty database \
-         (pre-launch behavior -> dev databases are disposable)"
-    );
-
-    retry_startup_file_op("rename pre-id-v2 database", path, || {
-        std::fs::rename(path, &backup)
-    })
-    .map_err(|e| {
-        DbError::Init(format!(
-            "Pre-ID-v2 rebuild failed: could not rename old database to {}: {e}. \
-             Original error: {original_error}",
-            backup.display()
-        ))
-    })?;
-
-    // Move the WAL/SHM sidecars alongside the renamed database so the new
-    // file does not start life next to a stale journal.
-    for suffix in ["-wal", "-shm"] {
-        let src = sibling_with_suffix(path, suffix);
-        if !src.exists() {
-            continue;
-        }
-        let dst = sibling_with_suffix(&backup, suffix);
-        if let Err(rename_err) =
-            retry_startup_file_op("rename pre-id-v2 sidecar", &src, || std::fs::rename(&src, &dst))
-        {
-            warn!(
-                sidecar = %src.display(),
-                error = %rename_err,
-                "Could not rename pre-id-v2 sidecar; deleting it instead"
-            );
-            retry_startup_file_op("remove pre-id-v2 sidecar", &src, || std::fs::remove_file(&src)).map_err(
-                |e| {
-                    DbError::Init(format!(
-                        "Pre-ID-v2 rebuild failed: could not move or delete sidecar {}: {e}. \
-                         Original error: {original_error}",
-                        src.display()
-                    ))
-                },
-            )?;
-        }
-    }
-
-    match try_init_file(path).await {
-        Ok(db) => {
-            info!(
-                backup = %backup.display(),
-                "Rebuilt empty database from baseline; old database preserved at backup path"
-            );
-            Ok(db)
-        }
-        Err(retry_err) => Err(DbError::Init(format!(
-            "Pre-ID-v2 rebuild failed after renaming old database to {}: {retry_err}. \
-             Original error: {original_error}",
-            backup.display()
-        ))),
-    }
-}
-
-async fn recover_and_retry(path: &Path, original_error: DbError) -> Result<Database, DbError> {
-    let backup_path = format!("{}.backup.{}", path.display(), nomifun_common::now_ms());
-    warn!("Backing up corrupted database to: {backup_path}");
-
-    std::fs::rename(path, &backup_path).map_err(|e| {
-        DbError::Init(format!(
-            "Recovery failed: could not backup corrupted database: {e}. \
-             Original error: {original_error}"
-        ))
-    })?;
-
-    match try_init_file(path).await {
-        Ok(db) => {
-            warn!("Database recovered. Backup at: {backup_path}");
-            Ok(db)
-        }
-        Err(retry_err) => Err(DbError::Init(format!(
-            "Recovery failed after backup: {retry_err}. Original error: {original_error}"
-        ))),
-    }
-}
-
-fn should_attempt_recovery(err: &DbError) -> bool {
-    match err {
-        DbError::Migration(_) => false,
-        DbError::NotFound(_) | DbError::Conflict(_) | DbError::SafetyBackup(_) => false,
-        DbError::Query(_) | DbError::Init(_) => is_corruption_like_error(err),
-    }
-}
-
-fn is_corruption_like_error(err: &DbError) -> bool {
-    let message = err.to_string().to_ascii_lowercase();
-
-    [
-        "sqlite_corrupt",
-        "database disk image is malformed",
-        "file is not a database",
-        "sqlite_notadb",
-        "malformed database schema",
-    ]
-    .iter()
-    .any(|needle| message.contains(needle))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn retired_lineage_detector_matches_version_class_errors() {
-        use sqlx::migrate::MigrateError;
-        for err in [
-            MigrateError::VersionMismatch(1),
-            MigrateError::VersionMissing(2),
-            MigrateError::VersionTooOld(1, 42),
-            MigrateError::VersionTooNew(42, 1),
-        ] {
-            assert!(is_retired_schema_lineage_error(&DbError::Migration(err)));
-        }
-    }
-
-    #[test]
-    fn retired_lineage_detector_rejects_other_errors() {
-        let exec = DbError::Migration(sqlx::migrate::MigrateError::Execute(
-            sqlx::Error::Protocol("boom".to_owned()),
-        ));
-        assert!(!is_retired_schema_lineage_error(&exec));
-        assert!(!is_retired_schema_lineage_error(&DbError::Init("locked".into())));
-    }
-
-    #[test]
-    fn startup_file_retry_handles_windows_transient_lock_errors() {
-        for code in [5, 32, 33] {
-            assert!(is_retryable_startup_file_error(&std::io::Error::from_raw_os_error(code)));
-        }
-    }
-
-    #[test]
-    fn startup_file_retry_rejects_non_transient_errors() {
-        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing file");
-        assert!(!is_retryable_startup_file_error(&err));
-    }
 
     #[tokio::test]
     async fn public_snapshot_includes_committed_wal_pages_and_refuses_overwrite() {
@@ -927,11 +582,11 @@ mod tests {
         let source = dir.path().join("source.db");
         let snapshot = dir.path().join("bundle").join("main.db");
         let database = init_database(&source).await.unwrap();
-        sqlx::query("CREATE TABLE snapshot_probe (value TEXT PRIMARY KEY)")
-            .execute(database.pool())
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO snapshot_probe(value) VALUES ('committed')")
+        sqlx::query(
+            "INSERT INTO client_preferences (key, value, updated_at) \
+             VALUES ('snapshot_probe', 'committed', ?)",
+        )
+            .bind(nomifun_common::now_ms())
             .execute(database.pool())
             .await
             .unwrap();
@@ -945,7 +600,8 @@ mod tests {
             .connect_with(options)
             .await
             .unwrap();
-        let value: String = sqlx::query_scalar("SELECT value FROM snapshot_probe")
+        let value: String =
+            sqlx::query_scalar("SELECT value FROM client_preferences WHERE key = 'snapshot_probe'")
             .fetch_one(&pool)
             .await
             .unwrap();

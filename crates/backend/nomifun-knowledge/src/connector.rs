@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 pub struct ConnectorCredential {
     /// Present only for a persisted credential. Validation probes are not
     /// durable entities and therefore carry no synthetic/empty identifier.
-    pub id: Option<ConnectorCredentialId>,
+    pub credential_id: Option<ConnectorCredentialId>,
     pub kind: String,
     pub name: String,
     pub payload: serde_json::Value,
@@ -186,7 +186,12 @@ mod tests {
     async fn trait_is_object_safe_and_defaults_apply() {
         let c: Arc<dyn KnowledgeConnector> = Arc::new(MockConnector);
         assert_eq!(c.kind(), "mock");
-        let cred = ConnectorCredential { id: None, kind: "mock".into(), name: "n".into(), payload: serde_json::json!({}) };
+        let cred = ConnectorCredential {
+            credential_id: None,
+            kind: "mock".into(),
+            name: "n".into(),
+            payload: serde_json::json!({}),
+        };
         assert_eq!(c.validate_credentials(&cred).await.unwrap().tenant_name.as_deref(), Some("Acme"));
         let page = c.list_documents(&cred, &ConnectorScope::default(), &SyncCursor::default(), None).await.unwrap();
         assert_eq!(page.docs.len(), 1);

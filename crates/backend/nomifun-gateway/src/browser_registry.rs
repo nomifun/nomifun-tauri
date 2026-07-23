@@ -175,9 +175,7 @@ impl BrowserRegistry {
     /// workspace. Constructs NO tools and launches NO browser — slots are created
     /// lazily on first use per companion.
     pub fn new(config: &BrowserConfig) -> Self {
-        let data_dir = nomi_config::config::app_config_dir()
-            .map(|d| d.join("browser-data"))
-            .unwrap_or_else(|| std::env::temp_dir().join("nomi-browser-data"));
+        let data_dir = nomi_config::config::app_data_dir();
         Self {
             data_dir,
             headful: !config.headless,
@@ -259,7 +257,9 @@ impl BrowserRegistry {
             return existing.clone();
         }
         let workspace = self.workspace_for(key);
-        let mut tool = BrowserTool::with_data_dir(self.data_dir.clone(), self.headful)
+        let mut tool =
+            BrowserTool::with_data_dir(self.data_dir.join("browser-data"), self.headful)
+                .persistent_data_dir(self.data_dir.clone())
             .workspace(workspace)
             .bundled_dir(self.bundled_dir.clone())
             .with_approval_gate(Arc::new(GatewayAutoApprovalGate));
@@ -339,7 +339,7 @@ impl BrowserRegistry {
     /// fails closed and denies) when the pending store is at capacity — a
     /// misbehaving agent cannot grow it without bound.
     pub fn stash_pending(&self, key: &str, input: Value) -> Option<String> {
-        let call_id = nomifun_common::generate_prefixed_id("browseroob");
+        let call_id = nomifun_common::generate_id();
         let mut map = self.pending.lock().expect("browser registry pending poisoned");
         if map.len() >= MAX_PENDING {
             return None;
@@ -491,11 +491,11 @@ mod tests {
     #[test]
     fn key_prefers_companion_then_conversation_and_rejects_missing_identity() {
         let companion = CompanionId::parse(
-            "companion_0190f5fe-7c00-7a00-8abc-012345678901",
+            "0190f5fe-7c00-7a00-8abc-012345678901",
         )
         .unwrap();
         let conversation = ConversationId::parse(
-            "conv_0190f5fe-7c00-7a00-8abc-012345678902",
+            "0190f5fe-7c00-7a00-8abc-012345678902",
         )
         .unwrap();
         assert_eq!(
@@ -588,7 +588,10 @@ mod tests {
         let r = registry();
         let input = json!({"action": "click", "ref": "f0e3"});
         let call_id = r.stash_pending("companion_a", input.clone()).expect("under cap");
-        assert!(call_id.starts_with("browseroob_"), "synthetic call_id prefix: {call_id}");
+        assert!(
+            nomifun_common::validate_uuidv7(&call_id).is_ok(),
+            "synthetic call_id must be a bare UUIDv7: {call_id}"
+        );
         assert_eq!(r.pending_count(), 1);
 
         let pending = r.take_pending(&call_id).expect("the just-stashed action");
@@ -602,7 +605,7 @@ mod tests {
     #[test]
     fn take_unknown_call_id_is_none() {
         let r = registry();
-        assert!(r.take_pending("browseroob_019f6672-ed10-7193-8a86-7981f6c6feae").is_none());
+        assert!(r.take_pending("019f6672-ed10-7193-8a86-7981f6c6feae").is_none());
     }
 
     #[test]
@@ -710,7 +713,7 @@ mod tests {
     async fn gateway_browser_navigate_then_observe_round_trip() {
         let r = registry();
         let companion = CompanionId::parse(
-            "companion_0190f5fe-7c00-7a00-8abc-012345678911",
+            "0190f5fe-7c00-7a00-8abc-012345678911",
         )
         .unwrap();
         let key = BrowserRegistry::key_for(Some(&companion), None).unwrap();
@@ -736,7 +739,7 @@ mod tests {
         // Isolation: a second companion gets a distinct slot (separate engine /
         // user-data-dir) — gateway-driven browsing is per-companion.
         let other_companion = CompanionId::parse(
-            "companion_0190f5fe-7c00-7a00-8abc-012345678912",
+            "0190f5fe-7c00-7a00-8abc-012345678912",
         )
         .unwrap();
         let other = BrowserRegistry::key_for(Some(&other_companion), None).unwrap();
@@ -759,7 +762,7 @@ mod tests {
     async fn gw2_confirmed_action_runs_held_then_approved() {
         let r = registry();
         let companion = CompanionId::parse(
-            "companion_0190f5fe-7c00-7a00-8abc-012345678913",
+            "0190f5fe-7c00-7a00-8abc-012345678913",
         )
         .unwrap();
         let key = BrowserRegistry::key_for(Some(&companion), None).unwrap();

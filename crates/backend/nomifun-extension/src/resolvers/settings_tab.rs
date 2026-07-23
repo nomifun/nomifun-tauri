@@ -16,7 +16,7 @@ fn resolve_asset_url(extension_name: &str, raw: &str) -> Option<String> {
 
 /// Resolve a single settings tab contribution.
 ///
-/// Position information (`relativeTo`, `placement`) is preserved for the
+/// Position information (`relative_to`, `placement`) is preserved for the
 /// frontend to handle insertion ordering.
 pub fn resolve_settings_tab(
     tab: &ExtSettingsTab,

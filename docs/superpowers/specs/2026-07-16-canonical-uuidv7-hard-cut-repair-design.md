@@ -1,5 +1,13 @@
 # Canonical UUIDv7 Hard-Cut Repair Design
 
+> **⚠️ SUPERSEDED / LEGACY 历史设计（非当前架构）**
+> 本文是 2026 年 7 月 16 日形成的过渡性 UUIDv7 硬切设计，保留用于追溯
+> 决策与风险分析，不得作为当前实现规范。当前 v3 架构已进一步重构为：所有
+> 持久化表统一使用自增 `id INTEGER PRIMARY KEY AUTOINCREMENT`；跨边界业务
+> 实体使用不带前缀的裸 UUIDv7；移除物理外键；新版本强制数据库清空重置，
+> 不进行历史数据迁移兼容。本文出现的前缀注册表、`prefix_UUIDv7` 以及相关
+> `wsa_`/`conv_` 等格式均属于 Legacy 历史内容。
+
 ## Decision
 
 NomiFun will enforce the current entity-ID contract without interpreting,

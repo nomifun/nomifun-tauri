@@ -89,10 +89,8 @@ export function buildWorkpathTree(
       kind: 'interactive',
       id: c.id,
       name: c.name,
-      // pinned/pinned_at 读 extra 即可：fromApiConversation 已把 DB 顶层 pinned 列
-      // 镜像进 extra（冲突时列优先），见 ui/src/common/adapter/apiModelMapper.ts
-      pinned: extra.pinned === true,
-      pinnedAt: typeof extra.pinned_at === 'number' ? extra.pinned_at : 0,
+      pinned: c.pinned === true,
+      pinnedAt: c.pinned_at ?? 0,
       activityAt: c.modified_at ?? 0,
       createdAt: c.created_at ?? 0,
       conversation: c,
@@ -102,7 +100,7 @@ export function buildWorkpathTree(
     const key = t.is_default_workpath ? DEFAULT_WORKPATH_KEY : workpathKey(t.cwd);
     ensure(key).terminal.push({
       kind: 'terminal',
-      id: t.id,
+      id: t.terminal_id,
       name: t.name,
       pinned: !!t.pinned,
       pinnedAt: t.pinned_at ?? 0,

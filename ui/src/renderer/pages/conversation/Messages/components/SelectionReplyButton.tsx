@@ -5,13 +5,14 @@
  */
 
 import type { TMessage } from '@/common/chat/chatLib';
+import type { MessageId } from '@/common/types/ids';
 import { emitter } from '@/renderer/utils/emitter';
 import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
 import { Quote } from '@icon-park/react';
 import React, { useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
-type ReplyPos = { top: number; left: number; text: string; msgId: string; msgPos: string };
+type ReplyPos = { top: number; left: number; text: string; messageId: MessageId; msgPos: string };
 
 /**
  * Get the current selection, checking Shadow DOM roots if needed.
@@ -106,8 +107,13 @@ const SelectionReplyButton: React.FC<{ messages: TMessage[] }> = ({ messages }) 
         const msgEl = findMessageElement(sel);
         if (!msgEl) return;
 
-        const msgId = msgEl.id.slice('message-'.length);
-        const msg = messagesRef.current.find((m) => m.id === msgId);
+        const messageId = msgEl.getAttribute('data-message-business-id');
+        if (!messageId) return;
+        const msg = messagesRef.current.find(
+          (message) => (message.message_id ?? message.msg_id) === messageId
+        );
+        const businessMessageId = msg?.message_id ?? msg?.msg_id;
+        if (!businessMessageId) return;
         const rect = sel.getRangeAt(0).getBoundingClientRect();
 
         // Place above selection; if too close to top, place below
@@ -119,7 +125,7 @@ const SelectionReplyButton: React.FC<{ messages: TMessage[] }> = ({ messages }) 
           top,
           left: Math.max(60, Math.min(rect.left + rect.width / 2, window.innerWidth - 60)),
           text,
-          msgId,
+          messageId: businessMessageId,
           msgPos: msg?.position ?? 'left',
         });
       }, 20);
@@ -167,7 +173,7 @@ const SelectionReplyButton: React.FC<{ messages: TMessage[] }> = ({ messages }) 
       onMouseDown={(e) => {
         e.preventDefault();
         emitter.emit('sendbox.reply', {
-          messageId: pos.msgId,
+          messageId: pos.messageId,
           content: pos.text,
           position: pos.msgPos as 'left' | 'right' | 'center' | 'pop',
         });

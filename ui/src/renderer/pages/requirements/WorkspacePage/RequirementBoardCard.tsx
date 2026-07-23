@@ -38,7 +38,7 @@ const formatCreatedDate = (timestamp: number): string =>
 const RequirementBoardCard: React.FC<RequirementBoardCardProps> = ({ item, onOpenDetail, onDragStart }) => {
   const { t } = useTranslation();
 
-  const open = () => onOpenDetail(item.id);
+  const open = () => onOpenDetail(item.requirement_id);
 
   return (
     <div
@@ -55,8 +55,8 @@ const RequirementBoardCard: React.FC<RequirementBoardCardProps> = ({ item, onOpe
       onDragStart={(e) => {
         // Seed parent state AND dataTransfer so the column can read either one.
         e.dataTransfer.effectAllowed = 'move';
-        e.dataTransfer.setData('text/plain', item.id);
-        onDragStart(item.id);
+        e.dataTransfer.setData('text/plain', item.requirement_id);
+        onDragStart(item.requirement_id);
       }}
       className={[
         'requirements-board-card group relative flex flex-col rounded-10px border border-solid p-12px cursor-grab active:cursor-grabbing select-none outline-none',
@@ -78,7 +78,7 @@ const RequirementBoardCard: React.FC<RequirementBoardCardProps> = ({ item, onOpe
         >
           {item.title}
         </div>
-        <CopyIconButton text={item.id} tooltip={t('common.copyFullId')} size={13} className='mt-2px shrink-0' />
+        <CopyIconButton text={item.requirement_id} tooltip={t('common.copyFullId')} size={13} className='mt-2px shrink-0' />
       </div>
 
       {/* Labelled metadata keeps the card scannable without competing with the title. */}

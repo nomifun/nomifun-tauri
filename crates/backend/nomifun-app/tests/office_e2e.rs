@@ -294,8 +294,9 @@ async fn sh1_save_snapshot() {
     assert_eq!(json["success"], true);
 
     let data = &json["data"];
-    assert!(data["id"].is_string());
-    assert!(!data["id"].as_str().unwrap().is_empty());
+    assert!(data["snapshot_id"].is_string());
+    assert!(!data["snapshot_id"].as_str().unwrap().is_empty());
+    assert!(data.get("id").is_none());
     assert!(data["created_at"].is_number());
     assert_eq!(data["size"], 13); // "# Hello World".len()
     assert_eq!(data["content_type"], "markdown");
@@ -344,7 +345,7 @@ async fn sh3_get_snapshot_content() {
     let req = json_with_token("POST", "/api/preview-history/save", save_body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     let save_json = body_json(resp).await;
-    let snapshot_id = save_json["data"]["id"].as_str().unwrap();
+    let snapshot_id = save_json["data"]["snapshot_id"].as_str().unwrap();
 
     let get_body = json!({
         "target": snapshot_target(),
@@ -357,7 +358,8 @@ async fn sh3_get_snapshot_content() {
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     assert_eq!(json["data"]["content"], "# Hello");
-    assert_eq!(json["data"]["snapshot"]["id"], snapshot_id);
+    assert_eq!(json["data"]["snapshot"]["snapshot_id"], snapshot_id);
+    assert!(json["data"]["snapshot"].get("id").is_none());
 }
 
 // ── SH-4: Get nonexistent snapshot ──────────────────────────────────
@@ -369,7 +371,7 @@ async fn sh4_get_nonexistent_snapshot() {
 
     let body = json!({
         "target": snapshot_target(),
-        "snapshot_id": "nonexistent"
+        "snapshot_id": "0190f5fe-7c00-7a00-8000-000000000099"
     });
     let req = json_with_token("POST", "/api/preview-history/get-content", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -453,7 +455,7 @@ async fn sh7_target_field_combination_different_hash() {
         "content_type": "markdown",
         "file_path": "/a.md",
         "workspace": "/ws",
-        "conversation_id": "conv_0190f5fe-7c00-7a00-8000-000000000016"
+        "conversation_id": "0190f5fe-7c00-7a00-8000-000000000016"
     });
 
     let body = json!({"target": target_simple, "content": "simple"});

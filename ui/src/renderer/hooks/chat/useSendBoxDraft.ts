@@ -17,12 +17,6 @@ type Draft =
       uploadFile: string[];
     }
   | {
-      _type: 'codex';
-      content: string;
-      atPath: Array<string | FileOrFolderItem>;
-      uploadFile: string[];
-    }
-  | {
       _type: 'openclaw-gateway';
       content: string;
       atPath: Array<string | FileOrFolderItem>;
@@ -45,14 +39,6 @@ type Draft =
       content: string;
       atPath: Array<string | FileOrFolderItem>;
       uploadFile: string[];
-    }
-  | {
-      // Legacy Gemini conversations are read-only on the backend — this draft
-      // shape exists only so the store map stays type-exhaustive.
-      _type: 'gemini';
-      content: string;
-      atPath: Array<string | FileOrFolderItem>;
-      uploadFile: string[];
     };
 
 /**
@@ -64,8 +50,6 @@ type SendBoxDraftStore = {
 
 const store: SendBoxDraftStore = {
   acp: new Map(),
-  codex: new Map(),
-  gemini: new Map(),
   'openclaw-gateway': new Map(),
   nanobot: new Map(),
   remote: new Map(),
@@ -84,13 +68,6 @@ const setDraft = <K extends TChatConversation['type']>(
         store.acp.set(conversation_id, draft as Extract<Draft, { _type: 'acp' }>);
       } else {
         store.acp.delete(conversation_id);
-      }
-      break;
-    case 'codex':
-      if (draft) {
-        store.codex.set(conversation_id, draft as Extract<Draft, { _type: 'codex' }>);
-      } else {
-        store.codex.delete(conversation_id);
       }
       break;
     case 'openclaw-gateway':
@@ -134,8 +111,6 @@ const getDraft = <K extends TChatConversation['type']>(
   switch (type) {
     case 'acp':
       return store.acp.get(conversation_id) as Extract<Draft, { _type: K }>;
-    case 'codex':
-      return store.codex.get(conversation_id) as Extract<Draft, { _type: K }>;
     case 'openclaw-gateway':
       return store['openclaw-gateway'].get(conversation_id) as Extract<Draft, { _type: K }>;
     case 'nanobot':

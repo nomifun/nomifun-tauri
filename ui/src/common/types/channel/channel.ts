@@ -1,5 +1,5 @@
 import type {
-  ChannelId,
+  ChannelPluginId,
   ChannelSessionId,
   ChannelUserId,
   CompanionId,
@@ -8,8 +8,8 @@ import type {
 } from '@/common/types/ids';
 
 export interface IChannelPluginStatus {
-  /** Canonical persisted channel entity id. */
-  id: ChannelId;
+  /** Stable `channel_plugins.channel_plugin_id` business identity. */
+  plugin_id: ChannelPluginId;
   type: string;
   name: string;
   enabled: boolean;
@@ -57,29 +57,30 @@ export interface IChannelPairingRequest {
   display_name?: string;
   requestedAt: number;
   expiresAt: number;
-  /** 发起/归属的机器人渠道行 id；旧库未回填时可能缺省。 */
-  channelId?: ChannelId;
+  /** 发起/归属的机器人渠道业务 ID。 */
+  channel_plugin_id?: ChannelPluginId;
 }
 
 export interface IChannelUser {
-  id: ChannelUserId;
+  channel_user_id: ChannelUserId;
   platformUserId: string;
   platformType: string;
   display_name?: string;
   authorizedAt: number;
   lastActive?: number;
-  session_id?: ChannelSessionId;
-  /** 发起/归属的机器人渠道行 id。 */
-  channelId?: ChannelId;
+  channel_session_id?: ChannelSessionId;
+  /** 发起/归属的机器人渠道业务 ID。 */
+  channel_plugin_id?: ChannelPluginId;
 }
 
 export interface IChannelSession {
-  id: ChannelSessionId;
-  user_id: ChannelUserId;
+  channel_session_id: ChannelSessionId;
+  channel_user_id: ChannelUserId;
   agent_type: string;
   conversation_id?: ConversationId;
   workspace?: string;
   chatId?: string;
+  channel_plugin_id?: ChannelPluginId;
   created_at: number;
   lastActivity: number;
 }

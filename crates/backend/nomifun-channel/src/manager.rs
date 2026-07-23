@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use nomifun_api_types::{PluginStatusChangedPayload, PluginStatusResponse, WebSocketMessage};
 use nomifun_common::{
-    ChannelId, CompanionId, PublicAgentId, decrypt_string, encrypt_string, now_ms,
+    ChannelPluginId, CompanionId, PublicAgentId, decrypt_string, encrypt_string, now_ms,
 };
-use nomifun_db::models::ChannelPluginRow;
+use nomifun_db::models::{ChannelPluginRow, NewChannelPluginRow};
 use nomifun_db::{IChannelRepository, UpdatePluginStatusParams};
 use nomifun_realtime::UserEventSink;
 use tokio::sync::mpsc;
@@ -41,10 +41,10 @@ pub struct ChannelManager {
     owner_id: Arc<str>,
     user_events: Arc<dyn UserEventSink>,
     encryption_key: [u8; 32],
-    /// Active plugin instances keyed by the canonical `channel_plugins.id`.
+    /// Active plugin instances keyed by `channel_plugins.channel_plugin_id`.
     plugins: DashMap<String, Box<dyn ChannelPlugin>>,
     /// Sender for incoming messages from all plugins, stamped with their
-    /// channel row id. The `ChannelMessageLoop` holds the receiving end.
+    /// channel UUIDv7. The `ChannelMessageLoop` holds the receiving end.
     message_tx: mpsc::Sender<ChannelIncoming>,
     /// Sender for tool confirmation callbacks from all plugins.
     confirm_tx: mpsc::Sender<(String, String)>,
@@ -63,8 +63,8 @@ pub type PluginFactory = Box<dyn Fn(PluginType) -> Option<Box<dyn ChannelPlugin>
 /// How a channel row is addressed by `enable_plugin`.
 ///
 /// - canonical `plugin_id` set: update that row;
-/// - `plugin_id` unset + `plugin_type` set: create a new row with a
-///   generated `chn_` id — this is the per-companion multi-bot path.
+/// - `plugin_id` unset + `plugin_type` set: create a new row and use the
+///   repository-generated UUIDv7.
 /// - `companion_id`: bind the bot to a companion; `None` keeps the row's binding.
 /// - `public_agent_id`: bind the bot to a 对外伙伴 (public agent); `None` keeps
 ///   the row's binding. Row-level MUTUALLY EXCLUSIVE with `companion_id` — an
@@ -152,17 +152,12 @@ impl WatchdogState {
 
 impl ChannelManager {
     fn validate_persisted_row(row: &ChannelPluginRow) -> Result<(), ChannelError> {
-        ChannelId::parse(&row.id).map_err(|error| {
-            ChannelError::InvalidConfig(format!(
-                "stored channel row has invalid id '{}': {error}",
-                row.id
-            ))
-        })?;
+        Self::validate_channel_id(&row.channel_plugin_id)?;
         if let Some(id) = row.companion_id.as_deref() {
             CompanionId::parse(id).map_err(|error| {
                 ChannelError::InvalidConfig(format!(
                     "stored channel '{}' has invalid companion_id '{id}': {error}",
-                    row.id
+                    row.channel_plugin_id
                 ))
             })?;
         }
@@ -170,7 +165,7 @@ impl ChannelManager {
             PublicAgentId::parse(id).map_err(|error| {
                 ChannelError::InvalidConfig(format!(
                     "stored channel '{}' has invalid public_agent_id '{id}': {error}",
-                    row.id
+                    row.channel_plugin_id
                 ))
             })?;
         }
@@ -178,8 +173,10 @@ impl ChannelManager {
     }
 
     fn validate_channel_id(id: &str) -> Result<(), ChannelError> {
-        ChannelId::parse(id).map(|_| ()).map_err(|error| {
-            ChannelError::InvalidConfig(format!("invalid channel id '{id}': {error}"))
+        ChannelPluginId::parse(id).map(|_| ()).map_err(|error| {
+            ChannelError::InvalidConfig(format!(
+                "invalid channel_plugin_id '{id}': {error}"
+            ))
         })
     }
 
@@ -227,7 +224,10 @@ impl ChannelManager {
         let statuses: Vec<PluginStatusResponse> = rows
             .into_iter()
             .map(|row| {
-                let live_status = self.plugins.get(&row.id).map(|p| p.status().to_string());
+                let live_status = self
+                    .plugins
+                    .get(row.channel_plugin_id.as_str())
+                    .map(|p| p.status().to_string());
                 self.row_to_status_response(&row, live_status)
             })
             .collect();
@@ -236,7 +236,7 @@ impl ChannelManager {
 
     /// Enables a bot channel: validates config, enforces bot identity
     /// uniqueness, encrypts credentials, persists to DB, and starts the
-    /// plugin connection. Returns the channel row id.
+    /// plugin connection. Returns the channel UUIDv7.
     ///
     /// If the channel is already running, it will be stopped first and
     /// restarted with the new configuration.
@@ -260,21 +260,18 @@ impl ChannelManager {
             }
             None => None,
         };
-        if let Some(id) = spec
-            .plugin_id
-            .as_deref()
-            .filter(|id| ChannelId::parse(*id).is_ok())
+        if let Some(id) = spec.plugin_id.as_deref()
             && existing.is_none()
         {
-            return Err(ChannelError::PluginNotFound(id.to_owned()));
+            return Err(ChannelError::PluginNotFound(id.to_string()));
         }
-        let (mut row_id, plugin_type, mut created_at, mut prior_companion, mut prior_public_agent) =
+        let (mut channel_plugin_id, plugin_type, mut created_at, mut prior_companion, mut prior_public_agent) =
             match (&existing, spec.plugin_id.as_deref()) {
                 (Some(row), _) => {
                     let pt = PluginType::from_str_opt(&row.r#type)
                         .ok_or_else(|| ChannelError::InvalidPluginType(row.r#type.clone()))?;
                     (
-                        row.id.clone(),
+                        Some(row.channel_plugin_id.clone()),
                         pt,
                         row.created_at,
                         row.companion_id.clone(),
@@ -289,14 +286,14 @@ impl ChannelManager {
                     })?;
                     let pt = PluginType::from_str_opt(type_str)
                         .ok_or_else(|| ChannelError::InvalidPluginType(type_str.to_owned()))?;
-                    (ChannelId::new().into_string(), pt, now_ms(), None, None)
+                    (None, pt, now_ms(), None, None)
                 }
                 (None, None) => {
                     let type_str = requested_type
                         .ok_or_else(|| ChannelError::InvalidConfig("plugin_type is required to create a channel".into()))?;
                     let pt = PluginType::from_str_opt(type_str)
                         .ok_or_else(|| ChannelError::InvalidPluginType(type_str.to_owned()))?;
-                    (ChannelId::new().into_string(), pt, now_ms(), None, None)
+                    (None, pt, now_ms(), None, None)
                 }
             };
 
@@ -313,31 +310,43 @@ impl ChannelManager {
                 .load_all_plugin_rows()
                 .await?
                 .into_iter()
-                .find(|r| r.id != row_id && r.r#type == plugin_type.to_string() && r.bot_key.as_deref() == Some(key));
+                .find(|r| {
+                    Some(r.channel_plugin_id.as_str()) != channel_plugin_id.as_deref()
+                        && r.r#type == plugin_type.to_string()
+                        && r.bot_key.as_deref() == Some(key)
+                });
             if let Some(other) = clash {
                 if existing.is_none()
                     && spec.plugin_id.is_none()
                     && self.can_reuse_identity_row_for_spec(&other, spec)
                 {
                     info!(
-                        plugin_id = %other.id,
+                        plugin_id = %other.channel_plugin_id,
                         plugin_type = %plugin_type,
                         bot_key = %key,
                         "reusing existing channel row for bot identity"
                     );
-                    row_id = other.id.clone();
+                    channel_plugin_id = Some(other.channel_plugin_id);
                     created_at = other.created_at;
                     prior_companion = other.companion_id;
                     prior_public_agent = other.public_agent_id;
                 } else {
-                    return Err(ChannelError::BotAlreadyBound(Self::bound_owner(&other)));
+                    let owner = Self::bound_owner(&other).ok_or_else(|| {
+                        ChannelError::InvalidConfig(format!(
+                            "bot identity is already reserved by unbound channel '{}'",
+                            other.channel_plugin_id
+                        ))
+                    })?;
+                    return Err(ChannelError::BotAlreadyBound(owner));
                 }
             }
         }
 
         // Stop existing plugin if running
-        if self.plugins.contains_key(&row_id) {
-            self.stop_plugin(&row_id).await;
+        if let Some(channel_plugin_id) = channel_plugin_id.as_deref()
+            && self.plugins.contains_key(channel_plugin_id)
+        {
+            self.stop_plugin(channel_plugin_id).await;
         }
 
         // Encrypt config for storage
@@ -376,37 +385,58 @@ impl ChannelManager {
         } else {
             (prior_companion, prior_public_agent)
         };
-        let row = ChannelPluginRow {
-            id: row_id.clone(),
-            r#type: plugin_type.to_string(),
-            name: self.default_plugin_name(plugin_type),
-            enabled: true,
-            config: encrypted_config,
-            status: Some(PluginStatus::Created.to_string()),
-            last_connected: None,
-            companion_id,
-            public_agent_id,
-            bot_key,
-            created_at,
-            updated_at: now_ms(),
+        let now = now_ms();
+        let row = if let Some(channel_plugin_id) = channel_plugin_id {
+            self.repo
+                .update_plugin(&ChannelPluginRow {
+                    channel_plugin_id,
+                    r#type: plugin_type.to_string(),
+                    name: self.default_plugin_name(plugin_type),
+                    enabled: true,
+                    config: encrypted_config,
+                    status: Some(PluginStatus::Created.to_string()),
+                    last_connected: None,
+                    companion_id,
+                    public_agent_id,
+                    bot_key,
+                    created_at,
+                    updated_at: now,
+                })
+                .await?
+        } else {
+            self.repo
+                .create_plugin(&NewChannelPluginRow {
+                    r#type: plugin_type.to_string(),
+                    name: self.default_plugin_name(plugin_type),
+                    enabled: true,
+                    config: encrypted_config,
+                    status: Some(PluginStatus::Created.to_string()),
+                    last_connected: None,
+                    companion_id,
+                    public_agent_id,
+                    bot_key,
+                    created_at,
+                    updated_at: now,
+                })
+                .await?
         };
-        self.repo.upsert_plugin(&row).await?;
+        let channel_plugin_id = row.channel_plugin_id;
 
         // Create and start plugin instance
         let mut plugin = factory(plugin_type)
             .ok_or_else(|| ChannelError::InvalidPluginType(format!("No implementation for {plugin_type}")))?;
 
-        let callbacks = self.plugin_callbacks(&row_id);
+        let callbacks = self.plugin_callbacks(&channel_plugin_id);
 
         if let Err(e) = plugin.initialize(config, callbacks).await {
-            self.update_plugin_error(&row_id, &e.to_string()).await;
-            self.broadcast_status_change(&row_id).await;
+            self.update_plugin_error(&channel_plugin_id, &e.to_string()).await;
+            self.broadcast_status_change(&channel_plugin_id).await;
             return Err(e);
         }
 
         if let Err(e) = plugin.start().await {
-            self.update_plugin_error(&row_id, &e.to_string()).await;
-            self.broadcast_status_change(&row_id).await;
+            self.update_plugin_error(&channel_plugin_id, &e.to_string()).await;
+            self.broadcast_status_change(&channel_plugin_id).await;
             return Err(e);
         }
 
@@ -416,14 +446,16 @@ impl ChannelManager {
             last_connected: Some(now_ms()),
             enabled: None,
         };
-        self.repo.update_plugin_status(&row_id, &params).await?;
+        self.repo
+            .update_plugin_status(&channel_plugin_id, &params)
+            .await?;
 
         // Store active instance
-        self.plugins.insert(row_id.clone(), plugin);
+        self.plugins.insert(channel_plugin_id.clone(), plugin);
 
-        info!(plugin_id = %row_id, plugin_type = %plugin_type, "plugin enabled and started");
-        self.broadcast_status_change(&row_id).await;
-        Ok(row_id)
+        info!(plugin_id = %channel_plugin_id, plugin_type = %plugin_type, "plugin enabled and started");
+        self.broadcast_status_change(&channel_plugin_id).await;
+        Ok(channel_plugin_id)
     }
 
     /// Enables an extension-contributed plugin in metadata-only mode.
@@ -449,20 +481,12 @@ impl ChannelManager {
             )));
         }
         let existing = matching_rows.into_iter().next();
-        let row_id = match existing.as_ref() {
-            Some(row) => ChannelId::parse(&row.id)
-                .map_err(|error| {
-                    ChannelError::InvalidConfig(format!(
-                        "extension channel row has invalid id '{}': {error}",
-                        row.id
-                    ))
-                })?
-                .into_string(),
-            None => ChannelId::new().into_string(),
-        };
-
-        if self.plugins.contains_key(&row_id) {
-            self.stop_plugin(&row_id).await;
+        if let Some(channel_plugin_id) = existing
+            .as_ref()
+            .map(|row| row.channel_plugin_id.as_str())
+            && self.plugins.contains_key(channel_plugin_id)
+        {
+            self.stop_plugin(channel_plugin_id).await;
         }
 
         let config_json = serde_json::to_string(config)?;
@@ -470,25 +494,45 @@ impl ChannelManager {
             .map_err(|e| ChannelError::EncryptionFailed(e.to_string()))?;
 
         let now = now_ms();
-        let row = ChannelPluginRow {
-            id: row_id.clone(),
-            r#type: plugin_type.to_owned(),
-            name: plugin_name.to_owned(),
-            enabled: true,
-            config: encrypted_config,
-            status: Some(PluginStatus::Stopped.to_string()),
-            last_connected: existing.as_ref().and_then(|row| row.last_connected),
-            companion_id: existing.as_ref().and_then(|row| row.companion_id.clone()),
-            public_agent_id: existing.as_ref().and_then(|row| row.public_agent_id.clone()),
-            bot_key: existing.as_ref().and_then(|row| row.bot_key.clone()),
-            created_at: existing.as_ref().map(|row| row.created_at).unwrap_or(now),
-            updated_at: now,
+        let row = if let Some(existing) = existing.as_ref() {
+            self.repo
+                .update_plugin(&ChannelPluginRow {
+                    channel_plugin_id: existing.channel_plugin_id.clone(),
+                    r#type: plugin_type.to_owned(),
+                    name: plugin_name.to_owned(),
+                    enabled: true,
+                    config: encrypted_config,
+                    status: Some(PluginStatus::Stopped.to_string()),
+                    last_connected: existing.last_connected,
+                    companion_id: existing.companion_id.clone(),
+                    public_agent_id: existing.public_agent_id.clone(),
+                    bot_key: existing.bot_key.clone(),
+                    created_at: existing.created_at,
+                    updated_at: now,
+                })
+                .await?
+        } else {
+            self.repo
+                .create_plugin(&NewChannelPluginRow {
+                    r#type: plugin_type.to_owned(),
+                    name: plugin_name.to_owned(),
+                    enabled: true,
+                    config: encrypted_config,
+                    status: Some(PluginStatus::Stopped.to_string()),
+                    last_connected: None,
+                    companion_id: None,
+                    public_agent_id: None,
+                    bot_key: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await?
         };
-        self.repo.upsert_plugin(&row).await?;
+        let channel_plugin_id = row.channel_plugin_id;
 
-        info!(plugin_id = %row_id, plugin_type = %plugin_type, "extension plugin enabled (metadata-only mode)");
-        self.broadcast_status_change(&row_id).await;
-        Ok(row_id)
+        info!(plugin_id = %channel_plugin_id, plugin_type = %plugin_type, "extension plugin enabled (metadata-only mode)");
+        self.broadcast_status_change(&channel_plugin_id).await;
+        Ok(channel_plugin_id)
     }
 
     /// Disables a plugin: stops the connection, updates DB, and removes
@@ -522,7 +566,7 @@ impl ChannelManager {
             .repo
             .get_plugin(plugin_id)
             .await?
-            .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_owned()))?;
+            .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_string()))?;
 
         self.stop_plugin(plugin_id).await;
         self.repo.delete_sessions_by_channel(plugin_id).await?;
@@ -543,7 +587,11 @@ impl ChannelManager {
     /// Rebinds (or clears) the companion of a channel row and clears only that
     /// channel's sessions so the next inbound message recreates its
     /// conversation under the new binding.
-    pub async fn rebind_channel_companion(&self, plugin_id: &str, companion_id: Option<&str>) -> Result<(), ChannelError> {
+    pub async fn rebind_channel_companion(
+        &self,
+        plugin_id: &str,
+        companion_id: Option<&str>,
+    ) -> Result<(), ChannelError> {
         Self::validate_channel_id(plugin_id)?;
         if let Some(id) = companion_id {
             CompanionId::parse(id).map_err(|error| {
@@ -612,11 +660,15 @@ impl ChannelManager {
             .into_iter()
             .filter(|r| r.companion_id.as_deref().map(str::trim) == Some(companion_id))
         {
-            match self.repo.delete_sessions_by_channel(&row.id).await {
+            match self
+                .repo
+                .delete_sessions_by_channel(&row.channel_plugin_id)
+                .await
+            {
                 Ok(()) => cleared += 1,
                 Err(e) => {
                     warn!(
-                        plugin_id = %row.id,
+                        plugin_id = %row.channel_plugin_id,
                         companion_id = %companion_id,
                         error = %e,
                         "clear_sessions_for_companion: failed to clear channel sessions"
@@ -649,24 +701,32 @@ impl ChannelManager {
             .into_iter()
             .filter(|r| r.companion_id.as_deref().map(str::trim) == Some(companion_id))
         {
-            if let Err(e) = self.repo.update_plugin_companion(&row.id, None).await {
+            if let Err(e) = self
+                .repo
+                .update_plugin_companion(&row.channel_plugin_id, None)
+                .await
+            {
                 warn!(
-                    plugin_id = %row.id,
+                    plugin_id = %row.channel_plugin_id,
                     companion_id = %companion_id,
                     error = %e,
                     "unbind_channels_for_deleted_companion: failed to clear binding"
                 );
                 continue;
             }
-            if let Err(e) = self.repo.delete_sessions_by_channel(&row.id).await {
+            if let Err(e) = self
+                .repo
+                .delete_sessions_by_channel(&row.channel_plugin_id)
+                .await
+            {
                 warn!(
-                    plugin_id = %row.id,
+                    plugin_id = %row.channel_plugin_id,
                     companion_id = %companion_id,
                     error = %e,
                     "unbind_channels_for_deleted_companion: failed to clear channel sessions"
                 );
             }
-            self.broadcast_status_change(&row.id).await;
+            self.broadcast_status_change(&row.channel_plugin_id).await;
             unbound += 1;
         }
 
@@ -710,21 +770,33 @@ impl ChannelManager {
             }
 
             if orphan_companion {
-                if let Err(e) = self.repo.update_plugin_companion(&row.id, None).await {
-                    warn!(plugin_id = %row.id, error = %e, "reconcile_orphaned_owners: failed to clear companion binding");
+                if let Err(e) = self
+                    .repo
+                    .update_plugin_companion(&row.channel_plugin_id, None)
+                    .await
+                {
+                    warn!(plugin_id = %row.channel_plugin_id, error = %e, "reconcile_orphaned_owners: failed to clear companion binding");
                     continue;
                 }
             }
             if orphan_public_agent {
-                if let Err(e) = self.repo.update_plugin_public_agent(&row.id, None).await {
-                    warn!(plugin_id = %row.id, error = %e, "reconcile_orphaned_owners: failed to clear public-agent binding");
+                if let Err(e) = self
+                    .repo
+                    .update_plugin_public_agent(&row.channel_plugin_id, None)
+                    .await
+                {
+                    warn!(plugin_id = %row.channel_plugin_id, error = %e, "reconcile_orphaned_owners: failed to clear public-agent binding");
                     continue;
                 }
             }
-            if let Err(e) = self.repo.delete_sessions_by_channel(&row.id).await {
-                warn!(plugin_id = %row.id, error = %e, "reconcile_orphaned_owners: failed to clear channel sessions");
+            if let Err(e) = self
+                .repo
+                .delete_sessions_by_channel(&row.channel_plugin_id)
+                .await
+            {
+                warn!(plugin_id = %row.channel_plugin_id, error = %e, "reconcile_orphaned_owners: failed to clear channel sessions");
             }
-            self.broadcast_status_change(&row.id).await;
+            self.broadcast_status_change(&row.channel_plugin_id).await;
             healed += 1;
         }
 
@@ -769,19 +841,11 @@ impl ChannelManager {
 
     /// Restores previously enabled plugins on startup.
     ///
-    /// Reads all plugins from DB, backfills missing `bot_key`s (the
-    /// migration cannot compute them — they live inside the encrypted
-    /// config), then decrypts and starts the enabled ones. Errors on
-    /// individual plugins are logged but don't prevent other plugins
-    /// from starting.
+    /// Reads all plugins from DB, then decrypts and starts the enabled ones.
+    /// Errors on individual plugins are logged but don't prevent other
+    /// plugins from starting.
     pub async fn restore_plugins(&self, factory: &PluginFactory) -> Result<(), ChannelError> {
         let rows = self.load_all_plugin_rows().await?;
-
-        for row in &rows {
-            if row.bot_key.is_none() {
-                self.backfill_bot_key(row).await;
-            }
-        }
 
         let enabled: Vec<ChannelPluginRow> = rows.into_iter().filter(|r| r.enabled).collect();
 
@@ -795,21 +859,22 @@ impl ChannelManager {
         for row in enabled {
             if PluginType::from_str_opt(&row.r#type).is_none() {
                 info!(
-                    plugin_id = %row.id,
+                    plugin_id = %row.channel_plugin_id,
                     plugin_type = %row.r#type,
                     "skipping extension plugin runtime restore; metadata-only mode"
                 );
-                self.broadcast_status_change(&row.id).await;
+                self.broadcast_status_change(&row.channel_plugin_id).await;
                 continue;
             }
             if let Err(e) = self.restore_single_plugin(&row, factory).await {
                 warn!(
-                    plugin_id = %row.id,
+                    plugin_id = %row.channel_plugin_id,
                     error = %e,
                     "failed to restore plugin, marking as error"
                 );
-                self.update_plugin_error(&row.id, &e.to_string()).await;
-                self.broadcast_status_change(&row.id).await;
+                self.update_plugin_error(&row.channel_plugin_id, &e.to_string())
+                    .await;
+                self.broadcast_status_change(&row.channel_plugin_id).await;
             }
         }
 
@@ -855,7 +920,7 @@ impl ChannelManager {
         let plugin = self
             .plugins
             .get(plugin_id)
-            .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_owned()))?;
+            .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_string()))?;
         plugin.send_message(chat_id, message).await
     }
 
@@ -871,7 +936,7 @@ impl ChannelManager {
         let plugin = self
             .plugins
             .get(plugin_id)
-            .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_owned()))?;
+            .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_string()))?;
         plugin.edit_message(chat_id, message_id, message).await
     }
 
@@ -887,7 +952,7 @@ impl ChannelManager {
         let plugin = self
             .plugins
             .get(plugin_id)
-            .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_owned()))?;
+            .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_string()))?;
         plugin.send_media(chat_id, media, caption).await
     }
 
@@ -1000,7 +1065,7 @@ impl ChannelManager {
             .repo
             .get_plugin(plugin_id)
             .await?
-            .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_owned()))?;
+            .ok_or_else(|| ChannelError::PluginNotFound(plugin_id.to_string()))?;
 
         self.stop_plugin(plugin_id).await;
         self.restore_single_plugin(&row, factory).await
@@ -1064,33 +1129,33 @@ impl ChannelManager {
             return true;
         }
 
-        !self.plugins.contains_key(&row.id)
+        !self.plugins.contains_key(&row.channel_plugin_id)
             && row.last_connected.is_none()
             && row.status.as_deref() != Some("running")
     }
 
-    fn bound_owner(row: &ChannelPluginRow) -> ChannelOwner {
+    fn bound_owner(row: &ChannelPluginRow) -> Option<ChannelOwner> {
         if let Some(companion) = row.companion_id.as_deref().filter(|p| !p.is_empty()) {
-            ChannelOwner::Companion(companion.to_owned())
+            Some(ChannelOwner::Companion(companion.to_owned()))
         } else if let Some(public_agent) = row.public_agent_id.as_deref().filter(|p| !p.is_empty()) {
-            ChannelOwner::PublicAgent(public_agent.to_owned())
+            Some(ChannelOwner::PublicAgent(public_agent.to_owned()))
         } else {
-            ChannelOwner::Channel(row.id.clone())
+            None
         }
     }
 
     /// Per-instance callbacks: a forwarder task stamps every message this
-    /// plugin emits with its channel row id (plugins stay channel-agnostic).
+    /// plugin emits with its channel UUIDv7 (plugins stay channel-agnostic).
     /// The forwarder exits when the plugin instance (and all its sender
     /// clones) is dropped after `stop_plugin`.
-    fn plugin_callbacks(&self, channel_id: &str) -> PluginCallbacks {
+    fn plugin_callbacks(&self, channel_plugin_id: &str) -> PluginCallbacks {
         let (tx, mut rx) = mpsc::channel::<UnifiedIncomingMessage>(64);
         let main_tx = self.message_tx.clone();
-        let channel_id = channel_id.to_owned();
+        let channel_plugin_id = channel_plugin_id.to_owned();
         tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
                 let incoming = ChannelIncoming {
-                    channel_id: channel_id.clone(),
+                    channel_plugin_id: channel_plugin_id.clone(),
                     message,
                 };
                 if main_tx.send(incoming).await.is_err() {
@@ -1101,28 +1166,6 @@ impl ChannelManager {
         PluginCallbacks {
             message_tx: tx,
             confirm_tx: self.confirm_tx.clone(),
-        }
-    }
-
-    /// Backfills `bot_key` for a pre-migration row by decrypting its config.
-    /// Best-effort: failures only log (the watchdog/UI keep working, the
-    /// uniqueness check just can't protect this row until it succeeds).
-    async fn backfill_bot_key(&self, row: &ChannelPluginRow) {
-        let Some(plugin_type) = PluginType::from_str_opt(&row.r#type) else {
-            return; // extension plugins have no builtin bot identity
-        };
-        let Ok(config_json) = decrypt_string(&row.config, &self.encryption_key) else {
-            warn!(plugin_id = %row.id, "bot_key backfill: cannot decrypt config");
-            return;
-        };
-        let Ok(config) = serde_json::from_str::<PluginConfig>(&config_json) else {
-            warn!(plugin_id = %row.id, "bot_key backfill: cannot parse config");
-            return;
-        };
-        if let Some(key) = bot_key_for(plugin_type, &config.credentials)
-            && let Err(e) = self.repo.update_plugin_bot_key(&row.id, &key).await
-        {
-            warn!(plugin_id = %row.id, error = %e, "bot_key backfill failed");
         }
     }
 
@@ -1153,7 +1196,7 @@ impl ChannelManager {
         let mut plugin = factory(plugin_type)
             .ok_or_else(|| ChannelError::InvalidPluginType(format!("No implementation for {plugin_type}")))?;
 
-        let callbacks = self.plugin_callbacks(&row.id);
+        let callbacks = self.plugin_callbacks(&row.channel_plugin_id);
 
         plugin.initialize(config, callbacks).await?;
         plugin.start().await?;
@@ -1164,11 +1207,13 @@ impl ChannelManager {
             last_connected: Some(now_ms()),
             enabled: None,
         };
-        self.repo.update_plugin_status(&row.id, &params).await?;
+        self.repo
+            .update_plugin_status(&row.channel_plugin_id, &params)
+            .await?;
 
-        self.plugins.insert(row.id.clone(), plugin);
-        info!(plugin_id = %row.id, "plugin restored");
-        self.broadcast_status_change(&row.id).await;
+        self.plugins.insert(row.channel_plugin_id.clone(), plugin);
+        info!(plugin_id = %row.channel_plugin_id, "plugin restored");
+        self.broadcast_status_change(&row.channel_plugin_id).await;
         Ok(())
     }
 
@@ -1198,7 +1243,8 @@ impl ChannelManager {
     }
 
     /// Updates a plugin to error status in the DB.
-    async fn update_plugin_error(&self, plugin_id: &str, error_msg: &str) {        let params = UpdatePluginStatusParams {
+    async fn update_plugin_error(&self, plugin_id: &str, error_msg: &str) {
+        let params = UpdatePluginStatusParams {
             status: Some(PluginStatus::Error.to_string()),
             last_connected: None,
             enabled: None,
@@ -1258,10 +1304,10 @@ impl ChannelManager {
 
     /// Converts a DB row + optional live status to a `PluginStatusResponse`.
     fn row_to_status_response(&self, row: &ChannelPluginRow, live_status: Option<String>) -> PluginStatusResponse {
-        let is_running = self.plugins.contains_key(&row.id);
+        let is_running = self.plugins.contains_key(&row.channel_plugin_id);
         let has_token = !row.config.is_empty();
         PluginStatusResponse {
-            plugin_id: row.id.clone(),
+            plugin_id: row.channel_plugin_id.clone(),
             plugin_type: row.r#type.clone(),
             name: row.name.clone(),
             enabled: row.enabled,
@@ -1336,20 +1382,24 @@ mod tests {
     use crate::types::{
         BotInfo, OutgoingMessageType, PluginCredentials, PluginStatus, PluginType, UnifiedOutgoingMessage,
     };
-    use nomifun_common::{ChannelId, TimestampMs};
-    use nomifun_db::models::{ChannelSessionRow, ChannelUserRow, ChannelPluginRow, ChannelPairingCodeRow};
+    use nomifun_common::TimestampMs;
+    use nomifun_db::models::{
+        ChannelPairingCodeRow, ChannelPluginRow, ChannelSessionRow, ChannelUserRow, NewChannelPairingCodeRow,
+        NewChannelPluginRow, NewChannelSessionRow, NewChannelUserRow,
+    };
     use nomifun_db::{DbError, IChannelRepository, UpdatePluginStatusParams};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
-    const OWNER_ID: &str = "user_018f1234-5678-7abc-8def-012345678900";
-    const COMPANION_A: &str = "companion_018f1234-5678-7abc-8def-012345678901";
-    const COMPANION_B: &str = "companion_018f1234-5678-7abc-8def-012345678902";
-    const COMPANION_Z: &str = "companion_018f1234-5678-7abc-8def-012345678903";
-    const COMPANION_LIVE: &str = "companion_018f1234-5678-7abc-8def-012345678904";
-    const COMPANION_GHOST: &str = "companion_018f1234-5678-7abc-8def-012345678905";
-    const PUBLIC_AGENT_A: &str = "pubagent_018f1234-5678-7abc-8def-012345678906";
-    const PUBLIC_AGENT_Z: &str = "pubagent_018f1234-5678-7abc-8def-012345678907";
-    const PUBLIC_AGENT_GHOST: &str = "pubagent_018f1234-5678-7abc-8def-012345678908";
+    const OWNER_ID: &str = "018f1234-5678-7abc-8def-012345678900";
+    const COMPANION_A: &str = "018f1234-5678-7abc-8def-012345678901";
+    const COMPANION_B: &str = "018f1234-5678-7abc-8def-012345678902";
+    const COMPANION_Z: &str = "018f1234-5678-7abc-8def-012345678903";
+    const COMPANION_LIVE: &str = "018f1234-5678-7abc-8def-012345678904";
+    const COMPANION_GHOST: &str = "018f1234-5678-7abc-8def-012345678905";
+    const PUBLIC_AGENT_A: &str = "018f1234-5678-7abc-8def-012345678906";
+    const PUBLIC_AGENT_Z: &str = "018f1234-5678-7abc-8def-012345678907";
+    const PUBLIC_AGENT_GHOST: &str = "018f1234-5678-7abc-8def-012345678908";
 
     fn platform_spec(plugin_type: &str) -> EnableChannelSpec {
         EnableChannelSpec {
@@ -1417,24 +1467,54 @@ mod tests {
             Ok(self.plugins.lock().unwrap().clone())
         }
 
-        async fn get_plugin(&self, id: &str) -> Result<Option<ChannelPluginRow>, DbError> {
+        async fn get_plugin(&self, channel_plugin_id: &str) -> Result<Option<ChannelPluginRow>, DbError> {
             let plugins = self.plugins.lock().unwrap();
-            Ok(plugins.iter().find(|p| p.id == id).cloned())
+            Ok(plugins
+                .iter()
+                .find(|p| p.channel_plugin_id == channel_plugin_id)
+                .cloned())
         }
 
-        async fn upsert_plugin(&self, row: &ChannelPluginRow) -> Result<(), DbError> {
+        async fn create_plugin(&self, row: &NewChannelPluginRow) -> Result<ChannelPluginRow, DbError> {
             let mut plugins = self.plugins.lock().unwrap();
-            if let Some(existing) = plugins.iter_mut().find(|p| p.id == row.id) {
-                *existing = row.clone();
-            } else {
-                plugins.push(row.clone());
-            }
-            Ok(())
+            let persisted = ChannelPluginRow {
+                channel_plugin_id: nomifun_common::generate_id(),
+                r#type: row.r#type.clone(),
+                name: row.name.clone(),
+                enabled: row.enabled,
+                config: row.config.clone(),
+                status: row.status.clone(),
+                last_connected: row.last_connected,
+                companion_id: row.companion_id.clone(),
+                public_agent_id: row.public_agent_id.clone(),
+                bot_key: row.bot_key.clone(),
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+            };
+            plugins.push(persisted.clone());
+            Ok(persisted)
         }
 
-        async fn update_plugin_status(&self, id: &str, params: &UpdatePluginStatusParams) -> Result<(), DbError> {
+        async fn update_plugin(&self, row: &ChannelPluginRow) -> Result<ChannelPluginRow, DbError> {
             let mut plugins = self.plugins.lock().unwrap();
-            if let Some(p) = plugins.iter_mut().find(|p| p.id == id) {
+            let existing = plugins
+                .iter_mut()
+                .find(|plugin| plugin.channel_plugin_id == row.channel_plugin_id)
+                .ok_or_else(|| DbError::NotFound(row.channel_plugin_id.clone()))?;
+            *existing = row.clone();
+            Ok(existing.clone())
+        }
+
+        async fn update_plugin_status(
+            &self,
+            channel_plugin_id: &str,
+            params: &UpdatePluginStatusParams,
+        ) -> Result<(), DbError> {
+            let mut plugins = self.plugins.lock().unwrap();
+            if let Some(p) = plugins
+                .iter_mut()
+                .find(|p| p.channel_plugin_id == channel_plugin_id)
+            {
                 if let Some(ref s) = params.status {
                     p.status = Some(s.clone());
                 }
@@ -1447,13 +1527,20 @@ mod tests {
                 p.updated_at = now_ms();
                 Ok(())
             } else {
-                Err(DbError::NotFound(id.into()))
+                Err(DbError::NotFound(channel_plugin_id.to_owned()))
             }
         }
 
-        async fn update_plugin_companion(&self, id: &str, companion_id: Option<&str>) -> Result<(), DbError> {
+        async fn update_plugin_companion(
+            &self,
+            channel_plugin_id: &str,
+            companion_id: Option<&str>,
+        ) -> Result<(), DbError> {
             let mut plugins = self.plugins.lock().unwrap();
-            if let Some(p) = plugins.iter_mut().find(|p| p.id == id) {
+            if let Some(p) = plugins
+                .iter_mut()
+                .find(|p| p.channel_plugin_id == channel_plugin_id)
+            {
                 p.companion_id = companion_id.map(str::to_owned);
                 if companion_id.is_some() {
                     p.public_agent_id = None;
@@ -1461,13 +1548,20 @@ mod tests {
                 p.updated_at = now_ms();
                 Ok(())
             } else {
-                Err(DbError::NotFound(id.into()))
+                Err(DbError::NotFound(channel_plugin_id.to_owned()))
             }
         }
 
-        async fn update_plugin_public_agent(&self, id: &str, public_agent_id: Option<&str>) -> Result<(), DbError> {
+        async fn update_plugin_public_agent(
+            &self,
+            channel_plugin_id: &str,
+            public_agent_id: Option<&str>,
+        ) -> Result<(), DbError> {
             let mut plugins = self.plugins.lock().unwrap();
-            if let Some(p) = plugins.iter_mut().find(|p| p.id == id) {
+            if let Some(p) = plugins
+                .iter_mut()
+                .find(|p| p.channel_plugin_id == channel_plugin_id)
+            {
                 p.public_agent_id = public_agent_id.map(str::to_owned);
                 if public_agent_id.is_some() {
                     p.companion_id = None;
@@ -1475,27 +1569,34 @@ mod tests {
                 p.updated_at = now_ms();
                 Ok(())
             } else {
-                Err(DbError::NotFound(id.into()))
+                Err(DbError::NotFound(channel_plugin_id.to_owned()))
             }
         }
 
-        async fn update_plugin_bot_key(&self, id: &str, bot_key: &str) -> Result<(), DbError> {
+        async fn update_plugin_bot_key(
+            &self,
+            channel_plugin_id: &str,
+            bot_key: &str,
+        ) -> Result<(), DbError> {
             let mut plugins = self.plugins.lock().unwrap();
-            if let Some(p) = plugins.iter_mut().find(|p| p.id == id) {
-                p.bot_key = Some(bot_key.to_owned());
-                p.updated_at = now_ms();
+            if let Some(plugin) = plugins
+                .iter_mut()
+                .find(|plugin| plugin.channel_plugin_id == channel_plugin_id)
+            {
+                plugin.bot_key = Some(bot_key.to_owned());
+                plugin.updated_at = now_ms();
                 Ok(())
             } else {
-                Err(DbError::NotFound(id.into()))
+                Err(DbError::NotFound(channel_plugin_id.to_owned()))
             }
         }
 
-        async fn delete_plugin(&self, id: &str) -> Result<(), DbError> {
+        async fn delete_plugin(&self, channel_plugin_id: &str) -> Result<(), DbError> {
             let mut plugins = self.plugins.lock().unwrap();
             let len_before = plugins.len();
-            plugins.retain(|p| p.id != id);
+            plugins.retain(|p| p.channel_plugin_id != channel_plugin_id);
             if plugins.len() == len_before {
-                Err(DbError::NotFound(id.into()))
+                Err(DbError::NotFound(channel_plugin_id.to_owned()))
             } else {
                 Ok(())
             }
@@ -1509,17 +1610,29 @@ mod tests {
             &self,
             _pid: &str,
             _pt: &str,
-            _channel_id: &str,
+            _channel_plugin_id: &str,
         ) -> Result<Option<ChannelUserRow>, DbError> {
             Ok(None)
         }
-        async fn create_user(&self, _row: &ChannelUserRow) -> Result<(), DbError> {
+        async fn create_user(&self, row: &NewChannelUserRow) -> Result<ChannelUserRow, DbError> {
+            Ok(ChannelUserRow {
+                channel_user_id: nomifun_common::generate_id(),
+                platform_user_id: row.platform_user_id.clone(),
+                platform_type: row.platform_type.clone(),
+                channel_plugin_id: row.channel_plugin_id.clone(),
+                display_name: row.display_name.clone(),
+                authorized_at: row.authorized_at,
+                last_active: row.last_active,
+            })
+        }
+        async fn update_user_last_active(
+            &self,
+            _channel_user_id: &str,
+            _last_active: TimestampMs,
+        ) -> Result<(), DbError> {
             Ok(())
         }
-        async fn update_user_last_active(&self, _id: &str, _la: TimestampMs) -> Result<(), DbError> {
-            Ok(())
-        }
-        async fn delete_user(&self, _id: &str) -> Result<(), DbError> {
+        async fn delete_user(&self, _channel_user_id: &str) -> Result<(), DbError> {
             Ok(())
         }
 
@@ -1527,41 +1640,68 @@ mod tests {
         async fn get_all_sessions(&self) -> Result<Vec<ChannelSessionRow>, DbError> {
             Ok(vec![])
         }
-        async fn get_session(&self, _id: &str) -> Result<Option<ChannelSessionRow>, DbError> {
+        async fn get_session(&self, _channel_session_id: &str) -> Result<Option<ChannelSessionRow>, DbError> {
             Ok(None)
         }
         async fn get_or_create_session(
             &self,
-            _uid: &str,
-            _cid: &str,
-            _channel_id: &str,
-            new_row: &ChannelSessionRow,
+            _channel_user_id: &str,
+            _chat_id: &str,
+            _channel_plugin_id: &str,
+            new_row: &NewChannelSessionRow,
         ) -> Result<ChannelSessionRow, DbError> {
-            Ok(new_row.clone())
+            Ok(ChannelSessionRow {
+                channel_session_id: new_row.channel_session_id.clone(),
+                channel_user_id: new_row.channel_user_id.clone(),
+                agent_type: new_row.agent_type.clone(),
+                conversation_id: new_row.conversation_id.clone(),
+                workspace: new_row.workspace.clone(),
+                chat_id: new_row.chat_id.clone(),
+                channel_plugin_id: new_row.channel_plugin_id.clone(),
+                created_at: new_row.created_at,
+                last_activity: new_row.last_activity,
+            })
         }
-        async fn update_session_activity(&self, _id: &str, _la: TimestampMs) -> Result<(), DbError> {
+        async fn update_session_activity(&self, _channel_session_id: &str, _la: TimestampMs) -> Result<(), DbError> {
             Ok(())
         }
-        async fn update_session_conversation(&self, _id: &str, _cid: &str) -> Result<(), DbError> {
+        async fn update_session_conversation(&self, _channel_session_id: &str, _cid: &str) -> Result<(), DbError> {
             Ok(())
         }
-        async fn update_session_agent_type(&self, _id: &str, _at: &str) -> Result<(), DbError> {
+        async fn update_session_agent_type(&self, _channel_session_id: &str, _at: &str) -> Result<(), DbError> {
             Ok(())
         }
-        async fn delete_sessions_by_user(&self, _uid: &str) -> Result<(), DbError> {
+        async fn delete_sessions_by_user(&self, _channel_user_id: &str) -> Result<(), DbError> {
             Ok(())
         }
-        async fn delete_sessions_by_channel(&self, channel_id: &str) -> Result<(), DbError> {
-            self.cleared_session_channels.lock().unwrap().push(channel_id.to_owned());
+        async fn delete_sessions_by_channel(&self, channel_plugin_id: &str) -> Result<(), DbError> {
+            self.cleared_session_channels
+                .lock()
+                .unwrap()
+                .push(channel_plugin_id.to_owned());
             Ok(())
         }
-        async fn delete_session_by_user_chat(&self, _uid: &str, _cid: &str, _channel_id: &str) -> Result<(), DbError> {
+        async fn delete_session_by_user_chat(
+            &self,
+            _channel_user_id: &str,
+            _chat_id: &str,
+            _channel_plugin_id: &str,
+        ) -> Result<(), DbError> {
             Ok(())
         }
 
         // -- Pairing codes (unused stubs) --
-        async fn create_pairing(&self, _row: &ChannelPairingCodeRow) -> Result<(), DbError> {
-            Ok(())
+        async fn create_pairing(&self, row: &NewChannelPairingCodeRow) -> Result<ChannelPairingCodeRow, DbError> {
+            Ok(ChannelPairingCodeRow {
+                code: row.code.clone(),
+                platform_user_id: row.platform_user_id.clone(),
+                platform_type: row.platform_type.clone(),
+                channel_plugin_id: row.channel_plugin_id.clone(),
+                display_name: row.display_name.clone(),
+                requested_at: row.requested_at,
+                expires_at: row.expires_at,
+                status: row.status.clone(),
+            })
         }
         async fn get_pending_pairings(&self) -> Result<Vec<ChannelPairingCodeRow>, DbError> {
             Ok(vec![])
@@ -1697,6 +1837,10 @@ mod tests {
         [0x42; 32]
     }
 
+    fn test_channel_id() -> String {
+        nomifun_common::generate_id()
+    }
+
     fn make_manager() -> (ChannelManager, Arc<MockRepo>, Arc<MockBroadcaster>) {
         let (mgr, repo, bc, _rx) = make_manager_with_rx();
         (mgr, repo, bc)
@@ -1797,9 +1941,9 @@ mod tests {
     async fn get_status_returns_db_plugins() {
         let (mgr, repo, _bc) = make_manager();
         let now = now_ms();
-        let channel_id = ChannelId::new().into_string();
+        let channel_id = test_channel_id();
         repo.plugins.lock().unwrap().push(ChannelPluginRow {
-            id: channel_id.clone(),
+            channel_plugin_id: channel_id.clone(),
             r#type: "telegram".into(),
             name: "Telegram Bot".into(),
             enabled: true,
@@ -1835,7 +1979,10 @@ mod tests {
         // Manually set DB status to something different
         {
             let mut plugins = repo.plugins.lock().unwrap();
-            if let Some(p) = plugins.iter_mut().find(|p| p.id == channel_id) {
+            if let Some(p) = plugins
+                .iter_mut()
+                .find(|p| p.channel_plugin_id == channel_id)
+            {
                 p.status = Some("stopped".into());
             }
         }
@@ -1860,7 +2007,7 @@ mod tests {
 
         let plugins = repo.get_plugins();
         assert_eq!(plugins.len(), 1);
-        assert_eq!(plugins[0].id, channel_id);
+        assert_eq!(plugins[0].channel_plugin_id, channel_id);
         assert!(plugins[0].enabled);
         // Config should be encrypted (base64), not plaintext
         assert_ne!(plugins[0].config, serde_json::to_string(&make_test_config()).unwrap());
@@ -2065,9 +2212,9 @@ mod tests {
     async fn disable_idempotent_for_not_running() {
         let (mgr, repo, _bc) = make_manager();
         // Manually insert a disabled plugin in DB
-        let channel_id = ChannelId::new().into_string();
+        let channel_id = test_channel_id();
         repo.plugins.lock().unwrap().push(ChannelPluginRow {
-            id: channel_id.clone(),
+            channel_plugin_id: channel_id.clone(),
             r#type: "telegram".into(),
             name: "Telegram Bot".into(),
             enabled: false,
@@ -2144,10 +2291,10 @@ mod tests {
 
         let config_json = serde_json::to_string(&make_plugin_config()).unwrap();
         let encrypted = encrypt_string(&config_json, &test_key()).unwrap();
-        let channel_id = ChannelId::new().into_string();
+        let channel_id = test_channel_id();
 
         repo.plugins.lock().unwrap().push(ChannelPluginRow {
-            id: channel_id,
+            channel_plugin_id: channel_id,
             r#type: "telegram".into(),
             name: "Telegram Bot".into(),
             enabled: false,
@@ -2172,10 +2319,10 @@ mod tests {
 
         let config_json = serde_json::to_string(&make_plugin_config()).unwrap();
         let encrypted = encrypt_string(&config_json, &test_key()).unwrap();
-        let channel_id = ChannelId::new().into_string();
+        let channel_id = test_channel_id();
 
         repo.plugins.lock().unwrap().push(ChannelPluginRow {
-            id: channel_id.clone(),
+            channel_plugin_id: channel_id.clone(),
             r#type: "telegram".into(),
             name: "Telegram Bot".into(),
             enabled: true,
@@ -2200,14 +2347,14 @@ mod tests {
 
         let config_json = serde_json::to_string(&make_plugin_config()).unwrap();
         let encrypted = encrypt_string(&config_json, &test_key()).unwrap();
-        let telegram_id = ChannelId::new().into_string();
-        let lark_id = ChannelId::new().into_string();
+        let telegram_id = test_channel_id();
+        let lark_id = test_channel_id();
 
         // One valid plugin and one with bad encrypted config
         {
             let mut plugins = repo.plugins.lock().unwrap();
             plugins.push(ChannelPluginRow {
-                id: telegram_id.clone(),
+                channel_plugin_id: telegram_id.clone(),
                 r#type: "telegram".into(),
                 name: "Telegram Bot".into(),
                 enabled: true,
@@ -2221,7 +2368,7 @@ mod tests {
                 updated_at: now_ms(),
             });
             plugins.push(ChannelPluginRow {
-                id: lark_id.clone(),
+                channel_plugin_id: lark_id.clone(),
                 r#type: "lark".into(),
                 name: "Lark Bot".into(),
                 enabled: true,
@@ -2246,7 +2393,10 @@ mod tests {
 
         // Lark should have error status in DB
         let plugins = repo.get_plugins();
-        let lark = plugins.iter().find(|p| p.id == lark_id).unwrap();
+        let lark = plugins
+            .iter()
+            .find(|p| p.channel_plugin_id == lark_id)
+            .unwrap();
         assert_eq!(lark.status.as_deref(), Some("error"));
     }
 
@@ -2307,7 +2457,7 @@ mod tests {
     #[tokio::test]
     async fn send_message_plugin_not_found() {
         let (mgr, _repo, _bc) = make_manager();
-        let channel_id = ChannelId::new().into_string();
+        let channel_id = test_channel_id();
         let err = mgr
             .send_message(&channel_id, "chat_1", make_test_outgoing())
             .await
@@ -2333,7 +2483,7 @@ mod tests {
     #[tokio::test]
     async fn edit_message_plugin_not_found() {
         let (mgr, _repo, _bc) = make_manager();
-        let channel_id = ChannelId::new().into_string();
+        let channel_id = test_channel_id();
         let err = mgr
             .edit_message(&channel_id, "chat_1", "msg_1", make_test_outgoing())
             .await
@@ -2363,7 +2513,7 @@ mod tests {
     #[tokio::test]
     async fn is_plugin_running_false_for_missing() {
         let (mgr, _repo, _bc) = make_manager();
-        assert!(!mgr.is_plugin_running(ChannelId::new().as_str()));
+        assert!(!mgr.is_plugin_running(&test_channel_id()));
     }
 
     #[test]
@@ -2452,10 +2602,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(id.starts_with("chn"), "generated id should be chn-prefixed: {id}");
+        assert!(nomifun_common::validate_uuidv7(&id).is_ok());
         let plugins = repo.get_plugins();
         assert_eq!(plugins.len(), 1);
-        assert_eq!(plugins[0].id, id);
+        assert_eq!(plugins[0].channel_plugin_id, id);
         assert_eq!(plugins[0].companion_id.as_deref(), Some(COMPANION_A));
         assert_eq!(plugins[0].bot_key.as_deref(), Some("cli_app_1"));
         assert!(mgr.is_plugin_running(&id));
@@ -2603,7 +2753,7 @@ mod tests {
             .enable_plugin(&lark_spec(COMPANION_A), &lark_config_with_app("cli_app_1"), &failing_factory)
             .await;
         assert!(err.is_err());
-        let failed_id = repo.get_plugins()[0].id.clone();
+        let failed_id = repo.get_plugins()[0].channel_plugin_id.clone();
         assert_eq!(repo.get_plugins()[0].status.as_deref(), Some("error"));
         assert!(repo.get_plugins()[0].last_connected.is_none());
         assert_eq!(mgr.active_plugin_count(), 0);
@@ -2673,12 +2823,12 @@ mod tests {
             .await
             .unwrap();
 
-        ChannelId::parse(id.clone()).expect("enable must mint a canonical channel id");
+        assert!(nomifun_common::validate_uuidv7(&id).is_ok());
         let plugins = repo.get_plugins();
         assert_eq!(plugins.len(), 1);
-        assert_eq!(plugins[0].id, id);
+        assert_eq!(plugins[0].channel_plugin_id, id);
         assert!(plugins[0].companion_id.is_none());
-        assert!(mgr.is_plugin_running(&plugins[0].id));
+        assert!(mgr.is_plugin_running(&plugins[0].channel_plugin_id));
     }
 
     #[tokio::test]
@@ -2703,7 +2853,7 @@ mod tests {
             .await
             .expect("forwarder should deliver within the timeout")
             .expect("manager message channel must stay open");
-        assert_eq!(incoming.channel_id, id);
+        assert_eq!(incoming.channel_plugin_id, id);
         assert_eq!(incoming.message.id, "m-1");
     }
 
@@ -2735,7 +2885,7 @@ mod tests {
     #[tokio::test]
     async fn delete_channel_unknown_id_is_not_found() {
         let (mgr, _repo, _bc) = make_manager();
-        let err = mgr.delete_channel(ChannelId::new().as_str()).await.unwrap_err();
+        let err = mgr.delete_channel(&test_channel_id()).await.unwrap_err();
         assert!(matches!(err, ChannelError::PluginNotFound(_)));
     }
 
@@ -2749,7 +2899,9 @@ mod tests {
             .await
             .unwrap();
 
-        mgr.rebind_channel_companion(&id, Some(COMPANION_Z)).await.unwrap();
+        mgr.rebind_channel_companion(&id, Some(COMPANION_Z))
+            .await
+            .unwrap();
         assert_eq!(repo.get_plugins()[0].companion_id.as_deref(), Some(COMPANION_Z));
         assert_eq!(repo.cleared_channels(), vec![id.clone()]);
 
@@ -2770,7 +2922,11 @@ mod tests {
             .enable_plugin(&lark_public_agent_spec(PUBLIC_AGENT_A), &lark_config_with_app("cli_app_1"), &factory)
             .await
             .unwrap();
-        let row = repo.get_plugins().into_iter().find(|r| r.id == id).unwrap();
+        let row = repo
+            .get_plugins()
+            .into_iter()
+            .find(|r| r.channel_plugin_id == id)
+            .unwrap();
         assert_eq!(row.public_agent_id.as_deref(), Some(PUBLIC_AGENT_A));
         assert!(row.companion_id.is_none(), "a public-agent bot must not carry a companion");
 
@@ -2783,7 +2939,11 @@ mod tests {
             public_agent_id: None,
         };
         mgr.enable_plugin(&spec, &lark_config_with_app("cli_app_1"), &factory).await.unwrap();
-        let row = repo.get_plugins().into_iter().find(|r| r.id == id).unwrap();
+        let row = repo
+            .get_plugins()
+            .into_iter()
+            .find(|r| r.channel_plugin_id == id)
+            .unwrap();
         assert_eq!(row.companion_id.as_deref(), Some(COMPANION_A));
         assert!(row.public_agent_id.is_none(), "binding a companion must clear the public agent");
     }
@@ -2800,8 +2960,14 @@ mod tests {
             .unwrap();
         assert_eq!(repo.get_plugins()[0].companion_id.as_deref(), Some(COMPANION_A));
 
-        mgr.rebind_channel_public_agent(&id, Some(PUBLIC_AGENT_Z)).await.unwrap();
-        let row = repo.get_plugins().into_iter().find(|r| r.id == id).unwrap();
+        mgr.rebind_channel_public_agent(&id, Some(PUBLIC_AGENT_Z))
+            .await
+            .unwrap();
+        let row = repo
+            .get_plugins()
+            .into_iter()
+            .find(|r| r.channel_plugin_id == id)
+            .unwrap();
         assert_eq!(row.public_agent_id.as_deref(), Some(PUBLIC_AGENT_Z));
         assert!(row.companion_id.is_none(), "rebinding to a public agent clears the companion");
         assert_eq!(repo.cleared_channels(), vec![id.clone()]);
@@ -2856,8 +3022,8 @@ mod tests {
         mgr.unbind_channels_for_deleted_companion(COMPANION_A).await;
 
         let rows = repo.get_plugins();
-        let row_a = rows.iter().find(|r| r.id == id_a).unwrap();
-        let row_b = rows.iter().find(|r| r.id == id_b).unwrap();
+        let row_a = rows.iter().find(|r| r.channel_plugin_id == id_a).unwrap();
+        let row_b = rows.iter().find(|r| r.channel_plugin_id == id_b).unwrap();
         assert!(row_a.companion_id.is_none());
         assert_eq!(row_b.companion_id.as_deref(), Some(COMPANION_B));
         assert_eq!(repo.cleared_channels(), vec![id_a]);
@@ -2891,9 +3057,18 @@ mod tests {
         mgr.reconcile_orphaned_owners(&live_companions, &live_public_agents).await;
 
         let rows = repo.get_plugins();
-        let live = rows.iter().find(|r| r.id == live_id).unwrap();
-        let ghost_c = rows.iter().find(|r| r.id == ghost_companion_id).unwrap();
-        let ghost_p = rows.iter().find(|r| r.id == ghost_pa_id).unwrap();
+        let live = rows
+            .iter()
+            .find(|r| r.channel_plugin_id == live_id)
+            .unwrap();
+        let ghost_c = rows
+            .iter()
+            .find(|r| r.channel_plugin_id == ghost_companion_id)
+            .unwrap();
+        let ghost_p = rows
+            .iter()
+            .find(|r| r.channel_plugin_id == ghost_pa_id)
+            .unwrap();
 
         assert_eq!(live.companion_id.as_deref(), Some(COMPANION_LIVE), "live owner preserved");
         assert!(ghost_c.companion_id.is_none(), "ghost companion unbound");
@@ -2926,8 +3101,6 @@ mod tests {
     // ── Watchdog ───────────────────────────────────────────────────────
 
     use crate::plugin::SharedPluginStatus;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     /// Mock plugin whose status lives in a shared cell, mimicking the real
     /// plugins where the background loop flips the status to `Error` after
     /// reconnect exhaustion.
@@ -3060,15 +3233,31 @@ mod tests {
         let t0 = Instant::now();
 
         // First attempt is always allowed.
-        assert!(state.allow_attempt("p", &config, t0));
+        assert!(state.allow_attempt("plugin-1", &config, t0));
         // Within the backoff window (base * 2^0 = 10s) → blocked.
-        assert!(!state.allow_attempt("p", &config, t0 + Duration::from_secs(5)));
+        assert!(!state.allow_attempt(
+            "plugin-1",
+            &config,
+            t0 + Duration::from_secs(5)
+        ));
         // After the backoff → second attempt allowed.
-        assert!(state.allow_attempt("p", &config, t0 + Duration::from_secs(11)));
+        assert!(state.allow_attempt(
+            "plugin-1",
+            &config,
+            t0 + Duration::from_secs(11)
+        ));
         // Budget (2) exhausted within the window → blocked even much later.
-        assert!(!state.allow_attempt("p", &config, t0 + Duration::from_secs(50)));
+        assert!(!state.allow_attempt(
+            "plugin-1",
+            &config,
+            t0 + Duration::from_secs(50)
+        ));
         // Window expired → attempts pruned, allowed again.
-        assert!(state.allow_attempt("p", &config, t0 + Duration::from_secs(200)));
+        assert!(state.allow_attempt(
+            "plugin-1",
+            &config,
+            t0 + Duration::from_secs(200)
+        ));
     }
 
     #[tokio::test]

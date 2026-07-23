@@ -115,7 +115,7 @@ const AssetCard: React.FC<AssetCardProps> = ({
     (e: React.DragEvent) => {
       if (!draggable) return;
       writeAssetDrag(e.dataTransfer, {
-        asset_id: asset.id,
+        asset_id: asset.asset_id,
         kind: asset.kind,
         title: asset.title,
         width: asset.width,

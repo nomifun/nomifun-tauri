@@ -728,11 +728,11 @@ impl BrowserMcpConfig {
 mod tests {
     use super::*;
 
-    const TEST_USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
-    const OTHER_USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000002";
-    const KB_A: &str = "kb_0190f5fe-7c00-7a00-8000-000000000001";
-    const KB_B: &str = "kb_0190f5fe-7c00-7a00-8000-000000000002";
-    const TEST_COMPANION_ID: &str = "companion_0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const OTHER_USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+    const KB_A: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const KB_B: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+    const TEST_COMPANION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 
     fn kb_id(value: &str) -> KnowledgeBaseId {
         KnowledgeBaseId::parse(value).expect("canonical knowledge-base test ID")
@@ -773,12 +773,12 @@ mod tests {
     #[test]
     fn requirement_child_is_short_lived_domain_and_session_bound() {
         let cfg = requirement_config(41234, "/bin/nomicore");
-        let child = cfg.issue_for_conversation(TEST_USER_ID, "conv_0190f5fe-7c00-7a00-8abc-012345678901").unwrap();
+        let child = cfg.issue_for_conversation(TEST_USER_ID, "0190f5fe-7c00-7a00-8abc-012345678901").unwrap();
         let access = &child.bootstrap.access;
         assert_eq!(child.bootstrap.port, 41234);
         assert_eq!(
             access.claims.session.conversation_id.as_deref(),
-            Some("conv_0190f5fe-7c00-7a00-8abc-012345678901")
+            Some("0190f5fe-7c00-7a00-8abc-012345678901")
         );
         assert!(access.claims.allows(REQUIREMENT_COMPLETE_TOOL));
         assert!(cfg
@@ -806,7 +806,7 @@ mod tests {
         let readonly = cfg
             .issue_for_terminal(
                 TEST_USER_ID,
-                "term_0190f5fe-7c00-7a00-8abc-012345678901",
+                "0190f5fe-7c00-7a00-8abc-012345678901",
                 "/workspace",
                 &[kb_id(KB_B), kb_id(KB_A)],
                 false,
@@ -827,7 +827,7 @@ mod tests {
             .allows(KNOWLEDGE_WRITE_TOOL));
 
         let writable = cfg
-            .issue_for_conversation(TEST_USER_ID, "conv_0190f5fe-7c00-7a00-8abc-012345678901", "/workspace", &[kb_id(KB_A)], true)
+            .issue_for_conversation(TEST_USER_ID, "0190f5fe-7c00-7a00-8abc-012345678901", "/workspace", &[kb_id(KB_A)], true)
             .unwrap();
         assert!(writable
             .bootstrap
@@ -896,7 +896,7 @@ mod tests {
         let cfg = gateway_config(
             41235,
             "/usr/bin/nomicore",
-            "user_0190f5fe-7c00-7a00-8000-000000000001",
+            "0190f5fe-7c00-7a00-8000-000000000001",
         );
         let debug = format!("{cfg:?}");
         assert!(debug.contains("[REDACTED]"));
@@ -916,7 +916,7 @@ mod tests {
         let cfg = gateway_config(41235, "/usr/bin/nomicore", TEST_USER_ID);
         let child = cfg.issue_for_conversation(
             OTHER_USER_ID,
-            "conv_0190f5fe-7c00-7a00-8abc-012345678901",
+            "0190f5fe-7c00-7a00-8abc-012345678901",
             Some(TEST_COMPANION_ID),
             Some("lark"),
             Some("yolo"),
@@ -927,7 +927,7 @@ mod tests {
         assert_eq!(access.claims.user_id.as_str(), OTHER_USER_ID);
         assert_eq!(
             access.claims.session.conversation_id.as_deref(),
-            Some("conv_0190f5fe-7c00-7a00-8abc-012345678901")
+            Some("0190f5fe-7c00-7a00-8abc-012345678901")
         );
         assert!(access.claims.allows(GATEWAY_LIST_TOOLS_OPERATION));
         assert!(access.claims.allows(GATEWAY_CALL_TOOL_OPERATION));
@@ -951,7 +951,7 @@ mod tests {
             .is_err());
 
         let mut forged_conversation = access.claims.clone();
-        forged_conversation.session = LoopbackSessionBinding::conversation("conv_0190f5fe-7c00-7a00-8abc-012345678902");
+        forged_conversation.session = LoopbackSessionBinding::conversation("0190f5fe-7c00-7a00-8abc-012345678902");
         assert!(cfg
             .issuer
             .verify_access(
@@ -974,7 +974,7 @@ mod tests {
     fn gateway_scope_reserves_top_level_creation_for_companions() {
         let cfg = gateway_config(41235, "/usr/bin/nomicore", TEST_USER_ID);
         let plain = cfg
-            .issue_for_conversation(TEST_USER_ID, "conv_0190f5fe-7c00-7a00-8abc-012345678901", None, None, None, &[])
+            .issue_for_conversation(TEST_USER_ID, "0190f5fe-7c00-7a00-8abc-012345678901", None, None, None, &[])
             .unwrap();
         assert!(
             plain
@@ -988,7 +988,7 @@ mod tests {
         let companion = cfg
             .issue_for_conversation(
                 TEST_USER_ID,
-                "conv_0190f5fe-7c00-7a00-8abc-012345678902",
+                "0190f5fe-7c00-7a00-8abc-012345678902",
                 Some(TEST_COMPANION_ID),
                 None,
                 None,
@@ -1009,7 +1009,7 @@ mod tests {
     fn gateway_correctly_signed_expired_claims_fail_closed() {
         let cfg = gateway_config(41235, "/usr/bin/nomicore", TEST_USER_ID);
         let child = cfg
-            .issue_for_conversation(TEST_USER_ID, "conv_0190f5fe-7c00-7a00-8abc-012345678901", None, None, None, &[])
+            .issue_for_conversation(TEST_USER_ID, "0190f5fe-7c00-7a00-8abc-012345678901", None, None, None, &[])
             .unwrap();
         let now = nomifun_common::unix_time_secs();
         let expired = cfg
@@ -1033,7 +1033,7 @@ mod tests {
     #[test]
     fn dropping_unaccepted_child_config_revokes_its_renewable_lease() {
         let cfg = requirement_config(41234, "/bin/nomicore");
-        let child = cfg.issue_for_conversation(TEST_USER_ID, "conv_0190f5fe-7c00-7a00-8abc-012345678901").unwrap();
+        let child = cfg.issue_for_conversation(TEST_USER_ID, "0190f5fe-7c00-7a00-8abc-012345678901").unwrap();
         let renewal = child.bootstrap.renewal.clone();
 
         assert!(cfg

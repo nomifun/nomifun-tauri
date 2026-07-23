@@ -1194,14 +1194,14 @@ mod tests {
     use nomifun_api_types::{AgentErrorCode, AgentErrorOwnership, AgentStreamErrorData};
     use nomifun_common::MessageId;
 
-    const TEST_USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 
     fn test_terminal_id() -> TerminalId {
-        TerminalId::parse("term_0190f5fe-7c00-7a00-8000-000000000001").unwrap()
+        TerminalId::parse("0190f5fe-7c00-7a00-8000-000000000001").unwrap()
     }
 
     fn alternate_test_terminal_id() -> TerminalId {
-        TerminalId::parse("term_0190f5fe-7c00-7a00-8000-000000000007").unwrap()
+        TerminalId::parse("0190f5fe-7c00-7a00-8000-000000000007").unwrap()
     }
 
     #[test]
@@ -1346,10 +1346,10 @@ mod tests {
         // Companion and public-service conversations route numbered menus to a
         // remote human — IDMM must not auto-answer them.
         assert!(extra_marks_routed_conversation(
-            r#"{"companion_session":true,"companion_id":"companion_0190f5fe-7c00-7a00-8abc-012345678942"}"#
+            r#"{"companion_session":true,"companion_id":"0190f5fe-7c00-7a00-8abc-012345678942"}"#
         ));
         assert!(extra_marks_routed_conversation(
-            r#"{"public_agent_id":"pubagent_0190f5fe-7c00-7a00-8abc-012345678943"}"#
+            r#"{"public_agent_id":"0190f5fe-7c00-7a00-8abc-012345678943"}"#
         ));
         // A plain desktop conversation is NOT routed.
         assert!(!extra_marks_routed_conversation(r#"{"workspace":"/project"}"#));
@@ -1369,7 +1369,7 @@ mod tests {
         // Shared companion/public sessions carry canonical business markers.
         assert!(conversation_is_routed(r#"{"companion_session":true}"#, None));
         assert!(conversation_is_routed(
-            r#"{"public_agent_id":"pubagent_0190f5fe-7c00-7a00-8abc-012345678943"}"#,
+            r#"{"public_agent_id":"0190f5fe-7c00-7a00-8abc-012345678943"}"#,
             None
         ));
         // Every dedicated channel session is routed by its first-class row field,
@@ -2027,8 +2027,9 @@ mod tests {
         created_at: i64,
     ) -> nomifun_db::models::MessageRow {
         nomifun_db::models::MessageRow {
-            id: MessageId::new().into_string(),
-            conversation_id: "conv_0190f5fe-7c00-7a00-8000-000000000001".into(),
+            id: 0,
+            message_id: MessageId::new().into_string(),
+            conversation_id: "0190f5fe-7c00-7a00-8000-000000000001".into(),
             msg_id: None,
             r#type: r#type.to_string(),
             content: serde_json::json!({ "content": text }).to_string(),
@@ -2108,7 +2109,7 @@ mod tests {
         );
         assert_eq!(
             pending_signal_from_page(
-                r#"{"public_agent_id":"pubagent_0190f5fe-7c00-7a00-8abc-012345678943"}"#,
+                r#"{"public_agent_id":"0190f5fe-7c00-7a00-8abc-012345678943"}"#,
                 &msgs,
             ),
             None
@@ -2293,7 +2294,8 @@ mod tests {
 
     fn conv_row(extra: &str) -> nomifun_db::models::ConversationRow {
         nomifun_db::models::ConversationRow {
-            id: "conv_0190f5fe-7c00-7a00-8000-000000000001".into(),
+            id: 0,
+            conversation_id: "0190f5fe-7c00-7a00-8000-000000000001".into(),
             user_id: TEST_USER_ID.into(),
             name: "c".into(),
             r#type: "nomi".into(),
@@ -2372,7 +2374,7 @@ mod tests {
             row: Some(conv_row(r#"{"workspace":"/p"}"#)),
             messages: vec![msg_row("left", false, "text", pending_decision_text())],
         });
-        match pending_signal_with_repo("conv_0190f5fe-7c00-7a00-8000-000000000001", repo).await {
+        match pending_signal_with_repo("0190f5fe-7c00-7a00-8000-000000000001", repo).await {
             Some(SessionSignal::Decision(dp)) => assert_eq!(dp.options.len(), 2),
             other => panic!("expected an options Decision, got {other:?}"),
         }
@@ -2391,7 +2393,7 @@ mod tests {
             row: Some(row),
             messages: vec![msg_row("left", false, "text", pending_decision_text())],
         });
-        assert_eq!(pending_signal_with_repo("conv_0190f5fe-7c00-7a00-8000-000000000001", repo).await, None);
+        assert_eq!(pending_signal_with_repo("0190f5fe-7c00-7a00-8000-000000000001", repo).await, None);
     }
 
     #[tokio::test]
@@ -2406,17 +2408,17 @@ mod tests {
         });
         // Cancelled at/after the row → None.
         assert_eq!(
-            pending_signal_with_repo_cancel("conv_0190f5fe-7c00-7a00-8000-000000000001", repo.clone(), Some(100)).await,
+            pending_signal_with_repo_cancel("0190f5fe-7c00-7a00-8000-000000000001", repo.clone(), Some(100)).await,
             None,
             "a cancel at/after the candidate row must suppress the on-arm replay"
         );
         // A cancel strictly BEFORE the row (an older, unrelated stop) does not.
-        match pending_signal_with_repo_cancel("conv_0190f5fe-7c00-7a00-8000-000000000001", repo.clone(), Some(99)).await {
+        match pending_signal_with_repo_cancel("0190f5fe-7c00-7a00-8000-000000000001", repo.clone(), Some(99)).await {
             Some(SessionSignal::Decision(dp)) => assert_eq!(dp.options.len(), 2),
             other => panic!("a pre-candidate cancel must not suppress; got {other:?}"),
         }
         // No cancel at all → fires.
-        match pending_signal_with_repo_cancel("conv_0190f5fe-7c00-7a00-8000-000000000001", repo, None).await {
+        match pending_signal_with_repo_cancel("0190f5fe-7c00-7a00-8000-000000000001", repo, None).await {
             Some(SessionSignal::Decision(dp)) => assert_eq!(dp.options.len(), 2),
             other => panic!("expected an options Decision with no cancel; got {other:?}"),
         }

@@ -9,7 +9,7 @@ import React, { createContext, useCallback, useContext, useMemo, useState } from
 /**
  * Snapshot of the message the user just submitted from the Guid composer, used
  * to render an immediate conversation-shaped loading state while the backend
- * mints the conversation row.
+ * mints the conversation entity.
  */
 export type PendingConversation = {
   /** The first message the user typed (echoed as a right-aligned bubble). */

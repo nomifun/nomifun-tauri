@@ -738,12 +738,12 @@ mod tests {
     fn parse_callback_roundtrip_with_params() {
         use std::collections::HashMap;
         let mut p = HashMap::new();
-        p.insert("agentType".into(), "gemini".into());
+        p.insert("agentType".into(), "acp".into());
         let encoded = format_lark_callback("agent.select", Some(&p));
         let (cat, action, params) = parse_lark_callback(&encoded).unwrap();
         assert_eq!(cat, "system");
         assert_eq!(action, "agent.select");
-        assert_eq!(params.unwrap().get("agentType").unwrap(), "gemini");
+        assert_eq!(params.unwrap().get("agentType").unwrap(), "acp");
     }
 
     #[test]

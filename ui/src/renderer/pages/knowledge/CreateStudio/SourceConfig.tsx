@@ -423,7 +423,7 @@ const FeishuConfig: React.FC<FeishuConfigInternalProps> = ({ value, onChange }) 
       });
       // Refresh list and auto-select the new credential
       await refreshCreds();
-      onChange({ credentialId: created.id });
+      onChange({ credentialId: created.credentialId });
       // Reset form
       setShowCreateForm(false);
       setCredName('');
@@ -461,16 +461,16 @@ const FeishuConfig: React.FC<FeishuConfigInternalProps> = ({ value, onChange }) 
             loading={loading}
             allowClear
             renderFormat={(_option, val) => {
-              const cred = creds.find((c) => c.id === val);
+              const cred = creds.find((c) => c.credentialId === val);
               return cred ? cred.name : '';
             }}
           >
             {creds.map((c) => (
-              <Select.Option key={c.id} value={c.id}>
+              <Select.Option key={c.credentialId} value={c.credentialId}>
                 <div className='flex flex-col py-2px'>
                   <span className='text-13px text-[var(--color-text-1)]'>{c.name}</span>
                   <span className='text-11px text-[var(--color-text-3)]'>
-                    {t('knowledge.studio.feishuCredId', { defaultValue: 'ID' })}: {c.id.slice(0, 8)}…
+                    {t('knowledge.studio.feishuCredId', { defaultValue: 'ID' })}: {c.credentialId.slice(0, 8)}…
                   </span>
                 </div>
               </Select.Option>

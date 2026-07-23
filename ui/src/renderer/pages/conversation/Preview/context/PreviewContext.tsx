@@ -6,7 +6,6 @@
 
 import { ipcBridge } from '@/common';
 import type { PreviewContentType } from '@/common/types/office/preview';
-import { getBrowserStorageGeneration } from '@/common/utils/browserStorageKey';
 import { emitter } from '@/renderer/utils/emitter';
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 
@@ -73,14 +72,12 @@ export interface PreviewContextValue {
 
 const PreviewContext = createContext<PreviewContextValue | null>(null);
 
-// 持久化 key（按 persistNamespace 分桶，使不同表面的预览互不串扰）
-// Persistence keys (bucketed by persistNamespace so previews of different surfaces don't leak into each other)
-const previewPersistenceNamespace = (ns: string) =>
-  `${getBrowserStorageGeneration()}:${ns}`;
+// Callers pass a generation-scoped, typed browser-storage namespace. No legacy
+// preview key is read.
 const previewTabsKey = (ns: string) =>
-  `nomifun_preview_tabs:${previewPersistenceNamespace(ns)}`;
+  `nomifun_preview_tabs:${ns}:tabs`;
 const previewActiveTabIdKey = (ns: string) =>
-  `nomifun_preview_active_tab_id:${previewPersistenceNamespace(ns)}`;
+  `nomifun_preview_tabs:${ns}:active`;
 
 // 仅持久化小体积文本预览，避免大文本导致 localStorage 写入卡顿
 // Persist only lightweight text previews to avoid localStorage jank on large files
@@ -147,9 +144,9 @@ const loadPersistedState = (ns: string): { isOpen: boolean; tabs: PreviewTab[]; 
 export const PreviewProvider: React.FC<{
   children: React.ReactNode;
   /**
-   * Persistence namespace: localStorage keys are bucketed by this exact entity
-   * identity. Callers must include the owning entity id, e.g.
-   * `conversation:42` or `terminal:17`.
+   * Generation-scoped persistence namespace created by browserStorageKey().
+   * Callers must pass the typed owning entity kind and ID rather than composing
+   * arbitrary `kind:id` strings.
    */
   persistNamespace: string;
   /**

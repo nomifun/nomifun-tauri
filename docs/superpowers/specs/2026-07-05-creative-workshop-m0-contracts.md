@@ -1,5 +1,12 @@
 # 创意工坊 M0 契约与模块分工(实施规范)
 
+> **⚠️ SUPERSEDED / LEGACY 历史规范（非当前架构）**
+> 本文是 2026 年 7 月 5 日的早期 M0 设计，保留用于追溯背景，不得作为当前
+> 实现契约。当前 v3 架构已改为：所有持久化表使用自增 `id INTEGER PRIMARY KEY
+> AUTOINCREMENT`；跨边界业务实体使用不带前缀的裸 UUIDv7 `*_id`；移除物理
+> 外键；新版本允许直接清空重置数据库，不兼容历史数据。本文中的 `wsc_`、
+> `wsa_`、`wst_` 等前缀示例均为历史内容。
+
 - 配套 PRD:`docs/superpowers/specs/2026-07-05-creative-workshop-prd.md`(先读它)
 - 本文是所有创意工坊开发 agent 的**共同契约**:接口/Schema 以此为准,模块只能改自己名下的文件。
 

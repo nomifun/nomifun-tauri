@@ -17,13 +17,13 @@
 use std::sync::Arc;
 
 use nomifun_api_types::{
-    CustomAgentUpsertRequest, ModelFailoverConfig, ProviderHealthCheckRequest,
-    TestRemoteAgentConnectionRequest, TryConnectCustomAgentRequest,
+    BehaviorPolicy, CustomAgentAdvancedOverrides, CustomAgentUpsertRequest, ModelFailoverConfig,
+    ProviderHealthCheckRequest, TestRemoteAgentConnectionRequest, TryConnectCustomAgentRequest,
 };
+use nomifun_common::{AgentId, ProviderId, ProviderWithModel, RemoteAgentId};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use nomifun_common::RemoteAgentId;
 
 use crate::deps::GatewayDeps;
 use crate::registry::{Capability, CapabilityMeta, DangerTier, Surface};
@@ -33,10 +33,12 @@ use crate::server::ok;
 
 /// List all installed agent backends with their status and metadata.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AgentListParams {}
 
 /// Run an ACP health check against a specific agent backend.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AgentHealthCheckParams {
     /// The agent backend identifier to health-check (e.g. "claude", "codex").
     backend: String,
@@ -44,24 +46,30 @@ struct AgentHealthCheckParams {
 
 /// Run a provider-level health check (verify model reachability via a provider).
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AgentProviderHealthCheckParams {
     /// Provider id to test against.
-    provider_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    provider_id: ProviderId,
     /// Model name to probe (must be enabled on the provider).
+    #[serde(deserialize_with = "deserialize_model_name")]
     model: String,
 }
 
 /// Enable or disable an agent backend.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AgentSetEnabledParams {
-    /// Agent id to toggle.
-    id: String,
+    /// Canonical agent_metadata.agent_id UUIDv7.
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    agent_id: AgentId,
     /// Whether to enable (true) or disable (false) the agent.
     enabled: bool,
 }
 
 /// Create a custom (user-registered) agent backend.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AgentCustomCreateParams {
     /// Display name for the custom agent.
     name: String,
@@ -78,14 +86,16 @@ struct AgentCustomCreateParams {
     env: Vec<AgentEnvEntryParam>,
     /// Advanced behavior overrides (yolo_id, native_skills_dirs, behavior_policy, description).
     #[serde(default)]
-    advanced: Option<Value>,
+    advanced: Option<CustomAgentAdvancedParam>,
 }
 
 /// Update an existing custom agent backend.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AgentCustomUpdateParams {
     /// The custom agent id to update.
-    id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    agent_id: AgentId,
     /// Display name for the custom agent.
     name: String,
     /// CLI command to launch the agent process.
@@ -101,18 +111,21 @@ struct AgentCustomUpdateParams {
     env: Vec<AgentEnvEntryParam>,
     /// Advanced behavior overrides.
     #[serde(default)]
-    advanced: Option<Value>,
+    advanced: Option<CustomAgentAdvancedParam>,
 }
 
 /// Delete a custom agent backend (irreversible).
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AgentCustomDeleteParams {
     /// The custom agent id to permanently delete.
-    id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    agent_id: AgentId,
 }
 
 /// Test connectivity to a custom agent binary (try-connect handshake).
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct AgentCustomTryConnectParams {
     /// CLI command to launch the agent process.
     command: String,
@@ -126,6 +139,7 @@ struct AgentCustomTryConnectParams {
 
 /// An environment variable entry for custom agent configuration.
 #[derive(Deserialize, JsonSchema, Clone)]
+#[serde(deny_unknown_fields)]
 struct AgentEnvEntryParam {
     /// Variable name.
     name: String,
@@ -136,22 +150,73 @@ struct AgentEnvEntryParam {
     description: Option<String>,
 }
 
+/// Fixed wire shape for the custom-agent advanced editor. Keep this local to
+/// the gateway because capability schemas must be generated from types that
+/// implement `JsonSchema`; the API crate intentionally remains schemars-free.
+#[derive(Deserialize, JsonSchema, Clone)]
+#[serde(deny_unknown_fields)]
+struct CustomAgentAdvancedParam {
+    #[serde(default)]
+    yolo_id: Option<String>,
+    #[serde(default)]
+    native_skills_dirs: Option<Vec<String>>,
+    #[serde(default)]
+    behavior_policy: Option<BehaviorPolicyParam>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema, Clone)]
+#[serde(deny_unknown_fields)]
+struct BehaviorPolicyParam {
+    #[serde(default)]
+    supports_side_question: bool,
+    #[serde(default)]
+    self_identity_sticky: bool,
+    #[serde(default)]
+    session_load_via_meta_field: bool,
+}
+
+impl From<BehaviorPolicyParam> for BehaviorPolicy {
+    fn from(value: BehaviorPolicyParam) -> Self {
+        Self {
+            supports_side_question: value.supports_side_question,
+            self_identity_sticky: value.self_identity_sticky,
+            session_load_via_meta_field: value.session_load_via_meta_field,
+        }
+    }
+}
+
+impl From<CustomAgentAdvancedParam> for CustomAgentAdvancedOverrides {
+    fn from(value: CustomAgentAdvancedParam) -> Self {
+        Self {
+            yolo_id: value.yolo_id,
+            native_skills_dirs: value.native_skills_dirs,
+            behavior_policy: value.behavior_policy.map(Into::into),
+            description: value.description,
+        }
+    }
+}
+
 // ── Remote agent param structs ──────────────────────────────────────────
 
 /// List all registered remote agents.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RemoteAgentListParams {}
 
 /// Get details of a single remote agent by id.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RemoteAgentGetParams {
     /// Remote agent id returned by `nomi_remote_agent_list`.
-    #[schemars(with = "String")]
-    id: RemoteAgentId,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    remote_agent_id: RemoteAgentId,
 }
 
 /// Register a new remote agent.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RemoteAgentCreateParams {
     /// Display name.
     name: String,
@@ -177,10 +242,11 @@ struct RemoteAgentCreateParams {
 
 /// Update an existing remote agent (partial — only provided fields are changed).
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RemoteAgentUpdateParams {
     /// Remote agent id to update.
-    #[schemars(with = "String")]
-    id: RemoteAgentId,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    remote_agent_id: RemoteAgentId,
     /// New display name.
     #[serde(default)]
     name: Option<String>,
@@ -209,14 +275,16 @@ struct RemoteAgentUpdateParams {
 
 /// Delete a remote agent registration (irreversible).
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RemoteAgentDeleteParams {
     /// Remote agent id to permanently delete.
-    #[schemars(with = "String")]
-    id: RemoteAgentId,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    remote_agent_id: RemoteAgentId,
 }
 
 /// Test connectivity to a remote agent endpoint without persisting it.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RemoteAgentTestParams {
     /// Endpoint URL to test.
     url: String,
@@ -233,27 +301,30 @@ struct RemoteAgentTestParams {
 
 /// Perform a saved OpenClaw protocol handshake and update cached status.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RemoteAgentHandshakeParams {
     /// Remote agent id to connect and authenticate.
-    #[schemars(with = "String")]
-    id: RemoteAgentId,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    remote_agent_id: RemoteAgentId,
 }
 
 // ── Model failover param structs ────────────────────────────────────────
 
 /// Read the global model-failover configuration.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ModelFailoverGetParams {}
 
 /// Set the global model-failover configuration.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ModelFailoverSetParams {
     /// Whether model failover is enabled.
     enabled: bool,
     /// Ordered list of provider+model pairs to try on failure (first = primary fallback).
-    /// Each entry: { "provider_id": "...", "model": "...", "use_model": null | "..." }.
+    /// Each entry has exactly `{ "provider_id": "...", "model": "..." }`.
     #[serde(default)]
-    queue: Vec<Value>,
+    queue: Vec<ModelRefParam>,
     /// Maximum number of model switches per conversation turn (default: 4).
     #[serde(default = "default_max_switches")]
     max_switches: u32,
@@ -262,11 +333,43 @@ struct ModelFailoverSetParams {
     stamp_unhealthy: bool,
 }
 
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ModelRefParam {
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    provider_id: ProviderId,
+    #[serde(deserialize_with = "deserialize_model_name")]
+    model: String,
+}
+
+impl From<ModelRefParam> for ProviderWithModel {
+    fn from(value: ModelRefParam) -> Self {
+        Self {
+            provider_id: value.provider_id.into_string(),
+            model: value.model,
+            use_model: None,
+        }
+    }
+}
+
 fn default_max_switches() -> u32 {
     4
 }
 fn default_stamp_unhealthy() -> bool {
     true
+}
+
+fn deserialize_model_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() || value.trim() != value {
+        return Err(serde::de::Error::custom(
+            "model must be a non-empty trimmed natural key",
+        ));
+    }
+    Ok(value)
 }
 
 // ── handlers ──────────────────────────────────────────────────────────────
@@ -293,7 +396,7 @@ async fn agent_provider_health_check(
     p: AgentProviderHealthCheckParams,
 ) -> Value {
     let req = ProviderHealthCheckRequest {
-        provider_id: p.provider_id,
+        provider_id: p.provider_id.into_string(),
         model: p.model,
         task: None,
     };
@@ -304,20 +407,14 @@ async fn agent_provider_health_check(
 }
 
 async fn agent_set_enabled(deps: Arc<GatewayDeps>, p: AgentSetEnabledParams) -> Value {
-    match deps.agent_service.set_agent_enabled(&p.id, p.enabled).await {
+    let agent_id = p.agent_id.into_string();
+    match deps.agent_service.set_agent_enabled(&agent_id, p.enabled).await {
         Ok(meta) => ok(meta),
         Err(e) => json!({ "error": e.to_string() }),
     }
 }
 
 async fn agent_custom_create(deps: Arc<GatewayDeps>, p: AgentCustomCreateParams) -> Value {
-    let advanced = match p.advanced {
-        Some(val) => match serde_json::from_value(val) {
-            Ok(adv) => Some(adv),
-            Err(e) => return json!({ "error": format!("invalid advanced field: {e}") }),
-        },
-        None => None,
-    };
     let req = CustomAgentUpsertRequest {
         name: p.name,
         command: p.command,
@@ -332,7 +429,7 @@ async fn agent_custom_create(deps: Arc<GatewayDeps>, p: AgentCustomCreateParams)
                 description: e.description,
             })
             .collect(),
-        advanced,
+        advanced: p.advanced.map(Into::into),
     };
     match deps.agent_service.create_custom_agent(req).await {
         Ok(meta) => ok(meta),
@@ -341,13 +438,6 @@ async fn agent_custom_create(deps: Arc<GatewayDeps>, p: AgentCustomCreateParams)
 }
 
 async fn agent_custom_update(deps: Arc<GatewayDeps>, p: AgentCustomUpdateParams) -> Value {
-    let advanced = match p.advanced {
-        Some(val) => match serde_json::from_value(val) {
-            Ok(adv) => Some(adv),
-            Err(e) => return json!({ "error": format!("invalid advanced field: {e}") }),
-        },
-        None => None,
-    };
     let req = CustomAgentUpsertRequest {
         name: p.name,
         command: p.command,
@@ -362,17 +452,25 @@ async fn agent_custom_update(deps: Arc<GatewayDeps>, p: AgentCustomUpdateParams)
                 description: e.description,
             })
             .collect(),
-        advanced,
+        advanced: p.advanced.map(Into::into),
     };
-    match deps.agent_service.update_custom_agent(&p.id, req).await {
+    match deps
+        .agent_service
+        .update_custom_agent(p.agent_id.as_str(), req)
+        .await
+    {
         Ok(meta) => ok(meta),
         Err(e) => json!({ "error": e.to_string() }),
     }
 }
 
 async fn agent_custom_delete(deps: Arc<GatewayDeps>, p: AgentCustomDeleteParams) -> Value {
-    match deps.agent_service.delete_custom_agent(&p.id).await {
-        Ok(()) => ok(json!({ "deleted": p.id })),
+    match deps
+        .agent_service
+        .delete_custom_agent(p.agent_id.as_str())
+        .await
+    {
+        Ok(()) => ok(json!({ "deleted": p.agent_id })),
         Err(e) => json!({ "error": e.to_string() }),
     }
 }
@@ -402,7 +500,7 @@ async fn remote_agent_list(deps: Arc<GatewayDeps>, _p: RemoteAgentListParams) ->
 }
 
 async fn remote_agent_get(deps: Arc<GatewayDeps>, p: RemoteAgentGetParams) -> Value {
-    match deps.remote_agent_service.get(&p.id).await {
+    match deps.remote_agent_service.get(&p.remote_agent_id).await {
         Ok(resp) => ok(resp),
         Err(e) => json!({ "error": e.to_string() }),
     }
@@ -459,15 +557,19 @@ async fn remote_agent_update(deps: Arc<GatewayDeps>, p: RemoteAgentUpdateParams)
         avatar: p.avatar,
         description: p.description,
     };
-    match deps.remote_agent_service.update(&p.id, req).await {
+    match deps
+        .remote_agent_service
+        .update(&p.remote_agent_id, req)
+        .await
+    {
         Ok(resp) => ok(resp),
         Err(e) => json!({ "error": e.to_string() }),
     }
 }
 
 async fn remote_agent_delete(deps: Arc<GatewayDeps>, p: RemoteAgentDeleteParams) -> Value {
-    match deps.remote_agent_service.delete(&p.id).await {
-        Ok(()) => ok(json!({ "deleted": p.id })),
+    match deps.remote_agent_service.delete(&p.remote_agent_id).await {
+        Ok(()) => ok(json!({ "remote_agent_id": p.remote_agent_id })),
         Err(e) => json!({ "error": e.to_string() }),
     }
 }
@@ -495,7 +597,11 @@ async fn remote_agent_test(deps: Arc<GatewayDeps>, p: RemoteAgentTestParams) -> 
 // ── model failover handlers ─────────────────────────────────────────────
 
 async fn remote_agent_handshake(deps: Arc<GatewayDeps>, p: RemoteAgentHandshakeParams) -> Value {
-    match deps.remote_agent_service.handshake(&p.id).await {
+    match deps
+        .remote_agent_service
+        .handshake(&p.remote_agent_id)
+        .await
+    {
         Ok(response) => ok(response),
         Err(e) => json!({ "error": e.to_string() }),
     }
@@ -509,22 +615,9 @@ async fn model_failover_get(deps: Arc<GatewayDeps>, _p: ModelFailoverGetParams) 
 }
 
 async fn model_failover_set(deps: Arc<GatewayDeps>, p: ModelFailoverSetParams) -> Value {
-    // Deserialize queue entries into the typed ProviderWithModel vec.
-    let queue: Vec<nomifun_common::ProviderWithModel> = match p
-        .queue
-        .into_iter()
-        .map(serde_json::from_value)
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(q) => q,
-        Err(e) => {
-            return json!({ "error": format!("invalid queue entry: {e}. Each entry must have provider_id and model fields.") })
-        }
-    };
-
     let cfg = ModelFailoverConfig {
         enabled: p.enabled,
-        queue,
+        queue: p.queue.into_iter().map(Into::into).collect(),
         max_switches: p.max_switches,
         stamp_unhealthy: p.stamp_unhealthy,
     };
@@ -655,7 +748,7 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
         CapabilityMeta::new(
             "nomi_remote_agent_get",
             "remote",
-            "Get a remote-agent configuration by id. Stored credentials are masked.",
+            "Get a remote-agent configuration by remote_agent_id. Stored credentials are masked.",
             DangerTier::Read,
         ),
         |deps, _ctx, p| remote_agent_get(deps, p),
@@ -751,16 +844,94 @@ mod tests {
     use super::*;
 
     #[test]
-    fn remote_agent_ids_are_canonical_strings() {
-        let id = "ragent_0190f5fe-7c00-7a00-8000-000000000012";
-        let get: RemoteAgentGetParams =
-            serde_json::from_value(json!({ "id": id })).unwrap();
-        let handshake: RemoteAgentHandshakeParams =
-            serde_json::from_value(json!({ "id": id })).unwrap();
+    fn set_enabled_accepts_only_canonical_agent_ids() {
+        let canonical_id = AgentId::new().into_string();
+        let parsed: AgentSetEnabledParams =
+            serde_json::from_value(json!({ "agent_id": canonical_id })).unwrap();
+        assert_eq!(parsed.agent_id.as_str(), canonical_id);
 
-        assert_eq!(get.id.as_str(), id);
-        assert_eq!(handshake.id.as_str(), id);
-        assert!(serde_json::from_value::<RemoteAgentGetParams>(json!({ "id": "1" })).is_err());
+        for invalid_id in [
+            "claude",
+            "nomi",
+            "extension:agent",
+            "agent_extension_demo",
+        ] {
+            assert!(
+                serde_json::from_value::<AgentSetEnabledParams>(
+                    json!({ "agent_id": invalid_id })
+                )
+                .is_err(),
+                "set-enabled must reject non-UUIDv7 agent_id {invalid_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_agent_ids_are_canonical_strings() {
+        let id = "0190f5fe-7c00-7a00-8000-000000000012";
+        let get: RemoteAgentGetParams =
+            serde_json::from_value(json!({ "remote_agent_id": id })).unwrap();
+        let update: RemoteAgentUpdateParams =
+            serde_json::from_value(json!({ "remote_agent_id": id })).unwrap();
+        let delete: RemoteAgentDeleteParams =
+            serde_json::from_value(json!({ "remote_agent_id": id })).unwrap();
+        let handshake: RemoteAgentHandshakeParams =
+            serde_json::from_value(json!({ "remote_agent_id": id })).unwrap();
+
+        assert_eq!(get.remote_agent_id.as_str(), id);
+        assert_eq!(update.remote_agent_id.as_str(), id);
+        assert_eq!(delete.remote_agent_id.as_str(), id);
+        assert_eq!(handshake.remote_agent_id.as_str(), id);
+        assert!(
+            serde_json::from_value::<RemoteAgentGetParams>(
+                json!({ "remote_agent_id": "1" })
+            )
+            .is_err()
+        );
+
+        for legacy in [
+            json!({ "id": id }),
+            json!({ "id": id, "remote_agent_id": id }),
+        ] {
+            assert!(serde_json::from_value::<RemoteAgentGetParams>(legacy.clone()).is_err());
+            assert!(serde_json::from_value::<RemoteAgentUpdateParams>(legacy.clone()).is_err());
+            assert!(serde_json::from_value::<RemoteAgentDeleteParams>(legacy.clone()).is_err());
+            assert!(serde_json::from_value::<RemoteAgentHandshakeParams>(legacy).is_err());
+        }
+    }
+
+    #[test]
+    fn remote_agent_capability_schemas_expose_only_named_wire_id() {
+        let mut caps = Vec::new();
+        register(&mut caps);
+
+        for name in [
+            "nomi_remote_agent_get",
+            "nomi_remote_agent_update",
+            "nomi_remote_agent_delete",
+            "nomi_remote_agent_handshake",
+        ] {
+            let cap = caps
+                .iter()
+                .find(|cap| cap.meta.name == name)
+                .unwrap_or_else(|| panic!("missing capability: {name}"));
+            let properties = cap.input_schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("capability {name} has no properties object"));
+
+            assert!(
+                properties.contains_key("remote_agent_id"),
+                "capability {name} must expose remote_agent_id"
+            );
+            assert!(
+                !properties.contains_key("id"),
+                "capability {name} must reject the legacy id field"
+            );
+            assert_eq!(
+                cap.input_schema.get("additionalProperties"),
+                Some(&json!(false))
+            );
+        }
     }
 
     #[test]

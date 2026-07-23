@@ -67,7 +67,7 @@ const AssetEditModal: React.FC<AssetEditModalProps> = ({ asset, collections, onC
     };
     setSaving(true);
     try {
-      await onSubmit(asset.id, patch);
+      await onSubmit(asset.asset_id, patch);
       message.success(
         removeFromLibrary
           ? t('workshopAssets.edit.removed', { defaultValue: '已移出资产库' })

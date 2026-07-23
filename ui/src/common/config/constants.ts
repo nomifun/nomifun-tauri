@@ -60,3 +60,6 @@ export const WEBUI_DEFAULT_PORT = (() => {
 // Stable ID for the Google Auth virtual provider.
 // Shared between frontend (useModelProviderList) and backend (SystemActions).
 export const GOOGLE_AUTH_PROVIDER_ID = 'google-auth-gemini';
+
+/** Stable bare UUIDv7 business ID of the built-in Nomi agent. */
+export const NOMI_AGENT_ID = '0190f5fe-7c00-7a00-8000-000000000114';

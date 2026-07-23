@@ -13,12 +13,12 @@ import {
 } from './hooks';
 
 const CONVERSATION_ID = parseConversationId(
-  'conv_019b0000-0000-7000-8000-000000000001'
+  '019b0000-0000-7000-8000-000000000001'
 );
 
 const messageId = (sequence: number): MessageId =>
   parseMessageId(
-    `msg_019b0000-0000-7000-8000-${sequence.toString(16).padStart(12, '0')}`
+    `019b0000-0000-7000-8000-${sequence.toString(16).padStart(12, '0')}`
   );
 
 const textMessage = (

@@ -23,7 +23,7 @@ import { Tag } from '@arco-design/web-react';
 import React, { useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import RequirementBoardCard from './RequirementBoardCard';
-import type { RequirementId } from '@/common/types/ids';
+import { parseRequirementId, type RequirementId } from '@/common/types/ids';
 
 interface RequirementBoardViewProps {
   items: IRequirement[];
@@ -73,7 +73,11 @@ const RequirementBoardView: React.FC<RequirementBoardViewProps> = ({ items, onOp
   const resolveDraggedId = (e: React.DragEvent<HTMLDivElement>): RequirementId | null => {
     if (draggedIdRef.current != null) return draggedIdRef.current;
     const raw = e.dataTransfer.getData('text/plain');
-    return raw !== '' && raw.startsWith('req_') ? (raw as RequirementId) : null;
+    try {
+      return parseRequirementId(raw);
+    } catch {
+      return null;
+    }
   };
 
   const handleDrop = (e: React.DragEvent<HTMLDivElement>, columnStatus: RequirementStatus) => {
@@ -82,7 +86,7 @@ const RequirementBoardView: React.FC<RequirementBoardViewProps> = ({ items, onOp
     const id = resolveDraggedId(e);
     draggedIdRef.current = null;
     if (id == null) return;
-    const dragged = items.find((it) => it.id === id);
+    const dragged = items.find((it) => it.requirement_id === id);
     // Only fire when the card is actually moving to a different column.
     if (dragged && dragged.status !== columnStatus) {
       onStatusChange(id, columnStatus);
@@ -151,7 +155,7 @@ const RequirementBoardView: React.FC<RequirementBoardViewProps> = ({ items, onOp
               ) : (
                 colItems.map((item) => (
                   <RequirementBoardCard
-                    key={item.id}
+                    key={item.requirement_id}
                     item={item}
                     onOpenDetail={onOpenDetail}
                     onDragStart={(id) => {

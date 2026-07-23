@@ -49,8 +49,10 @@ pub fn tool_call_signature(steps: &[String]) -> String {
 ///
 /// 返回去重后的极大套路，长窗优先。
 pub fn mine_patterns(events: &[CollectedEvent], min_count: i64, min_distinct_sessions: usize) -> Vec<MinedPattern> {
-    // 1) 按对话分组，保序收集 (tool_name, call_id, ts)。
-    let mut by_conv: BTreeMap<String, Vec<(String, String, i64)>> = BTreeMap::new();
+    // 1) 按对话分组，保序收集
+    // (tool_name, runtime_call_id, durable_event_id, ts)。
+    let mut by_conv: BTreeMap<String, Vec<(String, String, String, i64)>> =
+        BTreeMap::new();
     for ev in events {
         if ev.source != "tool_calls" {
             continue;
@@ -69,7 +71,10 @@ pub fn mine_patterns(events: &[CollectedEvent], min_count: i64, min_distinct_ses
             continue;
         };
         let call_id = ev.data.get("call_id").and_then(|c| c.as_str()).unwrap_or("").to_owned();
-        by_conv.entry(conv).or_default().push((name.to_owned(), call_id, ev.ts));
+        by_conv
+            .entry(conv)
+            .or_default()
+            .push((name.to_owned(), call_id, ev.event_id.clone(), ev.ts));
     }
 
     // 2) 每对话：折叠连续重复 → 序列；滑窗 [MIN_STEPS, MAX_STEPS] 聚合签名。
@@ -84,14 +89,14 @@ pub fn mine_patterns(events: &[CollectedEvent], min_count: i64, min_distinct_ses
     let mut agg: BTreeMap<String, Agg> = BTreeMap::new();
     for (conv, calls) in &by_conv {
         // 折叠连续重复（同一工具连刷多次算一步），保留首次的 (call_id, ts)。
-        let mut seq: Vec<(String, String, i64)> = Vec::new();
-        for (name, eid, ts) in calls {
-            if seq.last().map(|(n, _, _)| n == name).unwrap_or(false) {
+        let mut seq: Vec<(String, String, String, i64)> = Vec::new();
+        for (name, call_id, event_id, ts) in calls {
+            if seq.last().map(|(n, _, _, _)| n == name).unwrap_or(false) {
                 continue;
             }
-            seq.push((name.clone(), eid.clone(), *ts));
+            seq.push((name.clone(), call_id.clone(), event_id.clone(), *ts));
         }
-        let names: Vec<String> = seq.iter().map(|(n, _, _)| n.clone()).collect();
+        let names: Vec<String> = seq.iter().map(|(n, _, _, _)| n.clone()).collect();
         let n = names.len();
         if n < MIN_STEPS {
             continue;
@@ -114,16 +119,20 @@ pub fn mine_patterns(events: &[CollectedEvent], min_count: i64, min_distinct_ses
                     let slice = &seq[start..start + len];
                     entry.anchor = Some(TranscriptAnchor {
                         conversation_id: conv.clone(),
-                        start_ts: slice.first().map(|(_, _, t)| *t).unwrap_or(0),
-                        end_ts: slice.last().map(|(_, _, t)| *t).unwrap_or(0),
+                        start_ts: slice.first().map(|(_, _, _, t)| *t).unwrap_or(0),
+                        end_ts: slice.last().map(|(_, _, _, t)| *t).unwrap_or(0),
                         pad_turns: ANCHOR_PAD_TURNS,
-                        call_ids: slice.iter().filter(|(_, e, _)| !e.is_empty()).map(|(_, e, _)| e.clone()).collect(),
+                        call_ids: slice
+                            .iter()
+                            .filter(|(_, call_id, _, _)| !call_id.is_empty())
+                            .map(|(_, call_id, _, _)| call_id.clone())
+                            .collect(),
                     });
                 }
                 if entry.examples.len() < 8 {
-                    if let Some((_, eid, _)) = seq.get(start) {
-                        if !eid.is_empty() && !entry.examples.contains(eid) {
-                            entry.examples.push(eid.clone());
+                    if let Some((_, _, event_id, _)) = seq.get(start) {
+                        if !entry.examples.contains(event_id) {
+                            entry.examples.push(event_id.clone());
                         }
                     }
                 }
@@ -183,7 +192,8 @@ const MAX_REFLECT_STEPS: usize = 8;
 /// 长度 ≥ `min_steps`（取前 [`MAX_REFLECT_STEPS`] 步作签名），`distinct_sessions=1`
 /// （故其 confidence 低、永远走人审，不会被高置信自动激活）。最多返回 `max` 条。
 pub fn mine_reflection_candidates(events: &[CollectedEvent], min_steps: usize, max: usize) -> Vec<MinedPattern> {
-    let mut by_conv: BTreeMap<String, Vec<(String, String, i64)>> = BTreeMap::new();
+    let mut by_conv: BTreeMap<String, Vec<(String, String, String, i64)>> =
+        BTreeMap::new();
     for ev in events {
         if ev.source != "tool_calls" {
             continue;
@@ -202,34 +212,44 @@ pub fn mine_reflection_candidates(events: &[CollectedEvent], min_steps: usize, m
             continue;
         };
         let call_id = ev.data.get("call_id").and_then(|c| c.as_str()).unwrap_or("").to_owned();
-        by_conv.entry(conv).or_default().push((name.to_owned(), call_id, ev.ts));
+        by_conv
+            .entry(conv)
+            .or_default()
+            .push((name.to_owned(), call_id, ev.event_id.clone(), ev.ts));
     }
     let mut out = Vec::new();
     for (conv, calls) in &by_conv {
         if out.len() >= max {
             break;
         }
-        let mut seq: Vec<(String, String, i64)> = Vec::new();
-        for (name, eid, ts) in calls {
-            if seq.last().map(|(n, _, _)| n == name).unwrap_or(false) {
+        let mut seq: Vec<(String, String, String, i64)> = Vec::new();
+        for (name, call_id, event_id, ts) in calls {
+            if seq.last().map(|(n, _, _, _)| n == name).unwrap_or(false) {
                 continue;
             }
-            seq.push((name.clone(), eid.clone(), *ts));
+            seq.push((name.clone(), call_id.clone(), event_id.clone(), *ts));
         }
         if seq.len() < min_steps {
             continue;
         }
         let take = seq.len().min(MAX_REFLECT_STEPS);
         let taken = &seq[..take];
-        let names: Vec<String> = taken.iter().map(|(n, _, _)| n.clone()).collect();
-        let examples: Vec<String> =
-            taken.iter().take(8).filter_map(|(_, e, _)| if e.is_empty() { None } else { Some(e.clone()) }).collect();
+        let names: Vec<String> = taken.iter().map(|(n, _, _, _)| n.clone()).collect();
+        let examples: Vec<String> = taken
+            .iter()
+            .take(8)
+            .map(|(_, _, event_id, _)| event_id.clone())
+            .collect();
         let anchor = TranscriptAnchor {
             conversation_id: conv.clone(),
-            start_ts: taken.first().map(|(_, _, t)| *t).unwrap_or(0),
-            end_ts: taken.last().map(|(_, _, t)| *t).unwrap_or(0),
+            start_ts: taken.first().map(|(_, _, _, t)| *t).unwrap_or(0),
+            end_ts: taken.last().map(|(_, _, _, t)| *t).unwrap_or(0),
             pad_turns: ANCHOR_PAD_TURNS,
-            call_ids: taken.iter().filter(|(_, e, _)| !e.is_empty()).map(|(_, e, _)| e.clone()).collect(),
+            call_ids: taken
+                .iter()
+                .filter(|(_, call_id, _, _)| !call_id.is_empty())
+                .map(|(_, call_id, _, _)| call_id.clone())
+                .collect(),
         };
         out.push(MinedPattern {
             signature: tool_call_signature(&names),
@@ -249,12 +269,13 @@ mod tests {
     use serde_json::json;
 
     fn conversation_fixture(sequence: u64) -> String {
-        let raw = format!("conv_0190f5fe-7c00-7a00-8abc-{sequence:012}");
+        let raw = format!("0190f5fe-7c00-7a00-8abc-{sequence:012}");
         nomifun_common::ConversationId::try_from(raw.as_str()).unwrap().into_string()
     }
 
     fn tool_event(conv: &str, name: &str, call_id: &str, ts: i64) -> CollectedEvent {
         CollectedEvent {
+            event_id: nomifun_common::generate_id(),
             ts,
             source: "tool_calls".to_owned(),
             name: "tool.call".to_owned(),
@@ -288,6 +309,45 @@ mod tests {
         assert!(a.start_ts > 0 && a.end_ts >= a.start_ts, "anchor ts bounds: {a:?}");
         assert_eq!(a.call_ids.len(), 3, "3 步窗 → 3 个 call_id: {a:?}");
         assert!(a.call_ids.iter().all(|c| c.starts_with(&a.conversation_id)), "call_ids 同会话: {a:?}");
+    }
+
+    #[test]
+    fn provenance_uses_collected_event_ids_not_runtime_call_ids() {
+        let conversation = conversation_fixture(20);
+        let first_event_id = nomifun_common::generate_id();
+        let second_event_id = nomifun_common::generate_id();
+        let events = vec![
+            CollectedEvent {
+                event_id: first_event_id.clone(),
+                ts: 1,
+                source: "tool_calls".into(),
+                name: "tool.call".into(),
+                data: json!({
+                    "name": "grep",
+                    "conversation_id": conversation,
+                    "call_id": "runtime-call-1"
+                }),
+            },
+            CollectedEvent {
+                event_id: second_event_id,
+                ts: 2,
+                source: "tool_calls".into(),
+                name: "tool.call".into(),
+                data: json!({
+                    "name": "read",
+                    "conversation_id": conversation,
+                    "call_id": "runtime-call-2"
+                }),
+            },
+        ];
+
+        let patterns = mine_patterns(&events, 1, 1);
+        assert_eq!(patterns.len(), 1);
+        assert_eq!(patterns[0].example_event_ids, vec![first_event_id]);
+        assert_eq!(
+            patterns[0].anchor.call_ids,
+            vec!["runtime-call-1".to_owned(), "runtime-call-2".to_owned()]
+        );
     }
 
     /// 反思候选也带定位锚(单会话整段)。
@@ -341,6 +401,7 @@ mod tests {
     #[test]
     fn ignores_non_tool_call_sources() {
         let events = vec![CollectedEvent {
+            event_id: nomifun_common::generate_id(),
             ts: 1,
             source: "companion_dialogues".to_owned(),
             name: "chat".to_owned(),

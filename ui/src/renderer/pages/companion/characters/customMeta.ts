@@ -15,7 +15,7 @@ interface WireCustomFigure {
   size_tier?: string;
   /** Per-companion continuous figure-height override (logical px); supersedes size_tier. */
   size_px?: number | null;
-  /** Library figure id (`figure_…`); when present the image is served from the library. */
+  /** Stable library figure UUIDv7; when present the image is served from the library. */
   figure_id?: string | null;
 }
 

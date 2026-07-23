@@ -19,7 +19,7 @@ type PresetCardProps = {
   preset: PresetListItem;
   localeKey: string;
   avatarImageMap: Record<string, string>;
-  tagByKey: Map<string, PresetTag>;
+  tagById: Map<string, PresetTag>;
   isExtensionPreset: (preset: PresetListItem | null | undefined) => boolean;
   onEdit: (preset: PresetListItem) => void;
   onDuplicate: (preset: PresetListItem) => void;
@@ -34,7 +34,7 @@ const PresetCard: React.FC<PresetCardProps> = ({
   preset,
   localeKey,
   avatarImageMap,
-  tagByKey,
+  tagById,
   isExtensionPreset,
   onEdit,
   onDuplicate,
@@ -47,10 +47,9 @@ const PresetCard: React.FC<PresetCardProps> = ({
   const name = preset.name_i18n?.[localeKey] || preset.name;
   const description = preset.description_i18n?.[localeKey] || preset.description || '';
 
-  // Resolve tag keys → labels via the merged vocabulary. Unknown keys (e.g. a
-  // deleted tag still lingering on a row) are silently dropped.
-  const resolvedTags = [...(preset.audience_tags ?? []), ...(preset.scenario_tags ?? [])]
-    .map((key) => tagByKey.get(key))
+  // Resolve persisted UUIDv7 tag IDs to readable catalog labels.
+  const resolvedTags = [...(preset.audience_tag_ids ?? []), ...(preset.scenario_tag_ids ?? [])]
+    .map((presetTagId) => tagById.get(presetTagId))
     .filter((tag): tag is PresetTag => Boolean(tag));
   const visibleTags = resolvedTags.slice(0, MAX_VISIBLE_TAGS);
   const overflowCount = resolvedTags.length - visibleTags.length;
@@ -60,7 +59,7 @@ const PresetCard: React.FC<PresetCardProps> = ({
   return (
     <div
       ref={cardRef}
-      data-testid={`preset-card-${preset.id}`}
+      data-testid={`preset-card-${preset.preset_id}`}
       onClick={() => onEdit(preset)}
       className={[
         'group relative flex flex-col rounded-16px p-14px cursor-pointer',
@@ -100,7 +99,7 @@ const PresetCard: React.FC<PresetCardProps> = ({
           <Switch
             size='small'
             className='compact-dark-switch'
-            data-testid={`switch-enabled-${preset.id}`}
+            data-testid={`switch-enabled-${preset.preset_id}`}
             checked={presetIsExtension ? true : preset.enabled !== false}
             disabled={presetIsExtension}
             onChange={(checked) => onToggleEnabled(preset, checked)}
@@ -142,7 +141,7 @@ const PresetCard: React.FC<PresetCardProps> = ({
         <div className='mt-12px flex flex-wrap items-center gap-6px'>
           {visibleTags.map((tag) => (
             <span
-              key={tag.key}
+              key={tag.preset_tag_id}
               className={[
                 'inline-flex items-center rounded-[12px] px-8px py-1px text-11px leading-16px',
                 'bg-[var(--color-fill-3)] text-[var(--color-text-2)]',
@@ -167,7 +166,7 @@ const PresetCard: React.FC<PresetCardProps> = ({
         <span
           role='button'
           tabIndex={0}
-          data-testid={`btn-duplicate-${preset.id}`}
+          data-testid={`btn-duplicate-${preset.preset_id}`}
           onClick={() => onDuplicate(preset)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' || e.key === ' ') {
@@ -183,7 +182,7 @@ const PresetCard: React.FC<PresetCardProps> = ({
         <span
           role='button'
           tabIndex={0}
-          data-testid={`btn-edit-${preset.id}`}
+          data-testid={`btn-edit-${preset.preset_id}`}
           onClick={() => onEdit(preset)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' || e.key === ' ') {

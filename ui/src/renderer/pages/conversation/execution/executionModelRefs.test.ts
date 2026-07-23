@@ -4,9 +4,9 @@ import type { TExecutionModelRef } from '@/common/types/agentExecution/agentExec
 import { parseProviderId, type ProviderId } from '@/common/types/ids';
 import { reconcileModelRefs, sameModelRefs } from './executionModelRefs';
 
-const GONE = parseProviderId('prov_0190f5fe-7c00-7a00-8000-000000000001');
-const KEEP = parseProviderId('prov_0190f5fe-7c00-7a00-8000-000000000002');
-const P = parseProviderId('prov_0190f5fe-7c00-7a00-8000-000000000003');
+const GONE = parseProviderId('0190f5fe-7c00-7a00-8000-000000000001');
+const KEEP = parseProviderId('0190f5fe-7c00-7a00-8000-000000000002');
+const P = parseProviderId('0190f5fe-7c00-7a00-8000-000000000003');
 
 const ref = (provider_id: ProviderId, model: string): TExecutionModelRef => ({
   provider_id,

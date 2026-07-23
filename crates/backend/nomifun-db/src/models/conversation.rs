@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 /// deserialized by the service layer.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ConversationRow {
-    pub id: String,
+    pub id: i64,
+    pub conversation_id: String,
     pub user_id: String,
     pub name: String,
     /// Agent type string (e.g. "gemini", "acp", "remote").
@@ -30,7 +31,7 @@ pub struct ConversationRow {
     pub execution_template_id: Option<String>,
     /// JSON object: `ProviderWithModel` serialized.
     pub model: Option<String>,
-    /// One of: "pending", "running", "finished". NULL in legacy rows.
+    /// One of: "pending", "running", "finished". NULL means unspecified.
     pub status: Option<String>,
     /// One of: "nomifun", "telegram", "lark", "dingtalk", "weixin".
     pub source: Option<String>,
@@ -39,8 +40,7 @@ pub struct ConversationRow {
     /// Whether this conversation is pinned (SQLite INTEGER 0/1).
     pub pinned: bool,
     pub pinned_at: Option<TimestampMs>,
-    /// The cron job that created this conversation (was `extra.cronJobId`;
-    /// now a real nullable FK column to `cron_jobs`).
+    /// UUIDv7 logical reference to the cron job that created this conversation.
     pub cron_job_id: Option<String>,
     /// Preset lineage and immutable resolved launch configuration.
     pub preset_id: Option<String>,
@@ -52,6 +52,7 @@ pub struct ConversationRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ConversationDeliveryReceiptRow {
+    pub id: i64,
     pub operation_id: String,
     pub message_id: String,
     pub conversation_id: String,

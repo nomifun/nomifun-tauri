@@ -46,7 +46,10 @@ impl KnowledgeEventEmitter {
     }
 
     pub fn emit_base_deleted(&self, id: &KnowledgeBaseId) {
-        self.broadcast("knowledge.base-deleted", &serde_json::json!({ "id": id }));
+        self.broadcast(
+            "knowledge.base-deleted",
+            &serde_json::json!({ "knowledge_base_id": id }),
+        );
     }
 
     pub fn emit_binding_changed<T: serde::Serialize>(&self, binding: &T) {

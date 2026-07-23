@@ -1,5 +1,11 @@
 # Channel Outbound Image/File Send Implementation Plan
 
+> **⚠️ SUPERSEDED / LEGACY 历史计划（非当前架构）**
+> 本文是 2026 年 7 月 9 日的旧实施计划，保留用于追溯功能演进，不得作为当前
+> ID 或数据库契约。当前 v3 架构使用不带前缀的裸 UUIDv7 业务 ID，所有持久化
+> 表使用自增 `id INTEGER PRIMARY KEY AUTOINCREMENT`，且不使用物理外键。本文
+> 中的 `wsa_…`、`wsa_...` 等前缀示例属于历史格式。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Let a channel (Telegram first, WeChat later) deliver AI-generated images/files to the remote IM user, instead of only forwarding the assistant's text.

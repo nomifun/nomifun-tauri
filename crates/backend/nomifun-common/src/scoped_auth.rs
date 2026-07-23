@@ -772,8 +772,8 @@ where
 mod tests {
     use super::*;
 
-    const TEST_USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
-    const TEST_CONVERSATION_ID: &str = "conv_0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000002";
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     struct Scope {
@@ -820,7 +820,7 @@ mod tests {
         assert_eq!(future.validate_at(now), Err(LoopbackCapabilityError::InvalidLifetime));
 
         let mut mismatched = claims(now);
-        mismatched.session.session_id = "conv_0190f5fe-7c00-7a00-8000-000000000002".into();
+        mismatched.session.session_id = "0190f5fe-7c00-7a00-8000-000000000003".into();
         assert_eq!(mismatched.validate_at(now), Err(LoopbackCapabilityError::InvalidIdentity));
     }
 
@@ -862,18 +862,18 @@ mod tests {
     }
 
     #[test]
-    fn session_binding_deserialization_rejects_wrong_or_noncanonical_entity_ids() {
-        let wrong_prefix = serde_json::json!({
+    fn session_binding_deserialization_rejects_prefixed_or_mismatched_entity_ids() {
+        let legacy_prefixed = serde_json::json!({
             "kind": "conversation",
-            "session_id": "term_0190f5fe-7c00-7a00-8000-000000000001",
-            "conversation_id": "term_0190f5fe-7c00-7a00-8000-000000000001"
+            "session_id": "0190f5fe-7c00-7a00-8000-000000000001",
+            "conversation_id": "0190f5fe-7c00-7a00-8000-000000000001"
         });
-        assert!(serde_json::from_value::<LoopbackSessionBinding>(wrong_prefix).is_err());
+        assert!(serde_json::from_value::<LoopbackSessionBinding>(legacy_prefixed).is_err());
 
         let mismatched = serde_json::json!({
             "kind": "conversation",
             "session_id": TEST_CONVERSATION_ID,
-            "conversation_id": "conv_0190f5fe-7c00-7a00-8000-000000000002"
+            "conversation_id": "0190f5fe-7c00-7a00-8000-000000000003"
         });
         assert!(serde_json::from_value::<LoopbackSessionBinding>(mismatched).is_err());
     }

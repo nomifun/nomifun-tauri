@@ -18,6 +18,7 @@ use crate::provider_support::load_provider_summaries;
 const MAX_MODELS_PER_PROVIDER: usize = 20;
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ListProvidersParams {
     /// Include disabled providers too (default false: enabled only).
     #[serde(default)]
@@ -35,7 +36,7 @@ async fn list(deps: Arc<GatewayDeps>, p: ListProvidersParams) -> Value {
         .filter(|p| include_disabled || p.enabled)
         .map(|p| {
             json!({
-                "id": p.id,
+                "provider_id": p.provider_id,
                 "name": p.name,
                 "platform": p.platform,
                 "enabled": p.enabled,

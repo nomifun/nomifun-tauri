@@ -29,10 +29,7 @@ pub struct ModelGenerationSuggestion {
 
 /// Extract the model id from a [`ModelInfo`] (bare string or `{id,name}`).
 fn model_id(info: &ModelInfo) -> &str {
-    match info {
-        ModelInfo::Id(id) => id,
-        ModelInfo::Named { id, .. } => id,
-    }
+    &info.id
 }
 
 /// Classify a freshly-fetched model list into generation-capability suggestions.
@@ -65,13 +62,22 @@ mod tests {
     #[test]
     fn classifies_mixed_model_list() {
         let models = vec![
-            ModelInfo::Id("gpt-4o".into()),
-            ModelInfo::Id("dall-e-3".into()),
-            ModelInfo::Named {
-                id: "sora-2".into(),
-                name: "Sora 2".into(),
+            ModelInfo {
+                id: "gpt-4o".into(),
+                name: None,
             },
-            ModelInfo::Id("text-embedding-3-large".into()),
+            ModelInfo {
+                id: "dall-e-3".into(),
+                name: None,
+            },
+            ModelInfo {
+                id: "sora-2".into(),
+                name: Some("Sora 2".into()),
+            },
+            ModelInfo {
+                id: "text-embedding-3-large".into(),
+                name: None,
+            },
         ];
         let out = suggest_generation_capabilities(&models);
         // Only the two generators survive.
@@ -84,7 +90,16 @@ mod tests {
 
     #[test]
     fn empty_when_no_generators() {
-        let models = vec![ModelInfo::Id("claude-opus-4".into()), ModelInfo::Id("gpt-4o-mini".into())];
+        let models = vec![
+            ModelInfo {
+                id: "claude-opus-4".into(),
+                name: None,
+            },
+            ModelInfo {
+                id: "gpt-4o-mini".into(),
+                name: None,
+            },
+        ];
         assert!(suggest_generation_capabilities(&models).is_empty());
     }
 }

@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { parseExecutionStepId } from '@/common/types/ids';
 import { resolveExecutionCanvasFocusStepId, summarizeExecutionText } from './executionCanvasPresentation';
 
 describe('execution canvas summaries', () => {
@@ -19,7 +20,10 @@ describe('execution canvas summaries', () => {
   });
 
   test('falls back from a superseded hover target to the still-current projected step', () => {
-    expect(resolveExecutionCanvasFocusStepId(new Set(['current']), 'superseded', 'current')).toBe('current');
-    expect(resolveExecutionCanvasFocusStepId(new Set(['current']), 'superseded', 'also-superseded')).toBeNull();
+    const current = parseExecutionStepId('0190f5fe-7c00-7a00-8000-000000000001');
+    const superseded = parseExecutionStepId('0190f5fe-7c00-7a00-8000-000000000002');
+    const alsoSuperseded = parseExecutionStepId('0190f5fe-7c00-7a00-8000-000000000003');
+    expect(resolveExecutionCanvasFocusStepId(new Set([current]), superseded, current)).toBe(current);
+    expect(resolveExecutionCanvasFocusStepId(new Set([current]), superseded, alsoSuperseded)).toBeNull();
   });
 });

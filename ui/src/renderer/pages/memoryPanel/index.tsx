@@ -161,7 +161,9 @@ const MemoryPanelPage: React.FC = () => {
   }, [finishClose]);
 
   if (!snapshot) return null;
-  const activate = (suggestionId: MemoryPanelSnapshotPayload['suggestions'][number]['id']) => {
+  const activate = (
+    suggestionId: MemoryPanelSnapshotPayload['suggestions'][number]['suggestion_id']
+  ) => {
     if (activationPendingRef.current) return;
     activationPendingRef.current = true;
     const payload: MemoryPanelActivatePayload = { requestId: snapshot.requestId, ownerWindowLabel: snapshot.ownerWindowLabel, suggestionId };
@@ -173,7 +175,13 @@ const MemoryPanelPage: React.FC = () => {
       <section ref={cardRef} className='nomi-memory-panel__card' role='dialog' aria-label={t('nomi.tabs.suggestions')}>
         <div className='nomi-memory-panel__list'>
           {snapshot.suggestions.map((suggestion, index) => (
-            <button ref={index === 0 ? firstItemRef : undefined} key={suggestion.id} type='button' className='nomi-memory-panel__item' onClick={() => activate(suggestion.id)}>
+            <button
+              ref={index === 0 ? firstItemRef : undefined}
+              key={suggestion.suggestion_id}
+              type='button'
+              className='nomi-memory-panel__item'
+              onClick={() => activate(suggestion.suggestion_id)}
+            >
               <span className='nomi-memory-panel__title'>{suggestion.title}</span>
               <span className='nomi-memory-panel__body'>{suggestion.body}</span>
             </button>

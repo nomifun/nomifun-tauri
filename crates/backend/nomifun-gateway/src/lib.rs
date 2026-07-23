@@ -34,6 +34,7 @@ pub mod computer_registry;
 
 // Pure support functions shared by multiple registered capability domains.
 // They do not dispatch tools and are not an alternate capability surface.
+mod id_schema;
 mod provider_support;
 mod terminal_support;
 

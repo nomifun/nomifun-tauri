@@ -23,7 +23,7 @@ use nomifun_common::{
 use nomifun_conversation::ConversationService;
 use nomifun_conversation::runtime_state::ConversationRuntimeStateService;
 use nomifun_conversation::skill_resolver::{ResolvedAgentSkill, SkillResolver};
-use nomifun_db::models::{ChannelUserRow, ChannelPluginRow};
+use nomifun_db::models::{NewChannelPluginRow, NewChannelUserRow};
 use nomifun_db::{
     CreateProviderParams, IChannelRepository, IClientPreferenceRepository, IProviderRepository,
     SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteChannelRepository,
@@ -32,17 +32,14 @@ use nomifun_db::{
 use nomifun_realtime::UserEventSink;
 use tokio::sync::{broadcast, mpsc};
 
-/// The channel row id every test message arrives through.
-const TEST_CHANNEL: &str = "chn_018f1234-5678-7abc-8def-012345678930";
-const TEST_CHANNEL_USER: &str = "chu_018f1234-5678-7abc-8def-012345678931";
-const TEST_PROVIDER: &str = "prov_018f1234-5678-7abc-8def-012345678932";
-const TEST_OWNER: &str = "user_018f1234-5678-7abc-8def-012345678933";
+const TEST_PROVIDER: &str = "018f1234-5678-7abc-8def-012345678932";
+const TEST_OWNER: &str = "018f1234-5678-7abc-8def-012345678933";
 
 /// Stamps a platform message with the test channel id, the way the
 /// manager's per-instance forwarder does in production.
-fn incoming(message: UnifiedIncomingMessage) -> ChannelIncoming {
+fn incoming(channel_plugin_id: &str, message: UnifiedIncomingMessage) -> ChannelIncoming {
     ChannelIncoming {
-        channel_id: TEST_CHANNEL.into(),
+        channel_plugin_id: channel_plugin_id.to_owned(),
         message,
     }
 }
@@ -121,10 +118,8 @@ async fn unauthorized_user_gets_pairing_response() {
     let session_mgr = Arc::new(SessionManager::new(repo.clone()));
     let executor = Arc::new(ActionExecutor::new(pairing, Arc::clone(&session_mgr), settings, "acp"));
 
-    // The pairing code created for the unauthorized user carries an FK
-    // channel_id → channel_plugins(id), so the bot channel must exist first.
-    repo.upsert_plugin(&ChannelPluginRow {
-        id: TEST_CHANNEL.into(),
+    let plugin = repo
+        .create_plugin(&NewChannelPluginRow {
         r#type: "telegram".into(),
         name: "Test Bot".into(),
         enabled: true,
@@ -141,7 +136,10 @@ async fn unauthorized_user_gets_pairing_response() {
     .unwrap();
 
     let msg = make_text_message("unknown_user", "chat_1", "hello");
-    let result = executor.handle_incoming_message(&msg, TEST_CHANNEL).await.unwrap();
+    let result = executor
+        .handle_incoming_message(&msg, &plugin.channel_plugin_id)
+        .await
+        .unwrap();
 
     match result {
         MessageResult::Action(response) => {
@@ -319,6 +317,7 @@ struct Harness {
     /// The shared pending-decision store the message loop's relay/interception
     /// uses, so tests can seed and inspect pending decisions.
     pending_decisions: Arc<nomifun_channel::pending_decision::PendingDecisionStore>,
+    channel_plugin_id: String,
 }
 
 async fn build_harness() -> Harness {
@@ -334,7 +333,7 @@ async fn build_harness() -> Harness {
     let provider_repo = SqliteProviderRepository::new(pool.clone());
     provider_repo
         .create(CreateProviderParams {
-            id: Some(TEST_PROVIDER),
+            provider_id: Some(TEST_PROVIDER),
             platform: "openai",
             name: "Channel test provider",
             base_url: "https://example.invalid/v1",
@@ -342,7 +341,6 @@ async fn build_harness() -> Harness {
             models: r#"["channel-test-model"]"#,
             enabled: true,
             capabilities: "[]",
-            context_limit: None,
             model_context_limits: None,
             model_protocols: None,
             model_descriptions: None,
@@ -358,7 +356,9 @@ async fn build_harness() -> Harness {
     pref_repo
         .upsert_batch(&[(
             "channels.telegram.defaultModel",
-            &format!(r#"{{"id":"{TEST_PROVIDER}","use_model":"channel-test-model"}}"#),
+            &format!(
+                r#"{{"provider_id":"{TEST_PROVIDER}","model":"channel-test-model"}}"#
+            ),
         )])
         .await
         .unwrap();
@@ -372,13 +372,8 @@ async fn build_harness() -> Harness {
         "nomi",
     ));
 
-    // Every test message arrives through the canonical TEST_CHANNEL. channel_sessions
-    // now has an FK channel_id → channel_plugins(id), so the plugin row must
-    // exist before any session is created. bot_key=None avoids the
-    // UNIQUE(type, bot_key) index.
-    channel_repo
-        .upsert_plugin(&ChannelPluginRow {
-            id: TEST_CHANNEL.into(),
+    let plugin = channel_repo
+        .create_plugin(&NewChannelPluginRow {
             r#type: "telegram".into(),
             name: "Test Bot".into(),
             enabled: true,
@@ -396,15 +391,13 @@ async fn build_harness() -> Harness {
 
     // Authorize the test user so messages reach the dispatch path.
     channel_repo
-        .create_user(&ChannelUserRow {
-            id: TEST_CHANNEL_USER.into(),
+        .create_user(&NewChannelUserRow {
             platform_user_id: "tg_42".into(),
             platform_type: "telegram".into(),
-            channel_id: Some(TEST_CHANNEL.into()),
+            channel_plugin_id: Some(plugin.channel_plugin_id.clone()),
             display_name: Some("Test".into()),
             authorized_at: now_ms(),
             last_active: None,
-            session_id: None,
         })
         .await
         .unwrap();
@@ -455,6 +448,7 @@ async fn build_harness() -> Harness {
         runtime,
         installation_owner,
         pending_decisions,
+        channel_plugin_id: plugin.channel_plugin_id,
     }
 }
 
@@ -557,7 +551,10 @@ async fn busy_conversation_replies_with_processing_notice() {
 
     harness
         .message_tx
-        .send(incoming(make_text_message("tg_42", "chat_1", "hello world")))
+        .send(incoming(
+            &harness.channel_plugin_id,
+            make_text_message("tg_42", "chat_1", "hello world"),
+        ))
         .await
         .unwrap();
     let cid = wait_for_bound_conversation(&harness.channel_repo, &harness.recorder).await;
@@ -568,7 +565,10 @@ async fn busy_conversation_replies_with_processing_notice() {
 
     harness
         .message_tx
-        .send(incoming(make_text_message("tg_42", "chat_1", "second message")))
+        .send(incoming(
+            &harness.channel_plugin_id,
+            make_text_message("tg_42", "chat_1", "second message"),
+        ))
         .await
         .unwrap();
 
@@ -593,7 +593,10 @@ async fn chat_continue_sends_continue_prompt_to_agent() {
 
     harness
         .message_tx
-        .send(incoming(make_text_message("tg_42", "chat_1", "hello world")))
+        .send(incoming(
+            &harness.channel_plugin_id,
+            make_text_message("tg_42", "chat_1", "hello world"),
+        ))
         .await
         .unwrap();
     let cid = wait_for_bound_conversation(&harness.channel_repo, &harness.recorder).await;
@@ -601,7 +604,10 @@ async fn chat_continue_sends_continue_prompt_to_agent() {
 
     harness
         .message_tx
-        .send(incoming(make_chat_action_message("tg_42", "chat_1", "chat.continue")))
+        .send(incoming(
+            &harness.channel_plugin_id,
+            make_chat_action_message("tg_42", "chat_1", "chat.continue"),
+        ))
         .await
         .unwrap();
 
@@ -625,7 +631,10 @@ async fn chat_regenerate_resends_last_user_message() {
 
     harness
         .message_tx
-        .send(incoming(make_text_message("tg_42", "chat_1", "hello world")))
+        .send(incoming(
+            &harness.channel_plugin_id,
+            make_text_message("tg_42", "chat_1", "hello world"),
+        ))
         .await
         .unwrap();
     let cid = wait_for_bound_conversation(&harness.channel_repo, &harness.recorder).await;
@@ -633,7 +642,10 @@ async fn chat_regenerate_resends_last_user_message() {
 
     harness
         .message_tx
-        .send(incoming(make_chat_action_message("tg_42", "chat_1", "chat.regenerate")))
+        .send(incoming(
+            &harness.channel_plugin_id,
+            make_chat_action_message("tg_42", "chat_1", "chat.regenerate"),
+        ))
         .await
         .unwrap();
 
@@ -655,7 +667,10 @@ async fn chat_regenerate_without_history_replies_with_notice() {
 
     harness
         .message_tx
-        .send(incoming(make_chat_action_message("tg_42", "chat_1", "chat.regenerate")))
+        .send(incoming(
+            &harness.channel_plugin_id,
+            make_chat_action_message("tg_42", "chat_1", "chat.regenerate"),
+        ))
         .await
         .unwrap();
 
@@ -697,7 +712,10 @@ async fn decision_numeric_reply_resolves_and_does_not_dispatch() {
     // Establish a bound conversation with exactly one user message.
     harness
         .message_tx
-        .send(incoming(make_text_message("tg_42", "chat_1", "hello world")))
+        .send(incoming(
+            &harness.channel_plugin_id,
+            make_text_message("tg_42", "chat_1", "hello world"),
+        ))
         .await
         .unwrap();
     let cid = wait_for_bound_conversation(&harness.channel_repo, &harness.recorder).await;
@@ -708,7 +726,10 @@ async fn decision_numeric_reply_resolves_and_does_not_dispatch() {
 
     harness
         .message_tx
-        .send(incoming(make_text_message("tg_42", "chat_1", "2")))
+        .send(incoming(
+            &harness.channel_plugin_id,
+            make_text_message("tg_42", "chat_1", "2"),
+        ))
         .await
         .unwrap();
 
@@ -742,7 +763,10 @@ async fn decision_non_numeric_reply_reshows_list_and_does_not_dispatch() {
 
     harness
         .message_tx
-        .send(incoming(make_text_message("tg_42", "chat_1", "hello world")))
+        .send(incoming(
+            &harness.channel_plugin_id,
+            make_text_message("tg_42", "chat_1", "hello world"),
+        ))
         .await
         .unwrap();
     let cid = wait_for_bound_conversation(&harness.channel_repo, &harness.recorder).await;
@@ -752,7 +776,10 @@ async fn decision_non_numeric_reply_reshows_list_and_does_not_dispatch() {
 
     harness
         .message_tx
-        .send(incoming(make_text_message("tg_42", "chat_1", "what?")))
+        .send(incoming(
+            &harness.channel_plugin_id,
+            make_text_message("tg_42", "chat_1", "what?"),
+        ))
         .await
         .unwrap();
 

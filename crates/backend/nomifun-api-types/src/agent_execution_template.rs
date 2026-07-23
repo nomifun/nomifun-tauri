@@ -15,7 +15,7 @@ use crate::{
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentExecutionTemplate {
     #[serde(deserialize_with = "crate::serde_util::deserialize_execution_template_id")]
-    pub id: String,
+    pub execution_template_id: String,
     pub name: String,
     pub description: Option<String>,
     pub max_parallel: Option<i64>,
@@ -28,11 +28,14 @@ pub struct AgentExecutionTemplate {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentExecutionTemplateParticipant {
-    #[serde(
-        deserialize_with = "crate::serde_util::deserialize_execution_template_participant_id"
-    )]
-    pub id: String,
+    #[serde(deserialize_with = "crate::agent_execution::deserialize_uuidv7_id")]
+    pub template_participant_id: String,
+    #[serde(deserialize_with = "crate::serde_util::deserialize_agent_id")]
     pub source_agent_id: String,
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_util::deserialize_optional_preset_id"
+    )]
     pub preset_id: Option<String>,
     pub preset_revision: Option<i64>,
     pub preset_snapshot: Option<ResolvedPresetSnapshot>,
@@ -41,6 +44,7 @@ pub struct AgentExecutionTemplateParticipant {
         deserialize_with = "crate::serde_util::deserialize_optional_provider_id"
     )]
     pub provider_id: Option<String>,
+    #[serde(default, deserialize_with = "crate::serde_util::deserialize_optional_model_name")]
     pub model: Option<String>,
     pub role: Option<String>,
     pub capability: Option<ParticipantCapability>,
@@ -66,12 +70,18 @@ pub struct AgentExecutionTemplateDetail {
 /// Authoring input for one candidate Agent. A caller may either round-trip an
 /// existing frozen `preset_snapshot`, or provide `preset_id` + overrides and
 /// let the server resolve a fresh execution-step snapshot before persistence.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentExecutionTemplateParticipantInput {
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_util::deserialize_optional_agent_id"
+    )]
     pub source_agent_id: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_util::deserialize_optional_preset_id"
+    )]
     pub preset_id: Option<String>,
     #[serde(default)]
     pub preset_snapshot: Option<ResolvedPresetSnapshot>,
@@ -82,7 +92,7 @@ pub struct AgentExecutionTemplateParticipantInput {
         deserialize_with = "crate::serde_util::deserialize_optional_provider_id"
     )]
     pub provider_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::serde_util::deserialize_optional_model_name")]
     pub model: Option<String>,
     #[serde(default)]
     pub role: Option<String>,
@@ -100,6 +110,81 @@ pub struct AgentExecutionTemplateParticipantInput {
     pub disabled_builtin_skills: Vec<String>,
     #[serde(default)]
     pub sort_order: Option<i64>,
+}
+
+impl<'de> Deserialize<'de> for AgentExecutionTemplateParticipantInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            #[serde(
+                default,
+                deserialize_with = "crate::serde_util::deserialize_optional_agent_id"
+            )]
+            source_agent_id: Option<String>,
+            #[serde(
+                default,
+                deserialize_with = "crate::serde_util::deserialize_optional_preset_id"
+            )]
+            preset_id: Option<String>,
+            #[serde(default)]
+            preset_snapshot: Option<ResolvedPresetSnapshot>,
+            #[serde(default)]
+            preset_overrides: Option<PresetOverrides>,
+            #[serde(
+                default,
+                deserialize_with = "crate::serde_util::deserialize_optional_provider_id"
+            )]
+            provider_id: Option<String>,
+            #[serde(
+                default,
+                deserialize_with = "crate::serde_util::deserialize_optional_model_name"
+            )]
+            model: Option<String>,
+            #[serde(default)]
+            role: Option<String>,
+            #[serde(default)]
+            capability: Option<ParticipantCapability>,
+            #[serde(default)]
+            constraints: Option<ParticipantConstraints>,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default)]
+            system_prompt: Option<String>,
+            #[serde(default)]
+            enabled_skills: Vec<String>,
+            #[serde(default)]
+            disabled_builtin_skills: Vec<String>,
+            #[serde(default)]
+            sort_order: Option<i64>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        crate::serde_util::validate_optional_provider_model_pair(
+            wire.provider_id.as_deref(),
+            wire.model.as_deref(),
+        )
+        .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            source_agent_id: wire.source_agent_id,
+            preset_id: wire.preset_id,
+            preset_snapshot: wire.preset_snapshot,
+            preset_overrides: wire.preset_overrides,
+            provider_id: wire.provider_id,
+            model: wire.model,
+            role: wire.role,
+            capability: wire.capability,
+            constraints: wire.constraints,
+            description: wire.description,
+            system_prompt: wire.system_prompt,
+            enabled_skills: wire.enabled_skills,
+            disabled_builtin_skills: wire.disabled_builtin_skills,
+            sort_order: wire.sort_order,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,8 +257,8 @@ pub struct CreateExecutionFromTemplateRequest {
 mod tests {
     use super::*;
 
-    const CONVERSATION_ID: &str = "conv_0190f5fe-7c00-7a00-8000-000000000001";
-    const PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000001";
+    const CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 
     #[test]
     fn template_inputs_reject_noncanonical_durable_references() {
@@ -192,6 +277,23 @@ mod tests {
             .is_err()
         );
 
+        for invalid in [
+            "nomi",
+            "agent_builtin_nomi",
+            "agent_0190f5fe-7c00-7a00-8000-000000000114",
+        ] {
+            assert!(
+                serde_json::from_value::<AgentExecutionTemplateParticipantInput>(
+                    serde_json::json!({
+                        "source_agent_id": invalid,
+                        "provider_id": PROVIDER_ID,
+                        "model": "model-a"
+                    })
+                )
+                .is_err()
+            );
+        }
+
         assert!(
             serde_json::from_value::<CreateExecutionFromTemplateRequest>(serde_json::json!({
                 "goal": "ship",
@@ -206,5 +308,18 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn template_participant_input_requires_provider_and_model_together() {
+        for invalid in [
+            serde_json::json!({"provider_id": PROVIDER_ID}),
+            serde_json::json!({"model": "model-a"}),
+            serde_json::json!({"provider_id": PROVIDER_ID, "model": " model-a"}),
+        ] {
+            assert!(
+                serde_json::from_value::<AgentExecutionTemplateParticipantInput>(invalid).is_err()
+            );
+        }
     }
 }

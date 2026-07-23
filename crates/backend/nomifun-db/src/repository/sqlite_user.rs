@@ -30,8 +30,8 @@ impl IUserRepository for SqliteUserRepository {
         let user = sqlx::query_as::<_, User>(
             "SELECT users.* \
              FROM installation_identity identity \
-             JOIN users ON users.id = identity.owner_user_id \
-             WHERE identity.key = 'installation'",
+             JOIN users ON users.user_id = identity.owner_user_id \
+             WHERE identity.singleton_key = 'installation'",
         )
         .fetch_optional(&self.pool)
         .await?;
@@ -47,8 +47,8 @@ impl IUserRepository for SqliteUserRepository {
         let now = nomifun_common::now_ms();
         let result = sqlx::query(
             "UPDATE users SET username = ?, password_hash = ?, updated_at = ? \
-             WHERE id = (SELECT owner_user_id FROM installation_identity \
-                         WHERE key = 'installation')",
+             WHERE user_id = (SELECT owner_user_id FROM installation_identity \
+                              WHERE singleton_key = 'installation')",
         )
         .bind(username)
         .bind(password_hash)
@@ -83,8 +83,8 @@ impl IUserRepository for SqliteUserRepository {
         // already-populated hash and updates 0 rows.
         let result = sqlx::query(
             "UPDATE users SET username = ?, password_hash = ?, updated_at = ? \
-             WHERE id = (SELECT owner_user_id FROM installation_identity \
-                         WHERE key = 'installation') \
+             WHERE user_id = (SELECT owner_user_id FROM installation_identity \
+                              WHERE singleton_key = 'installation') \
                AND (password_hash = '' OR password_hash IS NULL)",
         )
         .bind(username)
@@ -109,8 +109,8 @@ impl IUserRepository for SqliteUserRepository {
         // the gate, so a second concurrent enable writes 0 rows.
         let result = sqlx::query(
             "UPDATE users SET password_hash = ?, updated_at = ? \
-             WHERE id = (SELECT owner_user_id FROM installation_identity \
-                         WHERE key = 'installation') \
+             WHERE user_id = (SELECT owner_user_id FROM installation_identity \
+                              WHERE singleton_key = 'installation') \
                AND (password_hash = '' OR password_hash IS NULL)",
         )
         .bind(password_hash)
@@ -125,16 +125,16 @@ impl IUserRepository for SqliteUserRepository {
         let id = nomifun_common::UserId::new();
         let now = nomifun_common::now_ms();
 
-        sqlx::query(
-            "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?)",
+        let row_id: i64 = sqlx::query_scalar(
+            "INSERT INTO users (user_id, username, password_hash, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(id.as_str())
         .bind(username)
         .bind(password_hash)
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
         .map_err(|e| match &e {
             sqlx::Error::Database(db_err) if is_unique_violation(db_err.as_ref()) => {
@@ -144,7 +144,8 @@ impl IUserRepository for SqliteUserRepository {
         })?;
 
         Ok(User {
-            id,
+            id: row_id,
+            user_id: id,
             username: username.to_string(),
             email: None,
             password_hash: password_hash.to_string(),
@@ -166,7 +167,7 @@ impl IUserRepository for SqliteUserRepository {
     }
 
     async fn find_by_id(&self, id: &str) -> Result<Option<User>, DbError> {
-        let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = ?")
+        let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE user_id = ?")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?;
@@ -192,7 +193,7 @@ impl IUserRepository for SqliteUserRepository {
 
     async fn update_password(&self, user_id: &str, password_hash: &str) -> Result<(), DbError> {
         let now = nomifun_common::now_ms();
-        let result = sqlx::query("UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?")
+        let result = sqlx::query("UPDATE users SET password_hash = ?, updated_at = ? WHERE user_id = ?")
             .bind(password_hash)
             .bind(now)
             .bind(user_id)
@@ -208,7 +209,7 @@ impl IUserRepository for SqliteUserRepository {
 
     async fn update_username(&self, user_id: &str, username: &str) -> Result<(), DbError> {
         let now = nomifun_common::now_ms();
-        let result = sqlx::query("UPDATE users SET username = ?, updated_at = ? WHERE id = ?")
+        let result = sqlx::query("UPDATE users SET username = ?, updated_at = ? WHERE user_id = ?")
             .bind(username)
             .bind(now)
             .bind(user_id)
@@ -230,7 +231,7 @@ impl IUserRepository for SqliteUserRepository {
 
     async fn update_last_login(&self, user_id: &str) -> Result<(), DbError> {
         let now = nomifun_common::now_ms();
-        let result = sqlx::query("UPDATE users SET last_login = ?, updated_at = ? WHERE id = ?")
+        let result = sqlx::query("UPDATE users SET last_login = ?, updated_at = ? WHERE user_id = ?")
             .bind(now)
             .bind(now)
             .bind(user_id)
@@ -246,7 +247,7 @@ impl IUserRepository for SqliteUserRepository {
 
     async fn update_jwt_secret(&self, user_id: &str, jwt_secret: &str) -> Result<(), DbError> {
         let now = nomifun_common::now_ms();
-        let result = sqlx::query("UPDATE users SET jwt_secret = ?, updated_at = ? WHERE id = ?")
+        let result = sqlx::query("UPDATE users SET jwt_secret = ?, updated_at = ? WHERE user_id = ?")
             .bind(jwt_secret)
             .bind(now)
             .bind(user_id)
@@ -336,7 +337,7 @@ mod tests {
         let (repo, _db) = setup().await;
         let user = repo.create_user("alice", "hash123").await.unwrap();
 
-        assert!(user.id.starts_with("user_"));
+        assert!(nomifun_common::UserId::parse(user.user_id.as_str()).is_ok());
         assert_eq!(user.username, "alice");
         assert_eq!(user.password_hash, "hash123");
         assert!(user.email.is_none());
@@ -374,7 +375,7 @@ mod tests {
         let (repo, db) = setup().await;
         let owner = crate::installation_owner_id(db.pool()).await.unwrap();
         let user = repo.get_system_user().await.unwrap().unwrap();
-        assert_eq!(user.id.as_str(), owner);
+        assert_eq!(user.user_id.as_str(), owner);
         assert_eq!(user.username, "admin");
     }
 
@@ -385,7 +386,7 @@ mod tests {
         repo.create_user("other", "hash").await.unwrap();
 
         let user = repo.get_primary_webui_user().await.unwrap().unwrap();
-        assert_eq!(user.id.as_str(), owner);
+        assert_eq!(user.user_id.as_str(), owner);
     }
 
     #[tokio::test]
@@ -409,9 +410,9 @@ mod tests {
         let (repo, _db) = setup().await;
         let created = repo.create_user("dave", "h").await.unwrap();
 
-        let found = repo.find_by_id(&created.id).await.unwrap();
+        let found = repo.find_by_id(created.user_id.as_str()).await.unwrap();
         assert!(found.is_some());
-        assert_eq!(found.unwrap().id, created.id);
+        assert_eq!(found.unwrap().user_id, created.user_id);
     }
 
     #[tokio::test]
@@ -445,9 +446,9 @@ mod tests {
         let (repo, _db) = setup().await;
         let user = repo.create_user("hal", "old_hash").await.unwrap();
 
-        repo.update_password(&user.id, "new_hash").await.unwrap();
+        repo.update_password(user.user_id.as_str(), "new_hash").await.unwrap();
 
-        let updated = repo.find_by_id(&user.id).await.unwrap().unwrap();
+        let updated = repo.find_by_id(user.user_id.as_str()).await.unwrap().unwrap();
         assert_eq!(updated.password_hash, "new_hash");
         assert!(updated.updated_at >= user.updated_at);
     }
@@ -464,9 +465,9 @@ mod tests {
         let (repo, _db) = setup().await;
         let user = repo.create_user("ivan", "h").await.unwrap();
 
-        repo.update_username(&user.id, "ivan_new").await.unwrap();
+        repo.update_username(user.user_id.as_str(), "ivan_new").await.unwrap();
 
-        let updated = repo.find_by_id(&user.id).await.unwrap().unwrap();
+        let updated = repo.find_by_id(user.user_id.as_str()).await.unwrap().unwrap();
         assert_eq!(updated.username, "ivan_new");
     }
 
@@ -476,7 +477,10 @@ mod tests {
         repo.create_user("jane", "h").await.unwrap();
         let other = repo.create_user("kate", "h").await.unwrap();
 
-        let err = repo.update_username(&other.id, "jane").await.unwrap_err();
+        let err = repo
+            .update_username(other.user_id.as_str(), "jane")
+            .await
+            .unwrap_err();
         assert!(matches!(err, DbError::Conflict(_)));
     }
 
@@ -486,9 +490,9 @@ mod tests {
         let user = repo.create_user("leo", "h").await.unwrap();
         assert!(user.last_login.is_none());
 
-        repo.update_last_login(&user.id).await.unwrap();
+        repo.update_last_login(user.user_id.as_str()).await.unwrap();
 
-        let updated = repo.find_by_id(&user.id).await.unwrap().unwrap();
+        let updated = repo.find_by_id(user.user_id.as_str()).await.unwrap().unwrap();
         assert!(updated.last_login.is_some());
         assert!(updated.last_login.unwrap() > 0);
     }
@@ -499,9 +503,9 @@ mod tests {
         let user = repo.create_user("mike", "h").await.unwrap();
         assert!(user.jwt_secret.is_none());
 
-        repo.update_jwt_secret(&user.id, "secret123").await.unwrap();
+        repo.update_jwt_secret(user.user_id.as_str(), "secret123").await.unwrap();
 
-        let updated = repo.find_by_id(&user.id).await.unwrap().unwrap();
+        let updated = repo.find_by_id(user.user_id.as_str()).await.unwrap().unwrap();
         assert_eq!(updated.jwt_secret.as_deref(), Some("secret123"));
     }
 

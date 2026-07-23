@@ -11,8 +11,8 @@ import { cloneProviderConfig } from './providerClone';
 
 describe('cloneProviderConfig', () => {
   test('copies provider configuration with a new id and without stale health state', () => {
-    const sourceId = parseProviderId('prov_0190f5fe-7c00-7a00-8000-000000000001');
-    const copyId = parseProviderId('prov_0190f5fe-7c00-7a00-8000-000000000002');
+    const sourceId = parseProviderId('0190f5fe-7c00-7a00-8000-000000000001');
+    const copyId = parseProviderId('0190f5fe-7c00-7a00-8000-000000000002');
     const source: IProvider = {
       id: sourceId,
       platform: 'openai',

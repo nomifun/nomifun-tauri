@@ -6,6 +6,7 @@
 
 import type { ConversationId, MessageId } from '@/common/types/ids';
 import { ipcBridge } from '@/common';
+import { uuid } from '@/common/utils';
 import {
   ACP_AGENT_MESSAGE_EVENT,
   normalizeWireAgentMessageMetadata,
@@ -73,8 +74,8 @@ const ACP_THINKING_NON_BOUNDARY_TYPES = new Set([
 
 /**
  * A delayed event from another explicit turn must not finish the thinking
- * segment that belongs to the active turn. Missing ids retain the legacy
- * stream-order behavior for older ACP servers that cannot correlate events.
+ * segment that belongs to the active turn. Some non-turn protocol frames have
+ * no correlation identity and retain stream-order behavior.
  */
 export const isAcpThinkingBoundaryForTurn = (
   messageType: string,
@@ -328,7 +329,7 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
       const thinkingTurnId = activeThinking.turnId ?? rootTurnIdRef.current ?? boundaryMessage.turn_id;
 
       addOrUpdateMessage({
-        id: `${activeThinking.msgId}-thinking-done`,
+        id: uuid(),
         type: 'thinking',
         msg_id: activeThinking.msgId,
         ...(thinkingTurnId ? { turn_id: thinkingTurnId } : {}),
@@ -653,7 +654,7 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
         turnStartGenerationRef.current += 1;
         turnLifecycleGenerationRef.current += 1;
         awaitingBackendTurnRef.current = false;
-        rootTurnIdRef.current = event.turn_id ?? null;
+        rootTurnIdRef.current = event.turn_id;
         rejectUnannouncedStartRef.current = false;
         verifyUnannouncedStartRuntimeRef.current = false;
         turnFinishedRef.current = false;
@@ -662,7 +663,6 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
           setActiveRequestMessageId(undefined);
         }
         if (
-          event.turn_id &&
           activeThinkingRef.current?.turnId &&
           activeThinkingRef.current.turnId !== event.turn_id
         ) {
@@ -727,8 +727,9 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
       }
       if (action === 'ignore') return;
 
-      // Compatibility with older servers that omitted turn_id: verify the live
-      // runtime before lowering UI state, and reject a start that races the GET.
+      // A current stop/idle completion may intentionally omit turn_id. Verify
+      // the live runtime before lowering UI state, and reject a start that
+      // races the GET.
       const observedRootTurnId = rootTurnId;
       const observedAwaitingBackendTurn = awaitingBackendTurn;
       const generation = turnLifecycleGenerationRef.current;
@@ -939,9 +940,7 @@ export const useAcpMessage = (conversation_id: ConversationId, options?: { skipW
     hasHydratedRunningState,
     acpStatus,
     aiProcessing,
-    // `turnStarted` is parsed at the IPC boundary, so any populated reducer id
-    // is a canonical MessageId. Locally submitted pre-start state has no id.
-    activeTurnId: turnState.turnId as MessageId | undefined,
+    activeTurnId: turnState.turnId,
     activeRequestMessageId,
     setAiProcessing,
     markTurnAccepted,

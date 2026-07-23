@@ -110,7 +110,7 @@ const RemoteAgentFormModal: React.FC<{
 
       pollTimerRef.current = setInterval(async () => {
         try {
-          const result = await ipcBridge.remoteAgent.handshake.invoke({ id: agentId });
+          const result = await ipcBridge.remoteAgent.handshake.invoke({ remote_agent_id: agentId });
           if (result.status === 'ok') {
             stopPolling();
             setPairingState('idle');
@@ -183,18 +183,18 @@ const RemoteAgentFormModal: React.FC<{
         ) {
           delete updates.auth_token;
         }
-        await ipcBridge.remoteAgent.update.invoke({ id: editAgent.id, updates });
-        agentId = editAgent.id;
+        await ipcBridge.remoteAgent.update.invoke({ remote_agent_id: editAgent.remote_agent_id, updates });
+        agentId = editAgent.remote_agent_id;
       } else {
         const created = await ipcBridge.remoteAgent.create.invoke(payload);
-        agentId = created.id;
-        createdAgentId = created.id;
+        agentId = created.remote_agent_id;
+        createdAgentId = created.remote_agent_id;
       }
 
       // For openclaw protocol, perform full handshake
       if (activeProtocol === 'openclaw') {
         setPairingState('handshaking');
-        const result = await ipcBridge.remoteAgent.handshake.invoke({ id: agentId });
+        const result = await ipcBridge.remoteAgent.handshake.invoke({ remote_agent_id: agentId });
 
         if (result.status === 'ok') {
           createdAgentId = undefined;
@@ -217,7 +217,7 @@ const RemoteAgentFormModal: React.FC<{
     } catch (error) {
       if (createdAgentId != null) {
         try {
-          await ipcBridge.remoteAgent.delete.invoke({ id: createdAgentId });
+          await ipcBridge.remoteAgent.delete.invoke({ remote_agent_id: createdAgentId });
         } catch (rollbackError) {
           console.error('Failed to roll back remote-agent creation after handshake failure:', rollbackError);
         }
@@ -472,7 +472,7 @@ const RemoteAgentManagement: React.FC = () => {
         content: t('settings.remoteAgent.deleteConfirmContent', { name: agent.name }),
         okButtonProps: { status: 'danger' },
         onOk: async () => {
-          await ipcBridge.remoteAgent.delete.invoke({ id: agent.id });
+          await ipcBridge.remoteAgent.delete.invoke({ remote_agent_id: agent.remote_agent_id });
           Message.success(t('settings.remoteAgent.deleted'));
           await mutate();
         },
@@ -540,7 +540,7 @@ const RemoteAgentManagement: React.FC = () => {
         <div className='grid gap-12px px-16px' style={{ gridTemplateColumns: 'repeat(auto-fill, minmax(min(248px, 100%), 1fr))' }}>
           {agents.map((agent) => (
             <div
-              key={agent.id}
+              key={agent.remote_agent_id}
               className='flex min-h-[214px] flex-col rounded-12px border border-solid border-[var(--color-border-2)] bg-[var(--color-bg-2)] p-14px transition-colors hover:border-[var(--color-border-3)]'
             >
               <div className='mb-12px flex justify-center'>

@@ -34,7 +34,7 @@ const KnowledgeSection: React.FC<Props> = ({ agent, patch, message }) => {
 
   useEffect(() => {
     setSelected(agent.knowledge_base_ids);
-  }, [agent.id, agent.knowledge_base_ids]);
+  }, [agent.public_agent_id, agent.knowledge_base_ids]);
 
   useEffect(() => {
     let alive = true;
@@ -121,7 +121,7 @@ const KnowledgeSection: React.FC<Props> = ({ agent, patch, message }) => {
             }
           >
             {bases.map((b) => (
-              <Select.Option key={b.id} value={b.id}>
+              <Select.Option key={b.knowledge_base_id} value={b.knowledge_base_id}>
                 {b.name}
               </Select.Option>
             ))}

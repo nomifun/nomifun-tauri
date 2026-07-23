@@ -18,7 +18,7 @@ describe('TerminalCreatePage extended capabilities', () => {
     expect(createPageSource.includes('const [idmm, setIdmm]')).toBe(true);
     expect(createPageSource.includes('ipcBridge.idmm.set.invoke')).toBe(true);
     expect(createPageSource.includes("kind: 'terminal'")).toBe(true);
-    expect(createPageSource.includes('target_id: session.id')).toBe(true);
+    expect(createPageSource.includes('target_id: session.terminal_id')).toBe(true);
 
     expect(panelSource.includes('IdmmControl')).toBe(true);
     expect(panelSource.includes('draft={{ value: idmm, onChange: onIdmmChange }}')).toBe(true);

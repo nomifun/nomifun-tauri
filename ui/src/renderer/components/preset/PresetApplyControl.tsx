@@ -51,7 +51,7 @@ const PresetApplyControl: React.FC<Props> = ({ target, appliedPreset, onApply, d
     [presets, target]
   );
   const selectedPresetExists = useMemo(
-    () => Boolean(selectedId && availablePresets.some((preset) => preset.id === selectedId)),
+    () => Boolean(selectedId && availablePresets.some((preset) => preset.preset_id === selectedId)),
     [availablePresets, selectedId]
   );
 
@@ -89,7 +89,7 @@ const PresetApplyControl: React.FC<Props> = ({ target, appliedPreset, onApply, d
           notFoundContent={t('settings.presetApplyEmpty', { defaultValue: 'No preset supports this target yet' })}
         >
           {availablePresets.map((preset) => (
-            <NomiSelect.Option key={preset.id} value={preset.id}>
+            <NomiSelect.Option key={preset.preset_id} value={preset.preset_id}>
               {preset.name_i18n?.[i18n.language] || preset.name}
             </NomiSelect.Option>
           ))}

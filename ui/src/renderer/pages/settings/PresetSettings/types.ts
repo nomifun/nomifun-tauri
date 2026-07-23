@@ -12,8 +12,7 @@ export type SkillInfo = {
   relative_location?: string;
   is_custom: boolean;
   source: SkillSource;
-  // Tag keys referencing the shared preset tag vocabulary. Resolved at the
-  // route layer from the user sidecar table (?? built-in seed ?? empty).
+  // Skill side-store tag keys. Preset wire bindings use preset_tag_id.
   audience_tags?: string[];
   scenario_tags?: string[];
 };

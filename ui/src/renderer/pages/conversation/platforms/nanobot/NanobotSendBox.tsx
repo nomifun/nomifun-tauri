@@ -7,6 +7,7 @@
 import { conversationTarget, type ConversationId, type MessageId } from '@/common/types/ids';
 import { sessionStorageKey } from '@/common/utils/browserStorageKey';
 import { ipcBridge } from '@/common';
+import { uuid } from '@/common/utils';
 import type { TMessage } from '@/common/chat/chatLib';
 import CommandQueuePanel from '@/renderer/components/chat/CommandQueuePanel';
 import SendBox from '@/renderer/components/chat/SendBox';
@@ -242,7 +243,7 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
         msg_id = res.msg_id;
         markLocalTurnAccepted();
         const userMessage: TMessage = {
-          id: msg_id,
+          id: uuid(),
           msg_id,
           conversation_id,
           type: 'text',
@@ -375,7 +376,7 @@ const NanobotSendBox: React.FC<{ conversation_id: ConversationId }> = ({ convers
         markLocalTurnAccepted();
 
         const userMessage: TMessage = {
-          id: msg_id,
+          id: uuid(),
           msg_id,
           conversation_id,
           type: 'text',

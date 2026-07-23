@@ -12,7 +12,7 @@ use nomifun_api_types::{
     SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use nomifun_auth::CurrentUser;
-use nomifun_common::{AppError, ConversationArtifactId, ConversationId, MessageId};
+use nomifun_common::{AppError, ConversationId, MessageId};
 
 use crate::service::strip_clone_instance_state;
 use crate::state::ConversationRouterState;
@@ -23,24 +23,48 @@ use crate::state::ConversationRouterState;
 pub fn conversation_routes(state: ConversationRouterState) -> Router {
     Router::new()
         .route("/api/conversations", post(create).get(list))
-        .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
-        .route("/api/conversations/{id}/reset", post(reset))
-        .route("/api/conversations/{id}/associated", get(associated))
-        .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
-        .route("/api/conversations/{id}/messages/{messageId}", get(get_msg))
         .route(
-            "/api/conversations/{id}/messages/{messageId}/edit-resubmit",
+            "/api/conversations/{conversation_id}",
+            get(get_one).patch(update).delete(delete_one),
+        )
+        .route("/api/conversations/{conversation_id}/reset", post(reset))
+        .route("/api/conversations/{conversation_id}/associated", get(associated))
+        .route(
+            "/api/conversations/{conversation_id}/messages",
+            get(list_msg).post(send_msg),
+        )
+        .route(
+            "/api/conversations/{conversation_id}/messages/{message_id}",
+            get(get_msg),
+        )
+        .route(
+            "/api/conversations/{conversation_id}/messages/{message_id}/edit-resubmit",
             post(edit_resubmit),
         )
-        .route("/api/conversations/{id}/artifacts", get(list_artifacts))
-        .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
-        .route("/api/conversations/{id}/cancel", post(cancel))
-        .route("/api/conversations/{id}/steer", post(steer))
-        .route("/api/conversations/{id}/warmup", post(warmup))
+        .route(
+            "/api/conversations/{conversation_id}/artifacts",
+            get(list_artifacts),
+        )
+        .route(
+            "/api/conversations/{conversation_id}/artifacts/{conversation_artifact_id}",
+            patch(update_artifact),
+        )
+        .route("/api/conversations/{conversation_id}/cancel", post(cancel))
+        .route("/api/conversations/{conversation_id}/steer", post(steer))
+        .route("/api/conversations/{conversation_id}/warmup", post(warmup))
         // Confirmation system
-        .route("/api/conversations/{id}/confirmations", get(list_confirmations))
-        .route("/api/conversations/{id}/confirmations/{callId}/confirm", post(confirm))
-        .route("/api/conversations/{id}/approvals/check", get(check_approval))
+        .route(
+            "/api/conversations/{conversation_id}/confirmations",
+            get(list_confirmations),
+        )
+        .route(
+            "/api/conversations/{conversation_id}/confirmations/{call_id}/confirm",
+            post(confirm),
+        )
+        .route(
+            "/api/conversations/{conversation_id}/approvals/check",
+            get(check_approval),
+        )
         .route("/api/conversations/active-count", get(active_runtime_count))
         .route("/api/conversations/clone", post(clone))
         .route("/api/messages/search", get(search_messages))
@@ -141,16 +165,16 @@ async fn clone(
 async fn get_one(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
 ) -> Result<Json<ApiResponse<ConversationResponse>>, AppError> {
-    let conversation = state.service.get(&user.id, id.as_str()).await?;
+    let conversation = state.service.get(&user.id, conversation_id.as_str()).await?;
     Ok(Json(ApiResponse::ok(conversation)))
 }
 
 async fn update(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
     body: Result<Json<UpdateConversationRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ConversationResponse>>, AppError> {
     let Json(mut req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
@@ -162,7 +186,12 @@ async fn update(
     }
     let conversation = state
         .service
-        .update(&user.id, id.as_str(), req, &state.runtime_registry)
+        .update(
+            &user.id,
+            conversation_id.as_str(),
+            req,
+            &state.runtime_registry,
+        )
         .await?;
     Ok(Json(ApiResponse::ok(conversation)))
 }
@@ -170,29 +199,29 @@ async fn update(
 async fn delete_one(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    state.service.delete(&user.id, id.as_str()).await?;
+    state.service.delete(&user.id, conversation_id.as_str()).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn reset(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
-    state.service.reset(&user.id, id.as_str()).await?;
+    state.service.reset(&user.id, conversation_id.as_str()).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn associated(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
 ) -> Result<Json<ApiResponse<Vec<ConversationResponse>>>, AppError> {
     let items = state
         .service
-        .list_associated(&user.id, id.as_str())
+        .list_associated(&user.id, conversation_id.as_str())
         .await?;
     Ok(Json(ApiResponse::ok(items)))
 }
@@ -200,20 +229,19 @@ async fn associated(
 async fn list_msg(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
     Query(query): Query<ListMessagesQuery>,
 ) -> Result<Json<ApiResponse<MessageListResponse>>, AppError> {
     let result = state
         .service
-        .list_messages(&user.id, id.as_str(), query)
+        .list_messages(&user.id, conversation_id.as_str(), query)
         .await?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
 #[derive(serde::Deserialize)]
 struct MessagePathParams {
-    id: ConversationId,
-    #[serde(rename = "messageId")]
+    conversation_id: ConversationId,
     message_id: MessageId,
 }
 
@@ -224,7 +252,11 @@ async fn get_msg(
 ) -> Result<Json<ApiResponse<MessageResponse>>, AppError> {
     let result = state
         .service
-        .get_message(&user.id, params.id.as_str(), params.message_id.as_str())
+        .get_message(
+            &user.id,
+            params.conversation_id.as_str(),
+            params.message_id.as_str(),
+        )
         .await?;
     Ok(Json(ApiResponse::ok(result)))
 }
@@ -240,7 +272,7 @@ async fn edit_resubmit(
         .service
         .edit_and_resubmit(
             &user.id,
-            params.id.as_str(),
+            params.conversation_id.as_str(),
             params.message_id.as_str(),
             req,
             &state.runtime_registry,
@@ -255,13 +287,18 @@ async fn edit_resubmit(
 async fn send_msg(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
     body: Result<Json<SendMessageRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<SendMessageResponse>>), AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     let msg_id = state
         .service
-        .send_message(&user.id, id.as_str(), req, &state.runtime_registry)
+        .send_message(
+            &user.id,
+            conversation_id.as_str(),
+            req,
+            &state.runtime_registry,
+        )
         .await?;
     Ok((
         StatusCode::ACCEPTED,
@@ -272,13 +309,18 @@ async fn send_msg(
 async fn steer(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
     body: Result<Json<SendMessageRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<SendMessageResponse>>), AppError> {
     let Json(req) = body.map_err(|e| AppError::BadRequest(e.to_string()))?;
     let msg_id = state
         .service
-        .steer_message(&user.id, id.as_str(), req, &state.runtime_registry)
+        .steer_message(
+            &user.id,
+            conversation_id.as_str(),
+            req,
+            &state.runtime_registry,
+        )
         .await?;
     Ok((
         StatusCode::ACCEPTED,
@@ -289,20 +331,19 @@ async fn steer(
 async fn list_artifacts(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
 ) -> Result<Json<ApiResponse<ConversationArtifactListResponse>>, AppError> {
     let result = state
         .service
-        .list_artifacts(&user.id, id.as_str())
+        .list_artifacts(&user.id, conversation_id.as_str())
         .await?;
     Ok(Json(ApiResponse::ok(result)))
 }
 
 #[derive(serde::Deserialize)]
 struct ArtifactPathParams {
-    id: ConversationId,
-    #[serde(rename = "artifactId")]
-    artifact_id: ConversationArtifactId,
+    conversation_id: ConversationId,
+    conversation_artifact_id: String,
 }
 
 async fn update_artifact(
@@ -316,8 +357,8 @@ async fn update_artifact(
         .service
         .update_artifact(
             &user.id,
-            params.id.as_str(),
-            params.artifact_id.as_str(),
+            params.conversation_id.as_str(),
+            &params.conversation_artifact_id,
             req,
         )
         .await?;
@@ -327,11 +368,15 @@ async fn update_artifact(
 async fn cancel(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     state
         .service
-        .cancel(&user.id, id.as_str(), &state.runtime_registry)
+        .cancel(
+            &user.id,
+            conversation_id.as_str(),
+            &state.runtime_registry,
+        )
         .await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -339,11 +384,15 @@ async fn cancel(
 async fn warmup(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
 ) -> Result<Json<ApiResponse<()>>, AppError> {
     state
         .service
-        .warmup(&user.id, id.as_str(), &state.runtime_registry)
+        .warmup(
+            &user.id,
+            conversation_id.as_str(),
+            &state.runtime_registry,
+        )
         .await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -362,19 +411,22 @@ async fn search_messages(
 async fn list_confirmations(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
 ) -> Result<Json<ApiResponse<ConfirmationListResponse>>, AppError> {
     let items = state
         .service
-        .list_confirmations(&user.id, id.as_str(), &state.runtime_registry)
+        .list_confirmations(
+            &user.id,
+            conversation_id.as_str(),
+            &state.runtime_registry,
+        )
         .await?;
     Ok(Json(ApiResponse::ok(items)))
 }
 
 #[derive(serde::Deserialize)]
 struct ConfirmPathParams {
-    id: ConversationId,
-    #[serde(rename = "callId")]
+    conversation_id: ConversationId,
     call_id: String,
 }
 
@@ -389,7 +441,7 @@ async fn confirm(
         .service
         .confirm(
             &user.id,
-            params.id.as_str(),
+            params.conversation_id.as_str(),
             &params.call_id,
             req,
             &state.runtime_registry,
@@ -401,7 +453,7 @@ async fn confirm(
 async fn check_approval(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Path(id): Path<ConversationId>,
+    Path(conversation_id): Path<ConversationId>,
     Query(query): Query<ApprovalCheckQuery>,
 ) -> Result<Json<ApiResponse<ApprovalCheckResponse>>, AppError> {
     if query.action.trim().is_empty() {
@@ -412,7 +464,7 @@ async fn check_approval(
         .service
         .check_approval(
             &user.id,
-            id.as_str(),
+            conversation_id.as_str(),
             &query.action,
             query.command_type.as_deref(),
             &state.runtime_registry,

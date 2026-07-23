@@ -3,12 +3,11 @@ use serde::{Deserialize, Serialize};
 
 /// Row mapping for the `channel_plugins` table.
 ///
-/// One row per connected bot — multiple rows may share the same platform
-/// `type` (legacy rows keep `id == type`). The `config` column holds an
-/// encrypted JSON blob containing credentials and options.
+/// One row per connected bot. The `config` column holds an encrypted JSON blob
+/// containing credentials and options.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ChannelPluginRow {
-    pub id: String,
+    pub channel_plugin_id: String,
     /// Platform type (telegram, lark, dingtalk, weixin, slack, discord).
     #[sqlx(rename = "type")]
     pub r#type: String,
@@ -32,40 +31,82 @@ pub struct ChannelPluginRow {
     pub updated_at: TimestampMs,
 }
 
+/// Values accepted when inserting a `channel_plugins` row.
+///
+/// SQLite owns the technical `id`; callers address the row only through the
+/// generated `channel_plugin_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewChannelPluginRow {
+    pub r#type: String,
+    pub name: String,
+    pub enabled: bool,
+    pub config: String,
+    pub status: Option<String>,
+    pub last_connected: Option<TimestampMs>,
+    pub companion_id: Option<String>,
+    pub public_agent_id: Option<String>,
+    pub bot_key: Option<String>,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
 /// Row mapping for the `channel_users` table.
 ///
 /// Represents an IM user authorized to chat with the Agent.
-/// UNIQUE constraint on (platform_user_id, platform_type).
+/// UNIQUE constraint on (platform_user_id, platform_type, channel_plugin_id).
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ChannelUserRow {
-    pub id: String,
+    pub channel_user_id: String,
     pub platform_user_id: String,
     pub platform_type: String,
-    /// The `channel_plugins` row (bot) this authorization belongs to.
-    /// `None` only for legacy rows the 004 migration could not backfill.
-    pub channel_id: Option<String>,
+    /// Optional logical reference to the `channel_plugins` business identity that owns
+    /// this authorization. `None` means the authorization is not plugin-scoped.
+    pub channel_plugin_id: Option<String>,
     pub display_name: Option<String>,
     pub authorized_at: TimestampMs,
     pub last_active: Option<TimestampMs>,
-    pub session_id: Option<String>,
+}
+
+/// Values accepted when inserting a `channel_users` row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewChannelUserRow {
+    pub platform_user_id: String,
+    pub platform_type: String,
+    pub channel_plugin_id: Option<String>,
+    pub display_name: Option<String>,
+    pub authorized_at: TimestampMs,
+    pub last_active: Option<TimestampMs>,
 }
 
 /// Row mapping for the `channel_sessions` table.
 ///
-/// Per-chat session linking an authorized user to a conversation.
-/// FK: user_id → channel_users(id) ON DELETE CASCADE.
-/// FK: conversation_id → conversations(id) ON DELETE SET NULL.
+/// Per-chat session linking an authorized user to a conversation. Relations
+/// are application-enforced logical references.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ChannelSessionRow {
-    pub id: String,
-    pub user_id: String,
+    pub channel_session_id: String,
+    pub channel_user_id: String,
     pub agent_type: String,
     pub conversation_id: Option<String>,
     pub workspace: Option<String>,
     pub chat_id: Option<String>,
-    /// The `channel_plugins` row this session arrived through. Two bots
+    /// The `channel_plugins` business identity this session arrived through. Two bots
     /// in the same chat get isolated sessions.
-    pub channel_id: Option<String>,
+    pub channel_plugin_id: Option<String>,
+    pub created_at: TimestampMs,
+    pub last_activity: TimestampMs,
+}
+
+/// Values accepted when inserting a `channel_sessions` row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewChannelSessionRow {
+    pub channel_session_id: String,
+    pub channel_user_id: String,
+    pub agent_type: String,
+    pub conversation_id: Option<String>,
+    pub workspace: Option<String>,
+    pub chat_id: Option<String>,
+    pub channel_plugin_id: Option<String>,
     pub created_at: TimestampMs,
     pub last_activity: TimestampMs,
 }
@@ -80,7 +121,20 @@ pub struct ChannelPairingCodeRow {
     pub platform_user_id: String,
     pub platform_type: String,
     /// The bot channel this pairing was initiated through.
-    pub channel_id: Option<String>,
+    pub channel_plugin_id: Option<String>,
+    pub display_name: Option<String>,
+    pub requested_at: TimestampMs,
+    pub expires_at: TimestampMs,
+    pub status: String,
+}
+
+/// Values accepted when inserting a `channel_pairing_codes` row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewChannelPairingCodeRow {
+    pub code: String,
+    pub platform_user_id: String,
+    pub platform_type: String,
+    pub channel_plugin_id: Option<String>,
     pub display_name: Option<String>,
     pub requested_at: TimestampMs,
     pub expires_at: TimestampMs,

@@ -94,7 +94,7 @@ pub trait ChannelAgentProfile: Send + Sync {
     async fn record_public_agent_turn(&self, _id: &str, _platform: &str, _text: &str) {}
 }
 
-/// Resolves a workshop asset id (`wsa_…`) to raw bytes for outbound media.
+/// Resolves a workshop asset UUIDv7 to raw bytes for outbound media.
 ///
 /// Defined here (not in `nomifun-workshop`) so `nomifun-channel` stays free of
 /// a workshop dependency; the concrete impl lives in `nomifun-app`
@@ -125,7 +125,8 @@ pub struct ChannelMessageService {
     /// reply. Shared with each `ChannelStreamRelay` (writer) so the inbound
     /// reply can be resolved against the right `call_id`/option.
     pending_decisions: Arc<crate::pending_decision::PendingDecisionStore>,
-    /// Optional resolver turning `wsa_…` ids into raw bytes for outbound media.
+    /// Optional resolver turning workshop asset UUIDv7 ids into raw bytes for
+    /// outbound media.
     /// `None` (default / tests) disables channel image sending gracefully.
     asset_resolver: Option<Arc<dyn AssetResolver>>,
 }
@@ -255,11 +256,11 @@ impl ChannelMessageService {
         // bot bound to a public agent serves strangers via an isolated per-chat,
         // PublicService-clamped nomi session — never a companion, and never the
         // Platform Gateway. Resolved FIRST and PER-BOT (from the channel row's own
-        // `public_agent_id`, via session.channel_id) so a companion-bound bot on
+        // `public_agent_id`, via session.channel_plugin_id) so a companion-bound bot on
         // the same platform is unaffected: precedence is per-bot, and the hard
         // clamp is the boundary.
-        if let Some(channel_id) = session.channel_id.as_deref()
-            && let Some(row) = self.repo.get_plugin(channel_id).await?
+        if let Some(channel_plugin_id) = session.channel_plugin_id.as_deref()
+            && let Some(row) = self.repo.get_plugin(channel_plugin_id).await?
             && let Some(pa_id) = row.public_agent_id.filter(|s| !s.trim().is_empty())
         {
             return self.send_to_public_agent(session, text, platform, &pa_id).await;
@@ -310,7 +311,12 @@ impl ChannelMessageService {
         // Dedicated per-chat channel conversations keep their extra-derived marker
         // (marker None → send_message falls back to extra).
         let channel_platform = companion_id.as_ref().map(|_| platform.to_string());
-        self.dispatch_to_conversation(&session.id, conversation_id, text, channel_platform)
+        self.dispatch_to_conversation(
+            &session.channel_session_id,
+            conversation_id,
+            text,
+            channel_platform,
+        )
             .await
     }
 
@@ -353,7 +359,7 @@ impl ChannelMessageService {
         // The public-agent conversation carries `channel_platform` in its own extra,
         // so no per-turn marker is needed (None).
         let result = self
-            .dispatch_to_conversation(&session.id, conversation_id, text, None)
+            .dispatch_to_conversation(&session.channel_session_id, conversation_id, text, None)
             .await?;
 
         // Best-effort audit of the inbound turn (records only for the public agent;
@@ -525,12 +531,12 @@ impl ChannelMessageService {
             .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
 
         debug!(
-            conversation_id = %response.id,
-            session_id = %session.id,
+            conversation_id = %response.conversation_id,
+            channel_session_id = %session.channel_session_id,
             "conversation created for channel session"
         );
 
-        Ok(response.id)
+        Ok(response.conversation_id)
     }
 
     /// Creates a fresh per-chat conversation for a 对外伙伴 (public-agent) session.
@@ -596,13 +602,13 @@ impl ChannelMessageService {
             .map_err(|e| ChannelError::MessageSendFailed(e.to_string()))?;
 
         debug!(
-            conversation_id = %response.id,
-            session_id = %session.id,
+            conversation_id = %response.conversation_id,
+            channel_session_id = %session.channel_session_id,
             public_agent_id = %public_agent_id,
             "public-agent conversation created for channel session"
         );
 
-        Ok(response.id)
+        Ok(response.conversation_id)
     }
 
     /// Resolves which companion greets a channel session.
@@ -614,22 +620,26 @@ impl ChannelMessageService {
     async fn resolve_session_companion(&self, session: &ChannelSessionRow, platform: PluginType) -> Option<String> {
         let profile = self.channel_agent_profile.as_ref()?;
 
-        if let Some(channel_id) = session.channel_id.as_deref() {
-            match self.repo.get_plugin(channel_id).await {
+        if let Some(channel_plugin_id) = session.channel_plugin_id.as_deref() {
+            match self.repo.get_plugin(channel_plugin_id).await {
                 Ok(Some(row)) => {
                     if let Some(companion_id) = row.companion_id.filter(|p| !p.trim().is_empty()) {
                         if profile.companion_exists(&companion_id).await {
                             return Some(companion_id);
                         }
                         warn!(
-                            channel_id = %channel_id,
+                            channel_plugin_id,
                             companion_id = %companion_id,
                             "channel companion binding names a missing companion; falling back"
                         );
                     }
                 }
                 Ok(None) => {}
-                Err(e) => warn!(channel_id = %channel_id, error = %e, "failed to load channel row for companion resolution"),
+                Err(e) => warn!(
+                    channel_plugin_id,
+                    error = %e,
+                    "failed to load channel row for companion resolution"
+                ),
             }
         }
 
@@ -771,7 +781,6 @@ impl ChannelMessageService {
             | AgentStreamEvent::AcpConfigOption(_)
             | AgentStreamEvent::AcpSessionInfo(_)
             | AgentStreamEvent::AcpContextUsage(_)
-            | AgentStreamEvent::AcpPromptHookWarning(_)
             | AgentStreamEvent::TurnCompleted(_)
             | AgentStreamEvent::System(_)
             | AgentStreamEvent::RequestTrace(_)
@@ -1104,7 +1113,7 @@ mod tests {
         AcpToolCallUpdateData, ErrorEventData, FinishEventData, StartEventData, TextEventData,
         ThinkingEventData, ToolCallEventData, ToolCallStatus,
     };
-    use nomifun_common::ProviderWithModel;
+    use nomifun_common::{PersistedArtifactId, ProviderWithModel};
 
     // ── extract_last_user_text ────────────────────────────────────────
 
@@ -1116,7 +1125,7 @@ mod tests {
         hidden: bool,
     ) -> MessageResponse {
         MessageResponse {
-            id: id.into(),
+            message_id: id.into(),
             conversation_id: nomifun_common::ConversationId::new().into_string(),
             msg_id: Some(id.into()),
             r#type: msg_type,
@@ -1433,11 +1442,16 @@ mod tests {
             status: ToolCallStatus::Completed,
             description: None,
             input: None,
-            output: Some(r#"{"status":"succeeded","result_asset_ids":["wsa_1"]}"#.into()),
+            output: Some(
+                r#"{"status":"succeeded","result_asset_ids":["0190f5fe-7c00-7a00-8000-000000000086"]}"#
+                    .into(),
+            ),
             artifacts: Vec::new(),
         });
         match ChannelMessageService::process_stream_event(&event) {
-            Some(StreamAction::MediaProduced(ids)) => assert_eq!(ids, vec!["wsa_1"]),
+            Some(StreamAction::MediaProduced(ids)) => {
+                assert_eq!(ids, vec!["0190f5fe-7c00-7a00-8000-000000000086"])
+            }
             other => panic!("expected MediaProduced, got {other:?}"),
         }
     }
@@ -1445,7 +1459,7 @@ mod tests {
     #[test]
     fn completed_tool_call_preserves_verified_artifact_receipts() {
         let artifact = nomifun_ai_agent::artifact_store::PersistedArtifact {
-            id: "artifact-1".into(),
+            id: PersistedArtifactId::new().into_string(),
             kind: nomifun_ai_agent::artifact_store::ArtifactKind::File,
             mime_type: "application/pdf".into(),
             path: "/workspace/nomifun-artifacts/artifact-1.pdf".into(),
@@ -1475,7 +1489,7 @@ mod tests {
     #[test]
     fn completed_acp_tool_call_preserves_verified_artifact_receipts() {
         let artifact = nomifun_ai_agent::artifact_store::PersistedArtifact {
-            id: "artifact-acp-1".into(),
+            id: PersistedArtifactId::new().into_string(),
             kind: nomifun_ai_agent::artifact_store::ArtifactKind::Image,
             mime_type: "image/png".into(),
             path: "/workspace/nomifun-artifacts/artifact-acp-1.png".into(),
@@ -1513,7 +1527,7 @@ mod tests {
     #[test]
     fn failed_acp_tool_call_never_uploads_artifact_receipts() {
         let artifact = nomifun_ai_agent::artifact_store::PersistedArtifact {
-            id: "artifact-acp-failed".into(),
+            id: PersistedArtifactId::new().into_string(),
             kind: nomifun_ai_agent::artifact_store::ArtifactKind::Image,
             mime_type: "image/png".into(),
             path: "/workspace/nomifun-artifacts/artifact-acp-failed.png".into(),

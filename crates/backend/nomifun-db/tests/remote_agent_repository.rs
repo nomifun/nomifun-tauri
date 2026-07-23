@@ -7,12 +7,16 @@ use std::sync::Arc;
 
 use nomifun_common::RemoteAgentId;
 use nomifun_db::{
-    CreateRemoteAgentParams, DbError, IRemoteAgentRepository, SqliteRemoteAgentRepository, UpdateRemoteAgentParams,
-    init_database_memory,
+    CreateRemoteAgentParams, DbError, IRemoteAgentRepository, SqliteRemoteAgentRepository,
+    UpdateRemoteAgentParams, init_database_memory,
 };
 
 fn missing_id() -> RemoteAgentId {
-    RemoteAgentId::parse("ragent_0190f5fe-7c00-7a00-8000-000000000999").unwrap()
+    RemoteAgentId::parse("0190f5fe-7c00-7a00-8000-000000000999").unwrap()
+}
+
+fn business_id(row: &nomifun_db::models::RemoteAgentRow) -> RemoteAgentId {
+    RemoteAgentId::parse(&row.remote_agent_id).expect("repository returned canonical remote_agent_id")
 }
 
 async fn repo() -> (Arc<dyn IRemoteAgentRepository>, nomifun_db::Database) {
@@ -62,7 +66,8 @@ async fn create_bearer_agent_returns_complete_object() {
     let (r, _db) = repo().await;
     let agent = r.create(bearer_params()).await.unwrap();
 
-    assert!(agent.id.as_str().starts_with("ragent_"));
+    assert!(agent.id > 0);
+    assert!(RemoteAgentId::parse(&agent.remote_agent_id).is_ok());
     assert_eq!(agent.name, "Remote Server");
     assert_eq!(agent.protocol, "acp");
     assert_eq!(agent.url, "wss://remote.example.com");
@@ -115,7 +120,7 @@ async fn find_by_id_returns_full_record() {
     let (r, _db) = repo().await;
     let created = r.create(bearer_params()).await.unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(&business_id(&created)).await.unwrap().unwrap();
     assert_eq!(found.id, created.id);
     assert_eq!(found.name, "Remote Server");
     assert_eq!(found.auth_token.as_deref(), Some("encrypted_bearer_token"));
@@ -138,7 +143,7 @@ async fn update_name_only_preserves_other_fields() {
 
     let updated = r
         .update(
-            &created.id,
+            &business_id(&created),
             UpdateRemoteAgentParams {
                 name: Some("New Name"),
                 ..Default::default()
@@ -162,7 +167,7 @@ async fn update_multiple_fields() {
 
     let updated = r
         .update(
-            &created.id,
+            &business_id(&created),
             UpdateRemoteAgentParams {
                 name: Some("Updated"),
                 url: Some("wss://new-url.example.com"),
@@ -197,7 +202,7 @@ async fn update_can_clear_optional_fields() {
 
     let updated = r
         .update(
-            &created.id,
+            &business_id(&created),
             UpdateRemoteAgentParams {
                 description: Some(None),
                 auth_token: Some(None),
@@ -217,7 +222,7 @@ async fn update_persists_to_database() {
     let created = r.create(bearer_params()).await.unwrap();
 
     r.update(
-        &created.id,
+        &business_id(&created),
         UpdateRemoteAgentParams {
             name: Some("Persisted Name"),
             ..Default::default()
@@ -226,7 +231,7 @@ async fn update_persists_to_database() {
     .await
     .unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(&business_id(&created)).await.unwrap().unwrap();
     assert_eq!(found.name, "Persisted Name");
 }
 
@@ -237,9 +242,9 @@ async fn delete_existing_removes_record() {
     let (r, _db) = repo().await;
     let created = r.create(bearer_params()).await.unwrap();
 
-    r.delete(&created.id).await.unwrap();
+    r.delete(&business_id(&created)).await.unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap();
+    let found = r.find_by_id(&business_id(&created)).await.unwrap();
     assert!(found.is_none());
 }
 
@@ -256,7 +261,7 @@ async fn delete_one_does_not_affect_others() {
     let a1 = r.create(bearer_params()).await.unwrap();
     let a2 = r.create(openclaw_params()).await.unwrap();
 
-    r.delete(&a1.id).await.unwrap();
+    r.delete(&business_id(&a1)).await.unwrap();
 
     let remaining = r.list().await.unwrap();
     assert_eq!(remaining.len(), 1);
@@ -271,9 +276,11 @@ async fn update_status_to_connected_with_timestamp() {
     let created = r.create(bearer_params()).await.unwrap();
 
     let ts = nomifun_common::now_ms();
-    r.update_status(&created.id, "connected", Some(ts)).await.unwrap();
+    r.update_status(&business_id(&created), "connected", Some(ts))
+        .await
+        .unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(&business_id(&created)).await.unwrap().unwrap();
     assert_eq!(found.status, "connected");
     assert_eq!(found.last_connected_at, Some(ts));
 }
@@ -283,9 +290,11 @@ async fn update_status_to_error_without_timestamp() {
     let (r, _db) = repo().await;
     let created = r.create(bearer_params()).await.unwrap();
 
-    r.update_status(&created.id, "error", None).await.unwrap();
+    r.update_status(&business_id(&created), "error", None)
+        .await
+        .unwrap();
 
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(&business_id(&created)).await.unwrap().unwrap();
     assert_eq!(found.status, "error");
     assert!(found.last_connected_at.is_none());
 }
@@ -311,13 +320,13 @@ async fn full_crud_lifecycle() {
     assert_eq!(created.name, "Remote Server");
 
     // Read
-    let found = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let found = r.find_by_id(&business_id(&created)).await.unwrap().unwrap();
     assert_eq!(found.id, created.id);
 
     // Update
     let updated = r
         .update(
-            &created.id,
+            &business_id(&created),
             UpdateRemoteAgentParams {
                 name: Some("Renamed Server"),
                 description: Some(Some("Updated desc")),
@@ -330,15 +339,24 @@ async fn full_crud_lifecycle() {
     assert_eq!(updated.description.as_deref(), Some("Updated desc"));
 
     // Update status
-    r.update_status(&created.id, "connected", Some(nomifun_common::now_ms()))
+    r.update_status(
+        &business_id(&created),
+        "connected",
+        Some(nomifun_common::now_ms()),
+    )
         .await
         .unwrap();
-    let after_status = r.find_by_id(&created.id).await.unwrap().unwrap();
+    let after_status = r.find_by_id(&business_id(&created)).await.unwrap().unwrap();
     assert_eq!(after_status.status, "connected");
 
     // Delete
-    r.delete(&created.id).await.unwrap();
-    assert!(r.find_by_id(&created.id).await.unwrap().is_none());
+    r.delete(&business_id(&created)).await.unwrap();
+    assert!(
+        r.find_by_id(&business_id(&created))
+            .await
+            .unwrap()
+            .is_none()
+    );
 
     // List should be empty
     assert!(r.list().await.unwrap().is_empty());

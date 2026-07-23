@@ -14,15 +14,17 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::deps::{CallerCtx, GatewayDeps};
+use crate::id_schema::{CanonicalEntityId, SessionTargetKind};
 use crate::registry::{Capability, CapabilityMeta, DangerTier};
 use crate::server::ok;
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SetAutoworkParams {
     /// Target kind: "conversation" or "terminal".
-    kind: String,
+    kind: SessionTargetKind,
     /// The conversation id or terminal id to bind.
-    target_id: String,
+    target_id: CanonicalEntityId,
     /// Enable (true) or disable (false) AutoWork on the target.
     enabled: bool,
     /// Requirement tag the session works through. REQUIRED when enabling.
@@ -34,16 +36,23 @@ struct SetAutoworkParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetAutoworkParams {
     /// Target kind: "conversation" or "terminal".
-    kind: String,
+    kind: SessionTargetKind,
     /// The conversation id or terminal id to inspect.
-    target_id: String,
+    target_id: CanonicalEntityId,
 }
 
-fn parse_kind(raw: &str) -> Result<AutoWorkTargetKind, Value> {
-    AutoWorkTargetKind::parse(raw)
-        .ok_or_else(|| json!({ "error": format!("unknown kind '{raw}' (expected conversation | terminal)") }))
+fn parse_target_id(kind: AutoWorkTargetKind, raw: String) -> Result<String, Value> {
+    match kind {
+        AutoWorkTargetKind::Conversation => nomifun_common::ConversationId::parse(raw)
+            .map(nomifun_common::ConversationId::into_string)
+            .map_err(|error| json!({ "error": format!("invalid conversation target_id: {error}") })),
+        AutoWorkTargetKind::Terminal => nomifun_common::TerminalId::parse(raw)
+            .map(nomifun_common::TerminalId::into_string)
+            .map_err(|error| json!({ "error": format!("invalid terminal target_id: {error}") })),
+    }
 }
 
 /// Assemble the persisted config + the AutoWork runner's live view into one
@@ -77,11 +86,11 @@ async fn set(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: SetAutoworkParams) -> Va
     if nomifun_common::UserId::parse(ctx.user_id.as_str()).is_err() {
         return json!({ "error": "missing caller user identity" });
     }
-    let kind = match parse_kind(&p.kind) {
-        Ok(k) => k,
-        Err(e) => return e,
+    let kind = AutoWorkTargetKind::from(p.kind);
+    let target_id = match parse_target_id(kind, p.target_id.into_string()) {
+        Ok(target_id) => target_id,
+        Err(error) => return error,
     };
-    let target_id = p.target_id;
     if p.enabled && p.tag.is_none() {
         return json!({ "error": "tag is required when enabling autowork (the tag groups the requirements this session will work through)" });
     }
@@ -134,11 +143,11 @@ async fn get(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: GetAutoworkParams) -> Va
     if nomifun_common::UserId::parse(ctx.user_id.as_str()).is_err() {
         return json!({ "error": "missing caller user identity" });
     }
-    let kind = match parse_kind(&p.kind) {
-        Ok(k) => k,
-        Err(e) => return e,
+    let kind = AutoWorkTargetKind::from(p.kind);
+    let target_id = match parse_target_id(kind, p.target_id.into_string()) {
+        Ok(target_id) => target_id,
+        Err(error) => return error,
     };
-    let target_id = p.target_id;
     let owner_check = match kind {
         AutoWorkTargetKind::Conversation => deps
             .requirement_service

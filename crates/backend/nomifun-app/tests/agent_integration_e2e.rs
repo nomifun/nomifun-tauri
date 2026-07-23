@@ -212,7 +212,7 @@ async fn create_conversation(app: &mut axum::Router, token: &str, csrf: &str, na
     let req = common::json_with_token("POST", "/api/conversations", body, token, csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = common::body_json(resp).await;
-    json["data"]["id"].as_str().unwrap().to_owned()
+    json["data"]["conversation_id"].as_str().unwrap().to_owned()
 }
 
 // ── Message flow with mock agent ────────────────────────────────

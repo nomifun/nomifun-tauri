@@ -71,7 +71,7 @@ const PresetPickerDrawer: React.FC<PresetPickerDrawerProps> = ({
   onToggleSkill,
 }) => {
   const { t } = useTranslation();
-  const { audienceTags, scenarioTags } = usePresetTags();
+  const { audienceTags, scenarioTags, tagById } = usePresetTags();
 
   // ── Responsive width ──
   const [drawerWidth, setDrawerWidth] = useState(computeDrawerWidth);
@@ -260,11 +260,12 @@ const PresetPickerDrawer: React.FC<PresetPickerDrawerProps> = ({
           {mode === 'preset' ? (
             filteredPresets.length > 0 ? filteredPresets.map((a) => (
                 <DrawerPresetCard
-                  key={a.id}
+                  key={a.preset_id}
                   preset={a}
                   selected={false}
                   localeKey={localeKey}
                   avatarImageMap={AVATAR_IMAGE_MAP}
+                  tagById={tagById}
                   onSelect={handleSelectPreset}
                 />
               )) : (

@@ -162,6 +162,7 @@ impl DesktopServer {
 
         let database = bootstrap::init_data_layer(&config).await?;
         let services = AppServices::from_config(database, &config).await?;
+        bootstrap::finalize_data_layer(&config)?;
         let user_repo = services.user_repo.clone();
         let terminal_service = services.terminal_service.clone();
         let router = create_router(&services).await;

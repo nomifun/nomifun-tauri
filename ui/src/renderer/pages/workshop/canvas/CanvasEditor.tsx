@@ -52,7 +52,7 @@ import { loadWorkshopMedia, revokeWorkshopMedia } from '../lib/media';
 import { abortAllLoopRuns, abortLoopRun } from '../generation/loop';
 import { nodeContribution } from '../generation/pipeline';
 import type { WorkshopAsset, WorkshopCanvasBackground, WorkshopCanvasDoc, WorkshopGeneratorMode, WorkshopGeneratorNodeData } from '../types';
-import { parseWorkshopNodeId } from '@/common/types/ids';
+import { parseWorkshopNodeId, tryParseEntityId } from '@/common/types/ids';
 import type { AssetId, WorkshopEdgeId, WorkshopNodeId } from '@/common/types/ids';
 import { CanvasNodeContext, type CanvasNodeApi } from './CanvasNodeContext';
 import { useAgentOps, type AgentAddNodeOp, type AgentConnectOp } from './agentOps';
@@ -429,12 +429,12 @@ const CanvasInner: React.FC<CanvasEditorProps> = ({ canvasId, initialDoc, onSave
       if (node.type === 'image') {
         const size = isImageFile(file) ? await readImageSize(file) : null;
         updateNodeData(nodeId, {
-          assetId: asset.id,
+          assetId: asset.asset_id,
           naturalWidth: asset.width ?? size?.width,
           naturalHeight: asset.height ?? size?.height,
         });
       } else {
-        updateNodeData(nodeId, { assetId: asset.id });
+        updateNodeData(nodeId, { assetId: asset.asset_id });
       }
     },
     [uploadFile, updateNodeData]
@@ -442,9 +442,11 @@ const CanvasInner: React.FC<CanvasEditorProps> = ({ canvasId, initialDoc, onSave
 
   const canvasImageAssetIds = useCallback(
     (): AssetId[] =>
-      nodesRef.current
-        .filter((n) => n.type === 'image' && typeof (n.data as { assetId?: unknown }).assetId === 'string')
-        .map((n) => (n.data as { assetId: AssetId }).assetId),
+      nodesRef.current.flatMap((node) => {
+        if (node.type !== 'image') return [];
+        const assetId = tryParseEntityId('asset', node.data.assetId);
+        return assetId ? [assetId] : [];
+      }),
     []
   );
 
@@ -514,7 +516,7 @@ const CanvasInner: React.FC<CanvasEditorProps> = ({ canvasId, initialDoc, onSave
         const asset = await uploadFile(file);
         if (!asset) return;
         revokeWorkshopMedia(data.assetId);
-        updateNodeData(nodeId, { assetId: asset.id, naturalWidth: asset.width, naturalHeight: asset.height });
+        updateNodeData(nodeId, { assetId: asset.asset_id, naturalWidth: asset.width, naturalHeight: asset.height });
       } else if (result.type === 'split') {
         const cols = Math.max(1, ...result.pieces.map((p) => p.col + 1));
         const originX = node.position.x + (node.width ?? 240) + 60;
@@ -528,7 +530,7 @@ const CanvasInner: React.FC<CanvasEditorProps> = ({ canvasId, initialDoc, onSave
           if (!asset) continue;
           const pos = { x: originX + piece.col * (cell + 24), y: originY + piece.row * (cell + 24) };
           const imgNode = makeImageNode(pos, {
-            assetId: asset.id,
+            assetId: asset.asset_id,
             naturalWidth: asset.width ?? undefined,
             naturalHeight: asset.height ?? undefined,
           });
@@ -547,7 +549,7 @@ const CanvasInner: React.FC<CanvasEditorProps> = ({ canvasId, initialDoc, onSave
         const pos = { x: node.position.x + (node.width ?? 240) + 60, y: node.position.y };
         const genNode = makeGeneratorNode(pos, 'image', {
           prompt: result.prompt,
-          maskAssetId: maskAsset.id,
+          maskAssetId: maskAsset.asset_id,
           autoRun: true,
         });
         addNodes([genNode], [{ id: newEdgeId(), source: node.id, target: genNode.id }]);
@@ -636,8 +638,8 @@ const CanvasInner: React.FC<CanvasEditorProps> = ({ canvasId, initialDoc, onSave
   // ── Create helpers used by menus / drops ────────────────────────────────────
 
   const createNodeFromAsset = useCallback(
-    (asset: Pick<WorkshopAsset, 'id' | 'kind' | 'title' | 'width' | 'height'> | WorkshopAssetDragPayload, pos: XY) => {
-      const assetId = 'asset_id' in asset ? asset.asset_id : asset.id;
+    (asset: Pick<WorkshopAsset, 'asset_id' | 'kind' | 'title' | 'width' | 'height'> | WorkshopAssetDragPayload, pos: XY) => {
+      const assetId = asset.asset_id;
       const kind = asset.kind;
       if (kind === 'image') {
         addNodes([makeImageNode(pos, { assetId, naturalWidth: asset.width ?? undefined, naturalHeight: asset.height ?? undefined })]);
@@ -660,7 +662,7 @@ const CanvasInner: React.FC<CanvasEditorProps> = ({ canvasId, initialDoc, onSave
       const size = await readImageSize(file);
       addNodes([
         makeImageNode(pos, {
-          assetId: asset.id,
+          assetId: asset.asset_id,
           naturalWidth: asset.width ?? size?.width,
           naturalHeight: asset.height ?? size?.height,
         }),
@@ -676,7 +678,7 @@ const CanvasInner: React.FC<CanvasEditorProps> = ({ canvasId, initialDoc, onSave
       if (!file) return;
       const asset = await uploadFile(file);
       if (!asset) return;
-      addNodes([makeVideoNode(pos, { assetId: asset.id })]);
+      addNodes([makeVideoNode(pos, { assetId: asset.asset_id })]);
     },
     [uploadFile, addNodes]
   );
@@ -740,7 +742,7 @@ const CanvasInner: React.FC<CanvasEditorProps> = ({ canvasId, initialDoc, onSave
               const size = await readImageSize(blob);
               addNodes([
                 makeImageNode(center, {
-                  assetId: asset.id,
+                  assetId: asset.asset_id,
                   naturalWidth: asset.width ?? size?.width,
                   naturalHeight: asset.height ?? size?.height,
                 }),
@@ -803,7 +805,7 @@ const CanvasInner: React.FC<CanvasEditorProps> = ({ canvasId, initialDoc, onSave
             const size = await readImageSize(file);
             addNodes([
               makeImageNode(pos, {
-                assetId: asset.id,
+                assetId: asset.asset_id,
                 naturalWidth: asset.width ?? size?.width,
                 naturalHeight: asset.height ?? size?.height,
               }),
@@ -811,7 +813,7 @@ const CanvasInner: React.FC<CanvasEditorProps> = ({ canvasId, initialDoc, onSave
           }
         } else if (isVideoFile(file)) {
           const asset = await uploadFile(file);
-          if (asset) addNodes([makeVideoNode(pos, { assetId: asset.id })]);
+          if (asset) addNodes([makeVideoNode(pos, { assetId: asset.asset_id })]);
         }
         offset += 28;
       }

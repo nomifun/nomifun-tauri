@@ -7,7 +7,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use nomifun_common::{AppError, generate_prefixed_id, now_ms};
+use nomifun_common::{
+    AppError, ProviderId, SharedProviderLifecycleBarrier, WorkshopAssetId, generate_id, now_ms,
+};
 use nomifun_db::{AssetSort, IWorkshopRepository, ListAssetsParams, UpdateAssetParams, WorkshopAssetRow};
 use serde_json::{Value, json};
 
@@ -128,22 +130,48 @@ pub struct WorkshopService {
     /// GC recency grace (ms). Defaults to [`GC_GRACE_MS`]; tests override it to
     /// `0` to drive immediate reclamation deterministically.
     gc_grace_ms: i64,
+    provider_lifecycle: Option<SharedProviderLifecycleBarrier>,
 }
 
 impl WorkshopService {
     /// Build the service over its index repo + the data dir root.
     pub fn start(data_dir: &Path, repo: Arc<dyn IWorkshopRepository>) -> Arc<Self> {
-        Self::start_with_gc_grace(data_dir, repo, GC_GRACE_MS)
+        Self::start_with_gc_grace_and_provider_lifecycle(data_dir, repo, GC_GRACE_MS, None)
+    }
+
+    /// Build the service with the process-wide Provider lifecycle barrier.
+    pub fn start_with_provider_lifecycle(
+        data_dir: &Path,
+        repo: Arc<dyn IWorkshopRepository>,
+        provider_lifecycle: SharedProviderLifecycleBarrier,
+    ) -> Arc<Self> {
+        Self::start_with_gc_grace_and_provider_lifecycle(
+            data_dir,
+            repo,
+            GC_GRACE_MS,
+            Some(provider_lifecycle),
+        )
     }
 
     /// [`Self::start`] with an explicit GC recency grace (ms). Production uses
     /// [`GC_GRACE_MS`]; tests pass `0` for immediate reclamation.
+    #[cfg(test)]
     fn start_with_gc_grace(data_dir: &Path, repo: Arc<dyn IWorkshopRepository>, gc_grace_ms: i64) -> Arc<Self> {
+        Self::start_with_gc_grace_and_provider_lifecycle(data_dir, repo, gc_grace_ms, None)
+    }
+
+    fn start_with_gc_grace_and_provider_lifecycle(
+        data_dir: &Path,
+        repo: Arc<dyn IWorkshopRepository>,
+        gc_grace_ms: i64,
+        provider_lifecycle: Option<SharedProviderLifecycleBarrier>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             repo,
             data_dir: data_dir.to_path_buf(),
             agent_ops: crate::agent_ops::AgentOpsQueue::new(),
             gc_grace_ms,
+            provider_lifecycle,
         })
     }
 
@@ -161,6 +189,28 @@ impl WorkshopService {
         self.workshop_dir().join("assets")
     }
 
+    async fn provider_read_guard(
+        &self,
+    ) -> Option<tokio::sync::RwLockReadGuard<'_, ()>> {
+        match &self.provider_lifecycle {
+            Some(barrier) => Some(barrier.read().await),
+            None => None,
+        }
+    }
+
+    async fn validate_generator_providers(&self, doc: &Value) -> Result<(), AppError> {
+        let provider_ids = docscan::collect_generator_provider_refs(doc)
+            .map_err(|error| AppError::BadRequest(format!("invalid workshop canvas doc: {error}")))?;
+        for provider_id in provider_ids {
+            if !self.repo.provider_exists(&provider_id).await? {
+                return Err(AppError::Conflict(format!(
+                    "workshop canvas references missing provider '{provider_id}'"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     // ---- canvases ----
 
     pub async fn list_canvases(&self) -> Result<Vec<WorkshopCanvasMeta>, AppError> {
@@ -168,7 +218,7 @@ impl WorkshopService {
     }
 
     pub async fn create_canvas(&self, title: Option<String>) -> Result<WorkshopCanvasMeta, AppError> {
-        let id = generate_prefixed_id("wsc");
+        let id = generate_id();
         let title = title
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
@@ -204,10 +254,12 @@ impl WorkshopService {
         let path = self.canvas_dir(id).join("canvas.json");
         match fsio::read_bytes_opt(&path).await {
             Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
-                Ok(doc) => match docscan::validate_canvas_doc_ids(&doc) {
-                    Ok(_) => doc,
+                Ok(doc) => match docscan::validate_canvas_doc_ids(&doc)
+                    .and_then(|_| docscan::collect_generator_provider_refs(&doc).map(|_| ()))
+                {
+                    Ok(()) => doc,
                     Err(error) => {
-                        tracing::warn!(id, %error, "workshop canvas doc has invalid durable ids; serving default");
+                        tracing::warn!(id, %error, "workshop canvas doc has invalid durable references; serving default");
                         default_doc_value()
                     }
                 },
@@ -231,6 +283,16 @@ impl WorkshopService {
     /// `nodes[].id`/`groupId`, `edges[].id`/`from`/`to`, and `node:<id>` mention
     /// references must all be canonical and internally resolvable.
     pub async fn save_doc(&self, id: &str, doc: &Value) -> Result<i64, AppError> {
+        let _provider_guard = self.provider_read_guard().await;
+        self.save_doc_inner(id, doc, true).await
+    }
+
+    async fn save_doc_inner(
+        &self,
+        id: &str,
+        doc: &Value,
+        validate_providers: bool,
+    ) -> Result<i64, AppError> {
         // Ensure the canvas exists before touching disk.
         if self.repo.get_canvas(id).await?.is_none() {
             return Err(AppError::NotFound(format!("workshop canvas {id} not found")));
@@ -238,6 +300,9 @@ impl WorkshopService {
         let node_count = docscan::validate_canvas_doc_ids(doc)
             .map_err(|error| AppError::BadRequest(format!("invalid workshop canvas doc: {error}")))?
             as i64;
+        if validate_providers {
+            self.validate_generator_providers(doc).await?;
+        }
         let bytes = serde_json::to_vec(doc).map_err(|e| AppError::BadRequest(format!("invalid doc json: {e}")))?;
         if bytes.len() > MAX_DOC_BYTES {
             return Err(AppError::BadRequest(format!(
@@ -373,7 +438,7 @@ impl WorkshopService {
     async fn collect_all_referenced_asset_ids(&self) -> Result<BTreeSet<String>, AppError> {
         let mut out = BTreeSet::new();
         for canvas in self.repo.list_canvases().await? {
-            let doc = self.read_doc(&canvas.id).await;
+            let doc = self.read_doc(&canvas.canvas_id).await;
             out.extend(docscan::collect_asset_refs(&doc));
         }
         Ok(out)
@@ -400,6 +465,7 @@ impl WorkshopService {
         source: &str,
     ) -> Result<Vec<crate::agent_ops::AppliedOp>, AppError> {
         use crate::agent_ops::{self, AgentOp, AppliedOp, OpDisposition, PendingOp};
+        let _provider_guard = self.provider_read_guard().await;
 
         if ops.is_empty() {
             return Err(AppError::BadRequest("no ops provided".into()));
@@ -478,7 +544,7 @@ impl WorkshopService {
         if dirty
             && let Some(d) = &doc
         {
-            self.save_doc(canvas_id, d).await?;
+            self.save_doc_inner(canvas_id, d, true).await?;
         }
         if !to_queue.is_empty() {
             self.agent_ops.enqueue(canvas_id, to_queue);
@@ -533,7 +599,7 @@ impl WorkshopService {
                 origin: None,
             })
             .await?;
-        Ok(row.into())
+        WorkshopAsset::try_from(row)
     }
 
     /// Programmatic asset ingest: store raw `bytes` of a given `mime` as a new
@@ -563,6 +629,56 @@ impl WorkshopService {
             origin,
         })
         .await
+    }
+
+    /// Remove Provider selections from all generator nodes in all persisted
+    /// canvas documents. This is a SET_NULL logical-reference cleanup invoked
+    /// by the Provider deletion coordinator while holding the lifecycle write
+    /// guard. The operation is idempotent and validates every rewritten doc
+    /// before replacing it atomically.
+    pub async fn clear_provider_references_under_lifecycle_write_guard(
+        &self,
+        provider_id: &str,
+    ) -> Result<(), AppError> {
+        let provider_id = ProviderId::parse(provider_id)
+            .map_err(|error| AppError::BadRequest(format!("invalid provider_id: {error}")))?
+            .into_string();
+        for canvas in self.repo.list_canvases().await? {
+            let path = self.canvas_dir(&canvas.canvas_id).join("canvas.json");
+            let bytes = fsio::read_bytes_opt(&path)
+                .await
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "read workshop canvas {}: {error}",
+                        canvas.canvas_id
+                    ))
+                })?
+                .ok_or_else(|| {
+                    AppError::Conflict(format!(
+                        "workshop canvas {} is missing canvas.json",
+                        canvas.canvas_id
+                    ))
+                })?;
+            let mut doc: Value = serde_json::from_slice(&bytes).map_err(|error| {
+                AppError::Conflict(format!(
+                    "workshop canvas {} has invalid JSON: {error}",
+                    canvas.canvas_id
+                ))
+            })?;
+            docscan::validate_canvas_doc_ids(&doc).map_err(|error| {
+                AppError::Conflict(format!(
+                    "workshop canvas {} has invalid durable IDs: {error}",
+                    canvas.canvas_id
+                ))
+            })?;
+            if !docscan::clear_generator_provider_reference(&mut doc, &provider_id)
+                .map_err(|error| AppError::Conflict(format!("invalid workshop canvas: {error}")))?
+            {
+                continue;
+            }
+            self.save_doc_inner(&canvas.canvas_id, &doc, false).await?;
+        }
+        Ok(())
     }
 
     /// Read an asset's original binary + its resolved mime. Errors when the
@@ -600,7 +716,7 @@ impl WorkshopService {
             (None, None)
         };
 
-        let id = generate_prefixed_id("wsa");
+        let id = generate_id();
         let disk_name = format!("{id}.{}", input.ext);
         let rel_path = format!("{WORKSHOP_REL_DIR}/assets/{disk_name}");
         fsio::save_bytes_atomic(&self.assets_dir(), &disk_name, &input.bytes)
@@ -615,7 +731,8 @@ impl WorkshopService {
 
         let now = now_ms();
         let row = WorkshopAssetRow {
-            id,
+            id: 0,
+            asset_id: id,
             kind: input.kind,
             title: input.title,
             collection: normalize_opt(input.collection),
@@ -680,9 +797,12 @@ impl WorkshopService {
         let rel = row.rel_path.as_deref()?;
         let abs = self.resolve_within_workshop(rel).ok()?;
         let original = tokio::fs::read(&abs).await.ok()?;
-        let thumb_rel = self.generate_and_store_thumb(&row.id, &original).await?;
+        let thumb_rel = self.generate_and_store_thumb(&row.asset_id, &original).await?;
         // Persist the freshly minted thumb path (best-effort).
-        let _ = self.repo.set_asset_thumb(&row.id, &thumb_rel, now_ms()).await;
+        let _ = self
+            .repo
+            .set_asset_thumb(&row.asset_id, &thumb_rel, now_ms())
+            .await;
         let thumb_abs = self.resolve_within_workshop(&thumb_rel).ok()?;
         tokio::fs::read(&thumb_abs).await.ok()
     }
@@ -694,12 +814,15 @@ impl WorkshopService {
             if let Some(text) = row.text_content.as_deref() {
                 return Ok((text.as_bytes().to_vec(), "text/plain; charset=utf-8".to_string()));
             }
-            return Err(AppError::NotFound(format!("asset {} has no file", row.id)));
+            return Err(AppError::NotFound(format!(
+                "asset {} has no file",
+                row.asset_id
+            )));
         };
         let abs = self.resolve_within_workshop(rel)?;
         let bytes = tokio::fs::read(&abs)
             .await
-            .map_err(|_| AppError::NotFound(format!("asset {} file is missing", row.id)))?;
+            .map_err(|_| AppError::NotFound(format!("asset {} file is missing", row.asset_id)))?;
         let mime = row.mime.clone().unwrap_or_else(|| "application/octet-stream".to_string());
         Ok((bytes, mime))
     }
@@ -711,7 +834,8 @@ impl WorkshopService {
         }
         let now = now_ms();
         let row = WorkshopAssetRow {
-            id: generate_prefixed_id("wsa"),
+            id: 0,
+            asset_id: generate_id(),
             kind: "text".to_string(),
             title: title.to_string(),
             collection: normalize_opt(input.collection),
@@ -728,7 +852,7 @@ impl WorkshopService {
             created_at: now,
             updated_at: now,
         };
-        Ok(self.repo.create_asset(&row).await?.into())
+        WorkshopAsset::try_from(self.repo.create_asset(&row).await?)
     }
 
     pub async fn list_assets(&self, query: AssetQuery) -> Result<AssetListPage, AppError> {
@@ -746,10 +870,11 @@ impl WorkshopService {
                 page_size: query.page_size,
             })
             .await?;
-        Ok(AssetListPage {
-            items: rows.into_iter().map(WorkshopAsset::from).collect(),
-            total,
-        })
+        let items = rows
+            .into_iter()
+            .map(WorkshopAsset::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AssetListPage { items, total })
     }
 
     pub async fn patch_asset(&self, id: &str, patch: AssetPatch) -> Result<WorkshopAsset, AppError> {
@@ -765,7 +890,7 @@ impl WorkshopService {
             tags: tags_owned.as_deref(),
             in_library: patch.in_library,
         };
-        Ok(self.repo.update_asset(id, params, now_ms()).await?.into())
+        WorkshopAsset::try_from(self.repo.update_asset(id, params, now_ms()).await?)
     }
 
     /// Bulk-rename a collection across every asset that used it (asset-library
@@ -845,7 +970,7 @@ impl WorkshopService {
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("bin");
-                let entry = format!("assets/{}.{ext}", row.id);
+                let entry = format!("assets/{}.{ext}", row.asset_id);
                 if let Ok(abs) = self.resolve_within_workshop(rel)
                     && let Ok(bytes) = tokio::fs::read(&abs).await
                 {
@@ -854,9 +979,19 @@ impl WorkshopService {
                 }
             }
             let tags = serde_json::from_str::<Value>(&row.tags).unwrap_or_else(|_| json!([]));
-            let origin = row.origin.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok());
+            let origin = row
+                .origin
+                .as_deref()
+                .map(serde_json::from_str::<Value>)
+                .transpose()
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "workshop asset {} has invalid origin JSON: {error}",
+                        row.asset_id
+                    ))
+                })?;
             manifest_assets.push(json!({
-                "id": row.id,
+                "id": row.asset_id,
                 "kind": row.kind,
                 "title": row.title,
                 "collection": row.collection,
@@ -944,10 +1079,10 @@ impl WorkshopService {
         let title = self.dedup_canvas_title(&base_title).await?;
 
         let meta = self.create_canvas(Some(title)).await?;
-        self.save_doc(&meta.id, &doc).await?;
+        self.save_doc(&meta.canvas_id, &doc).await?;
         let row = self
             .repo
-            .get_canvas(&meta.id)
+            .get_canvas(&meta.canvas_id)
             .await?
             .ok_or_else(|| AppError::Internal("imported canvas vanished".into()))?;
         Ok(row.into())
@@ -974,7 +1109,7 @@ impl WorkshopService {
             let row = self
                 .create_text_asset(NewTextAsset { title, text_content, collection, tags, in_library: Some(in_library) })
                 .await?;
-            return Ok(Some(row.id));
+            return Ok(Some(row.asset_id));
         }
 
         // Binary asset: needs a file in the archive.
@@ -999,7 +1134,7 @@ impl WorkshopService {
                 origin,
             })
             .await?;
-        Ok(Some(row.id))
+        Ok(Some(row.asset_id))
     }
 
     /// Return `base` if unused, else `base (2)`, `base (3)`, … (first free).
@@ -1036,13 +1171,14 @@ impl WorkshopService {
             // yet — reaping it now would leave a dangling reference. Keep it
             // (it's still an orphan next pass if truly unreferenced).
             let recent = now.saturating_sub(row.created_at.max(row.updated_at)) < self.gc_grace_ms;
-            let orphan = !row.in_library && !referenced.contains(&row.id) && !recent;
+            let orphan =
+                !row.in_library && !referenced.contains(&row.asset_id) && !recent;
             if orphan {
-                if self.delete_asset(&row.id).await.is_ok() {
+                if self.delete_asset(&row.asset_id).await.is_ok() {
                     orphan_rows_deleted += 1;
                 }
             } else {
-                surviving_ids.insert(row.id.clone());
+                surviving_ids.insert(row.asset_id.clone());
             }
         }
 
@@ -1050,8 +1186,9 @@ impl WorkshopService {
         Ok(GcStats { orphan_rows_deleted, orphan_files_deleted })
     }
 
-    /// Delete `wsa_*` files under the assets dir (originals + thumbs) whose id is
-    /// not in `surviving_ids`. Best-effort; returns the number removed.
+    /// Delete canonical UUIDv7 asset files under the assets dir (originals +
+    /// thumbs) whose id is not in `surviving_ids`. Best-effort; returns the
+    /// number removed.
     async fn sweep_orphan_files(&self, surviving_ids: &BTreeSet<String>) -> usize {
         let assets = self.assets_dir();
         let mut deleted = sweep_asset_dir(&assets, surviving_ids, self.gc_grace_ms).await;
@@ -1081,7 +1218,7 @@ fn default_doc_value() -> Value {
     serde_json::from_str(DEFAULT_DOC).expect("DEFAULT_DOC is valid json")
 }
 
-/// Delete `wsa_*` files directly under `dir` whose id-stem is not in
+/// Delete canonical UUIDv7 asset files directly under `dir` whose id-stem is not in
 /// `surviving_ids` AND that were last modified more than `grace_ms` ago.
 /// Non-recursive, best-effort; returns the count removed. The mtime grace is
 /// the TOCTOU guard: [`WorkshopService::store_binary_asset`] writes the file
@@ -1109,8 +1246,12 @@ async fn sweep_asset_dir(dir: &Path, surviving_ids: &BTreeSet<String>, grace_ms:
         }
         let path = entry.path();
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-        // Only ever touch our own asset files, and only when no row survives.
-        if stem.starts_with("wsa_") && !surviving_ids.contains(stem) && tokio::fs::remove_file(&path).await.is_ok() {
+        // Only ever touch canonical workshop asset files, and only when no row
+        // survives. Unrelated user files in this directory are never removed.
+        if WorkshopAssetId::parse(stem).is_ok()
+            && !surviving_ids.contains(stem)
+            && tokio::fs::remove_file(&path).await.is_ok()
+        {
             deleted += 1;
         }
     }
@@ -1184,7 +1325,9 @@ fn classify_mime(mime: &str) -> Result<(&'static str, String), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nomifun_common::{WorkshopEdgeId, WorkshopNodeId};
+    use nomifun_common::{
+        ProviderLifecycleBarrier, WorkshopCanvasId, WorkshopEdgeId, WorkshopNodeId,
+    };
     use nomifun_db::SqliteWorkshopRepository;
 
     async fn service() -> (Arc<WorkshopService>, tempfile::TempDir) {
@@ -1199,6 +1342,37 @@ mod tests {
         Box::leak(Box::new(db));
         let dir = tempfile::tempdir().unwrap();
         (WorkshopService::start_with_gc_grace(dir.path(), repo, grace_ms), dir)
+    }
+
+    async fn service_with_database_and_lifecycle(
+        provider_lifecycle: Option<SharedProviderLifecycleBarrier>,
+    ) -> (Arc<WorkshopService>, tempfile::TempDir, Arc<nomifun_db::Database>) {
+        let db = Arc::new(nomifun_db::init_database_memory().await.unwrap());
+        let repo: Arc<dyn IWorkshopRepository> =
+            Arc::new(SqliteWorkshopRepository::new(db.pool().clone()));
+        let dir = tempfile::tempdir().unwrap();
+        let service = WorkshopService::start_with_gc_grace_and_provider_lifecycle(
+            dir.path(),
+            repo,
+            0,
+            provider_lifecycle,
+        );
+        (service, dir, db)
+    }
+
+    async fn insert_provider(db: &nomifun_db::Database, provider_id: &str) {
+        nomifun_db::sqlx::query(
+            "INSERT INTO providers (\
+                provider_id, platform, name, base_url, api_key_encrypted, models, enabled, \
+                capabilities, created_at, updated_at\
+             ) VALUES (?, 'openai', ?, 'https://example.invalid', 'encrypted', \
+                       '[]', 1, '[]', 1, 1)",
+        )
+        .bind(provider_id)
+        .bind(provider_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
     }
 
     // A 1x1 PNG.
@@ -1217,11 +1391,11 @@ mod tests {
         let (svc, dir) = service().await;
         let meta = svc.create_canvas(None).await.unwrap();
         assert_eq!(meta.title, "未命名画布");
-        assert!(meta.id.starts_with("wsc_"));
-        assert!(dir.path().join("workshop/canvases").join(&meta.id).join("canvas.json").exists());
+        assert!(WorkshopCanvasId::parse(&meta.canvas_id).is_ok());
+        assert!(dir.path().join("workshop/canvases").join(&meta.canvas_id).join("canvas.json").exists());
 
         // default doc parses; save a doc with 2 nodes → node_count syncs.
-        let read = svc.get_canvas(&meta.id).await.unwrap();
+        let read = svc.get_canvas(&meta.canvas_id).await.unwrap();
         assert_eq!(read.doc["schema"], 1);
         let doc = serde_json::json!({
             "schema": 1,
@@ -1231,26 +1405,180 @@ mod tests {
             ],
             "edges": []
         });
-        let updated_at = svc.save_doc(&meta.id, &doc).await.unwrap();
+        let updated_at = svc.save_doc(&meta.canvas_id, &doc).await.unwrap();
         assert!(updated_at >= meta.created_at);
         let all = svc.list_canvases().await.unwrap();
         assert_eq!(all[0].node_count, 2);
 
         // rename
-        let renamed = svc.rename_canvas(&meta.id, "  我的画布  ").await.unwrap();
+        let renamed = svc.rename_canvas(&meta.canvas_id, "  我的画布  ").await.unwrap();
         assert_eq!(renamed.title, "我的画布");
-        assert!(svc.rename_canvas(&meta.id, "   ").await.is_err());
+        assert!(svc.rename_canvas(&meta.canvas_id, "   ").await.is_err());
 
         // delete removes row + dir
-        svc.delete_canvas(&meta.id).await.unwrap();
-        assert!(!dir.path().join("workshop/canvases").join(&meta.id).exists());
-        assert!(svc.get_canvas(&meta.id).await.is_err());
+        svc.delete_canvas(&meta.canvas_id).await.unwrap();
+        assert!(!dir.path().join("workshop/canvases").join(&meta.canvas_id).exists());
+        assert!(svc.get_canvas(&meta.canvas_id).await.is_err());
     }
 
     #[tokio::test]
     async fn save_doc_rejects_oversize_and_unknown_canvas() {
         let (svc, _dir) = service().await;
-        assert!(svc.save_doc("wsc_missing", &serde_json::json!({})).await.is_err());
+        assert!(
+            svc.save_doc(
+                "0190f5fe-7c00-7a00-8000-000000000099",
+                &serde_json::json!({})
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn save_doc_enforces_generator_provider_logical_references() {
+        let (svc, _dir, _db) = service_with_database_and_lifecycle(None).await;
+        let canvas = svc.create_canvas(Some("provider contract".into())).await.unwrap();
+        let missing_provider_id = "0190f5fe-7c00-7a00-8000-000000000085";
+        let base = serde_json::json!({
+            "schema": 1,
+            "nodes": [{
+                "id": WorkshopNodeId::new().into_string(),
+                "kind": "generator",
+                "data": {
+                    "providerId": missing_provider_id,
+                    "model": "image-model"
+                }
+            }],
+            "edges": []
+        });
+
+        let error = svc.save_doc(&canvas.canvas_id, &base).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AppError::Conflict(ref message)
+                    if message.contains("references missing provider")
+            ),
+            "missing logical parent must be rejected; got {error:?}"
+        );
+
+        let mut noncanonical = base.clone();
+        noncanonical["nodes"][0]["data"]["providerId"] =
+            serde_json::json!(format!("provider_{missing_provider_id}"));
+        let mut missing_model = base.clone();
+        missing_model["nodes"][0]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("model");
+        let mut missing_provider = base;
+        missing_provider["nodes"][0]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("providerId");
+
+        for (case, invalid) in [
+            ("non-canonical provider", noncanonical),
+            ("provider without model", missing_model),
+            ("model without provider", missing_provider),
+        ] {
+            let error = svc.save_doc(&canvas.canvas_id, &invalid).await.unwrap_err();
+            assert!(
+                matches!(error, AppError::BadRequest(_)),
+                "{case} must be rejected as an invalid fixed pair; got {error:?}"
+            );
+        }
+
+        assert_eq!(
+            svc.get_canvas(&canvas.canvas_id).await.unwrap().doc,
+            default_doc_value(),
+            "rejected logical references must not replace the persisted document"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_cleanup_clears_only_the_target_generator_pair_and_is_idempotent() {
+        let barrier = Arc::new(ProviderLifecycleBarrier::new());
+        let (svc, _dir, db) =
+            service_with_database_and_lifecycle(Some(barrier.clone())).await;
+        let target_provider_id = "0190f5fe-7c00-7a00-8000-000000000086";
+        let other_provider_id = "0190f5fe-7c00-7a00-8000-000000000087";
+        insert_provider(&db, target_provider_id).await;
+        insert_provider(&db, other_provider_id).await;
+        let canvas = svc.create_canvas(Some("provider cleanup".into())).await.unwrap();
+        let doc = serde_json::json!({
+            "schema": 1,
+            "nodes": [
+                {
+                    "id": WorkshopNodeId::new().into_string(),
+                    "kind": "generator",
+                    "data": {
+                        "providerId": target_provider_id,
+                        "model": "delete-me",
+                        "prompt": "keep prompt"
+                    }
+                },
+                {
+                    "id": WorkshopNodeId::new().into_string(),
+                    "kind": "generator",
+                    "data": {
+                        "providerId": other_provider_id,
+                        "model": "keep-me"
+                    }
+                }
+            ],
+            "edges": []
+        });
+        svc.save_doc(&canvas.canvas_id, &doc).await.unwrap();
+
+        let _write_guard = barrier.write().await;
+        svc.clear_provider_references_under_lifecycle_write_guard(target_provider_id)
+            .await
+            .unwrap();
+        svc.clear_provider_references_under_lifecycle_write_guard(target_provider_id)
+            .await
+            .unwrap();
+
+        let cleaned = svc.get_canvas(&canvas.canvas_id).await.unwrap().doc;
+        assert!(cleaned["nodes"][0]["data"].get("providerId").is_none());
+        assert!(cleaned["nodes"][0]["data"].get("model").is_none());
+        assert_eq!(cleaned["nodes"][0]["data"]["prompt"], "keep prompt");
+        assert_eq!(
+            cleaned["nodes"][1]["data"]["providerId"],
+            serde_json::json!(other_provider_id)
+        );
+        assert_eq!(cleaned["nodes"][1]["data"]["model"], "keep-me");
+    }
+
+    #[tokio::test]
+    async fn provider_lifecycle_write_guard_blocks_workshop_doc_writes() {
+        let barrier = Arc::new(ProviderLifecycleBarrier::new());
+        let (svc, _dir, db) =
+            service_with_database_and_lifecycle(Some(barrier.clone())).await;
+        let provider_id = "0190f5fe-7c00-7a00-8000-000000000088";
+        insert_provider(&db, provider_id).await;
+        let canvas = svc.create_canvas(Some("barrier".into())).await.unwrap();
+        let doc = serde_json::json!({
+            "schema": 1,
+            "nodes": [{
+                "id": WorkshopNodeId::new().into_string(),
+                "kind": "generator",
+                "data": {"providerId": provider_id, "model": "image-model"}
+            }],
+            "edges": []
+        });
+
+        let write_guard = barrier.write().await;
+        let service = svc.clone();
+        let canvas_id = canvas.canvas_id.clone();
+        let mut save = tokio::spawn(async move { service.save_doc(&canvas_id, &doc).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut save)
+                .await
+                .is_err(),
+            "a workshop write must wait while Provider deletion holds the lifecycle write guard"
+        );
+        drop(write_guard);
+        save.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -1273,12 +1601,11 @@ mod tests {
             ],
             "edges": [{"id": edge_id, "from": group_id, "to": member_id}]
         });
-        svc.save_doc(&canvas.id, &valid).await.unwrap();
+        svc.save_doc(&canvas.canvas_id, &valid).await.unwrap();
 
-        let mut wrong_node_prefix = valid.clone();
-        wrong_node_prefix["nodes"][0]["id"] = serde_json::json!(
-            "wsa_0190f5fe-7c00-7a00-8000-000000000001"
-        );
+        let mut non_v7_node_id = valid.clone();
+        non_v7_node_id["nodes"][0]["id"] =
+            serde_json::json!("550e8400-e29b-41d4-a716-446655440000");
         let mut duplicate_node = valid.clone();
         let duplicated_id = duplicate_node["nodes"][0]["id"].clone();
         duplicate_node["nodes"][1]["id"] = duplicated_id;
@@ -1287,29 +1614,30 @@ mod tests {
             serde_json::json!(WorkshopNodeId::new().into_string());
         let mut legacy_mention = valid.clone();
         legacy_mention["nodes"][1]["data"]["mentions"] = serde_json::json!(["node:legacy-node"]);
-        let mut wrong_edge_prefix = valid.clone();
-        wrong_edge_prefix["edges"][0]["id"] = serde_json::json!(WorkshopNodeId::new().into_string());
+        let mut non_v7_edge_id = valid.clone();
+        non_v7_edge_id["edges"][0]["id"] =
+            serde_json::json!("550e8400-e29b-41d4-a716-446655440001");
         let mut missing_endpoint = valid.clone();
         missing_endpoint["edges"][0]["to"] =
             serde_json::json!(WorkshopNodeId::new().into_string());
 
         for (case, invalid) in [
-            ("wrong node prefix", wrong_node_prefix),
+            ("non-v7 node id", non_v7_node_id),
             ("duplicate node id", duplicate_node),
             ("missing group", missing_group),
             ("legacy mention", legacy_mention),
-            ("wrong edge prefix", wrong_edge_prefix),
+            ("non-v7 edge id", non_v7_edge_id),
             ("missing endpoint", missing_endpoint),
         ] {
             let error = svc
-                .save_doc(&canvas.id, &invalid)
+                .save_doc(&canvas.canvas_id, &invalid)
                 .await
                 .unwrap_err();
             assert!(matches!(error, AppError::BadRequest(_)), "{case}: {error}");
         }
 
         // A rejected write must not replace the last valid document.
-        assert_eq!(svc.get_canvas(&canvas.id).await.unwrap().doc, valid);
+        assert_eq!(svc.get_canvas(&canvas.canvas_id).await.unwrap().doc, valid);
     }
 
     #[tokio::test]
@@ -1319,7 +1647,7 @@ mod tests {
         let path = dir
             .path()
             .join("workshop/canvases")
-            .join(&canvas.id)
+            .join(&canvas.canvas_id)
             .join("canvas.json");
         tokio::fs::write(
             path,
@@ -1328,7 +1656,7 @@ mod tests {
         .await
         .unwrap();
 
-        let read = svc.get_canvas(&canvas.id).await.unwrap();
+        let read = svc.get_canvas(&canvas.canvas_id).await.unwrap();
         assert_eq!(read.doc, default_doc_value());
     }
 
@@ -1351,14 +1679,14 @@ mod tests {
         assert_eq!(asset.width, Some(1));
         assert_eq!(asset.height, Some(1));
         assert!(asset.in_library);
-        assert_eq!(asset.url, format!("/api/workshop/files/{}", asset.id));
+        assert_eq!(asset.url, format!("/api/workshop/files/{}", asset.asset_id));
 
         // serve returns the bytes + mime
-        let served = svc.serve_file(&asset.id, false).await.unwrap();
+        let served = svc.serve_file(&asset.asset_id, false).await.unwrap();
         assert_eq!(served.mime, "image/png");
         assert_eq!(served.bytes, png_1x1());
         // thumb=1 falls back to original when no thumb exists
-        let served_thumb = svc.serve_file(&asset.id, true).await.unwrap();
+        let served_thumb = svc.serve_file(&asset.asset_id, true).await.unwrap();
         assert_eq!(served_thumb.bytes, png_1x1());
     }
 
@@ -1399,7 +1727,7 @@ mod tests {
 
         let patched = svc
             .patch_asset(
-                &a.id,
+                &a.asset_id,
                 AssetPatch {
                     title: Some("新标题".into()),
                     collection: Some("场景".into()),
@@ -1420,11 +1748,11 @@ mod tests {
         assert_eq!(page.total, 1);
 
         // text assets serve their inline body as text/plain (no file on disk)
-        let served = svc.serve_file(&a.id, false).await.unwrap();
+        let served = svc.serve_file(&a.asset_id, false).await.unwrap();
         assert_eq!(served.mime, "text/plain; charset=utf-8");
         assert_eq!(String::from_utf8(served.bytes).unwrap(), a.text_content.clone().unwrap());
-        svc.delete_asset(&a.id).await.unwrap();
-        assert!(svc.serve_file(&a.id, false).await.is_err());
+        svc.delete_asset(&a.asset_id).await.unwrap();
+        assert!(svc.serve_file(&a.asset_id, false).await.is_err());
     }
 
     /// A real, decodable PNG (unlike the header-only `png_1x1`).
@@ -1457,14 +1785,14 @@ mod tests {
         let asset = upload_png(&svc, true).await;
         assert!(asset.thumb_url.is_some(), "thumb_url should be advertised");
         assert!(
-            dir.path().join(format!("workshop/assets/thumbs/{}.jpg", asset.id)).exists(),
+            dir.path().join(format!("workshop/assets/thumbs/{}.jpg", asset.asset_id)).exists(),
             "thumb file should exist on disk"
         );
-        let served = svc.serve_file(&asset.id, true).await.unwrap();
+        let served = svc.serve_file(&asset.asset_id, true).await.unwrap();
         assert_eq!(served.mime, "image/jpeg");
         assert_eq!(&served.bytes[0..2], &[0xFF, 0xD8], "served thumb is JPEG");
         // original still served untouched
-        let orig = svc.serve_file(&asset.id, false).await.unwrap();
+        let orig = svc.serve_file(&asset.asset_id, false).await.unwrap();
         assert_eq!(orig.mime, "image/png");
     }
 
@@ -1483,7 +1811,7 @@ mod tests {
         assert!(row.thumb_rel_path.is_some());
         assert_eq!(row.origin.as_deref().map(|s| s.contains("a cat")), Some(true));
 
-        let (bytes, mime) = svc.read_asset_bytes(&row.id).await.unwrap();
+        let (bytes, mime) = svc.read_asset_bytes(&row.asset_id).await.unwrap();
         assert_eq!(bytes, png);
         assert_eq!(mime, "image/png");
 
@@ -1498,9 +1826,9 @@ mod tests {
         assert!(canvas.thumbnail_url.is_none());
         let asset = upload_png(&svc, true).await;
 
-        let meta = svc.patch_canvas(&canvas.id, None, Some(asset.id.clone())).await.unwrap();
-        assert_eq!(meta.thumbnail_url.as_deref(), Some(&*format!("/api/workshop/canvas-thumbs/{}", canvas.id)));
-        let served = svc.serve_canvas_thumbnail(&canvas.id).await.unwrap();
+        let meta = svc.patch_canvas(&canvas.canvas_id, None, Some(asset.asset_id.clone())).await.unwrap();
+        assert_eq!(meta.thumbnail_url.as_deref(), Some(&*format!("/api/workshop/canvas-thumbs/{}", canvas.canvas_id)));
+        let served = svc.serve_canvas_thumbnail(&canvas.canvas_id).await.unwrap();
         assert_eq!(served.mime, "image/jpeg");
         assert_eq!(&served.bytes[0..2], &[0xFF, 0xD8]);
 
@@ -1515,7 +1843,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(svc.set_canvas_thumbnail(&canvas.id, &text.id).await.is_err());
+        assert!(svc.set_canvas_thumbnail(&canvas.canvas_id, &text.asset_id).await.is_err());
     }
 
     #[tokio::test]
@@ -1532,27 +1860,27 @@ mod tests {
             "background": "dots",
             "nodes": [
                 { "id": image_node_id, "kind": "image", "x": 0, "y": 0, "w": 10, "h": 10,
-                  "data": { "assetId": asset.id, "caption": "hi" } },
+                  "data": { "assetId": asset.asset_id, "caption": "hi" } },
                 { "id": generator_node_id, "kind": "generator", "x": 20, "y": 20, "w": 10, "h": 10,
                   "data": { "mentions": [format!("node:{image_node_id}")] } }
             ],
             "edges": [{ "id": edge_id, "from": image_node_id, "to": generator_node_id }]
         });
-        svc.save_doc(&canvas.id, &doc).await.unwrap();
+        svc.save_doc(&canvas.canvas_id, &doc).await.unwrap();
 
-        let zip = svc.export_canvas(&canvas.id).await.unwrap();
+        let zip = svc.export_canvas(&canvas.canvas_id).await.unwrap();
         assert!(!zip.is_empty());
 
         let imported = svc.import_canvas(zip).await.unwrap();
-        assert_ne!(imported.id, canvas.id);
+        assert_ne!(imported.canvas_id, canvas.canvas_id);
         // title de-duplicated (base already exists)
         assert_eq!(imported.title, "原始画布 (2)");
         assert_eq!(imported.node_count, 2);
 
         // The imported doc references a NEW asset id, and that asset exists + serves.
-        let read = svc.get_canvas(&imported.id).await.unwrap();
+        let read = svc.get_canvas(&imported.canvas_id).await.unwrap();
         let new_asset_id = read.doc["nodes"][0]["data"]["assetId"].as_str().unwrap();
-        assert_ne!(new_asset_id, asset.id);
+        assert_ne!(new_asset_id, asset.asset_id);
         let served = svc.serve_file(new_asset_id, false).await.unwrap();
         assert_eq!(served.bytes, real_png(800, 600));
 
@@ -1587,20 +1915,20 @@ mod tests {
         let asset = upload_png(&svc, false).await;
         let node_id = WorkshopNodeId::new().into_string();
         let doc = serde_json::json!({
-            "schema": 1, "nodes": [{ "id": node_id, "kind": "image", "data": { "assetId": asset.id } }], "edges": []
+            "schema": 1, "nodes": [{ "id": node_id, "kind": "image", "data": { "assetId": asset.asset_id } }], "edges": []
         });
         let c1 = svc.create_canvas(Some("c1".into())).await.unwrap();
         let c2 = svc.create_canvas(Some("c2".into())).await.unwrap();
-        svc.save_doc(&c1.id, &doc).await.unwrap();
-        svc.save_doc(&c2.id, &doc).await.unwrap();
+        svc.save_doc(&c1.canvas_id, &doc).await.unwrap();
+        svc.save_doc(&c2.canvas_id, &doc).await.unwrap();
 
         // Deleting c1 keeps the asset (c2 still references it).
-        svc.delete_canvas(&c1.id).await.unwrap();
-        assert!(svc.serve_file(&asset.id, false).await.is_ok());
+        svc.delete_canvas(&c1.canvas_id).await.unwrap();
+        assert!(svc.serve_file(&asset.asset_id, false).await.is_ok());
 
         // Deleting c2 (the last referencer) GCs the internal asset + its file.
-        svc.delete_canvas(&c2.id).await.unwrap();
-        assert!(svc.serve_file(&asset.id, false).await.is_err());
+        svc.delete_canvas(&c2.canvas_id).await.unwrap();
+        assert!(svc.serve_file(&asset.asset_id, false).await.is_err());
     }
 
     #[tokio::test]
@@ -1609,13 +1937,13 @@ mod tests {
         let asset = upload_png(&svc, true).await; // in_library=1
         let node_id = WorkshopNodeId::new().into_string();
         let doc = serde_json::json!({
-            "schema": 1, "nodes": [{ "id": node_id, "kind": "image", "data": { "assetId": asset.id } }], "edges": []
+            "schema": 1, "nodes": [{ "id": node_id, "kind": "image", "data": { "assetId": asset.asset_id } }], "edges": []
         });
         let c = svc.create_canvas(Some("c".into())).await.unwrap();
-        svc.save_doc(&c.id, &doc).await.unwrap();
-        svc.delete_canvas(&c.id).await.unwrap();
+        svc.save_doc(&c.canvas_id, &doc).await.unwrap();
+        svc.delete_canvas(&c.canvas_id).await.unwrap();
         // Library assets are never GC'd on canvas delete.
-        assert!(svc.serve_file(&asset.id, false).await.is_ok());
+        assert!(svc.serve_file(&asset.asset_id, false).await.is_ok());
     }
 
     #[tokio::test]
@@ -1628,15 +1956,16 @@ mod tests {
         // A stray file on disk with no row.
         let assets_dir = dir.path().join("workshop/assets");
         tokio::fs::create_dir_all(&assets_dir).await.unwrap();
-        let stray = assets_dir.join("wsa_stray_orphan.png");
+        let stray =
+            assets_dir.join("0190f5fe-7c00-7a00-8000-000000000061.png");
         tokio::fs::write(&stray, real_png(4, 4)).await.unwrap();
 
         let stats = svc.gc().await.unwrap();
         assert_eq!(stats.orphan_rows_deleted, 1, "the internal orphan row");
         assert!(stats.orphan_files_deleted >= 1, "at least the stray file");
 
-        assert!(svc.serve_file(&orphan.id, false).await.is_err(), "orphan row gone");
-        assert!(svc.serve_file(&kept.id, false).await.is_ok(), "library asset kept");
+        assert!(svc.serve_file(&orphan.asset_id, false).await.is_err(), "orphan row gone");
+        assert!(svc.serve_file(&kept.asset_id, false).await.is_ok(), "library asset kept");
         assert!(!stray.exists(), "stray file swept");
     }
 
@@ -1650,13 +1979,14 @@ mod tests {
         // A freshly written stray file with no row.
         let assets_dir = dir.path().join("workshop/assets");
         tokio::fs::create_dir_all(&assets_dir).await.unwrap();
-        let stray = assets_dir.join("wsa_fresh_stray.png");
+        let stray =
+            assets_dir.join("0190f5fe-7c00-7a00-8000-000000000062.png");
         tokio::fs::write(&stray, real_png(4, 4)).await.unwrap();
 
         let stats = svc.gc().await.unwrap();
         assert_eq!(stats.orphan_rows_deleted, 0, "recent orphan row protected by grace");
         assert_eq!(stats.orphan_files_deleted, 0, "recent stray file protected by grace");
-        assert!(svc.serve_file(&orphan.id, false).await.is_ok(), "recent orphan not reaped");
+        assert!(svc.serve_file(&orphan.asset_id, false).await.is_ok(), "recent orphan not reaped");
         assert!(stray.exists(), "recent stray file not swept");
 
         // With no grace the same orphans ARE reclaimed (confirms the guard is the
@@ -1665,11 +1995,12 @@ mod tests {
         let orphan0 = upload_png(&svc0, false).await;
         let assets0 = dir0.path().join("workshop/assets");
         tokio::fs::create_dir_all(&assets0).await.unwrap();
-        let stray0 = assets0.join("wsa_old_stray.png");
+        let stray0 =
+            assets0.join("0190f5fe-7c00-7a00-8000-000000000063.png");
         tokio::fs::write(&stray0, real_png(4, 4)).await.unwrap();
         let stats0 = svc0.gc().await.unwrap();
         assert_eq!(stats0.orphan_rows_deleted, 1, "orphan row reclaimed with no grace");
-        assert!(svc0.serve_file(&orphan0.id, false).await.is_err());
+        assert!(svc0.serve_file(&orphan0.asset_id, false).await.is_err());
         assert!(!stray0.exists(), "stray file swept with no grace");
     }
 
@@ -1682,12 +2013,12 @@ mod tests {
         let asset = upload_png(&svc, false).await; // canvas-internal
         let node_id = WorkshopNodeId::new().into_string();
         let doc = serde_json::json!({
-            "schema": 1, "nodes": [{ "id": node_id, "kind": "image", "data": { "assetId": asset.id } }], "edges": []
+            "schema": 1, "nodes": [{ "id": node_id, "kind": "image", "data": { "assetId": asset.asset_id } }], "edges": []
         });
         let c = svc.create_canvas(Some("c".into())).await.unwrap();
-        svc.save_doc(&c.id, &doc).await.unwrap();
-        svc.delete_canvas(&c.id).await.unwrap();
-        assert!(svc.serve_file(&asset.id, false).await.is_ok(), "recent internal asset survives delete_canvas grace");
+        svc.save_doc(&c.canvas_id, &doc).await.unwrap();
+        svc.delete_canvas(&c.canvas_id).await.unwrap();
+        assert!(svc.serve_file(&asset.asset_id, false).await.is_ok(), "recent internal asset survives delete_canvas grace");
     }
 
     #[tokio::test]
@@ -1697,13 +2028,13 @@ mod tests {
         let canvas = svc.create_canvas(Some("c".into())).await.unwrap();
 
         // Simulate the editor's REST doc-load registering the canvas as open.
-        svc.mark_canvas_open(&canvas.id);
+        svc.mark_canvas_open(&canvas.canvas_id);
 
         // An agent add_node now QUEUES (frontend authority) instead of writing
         // straight to canvas.json — closing the cold-open clobber window.
         let applied = svc
             .apply_agent_ops(
-                &canvas.id,
+                &canvas.canvas_id,
                 vec![AgentOp::AddNode {
                     node: AddNodeSpec { kind: "image".into(), x: None, y: None, w: None, h: None, data: None },
                 }],
@@ -1713,7 +2044,7 @@ mod tests {
             .unwrap();
         assert_eq!(applied[0].disposition, OpDisposition::Queued);
         // The doc was NOT touched.
-        assert_eq!(svc.get_canvas(&canvas.id).await.unwrap().meta.node_count, 0);
+        assert_eq!(svc.get_canvas(&canvas.canvas_id).await.unwrap().meta.node_count, 0);
     }
 
     #[tokio::test]
@@ -1790,13 +2121,13 @@ mod tests {
                 },
             },
         ];
-        let applied = svc.apply_agent_ops(&canvas.id, ops, "test").await.unwrap();
+        let applied = svc.apply_agent_ops(&canvas.canvas_id, ops, "test").await.unwrap();
         assert_eq!(applied.len(), 1);
         assert_eq!(applied[0].disposition, OpDisposition::Applied);
         let node_id = applied[0].node_id.clone().unwrap();
 
         // The node is persisted in canvas.json and node_count synced.
-        let read = svc.get_canvas(&canvas.id).await.unwrap();
+        let read = svc.get_canvas(&canvas.canvas_id).await.unwrap();
         assert_eq!(read.meta.node_count, 1);
         assert_eq!(read.doc["nodes"][0]["id"], serde_json::json!(node_id));
         assert_eq!(read.doc["nodes"][0]["data"]["prompt"], "a wolf");
@@ -1805,18 +2136,18 @@ mod tests {
         let connect = vec![AgentOp::AddNode {
             node: AddNodeSpec { kind: "image".into(), x: None, y: None, w: None, h: None, data: None },
         }];
-        let more = svc.apply_agent_ops(&canvas.id, connect, "test").await.unwrap();
+        let more = svc.apply_agent_ops(&canvas.canvas_id, connect, "test").await.unwrap();
         let img_id = more[0].node_id.clone().unwrap();
         let edge = svc
             .apply_agent_ops(
-                &canvas.id,
+                &canvas.canvas_id,
                 vec![AgentOp::Connect { from_node_id: node_id, to_node_id: img_id }],
                 "test",
             )
             .await
             .unwrap();
         assert_eq!(edge[0].disposition, OpDisposition::Applied);
-        let read2 = svc.get_canvas(&canvas.id).await.unwrap();
+        let read2 = svc.get_canvas(&canvas.canvas_id).await.unwrap();
         assert_eq!(read2.doc["edges"].as_array().unwrap().len(), 1);
     }
 
@@ -1827,10 +2158,10 @@ mod tests {
         let canvas = svc.create_canvas(Some("c".into())).await.unwrap();
 
         // A poll marks the canvas OPEN → even add_node is queued (frontend owns writes).
-        assert!(svc.take_pending_ops(&canvas.id).await.unwrap().is_empty());
+        assert!(svc.take_pending_ops(&canvas.canvas_id).await.unwrap().is_empty());
         let applied = svc
             .apply_agent_ops(
-                &canvas.id,
+                &canvas.canvas_id,
                 vec![AgentOp::AddNode {
                     node: AddNodeSpec { kind: "image".into(), x: None, y: None, w: None, h: None, data: None },
                 }],
@@ -1840,13 +2171,13 @@ mod tests {
             .unwrap();
         assert_eq!(applied[0].disposition, OpDisposition::Queued);
         // The doc was NOT touched (frontend authority preserved).
-        assert_eq!(svc.get_canvas(&canvas.id).await.unwrap().meta.node_count, 0);
+        assert_eq!(svc.get_canvas(&canvas.canvas_id).await.unwrap().meta.node_count, 0);
 
         // The op is pullable and stays until acked.
-        let pending = svc.take_pending_ops(&canvas.id).await.unwrap();
+        let pending = svc.take_pending_ops(&canvas.canvas_id).await.unwrap();
         assert_eq!(pending.len(), 1);
-        svc.ack_agent_ops(&canvas.id, &[pending[0].op_id.clone()]);
-        assert!(svc.take_pending_ops(&canvas.id).await.unwrap().is_empty());
+        svc.ack_agent_ops(&canvas.canvas_id, &[pending[0].op_id.clone()]);
+        assert!(svc.take_pending_ops(&canvas.canvas_id).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1858,7 +2189,7 @@ mod tests {
         // delete_node is a data-mutating op → queued even on a closed canvas.
         let applied = svc
             .apply_agent_ops(
-                &canvas.id,
+                &canvas.canvas_id,
                 vec![AgentOp::DeleteNode { node_id: WorkshopNodeId::new().into_string() }],
                 "test",
             )
@@ -1870,7 +2201,7 @@ mod tests {
         let node_id = WorkshopNodeId::new().into_string();
         let bad = svc
             .apply_agent_ops(
-                &canvas.id,
+                &canvas.canvas_id,
                 vec![AgentOp::Connect { from_node_id: node_id.clone(), to_node_id: node_id }],
                 "test",
             )
@@ -1878,6 +2209,10 @@ mod tests {
         assert!(matches!(bad, Err(AppError::BadRequest(_))));
 
         // Unknown canvas → NotFound.
-        assert!(svc.take_pending_ops("wsc_missing").await.is_err());
+        assert!(
+            svc.take_pending_ops("0190f5fe-7c00-7a00-8000-000000000099")
+                .await
+                .is_err()
+        );
     }
 }

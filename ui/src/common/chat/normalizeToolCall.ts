@@ -1,5 +1,5 @@
 import type { IMessageAcpToolCall, IMessageToolCall, IMessageToolGroup } from './chatLib';
-import type { ConversationId } from '../types/ids';
+import type { ConversationId, MessageId } from '../types/ids';
 import { toDisplayText } from './displayText';
 import { normalizeToolGroupStatus } from './toolGroupStatus';
 
@@ -22,7 +22,7 @@ export interface NormalizedToolCall {
   input?: string;
   output?: string;
   truncated?: boolean;
-  messageId?: string;
+  messageId?: MessageId;
   conversationId?: ConversationId;
 }
 
@@ -276,7 +276,7 @@ export function normalizeAcpToolCall(message: IMessageAcpToolCall): NormalizedTo
     input,
     output,
     truncated: content?._compact?.truncated === true,
-    messageId: message.id,
+    messageId: message.message_id ?? message.msg_id,
     conversationId: message.conversation_id,
   };
 }

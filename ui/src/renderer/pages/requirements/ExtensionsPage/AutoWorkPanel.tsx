@@ -78,9 +78,9 @@ const AutoWorkPanel: React.FC = () => {
     return () => unsubs.forEach((u) => u());
   }, [loadData]);
 
-  // Forward the binding's own kind + target_id verbatim. conv/term target_id is
-  // now an integer; passing the binding through avoids re-asserting its type here
-  // (the type lives on ITagBinding / the setAutoWork param, owned by ipcBridge).
+  // Forward the binding's own kind + stable target UUID verbatim. Passing the
+  // binding through avoids re-asserting its type here (the type lives on
+  // ITagBinding / the setAutoWork param, owned by ipcBridge).
   const handleUnbind = async (binding: ITagBinding) => {
     try {
       await ipcBridge.requirements.setAutoWork.invoke({
@@ -137,17 +137,9 @@ const AutoWorkPanel: React.FC = () => {
     }
   };
 
-  // `binding.target_id` is polymorphic by `binding.kind`:
-  // - conversation / terminal → INTEGER primary key → show the short, sortable
-  //   `#N` form (the full id is `#N` itself).
-  // - any other kind (e.g. workpath path / companion) stays a TEXT/path locator →
-  //   reuse shortSessionId (last path segment / prefix-strip).
-  const bindingIdLabel = (binding: ITagBinding): string => {
-    if (binding.kind === 'conversation' || binding.kind === 'terminal') {
-      return `#${binding.target_id}`;
-    }
-    return shortSessionId(binding.target_id);
-  };
+  // Conversation and terminal bindings use stable UUIDs. Keep rows scannable
+  // with the shared UUID suffix while retaining the full id on hover.
+  const bindingIdLabel = (binding: ITagBinding): string => shortSessionId(binding.target_id);
 
   const columns = [
     {
@@ -216,11 +208,12 @@ const AutoWorkPanel: React.FC = () => {
                 className='inline-block w-8px h-8px rd-full shrink-0'
                 style={{ backgroundColor: runStateColor(binding.run_state) }}
               />
-              {/* Name + id label. conv/term ids are integers → `#N`; other kinds
-                  (workpath/companion) keep the shortSessionId path/locator form. */}
+              {/* Name + compact stable id label. */}
               <div className='flex flex-col min-w-0'>
                 <span className='text-t-primary text-13px truncate'>{binding.name}</span>
-                <span className='text-t-tertiary text-11px'>{bindingIdLabel(binding)}</span>
+                <span className='text-t-tertiary text-11px' title={String(binding.target_id)}>
+                  {bindingIdLabel(binding)}
+                </span>
               </div>
               {/* Run state text */}
               <Tag size='small' color={isActive ? 'green' : binding.run_state === 'idle' ? 'orange' : 'gray'}>

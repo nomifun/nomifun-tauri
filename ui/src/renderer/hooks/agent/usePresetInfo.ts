@@ -14,7 +14,7 @@ import CoworkLogo from '@/renderer/assets/icons/cowork.svg';
 import { resolveExtensionAssetUrl } from '@/renderer/utils/platform';
 
 export interface PresetInfo {
-  id: PresetReference;
+  preset_id: PresetReference;
   name: string;
   logo: string;
   isEmoji: boolean;
@@ -53,7 +53,7 @@ export function usePresetInfo(conversation: TChatConversation | undefined): {
   const { data: preset, isLoading } = useSWR<Preset | null>(presetId ? `preset.${presetId}` : null, async () => {
     if (!presetId) return null;
     try {
-      return await ipcBridge.presets.get.invoke({ id: presetId });
+      return await ipcBridge.presets.get.invoke({ preset_id: presetId });
     } catch {
       return null;
     }
@@ -66,7 +66,7 @@ export function usePresetInfo(conversation: TChatConversation | undefined): {
     const avatar = normalizeAvatar(preset?.avatar);
     return {
       info: {
-        id: presetId,
+        preset_id: presetId,
         name,
         logo: avatar.logo,
         isEmoji: avatar.isEmoji,

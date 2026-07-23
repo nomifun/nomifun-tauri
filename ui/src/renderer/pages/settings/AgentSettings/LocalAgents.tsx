@@ -5,6 +5,7 @@
  */
 
 import { ipcBridge } from '@/common';
+import type { AgentId } from '@/common/types/ids';
 import type { AgentMetadata } from '@/renderer/utils/model/agentTypes';
 import classNames from 'classnames';
 import NomiModal from '@/renderer/components/base/NomiModal';
@@ -109,7 +110,7 @@ const LocalAgents: React.FC = () => {
       };
       try {
         if (editingAgent) {
-          await ipcBridge.acpConversation.updateCustomAgent.invoke({ id: editingAgent.id, ...body });
+          await ipcBridge.acpConversation.updateCustomAgent.invoke({ agent_id: editingAgent.agent_id, ...body });
         } else {
           await ipcBridge.acpConversation.createCustomAgent.invoke(body);
         }
@@ -125,9 +126,9 @@ const LocalAgents: React.FC = () => {
   );
 
   const handleDeleteCustomAgent = useCallback(
-    async (agentId: string) => {
+    async (agentId: AgentId) => {
       try {
-        await ipcBridge.acpConversation.deleteCustomAgent.invoke({ id: agentId });
+      await ipcBridge.acpConversation.deleteCustomAgent.invoke({ agent_id: agentId });
         await mutateAgents();
       } catch (err) {
         console.error('delete custom agent failed:', err);
@@ -137,9 +138,9 @@ const LocalAgents: React.FC = () => {
   );
 
   const handleToggleCustomAgent = useCallback(
-    async (agentId: string, enabled: boolean) => {
+    async (agentId: AgentId, enabled: boolean) => {
       try {
-        await ipcBridge.acpConversation.setAgentEnabled.invoke({ id: agentId, enabled });
+      await ipcBridge.acpConversation.setAgentEnabled.invoke({ agent_id: agentId, enabled });
         await mutateAgents();
       } catch (err) {
         console.error('toggle custom agent failed:', err);
@@ -318,7 +319,7 @@ const LocalAgents: React.FC = () => {
             retrigger it. */}
         {editorVisible && (
           <InlineAgentEditor
-            key={editingAgent?.id ?? 'new'}
+            key={editingAgent?.agent_id ?? 'new'}
             agent={editingAgent}
             onSave={(agent) => void handleSaveCustomAgent(agent)}
             onCancel={() => {
@@ -332,7 +333,7 @@ const LocalAgents: React.FC = () => {
       <div className='flex flex-col gap-4px px-0'>
         {customAgents?.map((agent) => (
           <AgentCard
-            key={agent.id}
+            key={agent.agent_id}
             type='custom'
             agent={agent}
             onGoToChat={() => goToChatWithAgent(agent)}
@@ -340,8 +341,8 @@ const LocalAgents: React.FC = () => {
               setEditingAgent(agent);
               setEditorVisible(true);
             }}
-            onDelete={() => void handleDeleteCustomAgent(agent.id)}
-            onToggle={(enabled) => void handleToggleCustomAgent(agent.id, enabled)}
+            onDelete={() => void handleDeleteCustomAgent(agent.agent_id)}
+            onToggle={(enabled) => void handleToggleCustomAgent(agent.agent_id, enabled)}
           />
         ))}
       </div>

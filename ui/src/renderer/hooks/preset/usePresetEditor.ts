@@ -23,7 +23,12 @@ import {
 } from '@/renderer/pages/settings/skill/agentSkillImportUtils';
 import { useCallback, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { parseKnowledgeBaseId, type KnowledgeBaseId } from '@/common/types/ids';
+import {
+  parseKnowledgeBaseId,
+  type AgentId,
+  type KnowledgeBaseId,
+  type PresetTagId,
+} from '@/common/types/ids';
 
 type UsePresetEditorParams = {
   localeKey: string;
@@ -59,8 +64,8 @@ export const usePresetEditor = ({
   const [editContext, setEditContext] = useState('');
   const [editRoutingDescription, setEditRoutingDescription] = useState('');
   const [editAvatar, setEditAvatar] = useState('');
-  // editAgent holds a backend ID (e.g. "claude", "goose") or an extension adapter ID (e.g. "ext-buddy")
-  const [editAgents, setEditAgents] = useState<string[]>([]);
+  // Preset preferences always retain canonical AgentMetadata UUIDv7 IDs.
+  const [editAgents, setEditAgents] = useState<AgentId[]>([]);
   const [editModels, setEditModels] = useState<ModelPreference[]>([]);
   const [editTargets, setEditTargets] = useState<PresetTarget[]>(['conversation']);
   const [fallbackAllowed, setFallbackAllowed] = useState(false);
@@ -88,13 +93,13 @@ export const usePresetEditor = ({
   const [builtinAutoSkills, setBuiltinAutoSkills] = useState<BuiltinAutoSkill[]>([]);
   const [disabledBuiltinSkills, setDisabledBuiltinSkills] = useState<string[]>([]);
 
-  // Tag editing state (audience / scenario tag keys)
-  const [editAudienceTags, setEditAudienceTags] = useState<string[]>([]);
-  const [editScenarioTags, setEditScenarioTags] = useState<string[]>([]);
+  // Tag editing state (audience / scenario UUIDv7 business IDs).
+  const [editAudienceTags, setEditAudienceTags] = useState<PresetTagId[]>([]);
+  const [editScenarioTags, setEditScenarioTags] = useState<PresetTagId[]>([]);
 
   const handleEdit = async (preset: PresetListItem) => {
     setIsCreating(false);
-    setActivePresetId(preset.id);
+    setActivePresetId(preset.preset_id);
     setEditName(preset.name || '');
     setEditDescription(preset.description || '');
     setEditAvatar(preset.avatar || '');
@@ -107,8 +112,8 @@ export const usePresetEditor = ({
     setAutoSelectable(preset.auto_selectable);
     setKnowledgePolicy(preset.knowledge_policy);
     setKnowledgeBaseIds(preset.knowledge_bases.map((item) => item.knowledge_base_id));
-    setEditAudienceTags(preset.audience_tags ?? []);
-    setEditScenarioTags(preset.scenario_tags ?? []);
+    setEditAudienceTags(preset.audience_tag_ids ?? []);
+    setEditScenarioTags(preset.scenario_tag_ids ?? []);
     setPendingSkills([]);
     setDeletePendingSkillName(null);
     setDeleteCustomSkillName(null);
@@ -192,8 +197,8 @@ export const usePresetEditor = ({
     setAutoSelectable(preset.auto_selectable);
     setKnowledgePolicy(preset.knowledge_policy);
     setKnowledgeBaseIds(preset.knowledge_bases.map((item) => item.knowledge_base_id));
-    setEditAudienceTags(preset.audience_tags ?? []);
-    setEditScenarioTags(preset.scenario_tags ?? []);
+    setEditAudienceTags(preset.audience_tag_ids ?? []);
+    setEditScenarioTags(preset.scenario_tag_ids ?? []);
     setPromptViewMode('edit');
     setEditVisible(true);
 
@@ -275,18 +280,21 @@ export const usePresetEditor = ({
           knowledge_base_id: parseKnowledgeBaseId(knowledge_base_id),
           required: false,
         })),
-        audience_tags: editAudienceTags,
-        scenario_tags: editScenarioTags,
+        audience_tag_ids: editAudienceTags,
+        scenario_tag_ids: editScenarioTags,
       };
 
       if (isCreating) {
         // Create new preset via backend
         const created = await ipcBridge.presets.create.invoke(content);
         if (autoSelectable) {
-          await ipcBridge.presets.setState.invoke({ id: created.id, auto_selectable: true });
+          await ipcBridge.presets.setState.invoke({
+            preset_id: created.preset_id,
+            auto_selectable: true,
+          });
         }
 
-        setActivePresetId(created.id);
+        setActivePresetId(created.preset_id);
         await loadPresets();
         message.success(t('common.createSuccess', { defaultValue: 'Created successfully' }));
       } else {
@@ -294,8 +302,14 @@ export const usePresetEditor = ({
         if (!activePreset) return;
 
         const updateRequest: UpdatePresetRequest = content;
-        await ipcBridge.presets.update.invoke({ id: activePreset.id, ...updateRequest });
-        await ipcBridge.presets.setState.invoke({ id: activePreset.id, auto_selectable: autoSelectable });
+        await ipcBridge.presets.update.invoke({
+          preset_id: activePreset.preset_id,
+          ...updateRequest,
+        });
+        await ipcBridge.presets.setState.invoke({
+          preset_id: activePreset.preset_id,
+          auto_selectable: autoSelectable,
+        });
 
         await loadPresets();
         message.success(t('common.saveSuccess', { defaultValue: 'Saved successfully' }));
@@ -334,7 +348,7 @@ export const usePresetEditor = ({
     try {
       // Delete the backend-owned preset record. Conversation snapshots remain
       // immutable and continue to describe historical launches.
-      await ipcBridge.presets.delete.invoke({ id: activePreset.id });
+      await ipcBridge.presets.delete.invoke({ preset_id: activePreset.preset_id });
 
       // Reload preset list
       await loadPresets();
@@ -360,7 +374,7 @@ export const usePresetEditor = ({
     }
 
     try {
-      await ipcBridge.presets.setState.invoke({ id: preset.id, enabled });
+      await ipcBridge.presets.setState.invoke({ preset_id: preset.preset_id, enabled });
       await loadPresets();
       await refreshAgentDetection();
     } catch (error) {

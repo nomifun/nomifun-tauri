@@ -88,7 +88,7 @@ const LarkConfigForm: React.FC<LarkConfigFormProps> = ({
         // Filter for Lark platform only, scoped to this bot row when addressed.
         setPendingPairings(
           pairings.filter(
-            (p) => p.platformType === 'lark' && (!channelTarget?.channelId || p.channelId === channelTarget.channelId)
+            (p) => p.platformType === 'lark' && (!channelTarget?.channelPluginId || p.channel_plugin_id === channelTarget.channelPluginId)
           )
         );
       }
@@ -97,7 +97,7 @@ const LarkConfigForm: React.FC<LarkConfigFormProps> = ({
     } finally {
       setPairingLoading(false);
     }
-  }, [channelTarget?.channelId]);
+  }, [channelTarget?.channelPluginId]);
 
   // Load authorized users
   const loadAuthorizedUsers = useCallback(async () => {
@@ -108,7 +108,7 @@ const LarkConfigForm: React.FC<LarkConfigFormProps> = ({
         // Filter for Lark platform only, scoped to this bot row when addressed.
         setAuthorizedUsers(
           users.filter(
-            (u) => u.platformType === 'lark' && (!channelTarget?.channelId || u.channelId === channelTarget.channelId)
+            (u) => u.platformType === 'lark' && (!channelTarget?.channelPluginId || u.channel_plugin_id === channelTarget.channelPluginId)
           )
         );
       }
@@ -117,7 +117,7 @@ const LarkConfigForm: React.FC<LarkConfigFormProps> = ({
     } finally {
       setUsersLoading(false);
     }
-  }, [channelTarget?.channelId]);
+  }, [channelTarget?.channelPluginId]);
 
   // Initial load
   useEffect(() => {
@@ -129,7 +129,7 @@ const LarkConfigForm: React.FC<LarkConfigFormProps> = ({
   useEffect(() => {
     const unsubscribe = channel.pairingRequested.on((request) => {
       if (request.platformType !== 'lark') return;
-      if (channelTarget?.channelId && request.channelId !== channelTarget.channelId) return;
+      if (channelTarget?.channelPluginId && request.channel_plugin_id !== channelTarget.channelPluginId) return;
       setPendingPairings((prev) => {
         const exists = prev.some((p) => p.code === request.code);
         if (exists) return prev;
@@ -137,22 +137,22 @@ const LarkConfigForm: React.FC<LarkConfigFormProps> = ({
       });
     });
     return () => unsubscribe();
-  }, [channelTarget?.channelId]);
+  }, [channelTarget?.channelPluginId]);
 
   // Listen for user authorization
   useEffect(() => {
     const unsubscribe = channel.userAuthorized.on((user) => {
       if (user.platformType !== 'lark') return;
-      if (channelTarget?.channelId && user.channelId !== channelTarget.channelId) return;
+      if (channelTarget?.channelPluginId && user.channel_plugin_id !== channelTarget.channelPluginId) return;
       setAuthorizedUsers((prev) => {
-        const exists = prev.some((u) => u.id === user.id);
+        const exists = prev.some((u) => u.channel_user_id === user.channel_user_id);
         if (exists) return prev;
         return [user, ...prev];
       });
       setPendingPairings((prev) => prev.filter((p) => p.platformUserId !== user.platformUserId));
     });
     return () => unsubscribe();
-  }, [channelTarget?.channelId]);
+  }, [channelTarget?.channelPluginId]);
 
   // Test Lark connection
   const handleTestConnection = async () => {
@@ -208,21 +208,20 @@ const LarkConfigForm: React.FC<LarkConfigFormProps> = ({
       };
       const result = await channel.enablePlugin.invoke(
         channelTarget
-          ? { plugin_id: channelTarget.channelId, plugin_type: 'lark', ...(channelTarget.publicAgentId ? { public_agent_id: channelTarget.publicAgentId } : { companion_id: channelTarget.companionId }), config }
+          ? { plugin_id: channelTarget.channelPluginId, plugin_type: 'lark', ...(channelTarget.publicAgentId ? { public_agent_id: channelTarget.publicAgentId } : { companion_id: channelTarget.companionId }), config }
           : { plugin_type: 'lark', config }
       );
       if (!result.success) {
-        throw new Error(result.error || result.message || t('nomi.settings.remoteEnableFailed', { defaultValue: 'Failed to enable channel' }));
+        throw new Error(result.error || t('nomi.settings.remoteEnableFailed', { defaultValue: 'Failed to enable channel' }));
       }
 
       Message.success(t('settings.lark.pluginEnabled', 'Lark bot enabled'));
       const plugins = await channel.getPluginStatus.invoke();
       if (plugins) {
-        // Multi-row model: resolve by row id (or this companion's freshly created
-        // row in create mode); legacy path keeps the by-type lookup.
+        // Multi-plugin model: resolve by business UUID, or by owner after create.
         const larkPlugin = channelTarget
-          ? channelTarget.channelId
-            ? plugins.find((p) => p.id === channelTarget.channelId)
+          ? channelTarget.channelPluginId
+            ? plugins.find((p) => p.plugin_id === channelTarget.channelPluginId)
             : plugins.find((p) => p.type === 'lark' && p.companionId === channelTarget.companionId)
           : plugins.find((p) => p.type === 'lark');
         onStatusChange(larkPlugin || null);
@@ -265,9 +264,9 @@ const LarkConfigForm: React.FC<LarkConfigFormProps> = ({
   };
 
   // Revoke user
-  const handleRevokeUser = async (user_id: import('@/common/types/ids').ChannelUserId) => {
+  const handleRevokeUser = async (channel_user_id: import('@/common/types/ids').ChannelUserId) => {
     try {
-      await channel.revokeUser.invoke({ user_id });
+      await channel.revokeUser.invoke({ channel_user_id });
       Message.success(t('settings.channels.userRevoked', 'User access revoked'));
       await loadAuthorizedUsers();
     } catch (error: unknown) {
@@ -704,7 +703,7 @@ const LarkConfigForm: React.FC<LarkConfigFormProps> = ({
           ) : (
             <div className='flex flex-col gap-12px'>
               {authorizedUsers.map((user) => (
-                <div key={user.id} className='flex items-center justify-between bg-fill-2 rd-8px p-12px'>
+                <div key={user.channel_user_id} className='flex items-center justify-between bg-fill-2 rd-8px p-12px'>
                   <div className='flex-1'>
                     <div className='text-14px font-500 text-t-primary'>{user.display_name || t('common.unknownUser')}</div>
                     <div className='text-12px text-t-tertiary mt-4px'>
@@ -719,7 +718,7 @@ const LarkConfigForm: React.FC<LarkConfigFormProps> = ({
                       status='danger'
                       size='small'
                       icon={<Delete size={16} />}
-                      onClick={() => handleRevokeUser(user.id)}
+                      onClick={() => handleRevokeUser(user.channel_user_id)}
                     />
                   </Tooltip>
                 </div>

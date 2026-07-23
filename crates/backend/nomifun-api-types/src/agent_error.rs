@@ -107,8 +107,6 @@ pub struct AgentStreamErrorData {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        rename = "workspacePath",
-        alias = "workspace_path"
     )]
     pub workspace_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -253,7 +251,7 @@ mod tests {
 
         let json = serde_json::to_value(&payload).unwrap();
         assert_eq!(json["code"], "WORKSPACE_PATH_EDGE_WHITESPACE_RUNTIME_UNSUPPORTED");
-        assert_eq!(json["workspacePath"], "/tmp/Archive ");
+        assert_eq!(json["workspace_path"], "/tmp/Archive ");
 
         let roundtrip: AgentStreamErrorData = serde_json::from_value(json).unwrap();
         assert_eq!(roundtrip.workspace_path.as_deref(), Some("/tmp/Archive "));

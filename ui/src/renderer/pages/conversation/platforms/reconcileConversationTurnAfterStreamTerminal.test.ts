@@ -7,7 +7,7 @@ import {
   terminalReconcileDelayForAttempt,
 } from './reconcileConversationTurnAfterStreamTerminal';
 
-const conversationId = parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000041');
+const conversationId = parseConversationId('0190f5fe-7c00-7a00-8000-000000000041');
 const idleConversation = { runtime: { is_processing: false } } as TChatConversation;
 const busyConversation = { runtime: { is_processing: true } } as TChatConversation;
 

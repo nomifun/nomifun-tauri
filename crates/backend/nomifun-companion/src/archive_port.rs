@@ -15,7 +15,7 @@ use crate::archiver::{ArchiveConversationPort, WindowMessage};
 
 /// Upper bound on messages pulled for one digest — a chatty window only needs
 /// its most-recent turns summarized (the digest prompt caps again). Keeping this
-/// bounded also bounds the initial (boundary=0) bootstrap over a legacy thread.
+/// bounded also bounds the initial boundary=0 archive pass.
 const FETCH_LIMIT: u32 = 400;
 
 pub struct ConversationArchivePort {

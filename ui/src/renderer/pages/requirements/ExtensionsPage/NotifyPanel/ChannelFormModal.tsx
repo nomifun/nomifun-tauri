@@ -82,7 +82,7 @@ const ChannelFormModal: React.FC<ChannelFormModalProps> = ({ visible, editing, o
         }
 
         await ipcBridge.webhook.update.invoke({
-          id: editing.id,
+          webhook_id: editing.webhook_id,
           updates: {
             name: values.name,
             platform: submitPlatform,

@@ -11,15 +11,15 @@ use nomifun_api_types::{
     CreateConversationRequest, ListConversationsQuery, ListMessagesQuery, SendMessageRequest,
     UpdateConversationRequest,
 };
-use nomifun_common::{AgentType, AppError, CompanionId, ConversationId};
+use nomifun_common::{AgentType, AppError, CompanionId, ConversationId, ProviderWithModel, ProviderId, RemoteAgentId};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::deps::{CallerCtx, GatewayDeps};
+use crate::provider_support;
 use crate::registry::{Capability, CapabilityMeta, DangerTier, Surface};
 use crate::server::ok;
-use crate::provider_support;
 
 const DEFAULT_LIST_LIMIT: u32 = 50;
 const DEFAULT_MESSAGE_LIMIT: u32 = 5;
@@ -28,6 +28,7 @@ const DEFAULT_MESSAGE_LIMIT: u32 = 5;
 const MESSAGE_SNIPPET_CHARS: usize = 500;
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ListConversationsParams {
     /// Maximum number of conversations to return (default 50).
     #[serde(default)]
@@ -35,18 +36,22 @@ struct ListConversationsParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ConversationStatusParams {
     /// The id of the conversation to inspect.
-    conversation_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    conversation_id: ConversationId,
     /// How many recent messages to include (default 5, max 50).
     #[serde(default)]
     message_limit: Option<u32>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SendToConversationParams {
     /// The id of the TARGET conversation (not your own).
-    conversation_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    conversation_id: ConversationId,
     /// The message or task prompt to inject.
     content: String,
     /// When true the message is hidden from the visible history (use for
@@ -56,6 +61,7 @@ struct SendToConversationParams {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CreateConversationParams {
     /// Optional display name for the new conversation.
     #[serde(default)]
@@ -67,45 +73,77 @@ struct CreateConversationParams {
     /// ACP backend vendor when agent_type is "acp" (e.g. "claude", "codex", "gemini").
     #[serde(default)]
     backend: Option<String>,
-    /// Provider id for nomi sessions (from nomi_list_providers). Omit to
-    /// auto-resolve: your own companion model → first configured provider.
+    /// Exact provider/model pair for a nomi session. Omit to auto-resolve:
+    /// your own companion model → first configured provider.
     #[serde(default)]
-    provider_id: Option<String>,
-    /// Model id for nomi sessions. Omit to auto-resolve (see provider_id).
+    model: Option<ConversationModelRefParam>,
+    /// Registered remote-agent business id. Required when agent_type is "remote".
     #[serde(default)]
-    model: Option<String>,
-    /// Registered remote-agent row id. Required when agent_type is "remote".
-    #[serde(default)]
-    remote_agent_id: Option<String>,
+    #[schemars(schema_with = "crate::id_schema::optional_canonical_uuid_v7_schema")]
+    remote_agent_id: Option<RemoteAgentId>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct UpdateConversationParams {
     /// The id of the conversation to update (from nomi_list_conversations).
-    conversation_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    conversation_id: ConversationId,
     /// New display name (omit to keep).
     #[serde(default)]
     name: Option<String>,
     /// Pin (true) or unpin (false) the conversation in the sidebar.
     #[serde(default)]
     pinned: Option<bool>,
-    /// New provider id (nomi conversations only; from nomi_list_providers).
+    /// Exact replacement provider/model pair (nomi conversations only).
     #[serde(default)]
-    provider_id: Option<String>,
-    /// New model id (nomi conversations only).
-    #[serde(default)]
-    model: Option<String>,
+    model: Option<ConversationModelRefParam>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct DeleteConversationParams {
     /// The id of the conversation to delete. Confirm the target with the user
     /// before calling — deletion also kills its agent and cron bindings.
-    conversation_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    conversation_id: ConversationId,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct WhoamiParams {}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ConversationModelRefParam {
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    provider_id: ProviderId,
+    #[serde(deserialize_with = "deserialize_model_name")]
+    model: String,
+}
+
+impl From<ConversationModelRefParam> for ProviderWithModel {
+    fn from(value: ConversationModelRefParam) -> Self {
+        Self {
+            provider_id: value.provider_id.into_string(),
+            model: value.model,
+            use_model: None,
+        }
+    }
+}
+
+fn deserialize_model_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() || value.trim() != value {
+        return Err(serde::de::Error::custom(
+            "model must be a non-empty trimmed natural key",
+        ));
+    }
+    Ok(value)
+}
 
 fn error_value(e: AppError) -> Value {
     json!({ "error": e.to_string() })
@@ -145,21 +183,24 @@ async fn list(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: ListConversationsParams
     };
     let mut items = Vec::with_capacity(resp.items.len());
     for conv in resp.items {
-        let runtime = deps.conversation_service.runtime_summary_for(&conv.id.to_string()).await;
+        let runtime = deps
+            .conversation_service
+            .runtime_summary_for(conv.conversation_id.as_str())
+            .await;
         let companion_id = match conv.extra.get("companion_id") {
             None => None,
             Some(Value::String(value)) => match CompanionId::parse(value) {
                 Ok(id) => Some(id),
                 Err(error) => {
-                    return json!({"error": format!("conversation {} has invalid companion_id: {error}", conv.id)});
+                    return json!({"error": format!("conversation {} has invalid companion_id: {error}", conv.conversation_id)});
                 }
             },
             Some(_) => {
-                return json!({"error": format!("conversation {} has non-string companion_id", conv.id)});
+                return json!({"error": format!("conversation {} has non-string companion_id", conv.conversation_id)});
             }
         };
         items.push(json!({
-            "id": conv.id,
+            "conversation_id": conv.conversation_id,
             "name": conv.name,
             "agent_type": conv.r#type,
             "status": conv.status,
@@ -169,7 +210,7 @@ async fn list(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: ListConversationsParams
             "pinned": conv.pinned,
             "is_companion_companion": conv.extra.get("companion_session").and_then(Value::as_bool).unwrap_or(false),
             "companion_id": companion_id,
-            "is_self": ctx.conversation_id.as_ref().is_some_and(|id| conv.id.as_str() == id.as_str()),
+            "is_self": ctx.conversation_id.as_ref().is_some_and(|id| conv.conversation_id.as_str() == id.as_str()),
             "modified_at": conv.modified_at,
         }));
     }
@@ -181,11 +222,7 @@ async fn status(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: ConversationStatusPar
         Ok(u) => u,
         Err(e) => return e,
     };
-    let id = match ConversationId::try_from(p.conversation_id.as_str()) {
-        Ok(id) => id,
-        Err(error) => return json!({ "error": format!("invalid conversation_id: {error}") }),
-    };
-    let id = id.as_str();
+    let id = p.conversation_id.as_str();
     let conv = match deps.conversation_service.get(user_id, id).await {
         Ok(c) => c,
         Err(e) => return error_value(e),
@@ -215,7 +252,7 @@ async fn status(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: ConversationStatusPar
         Err(e) => return json!({ "error": format!("failed to serialize messages: {e}") }),
     };
     ok(json!({
-        "id": conv.id,
+        "conversation_id": conv.conversation_id,
         "name": conv.name,
         "agent_type": conv.r#type,
         "status": conv.status,
@@ -229,10 +266,7 @@ async fn send(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: SendToConversationParam
         Ok(u) => u.to_owned(),
         Err(e) => return e,
     };
-    let id = match ConversationId::try_from(p.conversation_id) {
-        Ok(id) => id.into_string(),
-        Err(error) => return json!({ "error": format!("invalid conversation_id: {error}") }),
-    };
+    let id = p.conversation_id.into_string();
     if ctx.conversation_id.as_ref().is_some_and(|caller| id == caller.as_str()) {
         return json!({ "error": "self_injection_forbidden: you cannot send a message into your own conversation" });
     }
@@ -279,10 +313,6 @@ async fn create(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: CreateConversationPar
         let Some(remote_agent_id) = p.remote_agent_id else {
             return json!({ "error": "remote_agent_id is required when agent_type is 'remote'" });
         };
-        let remote_agent_id = match nomifun_common::RemoteAgentId::parse(remote_agent_id) {
-            Ok(id) => id,
-            Err(error) => return json!({ "error": format!("invalid remote_agent_id: {error}") }),
-        };
         match deps.remote_agent_service.get(&remote_agent_id).await {
             Ok(remote) if remote.protocol == nomifun_common::RemoteAgentProtocol::OpenClaw => {}
             Ok(_) => {
@@ -302,13 +332,16 @@ async fn create(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: CreateConversationPar
     let mut model = None;
     let mut model_source = None;
     if agent_type == AgentType::Nomi {
-        match provider_support::resolve_nomi_model(&deps, &ctx, p.provider_id.as_deref(), p.model.as_deref()).await {
+        let requested_model = p.model.map(ProviderWithModel::from);
+        match provider_support::resolve_nomi_model(&deps, &ctx, requested_model.as_ref()).await {
             Ok((m, source)) => {
                 model = Some(m);
                 model_source = Some(source);
             }
             Err(e) => return e,
         }
+    } else if p.model.is_some() {
+        return json!({ "error": "model is only valid when agent_type is 'nomi'" });
     }
     let req = CreateConversationRequest {
         r#type: agent_type,
@@ -326,10 +359,7 @@ async fn create(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: CreateConversationPar
     };
     match deps.conversation_service.create(&user_id, req).await {
         Ok(resp) => ok(json!({
-            "id": resp.id,
-            // Canonical chaining field for nomi_send_to_conversation /
-            // nomi_conversation_status. Keep `id` for backwards compatibility.
-            "conversation_id": resp.id,
+            "conversation_id": resp.conversation_id,
             "name": resp.name,
             "agent_type": resp.r#type,
             "model": resp.model,
@@ -358,21 +388,18 @@ async fn update(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: UpdateConversationPar
         Ok(u) => u.to_owned(),
         Err(e) => return e,
     };
-    let id = match ConversationId::try_from(p.conversation_id) {
-        Ok(id) => id.into_string(),
-        Err(error) => return json!({ "error": format!("invalid conversation_id: {error}") }),
-    };
-    if p.name.is_none() && p.pinned.is_none() && p.provider_id.is_none() && p.model.is_none() {
-        return json!({ "error": "nothing to update: provide at least one of name / pinned / provider_id+model" });
+    let id = p.conversation_id.into_string();
+    if p.name.is_none() && p.pinned.is_none() && p.model.is_none() {
+        return json!({ "error": "nothing to update: provide at least one of name / pinned / model" });
     }
     let mut model = None;
-    if p.provider_id.is_some() || p.model.is_some() {
+    if let Some(requested_model) = p.model.map(ProviderWithModel::from) {
         if ctx.conversation_id.as_ref().is_some_and(|caller| id == caller.as_str()) {
             return json!({
                 "error": "self_model_change_forbidden: changing your own conversation's model would terminate your current turn; the owner can change it from the desktop UI"
             });
         }
-        match provider_support::resolve_explicit_model(&deps, p.provider_id.as_deref(), p.model.as_deref()).await {
+        match provider_support::resolve_explicit_model(&deps, requested_model).await {
             Ok(m) => model = Some(m),
             Err(e) => return e,
         }
@@ -390,7 +417,7 @@ async fn update(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: UpdateConversationPar
     };
     match deps.conversation_service.update(&user_id, &id, req, &deps.runtime_registry).await {
         Ok(resp) => ok(json!({
-            "id": resp.id,
+            "conversation_id": resp.conversation_id,
             "name": resp.name,
             "pinned": resp.pinned,
             "model": resp.model,
@@ -407,10 +434,7 @@ async fn delete(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: DeleteConversationPar
         Ok(u) => u.to_owned(),
         Err(e) => return e,
     };
-    let id = match ConversationId::try_from(p.conversation_id) {
-        Ok(id) => id.into_string(),
-        Err(error) => return json!({ "error": format!("invalid conversation_id: {error}") }),
-    };
+    let id = p.conversation_id.into_string();
     if ctx.conversation_id.as_ref().is_some_and(|caller| id == caller.as_str()) {
         return json!({ "error": "self_deletion_forbidden: you cannot delete your own conversation" });
     }
@@ -547,14 +571,55 @@ mod tests {
     fn remote_create_params_accepts_canonical_remote_agent_id() {
         let params: CreateConversationParams = serde_json::from_value(json!({
             "agent_type": "remote",
-            "remote_agent_id": "ragent_0190f5fe-7c00-7a00-8abc-012345678901"
+            "remote_agent_id": "0190f5fe-7c00-7a00-8abc-012345678901"
         }))
         .unwrap();
 
         assert_eq!(params.agent_type.as_deref(), Some("remote"));
         assert_eq!(
-            params.remote_agent_id.as_deref(),
-            Some("ragent_0190f5fe-7c00-7a00-8abc-012345678901")
+            params.remote_agent_id.as_ref().map(RemoteAgentId::as_str),
+            Some("0190f5fe-7c00-7a00-8abc-012345678901")
+        );
+    }
+
+    #[test]
+    fn conversation_params_require_typed_ids_and_fixed_model_object() {
+        assert!(
+            serde_json::from_value::<ConversationStatusParams>(json!({
+                "conversation_id": "conversation-1"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<CreateConversationParams>(json!({
+                "agent_type": "nomi",
+                "provider_id": "0190f5fe-7c00-7a00-8abc-012345678904",
+                "model": "model-a"
+            }))
+            .is_err()
+        );
+        let params: CreateConversationParams = serde_json::from_value(json!({
+            "agent_type": "nomi",
+            "model": {
+                "provider_id": "0190f5fe-7c00-7a00-8abc-012345678904",
+                "model": "model-a"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            params.model.as_ref().map(|model| model.provider_id.as_str()),
+            Some("0190f5fe-7c00-7a00-8abc-012345678904")
+        );
+        assert!(
+            serde_json::from_value::<CreateConversationParams>(json!({
+                "agent_type": "nomi",
+                "model": {
+                    "provider_id": "0190f5fe-7c00-7a00-8abc-012345678904",
+                    "model": "model-a",
+                    "use_model": "retired-alias"
+                }
+            }))
+            .is_err()
         );
     }
 
@@ -562,10 +627,10 @@ mod tests {
     fn top_level_creation_requires_a_companion_identity() {
         let plain = CallerCtx {
             conversation_id: Some(
-                ConversationId::parse("conv_0190f5fe-7c00-7a00-8abc-012345678901")
+                ConversationId::parse("0190f5fe-7c00-7a00-8abc-012345678901")
                     .unwrap(),
             ),
-            user_id: UserId::parse("user_0190f5fe-7c00-7a00-8abc-012345678902")
+            user_id: UserId::parse("0190f5fe-7c00-7a00-8abc-012345678902")
                 .unwrap(),
             ..Default::default()
         };
@@ -576,7 +641,7 @@ mod tests {
 
         let companion = CallerCtx {
             companion_id: Some(
-                CompanionId::parse("companion_0190f5fe-7c00-7a00-8abc-012345678903")
+                CompanionId::parse("0190f5fe-7c00-7a00-8abc-012345678903")
                     .unwrap(),
             ),
             ..plain

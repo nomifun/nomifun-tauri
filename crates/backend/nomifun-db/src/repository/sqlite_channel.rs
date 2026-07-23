@@ -1,7 +1,14 @@
-use sqlx::SqlitePool;
+use nomifun_common::{
+    ChannelPluginId, ChannelSessionId, ChannelUserId, CompanionId, ConversationId,
+    PublicAgentId, generate_id,
+};
+use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use crate::error::DbError;
-use crate::models::{ChannelSessionRow, ChannelUserRow, ChannelPluginRow, ChannelPairingCodeRow};
+use crate::models::{
+    ChannelPairingCodeRow, ChannelPluginRow, ChannelSessionRow, ChannelUserRow,
+    NewChannelPairingCodeRow, NewChannelPluginRow, NewChannelSessionRow, NewChannelUserRow,
+};
 use crate::repository::channel::{IChannelRepository, UpdatePluginStatusParams};
 
 /// SQLite-backed implementation of [`IChannelRepository`].
@@ -16,6 +23,104 @@ impl SqliteChannelRepository {
     }
 }
 
+async fn lock_channel_plugin(
+    tx: &mut Transaction<'_, Sqlite>,
+    channel_plugin_id: Option<&str>,
+    context: &str,
+) -> Result<(), DbError> {
+    let Some(channel_plugin_id) = channel_plugin_id else {
+        return Ok(());
+    };
+    let channel_plugin_id = ChannelPluginId::parse(channel_plugin_id).map_err(|error| {
+        DbError::Conflict(format!(
+            "{context} channel plugin '{channel_plugin_id}' is not a canonical UUIDv7: {error}"
+        ))
+    })?;
+    let parent = sqlx::query(
+        "UPDATE channel_plugins SET updated_at = updated_at WHERE channel_plugin_id = ?",
+    )
+    .bind(channel_plugin_id.as_str())
+    .execute(&mut **tx)
+    .await?;
+    if parent.rows_affected() == 0 {
+        return Err(DbError::Conflict(format!(
+            "{context} channel plugin '{channel_plugin_id}' does not exist"
+        )));
+    }
+    Ok(())
+}
+
+async fn lock_conversation(
+    tx: &mut Transaction<'_, Sqlite>,
+    conversation_id: Option<&str>,
+    context: &str,
+) -> Result<Option<String>, DbError> {
+    let Some(conversation_id) = conversation_id else {
+        return Ok(None);
+    };
+    let conversation_id = ConversationId::parse(conversation_id).map_err(|error| {
+        DbError::Conflict(format!(
+            "{context} conversation '{conversation_id}' is not a canonical UUIDv7: {error}"
+        ))
+    })?;
+    let parent = sqlx::query(
+        "UPDATE conversations SET updated_at = updated_at WHERE conversation_id = ?",
+    )
+    .bind(conversation_id.as_str())
+    .execute(&mut **tx)
+    .await?;
+    if parent.rows_affected() == 0 {
+        return Err(DbError::Conflict(format!(
+            "{context} conversation '{}' does not exist",
+            conversation_id
+        )));
+    }
+    Ok(Some(conversation_id.into_string()))
+}
+
+fn canonical_plugin_binding_ids(
+    companion_id: Option<&str>,
+    public_agent_id: Option<&str>,
+) -> Result<(Option<String>, Option<String>), DbError> {
+    if companion_id.is_some() && public_agent_id.is_some() {
+        return Err(DbError::Conflict(
+            "channel plugin cannot bind both a companion and a public agent".into(),
+        ));
+    }
+    let companion_id = companion_id
+        .map(|value| {
+            CompanionId::parse(value)
+                .map(CompanionId::into_string)
+                .map_err(|error| {
+                    DbError::Conflict(format!(
+                        "channel plugin companion_id '{value}' is not a canonical UUIDv7: {error}"
+                    ))
+                })
+        })
+        .transpose()?;
+    let public_agent_id = public_agent_id
+        .map(|value| {
+            PublicAgentId::parse(value)
+                .map(PublicAgentId::into_string)
+                .map_err(|error| {
+                    DbError::Conflict(format!(
+                        "channel plugin public_agent_id '{value}' is not a canonical UUIDv7: {error}"
+                    ))
+                })
+        })
+        .transpose()?;
+    Ok((companion_id, public_agent_id))
+}
+
+fn validate_agent_type(agent_type: &str, context: &str) -> Result<(), DbError> {
+    match agent_type {
+        "acp" | "openclaw-gateway" | "nanobot" | "remote" | "nomi" => Ok(()),
+        _ => Err(DbError::Conflict(format!(
+            "{context} agent type '{agent_type}' is not supported"
+        ))),
+    }
+}
+
 #[async_trait::async_trait]
 impl IChannelRepository for SqliteChannelRepository {
     // -- Plugin CRUD --------------------------------------------------
@@ -27,44 +132,90 @@ impl IChannelRepository for SqliteChannelRepository {
         Ok(rows)
     }
 
-    async fn get_plugin(&self, id: &str) -> Result<Option<ChannelPluginRow>, DbError> {
-        let row = sqlx::query_as::<_, ChannelPluginRow>("SELECT * FROM channel_plugins WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
+    async fn get_plugin(
+        &self,
+        channel_plugin_id: &str,
+    ) -> Result<Option<ChannelPluginRow>, DbError> {
+        let row = sqlx::query_as::<_, ChannelPluginRow>(
+            "SELECT * FROM channel_plugins WHERE channel_plugin_id = ?",
+        )
+        .bind(channel_plugin_id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row)
     }
 
-    async fn upsert_plugin(&self, row: &ChannelPluginRow) -> Result<(), DbError> {
-        sqlx::query(
+    async fn create_plugin(&self, row: &NewChannelPluginRow) -> Result<ChannelPluginRow, DbError> {
+        let channel_plugin_id = generate_id();
+        let (companion_id, public_agent_id) = canonical_plugin_binding_ids(
+            row.companion_id.as_deref(),
+            row.public_agent_id.as_deref(),
+        )?;
+        sqlx::query_as::<_, ChannelPluginRow>(
             "INSERT INTO channel_plugins \
-                (id, type, name, enabled, config, status, last_connected, companion_id, public_agent_id, bot_key, created_at, updated_at) \
+                (channel_plugin_id, type, name, enabled, config, status, last_connected, \
+                 companion_id, public_agent_id, bot_key, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(id) DO UPDATE SET \
-                type = excluded.type, \
-                name = excluded.name, \
-                enabled = excluded.enabled, \
-                config = excluded.config, \
-                status = excluded.status, \
-                last_connected = excluded.last_connected, \
-                companion_id = excluded.companion_id, \
-                public_agent_id = excluded.public_agent_id, \
-                bot_key = excluded.bot_key, \
-                updated_at = excluded.updated_at",
+             RETURNING *",
         )
-        .bind(&row.id)
+        .bind(channel_plugin_id)
         .bind(&row.r#type)
         .bind(&row.name)
         .bind(row.enabled)
         .bind(&row.config)
         .bind(&row.status)
         .bind(row.last_connected)
-        .bind(&row.companion_id)
-        .bind(&row.public_agent_id)
+        .bind(&companion_id)
+        .bind(&public_agent_id)
         .bind(&row.bot_key)
         .bind(row.created_at)
         .bind(row.updated_at)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            if is_unique_violation(&e) {
+                DbError::Conflict(format!(
+                    "Bot '{}' on platform '{}' is already configured",
+                    row.bot_key.as_deref().unwrap_or("?"),
+                    row.r#type
+                ))
+            } else {
+                DbError::Query(e)
+            }
+        })
+    }
+
+    async fn update_plugin(&self, row: &ChannelPluginRow) -> Result<ChannelPluginRow, DbError> {
+        ChannelPluginId::parse(&row.channel_plugin_id).map_err(|error| {
+            DbError::Conflict(format!(
+                "channel plugin id '{}' is not a canonical UUIDv7: {error}",
+                row.channel_plugin_id
+            ))
+        })?;
+        let (companion_id, public_agent_id) = canonical_plugin_binding_ids(
+            row.companion_id.as_deref(),
+            row.public_agent_id.as_deref(),
+        )?;
+        let updated = sqlx::query_as::<_, ChannelPluginRow>(
+            "UPDATE channel_plugins SET \
+                type = ?, name = ?, enabled = ?, config = ?, status = ?, \
+                last_connected = ?, companion_id = ?, public_agent_id = ?, \
+                bot_key = ?, updated_at = ? \
+             WHERE channel_plugin_id = ? \
+             RETURNING *",
+        )
+        .bind(&row.r#type)
+        .bind(&row.name)
+        .bind(row.enabled)
+        .bind(&row.config)
+        .bind(&row.status)
+        .bind(row.last_connected)
+        .bind(&companion_id)
+        .bind(&public_agent_id)
+        .bind(&row.bot_key)
+        .bind(row.updated_at)
+        .bind(&row.channel_plugin_id)
+        .fetch_optional(&self.pool)
         .await
         .map_err(|e| {
             if is_unique_violation(&e) {
@@ -77,10 +228,19 @@ impl IChannelRepository for SqliteChannelRepository {
                 DbError::Query(e)
             }
         })?;
-        Ok(())
+        updated.ok_or_else(|| {
+            DbError::NotFound(format!(
+                "Plugin '{}' not found",
+                row.channel_plugin_id
+            ))
+        })
     }
 
-    async fn update_plugin_status(&self, id: &str, params: &UpdatePluginStatusParams) -> Result<(), DbError> {
+    async fn update_plugin_status(
+        &self,
+        channel_plugin_id: &str,
+        params: &UpdatePluginStatusParams,
+    ) -> Result<(), DbError> {
         let mut set_clauses = Vec::new();
         if params.status.is_some() {
             set_clauses.push("status = ?");
@@ -97,7 +257,10 @@ impl IChannelRepository for SqliteChannelRepository {
         }
 
         set_clauses.push("updated_at = ?");
-        let sql = format!("UPDATE channel_plugins SET {} WHERE id = ?", set_clauses.join(", "));
+        let sql = format!(
+            "UPDATE channel_plugins SET {} WHERE channel_plugin_id = ?",
+            set_clauses.join(", ")
+        );
 
         let now = nomifun_common::now_ms();
         let mut query = sqlx::query(&sql);
@@ -112,16 +275,33 @@ impl IChannelRepository for SqliteChannelRepository {
             query = query.bind(enabled);
         }
         query = query.bind(now);
-        query = query.bind(id);
+        query = query.bind(channel_plugin_id);
 
         let result = query.execute(&self.pool).await?;
         if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("Plugin '{id}' not found")));
+            return Err(DbError::NotFound(format!(
+                "Plugin '{channel_plugin_id}' not found"
+            )));
         }
         Ok(())
     }
 
-    async fn update_plugin_companion(&self, id: &str, companion_id: Option<&str>) -> Result<(), DbError> {
+    async fn update_plugin_companion(
+        &self,
+        channel_plugin_id: &str,
+        companion_id: Option<&str>,
+    ) -> Result<(), DbError> {
+        let companion_id = companion_id
+            .map(|value| {
+                CompanionId::parse(value)
+                    .map(CompanionId::into_string)
+                    .map_err(|error| {
+                        DbError::Conflict(format!(
+                            "channel plugin companion_id '{value}' is not a canonical UUIDv7: {error}"
+                        ))
+                    })
+            })
+            .transpose()?;
         // Row-level mutual exclusivity: binding a companion (non-null) clears any
         // public-agent binding on the same row. Clearing (`None`) leaves the
         // public-agent binding untouched.
@@ -130,21 +310,38 @@ impl IChannelRepository for SqliteChannelRepository {
              SET companion_id = ?, \
                  public_agent_id = CASE WHEN ? IS NOT NULL THEN NULL ELSE public_agent_id END, \
                  updated_at = ? \
-             WHERE id = ?",
+             WHERE channel_plugin_id = ?",
         )
-        .bind(companion_id)
-        .bind(companion_id)
+        .bind(companion_id.as_deref())
+        .bind(companion_id.as_deref())
         .bind(nomifun_common::now_ms())
-        .bind(id)
+        .bind(channel_plugin_id)
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("Plugin '{id}' not found")));
+            return Err(DbError::NotFound(format!(
+                "Plugin '{channel_plugin_id}' not found"
+            )));
         }
         Ok(())
     }
 
-    async fn update_plugin_public_agent(&self, id: &str, public_agent_id: Option<&str>) -> Result<(), DbError> {
+    async fn update_plugin_public_agent(
+        &self,
+        channel_plugin_id: &str,
+        public_agent_id: Option<&str>,
+    ) -> Result<(), DbError> {
+        let public_agent_id = public_agent_id
+            .map(|value| {
+                PublicAgentId::parse(value)
+                    .map(PublicAgentId::into_string)
+                    .map_err(|error| {
+                        DbError::Conflict(format!(
+                            "channel plugin public_agent_id '{value}' is not a canonical UUIDv7: {error}"
+                        ))
+                    })
+            })
+            .transpose()?;
         // Row-level mutual exclusivity: binding a public agent (non-null) clears
         // any companion binding on the same row. Clearing (`None`) leaves the
         // companion binding untouched.
@@ -153,48 +350,112 @@ impl IChannelRepository for SqliteChannelRepository {
              SET public_agent_id = ?, \
                  companion_id = CASE WHEN ? IS NOT NULL THEN NULL ELSE companion_id END, \
                  updated_at = ? \
-             WHERE id = ?",
+             WHERE channel_plugin_id = ?",
         )
-        .bind(public_agent_id)
-        .bind(public_agent_id)
+        .bind(public_agent_id.as_deref())
+        .bind(public_agent_id.as_deref())
         .bind(nomifun_common::now_ms())
-        .bind(id)
+        .bind(channel_plugin_id)
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("Plugin '{id}' not found")));
+            return Err(DbError::NotFound(format!(
+                "Plugin '{channel_plugin_id}' not found"
+            )));
         }
         Ok(())
     }
 
-    async fn update_plugin_bot_key(&self, id: &str, bot_key: &str) -> Result<(), DbError> {
-        let result = sqlx::query("UPDATE channel_plugins SET bot_key = ?, updated_at = ? WHERE id = ?")
-            .bind(bot_key)
-            .bind(nomifun_common::now_ms())
-            .bind(id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| {
-                if is_unique_violation(&e) {
-                    DbError::Conflict(format!("Bot '{bot_key}' is already configured"))
-                } else {
-                    DbError::Query(e)
-                }
-            })?;
+    async fn update_plugin_bot_key(
+        &self,
+        channel_plugin_id: &str,
+        bot_key: &str,
+    ) -> Result<(), DbError> {
+        let bot_key = bot_key.trim();
+        if bot_key.is_empty() {
+            return Err(DbError::Conflict(
+                "channel plugin bot_key must not be empty".to_owned(),
+            ));
+        }
+        let result = sqlx::query(
+            "UPDATE channel_plugins \
+             SET bot_key = ?, updated_at = ? \
+             WHERE channel_plugin_id = ?",
+        )
+        .bind(bot_key)
+        .bind(nomifun_common::now_ms())
+        .bind(channel_plugin_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| {
+            if is_unique_violation(&error) {
+                DbError::Conflict(format!(
+                    "Bot '{bot_key}' is already configured for this platform"
+                ))
+            } else {
+                DbError::Query(error)
+            }
+        })?;
         if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("Plugin '{id}' not found")));
+            return Err(DbError::NotFound(format!(
+                "Plugin '{channel_plugin_id}' not found"
+            )));
         }
         Ok(())
     }
 
-    async fn delete_plugin(&self, id: &str) -> Result<(), DbError> {
-        let result = sqlx::query("DELETE FROM channel_plugins WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
+    async fn delete_plugin(&self, channel_plugin_id: &str) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        let locked = sqlx::query(
+            "UPDATE channel_plugins \
+             SET updated_at = updated_at \
+             WHERE channel_plugin_id = ?",
+        )
+        .bind(channel_plugin_id)
+        .execute(&mut *tx)
+        .await?;
+        if locked.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!(
+                "Plugin '{channel_plugin_id}' not found"
+            )));
+        }
+
+        // Deleting plugin-owned users cascades their authoritative sessions in
+        // the same transaction.
+        sqlx::query(
+            "DELETE FROM channel_sessions \
+             WHERE channel_user_id IN (\
+                 SELECT channel_user_id FROM channel_users WHERE channel_plugin_id = ?\
+             )",
+        )
+        .bind(channel_plugin_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM channel_users WHERE channel_plugin_id = ?")
+            .bind(channel_plugin_id)
+            .execute(&mut *tx)
             .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("Plugin '{id}' not found")));
-        }
+        sqlx::query("DELETE FROM channel_pairing_codes WHERE channel_plugin_id = ?")
+            .bind(channel_plugin_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Sessions not owned by a cascaded user retain their history but no
+        // longer point at the removed plugin.
+        sqlx::query(
+            "UPDATE channel_sessions \
+             SET channel_plugin_id = NULL \
+             WHERE channel_plugin_id = ?",
+        )
+        .bind(channel_plugin_id)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM channel_plugins WHERE channel_plugin_id = ?")
+            .bind(channel_plugin_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -211,36 +472,44 @@ impl IChannelRepository for SqliteChannelRepository {
         &self,
         platform_user_id: &str,
         platform_type: &str,
-        channel_id: &str,
+        channel_plugin_id: &str,
     ) -> Result<Option<ChannelUserRow>, DbError> {
         let row = sqlx::query_as::<_, ChannelUserRow>(
             "SELECT * FROM channel_users \
-             WHERE platform_user_id = ? AND platform_type = ? AND channel_id = ?",
+             WHERE platform_user_id = ? AND platform_type = ? AND channel_plugin_id = ?",
         )
         .bind(platform_user_id)
         .bind(platform_type)
-        .bind(channel_id)
+        .bind(channel_plugin_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
     }
 
-    async fn create_user(&self, row: &ChannelUserRow) -> Result<(), DbError> {
-        sqlx::query(
-            "INSERT INTO channel_users \
-                (id, platform_user_id, platform_type, channel_id, display_name, \
-                 authorized_at, last_active, session_id) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    async fn create_user(&self, row: &NewChannelUserRow) -> Result<ChannelUserRow, DbError> {
+        let mut tx = self.pool.begin().await?;
+        lock_channel_plugin(
+            &mut tx,
+            row.channel_plugin_id.as_deref(),
+            "channel user",
         )
-        .bind(&row.id)
+        .await?;
+        let channel_user_id = generate_id();
+        let inserted = sqlx::query_as::<_, ChannelUserRow>(
+            "INSERT INTO channel_users \
+                (channel_user_id, platform_user_id, platform_type, channel_plugin_id, \
+                 display_name, authorized_at, last_active) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             RETURNING *",
+        )
+        .bind(channel_user_id)
         .bind(&row.platform_user_id)
         .bind(&row.platform_type)
-        .bind(&row.channel_id)
+        .bind(&row.channel_plugin_id)
         .bind(&row.display_name)
         .bind(row.authorized_at)
         .bind(row.last_active)
-        .bind(&row.session_id)
-        .execute(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| {
             if is_unique_violation(&e) {
@@ -252,29 +521,55 @@ impl IChannelRepository for SqliteChannelRepository {
                 DbError::Query(e)
             }
         })?;
-        Ok(())
+        tx.commit().await?;
+        Ok(inserted)
     }
 
-    async fn update_user_last_active(&self, id: &str, last_active: nomifun_common::TimestampMs) -> Result<(), DbError> {
-        let result = sqlx::query("UPDATE channel_users SET last_active = ? WHERE id = ?")
+    async fn update_user_last_active(
+        &self,
+        channel_user_id: &str,
+        last_active: nomifun_common::TimestampMs,
+    ) -> Result<(), DbError> {
+        let result = sqlx::query(
+            "UPDATE channel_users SET last_active = ? WHERE channel_user_id = ?",
+        )
             .bind(last_active)
-            .bind(id)
+            .bind(channel_user_id)
             .execute(&self.pool)
             .await?;
         if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("User '{id}' not found")));
+            return Err(DbError::NotFound(format!(
+                "User '{channel_user_id}' not found"
+            )));
         }
         Ok(())
     }
 
-    async fn delete_user(&self, id: &str) -> Result<(), DbError> {
-        let result = sqlx::query("DELETE FROM channel_users WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("User '{id}' not found")));
+    async fn delete_user(&self, channel_user_id: &str) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        let locked = sqlx::query(
+            "UPDATE channel_users \
+             SET display_name = display_name \
+             WHERE channel_user_id = ?",
+        )
+        .bind(channel_user_id)
+        .execute(&mut *tx)
+        .await?;
+        if locked.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!(
+                "User '{channel_user_id}' not found"
+            )));
         }
+
+        sqlx::query("DELETE FROM channel_sessions WHERE channel_user_id = ?")
+            .bind(channel_user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM channel_users WHERE channel_user_id = ?")
+            .bind(channel_user_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -288,9 +583,11 @@ impl IChannelRepository for SqliteChannelRepository {
         Ok(rows)
     }
 
-    async fn get_session(&self, id: &str) -> Result<Option<ChannelSessionRow>, DbError> {
-        let row = sqlx::query_as::<_, ChannelSessionRow>("SELECT * FROM channel_sessions WHERE id = ?")
-            .bind(id)
+    async fn get_session(&self, channel_session_id: &str) -> Result<Option<ChannelSessionRow>, DbError> {
+        let row = sqlx::query_as::<_, ChannelSessionRow>(
+            "SELECT * FROM channel_sessions WHERE channel_session_id = ?",
+        )
+            .bind(channel_session_id)
             .fetch_optional(&self.pool)
             .await?;
         Ok(row)
@@ -298,31 +595,81 @@ impl IChannelRepository for SqliteChannelRepository {
 
     async fn get_or_create_session(
         &self,
-        user_id: &str,
+        channel_user_id: &str,
         chat_id: &str,
-        channel_id: &str,
-        new_row: &ChannelSessionRow,
+        channel_plugin_id: &str,
+        new_row: &NewChannelSessionRow,
     ) -> Result<ChannelSessionRow, DbError> {
-        // Try to find an existing session first.
+        validate_agent_type(&new_row.agent_type, "channel session")?;
+        if new_row.channel_user_id != channel_user_id
+            || new_row.chat_id.as_deref() != Some(chat_id)
+            || new_row.channel_plugin_id.as_deref() != Some(channel_plugin_id)
+        {
+            return Err(DbError::Conflict(
+                "channel session lookup keys must match the inserted row".into(),
+            ));
+        }
+        let session_id = ChannelSessionId::parse(&new_row.channel_session_id).map_err(|error| {
+            DbError::Conflict(format!(
+                "channel session id '{}' is not a canonical UUIDv7: {error}",
+                new_row.channel_session_id
+            ))
+        })?;
+        let mut tx = self.pool.begin().await?;
+        lock_channel_plugin(&mut tx, Some(channel_plugin_id), "channel session").await?;
+        let channel_user_id = ChannelUserId::parse(channel_user_id).map_err(|error| {
+            DbError::Conflict(format!(
+                "channel session user '{channel_user_id}' is not a canonical UUIDv7: {error}"
+            ))
+        })?;
+        let user_plugin_id: Option<String> = sqlx::query_scalar(
+            "UPDATE channel_users SET last_active = last_active WHERE channel_user_id = ? \
+             RETURNING channel_plugin_id",
+        )
+        .bind(channel_user_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            DbError::Conflict(format!(
+                "channel session user '{channel_user_id}' does not exist"
+            ))
+        })?;
+        if user_plugin_id.as_deref().is_some()
+            && user_plugin_id.as_deref() != Some(channel_plugin_id)
+        {
+            return Err(DbError::Conflict(
+                "channel session plugin does not match its channel user".into(),
+            ));
+        }
+        let conversation_id = lock_conversation(
+            &mut tx,
+            new_row.conversation_id.as_deref(),
+            "channel session",
+        )
+        .await?;
+
+        // Try to find an existing session under the same writer transaction.
         let existing = sqlx::query_as::<_, ChannelSessionRow>(
             "SELECT * FROM channel_sessions \
-             WHERE user_id = ? AND chat_id = ? AND channel_id = ?",
+             WHERE channel_user_id = ? AND chat_id = ? AND channel_plugin_id = ?",
         )
-        .bind(user_id)
+        .bind(channel_user_id.as_str())
         .bind(chat_id)
-        .bind(channel_id)
-        .fetch_optional(&self.pool)
+        .bind(channel_plugin_id)
+        .fetch_optional(&mut *tx)
         .await?;
 
         if let Some(row) = existing {
             // Touch last_activity.
             let now = nomifun_common::now_ms();
-            sqlx::query("UPDATE channel_sessions SET last_activity = ? WHERE id = ?")
+            sqlx::query(
+                "UPDATE channel_sessions SET last_activity = ? WHERE channel_session_id = ?",
+            )
                 .bind(now)
-                .bind(&row.id)
-                .execute(&self.pool)
+                .bind(&row.channel_session_id)
+                .execute(&mut *tx)
                 .await?;
-
+            tx.commit().await?;
             return Ok(ChannelSessionRow {
                 last_activity: now,
                 ..row
@@ -330,131 +677,158 @@ impl IChannelRepository for SqliteChannelRepository {
         }
 
         // Insert new session.
-        sqlx::query(
+        let inserted = sqlx::query_as::<_, ChannelSessionRow>(
             "INSERT INTO channel_sessions \
-                (id, user_id, agent_type, conversation_id, workspace, \
-                 chat_id, channel_id, created_at, last_activity) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (channel_session_id, channel_user_id, agent_type, conversation_id, workspace, \
+                 chat_id, channel_plugin_id, created_at, last_activity) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             RETURNING *",
         )
-        .bind(&new_row.id)
-        .bind(&new_row.user_id)
+        .bind(session_id.as_str())
+        .bind(&new_row.channel_user_id)
         .bind(&new_row.agent_type)
-        .bind(&new_row.conversation_id)
+        .bind(&conversation_id)
         .bind(&new_row.workspace)
         .bind(&new_row.chat_id)
-        .bind(&new_row.channel_id)
+        .bind(&new_row.channel_plugin_id)
         .bind(new_row.created_at)
         .bind(new_row.last_activity)
-        .execute(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
-
-        Ok(new_row.clone())
+        tx.commit().await?;
+        Ok(inserted)
     }
 
     async fn update_session_activity(
         &self,
-        id: &str,
+        channel_session_id: &str,
         last_activity: nomifun_common::TimestampMs,
     ) -> Result<(), DbError> {
-        let result = sqlx::query("UPDATE channel_sessions SET last_activity = ? WHERE id = ?")
+        let result = sqlx::query(
+            "UPDATE channel_sessions SET last_activity = ? WHERE channel_session_id = ?",
+        )
             .bind(last_activity)
-            .bind(id)
+            .bind(channel_session_id)
             .execute(&self.pool)
             .await?;
         if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("Session '{id}' not found")));
+            return Err(DbError::NotFound(format!("Session '{channel_session_id}' not found")));
         }
         Ok(())
     }
 
-    async fn update_session_conversation(&self, id: &str, conversation_id: &str) -> Result<(), DbError> {
+    async fn update_session_conversation(&self, channel_session_id: &str, conversation_id: &str) -> Result<(), DbError> {
         let now = nomifun_common::now_ms();
+        let mut tx = self.pool.begin().await?;
+        let conversation_id =
+            lock_conversation(&mut tx, Some(conversation_id), "channel session update")
+                .await?
+                .expect("Some input returns Some");
         let result = sqlx::query(
             "UPDATE channel_sessions \
              SET conversation_id = ?, last_activity = ? \
-             WHERE id = ?",
+             WHERE channel_session_id = ?",
         )
         .bind(conversation_id)
         .bind(now)
-        .bind(id)
-        .execute(&self.pool)
+        .bind(channel_session_id)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("Session '{id}' not found")));
+            return Err(DbError::NotFound(format!("Session '{channel_session_id}' not found")));
         }
+        tx.commit().await?;
         Ok(())
     }
 
-    async fn update_session_agent_type(&self, id: &str, agent_type: &str) -> Result<(), DbError> {
+    async fn update_session_agent_type(&self, channel_session_id: &str, agent_type: &str) -> Result<(), DbError> {
+        validate_agent_type(agent_type, "channel session update")?;
         let now = nomifun_common::now_ms();
         let result = sqlx::query(
             "UPDATE channel_sessions \
              SET agent_type = ?, last_activity = ? \
-             WHERE id = ?",
+             WHERE channel_session_id = ?",
         )
         .bind(agent_type)
         .bind(now)
-        .bind(id)
+        .bind(channel_session_id)
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("Session '{id}' not found")));
+            return Err(DbError::NotFound(format!("Session '{channel_session_id}' not found")));
         }
         Ok(())
     }
 
-    async fn delete_sessions_by_user(&self, user_id: &str) -> Result<(), DbError> {
-        sqlx::query("DELETE FROM channel_sessions WHERE user_id = ?")
-            .bind(user_id)
-            .execute(&self.pool)
+    async fn delete_sessions_by_user(&self, channel_user_id: &str) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM channel_sessions WHERE channel_user_id = ?")
+            .bind(channel_user_id)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
-    async fn delete_sessions_by_channel(&self, channel_id: &str) -> Result<(), DbError> {
-        sqlx::query("DELETE FROM channel_sessions WHERE channel_id = ?")
-            .bind(channel_id)
-            .execute(&self.pool)
+    async fn delete_sessions_by_channel(
+        &self,
+        channel_plugin_id: &str,
+    ) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM channel_sessions WHERE channel_plugin_id = ?")
+            .bind(channel_plugin_id)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     async fn delete_session_by_user_chat(
         &self,
-        user_id: &str,
+        channel_user_id: &str,
         chat_id: &str,
-        channel_id: &str,
+        channel_plugin_id: &str,
     ) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "DELETE FROM channel_sessions \
-             WHERE user_id = ? AND chat_id = ? AND channel_id = ?",
+             WHERE channel_user_id = ? AND chat_id = ? AND channel_plugin_id = ?",
         )
-        .bind(user_id)
+        .bind(channel_user_id)
         .bind(chat_id)
-        .bind(channel_id)
-        .execute(&self.pool)
+        .bind(channel_plugin_id)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     // -- Pairing Codes ------------------------------------------------
 
-    async fn create_pairing(&self, row: &ChannelPairingCodeRow) -> Result<(), DbError> {
-        sqlx::query(
+    async fn create_pairing(&self, row: &NewChannelPairingCodeRow) -> Result<ChannelPairingCodeRow, DbError> {
+        let mut tx = self.pool.begin().await?;
+        lock_channel_plugin(
+            &mut tx,
+            row.channel_plugin_id.as_deref(),
+            "channel pairing",
+        )
+        .await?;
+        let inserted = sqlx::query_as::<_, ChannelPairingCodeRow>(
             "INSERT INTO channel_pairing_codes \
-                (code, platform_user_id, platform_type, channel_id, display_name, \
+                (code, platform_user_id, platform_type, channel_plugin_id, display_name, \
                  requested_at, expires_at, status) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             RETURNING *",
         )
         .bind(&row.code)
         .bind(&row.platform_user_id)
         .bind(&row.platform_type)
-        .bind(&row.channel_id)
+        .bind(&row.channel_plugin_id)
         .bind(&row.display_name)
         .bind(row.requested_at)
         .bind(row.expires_at)
         .bind(&row.status)
-        .execute(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|e| {
             if is_unique_violation(&e) {
@@ -463,7 +837,8 @@ impl IChannelRepository for SqliteChannelRepository {
                 DbError::Query(e)
             }
         })?;
-        Ok(())
+        tx.commit().await?;
+        Ok(inserted)
     }
 
     async fn get_pending_pairings(&self) -> Result<Vec<ChannelPairingCodeRow>, DbError> {
@@ -520,6 +895,8 @@ fn is_unique_violation(err: &sqlx::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    const MISSING_ID: &str = "0190f5fe-7c00-7a00-8000-000000000999";
+
     use super::*;
     use crate::init_database_memory;
 
@@ -529,10 +906,9 @@ mod tests {
         (repo, db)
     }
 
-    fn sample_plugin() -> ChannelPluginRow {
+    fn sample_plugin() -> NewChannelPluginRow {
         let now = nomifun_common::now_ms();
-        ChannelPluginRow {
-            id: "tg-1".into(),
+        NewChannelPluginRow {
             r#type: "telegram".into(),
             name: "My Telegram Bot".into(),
             enabled: false,
@@ -547,47 +923,64 @@ mod tests {
         }
     }
 
-    fn sample_user() -> ChannelUserRow {
+    fn sample_user(channel_plugin_id: &str) -> NewChannelUserRow {
         let now = nomifun_common::now_ms();
-        ChannelUserRow {
-            id: "usr-1".into(),
+        NewChannelUserRow {
             platform_user_id: "tg_12345".into(),
             platform_type: "telegram".into(),
-            channel_id: Some("tg-1".into()),
+            channel_plugin_id: Some(channel_plugin_id.to_owned()),
             display_name: Some("Alice".into()),
             authorized_at: now,
             last_active: None,
-            session_id: None,
         }
     }
 
-    fn sample_session(user_id: &str) -> ChannelSessionRow {
+    fn sample_session(
+        channel_user_id: &str,
+        channel_plugin_id: &str,
+        chat_id: &str,
+    ) -> NewChannelSessionRow {
         let now = nomifun_common::now_ms();
-        ChannelSessionRow {
-            id: "sess-1".into(),
-            user_id: user_id.into(),
-            agent_type: "gemini".into(),
+        NewChannelSessionRow {
+            channel_session_id: nomifun_common::ChannelSessionId::new().into_string(),
+            channel_user_id: channel_user_id.to_owned(),
+            agent_type: "acp".into(),
             conversation_id: None,
             workspace: None,
-            chat_id: Some("chat-abc".into()),
-            channel_id: Some("tg-1".into()),
+            chat_id: Some(chat_id.into()),
+            channel_plugin_id: Some(channel_plugin_id.to_owned()),
             created_at: now,
             last_activity: now,
         }
     }
 
-    fn sample_pairing() -> ChannelPairingCodeRow {
+    fn sample_pairing() -> NewChannelPairingCodeRow {
         let now = nomifun_common::now_ms();
-        ChannelPairingCodeRow {
+        NewChannelPairingCodeRow {
             code: "123456".into(),
             platform_user_id: "tg_99".into(),
             platform_type: "telegram".into(),
-            channel_id: None,
+            channel_plugin_id: None,
             display_name: Some("Bob".into()),
             requested_at: now,
             expires_at: now + 600_000,
             status: "pending".into(),
         }
+    }
+
+    async fn seed_channel(repo: &SqliteChannelRepository, name: &str) -> ChannelPluginRow {
+        let mut plugin = sample_plugin();
+        plugin.name = name.into();
+        repo.create_plugin(&plugin).await.unwrap()
+    }
+
+    async fn seed_user(
+        repo: &SqliteChannelRepository,
+        channel_plugin_id: &str,
+    ) -> ChannelUserRow {
+        repo.create_user(&sample_user(channel_plugin_id))
+            .await
+            .unwrap()
     }
 
     // -- Plugin tests -----------------------------------------------------
@@ -600,23 +993,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_and_get_plugin() {
+    async fn create_and_get_plugin() {
         let (repo, _db) = setup().await;
-        let plugin = sample_plugin();
-        repo.upsert_plugin(&plugin).await.unwrap();
+        let plugin = repo.create_plugin(&sample_plugin()).await.unwrap();
 
-        let found = repo.get_plugin("tg-1").await.unwrap().unwrap();
-        assert_eq!(found.id, "tg-1");
+        let found = repo
+            .get_plugin(&plugin.channel_plugin_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.channel_plugin_id, plugin.channel_plugin_id);
         assert_eq!(found.r#type, "telegram");
         assert_eq!(found.name, "My Telegram Bot");
         assert!(!found.enabled);
     }
 
     #[tokio::test]
-    async fn upsert_plugin_updates_existing() {
+    async fn update_plugin_updates_existing() {
         let (repo, _db) = setup().await;
-        let plugin = sample_plugin();
-        repo.upsert_plugin(&plugin).await.unwrap();
+        let plugin = repo.create_plugin(&sample_plugin()).await.unwrap();
 
         let updated = ChannelPluginRow {
             name: "Updated Bot".into(),
@@ -624,9 +1019,13 @@ mod tests {
             updated_at: nomifun_common::now_ms(),
             ..plugin
         };
-        repo.upsert_plugin(&updated).await.unwrap();
+        repo.update_plugin(&updated).await.unwrap();
 
-        let found = repo.get_plugin("tg-1").await.unwrap().unwrap();
+        let found = repo
+            .get_plugin(&updated.channel_plugin_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.name, "Updated Bot");
         assert!(found.enabled);
     }
@@ -634,11 +1033,10 @@ mod tests {
     #[tokio::test]
     async fn get_all_plugins_returns_multiple() {
         let (repo, _db) = setup().await;
-        repo.upsert_plugin(&sample_plugin()).await.unwrap();
+        repo.create_plugin(&sample_plugin()).await.unwrap();
 
         let now = nomifun_common::now_ms();
-        let lark = ChannelPluginRow {
-            id: "lark-1".into(),
+        let lark = NewChannelPluginRow {
             r#type: "lark".into(),
             name: "Lark Bot".into(),
             enabled: true,
@@ -651,7 +1049,7 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        repo.upsert_plugin(&lark).await.unwrap();
+        repo.create_plugin(&lark).await.unwrap();
 
         let all = repo.get_all_plugins().await.unwrap();
         assert_eq!(all.len(), 2);
@@ -660,11 +1058,11 @@ mod tests {
     #[tokio::test]
     async fn update_plugin_status_sets_fields() {
         let (repo, _db) = setup().await;
-        repo.upsert_plugin(&sample_plugin()).await.unwrap();
+        let plugin = repo.create_plugin(&sample_plugin()).await.unwrap();
 
         let now = nomifun_common::now_ms();
         repo.update_plugin_status(
-            "tg-1",
+            &plugin.channel_plugin_id,
             &UpdatePluginStatusParams {
                 status: Some("running".into()),
                 last_connected: Some(now),
@@ -674,7 +1072,11 @@ mod tests {
         .await
         .unwrap();
 
-        let found = repo.get_plugin("tg-1").await.unwrap().unwrap();
+        let found = repo
+            .get_plugin(&plugin.channel_plugin_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.status.as_deref(), Some("running"));
         assert_eq!(found.last_connected, Some(now));
         assert!(found.enabled);
@@ -683,9 +1085,10 @@ mod tests {
     #[tokio::test]
     async fn update_plugin_status_not_found() {
         let (repo, _db) = setup().await;
+        let missing_id = ChannelPluginId::new();
         let err = repo
             .update_plugin_status(
-                "nope",
+                missing_id.as_str(),
                 &UpdatePluginStatusParams {
                     status: Some("error".into()),
                     ..Default::default()
@@ -699,25 +1102,109 @@ mod tests {
     #[tokio::test]
     async fn update_plugin_status_empty_params_is_noop() {
         let (repo, _db) = setup().await;
-        repo.upsert_plugin(&sample_plugin()).await.unwrap();
+        let plugin = repo.create_plugin(&sample_plugin()).await.unwrap();
         // No fields to update → no-op, no error.
-        repo.update_plugin_status("tg-1", &UpdatePluginStatusParams::default())
-            .await
-            .unwrap();
+        repo.update_plugin_status(
+            &plugin.channel_plugin_id,
+            &UpdatePluginStatusParams::default(),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn delete_plugin_removes_row() {
-        let (repo, _db) = setup().await;
-        repo.upsert_plugin(&sample_plugin()).await.unwrap();
-        repo.delete_plugin("tg-1").await.unwrap();
-        assert!(repo.get_plugin("tg-1").await.unwrap().is_none());
+        let (repo, db) = setup().await;
+        let plugin = repo.create_plugin(&sample_plugin()).await.unwrap();
+        let other_plugin = seed_channel(&repo, "Other channel").await;
+        let owned_user = seed_user(&repo, &plugin.channel_plugin_id).await;
+        let mut unscoped_user = sample_user(&other_plugin.channel_plugin_id);
+        unscoped_user.platform_user_id = "tg_unscoped".into();
+        unscoped_user.channel_plugin_id = None;
+        let other_user = repo.create_user(&unscoped_user).await.unwrap();
+        let owned_session = sample_session(
+            &owned_user.channel_user_id,
+            &plugin.channel_plugin_id,
+            "owned",
+        );
+        repo.get_or_create_session(
+            &owned_user.channel_user_id,
+            "owned",
+            &plugin.channel_plugin_id,
+            &owned_session,
+        )
+            .await
+            .unwrap();
+        let retained_session = sample_session(
+            &other_user.channel_user_id,
+            &plugin.channel_plugin_id,
+            "retained",
+        );
+        let retained_session = repo
+            .get_or_create_session(
+                &other_user.channel_user_id,
+                "retained",
+                &plugin.channel_plugin_id,
+                &retained_session,
+            )
+            .await
+            .unwrap();
+        let mut pairing = sample_pairing();
+        pairing.code = "654321".into();
+        pairing.channel_plugin_id = Some(plugin.channel_plugin_id.clone());
+        repo.create_pairing(&pairing).await.unwrap();
+
+        repo.delete_plugin(&plugin.channel_plugin_id).await.unwrap();
+
+        assert!(
+            repo.get_plugin(&plugin.channel_plugin_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repo.get_user_by_platform(
+                "tg_12345",
+                "telegram",
+                &plugin.channel_plugin_id,
+            )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repo.get_session(&owned_session.channel_session_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            repo.get_pairing_by_code("654321")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let retained = repo
+            .get_session(&retained_session.channel_session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retained.channel_plugin_id.is_none());
+
+        let remaining_user_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM channel_users WHERE channel_user_id = ?")
+                .bind(&other_user.channel_user_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(remaining_user_count, 1);
     }
 
     #[tokio::test]
     async fn delete_plugin_not_found() {
         let (repo, _db) = setup().await;
-        let err = repo.delete_plugin("nope").await.unwrap_err();
+        let missing_id = ChannelPluginId::new();
+        let err = repo.delete_plugin(missing_id.as_str()).await.unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
@@ -725,10 +1212,11 @@ mod tests {
     async fn same_bot_key_on_two_rows_conflicts() {
         let (repo, _db) = setup().await;
         let now = nomifun_common::now_ms();
-        let bot = |id: &str, companion: &str| ChannelPluginRow {
-            id: id.into(),
+        let companion_a = CompanionId::new().into_string();
+        let companion_b = CompanionId::new().into_string();
+        let bot = |name: &str, companion: &str| NewChannelPluginRow {
             r#type: "lark".into(),
-            name: "Lark Bot".into(),
+            name: name.into(),
             enabled: true,
             config: "enc".into(),
             status: None,
@@ -739,25 +1227,36 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        repo.upsert_plugin(&bot("achn_1", "companion_a")).await.unwrap();
+        let first = repo
+            .create_plugin(&bot("Lark Bot A", &companion_a))
+            .await
+            .unwrap();
 
         // Same lark app on a second row (= bound to another companion) must fail.
-        let err = repo.upsert_plugin(&bot("achn_2", "companion_b")).await.unwrap_err();
+        let err = repo
+            .create_plugin(&bot("Lark Bot B", &companion_b))
+            .await
+            .unwrap_err();
         assert!(matches!(err, DbError::Conflict(_)));
 
-        // Re-upserting the same row keeps working.
-        repo.upsert_plugin(&bot("achn_1", "companion_b")).await.unwrap();
+        // Updating the same row keeps working.
+        repo.update_plugin(&ChannelPluginRow {
+            companion_id: Some(companion_b),
+            updated_at: nomifun_common::now_ms(),
+            ..first
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn different_bot_keys_same_platform_coexist() {
         let (repo, _db) = setup().await;
         let now = nomifun_common::now_ms();
-        for (id, key) in [("achn_1", "cli_app_a"), ("achn_2", "cli_app_b")] {
-            repo.upsert_plugin(&ChannelPluginRow {
-                id: id.into(),
+        for (name, key) in [("Lark Bot A", "cli_app_a"), ("Lark Bot B", "cli_app_b")] {
+            repo.create_plugin(&NewChannelPluginRow {
                 r#type: "lark".into(),
-                name: "Lark Bot".into(),
+                name: name.into(),
                 enabled: true,
                 config: "enc".into(),
                 status: None,
@@ -777,36 +1276,78 @@ mod tests {
     #[tokio::test]
     async fn update_plugin_companion_roundtrip_and_clear() {
         let (repo, _db) = setup().await;
-        repo.upsert_plugin(&sample_plugin()).await.unwrap();
+        let plugin = repo.create_plugin(&sample_plugin()).await.unwrap();
+        let companion_id = CompanionId::new().into_string();
 
-        repo.update_plugin_companion("tg-1", Some("companion_x")).await.unwrap();
+        repo.update_plugin_companion(&plugin.channel_plugin_id, Some(&companion_id))
+            .await
+            .unwrap();
         assert_eq!(
-            repo.get_plugin("tg-1").await.unwrap().unwrap().companion_id.as_deref(),
-            Some("companion_x")
+            repo.get_plugin(&plugin.channel_plugin_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .companion_id
+                .as_deref(),
+            Some(companion_id.as_str())
         );
 
-        repo.update_plugin_companion("tg-1", None).await.unwrap();
-        assert!(repo.get_plugin("tg-1").await.unwrap().unwrap().companion_id.is_none());
+        repo.update_plugin_companion(&plugin.channel_plugin_id, None)
+            .await
+            .unwrap();
+        assert!(
+            repo.get_plugin(&plugin.channel_plugin_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .companion_id
+                .is_none()
+        );
 
-        let err = repo.update_plugin_companion("nope", Some("companion_x")).await.unwrap_err();
+        let missing_id = ChannelPluginId::new();
+        let err = repo
+            .update_plugin_companion(missing_id.as_str(), Some(&companion_id))
+            .await
+            .unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
     #[tokio::test]
     async fn update_plugin_public_agent_roundtrip_and_clear() {
         let (repo, _db) = setup().await;
-        repo.upsert_plugin(&sample_plugin()).await.unwrap();
+        let plugin = repo.create_plugin(&sample_plugin()).await.unwrap();
+        let public_agent_id = PublicAgentId::new().into_string();
 
-        repo.update_plugin_public_agent("tg-1", Some("pubagent_x")).await.unwrap();
+        repo.update_plugin_public_agent(&plugin.channel_plugin_id, Some(&public_agent_id))
+            .await
+            .unwrap();
         assert_eq!(
-            repo.get_plugin("tg-1").await.unwrap().unwrap().public_agent_id.as_deref(),
-            Some("pubagent_x")
+            repo.get_plugin(&plugin.channel_plugin_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .public_agent_id
+                .as_deref(),
+            Some(public_agent_id.as_str())
         );
 
-        repo.update_plugin_public_agent("tg-1", None).await.unwrap();
-        assert!(repo.get_plugin("tg-1").await.unwrap().unwrap().public_agent_id.is_none());
+        repo.update_plugin_public_agent(&plugin.channel_plugin_id, None)
+            .await
+            .unwrap();
+        assert!(
+            repo.get_plugin(&plugin.channel_plugin_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .public_agent_id
+                .is_none()
+        );
 
-        let err = repo.update_plugin_public_agent("nope", Some("pubagent_x")).await.unwrap_err();
+        let missing_id = ChannelPluginId::new();
+        let err = repo
+            .update_plugin_public_agent(missing_id.as_str(), Some(&public_agent_id))
+            .await
+            .unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
@@ -815,25 +1356,57 @@ mod tests {
     #[tokio::test]
     async fn companion_and_public_agent_bindings_are_mutually_exclusive_on_a_row() {
         let (repo, _db) = setup().await;
-        repo.upsert_plugin(&sample_plugin()).await.unwrap();
+        let plugin = repo.create_plugin(&sample_plugin()).await.unwrap();
+        let companion_1 = CompanionId::new().into_string();
+        let companion_2 = CompanionId::new().into_string();
+        let public_agent_1 = PublicAgentId::new().into_string();
+        let public_agent_2 = PublicAgentId::new().into_string();
 
         // Bind a companion, then bind a public agent → companion is cleared.
-        repo.update_plugin_companion("tg-1", Some("companion_1")).await.unwrap();
-        repo.update_plugin_public_agent("tg-1", Some("pubagent_1")).await.unwrap();
-        let row = repo.get_plugin("tg-1").await.unwrap().unwrap();
-        assert_eq!(row.public_agent_id.as_deref(), Some("pubagent_1"));
-        assert!(row.companion_id.is_none(), "binding a public agent must clear the companion");
+        repo.update_plugin_companion(&plugin.channel_plugin_id, Some(&companion_1))
+            .await
+            .unwrap();
+        repo.update_plugin_public_agent(&plugin.channel_plugin_id, Some(&public_agent_1))
+            .await
+            .unwrap();
+        let row = repo
+            .get_plugin(&plugin.channel_plugin_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.public_agent_id.as_deref(), Some(public_agent_1.as_str()));
+        assert!(
+            row.companion_id.is_none(),
+            "binding a public agent must clear the companion"
+        );
 
         // Bind a companion again → public agent is cleared.
-        repo.update_plugin_companion("tg-1", Some("companion_2")).await.unwrap();
-        let row = repo.get_plugin("tg-1").await.unwrap().unwrap();
-        assert_eq!(row.companion_id.as_deref(), Some("companion_2"));
-        assert!(row.public_agent_id.is_none(), "binding a companion must clear the public agent");
+        repo.update_plugin_companion(&plugin.channel_plugin_id, Some(&companion_2))
+            .await
+            .unwrap();
+        let row = repo
+            .get_plugin(&plugin.channel_plugin_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.companion_id.as_deref(), Some(companion_2.as_str()));
+        assert!(
+            row.public_agent_id.is_none(),
+            "binding a companion must clear the public agent"
+        );
 
         // Clearing one binding does NOT touch the other.
-        repo.update_plugin_public_agent("tg-1", Some("pubagent_2")).await.unwrap();
-        repo.update_plugin_public_agent("tg-1", None).await.unwrap();
-        let row = repo.get_plugin("tg-1").await.unwrap().unwrap();
+        repo.update_plugin_public_agent(&plugin.channel_plugin_id, Some(&public_agent_2))
+            .await
+            .unwrap();
+        repo.update_plugin_public_agent(&plugin.channel_plugin_id, None)
+            .await
+            .unwrap();
+        let row = repo
+            .get_plugin(&plugin.channel_plugin_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(row.public_agent_id.is_none());
         assert!(row.companion_id.is_none());
     }
@@ -841,11 +1414,18 @@ mod tests {
     #[tokio::test]
     async fn update_plugin_bot_key_backfills() {
         let (repo, _db) = setup().await;
-        repo.upsert_plugin(&sample_plugin()).await.unwrap();
+        let plugin = repo.create_plugin(&sample_plugin()).await.unwrap();
 
-        repo.update_plugin_bot_key("tg-1", "123456").await.unwrap();
+        repo.update_plugin_bot_key(&plugin.channel_plugin_id, "123456")
+            .await
+            .unwrap();
         assert_eq!(
-            repo.get_plugin("tg-1").await.unwrap().unwrap().bot_key.as_deref(),
+            repo.get_plugin(&plugin.channel_plugin_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .bot_key
+                .as_deref(),
             Some("123456")
         );
     }
@@ -862,38 +1442,38 @@ mod tests {
     #[tokio::test]
     async fn create_and_get_user_by_platform() {
         let (repo, _db) = setup().await;
-        seed_channel(&repo, "tg-1").await;
-        let user = sample_user();
-        repo.create_user(&user).await.unwrap();
+        let plugin = seed_channel(&repo, "Telegram Stub").await;
+        let user = repo
+            .create_user(&sample_user(&plugin.channel_plugin_id))
+            .await
+            .unwrap();
 
         let found = repo
-            .get_user_by_platform("tg_12345", "telegram", "tg-1")
+            .get_user_by_platform("tg_12345", "telegram", &plugin.channel_plugin_id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(found.id, "usr-1");
+        assert_eq!(found.channel_user_id, user.channel_user_id);
         assert_eq!(found.display_name.as_deref(), Some("Alice"));
     }
 
     #[tokio::test]
     async fn create_duplicate_user_returns_conflict() {
         let (repo, _db) = setup().await;
-        seed_channel(&repo, "tg-1").await;
-        repo.create_user(&sample_user()).await.unwrap();
+        let plugin = seed_channel(&repo, "Telegram Stub").await;
+        let user = sample_user(&plugin.channel_plugin_id);
+        repo.create_user(&user).await.unwrap();
 
-        let dup = ChannelUserRow {
-            id: "usr-2".into(),
-            ..sample_user()
-        };
-        let err = repo.create_user(&dup).await.unwrap_err();
+        let err = repo.create_user(&user).await.unwrap_err();
         assert!(matches!(err, DbError::Conflict(_)));
     }
 
     #[tokio::test]
     async fn get_user_by_platform_not_found() {
         let (repo, _db) = setup().await;
+        let plugin = seed_channel(&repo, "Telegram Stub").await;
         assert!(
-            repo.get_user_by_platform("nope", "telegram", "tg-1")
+            repo.get_user_by_platform("nope", "telegram", &plugin.channel_plugin_id)
                 .await
                 .unwrap()
                 .is_none()
@@ -903,56 +1483,82 @@ mod tests {
     #[tokio::test]
     async fn same_platform_user_two_channels_are_independent() {
         let (repo, _db) = setup().await;
-        seed_channel(&repo, "lark-1").await;
-        seed_channel(&repo, "lark-2").await;
+        let first_plugin = seed_channel(&repo, "Lark Stub A").await;
+        let second_plugin = seed_channel(&repo, "Lark Stub B").await;
 
-        let mk = |id: &str, chan: &str| ChannelUserRow {
-            id: id.into(),
+        let mk = |channel_plugin_id: &str| NewChannelUserRow {
             platform_user_id: "ou_same".into(),
             platform_type: "lark".into(),
-            channel_id: Some(chan.into()),
+            channel_plugin_id: Some(channel_plugin_id.to_owned()),
             display_name: None,
             authorized_at: nomifun_common::now_ms(),
             last_active: None,
-            session_id: None,
         };
-        repo.create_user(&mk("u1", "lark-1")).await.unwrap();
-        repo.create_user(&mk("u2", "lark-2")).await.unwrap();
+        let first_user = repo
+            .create_user(&mk(&first_plugin.channel_plugin_id))
+            .await
+            .unwrap();
+        let second_user = repo
+            .create_user(&mk(&second_plugin.channel_plugin_id))
+            .await
+            .unwrap();
 
-        assert_eq!(repo.get_user_by_platform("ou_same", "lark", "lark-1").await.unwrap().unwrap().id, "u1");
-        assert_eq!(repo.get_user_by_platform("ou_same", "lark", "lark-2").await.unwrap().unwrap().id, "u2");
+        assert_eq!(
+            repo.get_user_by_platform("ou_same", "lark", &first_plugin.channel_plugin_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .channel_user_id,
+            first_user.channel_user_id
+        );
+        assert_eq!(
+            repo.get_user_by_platform("ou_same", "lark", &second_plugin.channel_plugin_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .channel_user_id,
+            second_user.channel_user_id
+        );
     }
 
     #[tokio::test]
-    async fn deleting_channel_cascades_its_users() {
+    async fn deleting_channel_removes_scoped_user() {
         let (repo, _db) = setup().await;
-        seed_channel(&repo, "lark-1").await;
-        repo.create_user(&ChannelUserRow {
-            id: "u1".into(),
-            platform_user_id: "ou_x".into(),
-            platform_type: "lark".into(),
-            channel_id: Some("lark-1".into()),
-            display_name: None,
-            authorized_at: nomifun_common::now_ms(),
-            last_active: None,
-            session_id: None,
-        }).await.unwrap();
+        let plugin = seed_channel(&repo, "Lark Stub").await;
+        repo.create_user(&NewChannelUserRow {
+                platform_user_id: "ou_x".into(),
+                platform_type: "lark".into(),
+                channel_plugin_id: Some(plugin.channel_plugin_id.clone()),
+                display_name: None,
+                authorized_at: nomifun_common::now_ms(),
+                last_active: None,
+            })
+            .await
+            .unwrap();
 
-        repo.delete_plugin("lark-1").await.unwrap();
-        assert!(repo.get_user_by_platform("ou_x", "lark", "lark-1").await.unwrap().is_none());
+        repo.delete_plugin(&plugin.channel_plugin_id).await.unwrap();
+        assert!(
+            repo.get_all_users()
+                .await
+                .unwrap()
+                .iter()
+                .all(|user| user.platform_user_id != "ou_x")
+        );
     }
 
     #[tokio::test]
     async fn update_user_last_active_updates_timestamp() {
         let (repo, _db) = setup().await;
-        seed_channel(&repo, "tg-1").await;
-        repo.create_user(&sample_user()).await.unwrap();
+        let plugin = seed_channel(&repo, "Telegram Stub").await;
+        let user = seed_user(&repo, &plugin.channel_plugin_id).await;
 
         let new_ts = nomifun_common::now_ms() + 5000;
-        repo.update_user_last_active("usr-1", new_ts).await.unwrap();
+        repo.update_user_last_active(&user.channel_user_id, new_ts)
+            .await
+            .unwrap();
 
         let found = repo
-            .get_user_by_platform("tg_12345", "telegram", "tg-1")
+            .get_user_by_platform("tg_12345", "telegram", &plugin.channel_plugin_id)
             .await
             .unwrap()
             .unwrap();
@@ -962,18 +1568,22 @@ mod tests {
     #[tokio::test]
     async fn update_user_last_active_not_found() {
         let (repo, _db) = setup().await;
-        let err = repo.update_user_last_active("nope", 123).await.unwrap_err();
+        let missing_id = ChannelUserId::new();
+        let err = repo
+            .update_user_last_active(missing_id.as_str(), 123)
+            .await
+            .unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
     #[tokio::test]
     async fn delete_user_removes_row() {
         let (repo, _db) = setup().await;
-        seed_channel(&repo, "tg-1").await;
-        repo.create_user(&sample_user()).await.unwrap();
-        repo.delete_user("usr-1").await.unwrap();
+        let plugin = seed_channel(&repo, "Telegram Stub").await;
+        let user = seed_user(&repo, &plugin.channel_plugin_id).await;
+        repo.delete_user(&user.channel_user_id).await.unwrap();
         assert!(
-            repo.get_user_by_platform("tg_12345", "telegram", "tg-1")
+            repo.get_user_by_platform("tg_12345", "telegram", &plugin.channel_plugin_id)
                 .await
                 .unwrap()
                 .is_none()
@@ -983,25 +1593,36 @@ mod tests {
     #[tokio::test]
     async fn delete_user_not_found() {
         let (repo, _db) = setup().await;
-        let err = repo.delete_user("nope").await.unwrap_err();
+        let missing_id = ChannelUserId::new();
+        let err = repo.delete_user(missing_id.as_str()).await.unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
     }
 
     #[tokio::test]
     async fn delete_user_cascades_sessions() {
         let (repo, _db) = setup().await;
-        seed_channel(&repo, "tg-1").await;
-        repo.create_user(&sample_user()).await.unwrap();
+        let plugin = seed_channel(&repo, "Telegram Stub").await;
+        let user = seed_user(&repo, &plugin.channel_plugin_id).await;
 
-        let session = sample_session("usr-1");
-        repo.get_or_create_session("usr-1", "chat-abc", "tg-1", &session).await.unwrap();
+        let session = sample_session(
+            &user.channel_user_id,
+            &plugin.channel_plugin_id,
+            "chat-abc",
+        );
+        repo.get_or_create_session(
+            &user.channel_user_id,
+            "chat-abc",
+            &plugin.channel_plugin_id,
+            &session,
+        )
+            .await
+            .unwrap();
 
         // Sessions exist before delete.
         assert_eq!(repo.get_all_sessions().await.unwrap().len(), 1);
 
-        repo.delete_user("usr-1").await.unwrap();
+        repo.delete_user(&user.channel_user_id).await.unwrap();
 
-        // Sessions cascade-deleted.
         assert!(repo.get_all_sessions().await.unwrap().is_empty());
     }
 
@@ -1016,32 +1637,38 @@ mod tests {
     #[tokio::test]
     async fn get_or_create_session_creates_new() {
         let (repo, _db) = setup().await;
-        seed_channel(&repo, "tg-1").await;
-        repo.create_user(&sample_user()).await.unwrap();
+        let plugin = seed_channel(&repo, "Telegram Stub").await;
+        let user = seed_user(&repo, plugin.channel_plugin_id.as_str()).await;
 
-        let new = sample_session("usr-1");
-        let result = repo.get_or_create_session("usr-1", "chat-abc", "tg-1", &new).await.unwrap();
-        assert_eq!(result.id, "sess-1");
-        assert_eq!(result.user_id, "usr-1");
+        let new = sample_session(user.channel_user_id.as_str(), plugin.channel_plugin_id.as_str(), "chat-abc");
+        let result = repo
+            .get_or_create_session(user.channel_user_id.as_str(), "chat-abc", plugin.channel_plugin_id.as_str(), &new)
+            .await
+            .unwrap();
+        assert_eq!(result.channel_session_id, new.channel_session_id);
+        assert_eq!(result.channel_user_id, user.channel_user_id.as_str());
         assert_eq!(result.chat_id.as_deref(), Some("chat-abc"));
     }
 
     #[tokio::test]
     async fn get_or_create_session_reuses_existing() {
         let (repo, _db) = setup().await;
-        seed_channel(&repo, "tg-1").await;
-        repo.create_user(&sample_user()).await.unwrap();
+        let plugin = seed_channel(&repo, "Telegram Stub").await;
+        let user = seed_user(&repo, plugin.channel_plugin_id.as_str()).await;
 
-        let new = sample_session("usr-1");
-        let first = repo.get_or_create_session("usr-1", "chat-abc", "tg-1", &new).await.unwrap();
+        let new = sample_session(user.channel_user_id.as_str(), plugin.channel_plugin_id.as_str(), "chat-abc");
+        let first = repo
+            .get_or_create_session(user.channel_user_id.as_str(), "chat-abc", plugin.channel_plugin_id.as_str(), &new)
+            .await
+            .unwrap();
 
-        // Second call with different new_row id should still return the first.
-        let another = ChannelSessionRow {
-            id: "sess-2".into(),
-            ..new
-        };
-        let second = repo.get_or_create_session("usr-1", "chat-abc", "tg-1", &another).await.unwrap();
-        assert_eq!(second.id, first.id);
+        // A different proposed business id still reuses the persisted session.
+        let another = sample_session(user.channel_user_id.as_str(), plugin.channel_plugin_id.as_str(), "chat-abc");
+        let second = repo
+            .get_or_create_session(user.channel_user_id.as_str(), "chat-abc", plugin.channel_plugin_id.as_str(), &another)
+            .await
+            .unwrap();
+        assert_eq!(second.channel_session_id, first.channel_session_id);
         // last_activity should be updated.
         assert!(second.last_activity >= first.last_activity);
     }
@@ -1049,33 +1676,41 @@ mod tests {
     #[tokio::test]
     async fn per_chat_isolation_different_chats() {
         let (repo, _db) = setup().await;
-        seed_channel(&repo, "tg-1").await;
-        repo.create_user(&sample_user()).await.unwrap();
+        let plugin = seed_channel(&repo, "Telegram Stub").await;
+        let user = seed_user(&repo, plugin.channel_plugin_id.as_str()).await;
 
-        let s1 = sample_session("usr-1");
-        repo.get_or_create_session("usr-1", "chat-abc", "tg-1", &s1).await.unwrap();
+        let s1 = sample_session(user.channel_user_id.as_str(), plugin.channel_plugin_id.as_str(), "chat-abc");
+        repo.get_or_create_session(user.channel_user_id.as_str(), "chat-abc", plugin.channel_plugin_id.as_str(), &s1)
+            .await
+            .unwrap();
 
-        let s2 = ChannelSessionRow {
-            id: "sess-2".into(),
-            chat_id: Some("chat-xyz".into()),
-            ..sample_session("usr-1")
-        };
-        repo.get_or_create_session("usr-1", "chat-xyz", "tg-1", &s2).await.unwrap();
+        let s2 = sample_session(user.channel_user_id.as_str(), plugin.channel_plugin_id.as_str(), "chat-xyz");
+        repo.get_or_create_session(user.channel_user_id.as_str(), "chat-xyz", plugin.channel_plugin_id.as_str(), &s2)
+            .await
+            .unwrap();
 
         assert_eq!(repo.get_all_sessions().await.unwrap().len(), 2);
     }
 
     #[tokio::test]
-    async fn get_session_by_id() {
+    async fn get_session_by_business_id() {
         let (repo, _db) = setup().await;
-        seed_channel(&repo, "tg-1").await;
-        repo.create_user(&sample_user()).await.unwrap();
+        let plugin = seed_channel(&repo, "Telegram Stub").await;
+        let user = seed_user(&repo, plugin.channel_plugin_id.as_str()).await;
 
-        let new = sample_session("usr-1");
-        repo.get_or_create_session("usr-1", "chat-abc", "tg-1", &new).await.unwrap();
+        let new = sample_session(user.channel_user_id.as_str(), plugin.channel_plugin_id.as_str(), "chat-abc");
+        let created = repo
+            .get_or_create_session(user.channel_user_id.as_str(), "chat-abc", plugin.channel_plugin_id.as_str(), &new)
+            .await
+            .unwrap();
 
-        let found = repo.get_session("sess-1").await.unwrap().unwrap();
-        assert_eq!(found.agent_type, "gemini");
+        let found = repo
+            .get_session(&created.channel_session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.channel_session_id, created.channel_session_id);
+        assert_eq!(found.agent_type, "acp");
     }
 
     #[tokio::test]
@@ -1087,16 +1722,25 @@ mod tests {
     #[tokio::test]
     async fn update_session_activity_updates_timestamp() {
         let (repo, _db) = setup().await;
-        seed_channel(&repo, "tg-1").await;
-        repo.create_user(&sample_user()).await.unwrap();
+        let plugin = seed_channel(&repo, "Telegram Stub").await;
+        let user = seed_user(&repo, plugin.channel_plugin_id.as_str()).await;
 
-        let new = sample_session("usr-1");
-        repo.get_or_create_session("usr-1", "chat-abc", "tg-1", &new).await.unwrap();
+        let new = sample_session(user.channel_user_id.as_str(), plugin.channel_plugin_id.as_str(), "chat-abc");
+        let created = repo
+            .get_or_create_session(user.channel_user_id.as_str(), "chat-abc", plugin.channel_plugin_id.as_str(), &new)
+            .await
+            .unwrap();
 
         let new_ts = nomifun_common::now_ms() + 5000;
-        repo.update_session_activity("sess-1", new_ts).await.unwrap();
+        repo.update_session_activity(&created.channel_session_id, new_ts)
+            .await
+            .unwrap();
 
-        let found = repo.get_session("sess-1").await.unwrap().unwrap();
+        let found = repo
+            .get_session(&created.channel_session_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.last_activity, new_ts);
     }
 
@@ -1110,20 +1754,20 @@ mod tests {
     #[tokio::test]
     async fn delete_sessions_by_user_removes_all() {
         let (repo, _db) = setup().await;
-        seed_channel(&repo, "tg-1").await;
-        repo.create_user(&sample_user()).await.unwrap();
+        let plugin = seed_channel(&repo, "Telegram Stub").await;
+        let user = seed_user(&repo, plugin.channel_plugin_id.as_str()).await;
 
-        let s1 = sample_session("usr-1");
-        repo.get_or_create_session("usr-1", "chat-abc", "tg-1", &s1).await.unwrap();
+        let s1 = sample_session(user.channel_user_id.as_str(), plugin.channel_plugin_id.as_str(), "chat-abc");
+        repo.get_or_create_session(user.channel_user_id.as_str(), "chat-abc", plugin.channel_plugin_id.as_str(), &s1)
+            .await
+            .unwrap();
 
-        let s2 = ChannelSessionRow {
-            id: "sess-2".into(),
-            chat_id: Some("chat-xyz".into()),
-            ..sample_session("usr-1")
-        };
-        repo.get_or_create_session("usr-1", "chat-xyz", "tg-1", &s2).await.unwrap();
+        let s2 = sample_session(user.channel_user_id.as_str(), plugin.channel_plugin_id.as_str(), "chat-xyz");
+        repo.get_or_create_session(user.channel_user_id.as_str(), "chat-xyz", plugin.channel_plugin_id.as_str(), &s2)
+            .await
+            .unwrap();
 
-        repo.delete_sessions_by_user("usr-1").await.unwrap();
+        repo.delete_sessions_by_user(user.channel_user_id.as_str()).await.unwrap();
         assert!(repo.get_all_sessions().await.unwrap().is_empty());
     }
 
@@ -1131,45 +1775,19 @@ mod tests {
     async fn delete_sessions_by_user_no_sessions_is_ok() {
         let (repo, _db) = setup().await;
         // No sessions exist for this user —should not error.
-        repo.delete_sessions_by_user("usr-1").await.unwrap();
-    }
-
-    /// Seeds an `channel_plugins` row so `channel_sessions.channel_id`
-    /// (FK → channel_plugins(id), added in the seq/primary-key refactor) can
-    /// reference it. `channel_id` is used as a routing key bound verbatim in
-    /// `get_or_create_session`, so it cannot be nulled out without breaking the
-    /// reuse-matching semantics the session tests exercise —the parent row
-    /// must exist instead. Idempotent via the upsert path.
-    async fn seed_channel(repo: &SqliteChannelRepository, id: &str) {
-        let now = nomifun_common::now_ms();
-        repo.upsert_plugin(&ChannelPluginRow {
-            id: id.into(),
-            r#type: "telegram".into(),
-            name: "Stub Bot".into(),
-            enabled: false,
-            config: "{}".into(),
-            status: None,
-            last_connected: None,
-            companion_id: None,
-            public_agent_id: None,
-            bot_key: None,
-            created_at: now,
-            updated_at: now,
-        })
-        .await
-        .unwrap();
+        repo.delete_sessions_by_user(MISSING_ID).await.unwrap();
     }
 
     /// Helper to create an installation-owned stub conversation for
-    /// FK-constrained channel-session tests. Channel sessions may point at a
+    /// channel-session logical-reference tests. Channel sessions may point at a
     /// host-capable Conversation, so the fixture must use the one principal
     /// that is allowed to own host execution.
     async fn create_stub_conversation(pool: &SqlitePool, conv_id: &str) {
         let now = nomifun_common::now_ms();
         let installation_owner = crate::installation_owner_id(pool).await.unwrap();
         sqlx::query(
-            "INSERT INTO conversations (id, user_id, name, type, created_at, updated_at) \
-             VALUES (?1, ?2, 'Test Conv', 'chat', ?3, ?3)",
+            "INSERT INTO conversations (conversation_id, user_id, name, type, created_at, updated_at) \
+             VALUES (?1, ?2, 'Test Conv', 'nomi', ?3, ?3)",
         )
         .bind(conv_id)
         .bind(installation_owner)
@@ -1183,28 +1801,36 @@ mod tests {
     async fn update_session_conversation_persists() {
         let conversation_id = nomifun_common::ConversationId::new().into_string();
         let (repo, db) = setup().await;
-        seed_channel(&repo, "tg-1").await;
-        repo.create_user(&sample_user()).await.unwrap();
+        let plugin = seed_channel(&repo, "Telegram Stub").await;
+        let user = seed_user(&repo, plugin.channel_plugin_id.as_str()).await;
 
-        let new = sample_session("usr-1");
-        repo.get_or_create_session("usr-1", "chat-abc", "tg-1", &new).await.unwrap();
-
-        create_stub_conversation(db.pool(), &conversation_id).await;
-
-        repo.update_session_conversation("sess-1", &conversation_id)
+        let new = sample_session(user.channel_user_id.as_str(), plugin.channel_plugin_id.as_str(), "chat-abc");
+        let created = repo
+            .get_or_create_session(user.channel_user_id.as_str(), "chat-abc", plugin.channel_plugin_id.as_str(), &new)
             .await
             .unwrap();
 
-        let found = repo.get_session("sess-1").await.unwrap().unwrap();
+        create_stub_conversation(db.pool(), &conversation_id).await;
+
+        repo.update_session_conversation(&created.channel_session_id, &conversation_id)
+            .await
+            .unwrap();
+
+        let found = repo
+            .get_session(&created.channel_session_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.conversation_id, Some(conversation_id));
     }
 
     #[tokio::test]
     async fn update_session_conversation_not_found() {
-        let (repo, _db) = setup().await;
-        let missing_id = nomifun_common::ConversationId::new();
+        let (repo, db) = setup().await;
+        let conversation_id = nomifun_common::ConversationId::new();
+        create_stub_conversation(db.pool(), conversation_id.as_str()).await;
         let err = repo
-            .update_session_conversation("nope", missing_id.as_str())
+            .update_session_conversation("nope", conversation_id.as_str())
             .await
             .unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
@@ -1213,17 +1839,33 @@ mod tests {
     #[tokio::test]
     async fn update_session_agent_type_persists() {
         let (repo, _db) = setup().await;
-        seed_channel(&repo, "tg-1").await;
-        repo.create_user(&sample_user()).await.unwrap();
+        let plugin = seed_channel(&repo, "Telegram Stub").await;
+        let user = seed_user(&repo, plugin.channel_plugin_id.as_str()).await;
 
-        let new = sample_session("usr-1");
-        repo.get_or_create_session("usr-1", "chat-abc", "tg-1", &new).await.unwrap();
+        let new = sample_session(user.channel_user_id.as_str(), plugin.channel_plugin_id.as_str(), "chat-abc");
+        let created = repo
+            .get_or_create_session(user.channel_user_id.as_str(), "chat-abc", plugin.channel_plugin_id.as_str(), &new)
+            .await
+            .unwrap();
 
-        assert_eq!(repo.get_session("sess-1").await.unwrap().unwrap().agent_type, "gemini");
+        assert_eq!(
+            repo.get_session(&created.channel_session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .agent_type,
+            "acp"
+        );
 
-        repo.update_session_agent_type("sess-1", "acp").await.unwrap();
+        repo.update_session_agent_type(&created.channel_session_id, "acp")
+            .await
+            .unwrap();
 
-        let found = repo.get_session("sess-1").await.unwrap().unwrap();
+        let found = repo
+            .get_session(&created.channel_session_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.agent_type, "acp");
     }
 
@@ -1237,20 +1879,22 @@ mod tests {
     #[tokio::test]
     async fn delete_session_by_user_chat_removes_only_target() {
         let (repo, _db) = setup().await;
-        seed_channel(&repo, "tg-1").await;
-        repo.create_user(&sample_user()).await.unwrap();
+        let plugin = seed_channel(&repo, "Telegram Stub").await;
+        let user = seed_user(&repo, plugin.channel_plugin_id.as_str()).await;
 
-        let s1 = sample_session("usr-1");
-        repo.get_or_create_session("usr-1", "chat-abc", "tg-1", &s1).await.unwrap();
+        let s1 = sample_session(user.channel_user_id.as_str(), plugin.channel_plugin_id.as_str(), "chat-abc");
+        repo.get_or_create_session(user.channel_user_id.as_str(), "chat-abc", plugin.channel_plugin_id.as_str(), &s1)
+            .await
+            .unwrap();
 
-        let s2 = ChannelSessionRow {
-            id: "sess-2".into(),
-            chat_id: Some("chat-xyz".into()),
-            ..sample_session("usr-1")
-        };
-        repo.get_or_create_session("usr-1", "chat-xyz", "tg-1", &s2).await.unwrap();
+        let s2 = sample_session(user.channel_user_id.as_str(), plugin.channel_plugin_id.as_str(), "chat-xyz");
+        repo.get_or_create_session(user.channel_user_id.as_str(), "chat-xyz", plugin.channel_plugin_id.as_str(), &s2)
+            .await
+            .unwrap();
 
-        repo.delete_session_by_user_chat("usr-1", "chat-abc", "tg-1").await.unwrap();
+        repo.delete_session_by_user_chat(user.channel_user_id.as_str(), "chat-abc", plugin.channel_plugin_id.as_str())
+            .await
+            .unwrap();
 
         let remaining = repo.get_all_sessions().await.unwrap();
         assert_eq!(remaining.len(), 1);
@@ -1261,63 +1905,81 @@ mod tests {
     async fn delete_session_by_user_chat_no_match_is_ok() {
         let (repo, _db) = setup().await;
         // No sessions exist —should not error.
-        repo.delete_session_by_user_chat("usr-1", "chat-abc", "tg-1").await.unwrap();
+        repo.delete_session_by_user_chat(MISSING_ID, "chat-abc", MISSING_ID)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn same_chat_two_channels_get_isolated_sessions() {
         let (repo, _db) = setup().await;
-        seed_channel(&repo, "tg-1").await;
-        repo.create_user(&sample_user()).await.unwrap();
-        seed_channel(&repo, "achn_2").await;
+        let first_plugin = seed_channel(&repo, "Telegram Stub A").await;
+        let second_plugin = seed_channel(&repo, "Telegram Stub B").await;
+        let mut unscoped = sample_user(first_plugin.channel_plugin_id.as_str());
+        unscoped.channel_plugin_id = None;
+        let user = repo.create_user(&unscoped).await.unwrap();
 
-        let s1 = sample_session("usr-1");
-        repo.get_or_create_session("usr-1", "chat-abc", "tg-1", &s1).await.unwrap();
-
-        // Same user + same chat through another bot → a second session.
-        let s2 = ChannelSessionRow {
-            id: "sess-2".into(),
-            channel_id: Some("achn_2".into()),
-            ..sample_session("usr-1")
-        };
-        let created = repo
-            .get_or_create_session("usr-1", "chat-abc", "achn_2", &s2)
+        let s1 = sample_session(user.channel_user_id.as_str(), first_plugin.channel_plugin_id.as_str(), "chat-abc");
+        let first = repo
+            .get_or_create_session(user.channel_user_id.as_str(), "chat-abc", first_plugin.channel_plugin_id.as_str(), &s1)
             .await
             .unwrap();
-        assert_eq!(created.id, "sess-2");
+
+        // Same user + same chat through another bot → a second session.
+        let s2 = sample_session(user.channel_user_id.as_str(), second_plugin.channel_plugin_id.as_str(), "chat-abc");
+        let created = repo
+            .get_or_create_session(user.channel_user_id.as_str(), "chat-abc", second_plugin.channel_plugin_id.as_str(), &s2)
+            .await
+            .unwrap();
+        assert_eq!(created.channel_session_id, s2.channel_session_id);
         assert_eq!(repo.get_all_sessions().await.unwrap().len(), 2);
 
         // Reuse matches per channel.
+        let reuse_candidate = sample_session(
+            user.channel_user_id.as_str(),
+            first_plugin.channel_plugin_id.as_str(),
+            "chat-abc",
+        );
         let reused = repo
-            .get_or_create_session("usr-1", "chat-abc", "tg-1", &s2)
+            .get_or_create_session(
+                user.channel_user_id.as_str(),
+                "chat-abc",
+                first_plugin.channel_plugin_id.as_str(),
+                &reuse_candidate,
+            )
             .await
             .unwrap();
-        assert_eq!(reused.id, "sess-1");
+        assert_eq!(reused.channel_session_id, first.channel_session_id);
     }
 
     #[tokio::test]
     async fn delete_sessions_by_channel_only_hits_that_channel() {
         let (repo, _db) = setup().await;
-        seed_channel(&repo, "tg-1").await;
-        repo.create_user(&sample_user()).await.unwrap();
-        seed_channel(&repo, "achn_2").await;
+        let first_plugin = seed_channel(&repo, "Telegram Stub A").await;
+        let second_plugin = seed_channel(&repo, "Telegram Stub B").await;
+        let mut unscoped = sample_user(first_plugin.channel_plugin_id.as_str());
+        unscoped.channel_plugin_id = None;
+        let user = repo.create_user(&unscoped).await.unwrap();
 
-        let s1 = sample_session("usr-1");
-        repo.get_or_create_session("usr-1", "chat-abc", "tg-1", &s1).await.unwrap();
-        let s2 = ChannelSessionRow {
-            id: "sess-2".into(),
-            channel_id: Some("achn_2".into()),
-            ..sample_session("usr-1")
-        };
-        repo.get_or_create_session("usr-1", "chat-abc", "achn_2", &s2)
+        let s1 = sample_session(user.channel_user_id.as_str(), first_plugin.channel_plugin_id.as_str(), "chat-abc");
+        repo.get_or_create_session(user.channel_user_id.as_str(), "chat-abc", first_plugin.channel_plugin_id.as_str(), &s1)
+            .await
+            .unwrap();
+        let s2 = sample_session(user.channel_user_id.as_str(), second_plugin.channel_plugin_id.as_str(), "chat-abc");
+        repo.get_or_create_session(user.channel_user_id.as_str(), "chat-abc", second_plugin.channel_plugin_id.as_str(), &s2)
             .await
             .unwrap();
 
-        repo.delete_sessions_by_channel("tg-1").await.unwrap();
+        repo.delete_sessions_by_channel(first_plugin.channel_plugin_id.as_str())
+            .await
+            .unwrap();
 
         let remaining = repo.get_all_sessions().await.unwrap();
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].channel_id.as_deref(), Some("achn_2"));
+        assert_eq!(
+            remaining[0].channel_plugin_id,
+            Some(second_plugin.channel_plugin_id.clone())
+        );
     }
 
     // -- Pairing tests ------------------------------------------------
@@ -1326,9 +1988,10 @@ mod tests {
     async fn create_and_get_pairing() {
         let (repo, _db) = setup().await;
         let pairing = sample_pairing();
-        repo.create_pairing(&pairing).await.unwrap();
+        let created = repo.create_pairing(&pairing).await.unwrap();
 
         let found = repo.get_pairing_by_code("123456").await.unwrap().unwrap();
+        assert_eq!(found.code, created.code);
         assert_eq!(found.platform_user_id, "tg_99");
         assert_eq!(found.status, "pending");
     }
@@ -1347,7 +2010,7 @@ mod tests {
         let p1 = sample_pairing();
         repo.create_pairing(&p1).await.unwrap();
 
-        let p2 = ChannelPairingCodeRow {
+        let p2 = NewChannelPairingCodeRow {
             code: "654321".into(),
             status: "approved".into(),
             ..sample_pairing()
@@ -1389,7 +2052,7 @@ mod tests {
         let now = nomifun_common::now_ms();
 
         // Create an already-expired pairing.
-        let expired = ChannelPairingCodeRow {
+        let expired = NewChannelPairingCodeRow {
             code: "111111".into(),
             expires_at: now - 1000,
             ..sample_pairing()
@@ -1397,7 +2060,7 @@ mod tests {
         repo.create_pairing(&expired).await.unwrap();
 
         // Create a still-valid pairing.
-        let valid = ChannelPairingCodeRow {
+        let valid = NewChannelPairingCodeRow {
             code: "222222".into(),
             expires_at: now + 600_000,
             ..sample_pairing()
@@ -1420,7 +2083,7 @@ mod tests {
         let now = nomifun_common::now_ms();
 
         // Create an expired pairing that is already approved.
-        let approved = ChannelPairingCodeRow {
+        let approved = NewChannelPairingCodeRow {
             code: "333333".into(),
             expires_at: now - 1000,
             status: "approved".into(),

@@ -585,22 +585,8 @@ impl OnConversationDelete for NomiSessionFilesCascade {
             warn!(conversation_id, error = %e, "Failed to delete nomi session file on conversation delete (non-fatal)");
         }
 
-        // 2) legacy auto-provisioned temp workspace(s) named `{label}-temp-{id}`.
-        //    Exact suffix match is id-safe (`-temp-3` never matches `-temp-13`).
-        //    New token-named managed workspaces are deleted by ConversationService
-        //    while it still has the full conversation row.
-        let conv_dir = self.work_dir.join("conversations");
-        let suffix = format!("-temp-{id}");
-        if let Ok(entries) = std::fs::read_dir(&conv_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if name.to_string_lossy().ends_with(&suffix) && entry.path().is_dir() {
-                    if let Err(e) = std::fs::remove_dir_all(entry.path()) {
-                        warn!(conversation_id, error = %e, "Failed to remove temp workspace on conversation delete (non-fatal)");
-                    }
-                }
-            }
-        }
+        // Managed UUIDv7 workspace deletion is owned by ConversationService
+        // while it still has the authoritative temp_workspace_id.
     }
 }
 
@@ -727,7 +713,7 @@ mod tests {
 
     fn make_runtime_options(conversation_id: &str) -> AgentRuntimeBuildOptions {
         AgentRuntimeBuildOptions {
-            user_id: "user_0190f5fe-7c00-7a00-8000-000000000001".into(),
+            user_id: "0190f5fe-7c00-7a00-8000-000000000001".into(),
             agent_type: AgentType::Acp,
             workspace: "/tmp/test".into(),
             model: None,

@@ -37,7 +37,7 @@ const DRAFT_MAX_LINES: usize = 40;
 /// 一次进化运行的小结（P1 仅返回，不落表）。
 #[derive(Debug, Clone)]
 pub struct EvolveRun {
-    pub id: String,
+    pub evolve_run_id: String,
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub status: String,
@@ -131,14 +131,18 @@ impl EvolutionEngine {
             let cfg = self.config.read().await;
             (cfg.evolve.skill_half_life_days, cfg.evolve.skill_archive_threshold)
         };
-        if let Ok(n) = self.store.decay_skills(half_life, archive_threshold).await {
-            if n > 0 {
+        if let Ok(archived) = self.store.decay_skills(half_life, archive_threshold).await {
+            for skill in archived {
                 let owner = {
                     let did = { self.config.read().await.default_companion_id.clone() };
                     self.registry.resolve_default(did.as_deref()).await
                 };
                 if let Some(owner) = owner.as_deref() {
-                    self.emitter.emit_skill_archived(owner, "");
+                    self.emitter.emit_skill_archived(
+                        owner,
+                        &skill.companion_skill_id,
+                        &skill.skill_name,
+                    );
                 }
             }
         }
@@ -162,7 +166,7 @@ impl EvolutionEngine {
             // This summary is returned to the current caller only. It is not
             // persisted, exported, or referenced after the call, so use an
             // operation token rather than registering a durable entity type.
-            id: generate_id(),
+            evolve_run_id: generate_id(),
             started_at,
             finished_at: None,
             status: "ok".into(),
@@ -189,7 +193,8 @@ impl EvolutionEngine {
         };
 
         let cursor = self.store.get_state_i64("evolve_cursor_ts").await?;
-        let (events, _truncated) = read_events_since(&self.companion_dir, cursor, MAX_EVENTS_PER_RUN);
+        let (events, _truncated) =
+            read_events_since(&self.companion_dir, cursor, MAX_EVENTS_PER_RUN)?;
         if events.is_empty() {
             run.status = "no_events".into();
             run.finished_at = Some(now_ms());
@@ -260,11 +265,26 @@ impl EvolutionEngine {
         if self.store.is_signature_rejected(&p.signature).await.unwrap_or(false) {
             return Ok(false);
         }
-        if matches!(self.store.pattern_status(&p.signature).await.unwrap_or(None).as_deref(), Some("drafted")) {
+        if matches!(
+            self.store
+                .find_pattern_by_signature(&p.signature)
+                .await
+                .unwrap_or(None)
+                .map(|pattern| pattern.status),
+            Some(status) if status == "drafted"
+        ) {
             return Ok(false);
         }
-        let anchor = p.example_event_ids.first().cloned().unwrap_or_default();
-        let _ = self.store.bump_pattern(&p.signature, owner, &anchor, now_ms()).await;
+        let anchor = p.example_event_ids.first().cloned().ok_or_else(|| {
+            AppError::Internal(format!(
+                "mined pattern {:?} has no example event id",
+                p.signature
+            ))
+        })?;
+        let pattern = self
+            .store
+            .bump_pattern(&p.signature, &p.anchor.conversation_id, &anchor, now_ms())
+            .await?;
 
         // Draft (1 retry). A completer error → Err (caller terminates + keeps cursor).
         // Rehydrate the real (redacted) transcript window for this pattern so the drafter
@@ -294,7 +314,10 @@ impl EvolutionEngine {
             Err(e) => return Err(e),
         };
         // Mark drafted (approved or not) so the same signature isn't re-judged every run.
-        self.store.mark_pattern_status(&p.signature, "drafted").await.ok();
+        self.store
+            .mark_pattern_status(&pattern.skill_pattern_id, "drafted")
+            .await
+            .ok();
         if !approved {
             return Ok(false);
         }
@@ -309,9 +332,11 @@ impl EvolutionEngine {
         // (improve + version bump) instead of creating a near-duplicate (P5 T2-A). Provider error
         // → Err (terminate); any other failure degrades to the normal create path below.
         if let Ok(Some(existing)) = self.store.find_similar_skill(owner, &name).await {
-            if let Ok(Some(row)) = self.store.get_skill(owner, &existing).await {
+            if let Ok(Some(row)) = self.store.get_skill(&existing.companion_skill_id).await {
                 let draft_dir = row.status == "draft";
-                if let Ok(dir) = skill_service::skill_dir_for(&self.skill_paths, &scope, &existing, draft_dir) {
+                if let Ok(dir) =
+                    skill_service::skill_dir_for(&self.skill_paths, &scope, &existing.skill_name, draft_dir)
+                {
                     if let Ok(existing_body) = tokio::fs::read_to_string(dir.join(SKILL_MANIFEST_FILE)).await {
                         let merge_user = prompt::build_merge_prompt(&existing_body, &draft, p);
                         match self.completer.complete(provider_id, model, prompt::MERGE_SYSTEM, &merge_user, DRAFT_MAX_TOKENS).await {
@@ -319,7 +344,7 @@ impl EvolutionEngine {
                                 if let Ok(merged) = prompt::parse_draft_output(&raw) {
                                     if !merged.description.trim().is_empty() && !merged.body.trim().is_empty() {
                                         let merged_input = SkillDraftInput {
-                                            name: existing.clone(),
+                                            name: existing.skill_name.clone(),
                                             description: merged.description,
                                             when_to_use: merged.when_to_use,
                                             allowed_tools: None,
@@ -327,10 +352,14 @@ impl EvolutionEngine {
                                             body: merged.body,
                                         };
                                         let md = skill_service::build_skill_md(&merged_input);
-                                        if skill_service::write_skill(&self.skill_paths, &scope, draft_dir, &existing, &md).await.is_ok() {
-                                            let _ = self.store.bump_skill_version(owner, &existing).await;
-                                            self.emitter.emit_skill_learned(owner, &existing);
-                                            self.store.mark_pattern_status(&p.signature, "drafted").await.ok();
+                                        if crate::skill_io::write_skill(&self.skill_paths, &scope, draft_dir, &existing.skill_name, &md).await.is_ok() {
+                                            let _ = self.store.bump_skill_version(&existing.companion_skill_id).await;
+                                            self.emitter.emit_skill_learned(
+                                                owner,
+                                                &existing.companion_skill_id,
+                                                &existing.skill_name,
+                                            );
+                                            self.store.mark_pattern_status(&pattern.skill_pattern_id, "drafted").await.ok();
                                             return Ok(true);
                                         }
                                     }
@@ -357,22 +386,23 @@ impl EvolutionEngine {
         // the bar (repetition-derived; single-session reflections never reach it).
         let auto = auto_activate && confidence >= auto_threshold;
 
-        if let Err(e) = skill_service::create_skill(&self.skill_paths, &scope, /* draft= */ !auto, &input).await {
+        if let Err(e) = crate::skill_io::create_skill(&self.skill_paths, &scope, /* draft= */ !auto, &input).await {
             tracing::warn!(error = %e, skill = %name, "evolution failed to write skill");
             return Ok(false);
         }
         let now = now_ms();
         let skill = CompanionSkill {
+            companion_skill_id: nomifun_common::generate_id(),
             skill_name: name.clone(),
             scope_kind: "companion".into(),
             scope_companion_id: Some(owner.to_owned()),
             status: if auto { "active".into() } else { "draft".into() },
             source: "mined".into(),
             confidence,
-            provenance: p.example_event_ids.clone(),
+            provenance_event_ids: p.example_event_ids.clone(),
             strength: 1.0,
             version: 1,
-            superseded_by: None,
+            skill_pattern_id: Some(pattern.skill_pattern_id.clone()),
             usage_count: 0,
             last_used_at: None,
             created_at: now,
@@ -380,6 +410,20 @@ impl EvolutionEngine {
             signature: p.signature.clone(),
         };
         if let Err(e) = self.store.insert_skill(&skill).await {
+            if let Err(cleanup_error) = crate::fsio::remove_path_entry(
+                &skill_service::skill_dir_for(&self.skill_paths, &scope, &name, !auto)
+                    .map_err(|path_error| {
+                        AppError::Internal(format!(
+                            "resolve failed skill write for cleanup: {path_error}"
+                        ))
+                    })?,
+            ) {
+                tracing::error!(
+                    error = %cleanup_error,
+                    skill = %name,
+                    "evolution failed to roll back orphaned skill directory"
+                );
+            }
             tracing::warn!(error = %e, "evolution failed to insert skill row");
             return Ok(false);
         }
@@ -387,20 +431,27 @@ impl EvolutionEngine {
         if auto {
             // Auto-activated: no review card, but emit skill-learned so the UI toasts and
             // the skill shows as active (the user can still archive it — "see + undo").
-            self.emitter.emit_skill_learned(owner, &name);
+                self.emitter.emit_skill_learned(
+                    owner,
+                    &skill.companion_skill_id,
+                    &skill.skill_name,
+                );
         } else {
             let action = serde_json::json!({
                 "type": "create_skill",
-                "name": name,
+                "companion_skill_id": skill.companion_skill_id,
                 "companion_id": owner,
-                "signature": p.signature,
             });
             let title = format!("我学会了一个新技能：{name}");
             let body = format!("你做过「{}」这套操作，我把它固化成了技能，采纳后我就能自动帮你做。", draft.description);
             if let Ok(created) = self.store.insert_suggestion("create_skill", &title, &body, Some(&action)).await {
                 self.emitter.emit_suggestion_created(&owner, &created);
             }
-            self.emitter.emit_skill_drafted(owner, &name);
+            self.emitter.emit_skill_drafted(
+                owner,
+                &skill.companion_skill_id,
+                &skill.skill_name,
+            );
         }
         Ok(true)
     }
@@ -467,36 +518,69 @@ impl EvolutionEngine {
             body: draft.body.clone(),
         };
         let scope = SkillScope::Companion(owner.to_owned());
-        skill_service::create_skill(&self.skill_paths, &scope, true, &input)
+        crate::skill_io::create_skill(&self.skill_paths, &scope, true, &input)
             .await
             .map_err(|e| AppError::Internal(format!("write demonstrated skill: {e}")))?;
         let now = now_ms();
-        self.store
+        if let Err(error) = self
+            .store
             .insert_skill(&CompanionSkill {
+                companion_skill_id: nomifun_common::generate_id(),
                 skill_name: name.clone(),
                 scope_kind: "companion".into(),
                 scope_companion_id: Some(owner.to_owned()),
                 status: "draft".into(),
                 source: "demonstrated".into(),
                 confidence: 0.5,
-                provenance: vec![],
+                provenance_event_ids: vec![],
                 strength: 1.0,
                 version: 1,
-                superseded_by: None,
+                skill_pattern_id: None,
                 usage_count: 0,
                 last_used_at: None,
                 created_at: now,
                 updated_at: now,
                 signature: String::new(),
             })
-            .await?;
-        let action = serde_json::json!({ "type": "create_skill", "name": name, "companion_id": owner, "signature": "" });
+            .await
+        {
+            let draft_dir = skill_service::skill_dir_for(&self.skill_paths, &scope, &name, true)
+                .map_err(|path_error| {
+                    AppError::Internal(format!(
+                        "resolve demonstrated skill for rollback: {path_error}"
+                    ))
+                })?;
+            crate::fsio::remove_path_entry(&draft_dir).map_err(|cleanup_error| {
+                AppError::Internal(format!(
+                    "{error}; additionally failed to remove orphaned demonstrated skill {}: {cleanup_error}",
+                    draft_dir.display()
+                ))
+            })?;
+            return Err(error);
+        }
+        let companion_skill_id = self
+            .store
+            .find_owned_skill_by_name(owner, &name)
+            .await?
+            .ok_or_else(|| {
+                AppError::Internal("demonstrated skill row disappeared after insert".into())
+            })?
+            .companion_skill_id;
+        let action = serde_json::json!({
+            "type": "create_skill",
+            "companion_skill_id": companion_skill_id,
+            "companion_id": owner,
+        });
         let title = format!("我学会了你示范的技能：{name}");
         let body = format!("照你示范的「{}」整理成了技能，采纳后我就能复用。", draft.description);
-        if let Ok(created) = self.store.insert_suggestion("create_skill", &title, &body, Some(&action)).await {
+        if let Ok(created) = self
+            .store
+            .insert_suggestion("create_skill", &title, &body, Some(&action))
+            .await
+        {
             self.emitter.emit_suggestion_created(&owner, &created);
         }
-        self.emitter.emit_skill_drafted(owner, &name);
+        self.emitter.emit_skill_drafted(owner, &companion_skill_id, &name);
         Ok(Some(name))
     }
 }
@@ -527,7 +611,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     fn conversation_fixture(sequence: u64) -> String {
-        let raw = format!("conv_0190f5fe-7c00-7a00-8abc-{sequence:012}");
+        let raw = format!("0190f5fe-7c00-7a00-8abc-{sequence:012}");
         nomifun_common::ConversationId::try_from(raw.as_str()).unwrap().into_string()
     }
 
@@ -586,6 +670,7 @@ mod tests {
                 append_event(
                     dir,
                     &CollectedEvent {
+                        event_id: nomifun_common::generate_id(),
                         ts: base + k,
                         source: "tool_calls".into(),
                         name: "tool.call".into(),
@@ -611,9 +696,12 @@ mod tests {
         });
         config.evolve.min_pattern_count = 3;
         config.evolve.min_distinct_sessions = 2;
-        let registry = Arc::new(CompanionRegistry::scan(dir.join("companions"), dir.join("shared")));
+        let registry = Arc::new(
+            CompanionRegistry::scan(dir.join("companions"), dir.join("shared"))
+                .unwrap(),
+        );
         let companion = registry.create("测试", "ink").await.unwrap();
-        config.default_companion_id = Some(companion.id.clone());
+        config.default_companion_id = Some(companion.companion_id.clone());
         let engine = EvolutionEngine {
             companion_dir: dir.to_path_buf(),
             config: Arc::new(RwLock::new(config)),
@@ -625,7 +713,7 @@ mod tests {
             transcript: std::sync::RwLock::new(Arc::new(NoopTranscriptSource)),
             run_lock: Arc::new(Mutex::new(())),
         };
-        (engine, companion.id)
+        (engine, companion.companion_id)
     }
 
     #[tokio::test]
@@ -706,6 +794,7 @@ mod tests {
                 append_event(
                     dir,
                     &CollectedEvent {
+                        event_id: nomifun_common::generate_id(),
                         ts: base + k,
                         source: "tool_calls".into(),
                         name: "tool.call".into(),
@@ -793,16 +882,17 @@ mod tests {
         engine
             .store
             .insert_skill(&CompanionSkill {
+            companion_skill_id: nomifun_common::generate_id(),
                 skill_name: "grep-read-edit".into(),
                 scope_kind: "companion".into(),
                 scope_companion_id: Some(cid.clone()),
                 status: "active".into(),
                 source: "mined".into(),
                 confidence: 0.7,
-                provenance: vec![],
+                provenance_event_ids: vec![],
                 strength: 1.0,
                 version: 1,
-                superseded_by: None,
+                skill_pattern_id: None,
                 usage_count: 0,
                 last_used_at: None,
                 created_at: now,

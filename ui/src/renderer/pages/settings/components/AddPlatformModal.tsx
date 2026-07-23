@@ -1,7 +1,7 @@
 import type { IProvider, ModelTask } from '@/common/config/storage';
 import type { ProtocolDetectionResponse, ProtocolType } from '@/common/utils/protocolDetector';
 import { ipcBridge } from '@/common';
-import { prefixedId } from '@/common/utils';
+import { uuidv7 } from '@/common/utils';
 import { parseProviderId } from '@/common/types/ids';
 import { normalizeApiKeyList, validateApiKeysForSave } from '@/common/utils/apiKeys';
 import { platformHasNoModelsEndpoint } from '@/common/utils/platformConstants';
@@ -449,7 +449,7 @@ const AddPlatformModal = ModalHOC<{
         }
 
         const provider: IProvider = {
-          id: parseProviderId(prefixedId('prov')),
+          id: parseProviderId(uuidv7()),
           platform: providerPlatform,
           name,
           // 优先使用用户输入的 base_url，否则使用平台预设值

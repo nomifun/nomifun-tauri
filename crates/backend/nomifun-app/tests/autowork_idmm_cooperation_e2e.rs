@@ -123,7 +123,7 @@ async fn seed_mock_provider(services: &AppServices) -> String {
     let provider_id = ProviderId::new().into_string();
     nomifun_db::sqlx::query(
         "INSERT INTO providers \
-         (id, platform, name, base_url, api_key_encrypted, models, enabled, \
+         (provider_id, platform, name, base_url, api_key_encrypted, models, enabled, \
           capabilities, created_at, updated_at) \
          VALUES (?, 'openai', 'AutoWork IDMM mock', 'https://example.invalid', \
                  'encrypted', '[\"mock-model\"]', 1, '[]', 1, 1)",
@@ -160,7 +160,10 @@ async fn autowork_and_idmm_enable_auto_resumes_paused_tag_and_runs_requirement()
             .await
             .unwrap();
         assert!(resp.status().is_success(), "create conversation failed: {}", resp.status());
-        body_json(resp).await["data"]["id"].as_str().unwrap().to_owned()
+        body_json(resp).await["data"]["conversation_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     };
 
     // One requirement in `tag`.
@@ -172,7 +175,10 @@ async fn autowork_and_idmm_enable_auto_resumes_paused_tag_and_runs_requirement()
             .await
             .unwrap();
         assert!(resp.status().is_success(), "create requirement failed: {}", resp.status());
-        body_json(resp).await["data"]["id"].as_str().unwrap().to_owned()
+        body_json(resp).await["data"]["requirement_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     };
 
     // Drive the requirement to failure MAX_ATTEMPTS (=3) times so its tag PAUSES —
@@ -185,7 +191,11 @@ async fn autowork_and_idmm_enable_auto_resumes_paused_tag_and_runs_requirement()
             .await
             .unwrap()
             .expect("claimable during pause setup");
-        services.requirement_service.finalize_if_needed(&req_id, true, None, false).await.unwrap();
+        services
+            .requirement_service
+            .finalize_if_needed(&req_id, true, None, false)
+            .await
+            .unwrap();
     }
     assert!(
         services.requirement_service.is_tag_paused(tag).await.unwrap(),
@@ -287,7 +297,10 @@ async fn autowork_broadcasts_run_state_transitions_for_session_list_sync() {
             .await
             .unwrap();
         assert!(resp.status().is_success(), "create conversation failed: {}", resp.status());
-        body_json(resp).await["data"]["id"].as_str().unwrap().to_owned()
+        body_json(resp).await["data"]["conversation_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     };
     let req_id = {
         let body = json!({ "title": "需求", "content": "做点事", "tag": tag, "order_key": "1" });
@@ -297,7 +310,10 @@ async fn autowork_broadcasts_run_state_transitions_for_session_list_sync() {
             .await
             .unwrap();
         assert!(resp.status().is_success(), "create requirement failed: {}", resp.status());
-        body_json(resp).await["data"]["id"].as_str().unwrap().to_owned()
+        body_json(resp).await["data"]["requirement_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     };
 
     // Capture owner-scoped events BEFORE enabling, so the loop's emits are

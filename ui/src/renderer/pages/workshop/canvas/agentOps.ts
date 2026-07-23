@@ -8,7 +8,8 @@
  * 画布 Agent (canvas agent) op applier.
  *
  * While a canvas is open, this hook polls the backend's pending agent-op queue
- * (`GET /api/workshop/canvases/{id}/pending-ops`) and applies each op to the
+ * (`GET /api/workshop/canvases/{canvas_id}/pending-ops`) and applies each op to
+ * the
  * LIVE react-flow graph through handlers the editor supplies — so an agent's
  * writes land through the same code path a user's edits do (history + debounced
  * autosave), never by the backend racing the frontend's whole-doc autosave.

@@ -148,7 +148,7 @@ async fn setup_proxy(
     std::fs::write(&file, b"test").unwrap();
 
     let access = mgr
-        .start("user_0190f5fe-7c00-7a00-8abc-012345678901", file.to_str().unwrap(), doc_type)
+        .start("0190f5fe-7c00-7a00-8abc-012345678901", file.to_str().unwrap(), doc_type)
         .await
         .unwrap();
     let proxy = ProxyService::new(mgr);
@@ -167,7 +167,7 @@ async fn setup_ssrf_proxy(doc_type: DocType) -> (ProxyService, PreviewAccess, te
     std::fs::write(&file, b"test").unwrap();
 
     let access = mgr
-        .start("user_0190f5fe-7c00-7a00-8abc-012345678901", file.to_str().unwrap(), doc_type)
+        .start("0190f5fe-7c00-7a00-8abc-012345678901", file.to_str().unwrap(), doc_type)
         .await
         .unwrap();
     let proxy = ProxyService::new(mgr);
@@ -239,10 +239,10 @@ async fn stopped_capability_is_revoked_before_proxying() {
     let file = dir.path().join("test.docx");
     std::fs::write(&file, b"test").unwrap();
     let path = file.to_string_lossy().into_owned();
-    let access = mgr.start("user_0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Word).await.unwrap();
+    let access = mgr.start("0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Word).await.unwrap();
     let proxy = ProxyService::new(Arc::clone(&mgr));
 
-    mgr.stop("user_0190f5fe-7c00-7a00-8abc-012345678901", DocType::Word, &access.capability)
+    mgr.stop("0190f5fe-7c00-7a00-8abc-012345678901", DocType::Word, &access.capability)
         .await;
     let result = proxy
         .forward(&access.capability, "/", DocType::Word, &[])

@@ -515,8 +515,8 @@ export const useConversationCommandQueue = ({
       // send promise's accepted-result reconciliation may advance this phase.
       if (gate.phase === 'waiting_start') return;
 
-      // New servers provide an exact generation id. Never let a delayed
-      // completion from an older turn release the gate for a newer turn.
+      // Correlated completions carry the exact generation id. Never let a
+      // delayed completion from an older turn release the gate for a newer turn.
       const completedGate = reduceCommandQueueExecutionGate(gate, {
         type: 'turnCompleted',
         turnId: event.turn_id,
@@ -531,8 +531,8 @@ export const useConversationCommandQueue = ({
       // must never be upgraded into an uncorrelated runtime release.
       if (gate.phase === 'waiting_completion' && gate.turnId && event.turn_id) return;
 
-      // Backward compatibility for servers that predate turn_id on completion:
-      // re-read the authoritative runtime after the event. The identity check in
+      // A current stop/idle completion may intentionally omit turn_id. Re-read
+      // the authoritative runtime after the event. The identity check in
       // releaseExecutionGate also rejects a start/reset that races this request.
       void reconcileActiveExecution();
     });

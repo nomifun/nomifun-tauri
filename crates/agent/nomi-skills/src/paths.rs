@@ -1,21 +1,19 @@
 use std::path::{Path, PathBuf};
 
-use nomi_config::config::app_config_dir;
+use nomi_config::config::app_data_dir;
 
 // ---------------------------------------------------------------------------
-// User-level directories (<config_dir>/nomi/)
+// User-level directories (<app_data_dir>/)
 // ---------------------------------------------------------------------------
 
-/// Return the user-level skills directory: `<config_dir>/nomi/skills/`
+/// Return the user-level skills directory: `<app_data_dir>/skills/`.
 ///
-/// Returns `None` if the platform config directory cannot be determined.
+/// Hosted Nomi receives the effective Nomifun data root through
+/// `NOMIFUN_DATA_DIR`, keeping the loader on the same reset/backup-managed root
+/// as the backend skill service. Standalone callers use `app_data_dir()`'s
+/// platform fallback.
 pub fn user_skills_dir() -> Option<PathBuf> {
-    app_config_dir().map(|d| d.join("skills"))
-}
-
-/// Return the user-level legacy commands directory: `<config_dir>/nomi/commands/`
-pub fn user_commands_dir() -> Option<PathBuf> {
-    app_config_dir().map(|d| d.join("commands"))
+    Some(app_data_dir().join("skills"))
 }
 
 // ---------------------------------------------------------------------------
@@ -134,16 +132,6 @@ mod tests {
                 s.ends_with("skills"),
                 "expected path to end with 'skills': {s}"
             );
-        }
-        // If app_config_dir() returns None (rare), that's acceptable.
-    }
-
-    #[test]
-    fn test_user_commands_dir_contains_nomi_commands() {
-        if let Some(dir) = user_commands_dir() {
-            let s = dir.to_string_lossy();
-            assert!(s.contains("nomi"));
-            assert!(s.ends_with("commands"));
         }
     }
 
@@ -305,7 +293,7 @@ mod supplemental_tests {
     }
 
     // -----------------------------------------------------------------------
-    // TC-2.x / TC-3.x: user_skills_dir / user_commands_dir
+    // TC-2.x: user_skills_dir
     // -----------------------------------------------------------------------
 
     #[test]
@@ -313,18 +301,6 @@ mod supplemental_tests {
         if let Some(dir) = user_skills_dir() {
             let s = dir.to_string_lossy();
             assert!(s.ends_with("skills"), "path should end with 'skills': {s}");
-            assert!(s.contains("nomi"), "path should contain 'nomi': {s}");
-        }
-    }
-
-    #[test]
-    fn tc_3_1_user_commands_dir_ends_with_commands() {
-        if let Some(dir) = user_commands_dir() {
-            let s = dir.to_string_lossy();
-            assert!(
-                s.ends_with("commands"),
-                "path should end with 'commands': {s}"
-            );
             assert!(s.contains("nomi"), "path should contain 'nomi': {s}");
         }
     }

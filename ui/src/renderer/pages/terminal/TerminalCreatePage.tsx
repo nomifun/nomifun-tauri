@@ -104,7 +104,7 @@ const TerminalCreatePage: React.FC = () => {
         try {
           await ipcBridge.idmm.set.invoke({
             kind: 'terminal',
-            target_id: session.id,
+            target_id: session.terminal_id,
             ...idmm,
           });
         } catch {
@@ -122,7 +122,7 @@ const TerminalCreatePage: React.FC = () => {
         try {
           await ipcBridge.requirements.setAutoWork.invoke({
             kind: 'terminal',
-            target_id: session.id,
+            target_id: session.terminal_id,
             enabled: true,
             tag: autowork.tag,
           });
@@ -135,7 +135,7 @@ const TerminalCreatePage: React.FC = () => {
         }
       }
       emitter.emit('terminal.list.refresh');
-      navigate(`/terminal/${session.id}`);
+      navigate(`/terminal/${session.terminal_id}`);
     } catch (err) {
       Message.error(err instanceof Error ? err.message : String(err));
     } finally {

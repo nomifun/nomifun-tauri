@@ -26,7 +26,7 @@ const KIND_COLORS: Record<string, string> = {
 type ScopeKind = 'user' | 'companion';
 
 interface CompanionRef {
-  id: CompanionId;
+  companion_id: CompanionId;
   name: string;
 }
 
@@ -64,7 +64,7 @@ const MemoriesTab: React.FC<MemoriesTabProps> = ({ companionId = null, companion
   const [deleteTarget, setDeleteTarget] = useState<ICompanionMemory | null>(null);
 
   const companionName = useCallback(
-    (id: CompanionId) => companions.find((c) => c.id === id)?.name || id,
+    (id: CompanionId) => companions.find((c) => c.companion_id === id)?.name || id,
     [companions]
   );
 
@@ -129,7 +129,7 @@ const MemoriesTab: React.FC<MemoriesTabProps> = ({ companionId = null, companion
 
   const togglePin = useCallback(
     async (m: ICompanionMemory) => {
-      await ipcBridge.companion.updateMemory.invoke({ id: m.id, pinned: !m.pinned });
+      await ipcBridge.companion.updateMemory.invoke({ memory_id: m.memory_id, pinned: !m.pinned });
       void refresh();
     },
     [refresh]
@@ -137,7 +137,10 @@ const MemoriesTab: React.FC<MemoriesTabProps> = ({ companionId = null, companion
 
   const toggleArchive = useCallback(
     async (m: ICompanionMemory) => {
-      await ipcBridge.companion.updateMemory.invoke({ id: m.id, status: m.status === 'active' ? 'archived' : 'active' });
+      await ipcBridge.companion.updateMemory.invoke({
+        memory_id: m.memory_id,
+        status: m.status === 'active' ? 'archived' : 'active',
+      });
       void refresh();
     },
     [refresh]
@@ -145,7 +148,7 @@ const MemoriesTab: React.FC<MemoriesTabProps> = ({ companionId = null, companion
 
   const remove = useCallback(
     async (m: ICompanionMemory) => {
-      await ipcBridge.companion.deleteMemory.invoke({ id: m.id });
+      await ipcBridge.companion.deleteMemory.invoke({ memory_id: m.memory_id });
       void refresh();
     },
     [refresh]
@@ -194,7 +197,7 @@ const MemoriesTab: React.FC<MemoriesTabProps> = ({ companionId = null, companion
     if (!editTarget || !editContent.trim()) return;
     try {
       await ipcBridge.companion.updateMemory.invoke({
-        id: editTarget.id,
+        memory_id: editTarget.memory_id,
         content: editContent.trim(),
         scope_kind: editScopeKind,
         scope_companion_id: editScopeKind === 'companion' ? (editScopeCompanionId ?? undefined) : undefined,
@@ -239,8 +242,8 @@ const MemoriesTab: React.FC<MemoriesTabProps> = ({ companionId = null, companion
           placeholder={t('nomi.memories.scopePickCompanion')}
         >
           {companions.map((c) => (
-            <Select.Option key={c.id} value={c.id}>
-              {c.name || c.id}
+            <Select.Option key={c.companion_id} value={c.companion_id}>
+              {c.name || c.companion_id}
             </Select.Option>
           ))}
         </Select>
@@ -332,7 +335,7 @@ const MemoriesTab: React.FC<MemoriesTabProps> = ({ companionId = null, companion
         <div className='flex flex-col gap-8px transition-opacity duration-150' style={{ opacity: loading ? 0.6 : 1 }}>
           {memories.map((m) => (
             <div
-              key={m.id}
+              key={m.memory_id}
               className='group flex items-start gap-10px rounded-12px border border-solid border-[var(--color-border-2)] bg-[var(--color-bg-2)] px-12px py-10px transition-colors hover:bg-fill-2'
             >
               <Tag color={KIND_COLORS[m.kind]}>{t(`nomi.kinds.${m.kind}`)}</Tag>

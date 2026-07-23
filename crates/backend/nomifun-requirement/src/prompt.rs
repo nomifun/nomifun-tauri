@@ -11,7 +11,7 @@ use crate::attachments::PromptAttachment;
 /// (`crates/backend/nomifun-ai-agent/src/factory/nomi.rs`) consumes the
 /// `requirement_sink`, and only `NomiAgentManager` registers
 /// `RequirementCompleteTool` / `RequirementUpdateStatusTool` on the engine.
-/// Every other engine (ACP, Openclaw, Nanobot, Remote, Gemini) ships without
+/// Every other engine (ACP, Openclaw, Nanobot, Remote) ships without
 /// them *in-process* — though ACP gains an equivalent declaration channel via
 /// the injected requirement MCP server (see [`session_has_requirement_tools`]).
 ///
@@ -121,7 +121,7 @@ fn build_requirement_prompt_with_native_tools(tag: &str, req: &Requirement, atta
          status=\"failed\", and a reason.\n\
          Do not pick the next requirement yourself — the platform will hand you the next one.",
         tag = tag,
-        id = req.id,
+        id = req.requirement_id,
         title = req.title,
         order = req.order_key,
         content = req.content,
@@ -161,7 +161,7 @@ fn build_requirement_prompt_no_native_tools(tag: &str, req: &Requirement, attach
          \"Requirement failed:\" followed by the reason). Do not retry silently.\n\
          Do not pick the next requirement yourself — the platform will hand you the next one.",
         tag = tag,
-        id = req.id,
+        id = req.requirement_id,
         title = req.title,
         order = req.order_key,
         content = req.content,
@@ -199,7 +199,7 @@ pub fn build_terminal_requirement_prompt(
          status=\"failed\", and a reason.\n\
          Do not pick the next requirement yourself — the platform will hand you the next one.",
         tag = tag,
-        id = req.id,
+        id = req.requirement_id,
         title = req.title,
         order = req.order_key,
         content = req.content,
@@ -212,11 +212,11 @@ mod tests {
     use super::*;
     use nomifun_api_types::RequirementStatus;
 
-    const ATTACHMENT_REQ_ID: &str = "req_0190f5fe-7c00-7a00-8000-000000000001";
+    const ATTACHMENT_REQ_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 
     fn req() -> Requirement {
         Requirement {
-            id: nomifun_common::RequirementId::new().into_string(),
+            requirement_id: ATTACHMENT_REQ_ID.into(),
             display_no: 1,
             title: "Do X".into(),
             content: "Detailed body".into(),
@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn nomi_prompt_contains_id_and_native_tool_instructions() {
         let p = build_requirement_prompt("t", &req(), AgentType::Nomi, false, &[]);
-        assert!(p.contains("req_"));
+        assert!(p.contains(&format!("id: {ATTACHMENT_REQ_ID}")));
         assert!(p.contains("Detailed body"));
         assert!(
             p.contains("requirement_complete"),
@@ -303,10 +303,12 @@ mod tests {
             AgentType::OpenclawGateway,
             AgentType::Nanobot,
             AgentType::Remote,
-            AgentType::Gemini,
         ] {
             let p = build_requirement_prompt("t", &req(), at, false, &[]);
-            assert!(p.contains("req_"), "{at:?}: must still carry the requirement id");
+            assert!(
+                p.contains(&format!("id: {ATTACHMENT_REQ_ID}")),
+                "{at:?}: must still carry the requirement UUIDv7"
+            );
             assert!(p.contains("Detailed body"), "{at:?}: must still carry the body");
             assert!(
                 !p.contains("requirement_complete"),
@@ -335,7 +337,7 @@ mod tests {
         // declaration tools, so it must be told to call them (same contract as
         // Nomi). This is the soft-failure fix for ACP backends.
         let p = build_requirement_prompt("t", &req(), AgentType::Acp, true, &[]);
-        assert!(p.contains("req_"));
+        assert!(p.contains(&format!("id: {ATTACHMENT_REQ_ID}")));
         assert!(
             p.contains("requirement_complete"),
             "ACP + requirement MCP MUST instruct calling requirement_complete"
@@ -368,7 +370,6 @@ mod tests {
             AgentType::OpenclawGateway,
             AgentType::Nanobot,
             AgentType::Remote,
-            AgentType::Gemini,
         ] {
             assert!(!session_has_requirement_tools(at, true), "{at:?}: no requirement tools");
         }
@@ -382,7 +383,6 @@ mod tests {
             AgentType::OpenclawGateway,
             AgentType::Nanobot,
             AgentType::Remote,
-            AgentType::Gemini,
         ] {
             assert!(
                 !has_native_requirement_tools(at),
@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn terminal_prompt_instructs_requirement_complete_and_has_no_knowledge_hint() {
         let p = build_terminal_requirement_prompt("t", &req(), &[]);
-        assert!(p.contains("req_"));
+        assert!(p.contains(&format!("id: {ATTACHMENT_REQ_ID}")));
         assert!(p.contains("Detailed body"));
         // Must instruct the agent to call the requirement completion tools
         // (they are injected via the requirement MCP server — Task 2).

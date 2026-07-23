@@ -8,6 +8,7 @@
  * primary-light-3 border. Theme variables only; `<div onClick>` (no <button>).
  */
 import type { PresetTag, PresetTagDimension } from '@/common/types/agent/presetTypes';
+import type { PresetTagId } from '@/common/types/ids';
 import type { TagFilterState } from './presetUtils';
 import { SettingTwo } from '@icon-park/react';
 import React from 'react';
@@ -81,9 +82,11 @@ const PresetTagFilterBar: React.FC<PresetTagFilterBarProps> = ({
   const { t } = useTranslation();
   const isDrawer = variant === 'drawer';
 
-  const toggle = (dimension: PresetTagDimension, key: string) => {
+  const toggle = (dimension: PresetTagDimension, presetTagId: PresetTagId) => {
     const current = value[dimension];
-    const next = current.includes(key) ? current.filter((k) => k !== key) : [...current, key];
+    const next = current.includes(presetTagId)
+      ? current.filter((value) => value !== presetTagId)
+      : [...current, presetTagId];
     onChange({ ...value, [dimension]: next });
   };
 
@@ -115,10 +118,10 @@ const PresetTagFilterBar: React.FC<PresetTagFilterBarProps> = ({
           />
           {tags.map((tag) => (
             <FilterChip
-              key={tag.key}
+              key={tag.preset_tag_id}
               label={resolveTagLabel(tag, localeKey)}
-              active={selected.includes(tag.key)}
-              onClick={() => toggle(dimension, tag.key)}
+              active={selected.includes(tag.preset_tag_id)}
+              onClick={() => toggle(dimension, tag.preset_tag_id)}
               testId={`tag-chip-${dimension}-${tag.key}`}
               variant={variant}
             />

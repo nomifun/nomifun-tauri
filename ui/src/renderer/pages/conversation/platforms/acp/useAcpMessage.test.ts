@@ -42,8 +42,8 @@ describe('normalizeAcpSlashCommands', () => {
 });
 
 describe('ACP thinking turn correlation', () => {
-  const currentTurnId = parseMessageId('msg_0190f5fe-7c00-7a00-8000-000000000071');
-  const oldTurnId = parseMessageId('msg_0190f5fe-7c00-7a00-8000-000000000072');
+  const currentTurnId = parseMessageId('0190f5fe-7c00-7a00-8000-000000000071');
+  const oldTurnId = parseMessageId('0190f5fe-7c00-7a00-8000-000000000072');
 
   test('only lets a content boundary from the same explicit turn finish active thinking', () => {
     expect(isAcpThinkingBoundaryForTurn('text', currentTurnId, currentTurnId)).toBe(true);
@@ -51,7 +51,7 @@ describe('ACP thinking turn correlation', () => {
     expect(isAcpThinkingBoundaryForTurn('thinking', currentTurnId, currentTurnId)).toBe(false);
   });
 
-  test('retains compatibility when an older server omits event correlation ids', () => {
+  test('uses stream order when a non-turn frame has no correlation id', () => {
     expect(isAcpThinkingBoundaryForTurn('text', currentTurnId, undefined)).toBe(true);
     expect(isAcpThinkingBoundaryForTurn('text', undefined, oldTurnId)).toBe(true);
   });

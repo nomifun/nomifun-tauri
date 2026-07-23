@@ -65,8 +65,9 @@ describe('httpRequest client deadline + network-failure diagnosis', () => {
     }) as unknown as typeof fetch;
 
     try {
-      await httpRequest('GET', '/api/conversations/conv_test/messages?page=0&page_size=10000');
-      await httpRequest('POST', '/api/conversations/conv_test/messages', { content: 'hello' });
+      const conversationId = '0190f5fe-7c00-7a00-8000-000000000001';
+      await httpRequest('GET', `/api/conversations/${conversationId}/messages?page=0&page_size=10000`);
+      await httpRequest('POST', `/api/conversations/${conversationId}/messages`, { content: 'hello' });
       expect(requestInits[0]?.cache).toBe('no-store');
       expect(requestInits[1]?.cache).toBeUndefined();
     } finally {
@@ -138,16 +139,30 @@ describe('httpRequest client deadline + network-failure diagnosis', () => {
   });
 
   test('a normal 2xx JSON response is still unwrapped from the { data } envelope', async () => {
+    const knowledgeBaseId = '0190f5fe-7c00-7a00-8000-000000000001';
     globalThis.fetch = (() =>
       Promise.resolve(
-        new Response(JSON.stringify({ success: true, data: [{ id: 'kb_1' }] }), {
+        new Response(
+          JSON.stringify({
+            success: true,
+            data: [{ knowledge_base_id: knowledgeBaseId }],
+          }),
+          {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
-        })
+          },
+        ),
       )) as unknown as typeof fetch;
     try {
-      const res = await httpRequest<Array<{ id: string }>>('GET', '/api/knowledge/bases', undefined, { timeoutMs: 30000 });
-      expect(JSON.stringify(res)).toBe(JSON.stringify([{ id: 'kb_1' }]));
+      const res = await httpRequest<Array<{ knowledge_base_id: string }>>(
+        'GET',
+        '/api/knowledge/bases',
+        undefined,
+        { timeoutMs: 30000 },
+      );
+      expect(JSON.stringify(res)).toBe(
+        JSON.stringify([{ knowledge_base_id: knowledgeBaseId }]),
+      );
     } finally {
       globalThis.fetch = realFetch;
     }

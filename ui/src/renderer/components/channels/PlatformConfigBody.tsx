@@ -113,9 +113,9 @@ export const PLUGIN_DISABLED_KEY: Record<ChannelPlatform, string> = {
  * 这里不渲染模型选择器：机器人复用所绑定对象（桌面伙伴 / 对外伙伴）的
  * 对话模型，后端按绑定对象的 `profile.model` 解析；各平台表单只负责渠道连接。
  *
- * `channelTarget` addresses one channel row (multi-bot model). When
- * `channelTarget.channelId` is missing the form runs in create mode: the
- * first enable creates a new row bound to `channelTarget.companionId` OR
+ * `channelTarget` addresses one channel plugin entity (multi-bot model). When
+ * `channelTarget.channelPluginId` is missing the form runs in create mode: the
+ * first enable creates a new entity bound to `channelTarget.companionId` OR
  * `channelTarget.publicAgentId` (whichever is set — mutually exclusive).
  */
 export const PlatformConfigBody: React.FC<{
@@ -179,7 +179,7 @@ export const PlatformConfigBody: React.FC<{
         const result = await channel.enablePlugin.invoke(
           channelTarget
             ? {
-                plugin_id: channelTarget.channelId,
+                plugin_id: channelTarget.channelPluginId,
                 plugin_type: platform,
                 ...(channelTarget.publicAgentId
                   ? { public_agent_id: channelTarget.publicAgentId }
@@ -191,7 +191,6 @@ export const PlatformConfigBody: React.FC<{
         if (!result.success) {
           throw new Error(
             result.error ||
-              result.message ||
               t('nomi.settings.remoteEnableFailed', { defaultValue: 'Failed to enable channel' })
           );
         }
@@ -199,7 +198,7 @@ export const PlatformConfigBody: React.FC<{
         const enabledStatus = latestStatuses
           ? findEnabledChannelStatus(latestStatuses, {
               platform,
-              enabledPluginId: result.channel_id,
+              enabledPluginId: result.plugin_id,
               companionId: channelTarget?.companionId,
               publicAgentId: channelTarget?.publicAgentId,
             })
@@ -209,11 +208,11 @@ export const PlatformConfigBody: React.FC<{
         }
         Message.success(t(PLUGIN_ENABLED_KEY[platform]));
       } else {
-        const channelId = channelTarget?.channelId ?? status?.id;
-        if (!channelId) {
+        const channelPluginId = channelTarget?.channelPluginId ?? status?.plugin_id;
+        if (!channelPluginId) {
           throw new Error(t('nomi.settings.remoteChannelMissing', { defaultValue: 'Channel record is missing' }));
         }
-        await channel.disablePlugin.invoke({ plugin_id: channelId });
+        await channel.disablePlugin.invoke({ plugin_id: channelPluginId });
         Message.success(t(PLUGIN_DISABLED_KEY[platform]));
       }
       await refreshStatuses();

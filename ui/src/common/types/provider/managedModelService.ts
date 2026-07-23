@@ -79,12 +79,12 @@ export interface SetManagedModelServiceEnabledRequest {
 }
 
 export interface SetManagedModelEnabledRequest {
-  id: string;
+  model_id: string;
   enabled: boolean;
 }
 
 export interface CheckManagedModelHealthRequest {
-  id: string;
+  model_id: string;
 }
 
 export const NOMIFUN_FREE_MODEL_PLATFORM = 'nomifun-free-model';

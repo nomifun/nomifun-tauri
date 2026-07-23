@@ -1,5 +1,6 @@
 import { resolveExtensionAssetUrl } from '@/renderer/utils/platform';
 import type { PresetListItem } from './types';
+import type { PresetTagId } from '@/common/types/ids';
 
 /**
  * Check if a string is an emoji (simple check for common emoji patterns).
@@ -35,8 +36,8 @@ export const resolveAvatarImageSrc = (
 export const sortPresets = (list: PresetListItem[]): PresetListItem[] =>
   [...list].toSorted((a, b) => a.sort_order - b.sort_order);
 
-/** Selected tag keys per dimension. Empty array = no constraint on that dimension. */
-export type TagFilterState = { audience: string[]; scenario: string[] };
+/** Selected preset-tag business IDs per dimension. Empty = no constraint. */
+export type TagFilterState = { audience: PresetTagId[]; scenario: PresetTagId[] };
 
 /**
  * Faceted filter: search text (name + description) AND audience-facet AND
@@ -50,7 +51,7 @@ export const filterPresetsByTags = (
   localeKey: string
 ): PresetListItem[] => {
   const normalizedQuery = query.trim().toLowerCase();
-  const matchesFacet = (have: string[] | undefined, selected: string[]) =>
+  const matchesFacet = (have: PresetTagId[] | undefined, selected: PresetTagId[]) =>
     selected.length === 0 || (have ?? []).some((k) => selected.includes(k));
 
   return presets.filter((preset) => {
@@ -64,8 +65,8 @@ export const filterPresetsByTags = (
       if (!searchableText.includes(normalizedQuery)) return false;
     }
     return (
-      matchesFacet(preset.audience_tags, tagFilter.audience) &&
-      matchesFacet(preset.scenario_tags, tagFilter.scenario)
+      matchesFacet(preset.audience_tag_ids, tagFilter.audience) &&
+      matchesFacet(preset.scenario_tag_ids, tagFilter.scenario)
     );
   });
 };

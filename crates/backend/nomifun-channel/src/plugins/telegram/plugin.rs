@@ -945,7 +945,7 @@ mod tests {
     #[test]
     fn format_callback_with_params() {
         let mut params = HashMap::new();
-        params.insert("agentType".into(), "gemini".into());
+        params.insert("agentType".into(), "acp".into());
         let btn = ActionButton {
             label: "Test".into(),
             action: "agent.select".into(),
@@ -953,7 +953,7 @@ mod tests {
         };
         let result = format_callback_data(&btn);
         assert!(result.starts_with("system:agent.select:"));
-        assert!(result.contains("agentType=gemini"));
+        assert!(result.contains("agentType=acp"));
     }
 
     #[test]

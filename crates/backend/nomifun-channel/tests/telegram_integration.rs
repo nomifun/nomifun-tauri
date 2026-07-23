@@ -58,7 +58,7 @@ mod telegram_tests {
         let manager = ChannelManager::new(
             repo.clone(),
             broadcaster.clone(),
-            "user_018f1234-5678-7abc-8def-012345678970",
+            "018f1234-5678-7abc-8def-012345678970",
             make_encryption_key(),
             message_tx,
             confirm_tx,
@@ -226,8 +226,9 @@ mod telegram_tests {
     async fn disable_without_db_row_returns_error() {
         let (manager, _repo, _bc) = setup().await;
         // Plugin was never enabled (no DB row), so update_plugin_status fails
-        let missing_channel = nomifun_common::ChannelId::new();
-        let result = manager.disable_plugin(missing_channel.as_str()).await;
+        let result = manager
+            .disable_plugin("0190f5fe-7c00-7a00-8000-00000000ffff")
+            .await;
         assert!(result.is_err());
     }
 
@@ -256,6 +257,8 @@ mod telegram_tests {
     #[tokio::test]
     async fn is_plugin_running_false_when_not_enabled() {
         let (manager, _repo, _bc) = setup().await;
-        assert!(!manager.is_plugin_running(nomifun_common::ChannelId::new().as_str()));
+        assert!(!manager.is_plugin_running(
+            "0190f5fe-7c00-7a00-8000-00000000ffff"
+        ));
     }
 }

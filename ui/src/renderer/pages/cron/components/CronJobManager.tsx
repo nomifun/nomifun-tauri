@@ -19,7 +19,7 @@ import { getJobStatusFlags } from '../cronUtils';
 
 interface CronJobManagerProps {
   conversation_id: ConversationId;
-  /** When provided (e.g. from conversation.extra.cron_job_id), fetch the job directly */
+  /** When provided from the first-class conversation.cron_job_id field, fetch the job directly. */
   cron_job_id?: CronJobId;
   /** Whether the cron skill is loaded for this conversation. When false and no jobs exist, the component is hidden. */
   hasCronSkill?: boolean;
@@ -47,7 +47,7 @@ const CronJobManager: React.FC<CronJobManagerProps> = ({ conversation_id, cron_j
 
     setDirectLoading(true);
     ipcBridge.cron.getJob
-      .invoke({ job_id: cron_job_id })
+      .invoke({ cron_job_id: cron_job_id })
       .then((job) => setDirectJob(job ?? null))
       .catch(() => setDirectJob(null))
       .finally(() => setDirectLoading(false));
@@ -57,19 +57,19 @@ const CronJobManager: React.FC<CronJobManagerProps> = ({ conversation_id, cron_j
     if (!cron_job_id) return;
 
     const unsubCreated = ipcBridge.cron.onJobCreated.on((created) => {
-      if (created.id === cron_job_id) {
+      if (created.cron_job_id === cron_job_id) {
         setDirectJob(created);
         setDirectLoading(false);
       }
     });
     const unsubUpdated = ipcBridge.cron.onJobUpdated.on((updated) => {
-      if (updated.id === cron_job_id) {
+      if (updated.cron_job_id === cron_job_id) {
         setDirectJob(updated);
         setDirectLoading(false);
       }
     });
-    const unsubRemoved = ipcBridge.cron.onJobRemoved.on(({ job_id }) => {
-      if (job_id === cron_job_id) {
+    const unsubRemoved = ipcBridge.cron.onJobRemoved.on(({ cron_job_id: removed_cron_job_id }) => {
+      if (removed_cron_job_id === cron_job_id) {
         setDirectJob(null);
         setDirectLoading(false);
       }
@@ -141,7 +141,7 @@ const CronJobManager: React.FC<CronJobManagerProps> = ({ conversation_id, cron_j
         type='text'
         size='small'
         className='cron-job-manager-button chat-header-cron-pill !h-auto !w-auto !min-w-0 !px-0 !py-0'
-        onClick={() => navigate(`/scheduled/${job.id}`)}
+        onClick={() => navigate(`/scheduled/${job.cron_job_id}`)}
       >
         <span className='inline-flex items-center gap-2px rounded-full px-8px py-2px bg-2'>
           <AlarmClock theme='outline' size={16} fill={iconColors.primary} />

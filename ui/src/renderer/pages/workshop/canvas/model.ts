@@ -15,7 +15,7 @@
  * at both conversion boundaries.
  */
 
-import { prefixedId } from '@/common/utils/prefixedId';
+import { uuidv7 } from '@/common/utils/uuidv7';
 import { parseWorkshopEdgeId, parseWorkshopNodeId } from '@/common/types/ids';
 import type { WorkshopEdgeId, WorkshopNodeId } from '@/common/types/ids';
 import type { Edge, Node } from '@xyflow/react';
@@ -184,11 +184,11 @@ export const PASTE_OFFSET = 24;
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function newNodeId(): WorkshopNodeId {
-  return parseWorkshopNodeId(prefixedId('wsn'));
+  return parseWorkshopNodeId(uuidv7());
 }
 
 export function newEdgeId(): WorkshopEdgeId {
-  return parseWorkshopEdgeId(prefixedId('wse'));
+  return parseWorkshopEdgeId(uuidv7());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -654,22 +654,30 @@ export function cloneNodesWithEdges(
   const idMap = new Map<WorkshopNodeId, WorkshopNodeId>();
   const inSet = new Set(nodes.map((n) => n.id));
   for (const n of nodes) idMap.set(n.id, newNodeId());
+  const clonedNodeId = (id: WorkshopNodeId): WorkshopNodeId => {
+    const clonedId = idMap.get(id);
+    if (clonedId === undefined) {
+      throw new Error(`Missing cloned workshop node id for ${id}`);
+    }
+    return clonedId;
+  };
 
   // Absolute position of any node that could be an out-of-set parent (groups are
   // always free, so their `position` is already absolute).
   const posLookup = allNodes ? new Map(allNodes.map((n) => [n.id, n.position])) : null;
 
   const cloned = nodes.map((n) => {
-    const parentKept = n.parentId && inSet.has(n.parentId);
+    const originalParentId = n.parentId;
+    const parentKept = originalParentId !== undefined && inSet.has(originalParentId);
     let position: XY;
     if (parentKept) {
       // Members with an in-set parent keep their (relative) position so they stay
       // put inside the offset group.
       position = { x: n.position.x, y: n.position.y };
-    } else if (n.parentId) {
+    } else if (originalParentId) {
       // Orphan promotion: the node loses its group, so its relative position must
       // become absolute (parent origin + relative) before shifting by the offset.
-      const parentPos = posLookup?.get(n.parentId);
+      const parentPos = posLookup?.get(originalParentId);
       const baseX = parentPos ? parentPos.x + n.position.x : n.position.x;
       const baseY = parentPos ? parentPos.y + n.position.y : n.position.y;
       position = { x: baseX + offset.x, y: baseY + offset.y };
@@ -678,7 +686,7 @@ export function cloneNodesWithEdges(
     }
     const next = {
       ...n,
-      id: idMap.get(n.id) as WorkshopNodeId,
+      id: clonedNodeId(n.id),
       selected: true,
       dragging: false,
       measured: undefined,
@@ -686,7 +694,7 @@ export function cloneNodesWithEdges(
       data: { ...n.data },
     } as WorkshopFlowNode;
     if (parentKept) {
-      next.parentId = idMap.get(n.parentId as WorkshopNodeId) as WorkshopNodeId;
+      next.parentId = clonedNodeId(originalParentId);
       next.extent = 'parent';
     } else {
       delete next.parentId;
@@ -699,8 +707,8 @@ export function cloneNodesWithEdges(
     .filter((e) => inSet.has(e.source) && inSet.has(e.target))
     .map((e) => ({
       id: newEdgeId(),
-      source: idMap.get(e.source) as WorkshopNodeId,
-      target: idMap.get(e.target) as WorkshopNodeId,
+      source: clonedNodeId(e.source),
+      target: clonedNodeId(e.target),
     }));
   return { nodes: cloned, edges: clonedEdges, idMap };
 }

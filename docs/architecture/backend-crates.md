@@ -33,11 +33,31 @@ go through the normal seam or one of those bridge surfaces.
 
 ## Core, data, realtime, runtime
 
+### v3 data and identifier contract
+
+All backend crates follow the v3 data contract:
+
+- every NomiFun product table has `id INTEGER PRIMARY KEY AUTOINCREMENT`;
+- stable cross-dataset entities use named bare canonical UUIDv7 fields such as
+  `user_id`, `conversation_id`, and `message_id`;
+- internal-only rows keep the table `id` as a repository implementation detail
+  and use owner UUIDv7, sequence, natural, or composite keys for relations;
+- one relationship has one reference field, with no `*_row_id` dual fields;
+- repositories and services maintain indexed logical references; product DDL
+  contains no physical `FOREIGN KEY`, `REFERENCES`, `ON DELETE`, or `ON UPDATE`
+  clauses;
+- v3 startup resets/quarantines an incompatible managed dataset as a whole
+  instead of migrating historical rows.
+
+The technical `id` is dataset-local and must not be treated as an API or
+inter-table identity. Stable UUIDv7 fields are strings; external protocol
+identifiers remain opaque.
+
 | Crate | Responsibility |
 | --- | --- |
-| [`nomifun-common`](../../crates/backend/nomifun-common/) | `AppError`, error chain, enums (`AgentType`, `ConversationStatus`, `MessageType`, `McpServerStatus`, ...), id generation (`generate_prefixed_id` for entity IDs, `generate_id` for tokens), AES-GCM `encrypt_string` / `decrypt_string`, `TimestampMs`, pagination helpers, `constants::DEFAULT_HOST/DEFAULT_PORT/BODY_LIMIT/CSRF_*`. |
+| [`nomifun-common`](../../crates/backend/nomifun-common/) | `AppError`, error chain, enums (`AgentType`, `ConversationStatus`, `MessageType`, `McpServerStatus`, ...), bare UUIDv7 generation/validation for stable business IDs, dataset-reset helpers, AES-GCM `encrypt_string` / `decrypt_string`, `TimestampMs`, pagination helpers, `constants::DEFAULT_HOST/DEFAULT_PORT/BODY_LIMIT/CSRF_*`. |
 | [`nomifun-api-types`](../../crates/backend/nomifun-api-types/) | Every HTTP request / response DTO, the `WebSocketMessage` envelope, ACP / Nomi / OpenClaw / Remote build-extras. The frontend's TypeScript types mirror this crate. |
-| [`nomifun-db`](../../crates/backend/nomifun-db/) | SQLite via `sqlx`, embedded migrations, repository traits and Sqlite implementations for users, conversations, MCP, requirements, cron, ACP sessions, presets, terminal sessions, companion tokens, webhooks, and more. Owns the `Database` handle and `init_database`. |
+| [`nomifun-db`](../../crates/backend/nomifun-db/) | v3 SQLite baseline via `sqlx`, schema-contract and logical-reference registries, plus repository traits and Sqlite implementations for users, conversations, MCP, requirements, cron, ACP sessions, presets, terminal sessions, companion tokens, webhooks, and more. Owns the `Database` handle and v3 baseline initialization. |
 | [`nomifun-realtime`](../../crates/backend/nomifun-realtime/) | `WebSocketManager`, `BroadcastEventBus`, `/ws` upgrade handler with token validation, message router trait, heartbeat timing, per-connection buffer constants. |
 | [`nomifun-runtime`](../../crates/backend/nomifun-runtime/) | Bundled Bun extraction, cache management, command discovery, and startup-time `PATH` enhancement. Child-process ownership lives in the shared `nomi-process-runtime` crate. |
 | [`nomifun-assets`](../../crates/backend/nomifun-assets/) | Embedded static assets (`include_dir!`) shipped with the server. |

@@ -725,6 +725,7 @@ mod tests {
     impl IOAuthTokenRepository for ValidTokenRepo {
         async fn get_by_url(&self, _: &str) -> Result<Option<nomifun_db::models::OAuthTokenRow>, nomifun_db::DbError> {
             Ok(Some(nomifun_db::models::OAuthTokenRow {
+                id: 0,
                 server_url: "https://example.com".to_string(),
                 access_token: "valid_access_token".to_string(),
                 refresh_token: None,
@@ -757,6 +758,7 @@ mod tests {
     impl IOAuthTokenRepository for ExpiredTokenRepo {
         async fn get_by_url(&self, _: &str) -> Result<Option<nomifun_db::models::OAuthTokenRow>, nomifun_db::DbError> {
             Ok(Some(nomifun_db::models::OAuthTokenRow {
+                id: 0,
                 server_url: "https://example.com".to_string(),
                 access_token: "expired_token".to_string(),
                 refresh_token: None,
@@ -789,6 +791,7 @@ mod tests {
     impl IOAuthTokenRepository for NoExpiryTokenRepo {
         async fn get_by_url(&self, _: &str) -> Result<Option<nomifun_db::models::OAuthTokenRow>, nomifun_db::DbError> {
             Ok(Some(nomifun_db::models::OAuthTokenRow {
+                id: 0,
                 server_url: "https://example.com".to_string(),
                 access_token: "no_expiry_token".to_string(),
                 refresh_token: None,

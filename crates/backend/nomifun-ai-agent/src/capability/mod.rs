@@ -12,4 +12,4 @@ pub mod model_identity_reminder;
 pub mod prompt_pipeline;
 pub(crate) mod skill_manager;
 
-pub use prompt_pipeline::{PostRecvHook, PreSendHook, PromptCtx, PromptPipeline};
+pub use prompt_pipeline::{PreSendHook, PromptCtx, PromptPipeline};

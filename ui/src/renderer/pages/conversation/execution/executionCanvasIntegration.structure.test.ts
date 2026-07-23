@@ -71,7 +71,7 @@ describe('conversation execution canvas integration', () => {
     expect(projectedSource.includes("step.kind === 'agent' && step.status === 'pending'")).toBe(true);
     expect(projectedSource.includes('participant.retired_in_revision == null')).toBe(true);
     expect(projectedSource.includes('projectReplacementStep(replacement)')).toBe(true);
-    expect(projectedSource.includes('projectionKey: payload.projectionKey ?? payload.step.id')).toBe(true);
+    expect(projectedSource.includes('projectionKey: payload.projectionKey ?? payload.step.step_id')).toBe(true);
     expect(projectedSource.includes('canSteerExecutionAttempt(attempt?.status, detail?.execution.status)')).toBe(true);
     expect(projectedSource.includes('ipcBridge.agentExecution.steer.invoke')).toBe(true);
     expect(projectedSource.includes('expected_execution_version: detail.execution.version')).toBe(true);

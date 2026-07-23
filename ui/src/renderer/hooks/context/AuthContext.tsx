@@ -17,11 +17,17 @@ export interface AuthUser {
   username: string;
 }
 
-const parseAuthUser = (value: unknown): AuthUser | null => {
+/**
+ * Map the auth response's explicit `user_id` wire field to the UI's shorter
+ * internal `id` field. Generic `id` is intentionally not a compatibility
+ * alias: accepting it would hide a backend contract regression.
+ */
+export const parseAuthUser = (value: unknown): AuthUser | null => {
   if (!value || typeof value !== 'object') return null;
-  const raw = value as { id?: unknown; username?: unknown };
-  if (typeof raw.username !== 'string') return null;
-  return { id: parseUserId(raw.id), username: raw.username };
+  const raw = value as { user_id?: unknown; id?: unknown; username?: unknown };
+  if (Object.prototype.hasOwnProperty.call(raw, 'id')) return null;
+  if (typeof raw.user_id !== 'string' || typeof raw.username !== 'string') return null;
+  return { id: parseUserId(raw.user_id), username: raw.username };
 };
 
 interface LoginParams {

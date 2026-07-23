@@ -63,11 +63,6 @@ pub use workpath::{DEFAULT_WORKPATH_KEY, WORKPATH_BINDING_KIND, session_workpath
 /// `.gitignore`, see `mount.rs`).
 pub const KB_MOUNT_REL_DIR: &str = ".nomi/knowledge";
 
-/// Pre-`.nomi` mount location. Kept solely so `mount::sync_mounts` can sweep
-/// leftover links/scaffolding out of workspaces created before the rename —
-/// never mount anything here.
-pub const KB_LEGACY_MOUNT_REL_DIR: &str = ".nomifun/knowledge";
-
 /// Subdirectory of the backend data dir that hosts managed base directories:
 /// `{data_dir}/knowledge/{kb_id}/`.
 pub const KB_MANAGED_REL_DIR: &str = "knowledge";

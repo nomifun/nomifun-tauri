@@ -19,4 +19,10 @@ describe('desktop companion suggestions pagination', () => {
     expect(source.includes('sizeCanChange')).toBe(true);
     expect(source.includes('sizeOptions={[10, 20, 50]}')).toBe(true);
   });
+
+  test('uses suggestion_id for decision and list keys', () => {
+    expect(source.includes('suggestion_id: s.suggestion_id')).toBe(true);
+    expect(source.includes('key={s.suggestion_id}')).toBe(true);
+    expect(source.includes('invoke({ id: s.id')).toBe(false);
+  });
 });

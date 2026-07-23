@@ -1,5 +1,5 @@
-import type { IMcpServer, IMcpTool } from '@/common/config/storage';
-import { mcpService } from '@/common/adapter/ipcBridge';
+import type { IMcpServer } from '@/common/config/storage';
+import { mcpService, type DetectedMcpServer } from '@/common/adapter/ipcBridge';
 import { getAgents } from '@/renderer/hooks/agent/useAgents';
 import { Button, Select, Spin, Tag, Tooltip } from '@arco-design/web-react';
 import React, { useEffect, useState } from 'react';
@@ -8,11 +8,6 @@ import { Check } from '@icon-park/react';
 import { iconColors } from '@/renderer/styles/colors';
 import NomiSteps from '@/renderer/components/base/NomiSteps';
 import NomiModal from '@/renderer/components/base/NomiModal';
-
-type DetectedMcpServer = IMcpServer & {
-  importable: boolean;
-  import_skip_reason?: string;
-};
 
 const IMPORTABLE_AGENTS = [
   { backend: 'claude', name: 'Claude' },
@@ -58,7 +53,7 @@ interface OneClickImportModalProps {
   existingServerNames?: string[];
   onCancel: () => void;
   onBatchImport?: (
-    servers: Omit<IMcpServer, 'id' | 'created_at' | 'updated_at'>[]
+    servers: Omit<IMcpServer, 'mcp_server_id' | 'created_at' | 'updated_at'>[]
   ) => Promise<IMcpServer[] | void> | IMcpServer[] | void;
 }
 
@@ -214,8 +209,7 @@ const OneClickImportModal: React.FC<OneClickImportModalProps> = ({
       const agents = await getAgents();
       const mcpConfigs = await mcpService.getAgentMcpConfigs.invoke(agents);
       const selectedConfig = mcpConfigs.find((agentConfig) => agentConfig.source === selectedAgent);
-      const allServers = (selectedConfig?.servers ?? []) as DetectedMcpServer[];
-      setFetchedServers(allServers);
+      setFetchedServers(selectedConfig?.servers ?? []);
     } catch (error) {
       console.error('Failed to import from CLI:', error);
       setFetchedServers([]);
@@ -252,10 +246,8 @@ const OneClickImportModal: React.FC<OneClickImportModalProps> = ({
         return {
           name: server.name,
           description: server.description,
-          enabled: server.enabled,
+          enabled: true,
           transport: server.transport,
-          last_test_status: server.last_test_status as IMcpServer['last_test_status'],
-          tools: (server.tools || []) as IMcpTool[], // 保留原始的 tools 信息
           original_json: JSON.stringify({ mcpServers: { [server.name]: serverConfig } }, null, 2),
         };
       });

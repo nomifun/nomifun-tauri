@@ -1,5 +1,5 @@
-use nomifun_common::{TimestampMs, now_ms};
-use sqlx::SqlitePool;
+use nomifun_common::{ConversationId, RequirementId, TerminalId, TimestampMs, now_ms};
+use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use crate::error::DbError;
 use crate::models::{NewRequirementRow, RequirementRow, RequirementRowUpdate, RequirementTagRow};
@@ -17,19 +17,79 @@ impl SqliteRequirementRepository {
     }
 }
 
+fn parse_requirement_id(requirement_id: &str) -> Result<RequirementId, DbError> {
+    RequirementId::parse(requirement_id).map_err(|error| {
+        DbError::Conflict(format!(
+            "requirement id '{requirement_id}' is not a canonical UUIDv7: {error}"
+        ))
+    })
+}
+
+async fn lock_requirement_owners(
+    tx: &mut Transaction<'_, Sqlite>,
+    owner_conversation_id: Option<&str>,
+    owner_terminal_id: Option<&str>,
+) -> Result<(), DbError> {
+    if owner_conversation_id.is_some() && owner_terminal_id.is_some() {
+        return Err(DbError::Conflict(
+            "a requirement cannot have both conversation and terminal owners".into(),
+        ));
+    }
+    if let Some(owner) = owner_conversation_id {
+        let owner = ConversationId::parse(owner).map_err(|error| {
+            DbError::Conflict(format!(
+                "requirement conversation owner '{owner}' is not a canonical UUIDv7: {error}"
+            ))
+        })?;
+        let parent = sqlx::query(
+            "UPDATE conversations SET updated_at = updated_at WHERE conversation_id = ?",
+        )
+        .bind(owner.as_str())
+        .execute(&mut **tx)
+        .await?;
+        if parent.rows_affected() == 0 {
+            return Err(DbError::Conflict(format!(
+                "requirement conversation owner '{}' does not exist",
+                owner
+            )));
+        }
+    }
+    if let Some(owner) = owner_terminal_id {
+        let owner = TerminalId::parse(owner).map_err(|error| {
+            DbError::Conflict(format!(
+                "requirement terminal owner '{owner}' is not a canonical UUIDv7: {error}"
+            ))
+        })?;
+        let parent = sqlx::query(
+            "UPDATE terminal_sessions SET updated_at = updated_at WHERE terminal_id = ?",
+        )
+        .bind(owner.as_str())
+        .execute(&mut **tx)
+        .await?;
+        if parent.rows_affected() == 0 {
+            return Err(DbError::Conflict(format!(
+                "requirement terminal owner '{}' does not exist",
+                owner
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Build a safe `ORDER BY` clause for the requirements list.
 ///
 /// `order_by` is matched against a hard-coded whitelist of columns — user input
 /// only *selects* a fixed column name and is NEVER interpolated into SQL, so a
 /// value like `"title; DROP TABLE …"` simply misses the whitelist and falls
 /// back to the default queue order. `order` is constrained to `ASC|DESC`
-/// (default `DESC` for an explicit sort). For non-unique sort columns an
-/// `id <dir>` tiebreaker is appended so pagination is deterministic.
+/// (default `DESC` for an explicit sort). For non-unique sort columns the
+/// local technical `id <dir>` tiebreaker is appended internally so pagination
+/// is deterministic; it is never accepted as a public sort key.
 fn build_order_clause(order_by: Option<&str>, order: Option<&str>) -> String {
     const DEFAULT: &str = "ORDER BY sort_seq ASC, priority DESC, created_at ASC";
     let col = match order_by {
         Some("display_no") => "display_no",
-        Some("id") => "id",
+        Some("requirement_id") => "requirement_id",
         Some("created_at") => "created_at",
         Some("updated_at") => "updated_at",
         Some("status") => "status",
@@ -40,9 +100,8 @@ fn build_order_clause(order_by: Option<&str>, order: Option<&str>) -> String {
         Some("asc") => "ASC",
         _ => "DESC",
     };
-    if col == "id" {
-        // `id` is unique — no tiebreaker needed.
-        format!("ORDER BY id {dir}")
+    if col == "requirement_id" {
+        format!("ORDER BY requirement_id {dir}")
     } else {
         format!("ORDER BY {col} {dir}, id {dir}")
     }
@@ -52,25 +111,32 @@ fn build_order_clause(order_by: Option<&str>, order: Option<&str>) -> String {
 impl IRequirementRepository for SqliteRequirementRepository {
     async fn insert(&self, row: &NewRequirementRow) -> Result<RequirementRow, DbError> {
         let mut transaction = self.pool.begin().await?;
+        let requirement_id = RequirementId::new();
+        lock_requirement_owners(
+            &mut transaction,
+            row.owner_conversation_id.as_deref(),
+            row.owner_terminal_id.as_deref(),
+        )
+        .await?;
         let display_no: i64 = sqlx::query_scalar(
             "UPDATE requirement_display_sequence \
              SET last_no = last_no + 1 \
-             WHERE singleton = 'requirements' \
+             WHERE singleton_key = 'requirements' \
              RETURNING last_no",
         )
         .fetch_one(&mut *transaction)
         .await?;
 
-        sqlx::query(
+        let inserted = sqlx::query_as::<_, RequirementRow>(
             "INSERT INTO requirements (\
-                id, display_no, title, content, tag, order_key, sort_seq, status, priority, \
+                requirement_id, display_no, title, content, tag, order_key, sort_seq, status, priority, \
                 completion_note, owner_conversation_id, owner_terminal_id, active_turn_started_at, lease_expires_at, \
                 started_at, completed_at, attempt_count, created_by, extra, created_at, updated_at\
             ) VALUES (\
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?\
-            )",
+            ) RETURNING *",
         )
-        .bind(&row.id)
+        .bind(requirement_id.as_str())
         .bind(display_no)
         .bind(&row.title)
         .bind(&row.content)
@@ -91,19 +157,35 @@ impl IRequirementRepository for SqliteRequirementRepository {
         .bind(&row.extra)
         .bind(row.created_at)
         .bind(row.updated_at)
-        .execute(&mut *transaction)
-        .await?;
-        let inserted = sqlx::query_as::<_, RequirementRow>(
-            "SELECT * FROM requirements WHERE id = ?",
-        )
-        .bind(&row.id)
         .fetch_one(&mut *transaction)
         .await?;
         transaction.commit().await?;
         Ok(inserted)
     }
 
-    async fn update(&self, id: &str, params: &RequirementRowUpdate) -> Result<(), DbError> {
+    async fn update(
+        &self,
+        requirement_id: &str,
+        params: &RequirementRowUpdate,
+    ) -> Result<(), DbError> {
+        let requirement_id = parse_requirement_id(requirement_id)?;
+        let mut transaction = self.pool.begin().await?;
+        let current: RequirementRow =
+            sqlx::query_as("SELECT * FROM requirements WHERE requirement_id = ?")
+                .bind(requirement_id.as_str())
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or_else(|| DbError::NotFound(format!("requirement '{requirement_id}'")))?;
+        let final_conversation = params
+            .owner_conversation_id
+            .as_ref()
+            .map_or(current.owner_conversation_id.as_deref(), |value| value.as_deref());
+        let final_terminal = params
+            .owner_terminal_id
+            .as_ref()
+            .map_or(current.owner_terminal_id.as_deref(), |value| value.as_deref());
+        lock_requirement_owners(&mut transaction, final_conversation, final_terminal).await?;
+
         let mut set_parts: Vec<String> = Vec::new();
         let mut binds: Vec<BindValue> = Vec::new();
 
@@ -164,34 +246,77 @@ impl IRequirementRepository for SqliteRequirementRepository {
         set_parts.push("updated_at = ?".to_string());
         binds.push(BindValue::I64(now_ms()));
 
-        let sql = format!("UPDATE requirements SET {} WHERE id = ?", set_parts.join(", "));
+        let sql = format!(
+            "UPDATE requirements SET {} WHERE requirement_id = ?",
+            set_parts.join(", ")
+        );
         let mut query = sqlx::query(&sql);
         for bind in &binds {
             query = bind_value(query, bind);
         }
-        query = query.bind(id);
+        query = query.bind(requirement_id.as_str());
 
-        let result = query.execute(&self.pool).await?;
+        let result = query.execute(&mut *transaction).await?;
         if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("requirement '{id}'")));
+            return Err(DbError::NotFound(format!("requirement '{requirement_id}'")));
         }
+        transaction.commit().await?;
         Ok(())
     }
 
-    async fn delete(&self, id: &str) -> Result<(), DbError> {
-        let result = sqlx::query("DELETE FROM requirements WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
+    async fn delete(&self, requirement_id: &str) -> Result<(), DbError> {
+        let requirement_id = parse_requirement_id(requirement_id)?;
+        let mut transaction = self.pool.begin().await?;
+
+        // Acquire SQLite's writer lock before applying application-owned
+        // logical-reference policies. No physical FK/trigger participates.
+        let locked = sqlx::query(
+            "UPDATE requirements SET updated_at = updated_at WHERE requirement_id = ?",
+        )
+            .bind(requirement_id.as_str())
+            .execute(&mut *transaction)
             .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::NotFound(format!("requirement '{id}'")));
+        if locked.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("requirement '{requirement_id}'")));
         }
+
+        // SET_NULL: a paused tag may retain its pause reason/state after the
+        // triggering requirement is removed, but it must not retain a dangling
+        // stable business ID.
+        sqlx::query(
+            "UPDATE requirement_tags \
+             SET paused_requirement_id = NULL \
+             WHERE paused_requirement_id = ?",
+        )
+        .bind(requirement_id.as_str())
+        .execute(&mut *transaction)
+        .await?;
+
+        // CASCADE: attachment rows are part of the requirement aggregate.
+        // AttachmentStore stages the files before calling this repository so a
+        // failed transaction can restore the filesystem side.
+        sqlx::query("DELETE FROM attachments WHERE requirement_id = ?")
+            .bind(requirement_id.as_str())
+            .execute(&mut *transaction)
+            .await?;
+
+        sqlx::query("DELETE FROM requirements WHERE requirement_id = ?")
+            .bind(requirement_id.as_str())
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
-    async fn get_by_id(&self, id: &str) -> Result<Option<RequirementRow>, DbError> {
-        let row = sqlx::query_as::<_, RequirementRow>("SELECT * FROM requirements WHERE id = ?")
-            .bind(id)
+    async fn get_by_requirement_id(
+        &self,
+        requirement_id: &str,
+    ) -> Result<Option<RequirementRow>, DbError> {
+        let requirement_id = parse_requirement_id(requirement_id)?;
+        let row = sqlx::query_as::<_, RequirementRow>(
+            "SELECT * FROM requirements WHERE requirement_id = ?",
+        )
+            .bind(requirement_id.as_str())
             .fetch_optional(&self.pool)
             .await?;
         Ok(row)
@@ -297,6 +422,13 @@ impl IRequirementRepository for SqliteRequirementRepository {
         lease_ms: i64,
         now: TimestampMs,
     ) -> Result<Option<RequirementRow>, DbError> {
+        let mut transaction = self.pool.begin().await?;
+        lock_requirement_owners(
+            &mut transaction,
+            owner_conversation_id,
+            owner_terminal_id,
+        )
+        .await?;
         let row = sqlx::query_as::<_, RequirementRow>(
             "UPDATE requirements \
              SET status='in_progress', \
@@ -321,27 +453,29 @@ impl IRequirementRepository for SqliteRequirementRepository {
         .bind(now)
         .bind(lease_ms)
         .bind(tag)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok(row)
     }
 
     async fn renew_lease(
         &self,
-        id: &str,
+        requirement_id: &str,
         owner_conversation_id: Option<&str>,
         owner_terminal_id: Option<&str>,
         lease_ms: i64,
         now: TimestampMs,
     ) -> Result<bool, DbError> {
+        let requirement_id = parse_requirement_id(requirement_id)?;
         let result = sqlx::query(
             "UPDATE requirements SET lease_expires_at = ?1 + ?2, updated_at = ?1 \
-             WHERE id = ?3 AND owner_conversation_id IS ?4 \
+             WHERE requirement_id = ?3 AND owner_conversation_id IS ?4 \
                AND owner_terminal_id IS ?5 AND status = 'in_progress'",
         )
         .bind(now)
         .bind(lease_ms)
-        .bind(id)
+        .bind(requirement_id.as_str())
         .bind(owner_conversation_id)
         .bind(owner_terminal_id)
         .execute(&self.pool)
@@ -403,18 +537,21 @@ impl IRequirementRepository for SqliteRequirementRepository {
         &self,
         tag: &str,
         reason: &str,
-        req_id: Option<&str>,
+        requirement_id: Option<&str>,
         now: TimestampMs,
     ) -> Result<(), DbError> {
+        let requirement_id = requirement_id
+            .map(parse_requirement_id)
+            .transpose()?;
         sqlx::query(
-            "INSERT INTO requirement_tags (tag, paused, paused_reason, paused_req_id, paused_at) \
+            "INSERT INTO requirement_tags (tag, paused, paused_reason, paused_requirement_id, paused_at) \
              VALUES (?1, 1, ?2, ?3, ?4) \
              ON CONFLICT(tag) DO UPDATE SET \
-                 paused = 1, paused_reason = ?2, paused_req_id = ?3, paused_at = ?4",
+                 paused = 1, paused_reason = ?2, paused_requirement_id = ?3, paused_at = ?4",
         )
         .bind(tag)
         .bind(reason)
-        .bind(req_id)
+        .bind(requirement_id.as_ref().map(RequirementId::as_str))
         .bind(now)
         .execute(&self.pool)
         .await?;
@@ -447,21 +584,22 @@ impl IRequirementRepository for SqliteRequirementRepository {
 
     async fn unclaim(
         &self,
-        id: &str,
+        requirement_id: &str,
         owner_conversation_id: Option<&str>,
         owner_terminal_id: Option<&str>,
     ) -> Result<bool, DbError> {
+        let requirement_id = parse_requirement_id(requirement_id)?;
         let result = sqlx::query(
             "UPDATE requirements \
              SET status='pending', owner_conversation_id=NULL, owner_terminal_id=NULL, \
                  active_turn_started_at=NULL, lease_expires_at=NULL, \
                  attempt_count = MAX(attempt_count - 1, 0), \
                  updated_at=?1 \
-             WHERE id=?2 AND status='in_progress' \
+             WHERE requirement_id=?2 AND status='in_progress' \
                AND owner_conversation_id IS ?3 AND owner_terminal_id IS ?4",
         )
         .bind(now_ms())
-        .bind(id)
+        .bind(requirement_id.as_str())
         .bind(owner_conversation_id)
         .bind(owner_terminal_id)
         .execute(&self.pool)
@@ -474,7 +612,7 @@ impl IRequirementRepository for SqliteRequirementRepository {
 mod tests {
     use super::*;
     use crate::init_database_memory;
-    use nomifun_common::{ConversationId, RequirementId, TerminalId};
+    use nomifun_common::{ConversationId, TerminalId};
 
     async fn setup() -> (
         SqliteRequirementRepository,
@@ -490,7 +628,7 @@ mod tests {
 
         sqlx::query(
             "INSERT INTO conversations \
-                (id, user_id, name, type, created_at, updated_at) \
+                (conversation_id, user_id, name, type, created_at, updated_at) \
              VALUES (?1, ?2, 'requirement-owner-conversation', 'nomi', 0, 0)",
         )
         .bind(&conversation_id)
@@ -500,7 +638,7 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO terminal_sessions \
-                (id, name, cwd, command, args, created_at, updated_at, user_id) \
+                (terminal_id, name, cwd, command, args, created_at, updated_at, user_id) \
              VALUES (?1, 'requirement-owner-terminal', '/tmp', '$SHELL', '[]', 0, 0, ?2)",
         )
         .bind(&terminal_id)
@@ -515,7 +653,6 @@ mod tests {
     fn make_row(tag: &str, sort_seq: &str) -> NewRequirementRow {
         let now = now_ms();
         NewRequirementRow {
-            id: RequirementId::new().into_string(),
             title: format!("Req {tag}/{sort_seq}"),
             content: "do the thing".into(),
             tag: tag.into(),
@@ -539,17 +676,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn insert_update_get_delete_use_canonical_string_ids() {
+    async fn insert_update_get_delete_use_business_ids() {
         let (repo, _db, _conversation_id, _terminal_id) = setup().await;
         let row = make_row("t", "00000001");
         let inserted = repo.insert(&row).await.unwrap();
-        let id = inserted.id;
-        assert_eq!(id, row.id);
+        assert!(inserted.id > 0, "every row keeps an internal AUTOINCREMENT id");
+        assert!(RequirementId::parse(&inserted.requirement_id).is_ok());
         assert_eq!(inserted.display_no, 1);
-        assert!(id.parse::<RequirementId>().is_ok());
+        let requirement_id = inserted.requirement_id.clone();
 
         repo.update(
-            &id,
+            &requirement_id,
             &RequirementRowUpdate {
                 title: Some("updated".into()),
                 status: Some("done".into()),
@@ -558,12 +695,21 @@ mod tests {
         )
         .await
         .unwrap();
-        let found = repo.get_by_id(&id).await.unwrap().unwrap();
+        let found = repo
+            .get_by_requirement_id(&requirement_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(found.title, "updated");
         assert_eq!(found.status, "done");
 
-        repo.delete(&id).await.unwrap();
-        assert!(repo.get_by_id(&id).await.unwrap().is_none());
+        repo.delete(&requirement_id).await.unwrap();
+        assert!(
+            repo.get_by_requirement_id(&requirement_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
         let missing = RequirementId::new().into_string();
         assert!(matches!(
@@ -583,7 +729,7 @@ mod tests {
     #[tokio::test]
     async fn list_filters_paginates_and_sorts_without_interpolating_input() {
         let (repo, _db, _conversation_id, _terminal_id) = setup().await;
-        let low = repo.insert(&make_row("alpha", "00000001")).await.unwrap().id;
+        let low = repo.insert(&make_row("alpha", "00000001")).await.unwrap();
         let high = repo.insert(&make_row("alpha", "00000002")).await.unwrap();
         repo.insert(&make_row("beta", "00000001")).await.unwrap();
 
@@ -594,10 +740,10 @@ mod tests {
                 ..Default::default()
             })
             .await
-            .unwrap();
+        .unwrap();
         assert_eq!(total, 2);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, low);
+        assert_eq!(rows[0].requirement_id, low.requirement_id);
 
         let (rows, total) = repo
             .list(&ListRequirementsParams {
@@ -610,7 +756,12 @@ mod tests {
             .unwrap();
         assert_eq!(total, 3);
         assert_eq!(rows.len(), 3);
-        assert!(repo.get_by_id(&low).await.unwrap().is_some());
+        assert!(
+            repo.get_by_requirement_id(&low.requirement_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         let (rows, total) = repo
             .list(&ListRequirementsParams {
@@ -618,42 +769,55 @@ mod tests {
                 ..Default::default()
             })
             .await
-            .unwrap();
+        .unwrap();
         assert_eq!(total, 1);
-        assert_eq!(rows[0].id, high.id);
+        assert_eq!(rows[0].requirement_id, high.requirement_id);
     }
 
     #[tokio::test]
-    async fn display_numbers_are_monotonic_non_reusable_and_immutable() {
-        let (repo, db, _conversation_id, _terminal_id) = setup().await;
+    async fn display_numbers_are_monotonic_non_reusable_and_not_exposed_as_update_fields() {
+        let (repo, _db, _conversation_id, _terminal_id) = setup().await;
         let first = repo.insert(&make_row("alpha", "1")).await.unwrap();
         let second = repo.insert(&make_row("alpha", "2")).await.unwrap();
         assert_eq!((first.display_no, second.display_no), (1, 2));
+        assert!(second.id > first.id, "technical row ids remain monotonic");
 
-        repo.delete(&second.id).await.unwrap();
+        repo.delete(&second.requirement_id).await.unwrap();
         let third = repo.insert(&make_row("alpha", "3")).await.unwrap();
         assert_eq!(third.display_no, 3, "deleted display numbers must never be reused");
 
-        let error = sqlx::query("UPDATE requirements SET display_no = 99 WHERE id = ?")
-            .bind(&first.id)
-            .execute(db.pool())
+        repo.update(
+            &first.requirement_id,
+            &RequirementRowUpdate {
+                title: Some("still #1".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let refreshed = repo
+            .get_by_requirement_id(&first.requirement_id)
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains("requirement display_no is immutable"));
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.display_no, 1);
     }
 
     #[tokio::test]
     async fn claim_and_lease_guards_are_domain_typed() {
         let (repo, _db, conversation_id, terminal_id) = setup().await;
-        let conversation_req = repo.insert(&make_row("conv", "1")).await.unwrap().id;
-        let terminal_req = repo.insert(&make_row("term", "1")).await.unwrap().id;
+        let conversation_req = repo.insert(&make_row("conv", "1")).await.unwrap();
+        let terminal_req = repo.insert(&make_row("term", "1")).await.unwrap();
 
         let conversation_claim = repo
             .claim_next("conv", Some(&conversation_id), None, 60_000, now_ms())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(conversation_claim.id, conversation_req);
+        assert_eq!(
+            conversation_claim.requirement_id,
+            conversation_req.requirement_id
+        );
         assert_eq!(
             conversation_claim.owner_conversation_id.as_deref(),
             Some(conversation_id.as_str())
@@ -664,7 +828,7 @@ mod tests {
         assert!(
             !repo
                 .renew_lease(
-                    &conversation_req,
+                    &conversation_req.requirement_id,
                     None,
                     Some(&terminal_id),
                     60_000,
@@ -676,7 +840,7 @@ mod tests {
         );
         assert!(
             repo.renew_lease(
-                &conversation_req,
+                &conversation_req.requirement_id,
                 Some(&conversation_id),
                 None,
                 60_000,
@@ -691,7 +855,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(terminal_claim.id, terminal_req);
+        assert_eq!(terminal_claim.requirement_id, terminal_req.requirement_id);
         assert!(terminal_claim.owner_conversation_id.is_none());
         assert_eq!(
             terminal_claim.owner_terminal_id.as_deref(),
@@ -700,17 +864,25 @@ mod tests {
 
         assert!(
             !repo
-                .unclaim(&terminal_req, Some(&conversation_id), None)
+                .unclaim(
+                    &terminal_req.requirement_id,
+                    Some(&conversation_id),
+                    None,
+                )
                 .await
                 .unwrap(),
             "a conversation identity must not unclaim terminal-owned work"
         );
         assert!(
-            repo.unclaim(&terminal_req, None, Some(&terminal_id))
+            repo.unclaim(&terminal_req.requirement_id, None, Some(&terminal_id))
                 .await
                 .unwrap()
         );
-        let row = repo.get_by_id(&terminal_req).await.unwrap().unwrap();
+        let row = repo
+            .get_by_requirement_id(&terminal_req.requirement_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, "pending");
         assert_eq!(row.attempt_count, 0);
         assert!(row.owner_conversation_id.is_none());
@@ -720,7 +892,11 @@ mod tests {
     #[tokio::test]
     async fn expired_lease_sweep_respects_separate_owner_domains() {
         let (repo, _db, conversation_id, terminal_id) = setup().await;
-        let req_id = repo.insert(&make_row("t", "1")).await.unwrap().id;
+        let req_id = repo
+            .insert(&make_row("t", "1"))
+            .await
+            .unwrap()
+            .requirement_id;
         let expired_at = now_ms() - 10_000;
         repo.claim_next(
             "t",
@@ -742,7 +918,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reset, 1, "an active conversation cannot protect a terminal lease");
-        let row = repo.get_by_id(&req_id).await.unwrap().unwrap();
+        let row = repo
+            .get_by_requirement_id(&req_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, "pending");
         assert!(row.owner_conversation_id.is_none());
         assert!(row.owner_terminal_id.is_none());
@@ -771,7 +951,11 @@ mod tests {
     #[tokio::test]
     async fn pause_resume_blocks_and_restores_claiming() {
         let (repo, _db, conversation_id, _terminal_id) = setup().await;
-        let req_id = repo.insert(&make_row("paused", "1")).await.unwrap().id;
+        let req_id = repo
+            .insert(&make_row("paused", "1"))
+            .await
+            .unwrap()
+            .requirement_id;
         repo.pause_tag(
             "paused",
             "requirement_failed",
@@ -788,7 +972,7 @@ mod tests {
                 .is_none()
         );
         let state = repo.get_tag_state("paused").await.unwrap().unwrap();
-        assert_eq!(state.paused_req_id.as_deref(), Some(req_id.as_str()));
+        assert_eq!(state.paused_requirement_id, Some(req_id));
 
         repo.resume_tag("paused").await.unwrap();
         assert!(!repo.is_tag_paused("paused").await.unwrap());
@@ -800,13 +984,62 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn delete_sets_paused_requirement_reference_null_and_cascades_attachments() {
+        let (repo, db, _conversation_id, _terminal_id) = setup().await;
+        let requirement = repo.insert(&make_row("paused-delete", "1")).await.unwrap();
+        repo.pause_tag(
+            "paused-delete",
+            "requirement_failed",
+            Some(&requirement.requirement_id),
+            now_ms(),
+        )
+        .await
+        .unwrap();
+        let attachment_id = nomifun_common::AttachmentId::new().into_string();
+        sqlx::query(
+            "INSERT INTO attachments \
+             (attachment_id, requirement_id, file_name, rel_path, mime, size_bytes, created_at) \
+             VALUES (?, ?, 'proof.png', ?, 'image/png', 1, 1)",
+        )
+        .bind(&attachment_id)
+        .bind(&requirement.requirement_id)
+        .bind(format!(
+            "attachments/{}/{}.png",
+            requirement.requirement_id, attachment_id
+        ))
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        repo.delete(&requirement.requirement_id).await.unwrap();
+
+        let state = repo
+            .get_tag_state("paused-delete")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.is_paused(), "pause state survives parent deletion");
+        assert_eq!(state.paused_requirement_id, None);
+        let attachment_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM attachments WHERE requirement_id = ?")
+                .bind(&requirement.requirement_id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(attachment_count, 0);
+    }
+
     #[test]
     fn order_clause_is_whitelisted() {
         assert_eq!(
             build_order_clause(Some("display_no"), Some("asc")),
             "ORDER BY display_no ASC, id ASC"
         );
-        assert_eq!(build_order_clause(Some("id"), Some("asc")), "ORDER BY id ASC");
+        assert_eq!(
+            build_order_clause(Some("requirement_id"), Some("asc")),
+            "ORDER BY requirement_id ASC"
+        );
         assert_eq!(
             build_order_clause(Some("status"), Some("desc")),
             "ORDER BY status DESC, id DESC"

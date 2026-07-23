@@ -16,11 +16,13 @@ use crate::provider::ProviderResponse;
 pub struct CatalogModelRef {
     #[serde(deserialize_with = "crate::serde_util::deserialize_provider_id")]
     pub provider_id: String,
+    #[serde(deserialize_with = "crate::serde_util::deserialize_model_name")]
     pub model: String,
 }
 
 /// Request body for `POST /api/model-profiles/resolve`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResolveModelsRequest {
     pub task: ModelTask,
     #[serde(default)]
@@ -67,7 +69,7 @@ pub fn resolve_models(
 
             let profile = profiles
                 .iter()
-                .find(|p| p.provider_id == provider.id && &p.model == model);
+                .find(|p| p.provider_id == provider.provider_id && &p.model == model);
 
             let included = match profile {
                 Some(p) => matches(&p.tasks, &p.traits, task, required_traits),
@@ -77,7 +79,10 @@ pub fn resolve_models(
                 }
             };
             if included {
-                out.push(CatalogModelRef { provider_id: provider.id.clone(), model: model.clone() });
+                out.push(CatalogModelRef {
+                    provider_id: provider.provider_id.clone(),
+                    model: model.clone(),
+                });
             }
         }
     }
@@ -90,11 +95,11 @@ mod tests {
     use crate::provider::ProviderResponse;
     use std::collections::HashMap;
 
-    const PROVIDER_ID: &str = "prov_018f1234-5678-7abc-8def-012345678990";
+    const PROVIDER_ID: &str = "018f1234-5678-7abc-8def-012345678990";
 
     fn provider(id: &str, platform: &str, models: &[&str]) -> ProviderResponse {
         ProviderResponse {
-            id: id.into(),
+            provider_id: id.into(),
             platform: platform.into(),
             name: id.into(),
             base_url: "https://x.test/v1".into(),
@@ -102,7 +107,6 @@ mod tests {
             models: models.iter().map(|s| s.to_string()).collect(),
             enabled: true,
             capabilities: vec![],
-            context_limit: None,
             model_context_limits: None,
             model_protocols: None,
             model_descriptions: None,

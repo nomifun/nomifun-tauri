@@ -86,7 +86,7 @@ pub fn build_turn_writeback_prompt(
     prompt.push_str(&format!("- rule: {eagerness_rule}\n\n"));
     prompt.push_str("Mounted knowledge bases:\n");
     for m in mounts {
-        prompt.push_str(&format!("- kb_id: {}\n", m.id));
+        prompt.push_str(&format!("- kb_id: {}\n", m.knowledge_base_id));
         prompt.push_str(&format!("  name: {}\n", m.name));
         if !m.description.trim().is_empty() {
             prompt.push_str(&format!("  description: {}\n", one_line(&m.description)));
@@ -205,7 +205,7 @@ mod tests {
     fn prompt_labels_eagerness_without_changing_placement() {
         let prompt = build_turn_writeback_prompt(
             &[KnowledgeMountInfo {
-                id: nomifun_common::KnowledgeBaseId::new(),
+                knowledge_base_id: nomifun_common::KnowledgeBaseId::new(),
                 name: "Ops".into(),
                 description: String::new(),
                 rel_path: ".nomi/knowledge/Ops".into(),

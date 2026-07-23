@@ -35,10 +35,9 @@ fn login_request_empty_body() {
 }
 
 #[test]
-fn login_request_extra_fields_ignored() {
+fn login_request_rejects_extra_fields() {
     let json = r#"{"username":"admin","password":"secret","extra":"ignored"}"#;
-    let req: LoginRequest = serde_json::from_str(json).unwrap();
-    assert_eq!(req.username, "admin");
+    assert!(serde_json::from_str::<LoginRequest>(json).is_err());
 }
 
 // --- LoginResponse ---
@@ -48,7 +47,7 @@ fn login_response_serialization_matches_spec() {
     let user_id = UserId::new();
     let resp = LoginResponse::new(
         PublicUser {
-            id: user_id.clone(),
+            user_id: user_id.clone(),
             username: "admin".into(),
         },
         "eyJhbGciOiJIUzI1NiJ9".into(),
@@ -57,7 +56,7 @@ fn login_response_serialization_matches_spec() {
 
     assert_eq!(json["success"], true);
     assert_eq!(json["message"], "Login successful");
-    assert_eq!(json["user"]["id"], user_id.as_str());
+    assert_eq!(json["user"]["user_id"], user_id.as_str());
     assert_eq!(json["user"]["username"], "admin");
     assert_eq!(json["token"], "eyJhbGciOiJIUzI1NiJ9");
 }

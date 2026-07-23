@@ -1,11 +1,12 @@
 import { ipcBridge } from '@/common';
 import type { AgentMetadata } from '@/renderer/utils/model/agentTypes';
+import type { AgentId } from '@/common/types/ids';
 import { DETECTED_AGENTS_SWR_KEY, fetchDetectedAgents } from '@/renderer/utils/model/agentTypes';
 import { useCallback, useMemo } from 'react';
 import useSWR, { mutate } from 'swr';
 
 export type AvailableBackend = {
-  id: string;
+  id: AgentId;
   name: string;
   isExtension?: boolean;
 };
@@ -26,8 +27,8 @@ export const useDetectedAgents = () => {
       rawAgents
         .filter((a) => a.agent_type !== 'remote')
         .map((a) => ({
-          // Presets reference the canonical AgentMetadata id, never a backend slug.
-          id: a.id,
+          // Presets reference the canonical AgentMetadata agent_id, never a backend slug.
+          id: a.agent_id,
           name: a.name,
           isExtension: a.agent_source === 'extension',
         })),

@@ -4,7 +4,9 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use nomifun_common::{CompanionId, ConversationId, KnowledgeBindingId, TerminalId, TimestampMs};
+use nomifun_common::{
+    CompanionId, ConversationId, KnowledgeBindingId, TerminalId, TimestampMs,
+};
 use nomifun_db::models::{CreateKnowledgeTagParams, KnowledgeBaseRow, KnowledgeBindingRow, KnowledgeTagRow, UpdateKnowledgeTagParams};
 use nomifun_db::{DbError, IKnowledgeRepository};
 
@@ -23,7 +25,8 @@ pub(crate) struct MemRepo {
 /// Build a binding row with the `target_id` written to the column selected by
 /// `target_kind` (the in-memory analogue of the CHECK-constrained columns).
 fn binding_row(
-    binding_id: KnowledgeBindingId,
+    id: i64,
+    knowledge_binding_id: KnowledgeBindingId,
     kind: &str,
     target_id: &str,
     enabled: bool,
@@ -34,11 +37,12 @@ fn binding_row(
     updated_at: TimestampMs,
 ) -> KnowledgeBindingRow {
     let mut row = KnowledgeBindingRow {
-        binding_id,
+        id,
+        knowledge_binding_id,
         target_kind: kind.to_owned(),
         target_workpath: None,
-        target_conv_id: None,
-        target_term_id: None,
+        target_conversation_id: None,
+        target_terminal_id: None,
         target_companion_id: None,
         enabled,
         writeback,
@@ -49,8 +53,10 @@ fn binding_row(
     };
     match kind {
         "workpath" => row.target_workpath = Some(target_id.to_owned()),
-        "conversation" => row.target_conv_id = ConversationId::parse(target_id).ok(),
-        "terminal" => row.target_term_id = TerminalId::parse(target_id).ok(),
+        "conversation" => {
+            row.target_conversation_id = ConversationId::parse(target_id).ok()
+        }
+        "terminal" => row.target_terminal_id = TerminalId::parse(target_id).ok(),
         "companion" => row.target_companion_id = CompanionId::parse(target_id).ok(),
         _ => {}
     }
@@ -60,23 +66,33 @@ fn binding_row(
 #[async_trait::async_trait]
 impl IKnowledgeRepository for MemRepo {
     async fn insert_base(&self, row: &KnowledgeBaseRow) -> Result<(), DbError> {
-        self.bases.lock().unwrap().push(row.clone());
+        let mut bases = self.bases.lock().unwrap();
+        let mut row = row.clone();
+        if row.id == 0 {
+            row.id = bases.iter().map(|base| base.id).max().unwrap_or(0) + 1;
+        }
+        bases.push(row);
         Ok(())
     }
     async fn update_base(&self, row: &KnowledgeBaseRow) -> Result<(), DbError> {
         let mut bases = self.bases.lock().unwrap();
-        match bases.iter_mut().find(|r| r.id == row.id) {
+        match bases
+            .iter_mut()
+            .find(|r| r.knowledge_base_id == row.knowledge_base_id)
+        {
             Some(r) => {
+                let technical_id = r.id;
                 *r = row.clone();
+                r.id = technical_id;
                 Ok(())
             }
-            None => Err(DbError::NotFound(row.id.to_string())),
+            None => Err(DbError::NotFound(row.knowledge_base_id.clone())),
         }
     }
     async fn delete_base(&self, id: &str) -> Result<(), DbError> {
         let mut bases = self.bases.lock().unwrap();
         let before = bases.len();
-        bases.retain(|r| r.id.as_str() != id);
+        bases.retain(|r| r.knowledge_base_id != id);
         if bases.len() == before {
             Err(DbError::NotFound(id.to_owned()))
         } else {
@@ -84,7 +100,13 @@ impl IKnowledgeRepository for MemRepo {
         }
     }
     async fn get_base(&self, id: &str) -> Result<Option<KnowledgeBaseRow>, DbError> {
-        Ok(self.bases.lock().unwrap().iter().find(|r| r.id.as_str() == id).cloned())
+        Ok(self
+            .bases
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.knowledge_base_id == id)
+            .cloned())
     }
     async fn list_bases(&self) -> Result<Vec<KnowledgeBaseRow>, DbError> {
         Ok(self.bases.lock().unwrap().clone())
@@ -115,17 +137,34 @@ impl IKnowledgeRepository for MemRepo {
         updated_at: TimestampMs,
     ) -> Result<String, DbError> {
         let mut bindings = self.bindings.lock().unwrap();
-        // Reuse the existing binding_id on upsert; allocate a fresh one
-        // otherwise (the surrogate-key analogue of the real table).
-        let binding_id = bindings
+        // Preserve both identities on upsert. The local integer is only the
+        // technical row key; callers receive the stable UUIDv7 business ID.
+        let (technical_id, knowledge_binding_id) = bindings
             .iter()
             .find(|(b, _)| b.target_kind == kind && b.target_id().as_deref() == Some(id))
-            .map(|(b, _)| b.binding_id.clone())
-            .unwrap_or_else(KnowledgeBindingId::new);
+            .map(|(b, _)| (b.id, b.knowledge_binding_id.clone()))
+            .unwrap_or_else(|| {
+                (
+                    bindings.iter().map(|(b, _)| b.id).max().unwrap_or(0) + 1,
+                    KnowledgeBindingId::new(),
+                )
+            });
         bindings.retain(|(b, _)| !(b.target_kind == kind && b.target_id().as_deref() == Some(id)));
-        let row = binding_row(binding_id.clone(), kind, id, enabled, writeback, writeback_mode, writeback_eagerness, channel_write_enabled, updated_at);
+        let business_id = knowledge_binding_id.to_string();
+        let row = binding_row(
+            technical_id,
+            knowledge_binding_id,
+            kind,
+            id,
+            enabled,
+            writeback,
+            writeback_mode,
+            writeback_eagerness,
+            channel_write_enabled,
+            updated_at,
+        );
         bindings.push((row, kb_ids.to_vec()));
-        Ok(binding_id.into_string())
+        Ok(business_id)
     }
     async fn delete_binding(&self, kind: &str, id: &str) -> Result<(), DbError> {
         self.bindings
@@ -143,7 +182,7 @@ impl IKnowledgeRepository for MemRepo {
             .filter(|(_, kb_ids)| kb_ids.iter().any(|k| k == kb_id))
             .map(|(b, _)| b.clone())
             .collect();
-        rows.sort_by(|a, b| a.target_kind.cmp(&b.target_kind).then(a.binding_id.cmp(&b.binding_id)));
+        rows.sort_by(|a, b| a.target_kind.cmp(&b.target_kind).then(a.id.cmp(&b.id)));
         Ok(rows)
     }
 
@@ -154,7 +193,10 @@ impl IKnowledgeRepository for MemRepo {
     }
 
     async fn create_knowledge_tag(&self, params: CreateKnowledgeTagParams) -> Result<(), DbError> {
-        self.tags.lock().unwrap().push(KnowledgeTagRow {
+        let mut tags = self.tags.lock().unwrap();
+        let id = tags.iter().map(|tag| tag.id).max().unwrap_or(0) + 1;
+        tags.push(KnowledgeTagRow {
+            id,
             key: params.key,
             label: params.label,
             color: params.color,

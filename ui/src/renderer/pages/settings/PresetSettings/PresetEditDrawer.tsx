@@ -12,6 +12,7 @@ import type {
   PresetTag,
   PresetTarget,
 } from '@/common/types/agent/presetTypes';
+import type { PresetTagId } from '@/common/types/ids';
 import type { ImportedAgentSkill } from '@/renderer/pages/settings/skill/AgentSkillImportDrawer';
 import type { AgentSkillImportRow } from '@/renderer/pages/settings/skill/agentSkillImportUtils';
 import AgentSkillImportDrawer from '@/renderer/pages/settings/skill/AgentSkillImportDrawer';
@@ -28,7 +29,13 @@ import { Close, Delete, Info, Plus, Robot } from '@icon-park/react';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
-import { parseKnowledgeBaseId, parseProviderId, type KnowledgeBaseId } from '@/common/types/ids';
+import {
+  parseAgentId,
+  parseKnowledgeBaseId,
+  parseProviderId,
+  type AgentId,
+  type KnowledgeBaseId,
+} from '@/common/types/ids';
 
 const ANY_PROVIDER_TOKEN = '*';
 
@@ -48,8 +55,8 @@ type PresetEditDrawerProps = {
   editAvatar: string;
   setEditAvatar: (v: string) => void;
   editAvatarImage: string | undefined;
-  editAgents: string[];
-  setEditAgents: (v: string[]) => void;
+  editAgents: AgentId[];
+  setEditAgents: (v: AgentId[]) => void;
   editModels: ModelPreference[];
   setEditModels: (v: ModelPreference[]) => void;
   editTargets: PresetTarget[];
@@ -84,10 +91,10 @@ type PresetEditDrawerProps = {
   setDisabledBuiltinSkills: (v: string[]) => void;
 
   // Tag pickers (audience / scenario)
-  editAudienceTags: string[];
-  setEditAudienceTags: (v: string[]) => void;
-  editScenarioTags: string[];
-  setEditScenarioTags: (v: string[]) => void;
+  editAudienceTags: PresetTagId[];
+  setEditAudienceTags: (v: PresetTagId[]) => void;
+  editScenarioTags: PresetTagId[];
+  setEditScenarioTags: (v: PresetTagId[]) => void;
   audienceTags: PresetTag[];
   scenarioTags: PresetTag[];
   onCreateTag: (req: CreatePresetTagRequest) => Promise<PresetTag>;
@@ -467,7 +474,7 @@ const PresetEditDrawer: React.FC<PresetEditDrawerProps> = ({
               mode='multiple'
               className='mt-10px w-full rounded-4px'
               value={editAgents}
-              onChange={(value) => setEditAgents(value as string[])}
+              onChange={(value) => setEditAgents((value as string[]).map(parseAgentId))}
               disabled={readOnly}
               allowClear
               showSearch
@@ -609,7 +616,7 @@ const PresetEditDrawer: React.FC<PresetEditDrawerProps> = ({
                   placeholder={t('settings.presetKnowledgeBasesPlaceholder', { defaultValue: 'Choose knowledge bases' })}
                 >
                   {knowledgeBases.map((base) => (
-                    <NomiSelect.Option key={base.id} value={base.id}>{base.name}</NomiSelect.Option>
+                    <NomiSelect.Option key={base.knowledge_base_id} value={base.knowledge_base_id}>{base.name}</NomiSelect.Option>
                   ))}
                 </NomiSelect>
                 <div className='grid grid-cols-1 md:grid-cols-3 gap-10px'>
@@ -667,10 +674,11 @@ const PresetEditDrawer: React.FC<PresetEditDrawerProps> = ({
               label={t('settings.presetTagPickAudience', { defaultValue: 'Audience tags' })}
               tags={audienceTags}
               value={editAudienceTags}
-              onChange={setEditAudienceTags}
+              onChange={(values) => setEditAudienceTags(values as PresetTagId[])}
               onCreateTag={onCreateTag}
               localeKey={localeKey}
               readOnly={readOnly}
+              reference='id'
               showAddHint
             />
             <PresetTagPicker
@@ -679,10 +687,11 @@ const PresetEditDrawer: React.FC<PresetEditDrawerProps> = ({
               label={t('settings.presetTagPickScenario', { defaultValue: 'Scenario tags' })}
               tags={scenarioTags}
               value={editScenarioTags}
-              onChange={setEditScenarioTags}
+              onChange={(values) => setEditScenarioTags(values as PresetTagId[])}
               onCreateTag={onCreateTag}
               localeKey={localeKey}
               readOnly={readOnly}
+              reference='id'
               showAddHint
             />
           </div>

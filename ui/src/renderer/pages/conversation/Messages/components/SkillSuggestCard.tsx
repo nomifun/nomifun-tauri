@@ -3,7 +3,8 @@
  * Copyright 2025-2026 NomiFun (nomifun.com)
  * SPDX-License-Identifier: Apache-2.0
  */
-import type { ArtifactId, ConversationId, CronJobId } from '@/common/types/ids';
+import type { ConversationArtifactId } from '@/common/types/conversationArtifact';
+import type { ConversationId, CronJobId } from '@/common/types/ids';
 
 import { ipcBridge } from '@/common';
 import { iconColors } from '@/renderer/styles/colors';
@@ -17,7 +18,7 @@ import type { SkillSuggestion } from '@renderer/utils/chat/skillSuggestParser';
 import { MESSAGE_BODY_FONT_SIZE, MESSAGE_BODY_LINE_HEIGHT } from '../typography';
 
 interface SkillSuggestCardProps {
-  artifact_id: ArtifactId;
+  conversation_artifact_id: ConversationArtifactId;
   conversation_id: ConversationId;
   suggestion: SkillSuggestion;
   cron_job_id: CronJobId;
@@ -26,7 +27,7 @@ interface SkillSuggestCardProps {
 const CODE_STYLE = { marginTop: 4, marginBlock: 4 };
 
 const SkillSuggestCard: React.FC<SkillSuggestCardProps> = ({
-  artifact_id,
+  conversation_artifact_id,
   conversation_id,
   suggestion,
   cron_job_id,
@@ -41,7 +42,7 @@ const SkillSuggestCard: React.FC<SkillSuggestCardProps> = ({
   // Check if skill already exists on mount (persists across navigation)
   useEffect(() => {
     ipcBridge.cron.hasSkill
-      .invoke({ job_id: cron_job_id })
+      .invoke({ cron_job_id })
       .then((exists) => {
         if (exists) setSaved(true);
       })
@@ -53,8 +54,8 @@ const SkillSuggestCard: React.FC<SkillSuggestCardProps> = ({
   const handleSave = async () => {
     setSaving(true);
     try {
-      await ipcBridge.cron.saveSkill.invoke({ job_id: cron_job_id, content: suggestion.content });
-      updateArtifactStatus(artifact_id, 'saved');
+      await ipcBridge.cron.saveSkill.invoke({ cron_job_id, content: suggestion.content });
+      updateArtifactStatus(conversation_artifact_id, 'saved');
       setSaved(true);
       Message.success(t('cron.skill.saveSuccess'));
     } catch (err) {
@@ -104,10 +105,10 @@ const SkillSuggestCard: React.FC<SkillSuggestCardProps> = ({
             try {
               await ipcBridge.conversation.updateArtifact.invoke({
                 conversation_id,
-                artifact_id,
+                conversation_artifact_id,
                 status: 'dismissed',
               });
-              updateArtifactStatus(artifact_id, 'dismissed');
+              updateArtifactStatus(conversation_artifact_id, 'dismissed');
               setDismissed(true);
             } catch (error) {
               Message.error(t('cron.skill.saveFailed'));

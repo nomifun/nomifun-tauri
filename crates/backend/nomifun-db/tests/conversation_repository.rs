@@ -3,10 +3,10 @@ use nomifun_db::{
     SqliteConversationRepository, TurnArtifactMessageCommit, models::ConversationRow,
     models::MessageRow,
 };
-use nomifun_common::{ConversationArtifactId, ConversationId, CronJobId, MessageId};
+use nomifun_common::{ConversationId, MessageId};
 
-const USER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
-const ARTIFACT_CRON_JOB_ID: &str = "cron_0190f5fe-7c00-7a00-8000-000000000001";
+const USER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+const PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000002";
 
 async fn init_database_memory() -> Result<nomifun_db::Database, nomifun_db::DbError> {
     nomifun_db::init_database_memory_with_owner(
@@ -19,13 +19,14 @@ async fn setup() -> (SqliteConversationRepository, nomifun_db::Database) {
     let db = init_database_memory().await.unwrap();
     sqlx::query(
         "INSERT INTO providers (\
-            id, platform, name, base_url, api_key_encrypted, models, enabled, \
+            provider_id, platform, name, base_url, api_key_encrypted, models, enabled, \
             capabilities, created_at, updated_at\
          ) VALUES (\
-            'prov_0190f5fe-7c00-7a00-8000-000000000001', 'openai', 'Fixture provider', 'https://example.invalid', \
+            ?, 'openai', 'Fixture provider', 'https://example.invalid', \
             'encrypted', '[]', 1, '[]', 0, 0\
          )",
     )
+    .bind(PROVIDER_ID)
     .execute(db.pool())
     .await
     .unwrap();
@@ -36,16 +37,19 @@ async fn setup() -> (SqliteConversationRepository, nomifun_db::Database) {
 fn make_conversation(suffix: &str) -> ConversationRow {
     let now = nomifun_common::now_ms();
     ConversationRow {
-        id: ConversationId::new().into_string(),
+        id: 0,
+        conversation_id: ConversationId::new().into_string(),
         user_id: USER_ID.to_string(),
         name: format!("Conversation {suffix}"),
-        r#type: "gemini".to_string(),
+        r#type: "acp".to_string(),
         extra: r#"{"workspace":"/home/user/project"}"#.to_string(),
         delegation_policy: "automatic".to_string(),
         execution_model_pool: None,
         decision_policy: "automatic".to_string(),
         execution_template_id: None,
-        model: Some(r#"{"provider_id":"prov_0190f5fe-7c00-7a00-8000-000000000001","model":"claude-sonnet-4-20250514"}"#.to_string()),
+        model: Some(format!(
+            r#"{{"provider_id":"{PROVIDER_ID}","model":"claude-sonnet-4-20250514"}}"#
+        )),
         status: Some("pending".to_string()),
         source: Some("nomifun".to_string()),
         channel_chat_id: None,
@@ -62,10 +66,12 @@ fn make_conversation(suffix: &str) -> ConversationRow {
 
 fn make_message(conv_id: &str, content: &str) -> MessageRow {
     let now = nomifun_common::now_ms();
+    let message_id = MessageId::new().into_string();
     MessageRow {
-        id: nomifun_common::generate_prefixed_id("msg"),
+        id: 0,
+        message_id: message_id.clone(),
         conversation_id: conv_id.to_owned(),
-        msg_id: Some(MessageId::new().into_string()),
+        msg_id: Some(message_id),
         r#type: "text".to_string(),
         content: format!(r#"{{"content":"{content}"}}"#),
         position: Some("right".to_string()),
@@ -75,14 +81,35 @@ fn make_message(conv_id: &str, content: &str) -> MessageRow {
     }
 }
 
+async fn insert_turn_message(
+    repo: &SqliteConversationRepository,
+    conversation_id: &str,
+    message_id: &str,
+) {
+    repo.insert_message(&MessageRow {
+        id: 0,
+        message_id: message_id.to_owned(),
+        conversation_id: conversation_id.to_owned(),
+        msg_id: Some(message_id.to_owned()),
+        r#type: "text".to_owned(),
+        content: r#"{"content":"turn"}"#.to_owned(),
+        position: Some("right".to_owned()),
+        status: Some("finish".to_owned()),
+        hidden: false,
+        created_at: 1,
+    })
+    .await
+    .unwrap();
+}
+
 fn make_generic_artifact_commit(
-    id: String,
+    message_id: String,
     turn_message_id: &str,
     call_id: &str,
     artifact_id: &str,
 ) -> TurnArtifactMessageCommit {
     TurnArtifactMessageCommit {
-        id,
+        message_id,
         message_type: "tool_call".to_owned(),
         content: serde_json::json!({
             "call_id": call_id,
@@ -107,13 +134,13 @@ fn make_generic_artifact_commit(
 }
 
 fn make_acp_artifact_commit(
-    id: String,
+    message_id: String,
     turn_message_id: &str,
     call_id: &str,
     artifact_id: &str,
 ) -> TurnArtifactMessageCommit {
     TurnArtifactMessageCommit {
-        id,
+        message_id,
         message_type: "acp_tool_call".to_owned(),
         content: serde_json::json!({
             "session_id": "session-1",
@@ -162,7 +189,8 @@ fn make_provisional_artifact_message(
         _ => unreachable!("test fixture only supports artifact tool messages"),
     }
     MessageRow {
-        id: commit.id.clone(),
+        id: 0,
+        message_id: commit.message_id.clone(),
         conversation_id: conversation_id.to_owned(),
         msg_id: Some(turn_message_id.to_owned()),
         r#type: commit.message_type.clone(),
@@ -174,14 +202,11 @@ fn make_provisional_artifact_message(
     }
 }
 
-fn make_artifact(conv_id: &str) -> nomifun_db::ConversationArtifactRow {
-    let cron_job_id = CronJobId::parse(ARTIFACT_CRON_JOB_ID)
-        .expect("canonical artifact cron fixture")
-        .into_string();
+fn make_artifact(conv_id: &str, cron_job_id: &str) -> nomifun_db::ConversationArtifactRow {
     nomifun_db::ConversationArtifactRow {
-        id: ConversationArtifactId::new().into_string(),
+        conversation_artifact_id: nomifun_common::generate_id(),
         conversation_id: conv_id.to_owned(),
-        cron_job_id: Some(cron_job_id.clone()),
+        cron_job_id: Some(cron_job_id.to_owned()),
         kind: "skill_suggest".to_string(),
         status: "pending".to_string(),
         payload: serde_json::json!({
@@ -196,20 +221,20 @@ fn make_artifact(conv_id: &str) -> nomifun_db::ConversationArtifactRow {
     }
 }
 
-/// Insert a minimal `cron_jobs` row so the artifact FK
-/// (`conversation_artifacts.cron_job_id → cron_jobs(id)`) is satisfiable.
-/// conversation_id is left NULL to avoid an extra FK dependency.
-async fn seed_cron_job(pool: &sqlx::SqlitePool, id: &str) {
-    sqlx::query(
+/// Insert a minimal local cron job and return its logical UUIDv7 ID.
+async fn seed_cron_job(pool: &sqlx::SqlitePool) -> String {
+    let cron_job_id = nomifun_common::CronJobId::new().into_string();
+    sqlx::query_scalar(
         "INSERT INTO cron_jobs \
-            (id, user_id, name, schedule_kind, schedule_value, payload_message, agent_type, created_by, created_at, updated_at) \
-         VALUES (?, ?, 'Job', 'every', '60000', 'msg', 'acp', 'user', 0, 0)",
+            (cron_job_id, user_id, name, schedule_kind, schedule_value, payload_message, agent_type, created_by, created_at, updated_at) \
+         VALUES (?, ?, 'Job', 'every', '60000', 'msg', 'acp', 'user', 0, 0) \
+         RETURNING cron_job_id",
     )
-    .bind(id)
+    .bind(&cron_job_id)
     .bind(USER_ID)
-    .execute(pool)
+    .fetch_one(pool)
     .await
-    .unwrap();
+    .unwrap()
 }
 
 // ── Conversation CRUD ───────────────────────────────────────────────
@@ -220,17 +245,17 @@ async fn create_get_update_delete_lifecycle() {
 
     // Create
     let mut conv = make_conversation("lifecycle");
-    conv.id = repo.create(&conv).await.unwrap();
+    conv.conversation_id = repo.create(&conv).await.unwrap();
 
     // Get
-    let found = repo.get(&conv.id).await.unwrap().unwrap();
+    let found = repo.get(&conv.conversation_id).await.unwrap().unwrap();
     assert_eq!(found.name, "Conversation lifecycle");
     assert_eq!(found.status.as_deref(), Some("pending"));
 
     // Update
     let now = nomifun_common::now_ms();
     repo.update(
-        &conv.id,
+        &conv.conversation_id,
         &ConversationRowUpdate {
             name: Some("Updated Name".to_string()),
             status: Some("running".to_string()),
@@ -241,40 +266,40 @@ async fn create_get_update_delete_lifecycle() {
     .await
     .unwrap();
 
-    let updated = repo.get(&conv.id).await.unwrap().unwrap();
+    let updated = repo.get(&conv.conversation_id).await.unwrap().unwrap();
     assert_eq!(updated.name, "Updated Name");
     assert_eq!(updated.status.as_deref(), Some("running"));
 
     // Delete
-    repo.delete(&conv.id).await.unwrap();
-    assert!(repo.get(&conv.id).await.unwrap().is_none());
+    repo.delete(&conv.conversation_id).await.unwrap();
+    assert!(repo.get(&conv.conversation_id).await.unwrap().is_none());
 }
 
 #[tokio::test]
-async fn delete_conversation_cascades_messages() {
+async fn delete_conversation_cleans_up_messages() {
     let (repo, _db) = setup().await;
     let mut conv = make_conversation("cascade");
-    conv.id = repo.create(&conv).await.unwrap();
+    conv.conversation_id = repo.create(&conv).await.unwrap();
 
     // Insert messages
     for i in 0..3 {
-        let msg = make_message(&conv.id, &format!("msg {i}"));
+        let msg = make_message(&conv.conversation_id, &format!("msg {i}"));
         repo.insert_message(&msg).await.unwrap();
     }
 
     // Verify messages exist
-    let msgs = repo.get_messages(&conv.id, 1, 50, SortOrder::Desc).await.unwrap();
+    let msgs = repo.get_messages(&conv.conversation_id, 1, 50, SortOrder::Desc).await.unwrap();
     assert_eq!(msgs.total, 3);
 
-    // Delete conversation → messages cascade
-    repo.delete(&conv.id).await.unwrap();
+    // Repository-owned logical cleanup removes dependent messages.
+    repo.delete(&conv.conversation_id).await.unwrap();
 
-    let msgs = repo.get_messages(&conv.id, 1, 50, SortOrder::Desc).await.unwrap();
+    let msgs = repo.get_messages(&conv.conversation_id, 1, 50, SortOrder::Desc).await.unwrap();
     assert_eq!(msgs.total, 0);
 }
 
 #[tokio::test]
-async fn internal_creation_and_delivery_operations_are_durable_and_immutable() {
+async fn internal_creation_and_delivery_operations_are_durable_and_repository_idempotent() {
     let (repo, db) = setup().await;
     let conversation = make_conversation("durable-operation");
 
@@ -294,29 +319,9 @@ async fn internal_creation_and_delivery_operations_are_durable_and_immutable() {
             .await
             .unwrap()
             .unwrap()
-            .id,
+            .conversation_id,
         conversation_id
     );
-    assert!(
-        sqlx::query(
-            "UPDATE conversation_creation_keys SET creation_key = 'rewritten' \
-             WHERE creation_key = 'attempt:create:1'",
-        )
-        .execute(db.pool())
-        .await
-        .is_err(),
-        "a creation identity cannot be rewritten"
-    );
-    assert!(
-        sqlx::query(
-            "DELETE FROM conversation_creation_keys WHERE creation_key = 'attempt:create:1'",
-        )
-        .execute(db.pool())
-        .await
-        .is_err(),
-        "a direct delete cannot erase the creation replay fence"
-    );
-
     let accepted_at = nomifun_common::now_ms();
     let request = r#"{"content":"continue"}"#;
     let accepted = repo
@@ -363,17 +368,6 @@ async fn internal_creation_and_delivery_operations_are_durable_and_immutable() {
     );
 
     assert!(
-        sqlx::query(
-            "UPDATE conversation_delivery_receipts SET updated_at = updated_at + 1 \
-             WHERE operation_id = 'decision:1'",
-        )
-        .execute(db.pool())
-        .await
-        .is_err(),
-        "accepted receipt state cannot be rewritten in place"
-    );
-
-    assert!(
         repo.complete_delivery_receipt(
             USER_ID,
             &conversation_id,
@@ -416,44 +410,21 @@ async fn internal_creation_and_delivery_operations_are_durable_and_immutable() {
     assert_eq!(completed.result_text, None);
     assert_eq!(completed.result_error.as_deref(), Some("terminal provider error"));
 
+    let delete_error = repo.delete(&conversation_id).await.unwrap_err();
     assert!(
-        sqlx::query(
-            "UPDATE conversation_delivery_receipts SET result_error = 'rewritten' \
-             WHERE operation_id = 'decision:1'",
-        )
-        .execute(db.pool())
-        .await
-        .is_err(),
-        "completed result is immutable"
+        matches!(delete_error, nomifun_db::DbError::Conflict(_)),
+        "delivery history keeps the Conversation identity alive"
     );
-    assert!(
-        sqlx::query(
-            "UPDATE conversation_delivery_receipts SET request_payload = '{\"content\":\"rewritten\"}' \
-             WHERE operation_id = 'decision:1'",
-        )
-        .execute(db.pool())
-        .await
-        .is_err(),
-        "operation identity and request are immutable"
-    );
-    assert!(
-        sqlx::query(
-            "DELETE FROM conversation_delivery_receipts WHERE operation_id = 'decision:1'",
-        )
-        .execute(db.pool())
-        .await
-        .is_err(),
-        "a direct delete cannot erase the replay fence"
-    );
-
-    repo.delete(&conversation_id).await.unwrap();
     let remaining: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM conversation_delivery_receipts WHERE operation_id = 'decision:1'",
     )
     .fetch_one(db.pool())
     .await
     .unwrap();
-    assert_eq!(remaining, 0, "Conversation deletion may cascade the receipt");
+    assert_eq!(
+        remaining, 1,
+        "Conversation deletion is restricted while a durable receipt exists"
+    );
     let remaining_creation_keys: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM conversation_creation_keys \
          WHERE creation_key = 'attempt:create:1'",
@@ -462,8 +433,8 @@ async fn internal_creation_and_delivery_operations_are_durable_and_immutable() {
     .await
     .unwrap();
     assert_eq!(
-        remaining_creation_keys, 0,
-        "Conversation deletion may cascade the creation replay fence"
+        remaining_creation_keys, 1,
+        "Conversation deletion is atomic and keeps its creation replay fence"
     );
 }
 
@@ -471,19 +442,19 @@ async fn internal_creation_and_delivery_operations_are_durable_and_immutable() {
 async fn assistant_message_projection_is_atomic_idempotent_and_owner_scoped() {
     let (repo, db) = setup().await;
     let mut conversation = make_conversation("message-projection");
-    conversation.id = repo.create(&conversation).await.unwrap();
+    conversation.conversation_id = repo.create(&conversation).await.unwrap();
 
     let now = nomifun_common::now_ms();
     let request = r#"{"execution_id":"exec_1","summary":"done"}"#;
-    let mut message = make_message(&conversation.id, "Execution completed");
+    let mut message = make_message(&conversation.conversation_id, "Execution completed");
     message.position = Some("left".to_owned());
-    message.msg_id = Some(message.id.clone());
+    message.msg_id = Some(message.message_id.clone());
     message.created_at = now;
 
     let inserted = repo
         .project_assistant_message_with_receipt(
             USER_ID,
-            &conversation.id,
+            &conversation.conversation_id,
             "execution:exec_1:lead-report",
             "projection",
             request,
@@ -493,15 +464,15 @@ async fn assistant_message_projection_is_atomic_idempotent_and_owner_scoped() {
         .await
         .unwrap();
     assert!(inserted.inserted);
-    assert_eq!(inserted.message.id, message.id);
+    assert_eq!(inserted.message.message_id, message.message_id);
 
-    let mut replay_candidate = make_message(&conversation.id, "must not replace the result");
+    let mut replay_candidate = make_message(&conversation.conversation_id, "must not replace the result");
     replay_candidate.position = Some("left".to_owned());
-    replay_candidate.msg_id = Some(replay_candidate.id.clone());
+    replay_candidate.msg_id = Some(replay_candidate.message_id.clone());
     let replayed = repo
         .project_assistant_message_with_receipt(
             USER_ID,
-            &conversation.id,
+            &conversation.conversation_id,
             "execution:exec_1:lead-report",
             "projection",
             request,
@@ -511,13 +482,13 @@ async fn assistant_message_projection_is_atomic_idempotent_and_owner_scoped() {
         .await
         .unwrap();
     assert!(!replayed.inserted);
-    assert_eq!(replayed.message.id, message.id);
+    assert_eq!(replayed.message.message_id, message.message_id);
     assert_eq!(replayed.message.content, message.content);
 
     let message_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
     )
-    .bind(&conversation.id)
+    .bind(&conversation.conversation_id)
     .fetch_one(db.pool())
     .await
     .unwrap();
@@ -528,7 +499,7 @@ async fn assistant_message_projection_is_atomic_idempotent_and_owner_scoped() {
     let invalid_shape = repo
         .project_assistant_message_with_receipt(
             USER_ID,
-            &conversation.id,
+            &conversation.conversation_id,
             "execution:exec_invalid:lead-report",
             "projection",
             request,
@@ -542,7 +513,7 @@ async fn assistant_message_projection_is_atomic_idempotent_and_owner_scoped() {
     let invalid_kind = repo
         .project_assistant_message_with_receipt(
             USER_ID,
-            &conversation.id,
+            &conversation.conversation_id,
             "execution:exec_invalid_kind:lead-report",
             "turn",
             request,
@@ -556,7 +527,7 @@ async fn assistant_message_projection_is_atomic_idempotent_and_owner_scoped() {
     let payload_conflict = repo
         .project_assistant_message_with_receipt(
             USER_ID,
-            &conversation.id,
+            &conversation.conversation_id,
             "execution:exec_1:lead-report",
             "projection",
             r#"{"execution_id":"exec_1","summary":"different"}"#,
@@ -569,8 +540,8 @@ async fn assistant_message_projection_is_atomic_idempotent_and_owner_scoped() {
 
     let non_owner = repo
         .project_assistant_message_with_receipt(
-            "another_user",
-            &conversation.id,
+            "0190f5fe-7c00-7a00-8000-000000000099",
+            &conversation.conversation_id,
             "execution:exec_2:lead-report",
             "projection",
             request,
@@ -582,11 +553,11 @@ async fn assistant_message_projection_is_atomic_idempotent_and_owner_scoped() {
     assert!(matches!(non_owner, nomifun_db::DbError::NotFound(_)));
 
     let mut missing_message = message.clone();
-    missing_message.conversation_id = "conv_0190f5fe-7c00-7a00-8abc-012345679999".to_owned();
+    missing_message.conversation_id = "0190f5fe-7c00-7a00-8abc-012345679999".to_owned();
     let missing = repo
         .project_assistant_message_with_receipt(
             USER_ID,
-            "conv_0190f5fe-7c00-7a00-8abc-012345679999",
+            "0190f5fe-7c00-7a00-8abc-012345679999",
             "execution:exec_3:lead-report",
             "projection",
             request,
@@ -627,7 +598,7 @@ async fn cursor_pagination_walks_through_all_items() {
     assert_eq!(p1.total, 7);
 
     // Page 2
-    let cursor = p1.items.last().unwrap().id.clone();
+    let cursor = p1.items.last().unwrap().conversation_id.clone();
     let p2 = repo
         .list_paginated(
             USER_ID,
@@ -643,7 +614,7 @@ async fn cursor_pagination_walks_through_all_items() {
     assert!(p2.has_more);
 
     // Page 3
-    let cursor = p2.items.last().unwrap().id.clone();
+    let cursor = p2.items.last().unwrap().conversation_id.clone();
     let p3 = repo
         .list_paginated(
             USER_ID,
@@ -664,7 +635,7 @@ async fn cursor_pagination_walks_through_all_items() {
         .iter()
         .chain(p2.items.iter())
         .chain(p3.items.iter())
-        .map(|c| c.id.clone())
+        .map(|c| c.conversation_id.clone())
         .collect();
     all_ids.sort();
     all_ids.dedup();
@@ -681,7 +652,7 @@ async fn filter_by_source_and_pinned_combined() {
     c1.source = Some("nomifun".to_string());
     c1.pinned = true;
     c1.pinned_at = Some(nomifun_common::now_ms());
-    c1.id = repo.create(&c1).await.unwrap();
+    c1.conversation_id = repo.create(&c1).await.unwrap();
 
     let mut c2 = make_conversation("telegram-pinned");
     c2.source = Some("telegram".to_string());
@@ -709,21 +680,21 @@ async fn filter_by_source_and_pinned_combined() {
         .unwrap();
 
     assert_eq!(result.items.len(), 1);
-    assert_eq!(result.items[0].id, c1.id);
+    assert_eq!(result.items[0].conversation_id, c1.conversation_id);
 }
 
 #[tokio::test]
 async fn filter_by_cron_job_id() {
     let (repo, db) = setup().await;
-    seed_cron_job(db.pool(), "cron_123").await;
-    seed_cron_job(db.pool(), "cron_456").await;
+    let cron_123 = seed_cron_job(db.pool()).await;
+    let cron_456 = seed_cron_job(db.pool()).await;
 
     let mut c1 = make_conversation("cron-a");
-    c1.cron_job_id = Some("cron_123".to_string());
-    c1.id = repo.create(&c1).await.unwrap();
+    c1.cron_job_id = Some(cron_123.clone());
+    c1.conversation_id = repo.create(&c1).await.unwrap();
 
     let mut c2 = make_conversation("cron-b");
-    c2.cron_job_id = Some("cron_456".to_string());
+    c2.cron_job_id = Some(cron_456);
     repo.create(&c2).await.unwrap();
 
     let c3 = make_conversation("no-cron"); // cron_job_id is None
@@ -733,7 +704,7 @@ async fn filter_by_cron_job_id() {
         .list_paginated(
             USER_ID,
             &ConversationFilters {
-                cron_job_id: Some("cron_123".to_string()),
+                cron_job_id: Some(cron_123),
                 limit: 20,
                 ..Default::default()
             },
@@ -742,7 +713,7 @@ async fn filter_by_cron_job_id() {
         .unwrap();
 
     assert_eq!(result.items.len(), 1);
-    assert_eq!(result.items[0].id, c1.id);
+    assert_eq!(result.items[0].conversation_id, c1.conversation_id);
 }
 
 // ── Extended queries ────────────────────────────────────────────────
@@ -755,35 +726,35 @@ async fn find_by_source_and_chat_integration() {
     c.source = Some("telegram".to_string());
     c.channel_chat_id = Some("group:789".to_string());
     c.r#type = "acp".to_string();
-    c.id = repo.create(&c).await.unwrap();
+    c.conversation_id = repo.create(&c).await.unwrap();
 
     let found = repo
         .find_by_source_and_chat(USER_ID, "telegram", "group:789", "acp")
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(found.id, c.id);
+    assert_eq!(found.conversation_id, c.conversation_id);
 }
 
 #[tokio::test]
 async fn list_by_cron_job_returns_matching() {
     let (repo, db) = setup().await;
-    seed_cron_job(db.pool(), "job_x").await;
-    seed_cron_job(db.pool(), "job_y").await;
+    let job_x = seed_cron_job(db.pool()).await;
+    let job_y = seed_cron_job(db.pool()).await;
 
     let mut c1 = make_conversation("cron1");
-    c1.cron_job_id = Some("job_x".to_string());
+    c1.cron_job_id = Some(job_x.clone());
     repo.create(&c1).await.unwrap();
 
     let mut c2 = make_conversation("cron2");
-    c2.cron_job_id = Some("job_x".to_string());
+    c2.cron_job_id = Some(job_x.clone());
     repo.create(&c2).await.unwrap();
 
     let mut c3 = make_conversation("cron3");
-    c3.cron_job_id = Some("job_y".to_string());
+    c3.cron_job_id = Some(job_y);
     repo.create(&c3).await.unwrap();
 
-    let result = repo.list_by_cron_job(USER_ID, "job_x").await.unwrap();
+    let result = repo.list_by_cron_job(USER_ID, &job_x).await.unwrap();
     assert_eq!(result.len(), 2);
 }
 
@@ -793,19 +764,19 @@ async fn list_associated_finds_same_workspace() {
 
     let mut c1 = make_conversation("ws1");
     c1.extra = r#"{"workspace":"/shared"}"#.to_string();
-    c1.id = repo.create(&c1).await.unwrap();
+    c1.conversation_id = repo.create(&c1).await.unwrap();
 
     let mut c2 = make_conversation("ws2");
     c2.extra = r#"{"workspace":"/shared"}"#.to_string();
-    c2.id = repo.create(&c2).await.unwrap();
+    c2.conversation_id = repo.create(&c2).await.unwrap();
 
     let mut c3 = make_conversation("ws3");
     c3.extra = r#"{"workspace":"/different"}"#.to_string();
     repo.create(&c3).await.unwrap();
 
-    let assoc = repo.list_associated(USER_ID, &c1.id).await.unwrap();
+    let assoc = repo.list_associated(USER_ID, &c1.conversation_id).await.unwrap();
     assert_eq!(assoc.len(), 1);
-    assert_eq!(assoc[0].id, c2.id);
+    assert_eq!(assoc[0].conversation_id, c2.conversation_id);
 }
 
 #[tokio::test]
@@ -814,46 +785,87 @@ async fn list_associated_returns_empty_when_no_workspace() {
 
     let mut c = make_conversation("no-ws");
     c.extra = r#"{"setting":"value"}"#.to_string();
-    c.id = repo.create(&c).await.unwrap();
+    c.conversation_id = repo.create(&c).await.unwrap();
 
-    let assoc = repo.list_associated(USER_ID, &c.id).await.unwrap();
+    let assoc = repo.list_associated(USER_ID, &c.conversation_id).await.unwrap();
     assert!(assoc.is_empty());
 }
 
 // ── Message operations ──────────────────────────────────────────────
 
 #[tokio::test]
-async fn message_correlation_claim_is_canonical_stable_and_turn_scoped() {
+async fn message_parent_must_exist_in_the_same_conversation() {
     let (repo, _db) = setup().await;
+    let mut first = make_conversation("message-parent-first");
+    first.conversation_id = repo.create(&first).await.unwrap();
+    let mut second = make_conversation("message-parent-second");
+    second.conversation_id = repo.create(&second).await.unwrap();
+
+    let parent = make_message(&first.conversation_id, "parent");
+    repo.insert_message(&parent).await.unwrap();
+
+    let mut child = make_message(&first.conversation_id, "child");
+    child.msg_id = Some(parent.message_id.clone());
+    repo.insert_message(&child).await.unwrap();
+
+    let mut cross_scope = make_message(&second.conversation_id, "cross-scope");
+    cross_scope.msg_id = Some(parent.message_id.clone());
+    let error = repo.insert_message(&cross_scope).await.unwrap_err();
+    assert!(matches!(error, nomifun_db::DbError::Conflict(_)));
+
+    let mut missing = make_message(&first.conversation_id, "missing");
+    missing.msg_id = Some(MessageId::new().into_string());
+    let error = repo.insert_message(&missing).await.unwrap_err();
+    assert!(matches!(error, nomifun_db::DbError::Conflict(_)));
+}
+
+#[tokio::test]
+async fn message_correlation_claim_is_canonical_stable_and_turn_scoped() {
+    let (repo, db) = setup().await;
     let mut conv = make_conversation("message-correlation");
-    conv.id = repo.create(&conv).await.unwrap();
+    conv.conversation_id = repo.create(&conv).await.unwrap();
     let turn_a = MessageId::new().into_string();
     let turn_b = MessageId::new().into_string();
 
     let first = repo
-        .claim_message_correlation(&conv.id, &turn_a, "tool_call", "provider-call-1")
+        .claim_message_correlation(&conv.conversation_id, &turn_a, "tool_call", "provider-call-1")
         .await
         .unwrap();
     let replay = repo
-        .claim_message_correlation(&conv.id, &turn_a, "tool_call", "provider-call-1")
+        .claim_message_correlation(&conv.conversation_id, &turn_a, "tool_call", "provider-call-1")
         .await
         .unwrap();
     let other_turn = repo
-        .claim_message_correlation(&conv.id, &turn_b, "tool_call", "provider-call-1")
+        .claim_message_correlation(&conv.conversation_id, &turn_b, "tool_call", "provider-call-1")
         .await
         .unwrap();
 
     MessageId::parse(&first).expect("claimed correlation ID must be canonical");
     assert_eq!(replay, first);
     assert_ne!(other_turn, first);
+
+    let reserved_without_projected_turn: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM message_correlations \
+         WHERE conversation_id = ? AND turn_message_id = ?",
+    )
+    .bind(&conv.conversation_id)
+    .bind(&turn_a)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        reserved_without_projected_turn, 1,
+        "correlation reservation must not require a messages row for the wire owner"
+    );
 }
 
 #[tokio::test]
 async fn artifact_message_commit_promotes_inserts_and_replays_atomically() {
     let (repo, _db) = setup().await;
     let mut conv = make_conversation("artifact-commit");
-    conv.id = repo.create(&conv).await.unwrap();
+    conv.conversation_id = repo.create(&conv).await.unwrap();
     let turn_id = MessageId::new().into_string();
+    insert_turn_message(&repo, &conv.conversation_id, &turn_id).await;
     let generic = make_generic_artifact_commit(
         MessageId::new().into_string(),
         &turn_id,
@@ -866,31 +878,31 @@ async fn artifact_message_commit_promotes_inserts_and_replays_atomically() {
         "acp-call",
         "acp-image",
     );
-    let provisional = make_provisional_artifact_message(&conv.id, &turn_id, &generic, 100);
+    let provisional = make_provisional_artifact_message(&conv.conversation_id, &turn_id, &generic, 100);
     repo.insert_message(&provisional).await.unwrap();
 
     let empty_error = repo
-        .commit_turn_artifact_messages(&conv.id, &turn_id, &[], 200)
+        .commit_turn_artifact_messages(&conv.conversation_id, &turn_id, &[], 200)
         .await
         .unwrap_err();
     assert!(matches!(empty_error, nomifun_db::DbError::Conflict(_)));
 
     let committed = repo
-        .commit_turn_artifact_messages(&conv.id, &turn_id, &[generic.clone(), acp.clone()], 200)
+        .commit_turn_artifact_messages(&conv.conversation_id, &turn_id, &[generic.clone(), acp.clone()], 200)
         .await
         .unwrap();
     assert_eq!(committed.len(), 2);
-    assert_eq!(committed[0].id, generic.id);
+    assert_eq!(committed[0].message_id, generic.message_id);
     assert_eq!(committed[0].status.as_deref(), Some("finish"));
     assert_eq!(committed[0].content, generic.content);
     assert_eq!(committed[0].created_at, 100, "promotion preserves provisional creation time");
-    assert_eq!(committed[1].id, acp.id);
+    assert_eq!(committed[1].message_id, acp.message_id);
     assert_eq!(committed[1].status.as_deref(), Some("finish"));
     assert_eq!(committed[1].content, acp.content);
     assert_eq!(committed[1].created_at, 200, "missing row is inserted at commit time");
 
     let replay = repo
-        .commit_turn_artifact_messages(&conv.id, &turn_id, &[generic.clone(), acp.clone()], 999)
+        .commit_turn_artifact_messages(&conv.conversation_id, &turn_id, &[generic.clone(), acp.clone()], 999)
         .await
         .unwrap();
     assert_eq!(replay.len(), 2);
@@ -904,8 +916,9 @@ async fn artifact_message_commit_promotes_inserts_and_replays_atomically() {
 async fn artifact_message_commit_rolls_back_the_batch_on_error_state() {
     let (repo, _db) = setup().await;
     let mut conv = make_conversation("artifact-error-rollback");
-    conv.id = repo.create(&conv).await.unwrap();
+    conv.conversation_id = repo.create(&conv).await.unwrap();
     let turn_id = MessageId::new().into_string();
+    insert_turn_message(&repo, &conv.conversation_id, &turn_id).await;
     let would_insert = make_generic_artifact_commit(
         MessageId::new().into_string(),
         &turn_id,
@@ -918,14 +931,14 @@ async fn artifact_message_commit_rolls_back_the_batch_on_error_state() {
         "already-failed",
         "failed-image",
     );
-    let mut error_row = make_provisional_artifact_message(&conv.id, &turn_id, &blocked, 100);
+    let mut error_row = make_provisional_artifact_message(&conv.conversation_id, &turn_id, &blocked, 100);
     error_row.status = Some("error".to_owned());
     let original_error_content = error_row.content.clone();
     repo.insert_message(&error_row).await.unwrap();
 
     let error = repo
         .commit_turn_artifact_messages(
-            &conv.id,
+            &conv.conversation_id,
             &turn_id,
             &[would_insert.clone(), blocked.clone()],
             200,
@@ -934,13 +947,13 @@ async fn artifact_message_commit_rolls_back_the_batch_on_error_state() {
         .unwrap_err();
     assert!(matches!(error, nomifun_db::DbError::Conflict(_)));
     assert!(
-        repo.get_message(&conv.id, &would_insert.id)
+        repo.get_message(&conv.conversation_id, &would_insert.message_id)
             .await
             .unwrap()
             .is_none(),
         "the earlier insert must roll back when a later row conflicts"
     );
-    let still_error = repo.get_message(&conv.id, &blocked.id).await.unwrap().unwrap();
+    let still_error = repo.get_message(&conv.conversation_id, &blocked.message_id).await.unwrap().unwrap();
     assert_eq!(still_error.status.as_deref(), Some("error"));
     assert_eq!(still_error.content, original_error_content);
 }
@@ -949,11 +962,20 @@ async fn artifact_message_commit_rolls_back_the_batch_on_error_state() {
 async fn artifact_message_commit_rejects_cross_turn_and_wrong_type_rows() {
     let (repo, _db) = setup().await;
     let mut conv = make_conversation("artifact-identity-conflicts");
-    conv.id = repo.create(&conv).await.unwrap();
+    conv.conversation_id = repo.create(&conv).await.unwrap();
     let mut other_conv = make_conversation("artifact-other-owner");
-    other_conv.id = repo.create(&other_conv).await.unwrap();
+    other_conv.conversation_id = repo.create(&other_conv).await.unwrap();
     let turn_id = MessageId::new().into_string();
     let other_turn_id = MessageId::new().into_string();
+    let other_conversation_turn_id = MessageId::new().into_string();
+    insert_turn_message(&repo, &conv.conversation_id, &turn_id).await;
+    insert_turn_message(&repo, &conv.conversation_id, &other_turn_id).await;
+    insert_turn_message(
+        &repo,
+        &other_conv.conversation_id,
+        &other_conversation_turn_id,
+    )
+    .await;
 
     let cross_conversation = make_acp_artifact_commit(
         MessageId::new().into_string(),
@@ -961,12 +983,21 @@ async fn artifact_message_commit_rejects_cross_turn_and_wrong_type_rows() {
         "cross-conversation-call",
         "cross-conversation-image",
     );
-    let cross_conversation_row =
-        make_provisional_artifact_message(&other_conv.id, &turn_id, &cross_conversation, 100);
+    let cross_conversation_row = make_provisional_artifact_message(
+        &other_conv.conversation_id,
+        &other_conversation_turn_id,
+        &make_acp_artifact_commit(
+            cross_conversation.message_id.clone(),
+            &other_conversation_turn_id,
+            "cross-conversation-call",
+            "cross-conversation-image",
+        ),
+        100,
+    );
     repo.insert_message(&cross_conversation_row).await.unwrap();
     let error = repo
         .commit_turn_artifact_messages(
-            &conv.id,
+            &conv.conversation_id,
             &turn_id,
             std::slice::from_ref(&cross_conversation),
             200,
@@ -982,10 +1013,10 @@ async fn artifact_message_commit_rejects_cross_turn_and_wrong_type_rows() {
         "cross-turn-image",
     );
     let cross_turn_row = make_provisional_artifact_message(
-        &conv.id,
+        &conv.conversation_id,
         &other_turn_id,
         &make_generic_artifact_commit(
-            cross_turn.id.clone(),
+            cross_turn.message_id.clone(),
             &other_turn_id,
             "cross-turn-call",
             "cross-turn-image",
@@ -994,7 +1025,7 @@ async fn artifact_message_commit_rejects_cross_turn_and_wrong_type_rows() {
     );
     repo.insert_message(&cross_turn_row).await.unwrap();
     let error = repo
-        .commit_turn_artifact_messages(&conv.id, &turn_id, std::slice::from_ref(&cross_turn), 200)
+        .commit_turn_artifact_messages(&conv.conversation_id, &turn_id, std::slice::from_ref(&cross_turn), 200)
         .await
         .unwrap_err();
     assert!(matches!(error, nomifun_db::DbError::Conflict(_)));
@@ -1006,8 +1037,9 @@ async fn artifact_message_commit_rejects_cross_turn_and_wrong_type_rows() {
         "wrong-type-image",
     );
     let row = MessageRow {
-        id: wrong_type.id.clone(),
-        conversation_id: conv.id.clone(),
+        id: 0,
+        message_id: wrong_type.message_id.clone(),
+        conversation_id: conv.conversation_id.clone(),
         msg_id: Some(turn_id.clone()),
         r#type: "text".to_owned(),
         content: serde_json::json!({"content": "not a tool", "turn_id": turn_id}).to_string(),
@@ -1018,7 +1050,7 @@ async fn artifact_message_commit_rejects_cross_turn_and_wrong_type_rows() {
     };
     repo.insert_message(&row).await.unwrap();
     let error = repo
-        .commit_turn_artifact_messages(&conv.id, &turn_id, std::slice::from_ref(&wrong_type), 200)
+        .commit_turn_artifact_messages(&conv.conversation_id, &turn_id, std::slice::from_ref(&wrong_type), 200)
         .await
         .unwrap_err();
     assert!(matches!(error, nomifun_db::DbError::Conflict(_)));
@@ -1031,7 +1063,7 @@ async fn artifact_message_commit_rejects_cross_turn_and_wrong_type_rows() {
     );
     unsupported.message_type = "text".to_owned();
     let error = repo
-        .commit_turn_artifact_messages(&conv.id, &turn_id, &[unsupported], 200)
+        .commit_turn_artifact_messages(&conv.conversation_id, &turn_id, &[unsupported], 200)
         .await
         .unwrap_err();
     assert!(matches!(error, nomifun_db::DbError::Conflict(_)));
@@ -1041,8 +1073,9 @@ async fn artifact_message_commit_rejects_cross_turn_and_wrong_type_rows() {
 async fn artifact_message_commit_rolls_back_on_different_finished_projection() {
     let (repo, _db) = setup().await;
     let mut conv = make_conversation("artifact-finish-conflict");
-    conv.id = repo.create(&conv).await.unwrap();
+    conv.conversation_id = repo.create(&conv).await.unwrap();
     let turn_id = MessageId::new().into_string();
+    insert_turn_message(&repo, &conv.conversation_id, &turn_id).await;
     let would_insert = make_acp_artifact_commit(
         MessageId::new().into_string(),
         &turn_id,
@@ -1056,14 +1089,15 @@ async fn artifact_message_commit_rolls_back_on_different_finished_projection() {
         "original-image",
     );
     let different = make_generic_artifact_commit(
-        existing.id.clone(),
+        existing.message_id.clone(),
         &turn_id,
         "same-call",
         "different-image",
     );
     let existing_row = MessageRow {
-        id: existing.id.clone(),
-        conversation_id: conv.id.clone(),
+        id: 0,
+        message_id: existing.message_id.clone(),
+        conversation_id: conv.conversation_id.clone(),
         msg_id: Some(turn_id.clone()),
         r#type: existing.message_type.clone(),
         content: existing.content.clone(),
@@ -1076,7 +1110,7 @@ async fn artifact_message_commit_rolls_back_on_different_finished_projection() {
 
     let error = repo
         .commit_turn_artifact_messages(
-            &conv.id,
+            &conv.conversation_id,
             &turn_id,
             &[would_insert.clone(), different],
             200,
@@ -1085,11 +1119,11 @@ async fn artifact_message_commit_rolls_back_on_different_finished_projection() {
         .unwrap_err();
     assert!(matches!(error, nomifun_db::DbError::Conflict(_)));
     assert!(repo
-        .get_message(&conv.id, &would_insert.id)
+        .get_message(&conv.conversation_id, &would_insert.message_id)
         .await
         .unwrap()
         .is_none());
-    let preserved = repo.get_message(&conv.id, &existing.id).await.unwrap().unwrap();
+    let preserved = repo.get_message(&conv.conversation_id, &existing.message_id).await.unwrap().unwrap();
     assert_eq!(preserved.content, existing.content);
     assert_eq!(preserved.status.as_deref(), Some("finish"));
 }
@@ -1098,23 +1132,23 @@ async fn artifact_message_commit_rolls_back_on_different_finished_projection() {
 async fn message_pagination_and_ordering() {
     let (repo, _db) = setup().await;
     let mut conv = make_conversation("msgs");
-    conv.id = repo.create(&conv).await.unwrap();
+    conv.conversation_id = repo.create(&conv).await.unwrap();
 
     for i in 0..10 {
-        let mut msg = make_message(&conv.id, &format!("item {i}"));
+        let mut msg = make_message(&conv.conversation_id, &format!("item {i}"));
         msg.created_at = (i + 1) as i64 * 1000;
         repo.insert_message(&msg).await.unwrap();
     }
 
     // DESC page 1
-    let p1 = repo.get_messages(&conv.id, 1, 3, SortOrder::Desc).await.unwrap();
+    let p1 = repo.get_messages(&conv.conversation_id, 1, 3, SortOrder::Desc).await.unwrap();
     assert_eq!(p1.items.len(), 3);
     assert_eq!(p1.total, 10);
     assert!(p1.has_more);
     assert!(p1.items[0].created_at > p1.items[1].created_at);
 
     // ASC page 1
-    let asc = repo.get_messages(&conv.id, 1, 3, SortOrder::Asc).await.unwrap();
+    let asc = repo.get_messages(&conv.conversation_id, 1, 3, SortOrder::Asc).await.unwrap();
     assert!(asc.items[0].created_at < asc.items[1].created_at);
 }
 
@@ -1122,13 +1156,13 @@ async fn message_pagination_and_ordering() {
 async fn update_message_fields() {
     let (repo, _db) = setup().await;
     let mut conv = make_conversation("msg-update");
-    conv.id = repo.create(&conv).await.unwrap();
+    conv.conversation_id = repo.create(&conv).await.unwrap();
 
-    let msg = make_message(&conv.id, "original");
+    let msg = make_message(&conv.conversation_id, "original");
     repo.insert_message(&msg).await.unwrap();
 
     repo.update_message(
-        &msg.id,
+        &msg.message_id,
         &MessageRowUpdate {
             content: Some(r#"{"content":"modified"}"#.to_string()),
             hidden: Some(true),
@@ -1138,7 +1172,7 @@ async fn update_message_fields() {
     .await
     .unwrap();
 
-    let msgs = repo.get_messages(&conv.id, 1, 50, SortOrder::Desc).await.unwrap();
+    let msgs = repo.get_messages(&conv.conversation_id, 1, 50, SortOrder::Desc).await.unwrap();
     let updated = &msgs.items[0];
     assert_eq!(updated.content, r#"{"content":"modified"}"#);
     assert!(updated.hidden);
@@ -1149,16 +1183,16 @@ async fn update_message_fields() {
 async fn delete_messages_by_conversation_clears_all() {
     let (repo, _db) = setup().await;
     let mut conv = make_conversation("msg-delete");
-    conv.id = repo.create(&conv).await.unwrap();
+    conv.conversation_id = repo.create(&conv).await.unwrap();
 
     for i in 0..5 {
-        let msg = make_message(&conv.id, &format!("msg {i}"));
+        let msg = make_message(&conv.conversation_id, &format!("msg {i}"));
         repo.insert_message(&msg).await.unwrap();
     }
 
-    repo.delete_messages_by_conversation(&conv.id).await.unwrap();
+    repo.delete_messages_by_conversation(&conv.conversation_id).await.unwrap();
 
-    let result = repo.get_messages(&conv.id, 1, 50, SortOrder::Desc).await.unwrap();
+    let result = repo.get_messages(&conv.conversation_id, 1, 50, SortOrder::Desc).await.unwrap();
     assert!(result.items.is_empty());
     assert_eq!(result.total, 0);
 }
@@ -1167,23 +1201,37 @@ async fn delete_messages_by_conversation_clears_all() {
 async fn get_message_by_msg_id_triple() {
     let (repo, _db) = setup().await;
     let mut conv = make_conversation("msg-find");
-    conv.id = repo.create(&conv).await.unwrap();
+    conv.conversation_id = repo.create(&conv).await.unwrap();
 
-    let mut msg = make_message(&conv.id, "findable");
-    msg.msg_id = Some("unique_msg_123".to_string());
+    let parent = make_message(&conv.conversation_id, "parent");
+    repo.insert_message(&parent).await.unwrap();
+
+    let mut msg = make_message(&conv.conversation_id, "findable");
+    msg.msg_id = Some(parent.message_id.clone());
     msg.r#type = "tool_call".to_string();
     repo.insert_message(&msg).await.unwrap();
 
     // Match
     let found = repo
-        .get_message_by_msg_id(&conv.id, "unique_msg_123", "tool_call")
+        .get_message_by_msg_id(&conv.conversation_id, &parent.message_id, "tool_call")
         .await
         .unwrap();
     assert!(found.is_some());
 
-    // Wrong type → None
+    // The parent message itself uses the same msg_id and remains discoverable
+    // under its own type.
     let not_found = repo
-        .get_message_by_msg_id(&conv.id, "unique_msg_123", "text")
+        .get_message_by_msg_id(&conv.conversation_id, &parent.message_id, "text")
+        .await
+        .unwrap();
+    assert_eq!(
+        not_found.as_ref().map(|row| row.message_id.as_str()),
+        Some(parent.message_id.as_str())
+    );
+
+    // A type not used by either row is absent.
+    let not_found = repo
+        .get_message_by_msg_id(&conv.conversation_id, &parent.message_id, "tips")
         .await
         .unwrap();
     assert!(not_found.is_none());
@@ -1191,8 +1239,8 @@ async fn get_message_by_msg_id_triple() {
     // Wrong conv → None
     let not_found = repo
         .get_message_by_msg_id(
-            "conv_0190f5fe-7c00-7a00-8abc-012345679999",
-            "unique_msg_123",
+            "0190f5fe-7c00-7a00-8abc-012345679999",
+            &parent.message_id,
             "tool_call",
         )
         .await
@@ -1207,17 +1255,17 @@ async fn search_messages_across_conversations() {
     let (repo, _db) = setup().await;
 
     let mut c1 = make_conversation("search1");
-    c1.id = repo.create(&c1).await.unwrap();
+    c1.conversation_id = repo.create(&c1).await.unwrap();
     let mut c2 = make_conversation("search2");
-    c2.id = repo.create(&c2).await.unwrap();
+    c2.conversation_id = repo.create(&c2).await.unwrap();
 
-    let msg1 = make_message(&c1.id, "Rust 代码审查报告");
+    let msg1 = make_message(&c1.conversation_id, "Rust 代码审查报告");
     repo.insert_message(&msg1).await.unwrap();
 
-    let msg2 = make_message(&c2.id, "Python 代码审查总结");
+    let msg2 = make_message(&c2.conversation_id, "Python 代码审查总结");
     repo.insert_message(&msg2).await.unwrap();
 
-    let msg3 = make_message(&c1.id, "unrelated content");
+    let msg3 = make_message(&c1.conversation_id, "unrelated content");
     repo.insert_message(&msg3).await.unwrap();
 
     let result = repo.search_messages(USER_ID, "审查", 1, 20).await.unwrap();
@@ -1234,9 +1282,9 @@ async fn search_messages_across_conversations() {
 async fn search_messages_empty_result() {
     let (repo, _db) = setup().await;
     let mut conv = make_conversation("empty-search");
-    conv.id = repo.create(&conv).await.unwrap();
+    conv.conversation_id = repo.create(&conv).await.unwrap();
 
-    let msg = make_message(&conv.id, "hello world");
+    let msg = make_message(&conv.conversation_id, "hello world");
     repo.insert_message(&msg).await.unwrap();
 
     let result = repo
@@ -1252,10 +1300,10 @@ async fn search_messages_empty_result() {
 async fn search_messages_pagination() {
     let (repo, _db) = setup().await;
     let mut conv = make_conversation("search-page");
-    conv.id = repo.create(&conv).await.unwrap();
+    conv.conversation_id = repo.create(&conv).await.unwrap();
 
     for i in 0..5 {
-        let mut msg = make_message(&conv.id, &format!("searchable item {i}"));
+        let mut msg = make_message(&conv.conversation_id, &format!("searchable item {i}"));
         msg.created_at = (i + 1) as i64 * 1000;
         repo.insert_message(&msg).await.unwrap();
     }
@@ -1280,12 +1328,12 @@ async fn search_messages_pagination() {
 async fn pin_and_unpin_conversation() {
     let (repo, _db) = setup().await;
     let mut conv = make_conversation("pin-test");
-    conv.id = repo.create(&conv).await.unwrap();
+    conv.conversation_id = repo.create(&conv).await.unwrap();
 
     // Pin
     let pin_time = nomifun_common::now_ms();
     repo.update(
-        &conv.id,
+        &conv.conversation_id,
         &ConversationRowUpdate {
             pinned: Some(true),
             pinned_at: Some(Some(pin_time)),
@@ -1296,14 +1344,14 @@ async fn pin_and_unpin_conversation() {
     .await
     .unwrap();
 
-    let pinned = repo.get(&conv.id).await.unwrap().unwrap();
+    let pinned = repo.get(&conv.conversation_id).await.unwrap().unwrap();
     assert!(pinned.pinned);
     assert_eq!(pinned.pinned_at, Some(pin_time));
 
     // Unpin
     let now = nomifun_common::now_ms();
     repo.update(
-        &conv.id,
+        &conv.conversation_id,
         &ConversationRowUpdate {
             pinned: Some(false),
             pinned_at: Some(None),
@@ -1314,7 +1362,7 @@ async fn pin_and_unpin_conversation() {
     .await
     .unwrap();
 
-    let unpinned = repo.get(&conv.id).await.unwrap().unwrap();
+    let unpinned = repo.get(&conv.conversation_id).await.unwrap().unwrap();
     assert!(!unpinned.pinned);
     assert!(unpinned.pinned_at.is_none());
 }
@@ -1326,7 +1374,7 @@ async fn update_nonexistent_conversation_returns_not_found() {
     let (repo, _db) = setup().await;
     let err = repo
         .update(
-            "conv_0190f5fe-7c00-7a00-8abc-012345679999",
+            "0190f5fe-7c00-7a00-8abc-012345679999",
             &ConversationRowUpdate {
                 name: Some("x".to_string()),
                 ..Default::default()
@@ -1340,7 +1388,7 @@ async fn update_nonexistent_conversation_returns_not_found() {
 #[tokio::test]
 async fn delete_nonexistent_conversation_returns_not_found() {
     let (repo, _db) = setup().await;
-    let err = repo.delete("conv_0190f5fe-7c00-7a00-8abc-012345679999").await.unwrap_err();
+    let err = repo.delete("0190f5fe-7c00-7a00-8abc-012345679999").await.unwrap_err();
     assert!(matches!(err, nomifun_db::DbError::NotFound(_)));
 }
 
@@ -1348,7 +1396,7 @@ async fn delete_nonexistent_conversation_returns_not_found() {
 async fn list_associated_nonexistent_returns_not_found() {
     let (repo, _db) = setup().await;
     let err = repo
-        .list_associated(USER_ID, "conv_0190f5fe-7c00-7a00-8abc-012345679999")
+        .list_associated(USER_ID, "0190f5fe-7c00-7a00-8abc-012345679999")
         .await
         .unwrap_err();
     assert!(matches!(err, nomifun_db::DbError::NotFound(_)));
@@ -1359,7 +1407,7 @@ async fn update_message_nonexistent_returns_not_found() {
     let (repo, _db) = setup().await;
     let err = repo
         .update_message(
-            "nonexistent_id",
+            &MessageId::new().into_string(),
             &MessageRowUpdate {
                 hidden: Some(true),
                 ..Default::default()
@@ -1376,11 +1424,11 @@ async fn update_message_nonexistent_returns_not_found() {
 async fn update_extra_replaces_json() {
     let (repo, _db) = setup().await;
     let mut conv = make_conversation("extra-update");
-    conv.id = repo.create(&conv).await.unwrap();
+    conv.conversation_id = repo.create(&conv).await.unwrap();
 
     let now = nomifun_common::now_ms();
     repo.update(
-        &conv.id,
+        &conv.conversation_id,
         &ConversationRowUpdate {
             extra: Some(r#"{"workspace":"/new","flag":true}"#.to_string()),
             updated_at: Some(now),
@@ -1390,7 +1438,7 @@ async fn update_extra_replaces_json() {
     .await
     .unwrap();
 
-    let found = repo.get(&conv.id).await.unwrap().unwrap();
+    let found = repo.get(&conv.conversation_id).await.unwrap().unwrap();
     assert_eq!(found.extra, r#"{"workspace":"/new","flag":true}"#);
 }
 
@@ -1398,14 +1446,15 @@ async fn update_extra_replaces_json() {
 async fn get_messages_excludes_legacy_cron_and_skill_suggest_rows() {
     let (repo, _db) = setup().await;
     let mut conv = make_conversation("message-filter");
-    conv.id = repo.create(&conv).await.unwrap();
+    conv.conversation_id = repo.create(&conv).await.unwrap();
 
-    repo.insert_message(&make_message(&conv.id, "visible")).await.unwrap();
+    repo.insert_message(&make_message(&conv.conversation_id, "visible")).await.unwrap();
 
-    for (id, ty) in [("legacy-cron", "cron_trigger"), ("legacy-skill", "skill_suggest")] {
+    for ty in ["cron_trigger", "skill_suggest"] {
         repo.insert_message(&MessageRow {
-            id: id.into(),
-            conversation_id: conv.id.clone(),
+            id: 0,
+            message_id: MessageId::new().into_string(),
+            conversation_id: conv.conversation_id.clone(),
             msg_id: None,
             r#type: ty.into(),
             content: "{}".into(),
@@ -1418,57 +1467,40 @@ async fn get_messages_excludes_legacy_cron_and_skill_suggest_rows() {
         .unwrap();
     }
 
-    let rows = repo.get_messages(&conv.id, 1, 50, SortOrder::Asc).await.unwrap();
+    let rows = repo.get_messages(&conv.conversation_id, 1, 50, SortOrder::Asc).await.unwrap();
     assert_eq!(rows.total, 1);
     assert_eq!(rows.items.len(), 1);
     assert_eq!(rows.items[0].r#type, "text");
 }
 
 #[tokio::test]
-async fn list_legacy_cron_trigger_messages_returns_only_trigger_rows() {
-    let (repo, _db) = setup().await;
-    let mut conv = make_conversation("legacy-cron-trigger");
-    conv.id = repo.create(&conv).await.unwrap();
-
-    repo.insert_message(&MessageRow {
-        id: nomifun_common::generate_prefixed_id("msg"),
-        conversation_id: conv.id.clone(),
-        msg_id: Some("legacy-trigger".into()),
-        r#type: "cron_trigger".into(),
-        content: r#"{"cron_job_id":"cron_1","cron_job_name":"Daily Report"}"#.into(),
-        position: Some("center".into()),
-        status: Some("finish".into()),
-        hidden: false,
-        created_at: 1000,
-    })
-    .await
-    .unwrap();
-    repo.insert_message(&make_message(&conv.id, "plain text"))
-        .await
-        .unwrap();
-
-    let rows = repo.list_legacy_cron_trigger_messages(&conv.id).await.unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].r#type, "cron_trigger");
-}
-
-#[tokio::test]
 async fn artifact_upsert_list_and_mark_saved() {
     let (repo, db) = setup().await;
     let mut conv = make_conversation("artifact-row");
-    conv.id = repo.create(&conv).await.unwrap();
-    seed_cron_job(db.pool(), ARTIFACT_CRON_JOB_ID).await;
+    conv.conversation_id = repo.create(&conv).await.unwrap();
+    let cron_job_id = seed_cron_job(db.pool()).await;
 
-    let inserted = repo.upsert_artifact(&make_artifact(&conv.id)).await.unwrap();
+    let inserted = repo
+        .upsert_artifact(&make_artifact(&conv.conversation_id, &cron_job_id))
+        .await
+        .unwrap();
     assert_eq!(inserted.status, "pending");
-    let artifact_id = inserted.id;
+    let conversation_artifact_id = inserted.conversation_artifact_id.clone();
 
-    let listed = repo.list_artifacts(&conv.id).await.unwrap();
+    let listed = repo.list_artifacts(&conv.conversation_id).await.unwrap();
     assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].id, artifact_id);
+    assert_eq!(
+        listed[0].conversation_artifact_id,
+        conversation_artifact_id
+    );
 
     let dismissed = repo
-        .update_artifact_status(&conv.id, &artifact_id, "dismissed", 2000)
+        .update_artifact_status(
+            &conv.conversation_id,
+            &conversation_artifact_id,
+            "dismissed",
+            2000,
+        )
         .await
         .unwrap()
         .unwrap();
@@ -1477,15 +1509,15 @@ async fn artifact_upsert_list_and_mark_saved() {
 
     let foreign = repo
         .mark_skill_suggest_artifacts_saved(
-            "user_0190f5fe-7c00-7a00-8000-000000000099",
-            ARTIFACT_CRON_JOB_ID,
+            "0190f5fe-7c00-7a00-8000-000000000099",
+            &cron_job_id,
             2500,
         )
         .await
         .unwrap();
     assert!(foreign.is_empty());
     let unchanged = repo
-        .get_artifact(&conv.id, &artifact_id)
+        .get_artifact(&conv.conversation_id, &conversation_artifact_id)
         .await
         .unwrap()
         .unwrap();
@@ -1493,7 +1525,7 @@ async fn artifact_upsert_list_and_mark_saved() {
     assert_eq!(unchanged.updated_at, 2000);
 
     let saved = repo
-        .mark_skill_suggest_artifacts_saved(USER_ID, ARTIFACT_CRON_JOB_ID, 3000)
+        .mark_skill_suggest_artifacts_saved(USER_ID, &cron_job_id, 3000)
         .await
         .unwrap();
     assert_eq!(saved.len(), 1);
@@ -1505,15 +1537,71 @@ async fn artifact_upsert_list_and_mark_saved() {
 async fn delete_artifacts_by_conversation_removes_rows() {
     let (repo, db) = setup().await;
     let mut conv = make_conversation("artifact-delete");
-    conv.id = repo.create(&conv).await.unwrap();
-    seed_cron_job(db.pool(), ARTIFACT_CRON_JOB_ID).await;
+    conv.conversation_id = repo.create(&conv).await.unwrap();
+    let cron_job_id = seed_cron_job(db.pool()).await;
 
-    repo.upsert_artifact(&make_artifact(&conv.id)).await.unwrap();
+    repo.upsert_artifact(&make_artifact(&conv.conversation_id, &cron_job_id))
+        .await
+        .unwrap();
 
-    repo.delete_artifacts_by_conversation(&conv.id).await.unwrap();
+    repo.delete_artifacts_by_conversation(&conv.conversation_id).await.unwrap();
 
-    let listed = repo.list_artifacts(&conv.id).await.unwrap();
+    let listed = repo.list_artifacts(&conv.conversation_id).await.unwrap();
     assert!(listed.is_empty());
+}
+
+#[tokio::test]
+async fn artifact_upsert_rejects_cross_owner_and_cross_conversation_cron_links() {
+    let (repo, db) = setup().await;
+    let other_user = "0190f5fe-7c00-7a00-8000-000000000003";
+    sqlx::query(
+        "INSERT INTO users (user_id, username, password_hash, created_at, updated_at) \
+         VALUES (?, 'artifact-other', 'hash', 0, 0)",
+    )
+    .bind(other_user)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let mut foreign_conversation = make_conversation("foreign-artifact-owner");
+    foreign_conversation.user_id = other_user.to_owned();
+    foreign_conversation.conversation_id = repo.create(&foreign_conversation).await.unwrap();
+    let cron_job_id = seed_cron_job(db.pool()).await;
+
+    let error = repo
+        .upsert_artifact(&make_artifact(
+            &foreign_conversation.conversation_id,
+            &cron_job_id,
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        nomifun_db::DbError::Conflict(message)
+            if message.contains("different owners")
+    ));
+
+    let mut conversation = make_conversation("bound-artifact-conversation");
+    conversation.conversation_id = repo.create(&conversation).await.unwrap();
+    sqlx::query("UPDATE cron_jobs SET conversation_id = ? WHERE cron_job_id = ?")
+        .bind(&foreign_conversation.conversation_id)
+        .bind(&cron_job_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let error = repo
+        .upsert_artifact(&make_artifact(
+            &conversation.conversation_id,
+            &cron_job_id,
+        ))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        nomifun_db::DbError::Conflict(message)
+            if message.contains("bound to another Conversation")
+    ));
 }
 
 // ── User isolation ──────────────────────────────────────────────────
@@ -1524,8 +1612,8 @@ async fn list_paginated_scoped_to_user() {
 
     // Create a second user
     sqlx::query(
-        "INSERT INTO users (id, username, password_hash, created_at, updated_at) \
-         VALUES ('user_0190f5fe-7c00-7a00-8000-000000000002', 'other', 'hash', 1000, 1000)",
+        "INSERT INTO users (user_id, username, password_hash, created_at, updated_at) \
+         VALUES ('0190f5fe-7c00-7a00-8000-000000000003', 'other', 'hash', 1000, 1000)",
     )
     .execute(db.pool())
     .await
@@ -1535,11 +1623,11 @@ async fn list_paginated_scoped_to_user() {
     repo.create(&c1).await.unwrap();
 
     let mut c2 = make_conversation("user2-conv");
-    c2.user_id = "user_0190f5fe-7c00-7a00-8000-000000000002".to_string();
+    c2.user_id = "0190f5fe-7c00-7a00-8000-000000000003".to_string();
     c2.r#type = "nomi".to_string();
     c2.delegation_policy = "disabled".to_string();
     c2.model = Some(
-        r#"{"provider_id":"prov_0190f5fe-7c00-7a00-8000-000000000001","model":"claude-sonnet-4-20250514"}"#.to_string(),
+        r#"{"provider_id":"0190f5fe-7c00-7a00-8000-000000000002","model":"claude-sonnet-4-20250514"}"#.to_string(),
     );
     repo.create(&c2).await.unwrap();
 

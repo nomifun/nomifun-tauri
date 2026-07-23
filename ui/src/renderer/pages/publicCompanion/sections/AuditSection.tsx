@@ -92,12 +92,12 @@ const AuditSection: React.FC<Props> = ({ agent, patch, message }) => {
   useEffect(() => {
     setRetention(agent.audit_retention_days);
     setCleanupDays(agent.audit_retention_days);
-  }, [agent.id, agent.audit_retention_days]);
+  }, [agent.public_agent_id, agent.audit_retention_days]);
 
   const fetchPage = useCallback(
     async (opts: { reset: boolean; cursor?: number | null }) => {
       const res = await ipcBridge.publicAgent.listAudit.invoke({
-        id: agent.id,
+        public_agent_id: agent.public_agent_id,
         limit: PAGE_SIZE,
         cursor: opts.reset ? undefined : opts.cursor,
         q: q.trim() || undefined,
@@ -106,7 +106,7 @@ const AuditSection: React.FC<Props> = ({ agent, patch, message }) => {
       });
       return res ?? { entries: [], next_cursor: null };
     },
-    [agent.id, q, kind, days]
+    [agent.public_agent_id, q, kind, days]
   );
 
   // Reload (reset) whenever the filters change. q is debounced.
@@ -190,7 +190,10 @@ const AuditSection: React.FC<Props> = ({ agent, patch, message }) => {
       cancelText: t('common.cancel', { defaultValue: '取消' }),
       onOk: async () => {
         try {
-          const res = await ipcBridge.publicAgent.clearAudit.invoke({ id: agent.id, older_than_days: cleanupDays });
+          const res = await ipcBridge.publicAgent.clearAudit.invoke({
+            public_agent_id: agent.public_agent_id,
+            older_than_days: cleanupDays,
+          });
           message.success(
             t('publicCompanion.audit.cleanupOk', { defaultValue: '已清理 {{n}} 天前的记录', n: res?.deleted_days ?? cleanupDays })
           );
@@ -261,7 +264,7 @@ const AuditSection: React.FC<Props> = ({ agent, patch, message }) => {
         ) : (
           <div className='flex flex-col gap-6px'>
             {entries.map((e) => (
-              <AuditRow key={e.id} entry={e} t={t} />
+              <AuditRow key={e.audit_entry_id} entry={e} t={t} />
             ))}
             {cursor != null && (
               <div className='flex justify-center pt-6px'>

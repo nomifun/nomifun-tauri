@@ -6,6 +6,7 @@
 
 import { ipcBridge } from '@/common';
 import type {
+  TAgentExecutionChangedEvent,
   TAgentExecutionLeadThinkingEvent,
   TAgentExecutionLeadThinkingPhase,
 } from '@/common/types/agentExecution/agentExecutionEvents';
@@ -134,7 +135,7 @@ export function useLeadThinking(executionId: ExecutionId | null): LeadThinkingSt
 
     // A ready plan ends the planning stream even without an explicit
     // `done` — settle to inactive.
-    const onExecutionChanged = (e: { execution_id: string; change_kind: string }) => {
+    const onExecutionChanged = (e: TAgentExecutionChangedEvent) => {
       if (e.execution_id !== executionId || e.change_kind !== 'plan_changed') return;
       if (rafRef.current !== null) {
         cancelAnimationFrame(rafRef.current);

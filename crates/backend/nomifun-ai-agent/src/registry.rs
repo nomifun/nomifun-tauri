@@ -112,7 +112,7 @@ impl AgentRegistry {
         };
 
         if let Some((meta, _)) = decode_row(row) {
-            self.by_id.write().await.insert(meta.id.clone(), meta);
+            self.by_id.write().await.insert(meta.agent_id.clone(), meta);
         }
         Ok(())
     }
@@ -141,7 +141,7 @@ impl AgentRegistry {
                 continue;
             };
             log_probe_result(&meta, &reason);
-            map.insert(meta.id.clone(), meta);
+            map.insert(meta.agent_id.clone(), meta);
         }
         // Snapshot the summary off the local map before transferring it
         // into the lock — `log_availability_summary` borrows the values
@@ -309,7 +309,7 @@ fn decode_row(row: AgentMetadataRow) -> Option<(AgentMetadata, Option<Unavailabl
     };
 
     let mut meta = AgentMetadata {
-        id: row.id,
+        agent_id: row.agent_id,
         icon: row.icon,
         name: row.name,
         name_i18n: parse_json(row.name_i18n.as_deref(), "name_i18n"),
@@ -361,7 +361,7 @@ fn log_probe_result(meta: &AgentMetadata, reason: &Option<UnavailableReason>) {
     match (meta.available, reason) {
         (true, _) => {
             debug!(
-                id = %meta.id,
+                agent_id = %meta.agent_id,
                 name = %meta.name,
                 backend,
                 source = %source,
@@ -376,7 +376,7 @@ fn log_probe_result(meta: &AgentMetadata, reason: &Option<UnavailableReason>) {
         }
         (false, Some(reason)) => {
             info!(
-                id = %meta.id,
+                agent_id = %meta.agent_id,
                 name = %meta.name,
                 backend,
                 source = %source,
@@ -390,7 +390,7 @@ fn log_probe_result(meta: &AgentMetadata, reason: &Option<UnavailableReason>) {
             // shouldn't happen given current rules, but we'd want to
             // know if it does.
             warn!(
-                id = %meta.id,
+                agent_id = %meta.agent_id,
                 name = %meta.name,
                 backend,
                 source = %source,
@@ -416,7 +416,7 @@ where
         if meta.available {
             available += 1;
         } else {
-            unavailable_ids.push(meta.id.clone());
+            unavailable_ids.push(meta.agent_id.clone());
         }
     }
     let unavailable = total - available;
@@ -608,7 +608,10 @@ mod tests {
     #[tokio::test]
     async fn find_builtin_claude_has_bridge_command() {
         let reg = registry().await;
-        let m = reg.find_builtin_by_backend("claude").await.unwrap();
+        let m = reg
+            .get("0190f5fe-7c00-7a00-8000-000000000101")
+            .await
+            .unwrap();
         assert_eq!(m.command.as_deref(), Some("bun"));
         assert!(m.behavior_policy.supports_side_question);
         assert_eq!(
@@ -620,7 +623,10 @@ mod tests {
     #[tokio::test]
     async fn codex_yolo_id_maps_to_full_access() {
         let reg = registry().await;
-        let codex = reg.find_builtin_by_backend("codex").await.unwrap();
+        let codex = reg
+            .get("0190f5fe-7c00-7a00-8000-000000000102")
+            .await
+            .unwrap();
         // Legacy Nomi yolo aliases resolve to Codex's native
         // `full-access` mode via the catalog row.
         assert_eq!(codex.yolo_id.as_deref(), Some("full-access"));
@@ -629,7 +635,10 @@ mod tests {
     #[tokio::test]
     async fn claude_yolo_id_maps_to_bypass_permissions() {
         let reg = registry().await;
-        let claude = reg.find_builtin_by_backend("claude").await.unwrap();
+        let claude = reg
+            .get("0190f5fe-7c00-7a00-8000-000000000101")
+            .await
+            .unwrap();
         assert_eq!(claude.yolo_id.as_deref(), Some("bypassPermissions"));
     }
 
@@ -647,7 +656,7 @@ mod tests {
             "list_all must only return enabled + available rows, got: {:?}",
             visible
                 .iter()
-                .map(|m| (&m.id, m.enabled, m.available))
+                .map(|m| (&m.agent_id, m.enabled, m.available))
                 .collect::<Vec<_>>()
         );
         // Nomi (internal, no spawn command) is always available.
@@ -688,7 +697,10 @@ mod tests {
     #[tokio::test]
     async fn apply_handshake_persists_json_payload() {
         let reg = registry().await;
-        let claude = reg.find_builtin_by_backend("claude").await.unwrap();
+        let claude = reg
+            .get("0190f5fe-7c00-7a00-8000-000000000101")
+            .await
+            .unwrap();
 
         let snapshot = AgentHandshake {
             auth_methods: Some(serde_json::json!([
@@ -696,9 +708,9 @@ mod tests {
             ])),
             ..Default::default()
         };
-        reg.apply_handshake_inner(&claude.id, &snapshot).await.unwrap();
+        reg.apply_handshake_inner(&claude.agent_id, &snapshot).await.unwrap();
 
-        let refreshed = reg.get(&claude.id).await.unwrap();
+        let refreshed = reg.get(&claude.agent_id).await.unwrap();
         let methods = refreshed.handshake.auth_methods.unwrap();
         assert_eq!(methods.as_array().unwrap().len(), 1);
     }
@@ -715,11 +727,14 @@ mod tests {
     #[tokio::test]
     async fn apply_handshake_is_partial_does_not_clobber_siblings() {
         let reg = registry().await;
-        let claude = reg.find_builtin_by_backend("claude").await.unwrap();
+        let claude = reg
+            .get("0190f5fe-7c00-7a00-8000-000000000101")
+            .await
+            .unwrap();
 
         // Write #1: agent_capabilities only.
         reg.apply_handshake_inner(
-            &claude.id,
+            &claude.agent_id,
             &AgentHandshake {
                 agent_capabilities: Some(serde_json::json!({"load_session": true})),
                 ..Default::default()
@@ -730,7 +745,7 @@ mod tests {
 
         // Write #2: auth_methods only. Capabilities must survive.
         reg.apply_handshake_inner(
-            &claude.id,
+            &claude.agent_id,
             &AgentHandshake {
                 auth_methods: Some(serde_json::json!([{"type": "agent", "id": "oauth"}])),
                 ..Default::default()
@@ -741,7 +756,7 @@ mod tests {
 
         // Write #3: available_modes only. Capabilities + auth_methods must survive.
         reg.apply_handshake_inner(
-            &claude.id,
+            &claude.agent_id,
             &AgentHandshake {
                 available_modes: Some(serde_json::json!([{"id": "code", "name": "Code"}])),
                 ..Default::default()
@@ -750,7 +765,7 @@ mod tests {
         .await
         .unwrap();
 
-        let refreshed = reg.get(&claude.id).await.unwrap();
+        let refreshed = reg.get(&claude.agent_id).await.unwrap();
         assert_eq!(
             refreshed.handshake.agent_capabilities,
             Some(serde_json::json!({"load_session": true})),
@@ -782,10 +797,10 @@ mod tests {
             match (meta.available, reason) {
                 (true, None) => {}
                 (false, Some(_)) => {}
-                (true, Some(r)) => panic!("available row {} has unexpected reason {:?}", meta.id, r),
+                (true, Some(r)) => panic!("available row {} has unexpected reason {:?}", meta.agent_id, r),
                 (false, None) => panic!(
                     "unavailable row {} (source={:?}) is missing a reason",
-                    meta.id, meta.agent_source
+                    meta.agent_id, meta.agent_source
                 ),
             }
         }
@@ -807,7 +822,7 @@ mod tests {
     #[tokio::test]
     async fn handshake_backfills_capabilities() {
         let reg = registry().await;
-        let id = "agent_builtin_opencode";
+        let id = "0190f5fe-7c00-7a00-8000-00000000010a";
 
         let before = reg.get(id).await.unwrap();
         assert!(before.handshake.agent_capabilities.is_none());
@@ -836,10 +851,13 @@ mod tests {
     #[tokio::test]
     async fn apply_handshake_with_empty_snapshot_is_noop() {
         let reg = registry().await;
-        let claude = reg.find_builtin_by_backend("claude").await.unwrap();
+        let claude = reg
+            .get("0190f5fe-7c00-7a00-8000-000000000101")
+            .await
+            .unwrap();
 
         reg.apply_handshake_inner(
-            &claude.id,
+            &claude.agent_id,
             &AgentHandshake {
                 agent_capabilities: Some(serde_json::json!({"x": 1})),
                 ..Default::default()
@@ -848,11 +866,11 @@ mod tests {
         .await
         .unwrap();
 
-        reg.apply_handshake_inner(&claude.id, &AgentHandshake::default())
+        reg.apply_handshake_inner(&claude.agent_id, &AgentHandshake::default())
             .await
             .unwrap();
 
-        let refreshed = reg.get(&claude.id).await.unwrap();
+        let refreshed = reg.get(&claude.agent_id).await.unwrap();
         assert_eq!(
             refreshed.handshake.agent_capabilities,
             Some(serde_json::json!({"x": 1}))

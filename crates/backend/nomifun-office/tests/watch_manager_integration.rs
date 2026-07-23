@@ -134,8 +134,8 @@ async fn wp2_session_reuse_returns_same_port() {
     let dir = tempfile::tempdir().unwrap();
     let path = create_temp_file(&dir, "doc.docx");
 
-    let first = mgr.start("user_0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Word).await.unwrap();
-    let second = mgr.start("user_0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Word).await.unwrap();
+    let first = mgr.start("0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Word).await.unwrap();
+    let second = mgr.start("0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Word).await.unwrap();
 
     assert_eq!(first.port, second.port);
     assert_ne!(first.capability, second.capability);
@@ -157,10 +157,10 @@ async fn wp3_stop_terminates_session() {
     let dir = tempfile::tempdir().unwrap();
     let path = create_temp_file(&dir, "doc.docx");
 
-    let access = mgr.start("user_0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Word).await.unwrap();
+    let access = mgr.start("0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Word).await.unwrap();
     assert!(mgr.resolve_capability(&access.capability).is_some());
 
-    mgr.stop("user_0190f5fe-7c00-7a00-8abc-012345678901", DocType::Word, &access.capability)
+    mgr.stop("0190f5fe-7c00-7a00-8abc-012345678901", DocType::Word, &access.capability)
         .await;
     assert!(mgr.resolve_capability(&access.capability).is_none());
     assert_eq!(mgr.active_session_count(), 0);
@@ -179,7 +179,7 @@ async fn wp4_auto_install_on_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let path = create_temp_file(&dir, "doc.docx");
 
-    let access = mgr.start("user_0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Word).await.unwrap();
+    let access = mgr.start("0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Word).await.unwrap();
     assert!(access.port > 0);
     assert_eq!(spawner.install_count.load(Ordering::SeqCst), 1);
 
@@ -202,8 +202,8 @@ async fn ep1_excel_independent_session_pool() {
     let dir = tempfile::tempdir().unwrap();
     let path = create_temp_file(&dir, "data.xlsx");
 
-    let word = mgr.start("user_0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Word).await.unwrap();
-    let excel = mgr.start("user_0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Excel).await.unwrap();
+    let word = mgr.start("0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Word).await.unwrap();
+    let excel = mgr.start("0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Excel).await.unwrap();
 
     assert_ne!(word.port, excel.port);
     assert_eq!(mgr.active_session_count(), 2);
@@ -230,7 +230,7 @@ async fn pp1_ppt_independent_session_pool() {
     let dir = tempfile::tempdir().unwrap();
     let path = create_temp_file(&dir, "slides.pptx");
 
-    let access = mgr.start("user_0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Ppt).await.unwrap();
+    let access = mgr.start("0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Ppt).await.unwrap();
     assert!(access.port > 0);
     assert_eq!(
         mgr.resolve_capability(&access.capability).unwrap().doc_type,
@@ -251,7 +251,7 @@ async fn pp3_ppt_background_version_check() {
     let dir = tempfile::tempdir().unwrap();
     let path = create_temp_file(&dir, "slides.pptx");
 
-    mgr.start("user_0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Ppt).await.unwrap();
+    mgr.start("0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Ppt).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     // Version check is fire-and-forget; we just verify it doesn't panic
@@ -273,9 +273,9 @@ async fn status_events_use_correct_prefix() {
     let f2 = create_temp_file(&dir, "b.xlsx");
     let f3 = create_temp_file(&dir, "c.pptx");
 
-    mgr.start("user_0190f5fe-7c00-7a00-8abc-012345678901", &f1, DocType::Word).await.unwrap();
-    mgr.start("user_0190f5fe-7c00-7a00-8abc-012345678901", &f2, DocType::Excel).await.unwrap();
-    mgr.start("user_0190f5fe-7c00-7a00-8abc-012345678901", &f3, DocType::Ppt).await.unwrap();
+    mgr.start("0190f5fe-7c00-7a00-8abc-012345678901", &f1, DocType::Word).await.unwrap();
+    mgr.start("0190f5fe-7c00-7a00-8abc-012345678901", &f2, DocType::Excel).await.unwrap();
+    mgr.start("0190f5fe-7c00-7a00-8abc-012345678901", &f3, DocType::Ppt).await.unwrap();
 
     let names = broadcaster.event_names();
     assert!(names.contains(&"word-preview.status".to_string()));
@@ -298,9 +298,9 @@ async fn stop_all_clears_all_sessions() {
     let f2 = create_temp_file(&dir, "b.xlsx");
     let f3 = create_temp_file(&dir, "c.pptx");
 
-    mgr.start("user_0190f5fe-7c00-7a00-8abc-012345678901", &f1, DocType::Word).await.unwrap();
-    mgr.start("user_0190f5fe-7c00-7a00-8abc-012345678901", &f2, DocType::Excel).await.unwrap();
-    mgr.start("user_0190f5fe-7c00-7a00-8abc-012345678901", &f3, DocType::Ppt).await.unwrap();
+    mgr.start("0190f5fe-7c00-7a00-8abc-012345678901", &f1, DocType::Word).await.unwrap();
+    mgr.start("0190f5fe-7c00-7a00-8abc-012345678901", &f2, DocType::Excel).await.unwrap();
+    mgr.start("0190f5fe-7c00-7a00-8abc-012345678901", &f3, DocType::Ppt).await.unwrap();
     assert_eq!(mgr.active_session_count(), 3);
 
     mgr.stop_all().await;
@@ -334,11 +334,11 @@ async fn stop_then_restart_creates_new_session() {
     let dir = tempfile::tempdir().unwrap();
     let path = create_temp_file(&dir, "doc.docx");
 
-    let first = mgr.start("user_0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Word).await.unwrap();
-    mgr.stop("user_0190f5fe-7c00-7a00-8abc-012345678901", DocType::Word, &first.capability)
+    let first = mgr.start("0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Word).await.unwrap();
+    mgr.stop("0190f5fe-7c00-7a00-8abc-012345678901", DocType::Word, &first.capability)
         .await;
 
-    let second = mgr.start("user_0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Word).await.unwrap();
+    let second = mgr.start("0190f5fe-7c00-7a00-8abc-012345678901", &path, DocType::Word).await.unwrap();
     assert_ne!(first.port, second.port);
     assert_ne!(first.capability, second.capability);
     assert_eq!(spawner.spawn_count.load(Ordering::SeqCst), 2);

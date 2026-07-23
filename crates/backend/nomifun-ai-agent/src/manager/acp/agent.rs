@@ -366,7 +366,7 @@ impl AcpAgentManager {
             ..Default::default()
         };
         if init_handshake.agent_capabilities.is_some() || init_handshake.auth_methods.is_some() {
-            catalog_tx.send_partial(self.params.metadata.id.clone(), init_handshake);
+            catalog_tx.send_partial(self.params.metadata.agent_id.clone(), init_handshake);
         }
 
         // Seed the observed/advertised layers (observed mode/model, cached
@@ -553,7 +553,7 @@ impl AcpAgentManager {
 
     /// Agent metadata id this session was spawned from.
     pub fn agent_id(&self) -> &str {
-        &self.params.metadata.id
+        &self.params.metadata.agent_id
     }
 
     /// Whether the configured agent supports side questions.
@@ -618,7 +618,6 @@ impl AcpAgentManager {
                 session: &mut s,
                 params: &self.params,
                 skill_manager: &self.skill_manager,
-                runtime: &self.runtime,
             };
             let transformed = self.pipeline.pre_send(&mut ctx, data.content.clone()).await;
             self.commit_session_changes(&mut s).await;

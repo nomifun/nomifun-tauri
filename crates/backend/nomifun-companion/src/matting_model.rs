@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 
 use nomifun_common::AppError;
+use std::io::Write;
 use tokio::sync::Mutex;
 
 /// Cached model filename under `{data_dir}/companion/models/`.
@@ -110,17 +111,33 @@ async fn download_one(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, St
     res.bytes().await.map(|b| b.to_vec()).map_err(|e| e.to_string())
 }
 
-/// Write to a sibling temp file then rename, so a crashed/partial download
-/// never leaves a half-written model at the real path.
+/// Write to a securely-created same-directory tempfile, fsync it, atomically
+/// replace the cache entry, then fsync the parent directory. A crash or
+/// concurrent process can never expose a partial model or collide on a fixed
+/// `.partial` name.
 async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), AppError> {
-    let tmp = path.with_extension("onnx.partial");
-    tokio::fs::write(&tmp, bytes)
-        .await
-        .map_err(|e| AppError::Internal(format!("write model temp: {e}")))?;
-    tokio::fs::rename(&tmp, path)
-        .await
-        .map_err(|e| AppError::Internal(format!("commit model: {e}")))?;
-    Ok(())
+    let path = path.to_path_buf();
+    let bytes = bytes.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let parent = path
+            .parent()
+            .ok_or_else(|| AppError::Internal("matting model path has no parent".into()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| AppError::Internal(format!("create models dir: {error}")))?;
+        let mut temp = tempfile::Builder::new()
+            .prefix(".modnet.onnx.tmp.")
+            .tempfile_in(parent)
+            .map_err(|error| AppError::Internal(format!("create model tempfile: {error}")))?;
+        temp.write_all(&bytes)
+            .and_then(|_| temp.as_file_mut().sync_all())
+            .map_err(|error| AppError::Internal(format!("write model tempfile: {error}")))?;
+        temp.persist(&path)
+            .map_err(|error| AppError::Internal(format!("commit model: {}", error.error)))?;
+        crate::fsio::sync_dir(parent)
+            .map_err(|error| AppError::Internal(format!("fsync models dir: {error}")))
+    })
+    .await
+    .map_err(|error| AppError::Internal(format!("model write task failed: {error}")))?
 }
 
 #[cfg(test)]

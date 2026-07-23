@@ -7,14 +7,11 @@
 //! does for the server, so the bundled `bun` resolves through the
 //! same cache the server uses.
 //!
-//! Writes to stdout (not the rolling nomicore.log) — the user
-//! typically runs `doctor` interactively after reporting "no agent
-//! works", and the answer needs to be visible in their terminal
-//! without grepping logs. We deliberately skip `init_environment` to
-//! avoid installing a tracing subscriber that would redirect
-//! diagnostic output to a log file, and skip `init_data_layer` to
-//! avoid materializing the builtin-skills tree as a side effect of a
-//! read-only diagnostic run.
+//! Writes its report to stdout so an interactive caller does not need to grep
+//! logs. Unlike the old shortcut, it enters the same locked v3 reset/database
+//! gate as the server before hydrating the real catalog. This is intentionally
+//! not a read-only bypass: a receipt-valid legacy database must be retired (or
+//! fail closed) before any writable database initialization occurs.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -23,17 +20,18 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use nomifun_ai_agent::{AgentRegistry, UnavailableReason};
-use nomifun_db::{IAgentMetadataRepository, SqliteAgentMetadataRepository, init_database};
+use nomifun_db::{IAgentMetadataRepository, SqliteAgentMetadataRepository};
 
 use crate::cli::Cli;
 
 pub async fn run_doctor(cli: &Cli, merged_path: &str) -> Result<ExitCode> {
     print_environment(merged_path, &cli.data_dir);
 
-    // Use the real on-disk DB so the report reflects the user's actual
-    // catalog (including custom agents they've added via the UI).
-    let db_path = cli.data_dir.join("nomifun-backend.db");
-    let database = init_database(&db_path).await?;
+    // Hold the same exclusive data-dir lock and execute the same pre-open v3
+    // lifecycle/probe as server startup. In particular, never call
+    // `init_database` directly against receipt-claimed data.
+    let environment = crate::bootstrap::init_environment(cli, merged_path)?;
+    let database = environment.init_doctor_data_layer().await?;
 
     let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(database.pool().clone()));
     let registry = AgentRegistry::new(repo);
@@ -46,6 +44,7 @@ pub async fn run_doctor(cli: &Cli, merged_path: &str) -> Result<ExitCode> {
     print_snapshot(&snapshot);
 
     database.close().await;
+    drop(environment);
 
     Ok(ExitCode::SUCCESS)
 }
@@ -90,7 +89,7 @@ fn print_snapshot(snapshot: &[(nomifun_api_types::AgentMetadata, Option<Unavaila
         };
         println!(
             "{:<32} {:<10} {:<14} {:<10} {}",
-            meta.id, backend, source, status, trailer
+            meta.agent_id, backend, source, status, trailer
         );
     }
 

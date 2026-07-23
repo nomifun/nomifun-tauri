@@ -39,7 +39,10 @@ export function useCompanionWindowsSync(): void {
       try {
         const companions = await ipcBridge.companion.listCompanions.invoke();
         if (disposed) return;
-        const specs = companions.map((p) => ({ companion_id: p.id, enabled: Boolean(p.appearance.companion_enabled) }));
+        const specs = companions.map((p) => ({
+          companion_id: p.companion_id,
+          enabled: Boolean(p.appearance.companion_enabled),
+        }));
         const { invoke } = await import('@tauri-apps/api/core');
         await invoke('sync_companion_windows', { specs });
       } catch (e) {

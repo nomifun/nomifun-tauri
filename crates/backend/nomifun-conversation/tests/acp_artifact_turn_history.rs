@@ -17,7 +17,7 @@ use nomifun_common::{ConversationId, MessageId, now_ms};
 use nomifun_conversation::stream_relay::{RelayTerminal, StreamRelay};
 use nomifun_db::{
     IConversationRepository, SortOrder, SqliteConversationRepository, init_database_memory,
-    models::ConversationRow,
+    models::{ConversationRow, MessageRow},
 };
 use nomifun_realtime::BroadcastEventBus;
 use serde_json::{Value, json};
@@ -63,7 +63,8 @@ async fn setup_repo() -> (
     let conversation_id = ConversationId::new().into_string();
     let now = now_ms();
     repo.create(&ConversationRow {
-        id: conversation_id.clone(),
+        id: 0,
+        conversation_id: conversation_id.clone(),
         user_id: owner.clone(),
         name: "ACP artifact turn history".into(),
         r#type: "acp".into(),
@@ -103,6 +104,27 @@ fn artifact_items(content: &Value) -> Vec<PersistedArtifact> {
         .collect()
 }
 
+async fn insert_turn_parent(
+    repo: &SqliteConversationRepository,
+    conversation_id: &str,
+    turn_id: &str,
+) {
+    repo.insert_message(&MessageRow {
+        id: 0,
+        message_id: turn_id.to_owned(),
+        conversation_id: conversation_id.to_owned(),
+        msg_id: Some(turn_id.to_owned()),
+        r#type: "system".to_owned(),
+        content: r#"{"kind":"turn_root"}"#.to_owned(),
+        position: Some("center".to_owned()),
+        status: Some("finish".to_owned()),
+        hidden: true,
+        created_at: now_ms(),
+    })
+    .await
+    .expect("insert logical root turn message");
+}
+
 #[tokio::test]
 async fn sparse_acp_completion_commits_to_the_root_turn_and_hydrates_as_finished() {
     let (repo, _db, conversation_id, owner) = setup_repo().await;
@@ -117,6 +139,7 @@ async fn sparse_acp_completion_commits_to_the_root_turn_and_hydrates_as_finished
     let root_turn_id = MessageId::new().into_string();
     let wire_segment_id = MessageId::new().into_string();
     assert_ne!(root_turn_id, wire_segment_id);
+    insert_turn_parent(&repo, &conversation_id, &root_turn_id).await;
 
     let bus = Arc::new(BroadcastEventBus::new(64));
     let mut live_rx = bus.subscribe_user();
@@ -273,6 +296,7 @@ async fn sparse_acp_completion_commits_to_the_root_turn_and_hydrates_as_finished
 async fn enclosing_finish_closes_an_unfinished_acp_projection_in_real_history() {
     let (repo, _db, conversation_id, owner) = setup_repo().await;
     let root_turn_id = MessageId::new().into_string();
+    insert_turn_parent(&repo, &conversation_id, &root_turn_id).await;
     let wire_segment_id = MessageId::new().into_string();
     let bus = Arc::new(BroadcastEventBus::new(32));
     let (tx, _) = broadcast::channel(32);
@@ -336,6 +360,7 @@ async fn enclosing_finish_closes_an_unfinished_acp_projection_in_real_history() 
 async fn continuation_reused_call_ids_keep_distinct_wire_rows_with_one_root_owner() {
     let (repo, _db, conversation_id, owner) = setup_repo().await;
     let root_turn_id = MessageId::new().into_string();
+    insert_turn_parent(&repo, &conversation_id, &root_turn_id).await;
 
     for index in 0..2 {
         let wire_segment_id = MessageId::new().into_string();
@@ -395,7 +420,14 @@ async fn continuation_reused_call_ids_keep_distinct_wire_rows_with_one_root_owne
         2,
         "wire-scoped correlation must not collapse reused provider call ids"
     );
-    assert_ne!(acp_rows[0].id, acp_rows[1].id);
+    assert_ne!(
+        acp_rows[0].message_id,
+        acp_rows[1].message_id,
+        "each persisted wire-scoped lifecycle row has its own business message UUIDv7"
+    );
+    for row in &acp_rows {
+        MessageId::parse(&row.message_id).expect("ACP lifecycle message id is a canonical UUIDv7");
+    }
     for row in acp_rows {
         assert_eq!(row.msg_id.as_deref(), Some(root_turn_id.as_str()));
         assert_eq!(row.status.as_deref(), Some("finish"));

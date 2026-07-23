@@ -68,7 +68,8 @@ pub struct ChannelStreamRelay {
     /// Shared store: a relayed decision is recorded here so the inbound
     /// numeric reply can be mapped back to the right `call_id`/option.
     pending: Arc<PendingDecisionStore>,
-    /// Resolves `wsa_…` ids to bytes for outbound media. `None` disables sending.
+    /// Resolves workshop asset UUIDv7 ids to bytes for outbound media. `None`
+    /// disables sending.
     asset_resolver: Option<Arc<dyn crate::message_service::AssetResolver>>,
 }
 
@@ -945,6 +946,7 @@ mod media_tests {
     use super::*;
     use crate::types::{MediaKind, OutgoingMedia};
     use async_trait::async_trait;
+    use nomifun_common::PersistedArtifactId;
     use std::sync::Arc;
 
     struct StubResolver;
@@ -1059,10 +1061,10 @@ mod media_tests {
     fn cfg(platform: PluginType) -> RelayConfig {
         RelayConfig {
             platform,
-            plugin_id: "p1".into(),
+            plugin_id: "018f1234-5678-7abc-8def-012345678901".into(),
             chat_id: "c1".into(),
             throttle_ms: 0,
-            conversation_id: "conv1".into(),
+            conversation_id: "0190f5fe-7c00-7a00-8000-000000000080".into(),
         }
     }
 
@@ -1093,7 +1095,10 @@ mod media_tests {
                 status: ToolCallStatus::Completed,
                 description: None,
                 input: None,
-                output: Some(r#"{"result_asset_ids":["wsa_x"]}"#.into()),
+                output: Some(
+                    r#"{"result_asset_ids":["0190f5fe-7c00-7a00-8000-000000000081"]}"#
+                        .into(),
+                ),
                 artifacts: Vec::new(),
             })).unwrap();
         }
@@ -1104,7 +1109,10 @@ mod media_tests {
 
         let media = recorder.take_media();
         assert_eq!(media.len(), 1, "one deduped image sent");
-        assert_eq!(media[0].filename, "wsa_x.png");
+        assert_eq!(
+            media[0].filename,
+            "0190f5fe-7c00-7a00-8000-000000000081.png"
+        );
         assert!(!recorder.take_edits().is_empty(), "final text edit delivered too");
     }
 
@@ -1127,7 +1135,10 @@ mod media_tests {
             status: ToolCallStatus::Completed,
             description: None,
             input: None,
-            output: Some(r#"{"result_asset_ids":["wsa_missing"]}"#.into()),
+            output: Some(
+                r#"{"result_asset_ids":["0190f5fe-7c00-7a00-8000-000000000082"]}"#
+                    .into(),
+            ),
             artifacts: Vec::new(),
         }))
         .unwrap();
@@ -1145,7 +1156,10 @@ mod media_tests {
             message
                 .text
                 .as_deref()
-                .is_some_and(|text| text.contains("wsa_missing") && text.contains("no longer resolvable"))
+                .is_some_and(|text| {
+                    text.contains("0190f5fe-7c00-7a00-8000-000000000082")
+                        && text.contains("no longer resolvable")
+                })
         }));
         assert!(recorder.take_edits().iter().any(|message| {
             message
@@ -1176,7 +1190,10 @@ mod media_tests {
             status: ToolCallStatus::Completed,
             description: None,
             input: None,
-            output: Some(r#"{"result_asset_ids":["wsa_fallback_ok"]}"#.into()),
+            output: Some(
+                r#"{"result_asset_ids":["0190f5fe-7c00-7a00-8000-000000000083"]}"#
+                    .into(),
+            ),
             artifacts: Vec::new(),
         }))
         .unwrap();
@@ -1191,7 +1208,9 @@ mod media_tests {
             message
                 .text
                 .as_deref()
-                .is_some_and(|text| text.contains("Asset ID: wsa_fallback_ok"))
+                .is_some_and(|text| {
+                    text.contains("Asset ID: 0190f5fe-7c00-7a00-8000-000000000083")
+                })
         }));
         let edits = sender.take_edits();
         assert!(edits.last().is_some_and(|message| {
@@ -1229,7 +1248,10 @@ mod media_tests {
             status: ToolCallStatus::Completed,
             description: None,
             input: None,
-            output: Some(r#"{"result_asset_ids":["wsa_delivery_failed"]}"#.into()),
+            output: Some(
+                r#"{"result_asset_ids":["0190f5fe-7c00-7a00-8000-000000000084"]}"#
+                    .into(),
+            ),
             artifacts: Vec::new(),
         }))
         .unwrap();
@@ -1276,7 +1298,10 @@ mod media_tests {
             status: ToolCallStatus::Completed,
             description: None,
             input: None,
-            output: Some(r#"{"result_asset_ids":["wsa_no_resolver"]}"#.into()),
+            output: Some(
+                r#"{"result_asset_ids":["0190f5fe-7c00-7a00-8000-000000000085"]}"#
+                    .into(),
+            ),
             artifacts: Vec::new(),
         }))
         .unwrap();
@@ -1316,7 +1341,7 @@ mod media_tests {
         std::fs::write(&file_path, &file_bytes).unwrap();
         let receipt = |id: &str, kind, mime: &str, path: &std::path::Path, bytes: &[u8]| {
             PersistedArtifact {
-                id: id.into(),
+                id: PersistedArtifactId::new().into_string(),
                 kind,
                 mime_type: mime.into(),
                 path: path.to_string_lossy().into_owned(),
@@ -1377,7 +1402,7 @@ mod media_tests {
         let bytes = b"%PDF-deliverable";
         std::fs::write(&path, bytes).unwrap();
         let artifact = PersistedArtifact {
-            id: "artifact-fallback-ok".into(),
+            id: PersistedArtifactId::new().into_string(),
             kind: ArtifactKind::File,
             mime_type: "application/pdf".into(),
             path: path.to_string_lossy().into_owned(),
@@ -1437,7 +1462,7 @@ mod media_tests {
         let bytes = b"%PDF-undelivered";
         std::fs::write(&path, bytes).unwrap();
         let artifact = PersistedArtifact {
-            id: "artifact-delivery-failed".into(),
+            id: PersistedArtifactId::new().into_string(),
             kind: ArtifactKind::File,
             mime_type: "application/pdf".into(),
             path: path.to_string_lossy().into_owned(),
@@ -1499,7 +1524,7 @@ mod media_tests {
         let bytes = b"verified-acp-image".to_vec();
         std::fs::write(&path, &bytes).unwrap();
         let artifact = PersistedArtifact {
-            id: "acp-image".into(),
+            id: PersistedArtifactId::new().into_string(),
             kind: ArtifactKind::Image,
             mime_type: "image/png".into(),
             path: path.to_string_lossy().into_owned(),
@@ -1574,7 +1599,7 @@ mod media_tests {
         let bytes = b"failed-acp-image";
         std::fs::write(&path, bytes).unwrap();
         let artifact = PersistedArtifact {
-            id: "failed-acp-image".into(),
+            id: PersistedArtifactId::new().into_string(),
             kind: ArtifactKind::Image,
             mime_type: "image/png".into(),
             path: path.to_string_lossy().into_owned(),
@@ -1631,7 +1656,7 @@ mod media_tests {
 
         let missing = std::env::temp_dir().join("nomifun-missing-artifact-test.pdf");
         let artifact = PersistedArtifact {
-            id: "missing".into(),
+            id: PersistedArtifactId::new().into_string(),
             kind: ArtifactKind::File,
             mime_type: "application/pdf".into(),
             path: missing.to_string_lossy().into_owned(),
@@ -1699,7 +1724,7 @@ mod media_tests {
         let bytes = b"%PDF-partial";
         std::fs::write(&path, bytes).unwrap();
         let artifact = PersistedArtifact {
-            id: "partial".into(),
+            id: PersistedArtifactId::new().into_string(),
             kind: ArtifactKind::File,
             mime_type: "application/pdf".into(),
             path: path.to_string_lossy().into_owned(),
@@ -1751,7 +1776,7 @@ mod media_tests {
         let bytes = b"%PDF-partial";
         std::fs::write(&path, bytes).unwrap();
         let artifact = PersistedArtifact {
-            id: "partial-before-turn-error".into(),
+            id: PersistedArtifactId::new().into_string(),
             kind: ArtifactKind::File,
             mime_type: "application/pdf".into(),
             path: path.to_string_lossy().into_owned(),
@@ -1803,7 +1828,7 @@ mod media_tests {
         let bytes = b"%PDF-late";
         std::fs::write(&path, bytes).unwrap();
         let artifact = PersistedArtifact {
-            id: "late-after-failure".into(),
+            id: PersistedArtifactId::new().into_string(),
             kind: ArtifactKind::File,
             mime_type: "application/pdf".into(),
             path: path.to_string_lossy().into_owned(),
@@ -1871,7 +1896,7 @@ mod media_tests {
             output: None,
             description: None,
             artifacts: vec![PersistedArtifact {
-                id: "orphan".into(),
+                id: PersistedArtifactId::new().into_string(),
                 kind: ArtifactKind::File,
                 mime_type: "application/pdf".into(),
                 path: path.to_string_lossy().into_owned(),
@@ -2032,7 +2057,10 @@ mod media_tests {
             status: ToolCallStatus::Completed,
             description: None,
             input: None,
-            output: Some(r#"{"result_asset_ids":["wsa_x"]}"#.into()),
+            output: Some(
+                r#"{"result_asset_ids":["0190f5fe-7c00-7a00-8000-000000000081"]}"#
+                    .into(),
+            ),
             artifacts: Vec::new(),
         })).unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData { session_id: None, stop_reason: None })).unwrap();

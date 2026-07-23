@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 /// Row in the `requirements` table.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct RequirementRow {
-    pub id: String,
+    pub id: i64,
+    /// Stable business identity (canonical bare UUIDv7).
+    pub requirement_id: String,
     /// Compact, immutable identifier shown to people as `#N`.
     pub display_no: i64,
     pub title: String,
@@ -40,7 +42,6 @@ pub struct RequirementRow {
 /// fully persisted [`RequirementRow`].
 #[derive(Debug, Clone)]
 pub struct NewRequirementRow {
-    pub id: String,
     pub title: String,
     pub content: String,
     pub tag: String,
@@ -90,11 +91,12 @@ pub struct RequirementRowUpdate {
 /// A tag with no row is treated as not paused.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct RequirementTagRow {
+    pub id: i64,
     pub tag: String,
     /// 0 = active, 1 = paused (SQLite has no bool; stored as INTEGER).
     pub paused: i64,
     pub paused_reason: Option<String>,
-    pub paused_req_id: Option<String>,
+    pub paused_requirement_id: Option<String>,
     pub paused_at: Option<TimestampMs>,
 }
 

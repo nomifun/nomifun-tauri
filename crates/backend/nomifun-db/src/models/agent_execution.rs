@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, sqlx::FromRow, Serialize, Deserialize)]
 pub struct AgentExecutionRow {
-    pub id: String,
+    pub execution_id: String,
     pub user_id: String,
     pub goal: String,
     pub status: String,
@@ -28,7 +28,7 @@ pub struct AgentExecutionRow {
 
 #[derive(Debug, Clone, sqlx::FromRow, Serialize, Deserialize)]
 pub struct AgentExecutionParticipantRow {
-    pub id: String,
+    pub participant_id: String,
     pub execution_id: String,
     pub source_agent_id: String,
     pub preset_id: Option<String>,
@@ -51,7 +51,7 @@ pub struct AgentExecutionParticipantRow {
 
 #[derive(Debug, Clone, sqlx::FromRow, Serialize, Deserialize)]
 pub struct AgentExecutionStepRow {
-    pub id: String,
+    pub step_id: String,
     pub execution_id: String,
     pub title: String,
     pub spec: String,
@@ -94,7 +94,7 @@ pub struct AgentExecutionStepDependencyRow {
 
 #[derive(Debug, Clone, sqlx::FromRow, Serialize, Deserialize)]
 pub struct AgentExecutionAttemptRow {
-    pub id: String,
+    pub attempt_id: String,
     pub execution_id: String,
     pub step_id: String,
     pub attempt_no: i64,
@@ -118,7 +118,6 @@ pub struct AgentExecutionAttemptRow {
 
 #[derive(Debug, Clone, sqlx::FromRow, Serialize, Deserialize)]
 pub struct ConversationExecutionLinkRow {
-    pub id: String,
     pub conversation_id: String,
     pub execution_id: String,
     pub relation: String,
@@ -132,7 +131,6 @@ pub struct ConversationExecutionLinkRow {
 
 #[derive(Debug, Clone, sqlx::FromRow, Serialize, Deserialize)]
 pub struct AgentExecutionEventRow {
-    pub id: String,
     pub execution_id: String,
     pub sequence: i64,
     pub event_type: String,

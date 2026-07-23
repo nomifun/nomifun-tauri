@@ -150,6 +150,11 @@ pub struct BrowserTool {
     /// fallback + the dedicated user-data-dir parent). Never the user's real
     /// browser profile.
     data_dir: PathBuf,
+    /// Durable browser identity root. Backend-hosted tools keep this at the
+    /// application data dir while `data_dir` points at its regenerable
+    /// `browser-data` child. Explicit `with_data_dir` callers default both
+    /// roots to the supplied directory for backwards-compatible embedding.
+    persistent_data_dir: PathBuf,
     /// **并发隔离基石：本 facade 专属的 Chromium `--user-data-dir`**（`<data_dir>/profiles/<token>`）。
     ///
     /// 每个 `BrowserTool` 实例分配一个**进程内唯一**目录（token = pid + 单调计数 + 纳秒），使任意两个
@@ -409,10 +414,10 @@ impl BrowserTool {
     /// session) for callers that only have a `BrowserConfig` (the redline gate then
     /// never hard-denies — equivalent to leaving approval to approval pipeline).
     pub fn new(config: &BrowserConfig) -> Self {
-        let data_dir = nomi_config::config::app_config_dir()
-            .map(|d| d.join("browser-data"))
-            .unwrap_or_else(|| EngineConfig::default().data_dir);
+        let persistent_data_dir = nomi_config::config::app_data_dir();
+        let data_dir = persistent_data_dir.join("browser-data");
         let mut t = Self::with_data_dir(data_dir, !config.headless);
+        t.persistent_data_dir = persistent_data_dir;
         // 浏览器来源（「我的浏览器」）：从 BrowserConfig.source 解析（坏值静默退回 Managed）。
         // 与 headful 正交；`with_policy` 无需带参——两开关都经 config.tools.browser.* 流入。
         t.chrome_source = ChromeSource::from_source_str(&config.source);
@@ -476,6 +481,7 @@ impl BrowserTool {
         let profile_dir = allocate_profile_dir(&data_dir);
         Self {
             description: format!("{DESCRIPTION}{}", capabilities_note(&default_capabilities())),
+            persistent_data_dir: data_dir.clone(),
             data_dir,
             profile_dir,
             // P3-G2: 默认无 per-pet workspace（仅有 BrowserConfig 的调用方 / 测试）。bootstrap 经
@@ -556,6 +562,14 @@ impl BrowserTool {
     /// explicit data dir but still wants downloads to land in the session workspace.
     pub fn workspace(mut self, workspace_dir: PathBuf) -> Self {
         self.workspace_dir = Some(workspace_dir);
+        self
+    }
+
+    /// Set the application data root that owns durable login state. Engine
+    /// caches/profiles continue to use the directory supplied to
+    /// [`Self::with_data_dir`].
+    pub fn persistent_data_dir(mut self, data_dir: PathBuf) -> Self {
+        self.persistent_data_dir = data_dir;
         self
     }
 
@@ -869,7 +883,7 @@ impl BrowserTool {
         // key 复用 secret vault 的机器绑定 key。坏/缺 vault → None（优雅降级）。
         let storage_state = if self.evaluate_persistent_login && !self.profile_dir.exists() {
             self.persist_login_key().and_then(|key| {
-                load_storage_state(&shared_storage_state_path(&self.data_dir), &key)
+                load_storage_state(&shared_storage_state_path(&self.persistent_data_dir), &key)
                     .and_then(|s| serde_json::to_value(&s).ok())
             })
         } else {
@@ -964,7 +978,7 @@ impl BrowserTool {
             *last = Some(now);
         }
         let engine = engine.clone();
-        let vault_path = shared_storage_state_path(&self.data_dir);
+        let vault_path = shared_storage_state_path(&self.persistent_data_dir);
         tokio::spawn(async move {
             match engine.capture_storage_state().await {
                 Ok(state) => {

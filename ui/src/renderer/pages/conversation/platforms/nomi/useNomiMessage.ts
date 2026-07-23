@@ -11,7 +11,7 @@ import { isToolGroupStatusActive, normalizeToolGroupStatus } from '@/common/chat
 import { extractResponseTextChunk, optionalDisplayText, toDisplayText } from '@/common/chat/displayText';
 import type { IResponseMessage } from '@/common/adapter/ipcBridge';
 import type { TChatConversation, TokenUsageData } from '@/common/config/storage';
-import { prefixedId, uuid } from '@/common/utils';
+import { uuid } from '@/common/utils';
 import { useAddOrUpdateMessage } from '@/renderer/pages/conversation/Messages/hooks';
 import { getConversationOrNull } from '@/renderer/pages/conversation/utils/conversationCache';
 import {
@@ -281,7 +281,7 @@ export const useNomiMessage = (
         for (const response of result.systemResponses) {
           addOrUpdateMessage(
             {
-              id: prefixedId('msg'),
+              id: uuid(),
               type: 'tips',
               position: 'center',
               conversation_id,
@@ -373,7 +373,7 @@ export const useNomiMessage = (
               if (!readOnly) {
                 emitter.emit('nomi.usage.updated', { conversation_id, tokenUsage: newTokenUsage });
                 void ipcBridge.conversation.update.invoke({
-                  id: conversation_id,
+                  conversation_id: conversation_id,
                   updates: {
                     extra: { last_token_usage: newTokenUsage } as TChatConversation['extra'],
                   },
@@ -485,7 +485,7 @@ export const useNomiMessage = (
       const acceptStart = () => {
         turnStartGenerationRef.current += 1;
         turnLifecycleGenerationRef.current += 1;
-        rootTurnIdRef.current = event.turn_id ?? null;
+        rootTurnIdRef.current = event.turn_id;
         awaitingBackendTurnRef.current = false;
         turnClosedRef.current = false;
         rejectUnannouncedStartRef.current = false;

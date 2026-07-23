@@ -8,7 +8,7 @@ import { sessionStorageKey } from '@/common/utils/browserStorageKey';
 
 import { ipcBridge } from '@/common';
 import type { TMessage } from '@/common/chat/chatLib';
-import { parseError } from '@/common/utils';
+import { parseError, uuid } from '@/common/utils';
 import { emitter } from '@/renderer/utils/emitter';
 import { buildDisplayMessage } from '@/renderer/utils/file/messageFiles';
 import { Message } from '@arco-design/web-react';
@@ -81,7 +81,7 @@ export const useAcpInitialMessage = ({
         // by msg_id — this prevents a duplicate bubble if useMessageLstCache
         // already inserted the DB row for this same msg_id.
         addOrUpdateMessage({
-          id: msg_id,
+          id: uuid(),
           msg_id,
           type: 'text',
           position: 'right',

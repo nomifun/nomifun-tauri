@@ -7,11 +7,9 @@ use crate::models::{CreateKnowledgeTagParams, KnowledgeBaseRow, KnowledgeBinding
 /// Bases are global (not per-user), mirroring webhooks: a shared pool of
 /// knowledge directories reused across sessions. Bindings are addressed by
 /// `(target_kind, target_id)`; internally the former composite PK + JSON
-/// `kb_ids` array are redesigned into a surrogate `binding_id` +
-/// type-discriminated nullable target columns (CHECK exactly-one) + the
-/// `knowledge_binding_bases` junction. The `(target_kind, target_id)` pair the
-/// service addresses bindings by maps to the matching `target_*` column per
-/// the `target_kind` discriminator (`workpath`/`conversation`/`terminal`/`companion`).
+/// `kb_ids` array are redesigned into a local technical `id`, a stable
+/// `knowledge_binding_id` UUIDv7 business identity, type-discriminated target
+/// columns, and the `knowledge_binding_bases` logical junction.
 #[async_trait::async_trait]
 pub trait IKnowledgeRepository: Send + Sync {
     /// Insert a new knowledge base row.
@@ -41,10 +39,11 @@ pub trait IKnowledgeRepository: Send + Sync {
 
     /// Insert-or-replace the binding for a target in one transaction:
     ///   1. upsert the `knowledge_bindings` row (the `target_id` is written to
-    ///      the column selected by `target_kind`), obtaining `binding_id`;
+    ///      the column selected by `target_kind`), preserving its UUIDv7
+    ///      `knowledge_binding_id`;
     ///   2. clear and re-insert `knowledge_binding_bases` for `kb_ids`,
     ///      preserving order via `position`.
-    /// Returns the (possibly newly allocated) `binding_id`.
+    /// Returns the stable UUIDv7 `knowledge_binding_id`.
     #[allow(clippy::too_many_arguments)]
     async fn set_binding(
         &self,
@@ -60,14 +59,14 @@ pub trait IKnowledgeRepository: Send + Sync {
     ) -> Result<String, DbError>;
 
     /// Delete the binding for a target (no-op when absent). Used by the
-    /// conversation-delete hook so bindings don't accumulate as orphans. The
-    /// `knowledge_binding_bases` rows are removed automatically by FK CASCADE.
+    /// conversation-delete hook so bindings don't accumulate as orphans.
+    /// The repository removes `knowledge_binding_bases` explicitly.
     async fn delete_binding(&self, target_kind: &str, target_id: &str) -> Result<(), DbError>;
 
     /// All bindings that reference `kb_id` (via the `knowledge_binding_bases`
     /// junction), enabled or not. Powers the "who is using this base?"
-    /// consumers view. Ordered by `target_kind` then `binding_id` for stable
-    /// display.
+    /// consumers view. Ordered by `target_kind` then `knowledge_binding_id`
+    /// for stable display.
     async fn list_bindings_using_kb(&self, kb_id: &str) -> Result<Vec<KnowledgeBindingRow>, DbError>;
 
     // ── Knowledge tags (user-defined tag palette) ─────────────────────────

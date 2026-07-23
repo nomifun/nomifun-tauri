@@ -41,7 +41,7 @@ describe('legacy tool-group artifact visibility', () => {
       artifact_delivery_committed: true,
       artifacts: [
         {
-          id: 'artifact-old',
+          id: '019b0000-0000-7000-8000-000000000002',
           kind: 'image',
           mime_type: 'image/png',
           path: '/workspace/old.png',

@@ -181,9 +181,8 @@ impl Archiver {
             return Ok(SweepAction::Wait);
         };
 
-        // First-ever window covers all pre-existing history (boundary 0) so the
-        // initial archive bootstraps from — and resets — a possibly-bloated
-        // legacy thread. Rolled windows set their own boundary (close time).
+        // The first window covers all current history (boundary 0); rolled
+        // windows set their own boundary at close time.
         let window = self.store.ensure_open_window(companion_id, &conversation_id, 0).await?;
         let msgs = self.port.window_messages(&conversation_id, window.boundary_ts).await?;
 
@@ -191,13 +190,17 @@ impl Archiver {
         let user_messages = msgs.iter().filter(|m| m.is_user).count();
         let total_chars: usize = msgs.iter().map(|m| m.content.chars().count()).sum();
         let last_activity = msgs.iter().map(|m| m.created_at).max().unwrap_or(window.started_at);
-        self.store.touch_window(&window.id, last_activity, msgs.len() as i64).await?;
+        self.store
+            .touch_window(&window.session_window_id, last_activity, msgs.len() as i64)
+            .await?;
 
         let idle_ms = now - last_activity;
         match decide(idle_ms, user_messages, total_chars, thresholds) {
             SweepAction::Wait => Ok(SweepAction::Wait),
             SweepAction::Skip => {
-                self.store.close_window(&window.id, "skipped", None, None, 0).await?;
+                self.store
+                    .close_window(&window.session_window_id, "skipped", None, None, 0)
+                    .await?;
                 self.store.ensure_open_window(companion_id, &conversation_id, now).await?;
                 Ok(SweepAction::Skip)
             }
@@ -225,14 +228,28 @@ impl Archiver {
                     Ok(out) => out,
                     Err(e) => {
                         tracing::warn!(companion = %companion_id, error = %e, "archive digest unparseable; skipping window");
-                        self.store.close_window(&window.id, "skipped", None, None, 0).await?;
+                        self.store
+                            .close_window(
+                                &window.session_window_id,
+                                "skipped",
+                                None,
+                                None,
+                                0,
+                            )
+                            .await?;
                         self.store.ensure_open_window(companion_id, &conversation_id, now).await?;
                         return Ok(SweepAction::Skip);
                     }
                 };
                 let token_estimate = (total_chars / 4) as i64;
                 self.store
-                    .close_window(&window.id, "archived", Some(&out.summary), out.highlights_json().as_deref(), token_estimate)
+                    .close_window(
+                        &window.session_window_id,
+                        "archived",
+                        Some(&out.summary),
+                        out.highlights_json().as_deref(),
+                        token_estimate,
+                    )
                     .await?;
                 // Durable context reset so the next window starts small. Best-
                 // effort: a failed reset must not lose the digest we just stored.
@@ -259,7 +276,7 @@ mod tests {
 
     fn conversation_fixture() -> String {
         nomifun_common::ConversationId::try_from(
-            "conv_0190f5fe-7c00-7a00-8abc-000000000001",
+            "0190f5fe-7c00-7a00-8abc-000000000001",
         )
         .unwrap()
         .into_string()
@@ -336,11 +353,14 @@ mod tests {
             model: "test-model".into(),
             use_model: None,
         });
-        let registry = Arc::new(CompanionRegistry::scan(dir.join("companions"), dir.join("shared")));
+        let registry = Arc::new(
+            CompanionRegistry::scan(dir.join("companions"), dir.join("shared"))
+                .unwrap(),
+        );
         let companion = registry.create("测试宠", "ink").await.unwrap();
         let store = CompanionStore::open_memory().await.unwrap();
         // Point the companion at a chat thread the port will answer for.
-        crate::companion::set_active_thread_ptr(&store, &companion.id, Some(&conversation_fixture())).await.unwrap();
+        crate::companion::set_active_thread_ptr(&store, &companion.companion_id, Some(&conversation_fixture())).await.unwrap();
         let resets = Arc::new(StdMutex::new(Vec::new()));
         let calls = Arc::new(StdMutex::new(0usize));
         let archiver = Archiver {
@@ -351,7 +371,7 @@ mod tests {
             port: Arc::new(MockPort { msgs, resets: resets.clone() }),
             run_lock: Arc::new(Mutex::new(())),
         };
-        (archiver, companion.id, resets, calls)
+        (archiver, companion.companion_id, resets, calls)
     }
 
     const GOOD_DIGEST: &str = r#"{"summary":"今天陪主人修了一下午 Rust 编译错误。","topics":["Rust","编译"],"mood":"content"}"#;

@@ -70,7 +70,7 @@ export const useGuidAdvancedConfig = (): GuidAdvancedConfig => {
           // (which also reads by workpath) reads these picks back instead of a
           // dangling conversation-scoped row.
           run: async () => {
-            const conv = (await ipcBridge.conversation.get.invoke({ id: conversationId })) as TChatConversation | undefined;
+            const conv = (await ipcBridge.conversation.get.invoke({ conversation_id: conversationId })) as TChatConversation | undefined;
             const workpath = workpathKeyForConversation(conv?.extra as Record<string, unknown> | undefined);
             return ipcBridge.knowledge.setBinding.invoke({ kind: 'workpath', target_id: workpath, ...kb });
           },

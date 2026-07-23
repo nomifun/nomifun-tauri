@@ -41,7 +41,8 @@ use nomifun_api_types::{
 };
 use nomifun_common::{
     LOOPBACK_CAPABILITY_RENEW_PATH, LOOPBACK_CAPABILITY_REVOKE_PATH,
-    LoopbackCapabilityIssuer, LoopbackCapabilityRenewalRequest, RequirementId,
+    LoopbackCapabilityIssuer, LoopbackCapabilityRenewalRequest,
+    RequirementId,
 };
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -261,9 +262,9 @@ async fn handle_capability_revoke(
 }
 
 fn json_to_requirement_id(v: Option<&Value>) -> Option<String> {
-    v.and_then(Value::as_str)
-        .and_then(|value| RequirementId::try_from(value).ok())
-        .map(RequirementId::into_string)
+    let value = v?.as_str()?;
+    RequirementId::parse(value).ok()?;
+    Some(value.to_owned())
 }
 
 /// Wrap a JSON body as a response and ask the client to close the connection
@@ -298,7 +299,7 @@ async fn exec_complete(
     }
     match svc.complete(&id, note).await {
         Ok(_) => {
-            info!(requirement_id = id, "Requirement MCP: requirement_complete succeeded");
+            info!(requirement_id = %id, "Requirement MCP: requirement_complete succeeded");
             json!({"result": format!("Requirement {id} marked complete.")})
         }
         Err(e) => json!({"error": e.to_string()}),
@@ -335,7 +336,7 @@ async fn exec_update_status(
     }
     match svc.set_status(&id, status, note).await {
         Ok(_) => {
-            info!(requirement_id = id, status = status_str, "Requirement MCP: requirement_update_status succeeded");
+            info!(requirement_id = %id, status = status_str, "Requirement MCP: requirement_update_status succeeded");
             json!({"result": format!("Requirement {id} status set to {status_str}.")})
         }
         Err(e) => json!({"error": e.to_string()}),
@@ -398,7 +399,7 @@ mod tests {
                 let id = ConversationId::new().into_string();
                 sqlx::query(
                     "INSERT INTO conversations \
-                        (id, user_id, name, type, created_at, updated_at) \
+                        (conversation_id, user_id, name, type, created_at, updated_at) \
                      VALUES (?1, ?2, 'Requirement MCP Conversation', 'nomi', 0, 0)",
                 )
                 .bind(&id)
@@ -412,7 +413,7 @@ mod tests {
                 let id = TerminalId::new().into_string();
                 sqlx::query(
                     "INSERT INTO terminal_sessions \
-                        (id, user_id, name, cwd, command, args, cols, rows, last_status, created_at, updated_at) \
+                        (terminal_id, user_id, name, cwd, command, args, cols, rows, last_status, created_at, updated_at) \
                      VALUES (?1, ?2, 'Requirement MCP Terminal', '/tmp', '$SHELL', '[]', 80, 24, 'running', 0, 0)",
                 )
                 .bind(&id)
@@ -446,7 +447,12 @@ mod tests {
             .unwrap()
             .unwrap();
         Box::leak(Box::new(db));
-        (service, installation_owner, owner_id, requirement.id)
+        (
+            service,
+            installation_owner,
+            owner_id,
+            requirement.requirement_id,
+        )
     }
 
     fn child_for(
@@ -496,12 +502,15 @@ mod tests {
     }
 
     #[test]
-    fn requirement_id_parser_accepts_only_canonical_string_ids() {
+    fn requirement_id_parser_accepts_only_canonical_uuidv7_strings() {
         let id = RequirementId::new().into_string();
-        assert_eq!(json_to_requirement_id(Some(&json!(id))), Some(id));
+        assert_eq!(
+            json_to_requirement_id(Some(&json!(id))),
+            Some(id.clone())
+        );
         assert!(json_to_requirement_id(Some(&json!(7))).is_none());
         assert!(json_to_requirement_id(Some(&json!("7"))).is_none());
-        assert!(json_to_requirement_id(Some(&json!("term_invalid"))).is_none());
+        assert!(json_to_requirement_id(Some(&json!(format!("requirement_{id}")))).is_none());
     }
 
     #[tokio::test]

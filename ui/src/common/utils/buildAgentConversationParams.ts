@@ -18,7 +18,6 @@ export type BuildAgentConversationInput = {
   workspace: string;
   model: TProviderWithModel;
   cli_path?: string;
-  custom_agent_id?: string;
   remote_agent_id?: RemoteAgentId;
   custom_workspace?: boolean;
   is_preset?: boolean;
@@ -53,7 +52,6 @@ export function buildAgentConversationParams(input: BuildAgentConversationInput)
     workspace,
     model,
     cli_path,
-    custom_agent_id,
     remote_agent_id,
     custom_workspace = true,
     is_preset = false,
@@ -80,17 +78,11 @@ export function buildAgentConversationParams(input: BuildAgentConversationInput)
       extra.gateway = {
         cli_path,
       };
-      if (custom_agent_id) {
-        extra.custom_agent_id = custom_agent_id;
-      }
     } else if (type === 'acp') {
       extra.backend = backend as string;
       extra.agent_name = agent_name || name;
       if (agent_id) extra.agent_id = agent_id;
       if (cli_path) extra.cli_path = cli_path;
-      if (custom_agent_id) {
-        extra.custom_agent_id = custom_agent_id;
-      }
     }
   }
 

@@ -23,7 +23,7 @@ pub struct UpdateCronJobParams {
     pub preset_revision: Option<Option<i64>>,
     pub preset_snapshot: Option<Option<String>>,
     /// Target conversation. `Some(Some(id))` binds a conversation, `Some(None)`
-    /// clears it to NULL (FK ON DELETE SET NULL), `None` leaves it unchanged.
+    /// clears it to NULL, `None` leaves it unchanged.
     pub conversation_id: Option<Option<String>>,
     pub conversation_title: Option<Option<String>>,
     pub agent_type: Option<String>,
@@ -35,6 +35,7 @@ pub struct UpdateCronJobParams {
     pub last_error: Option<Option<String>>,
     pub run_count: Option<i64>,
     pub retry_count: Option<i64>,
+    pub max_retries: Option<i64>,
 }
 
 /// Data access abstraction for the `cron_jobs` table.
@@ -43,20 +44,24 @@ pub trait ICronRepository: Send + Sync {
     /// Inserts a new cron job row.
     async fn insert(&self, row: &CronJobRow) -> Result<(), DbError>;
 
-    /// Updates a cron job by ID with the provided fields.
+    /// Updates a cron job by its stable business ID with the provided fields.
     /// Returns `DbError::NotFound` if absent.
     async fn update(
         &self,
         user_id: &str,
-        id: &str,
+        cron_job_id: &str,
         params: &UpdateCronJobParams,
     ) -> Result<(), DbError>;
 
-    /// Deletes a cron job by ID. Returns `DbError::NotFound` if absent.
-    async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError>;
+    /// Deletes a cron job by business ID. Returns `DbError::NotFound` if absent.
+    async fn delete(&self, user_id: &str, cron_job_id: &str) -> Result<(), DbError>;
 
-    /// Returns a single cron job by ID, or `None` if not found.
-    async fn get_by_id(&self, user_id: &str, id: &str) -> Result<Option<CronJobRow>, DbError>;
+    /// Returns a single cron job by business ID, or `None` if not found.
+    async fn get_by_cron_job_id(
+        &self,
+        user_id: &str,
+        cron_job_id: &str,
+    ) -> Result<Option<CronJobRow>, DbError>;
 
     /// Returns all cron jobs ordered by creation time ascending.
     async fn list_all(&self, user_id: &str) -> Result<Vec<CronJobRow>, DbError>;
@@ -64,7 +69,10 @@ pub trait ICronRepository: Send + Sync {
     /// Process-internal scheduler lookup. The returned row carries the
     /// authoritative non-empty owner; callers must preserve it through the
     /// execution path rather than supplying or deriving a fallback owner.
-    async fn get_by_id_for_scheduler(&self, id: &str) -> Result<Option<CronJobRow>, DbError>;
+    async fn get_by_cron_job_id_for_scheduler(
+        &self,
+        cron_job_id: &str,
+    ) -> Result<Option<CronJobRow>, DbError>;
 
     /// Process-internal scheduler scan across owners.
     async fn list_enabled_for_scheduler(&self) -> Result<Vec<CronJobRow>, DbError>;
@@ -96,7 +104,7 @@ pub trait ICronRepository: Send + Sync {
     async fn list_runs_by_job(
         &self,
         user_id: &str,
-        job_id: &str,
+        cron_job_id: &str,
         limit: i64,
     ) -> Result<Vec<CronJobRunRow>, DbError>;
 }

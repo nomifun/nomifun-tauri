@@ -48,7 +48,7 @@ impl LiveTerminalTitleCompleter {
             .map_err(|e| AppError::Internal(format!("failed to list providers: {e}")))?;
         for provider in providers.iter().filter(|p| p.enabled) {
             if let Some(model) = first_enabled_model(&provider.models, provider.model_enabled.as_deref()) {
-                return Ok((provider.id.clone(), model));
+                return Ok((provider.provider_id.clone(), model));
             }
         }
         Err(AppError::Conflict(

@@ -11,9 +11,9 @@ const transport: IMcpServer['transport'] = {
 
 describe('toSessionMcpServer', () => {
   test('preserves a canonical catalog id in the session snapshot', () => {
-    const id = parseMcpServerId('mcp_0190f5fe-7c00-7a00-8000-000000000003');
-    expect(toSessionMcpServer({ id, name: 'everything', transport })).toEqual({
-      id,
+    const id = parseMcpServerId('0190f5fe-7c00-7a00-8000-000000000003');
+    expect(toSessionMcpServer({ mcp_server_id: id, name: 'everything', transport })).toEqual({
+      mcp_server_id: id,
       name: 'everything',
       transport,
     });

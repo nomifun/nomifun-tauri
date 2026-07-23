@@ -1,6 +1,7 @@
 import type { ConversationId } from '@/common/types/ids';
 import { AgentLogoIcon } from '@/renderer/components/agent/AgentBadge';
 import { conversationTarget } from '@/common/types/ids';
+import { browserStorageKey } from '@/common/utils/browserStorageKey';
 import type { PresetInfo } from '@/renderer/hooks/agent/usePresetInfo';
 import FlexFullContainer from '@/renderer/components/layout/FlexFullContainer';
 import { useLayoutContext } from '@/renderer/hooks/context/LayoutContext';
@@ -51,7 +52,7 @@ export interface ChatLayoutProps {
   siderTitle?: React.ReactNode;
   backend?: string;
   /** Preset info — when provided, the badge shows the preset identity instead of the backend. */
-  preset?: PresetInfo & { id?: string };
+  preset?: PresetInfo;
   /** Fallback agent name (used when no preset, e.g. from conversation.extra.agent_name) */
   agent_name?: string;
   headerExtra?: React.ReactNode;
@@ -532,7 +533,7 @@ const ChatLayoutInner: React.FC<ChatLayoutProps> = (props) => {
 const ChatLayout: React.FC<ChatLayoutProps> = (props) => {
   const pendingPreviewScope = useRef(`conversation-pending:${uuid()}`);
   const previewScope = props.conversation_id
-    ? `conversation:${props.conversation_id}`
+    ? browserStorageKey('workspace-preview', 'conversation', props.conversation_id)
     : pendingPreviewScope.current;
 
   return (

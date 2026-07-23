@@ -15,7 +15,7 @@ use nomifun_mcp::{McpServer, McpServerTransport, McpTool};
 
 fn row(transport_type: &str, transport_config: &str, tools: Option<&str>, status: &str) -> McpServerRow {
     McpServerRow {
-        id: nomifun_common::McpServerId::parse("mcp_0190f5fe-7c00-7a00-8000-000000000042").unwrap(),
+        mcp_server_id: nomifun_common::generate_id(),
         name: "integration-test".into(),
         description: Some("Integration test server".into()),
         enabled: true,
@@ -48,7 +48,7 @@ fn stdio_server_full_pipeline() {
     let server = McpServer::from_row(r).unwrap();
 
     // Verify all fields
-    assert_eq!(server.id.as_str(), "mcp_0190f5fe-7c00-7a00-8000-000000000042");
+    assert!(nomifun_common::validate_uuidv7(server.mcp_server_id.as_str()).is_ok());
     assert_eq!(server.name, "integration-test");
     assert_eq!(server.description.as_deref(), Some("Integration test server"));
     assert!(server.enabled);
@@ -73,8 +73,9 @@ fn stdio_server_full_pipeline() {
     assert!(server.tools[1].input_schema.is_some());
 
     // Convert to API response and verify
+    let server_id = server.mcp_server_id.clone();
     let resp = server.into_response();
-    assert_eq!(resp.id.as_str(), "mcp_0190f5fe-7c00-7a00-8000-000000000042");
+    assert_eq!(resp.mcp_server_id, server_id);
     assert_eq!(resp.last_test_status, McpServerStatus::Connected);
     assert!(resp.tools.is_some());
     assert_eq!(resp.tools.unwrap().len(), 2);

@@ -187,6 +187,7 @@ async fn serve(cli: nomifun_app::cli::Cli, merged_path: String, args: Args) -> R
     let env = nomifun_app::bootstrap::init_environment(&cli, &merged_path)?;
     let database = nomifun_app::bootstrap::init_data_layer(&env.config).await?;
     let services = nomifun_app::AppServices::from_config(database, &env.config).await?;
+    nomifun_app::bootstrap::finalize_data_layer(&env.config)?;
 
     // First-run admin provisioning. No-op in local mode and once an admin
     // exists; otherwise a fresh authenticated install would have no way to set

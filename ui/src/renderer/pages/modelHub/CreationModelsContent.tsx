@@ -98,7 +98,7 @@ const CreationModelsContent: React.FC = () => {
 
     const { id, ...body } = updated;
     ipcBridge.mode.updateProvider
-      .invoke({ id, ...body })
+      .invoke({ provider_id: id, ...body })
       .then(() => {
         void mutate();
       })

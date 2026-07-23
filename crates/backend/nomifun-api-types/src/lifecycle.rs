@@ -18,6 +18,7 @@ pub struct SystemInfoResponse {
 
 /// Request body for `POST /api/system/check-update`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateCheckRequest {
     #[serde(default)]
     pub include_prerelease: bool,
@@ -29,6 +30,7 @@ pub struct UpdateCheckRequest {
 /// conversation workspace root. Applied on the next boot (the backend resolves
 /// `work_dir` before any service starts), so the client restarts after this.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateWorkDirRequest {
     pub work_dir: String,
 }

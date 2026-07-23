@@ -9,6 +9,7 @@ import { Spin } from '@arco-design/web-react';
 import React, { Suspense, useCallback } from 'react';
 import { useNomiModelSelection } from '@/renderer/pages/conversation/platforms/nomi/useNomiModelSelection';
 import { PreviewProvider } from '@/renderer/pages/conversation/Preview';
+import { browserStorageKey } from '@/common/utils/browserStorageKey';
 
 const AcpChat = React.lazy(() => import('@/renderer/pages/conversation/platforms/acp/AcpChat'));
 const NomiChat = React.lazy(() => import('@/renderer/pages/conversation/platforms/nomi/NomiChat'));
@@ -65,8 +66,12 @@ export type ReadOnlyConversationViewProps = {
  * agent-driven global preview opens.
  */
 const ReadOnlyConversationView: React.FC<ReadOnlyConversationViewProps> = ({ conversation, agent_name }) => {
-  const transcriptEntityId =
-    conversation.execution_attempt_id ?? conversation.execution_step_id ?? conversation.id;
+  const transcriptStorageKey =
+    conversation.execution_attempt_id != null
+      ? browserStorageKey('workspace-preview', 'execution-attempt', conversation.execution_attempt_id)
+      : conversation.execution_step_id != null
+        ? browserStorageKey('workspace-preview', 'execution-step', conversation.execution_step_id)
+        : browserStorageKey('workspace-preview', 'conversation', conversation.id);
   const content = (() => {
     switch (conversation.type) {
       case 'acp':
@@ -78,32 +83,6 @@ const ReadOnlyConversationView: React.FC<ReadOnlyConversationViewProps> = ({ con
             backend={conversation.extra?.backend || 'claude'}
             initialModelId={(conversation.extra as { current_model_id?: string } | undefined)?.current_model_id}
             session_mode={conversation.extra?.session_mode}
-            agent_name={agent_name ?? (conversation.extra as { agent_name?: string })?.agent_name}
-            hideSendBox
-            readOnly
-          />
-        );
-      case 'codex': // Legacy: codex now uses ACP protocol
-        return (
-          <AcpChat
-            key={conversation.id}
-            conversation_id={conversation.id}
-            workspace={conversation.extra?.workspace}
-            backend='codex'
-            initialModelId={(conversation.extra as { current_model_id?: string } | undefined)?.current_model_id}
-            agent_name={agent_name ?? (conversation.extra as { agent_name?: string })?.agent_name}
-            hideSendBox
-            readOnly
-          />
-        );
-      case 'gemini': // Legacy transcript rendered through the shared ACP view.
-        return (
-          <AcpChat
-            key={conversation.id}
-            conversation_id={conversation.id}
-            workspace={conversation.extra?.workspace}
-            backend='gemini'
-            initialModelId={(conversation.extra as { current_model_id?: string } | undefined)?.current_model_id}
             agent_name={agent_name ?? (conversation.extra as { agent_name?: string })?.agent_name}
             hideSendBox
             readOnly
@@ -154,8 +133,8 @@ const ReadOnlyConversationView: React.FC<ReadOnlyConversationViewProps> = ({ con
 
   return (
     <PreviewProvider
-      key={`execution-transcript:${transcriptEntityId}`}
-      persistNamespace={`execution-transcript:${transcriptEntityId}`}
+      key={transcriptStorageKey}
+      persistNamespace={transcriptStorageKey}
       subscribeGlobalOpen={false}
     >
       <Suspense fallback={<Spin loading className='flex flex-1 items-center justify-center' />}>{content}</Suspense>

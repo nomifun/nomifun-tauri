@@ -195,7 +195,7 @@ const RequirementForm: React.FC<RequirementFormProps> = ({
 
       <Form.Item>
         <AttachmentsField
-          key={`attachments-${mode}-${initial?.id ?? 'new'}-${resetSignal}`}
+          key={`attachments-${mode}-${initial?.requirement_id ?? 'new'}-${resetSignal}`}
           value={newAttachments}
           onChange={setNewAttachments}
           existing={existing}

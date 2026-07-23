@@ -35,17 +35,23 @@ export function useTerminalSessions() {
     void refresh();
 
     const offCreated = ipcBridge.terminal.onCreated.on((s) => {
-      setSessions((prev) => (prev.some((p) => p.id === s.id) ? prev : [s, ...prev]));
+      setSessions((prev) =>
+        prev.some((p) => p.terminal_id === s.terminal_id) ? prev : [s, ...prev],
+      );
     });
     const offUpdated = ipcBridge.terminal.onUpdated.on((s) => {
-      setSessions((prev) => prev.map((p) => (p.id === s.id ? s : p)));
+      setSessions((prev) => prev.map((p) => (p.terminal_id === s.terminal_id ? s : p)));
     });
     const offRemoved = ipcBridge.terminal.onRemoved.on((evt) => {
-      setSessions((prev) => prev.filter((p) => p.id !== evt.id));
+      setSessions((prev) => prev.filter((p) => p.terminal_id !== evt.terminal_id));
     });
     const offExit = ipcBridge.terminal.onExit.on((evt) => {
       setSessions((prev) =>
-        prev.map((p) => (p.id === evt.id ? { ...p, last_status: 'exited', exit_code: evt.exit_code } : p))
+        prev.map((p) =>
+          p.terminal_id === evt.terminal_id
+            ? { ...p, last_status: 'exited', exit_code: evt.exit_code }
+            : p,
+        ),
       );
     });
     const offRefresh = (): void => {
@@ -63,8 +69,8 @@ export function useTerminalSessions() {
   }, [refresh]);
 
   const removeSession = useCallback(async (id: TerminalId) => {
-    await ipcBridge.terminal.remove.invoke({ id });
-    setSessions((prev) => prev.filter((p) => p.id !== id));
+    await ipcBridge.terminal.remove.invoke({ terminal_id: id });
+    setSessions((prev) => prev.filter((p) => p.terminal_id !== id));
   }, []);
 
   return { sessions, loading, refresh, removeSession };

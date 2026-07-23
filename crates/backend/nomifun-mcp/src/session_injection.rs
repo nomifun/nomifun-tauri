@@ -251,8 +251,8 @@ mod tests {
 
     fn make_server(name: &str, enabled: bool, transport: McpServerTransport) -> McpServer {
         McpServer {
-            // Injection keys on `name`, never `id`; any stable value works here.
-            id: nomifun_common::McpServerId::new(),
+            // Injection keys on `name`, never the business ID; any stable value works here.
+            mcp_server_id: nomifun_api_types::McpServerId::new(),
             name: name.into(),
             description: None,
             enabled,

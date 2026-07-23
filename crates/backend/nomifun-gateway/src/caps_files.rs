@@ -36,6 +36,7 @@ const READ_FILE_MAX_BYTES: usize = 64 * 1024;
 
 /// Read a file as UTF-8 text.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ReadFileParams {
     /// Absolute path to the file to read.
     path: String,
@@ -43,6 +44,7 @@ struct ReadFileParams {
 
 /// Write (create or overwrite) a file with the given content.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct WriteFileParams {
     /// Absolute path to the file to write.
     path: String,
@@ -55,6 +57,7 @@ struct WriteFileParams {
 
 /// List immediate children of a directory.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct BrowseParams {
     /// Absolute path to the directory to list.
     dir: String,
@@ -64,6 +67,7 @@ struct BrowseParams {
 
 /// Recursively list all files under a workspace root as a flat list.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ListWorkspaceFilesParams {
     /// Absolute path to the workspace root.
     root: String,
@@ -71,6 +75,7 @@ struct ListWorkspaceFilesParams {
 
 /// Get metadata (name, size, mime, last_modified, is_directory) for a path.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetMetadataParams {
     /// Absolute path to the file or directory.
     path: String,
@@ -78,6 +83,7 @@ struct GetMetadataParams {
 
 /// Delete a file or directory (recursively).
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RemoveParams {
     /// Absolute path to the file or directory to remove.
     path: String,
@@ -87,6 +93,7 @@ struct RemoveParams {
 
 /// Rename a file or directory (same parent, new name).
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RenameParams {
     /// Absolute path to the file or directory to rename.
     path: String,
@@ -96,6 +103,7 @@ struct RenameParams {
 
 /// Open a URL in the default browser (http/https/mailto only).
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ShellOpenExternalParams {
     /// URL to open (must be http://, https://, or mailto:).
     url: String,

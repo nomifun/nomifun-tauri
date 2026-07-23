@@ -42,9 +42,8 @@ export interface WorkpathDrawerProps {
   node: WorkpathNode;
   ui: WorkpathUiState;
   /**
-   * The session id currently open via `/conversation/:id` or `/terminal/:id`,
-   * coerced to the numeric session id (route strings are coerced at the
-   * SessionList boundary). When it belongs to this node, the drawer (and the
+   * The canonical session id currently open via `/conversation/:id` or
+   * `/terminal/:id`. When it belongs to this node, the drawer (and the
    * containing subgroup) is forced open — visually only, never written back to
    * localStorage.
    */
@@ -98,26 +97,14 @@ const WorkpathDrawer: React.FC<WorkpathDrawerProps> = ({
   const twoLineWorkpath = workpathDisplay?.kind === 'twoLine';
   const sessionCount = node.interactive.length + node.terminal.length;
 
-  const activeKind: SessionKind | null =
+  const activeEntry: SessionEntry | null =
     activeSessionId === null
       ? null
-      : node.interactive.some((entry) => entry.id === activeSessionId)
-        ? 'interactive'
-        : node.terminal.some((entry) => entry.id === activeSessionId)
-          ? 'terminal'
-          : null;
-  const activeDisplayIndex =
-    activeKind && activeSessionId !== null
-      ? activeKind === 'interactive'
-        ? getWorkpathEntryDisplayIndex(node, {
-            kind: 'interactive',
-            id: activeSessionId as ConversationId,
-          })
-        : getWorkpathEntryDisplayIndex(node, {
-            kind: 'terminal',
-            id: activeSessionId as TerminalId,
-          })
-      : null;
+      : (node.interactive.find((entry) => entry.id === activeSessionId) ??
+        node.terminal.find((entry) => entry.id === activeSessionId) ??
+        null);
+  const activeKind: SessionKind | null = activeEntry?.kind ?? null;
+  const activeDisplayIndex = activeEntry ? getWorkpathEntryDisplayIndex(node, activeEntry) : null;
   const forceShowAllForActiveKind: Record<SessionKind, boolean> = {
     interactive: activeKind === 'interactive' && activeDisplayIndex !== null && activeDisplayIndex >= WORKPATH_COLLAPSED_SESSION_LIMIT,
     terminal: activeKind === 'terminal' && activeDisplayIndex !== null && activeDisplayIndex >= WORKPATH_COLLAPSED_SESSION_LIMIT,

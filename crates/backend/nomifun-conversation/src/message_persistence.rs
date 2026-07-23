@@ -26,7 +26,8 @@ impl ConversationService {
         let stream_error = AgentSendError::from_app_error_ref(err).into_stream_error();
         let id = Self::mint_msg_id();
         let row = MessageRow {
-            id: id.clone(),
+            id: 0,
+            message_id: id.clone(),
             conversation_id: conv_id,
             msg_id: Some(id),
             r#type: "tips".into(),
@@ -61,8 +62,10 @@ impl ConversationService {
     /// 在会话里插入一条"图片已移除"警告提示(tips)。仅供用户查看,不回传模型。
     pub(crate) async fn persist_images_stripped_tip(&self, conversation_id: &str) -> Option<MessageRow> {
         let conv_id = conversation_id.to_owned();
+        let message_id = Self::mint_msg_id();
         let row = MessageRow {
-            id: Self::mint_msg_id(),
+            id: 0,
+            message_id,
             conversation_id: conv_id,
             msg_id: None,
             r#type: "tips".into(),

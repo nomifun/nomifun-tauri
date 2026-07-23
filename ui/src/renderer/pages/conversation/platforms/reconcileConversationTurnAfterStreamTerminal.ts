@@ -36,7 +36,7 @@ const getConversationWithTimeout = async (
 };
 
 /**
- * Compatibility fallback for a lost turn.completed event. A stream terminal is
+ * Reliability reconciliation for a lost turn.completed event. A stream terminal is
  * only a trigger for these reads; it never directly lowers the busy state.
  */
 export const reconcileConversationTurnAfterStreamTerminal = async (

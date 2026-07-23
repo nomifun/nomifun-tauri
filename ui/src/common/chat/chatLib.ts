@@ -16,6 +16,7 @@ import {
   parseConversationId,
   parseCronJobId,
   parseKnowledgeBaseId,
+  parsePersistedArtifactId,
   type ConversationId,
   type CronJobId,
   type KnowledgeBaseId,
@@ -61,12 +62,12 @@ type TMessageType =
 
 interface IMessage<T extends TMessageType, Content extends Record<string, any>> {
   /**
-   * 唯一ID — frontend-local message key (uuid), NOT a backend entity id.
+   * 唯一ID — frontend-local render key, NOT a backend entity id.
    */
   id: string;
-  /**
-   * 消息来源ID，— backend messages.id, stays TEXT (`msg_…`).
-   */
+  /** Durable message entity identity, present for persisted history rows. */
+  message_id?: MessageId;
+  /** Stable backend message UUIDv7. */
   msg_id?: MessageId;
 
   /** Stable backend turn correlation. Message identity and turn identity are
@@ -950,7 +951,12 @@ const normalizeDurableResourceUri = (value: unknown): string | undefined => {
 /** Reject malformed or non-canonical receipt metadata before it reaches UI. */
 const normalizePersistedToolArtifact = (value: unknown): PersistedToolArtifact | undefined => {
   if (!isObject(value)) return undefined;
-  const id = optionalDisplayText(value.id);
+  let id;
+  try {
+    id = parsePersistedArtifactId(value.id);
+  } catch {
+    return undefined;
+  }
   const kind = optionalDisplayText(value.kind) as PersistedToolArtifact['kind'] | undefined;
   const mimeType = optionalDisplayText(value.mime_type);
   const artifactPath = optionalDisplayText(value.path);
@@ -1201,7 +1207,7 @@ export const transformMessage = (message: IResponseMessage): TMessage | undefine
       const errorText =
         (isObject(errorData) ? optionalDisplayText(errorData.message) : undefined) ?? toDisplayText(errorData);
       return {
-        id: message.msg_id,
+        id: uuid(),
         type: 'tips',
         msg_id: message.msg_id,
         ...turnIdentity,
@@ -1224,7 +1230,7 @@ export const transformMessage = (message: IResponseMessage): TMessage | undefine
           ? (normalizeAgentStreamError(data.error) ?? normalizeAgentStreamError({ ...data, message: content }))
           : undefined;
       return {
-        id: message.msg_id,
+        id: uuid(),
         type: 'tips',
         msg_id: message.msg_id,
         ...turnIdentity,
@@ -1432,7 +1438,7 @@ export const transformUserCreatedEvent = (
 ): IMessageText | undefined => {
   if (event.hidden || event.conversation_id !== conversationId || !event.msg_id) return undefined;
   return {
-    id: event.msg_id,
+    id: uuid(),
     type: 'text',
     msg_id: event.msg_id,
     position: 'right',

@@ -5,12 +5,13 @@
  */
 
 /**
- * IDs are canonical strings at both protocol and component boundaries. Strict
- * equality intentionally rejects numeric compatibility representations.
+ * Live session targets are already validated at their protocol/component
+ * boundaries. Keep the entity kind in the comparison so equal UUID text from
+ * different business domains never aliases.
  */
 export const isLiveEventForTarget = (
-  eventKind: string,
-  eventTargetId: string,
-  kind: string,
-  id: string,
+  eventKind: 'conversation' | 'terminal',
+  eventTargetId: import('@/common/types/ids').ConversationId | import('@/common/types/ids').TerminalId,
+  kind: 'conversation' | 'terminal',
+  id: import('@/common/types/ids').ConversationId | import('@/common/types/ids').TerminalId,
 ): boolean => eventKind === kind && eventTargetId === id;

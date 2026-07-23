@@ -63,6 +63,9 @@ pub use agent_execution_template::*;
 pub use attachment::IAttachmentRepository;
 pub use channel::IChannelRepository;
 pub use client_preference::IClientPreferenceRepository;
+pub(crate) use client_preference::{
+    provider_preference_delete_action, ProviderPreferenceDeleteAction,
+};
 pub use connector_credential::IConnectorCredentialRepository;
 pub use conversation::IConversationRepository;
 pub use creation_task::{

@@ -33,7 +33,7 @@ const IdentitySection: React.FC<Props> = ({ agent, patch, message }) => {
     setName(agent.name);
     setGreeting(agent.greeting);
     setTone(agent.tone);
-  }, [agent.id, agent.name, agent.greeting, agent.tone]);
+  }, [agent.public_agent_id, agent.name, agent.greeting, agent.tone]);
 
   const dirty = useMemo(
     () => name !== agent.name || greeting !== agent.greeting || tone !== agent.tone,

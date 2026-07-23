@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
+use nomifun_common::PersistedArtifactId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -231,7 +232,7 @@ impl ArtifactStore {
             .ok_or(ArtifactStoreError::VerificationFailed)?;
 
         Ok(PersistedArtifact {
-            id: format!("artifact-{}", uuid::Uuid::now_v7()),
+            id: PersistedArtifactId::new().into_string(),
             kind,
             mime_type,
             path: canonical_locator.to_owned(),
@@ -410,10 +411,12 @@ impl ArtifactStore {
         let mut output = Vec::with_capacity(validated.len());
 
         for item in validated {
-            let id = format!("artifact-{}", uuid::Uuid::now_v7());
-            let file_name = format!("{id}.{}", item.extension);
+            let id = PersistedArtifactId::new().into_string();
+            // Keep the readable storage namespace in the file name only. The
+            // durable/wire business identity remains a bare UUIDv7.
+            let file_name = format!("artifact-{id}.{}", item.extension);
             let final_path = artifact_root.join(&file_name);
-            let temp_path = artifact_root.join(format!(".{id}.tmp"));
+            let temp_path = artifact_root.join(format!(".artifact-{id}.tmp"));
 
             let mut published_by_this_batch = false;
             let result = (|| -> Result<PersistedArtifact, ArtifactStoreError> {

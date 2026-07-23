@@ -52,7 +52,6 @@ pub enum AgentStreamEvent {
     AcpConfigOption(serde_json::Value),
     AcpSessionInfo(serde_json::Value),
     AcpContextUsage(serde_json::Value),
-    AcpPromptHookWarning(serde_json::Value),
     SlashCommandsUpdated(serde_json::Value),
     AvailableCommands(AvailableCommandsEventData),
     /// Emitted once at the end of a turn with aggregate metrics so the UI can
@@ -2487,7 +2486,6 @@ mod tests {
             (AgentStreamEvent::AcpConfigOption(serde_json::json!({})), "acp_config_option"),
             (AgentStreamEvent::AcpSessionInfo(serde_json::json!({})), "acp_session_info"),
             (AgentStreamEvent::AcpContextUsage(serde_json::json!({})), "acp_context_usage"),
-            (AgentStreamEvent::AcpPromptHookWarning(serde_json::json!({})), "acp_prompt_hook_warning"),
             (AgentStreamEvent::SlashCommandsUpdated(serde_json::json!({})), "slash_commands_updated"),
             (AgentStreamEvent::System(serde_json::json!({})), "system"),
             (AgentStreamEvent::RequestTrace(serde_json::json!({})), "request_trace"),

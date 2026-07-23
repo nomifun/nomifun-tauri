@@ -5,7 +5,7 @@
  */
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import type { ChannelId } from '@/common/types/ids';
+import type { ChannelPluginId } from '@/common/types/ids';
 import { useTranslation } from 'react-i18next';
 import { Button, Modal, Spin, Switch, Tag } from '@arco-design/web-react';
 import { Connection } from '@icon-park/react';
@@ -43,22 +43,20 @@ interface Props {
  * 陌生人经该渠道自动被安全接待。
  *
  * Per-public-agent multi-bot manager over the same channel model as the desktop
- * companion's RemoteConnectSection. Each bot is one `channel_plugins` row; a bot
- * "belongs to this agent" when `row.publicAgentId === agent.id`. The card for a
- * platform branches on whether this agent owns a row, an unbound row exists, or
- * only rows bound to other objects exist. Pending pairing requests surface as a
- * per-row badge.
+ * companion's RemoteConnectSection. Each bot is one channel plugin entity; a bot
+ * belongs to this agent when
+ * `publicAgentId === agent.public_agent_id`. Pairing badges are
+ * scoped by the plugin business UUID.
  */
 const ChannelsSection: React.FC<Props> = ({ agent, message }) => {
   const { t } = useTranslation();
 
-  // All channel rows, indexed by row id (NOT platform type — one platform may have many rows).
+  // All channel plugins, indexed by business UUID (not platform type).
   const [statuses, setStatuses] = useState<Record<string, IChannelPluginStatus>>({});
   const [pendingCounts, setPendingCounts] = useState<Record<string, number>>({});
-  const [busyRowId, setBusyRowId] = useState<ChannelId | null>(null);
+  const [busyPluginId, setBusyPluginId] = useState<ChannelPluginId | null>(null);
   const [loaded, setLoaded] = useState(false);
-  // Config modal target: with channelId = edit that row; without = create mode
-  // (the form's first save creates a row bound to this public agent).
+  // Config modal target: with channelPluginId = edit; without = create mode.
   const [configTarget, setConfigTarget] = useState<ChannelConfigTarget>(null);
 
   // ── Channel plugin statuses (REST snapshot + WS live updates) ──
@@ -68,7 +66,7 @@ const ChannelsSection: React.FC<Props> = ({ agent, message }) => {
       if (!plugins) return;
       setStatuses(() => {
         const next: Record<string, IChannelPluginStatus> = {};
-        for (const plugin of plugins) next[plugin.id] = plugin;
+        for (const plugin of plugins) next[plugin.plugin_id] = plugin;
         return next;
       });
     } catch (error) {
@@ -81,10 +79,11 @@ const ChannelsSection: React.FC<Props> = ({ agent, message }) => {
   useEffect(() => {
     void refreshStatuses();
     const unsubscribe = channel.pluginStatusChanged.on(({ status }) => {
-      // Merge known rows by id for fast feedback, then reconcile with a REST
-      // snapshot: a just-deleted row still emits one trailing enabled=false
-      // event, and new rows created elsewhere only exist in the snapshot.
-      setStatuses((prev) => (prev[status.id] ? { ...prev, [status.id]: { ...prev[status.id], ...status } } : prev));
+      setStatuses((prev) =>
+        prev[status.plugin_id]
+          ? { ...prev, [status.plugin_id]: { ...prev[status.plugin_id], ...status } }
+          : prev
+      );
       void refreshStatuses();
     });
     return () => unsubscribe();
@@ -97,8 +96,8 @@ const ChannelsSection: React.FC<Props> = ({ agent, message }) => {
       setPendingCounts(() => {
         const next: Record<string, number> = {};
         for (const pairing of pairings ?? []) {
-          if (!pairing.channelId) continue;
-          next[pairing.channelId] = (next[pairing.channelId] ?? 0) + 1;
+          if (!pairing.channel_plugin_id) continue;
+          next[pairing.channel_plugin_id] = (next[pairing.channel_plugin_id] ?? 0) + 1;
         }
         return next;
       });
@@ -120,17 +119,19 @@ const ChannelsSection: React.FC<Props> = ({ agent, message }) => {
   // platform bound to this agent shows up, retarget the modal so the enable
   // switch and the form address the new row instead of creating another one.
   useEffect(() => {
-    if (!configTarget || configTarget.channelId) return;
+    if (!configTarget || configTarget.channelPluginId) return;
     const created = Object.values(statuses).find(
-      (s) => s.type === configTarget.platform && statusOwnedBy(s, { publicAgentId: agent.id })
+      (s) =>
+        s.type === configTarget.platform &&
+        statusOwnedBy(s, { publicAgentId: agent.public_agent_id })
     );
     if (created) setConfigTarget((prev) => retargetConfigAfterStatus(prev, created));
-  }, [statuses, configTarget, agent.id]);
+  }, [statuses, configTarget, agent.public_agent_id]);
 
   // ── Row actions ──
   const handleToggleEnabled = useCallback(
     async (row: IChannelPluginStatus, platform: ChannelPlatform, enabled: boolean) => {
-      setBusyRowId(row.id);
+      setBusyPluginId(row.plugin_id);
       try {
         if (enabled) {
           // The outer card has no credential inputs — point the user at the form instead.
@@ -138,36 +139,38 @@ const ChannelsSection: React.FC<Props> = ({ agent, message }) => {
             message.warning(t(CREDENTIALS_REQUIRED_KEY[platform]));
             return;
           }
-          const result = await channel.enablePlugin.invoke({ plugin_id: row.id, config: {} });
+          const result = await channel.enablePlugin.invoke({ plugin_id: row.plugin_id, config: {} });
           if (!result.success) {
             throw new Error(
               result.error ||
-                result.message ||
                 t('nomi.settings.remoteEnableFailed', { defaultValue: 'Failed to enable channel' })
             );
           }
           message.success(t(PLUGIN_ENABLED_KEY[platform]));
         } else {
-          await channel.disablePlugin.invoke({ plugin_id: row.id });
+          await channel.disablePlugin.invoke({ plugin_id: row.plugin_id });
           message.success(t(PLUGIN_DISABLED_KEY[platform]));
         }
         await refreshStatuses();
       } catch (error: unknown) {
         message.error(error instanceof Error ? error.message : String(error));
       } finally {
-        setBusyRowId(null);
+        setBusyPluginId(null);
       }
     },
     [message, refreshStatuses, t]
   );
 
-  const applyRowBinding = useCallback(
-    async (rowId: ChannelId, bind: boolean) => {
-      setBusyRowId(rowId);
+  const applyPluginBinding = useCallback(
+    async (pluginId: ChannelPluginId, bind: boolean) => {
+      setBusyPluginId(pluginId);
       try {
         // Backend contract: null public_agent_id clears the binding. Atomic — persists
-        // the binding AND resets only this channel row's sessions.
-        await channel.setChannelPublicAgent.invoke({ plugin_id: rowId, public_agent_id: bind ? agent.id : null });
+        // the binding AND resets only this channel plugin's sessions.
+        await channel.setChannelPublicAgent.invoke({
+          plugin_id: pluginId,
+          public_agent_id: bind ? agent.public_agent_id : null,
+        });
         message.success(
           bind
             ? t('publicCompanion.channels.bindSuccess', {
@@ -178,7 +181,7 @@ const ChannelsSection: React.FC<Props> = ({ agent, message }) => {
         );
         await refreshStatuses();
       } catch (error) {
-        console.error(`[PublicAgentChannels] Failed to update binding for ${rowId}:`, error);
+        console.error(`[PublicAgentChannels] Failed to update binding for ${pluginId}:`, error);
         // Conflict (bot already bound elsewhere) carries the other owner's name in the
         // backend message — surface it verbatim.
         if (isBackendHttpError(error) && error.backendMessage) {
@@ -187,10 +190,10 @@ const ChannelsSection: React.FC<Props> = ({ agent, message }) => {
           message.error(t('nomi.settings.remoteBindFailed'));
         }
       } finally {
-        setBusyRowId(null);
+        setBusyPluginId(null);
       }
     },
-    [agent.id, agent.name, message, refreshStatuses, t]
+    [agent.public_agent_id, agent.name, message, refreshStatuses, t]
   );
 
   const confirmBind = useCallback(
@@ -201,10 +204,10 @@ const ChannelsSection: React.FC<Props> = ({ agent, message }) => {
           defaultValue: '绑定后该机器人由「{{name}}」接待,并重置该渠道的活跃会话。',
           name: agent.name,
         }),
-        onOk: () => applyRowBinding(row.id, true),
+        onOk: () => applyPluginBinding(row.plugin_id, true),
       });
     },
-    [applyRowBinding, agent.name, t]
+    [applyPluginBinding, agent.name, t]
   );
 
   const confirmUnbind = useCallback(
@@ -214,10 +217,10 @@ const ChannelsSection: React.FC<Props> = ({ agent, message }) => {
         content: t('publicCompanion.channels.unbindConfirm', {
           defaultValue: '解绑后该机器人不再由此对外伙伴接待,并重置该渠道的活跃会话。',
         }),
-        onOk: () => applyRowBinding(row.id, false),
+        onOk: () => applyPluginBinding(row.plugin_id, false),
       });
     },
-    [applyRowBinding, t]
+    [applyPluginBinding, t]
   );
 
   // Move (rebind) a bot that currently belongs to another object onto this
@@ -230,10 +233,10 @@ const ChannelsSection: React.FC<Props> = ({ agent, message }) => {
           from: t('publicCompanion.channels.otherOwner', { defaultValue: '其他对象' }),
           to: agent.name,
         }),
-        onOk: () => applyRowBinding(row.id, true),
+        onOk: () => applyPluginBinding(row.plugin_id, true),
       });
     },
-    [applyRowBinding, agent.name, t]
+    [applyPluginBinding, agent.name, t]
   );
 
   const confirmDelete = useCallback(
@@ -244,7 +247,7 @@ const ChannelsSection: React.FC<Props> = ({ agent, message }) => {
         okButtonProps: { status: 'danger' },
         onOk: async () => {
           try {
-            await channel.deletePlugin.invoke({ plugin_id: row.id });
+            await channel.deletePlugin.invoke({ plugin_id: row.plugin_id });
             await refreshStatuses();
           } catch (error: unknown) {
             message.error(error instanceof Error ? error.message : String(error));
@@ -315,16 +318,23 @@ const ChannelsSection: React.FC<Props> = ({ agent, message }) => {
         <div className='flex flex-col gap-10px'>
           {CHANNEL_PLATFORMS.map(({ id, logo, titleKey, fallback }) => {
             const title = t(titleKey, fallback);
-            // Only real DB rows: `GET /plugins` pads every builtin platform with a
-            // placeholder entry (id == platform name, hasToken=false) when it has no
-            // rows yet. Real rows always carry an encrypted config (hasToken=true).
+            // Ignore unconfigured platform placeholders; configured plugins
+            // carry credentials (`hasToken=true`).
             const rows = allRows.filter((s) => s.type === id && s.hasToken);
-            const myRow = rows.find((r) => statusOwnedBy(r, { publicAgentId: agent.id }));
+            const myRow = rows.find((r) =>
+              statusOwnedBy(r, { publicAgentId: agent.public_agent_id })
+            );
             const unboundRows = rows.filter((r) => statusIsUnbound(r));
-            const otherRows = rows.filter((r) => !statusIsUnbound(r) && !statusOwnedBy(r, { publicAgentId: agent.id }));
+            const otherRows = rows.filter(
+              (r) =>
+                !statusIsUnbound(r) &&
+                !statusOwnedBy(r, {
+                  publicAgentId: agent.public_agent_id,
+                })
+            );
             // The row this card talks about: this agent's bot, else a bindable one.
             const focusRow = myRow ?? unboundRows[0] ?? null;
-            const pending = focusRow ? (pendingCounts[focusRow.id] ?? 0) : 0;
+            const pending = focusRow ? (pendingCounts[focusRow.plugin_id] ?? 0) : 0;
 
             let subtitle = '';
             let actions: React.ReactNode;
@@ -334,10 +344,13 @@ const ChannelsSection: React.FC<Props> = ({ agent, message }) => {
                 <>
                   <Switch
                     checked={myRow.enabled}
-                    loading={busyRowId === myRow.id}
+                    loading={busyPluginId === myRow.plugin_id}
                     onChange={(checked: boolean) => void handleToggleEnabled(myRow, id, checked)}
                   />
-                  <Button size='small' onClick={() => setConfigTarget({ platform: id, channelId: myRow.id })}>
+                  <Button
+                    size='small'
+                    onClick={() => setConfigTarget({ platform: id, channelPluginId: myRow.plugin_id })}
+                  >
                     {t('nomi.settings.remoteConfigure')}
                   </Button>
                   <Button size='small' onClick={() => confirmUnbind(myRow)}>
@@ -356,12 +369,15 @@ const ChannelsSection: React.FC<Props> = ({ agent, message }) => {
                   <Button
                     size='small'
                     type='primary'
-                    loading={busyRowId === bindable.id}
+                    loading={busyPluginId === bindable.plugin_id}
                     onClick={() => confirmBind(bindable)}
                   >
                     {t('publicCompanion.channels.bindRow', { defaultValue: '绑定到此对外伙伴' })}
                   </Button>
-                  <Button size='small' onClick={() => setConfigTarget({ platform: id, channelId: bindable.id })}>
+                  <Button
+                    size='small'
+                    onClick={() => setConfigTarget({ platform: id, channelPluginId: bindable.plugin_id })}
+                  >
                     {t('nomi.settings.remoteConfigure')}
                   </Button>
                 </>
@@ -374,7 +390,12 @@ const ChannelsSection: React.FC<Props> = ({ agent, message }) => {
               });
               actions = (
                 <>
-                  <Button size='small' type='primary' loading={busyRowId === movable.id} onClick={() => confirmMove(movable)}>
+                  <Button
+                    size='small'
+                    type='primary'
+                    loading={busyPluginId === movable.plugin_id}
+                    onClick={() => confirmMove(movable)}
+                  >
                     {t('nomi.settings.remoteMoveHere')}
                   </Button>
                   <Button size='small' onClick={() => setConfigTarget({ platform: id })}>
@@ -443,18 +464,17 @@ const ChannelsSection: React.FC<Props> = ({ agent, message }) => {
       >
         {configTarget && (
           <PlatformConfigBody
-            key={configTarget.channelId ?? `${configTarget.platform}:new`}
+            key={configTarget.channelPluginId ?? `${configTarget.platform}:new`}
             platform={configTarget.platform}
-            status={configTarget.channelId ? (statuses[configTarget.channelId] ?? null) : null}
+            status={configTarget.channelPluginId ? (statuses[configTarget.channelPluginId] ?? null) : null}
             channelTarget={{
-              channelId: configTarget.channelId,
-              publicAgentId: agent.id,
+              channelPluginId: configTarget.channelPluginId,
+              publicAgentId: agent.public_agent_id,
             }}
             onStatusChange={(status) => {
-              // Forms report the row they saved; merge by row id, then let the
-              // snapshot reconcile (create mode discovers the new row there).
+              // Forms report the plugin they saved; merge by business UUID.
               if (status) {
-                setStatuses((prev) => ({ ...prev, [status.id]: status }));
+                setStatuses((prev) => ({ ...prev, [status.plugin_id]: status }));
                 setConfigTarget((prev) => retargetConfigAfterStatus(prev, status));
               }
               void refreshStatuses();

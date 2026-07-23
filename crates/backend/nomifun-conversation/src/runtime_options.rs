@@ -45,11 +45,13 @@ mod tests {
     use super::*;
     use nomifun_common::ConversationId;
 
-    const PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000001";
+    const PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 
     fn row_with_model(model: Option<&str>) -> ConversationRow {
+        let conversation_id = ConversationId::new().into_string();
         ConversationRow {
-            id: ConversationId::new().into_string(),
+            id: 0,
+            conversation_id,
             user_id: "user-1".into(),
             name: "test".into(),
             r#type: "nomi".into(),

@@ -71,9 +71,11 @@ pub enum ProviderHealthCheckErrorKind {
 
 /// Request body for `POST /api/agents/provider-health-check`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderHealthCheckRequest {
     #[serde(deserialize_with = "crate::serde_util::deserialize_provider_id")]
     pub provider_id: String,
+    #[serde(deserialize_with = "crate::serde_util::deserialize_model_name")]
     pub model: String,
     /// Which task to probe. `None` → look up the model's stored profile primary
     /// task, falling back to Chat. Lets image/tts/asr models be probed at the
@@ -88,6 +90,7 @@ pub struct ProviderHealthCheckResponse {
     #[serde(deserialize_with = "crate::serde_util::deserialize_provider_id")]
     pub provider_id: String,
     pub platform: String,
+    #[serde(deserialize_with = "crate::serde_util::deserialize_model_name")]
     pub model: String,
     pub status: HealthStatus,
     pub elapsed_ms: u64,
@@ -126,12 +129,12 @@ pub struct BedrockConfig {
 /// Provider response for `GET /api/providers` and single-provider endpoints.
 ///
 /// The `api_key` field is returned in plaintext (decrypted on read). Storage
-/// remains encrypted at rest. Pre-launch convention for the frontend
-/// local-store → backend migration; no masking applied.
+/// remains encrypted at rest. The v3 renderer/backend boundary intentionally
+/// has no legacy local-store compatibility path.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderResponse {
     #[serde(deserialize_with = "crate::serde_util::deserialize_provider_id")]
-    pub id: String,
+    pub provider_id: String,
     pub platform: String,
     pub name: String,
     pub base_url: String,
@@ -140,8 +143,6 @@ pub struct ProviderResponse {
     pub models: Vec<String>,
     pub enabled: bool,
     pub capabilities: Vec<ModelCapability>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context_limit: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_context_limits: Option<HashMap<String, i64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -163,16 +164,16 @@ pub struct ProviderResponse {
 
 /// Request body for `POST /api/providers`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateProviderRequest {
-    /// Optional caller-supplied id. When `None`, the server generates one.
-    /// Lets callers preserve a locally-known id across the create boundary
-    /// (used during the frontend-local-store → backend migration).
+    /// Optional caller-supplied business ID. When `None`, the server generates one.
+    /// This is a normal v3 create contract, not a historical-data migration hook.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "crate::serde_util::deserialize_optional_provider_id"
     )]
-    pub id: Option<String>,
+    pub provider_id: Option<String>,
     pub platform: String,
     pub name: String,
     pub base_url: String,
@@ -184,8 +185,6 @@ pub struct CreateProviderRequest {
     pub enabled: bool,
     #[serde(default)]
     pub capabilities: Vec<ModelCapability>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_limit: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_context_limits: Option<HashMap<String, i64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -212,6 +211,7 @@ fn default_true() -> bool {
 ///
 /// All fields are optional — partial update semantics.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateProviderRequest {
     pub platform: Option<String>,
     pub name: Option<String>,
@@ -220,7 +220,6 @@ pub struct UpdateProviderRequest {
     pub models: Option<Vec<String>>,
     pub enabled: Option<bool>,
     pub capabilities: Option<Vec<ModelCapability>>,
-    pub context_limit: Option<i64>,
     pub model_context_limits: Option<HashMap<String, i64>>,
     pub model_protocols: Option<HashMap<String, String>>,
     pub model_descriptions: Option<HashMap<String, String>>,
@@ -233,6 +232,7 @@ pub struct UpdateProviderRequest {
 
 /// Request body for `POST /api/providers/:id/models`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct FetchModelsRequest {
     #[serde(default)]
     pub try_fix: bool,
@@ -244,6 +244,7 @@ pub struct FetchModelsRequest {
 /// list before the provider row is persisted — credentials are passed in
 /// the request body instead of looked up by id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FetchModelsAnonymousRequest {
     pub platform: String,
     pub base_url: String,
@@ -255,13 +256,13 @@ pub struct FetchModelsAnonymousRequest {
     pub try_fix: bool,
 }
 
-/// A model entry that can be either a bare ID string or an object with
-/// id and name.
+/// A fetched model entry with one fixed wire shape.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(untagged)]
-pub enum ModelInfo {
-    Id(String),
-    Named { id: String, name: String },
+#[serde(deny_unknown_fields)]
+pub struct ModelInfo {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// Response for `POST /api/providers/:id/models`.
@@ -274,6 +275,7 @@ pub struct FetchModelsResponse {
 
 /// Request body for `POST /api/providers/detect-protocol`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DetectProtocolRequest {
     pub base_url: String,
     /// Plain-text API key (supports multi-key).
@@ -358,7 +360,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const PROVIDER_ID: &str = "prov_018f1234-5678-7abc-8def-012345678990";
+    const PROVIDER_ID: &str = "018f1234-5678-7abc-8def-012345678990";
 
     // -- ModelType --
 
@@ -510,7 +512,7 @@ mod tests {
     #[test]
     fn test_provider_response_serialization() {
         let resp = ProviderResponse {
-            id: PROVIDER_ID.into(),
+            provider_id: PROVIDER_ID.into(),
             platform: "anthropic".into(),
             name: "Anthropic".into(),
             base_url: "https://api.anthropic.com".into(),
@@ -521,7 +523,6 @@ mod tests {
                 capability_type: ModelType::Text,
                 is_user_selected: None,
             }],
-            context_limit: None,
             model_context_limits: None,
             model_protocols: None,
             model_descriptions: None,
@@ -534,7 +535,7 @@ mod tests {
             updated_at: 1712345678000,
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["id"], PROVIDER_ID);
+        assert_eq!(json["provider_id"], PROVIDER_ID);
         assert_eq!(json["platform"], "anthropic");
         assert_eq!(json["api_key"], "sk-ant-api03-plaintext");
         assert_eq!(json["base_url"], "https://api.anthropic.com");
@@ -549,7 +550,7 @@ mod tests {
     fn test_provider_response_api_key_plaintext() {
         // Pre-launch: no masking is applied to the api_key field on the wire.
         let resp = ProviderResponse {
-            id: PROVIDER_ID.into(),
+            provider_id: PROVIDER_ID.into(),
             platform: "openai".into(),
             name: "n".into(),
             base_url: "https://api.openai.com".into(),
@@ -557,7 +558,6 @@ mod tests {
             models: vec![],
             enabled: true,
             capabilities: vec![],
-            context_limit: None,
             model_context_limits: None,
             model_protocols: None,
             model_descriptions: None,
@@ -592,7 +592,7 @@ mod tests {
         assert!(req.models.is_empty());
         assert!(req.enabled);
         assert!(req.capabilities.is_empty());
-        assert!(req.context_limit.is_none());
+        assert!(req.model_context_limits.is_none());
         assert!(req.bedrock_config.is_none());
     }
 
@@ -613,7 +613,7 @@ mod tests {
             "models": ["anthropic.claude-3-sonnet"],
             "enabled": false,
             "capabilities": [{"type": "text"}, {"type": "vision", "is_user_selected": true}],
-            "context_limit": 200000,
+            "model_context_limits": {"anthropic.claude-3-sonnet": 200000},
             "bedrock_config": {
                 "auth_method": "accessKey",
                 "region": "us-east-1",
@@ -622,25 +622,30 @@ mod tests {
             }
         });
         let req: CreateProviderRequest = serde_json::from_value(raw).unwrap();
-        assert!(req.id.is_none());
+        assert!(req.provider_id.is_none());
         assert!(!req.enabled);
         assert_eq!(req.models.len(), 1);
         assert_eq!(req.capabilities.len(), 2);
-        assert_eq!(req.context_limit, Some(200000));
+        assert_eq!(
+            req.model_context_limits
+                .as_ref()
+                .and_then(|limits| limits.get("anthropic.claude-3-sonnet")),
+            Some(&200000)
+        );
         assert!(req.bedrock_config.is_some());
     }
 
     #[test]
     fn test_create_provider_request_with_id() {
         let raw = json!({
-            "id": PROVIDER_ID,
+            "provider_id": PROVIDER_ID,
             "platform": "openai",
             "name": "OpenAI",
             "base_url": "https://api.openai.com",
             "api_key": "sk-test"
         });
         let req: CreateProviderRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.id.as_deref(), Some(PROVIDER_ID));
+        assert_eq!(req.provider_id.as_deref(), Some(PROVIDER_ID));
     }
 
     #[test]
@@ -678,7 +683,7 @@ mod tests {
     fn test_create_provider_request_id_skipped_when_none() {
         // When id is None, it should not appear in serialized output.
         let req = CreateProviderRequest {
-            id: None,
+            provider_id: None,
             platform: "openai".into(),
             name: "OpenAI".into(),
             base_url: "https://api.openai.com".into(),
@@ -686,7 +691,6 @@ mod tests {
             models: vec![],
             enabled: true,
             capabilities: vec![],
-            context_limit: None,
             model_context_limits: None,
             model_protocols: None,
             model_descriptions: None,
@@ -697,7 +701,7 @@ mod tests {
             sort_order: None,
         };
         let json = serde_json::to_value(&req).unwrap();
-        assert!(json.get("id").is_none());
+        assert!(json.get("provider_id").is_none());
     }
 
     // -- UpdateProviderRequest --
@@ -783,29 +787,38 @@ mod tests {
     // -- ModelInfo --
 
     #[test]
-    fn test_model_info_string() {
-        let info: ModelInfo = serde_json::from_value(json!("gpt-4")).unwrap();
-        assert_eq!(info, ModelInfo::Id("gpt-4".into()));
+    fn test_model_info_rejects_bare_string() {
+        assert!(serde_json::from_value::<ModelInfo>(json!("gpt-4")).is_err());
     }
 
     #[test]
     fn test_model_info_named() {
-        let info: ModelInfo = serde_json::from_value(json!({"id": "gpt-4", "name": "GPT-4"})).unwrap();
+        let info: ModelInfo =
+            serde_json::from_value(json!({"id": "gpt-4", "name": "GPT-4"})).unwrap();
         assert_eq!(
             info,
-            ModelInfo::Named {
+            ModelInfo {
                 id: "gpt-4".into(),
-                name: "GPT-4".into()
+                name: Some("GPT-4".into())
             }
         );
     }
 
     #[test]
-    fn test_model_info_mixed_array() {
-        let raw = json!(["gpt-4", {"id": "claude-3", "name": "Claude 3"}]);
+    fn test_model_info_fixed_array() {
+        let raw = json!([
+            {"id": "gpt-4"},
+            {"id": "claude-3", "name": "Claude 3"}
+        ]);
         let models: Vec<ModelInfo> = serde_json::from_value(raw).unwrap();
         assert_eq!(models.len(), 2);
-        assert_eq!(models[0], ModelInfo::Id("gpt-4".into()));
+        assert_eq!(
+            models[0],
+            ModelInfo {
+                id: "gpt-4".into(),
+                name: None,
+            }
+        );
     }
 
     // -- FetchModelsResponse --
@@ -814,8 +827,14 @@ mod tests {
     fn test_fetch_models_response_without_fixed_url() {
         let resp = FetchModelsResponse {
             models: vec![
-                ModelInfo::Id("claude-sonnet-4-20250514".into()),
-                ModelInfo::Id("claude-opus-4-20250514".into()),
+                ModelInfo {
+                    id: "claude-sonnet-4-20250514".into(),
+                    name: None,
+                },
+                ModelInfo {
+                    id: "claude-opus-4-20250514".into(),
+                    name: None,
+                },
             ],
             fixed_base_url: None,
         };
@@ -827,7 +846,10 @@ mod tests {
     #[test]
     fn test_fetch_models_response_with_fixed_url() {
         let resp = FetchModelsResponse {
-            models: vec![ModelInfo::Id("gpt-4".into())],
+            models: vec![ModelInfo {
+                id: "gpt-4".into(),
+                name: None,
+            }],
             fixed_base_url: Some("https://api.openai.com/v1".into()),
         };
         let json = serde_json::to_value(&resp).unwrap();
@@ -1047,9 +1069,29 @@ mod tests {
     }
 
     #[test]
-    fn create_provider_request_rejects_noncanonical_supplied_id() {
+    fn create_provider_request_rejects_noncanonical_provider_id() {
+        for provider_id in [
+            json!(42),
+            json!("openai"),
+            json!("550e8400-e29b-41d4-a716-446655440000"),
+            json!("0190F5FE-7C00-7A00-8000-000000000042"),
+            json!("provider_0190f5fe-7c00-7a00-8000-000000000042"),
+        ] {
+            let raw = json!({
+                "provider_id": provider_id,
+                "platform": "openai",
+                "name": "OpenAI",
+                "base_url": "https://api.openai.com",
+                "api_key": "sk-test"
+            });
+            assert!(serde_json::from_value::<CreateProviderRequest>(raw).is_err());
+        }
+    }
+
+    #[test]
+    fn create_provider_request_rejects_removed_generic_id() {
         let raw = json!({
-            "id": "caller-supplied-1",
+            "id": PROVIDER_ID,
             "platform": "openai",
             "name": "OpenAI",
             "base_url": "https://api.openai.com",
@@ -1068,9 +1110,49 @@ mod tests {
     }
 
     #[test]
-    fn provider_response_rejects_noncanonical_entity_id() {
+    fn provider_health_check_request_rejects_invalid_model_name() {
+        for model in ["", " claude-sonnet-4-20250514", "claude-sonnet-4-20250514 "] {
+            let raw = json!({
+                "provider_id": PROVIDER_ID,
+                "model": model
+            });
+            assert!(serde_json::from_value::<ProviderHealthCheckRequest>(raw).is_err());
+        }
+    }
+
+    #[test]
+    fn provider_response_rejects_noncanonical_provider_id() {
+        let valid = json!({
+            "provider_id": PROVIDER_ID,
+            "platform": "openai",
+            "name": "OpenAI",
+            "base_url": "https://api.openai.com",
+            "api_key": "sk-test",
+            "models": [],
+            "enabled": true,
+            "capabilities": [],
+            "is_full_url": false,
+            "sort_order": 0,
+            "created_at": 0,
+            "updated_at": 0
+        });
+        for provider_id in [
+            json!(42),
+            json!("openai"),
+            json!("550e8400-e29b-41d4-a716-446655440000"),
+            json!("0190F5FE-7C00-7A00-8000-000000000042"),
+            json!("provider_0190f5fe-7c00-7a00-8000-000000000042"),
+        ] {
+            let mut raw = valid.clone();
+            raw["provider_id"] = provider_id;
+            assert!(serde_json::from_value::<ProviderResponse>(raw).is_err());
+        }
+    }
+
+    #[test]
+    fn provider_response_rejects_removed_generic_id() {
         let raw = json!({
-            "id": "openai",
+            "id": PROVIDER_ID,
             "platform": "openai",
             "name": "OpenAI",
             "base_url": "https://api.openai.com",

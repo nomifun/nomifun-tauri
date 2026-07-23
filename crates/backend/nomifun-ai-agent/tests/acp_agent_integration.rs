@@ -30,6 +30,17 @@ use tokio::sync::broadcast;
 
 /// Timeout for receiving events from the relay.
 const EVENT_TIMEOUT: Duration = Duration::from_secs(5);
+const CLAUDE_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000101";
+const CODEX_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000102";
+const TEST_CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000231";
+
+fn baseline_agent_id(backend: &str) -> &'static str {
+    match backend {
+        "claude" => CLAUDE_AGENT_ID,
+        "codex" => CODEX_AGENT_ID,
+        other => panic!("unsupported ACP fixture backend: {other}"),
+    }
+}
 
 /// Serialize integration tests to avoid OS-level resource contention
 /// from parallel subprocess spawning (pipes, I/O scheduling).
@@ -64,7 +75,7 @@ async fn make_mock_agent(script: &str, backend: &str) -> (Arc<AcpAgentManager>, 
         open_mcp_config: None,
         computer_mcp_config: None,
         browser_mcp_config: None,
-        agent_id: None,
+        agent_id: Some(baseline_agent_id(backend).to_owned()),
         backend: Some(backend.to_owned()),
         cli_path: Some(script_path.to_string_lossy().into_owned()),
         agent_name: None,
@@ -101,14 +112,14 @@ async fn make_mock_agent(script: &str, backend: &str) -> (Arc<AcpAgentManager>, 
     registry.hydrate().await.unwrap();
 
     let metadata = registry
-        .find_builtin_by_backend(backend)
+        .get(baseline_agent_id(backend))
         .await
-        .expect("seeded backend row must exist");
+        .expect("seeded agent row must exist");
     let catalog_tx = registry.catalog_sender();
 
     let params = Arc::new(
         assemble_acp_params(
-            "test-conv-1".into(),
+            TEST_CONVERSATION_ID.into(),
             WorkspaceInfo {
                 path: "/tmp".into(),
                 is_custom: true,
@@ -196,7 +207,6 @@ fn event_type_name(event: &AgentStreamEvent) -> &'static str {
         AgentStreamEvent::AcpConfigOption(_) => "AcpConfigOption",
         AgentStreamEvent::AcpSessionInfo(_) => "AcpSessionInfo",
         AgentStreamEvent::AcpContextUsage(_) => "AcpContextUsage",
-        AgentStreamEvent::AcpPromptHookWarning(_) => "AcpPromptHookWarning",
         AgentStreamEvent::TurnCompleted(_) => "TurnCompleted",
         AgentStreamEvent::Finish(_) => "Finish",
         AgentStreamEvent::Error(_) => "Error",
@@ -228,7 +238,7 @@ async fn acp_agent_type_is_acp() {
     let (agent, _rx) = make_mock_agent(r#"echo '{"type":"finish","data":{}}'"#, "claude").await;
 
     assert_eq!(agent.agent_type(), nomifun_common::AgentType::Acp);
-    assert_eq!(agent.conversation_id(), "test-conv-1");
+    assert_eq!(agent.conversation_id(), TEST_CONVERSATION_ID);
     assert_eq!(agent.workspace(), "/tmp");
     assert_eq!(agent.backend(), Some("claude"));
 }

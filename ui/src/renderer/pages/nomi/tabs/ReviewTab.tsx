@@ -97,7 +97,10 @@ const ReviewTab: React.FC<Props> = ({ companionId }) => {
               {items.map((d) => {
                 const { topics, mood } = parseHighlights(d.highlights);
                 return (
-                  <div key={d.id} className='bg-fill-2 rd-10px px-14px py-12px flex flex-col gap-8px'>
+                  <div
+                    key={d.session_window_id}
+                    className='bg-fill-2 rd-10px px-14px py-12px flex flex-col gap-8px'
+                  >
                     <div className='text-14px text-t-primary leading-relaxed whitespace-pre-wrap'>
                       {d.digest || '—'}
                     </div>

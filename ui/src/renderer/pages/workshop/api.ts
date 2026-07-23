@@ -75,7 +75,7 @@ export function workshopFileUrl(assetId: AssetId, thumb = false): string {
 }
 
 function normalizeCanvasMeta(meta: WorkshopCanvasMeta): WorkshopCanvasMeta {
-  return { ...meta, id: parseCanvasId(meta.id) };
+  return { ...meta, canvas_id: parseCanvasId(meta.canvas_id) };
 }
 
 function normalizeAsset(asset: WorkshopAsset): WorkshopAsset {
@@ -87,11 +87,11 @@ function normalizeAsset(asset: WorkshopAsset): WorkshopAsset {
         canvas_id: asset.origin.canvas_id === undefined ? undefined : parseCanvasId(asset.origin.canvas_id),
         node_id:
           asset.origin.node_id === undefined ? undefined : parseWorkshopNodeId(asset.origin.node_id),
-        task_id:
-          asset.origin.task_id === undefined ? undefined : parseCreationTaskId(asset.origin.task_id),
+        creation_task_id:
+          asset.origin.creation_task_id === undefined ? undefined : parseCreationTaskId(asset.origin.creation_task_id),
       }
     : null;
-  return { ...asset, id: parseAssetId(asset.id), origin };
+  return { ...asset, asset_id: parseAssetId(asset.asset_id), origin };
 }
 
 function normalizeNode(node: WorkshopNode): WorkshopNode {
@@ -137,7 +137,7 @@ function normalizeCanvasDoc(doc: WorkshopCanvasDoc): WorkshopCanvasDoc {
 function normalizeCreationTask(task: CreationTask): CreationTask {
   return {
     ...task,
-    id: parseCreationTaskId(task.id),
+    creation_task_id: parseCreationTaskId(task.creation_task_id),
     canvas_id: task.canvas_id == null ? null : parseCanvasId(task.canvas_id),
     node_id: task.node_id == null ? null : parseWorkshopNodeId(task.node_id),
     provider_id: parseProviderId(task.provider_id),
@@ -172,26 +172,40 @@ export async function createCanvas(body: CreateCanvasBody = {}): Promise<Worksho
 }
 
 /** Load a canvas's index row plus its full (opaque) doc. */
-export async function getCanvas(id: CanvasId): Promise<CanvasDetailResponse> {
-  const detail = await httpRequest<CanvasDetailResponse>('GET', `/api/workshop/canvases/${encodeURIComponent(id)}`);
+export async function getCanvas(canvas_id: CanvasId): Promise<CanvasDetailResponse> {
+  const detail = await httpRequest<CanvasDetailResponse>(
+    'GET',
+    `/api/workshop/canvases/${encodeURIComponent(canvas_id)}`
+  );
   return { meta: normalizeCanvasMeta(detail.meta), doc: normalizeCanvasDoc(detail.doc) };
 }
 
 /** Persist the canvas doc (atomic write; backend re-derives `node_count`). */
-export async function putCanvasDoc(id: CanvasId, doc: WorkshopCanvasDoc): Promise<PutDocResponse> {
-  return httpRequest<PutDocResponse>('PUT', `/api/workshop/canvases/${encodeURIComponent(id)}/doc`, { doc });
+export async function putCanvasDoc(canvas_id: CanvasId, doc: WorkshopCanvasDoc): Promise<PutDocResponse> {
+  return httpRequest<PutDocResponse>(
+    'PUT',
+    `/api/workshop/canvases/${encodeURIComponent(canvas_id)}/doc`,
+    { doc }
+  );
 }
 
 /** Rename a canvas. */
-export async function patchCanvas(id: CanvasId, patch: PatchCanvasBody): Promise<WorkshopCanvasMeta> {
+export async function patchCanvas(
+  canvas_id: CanvasId,
+  patch: PatchCanvasBody
+): Promise<WorkshopCanvasMeta> {
   return normalizeCanvasMeta(
-    await httpRequest<WorkshopCanvasMeta>('PATCH', `/api/workshop/canvases/${encodeURIComponent(id)}`, patch)
+    await httpRequest<WorkshopCanvasMeta>(
+      'PATCH',
+      `/api/workshop/canvases/${encodeURIComponent(canvas_id)}`,
+      patch
+    )
   );
 }
 
 /** Delete a canvas (index row + domain directory; assets are GC'd separately). */
-export async function deleteCanvas(id: CanvasId): Promise<void> {
-  await httpRequest<void>('DELETE', `/api/workshop/canvases/${encodeURIComponent(id)}`);
+export async function deleteCanvas(canvas_id: CanvasId): Promise<void> {
+  await httpRequest<void>('DELETE', `/api/workshop/canvases/${encodeURIComponent(canvas_id)}`);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -221,15 +235,19 @@ export async function createTextAsset(body: CreateTextAssetBody): Promise<Worksh
 }
 
 /** Partially edit an asset's metadata (title/collection/tags/in_library). */
-export async function patchAsset(id: AssetId, patch: PatchAssetBody): Promise<WorkshopAsset> {
+export async function patchAsset(asset_id: AssetId, patch: PatchAssetBody): Promise<WorkshopAsset> {
   return normalizeAsset(
-    await httpRequest<WorkshopAsset>('PATCH', `/api/workshop/assets/${encodeURIComponent(id)}`, patch)
+    await httpRequest<WorkshopAsset>(
+      'PATCH',
+      `/api/workshop/assets/${encodeURIComponent(asset_id)}`,
+      patch
+    )
   );
 }
 
 /** Delete an asset (index row + on-disk file). */
-export async function deleteAsset(id: AssetId): Promise<void> {
-  await httpRequest<void>('DELETE', `/api/workshop/assets/${encodeURIComponent(id)}`);
+export async function deleteAsset(asset_id: AssetId): Promise<void> {
+  await httpRequest<void>('DELETE', `/api/workshop/assets/${encodeURIComponent(asset_id)}`);
 }
 
 /**
@@ -329,7 +347,7 @@ export function uploadAsset(file: File, hooks: UploadAssetHooks = {}): Promise<W
           parsed && typeof parsed === 'object' && 'data' in parsed
             ? (parsed as { data: WorkshopAsset }).data
             : (parsed as WorkshopAsset);
-        if (!asset || typeof asset !== 'object' || typeof (asset as WorkshopAsset).id !== 'string') {
+        if (!asset || typeof asset !== 'object' || typeof (asset as WorkshopAsset).asset_id !== 'string') {
           reject(new Error('Upload failed: server returned an unexpected response'));
         } else {
           resolve(normalizeAsset(asset));
@@ -370,15 +388,18 @@ export async function listTasks(query: ListTasksQuery = {}): Promise<CreationTas
 }
 
 /** Fetch a single generation task. */
-export async function getTask(id: CreationTaskId): Promise<CreationTask> {
+export async function getTask(taskId: CreationTaskId): Promise<CreationTask> {
   return normalizeCreationTask(
-    await httpRequest<CreationTask>('GET', `/api/creation/tasks/${encodeURIComponent(id)}`)
+    await httpRequest<CreationTask>('GET', `/api/creation/tasks/${encodeURIComponent(String(taskId))}`)
   );
 }
 
 /** Cancel a generation task. */
-export async function cancelTask(id: CreationTaskId): Promise<CreationTask> {
+export async function cancelTask(taskId: CreationTaskId): Promise<CreationTask> {
   return normalizeCreationTask(
-    await httpRequest<CreationTask>('POST', `/api/creation/tasks/${encodeURIComponent(id)}/cancel`)
+    await httpRequest<CreationTask>(
+      'POST',
+      `/api/creation/tasks/${encodeURIComponent(String(taskId))}/cancel`
+    )
   );
 }

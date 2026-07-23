@@ -238,7 +238,7 @@ const Titlebar: React.FC<TitlebarProps> = ({ workspaceAvailable }) => {
 
     let cancelled = false;
     void ipcBridge.conversation.get
-      .invoke({ id: activeConversationId })
+      .invoke({ conversation_id: activeConversationId })
       .then((conversation) => {
         if (cancelled) return;
         setMobileCenterTitle(conversation?.name || appTitle);

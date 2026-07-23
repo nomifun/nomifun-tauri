@@ -56,7 +56,7 @@ async fn deleting_terminal_clears_requirement_owner_via_hook() {
     term_service.with_delete_hook(req_service.clone() as Arc<dyn OnTerminalDelete>);
 
     // Persist a terminal row (no live PTY needed — delete tolerates that). The
-    // id is minted by SQLite and returned on the row.
+    // terminal business UUIDv7 is returned by the repository.
     let term = term_repo
         .create(&CreateTerminalParams {
             id: TerminalId::new(),
@@ -73,7 +73,7 @@ async fn deleting_terminal_clears_requirement_owner_via_hook() {
         })
         .await
         .unwrap();
-    let term_id = term.id;
+    let term_id = term.terminal_id;
 
     // Create a requirement and let the terminal claim it (owner=term_1, in_progress).
     let r = req_service
@@ -89,7 +89,7 @@ async fn deleting_terminal_clears_requirement_owner_via_hook() {
         .await
         .unwrap();
     let claimed = req_service
-        .claim_next("auto", &term_id, AutoWorkTargetKind::Terminal, 60_000)
+        .claim_next("auto", term_id.as_str(), AutoWorkTargetKind::Terminal, 60_000)
         .await
         .unwrap()
         .unwrap();
@@ -98,9 +98,9 @@ async fn deleting_terminal_clears_requirement_owner_via_hook() {
     assert_eq!(claimed.status, RequirementStatus::InProgress);
 
     // Delete the terminal through the service → the hook fires and clears owner.
-    term_service.delete(&term_id).await.unwrap();
+    term_service.delete(term_id.as_str()).await.unwrap();
 
-    let after = req_service.get(&r.id).await.unwrap();
+    let after = req_service.get(&r.requirement_id).await.unwrap();
     assert_eq!(after.owner_terminal_id, None, "terminal owner cleared on delete");
     assert_eq!(after.owner_conversation_id, None);
     assert_eq!(

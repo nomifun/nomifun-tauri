@@ -1,4 +1,4 @@
-//! Repository trait for the `agent_metadata` catalog.
+//! Repository trait for the `agent_metadata` table.
 
 use crate::error::DbError;
 use crate::models::{AgentMetadataRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams};
@@ -15,8 +15,8 @@ pub trait IAgentMetadataRepository: Send + Sync {
     /// Return every row, in insertion order.
     async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError>;
 
-    /// Look up by primary key.
-    async fn get(&self, id: &str) -> Result<Option<AgentMetadataRow>, DbError>;
+    /// Look up by the durable business `agent_id`.
+    async fn get(&self, agent_id: &str) -> Result<Option<AgentMetadataRow>, DbError>;
 
     /// Look up by the unique `(agent_source, name)` pair.
     async fn find_by_source_and_name(
@@ -34,21 +34,21 @@ pub trait IAgentMetadataRepository: Send + Sync {
     async fn upsert(&self, params: &UpsertAgentMetadataParams<'_>) -> Result<AgentMetadataRow, DbError>;
 
     /// Apply handshake-derived fields on top of an existing row.
-    /// Returns `Ok(None)` if no row matches `id`.
+    /// Returns `Ok(None)` if no row matches `agent_id`.
     async fn apply_handshake(
         &self,
-        id: &str,
+        agent_id: &str,
         params: &UpdateAgentHandshakeParams<'_>,
     ) -> Result<Option<AgentMetadataRow>, DbError>;
 
     /// Toggle the `enabled` flag. Returns `true` if a row was updated.
-    async fn set_enabled(&self, id: &str, enabled: bool) -> Result<bool, DbError>;
+    async fn set_enabled(&self, agent_id: &str, enabled: bool) -> Result<bool, DbError>;
 
     /// Overwrite the `behavior_policy` JSON column. Used by custom-agent
     /// upserts and catalog maintenance paths that need to persist typed
     /// adapter behavior switches. The caller is responsible for merging on
     /// top of the existing policy if partial updates are needed. Returns the
-    /// updated row, or `Ok(None)` if no row matches `id`.
+    /// updated row, or `Ok(None)` if no row matches `agent_id`.
     ///
     /// Defaulted so the many test-only stub repositories across the
     /// workspace need not implement it; the real SQLite repository
@@ -57,14 +57,14 @@ pub trait IAgentMetadataRepository: Send + Sync {
     /// loud, not silently broken.
     async fn set_behavior_policy(
         &self,
-        id: &str,
+        agent_id: &str,
         _behavior_policy: &str,
     ) -> Result<Option<AgentMetadataRow>, DbError> {
         Err(DbError::Init(format!(
-            "set_behavior_policy not implemented for this repository (id '{id}')"
+            "set_behavior_policy not implemented for this repository (agent_id '{agent_id}')"
         )))
     }
 
     /// Delete a row. Returns `true` if a row was removed.
-    async fn delete(&self, id: &str) -> Result<bool, DbError>;
+    async fn delete(&self, agent_id: &str) -> Result<bool, DbError>;
 }

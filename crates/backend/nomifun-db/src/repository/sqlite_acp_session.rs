@@ -29,11 +29,13 @@ fn is_unique_violation(err: &dyn sqlx::error::DatabaseError) -> bool {
 impl IAcpSessionRepository for SqliteAcpSessionRepository {
     async fn get(&self, conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
         // `agent_id` is nullable in the schema (NULL = "no agent chosen yet").
+        // When present it is the bare UUIDv7 business ID from agent_metadata;
+        // builtin catalog lineage lives in agent_metadata.source_key.
         // COALESCE it back to the empty-string sentinel so `AcpSessionRow.agent_id`
         // stays a non-optional `String` for all downstream consumers.
         let row = sqlx::query_as::<_, AcpSessionRow>(
-            "SELECT conversation_id, agent_backend, agent_source, \
-                    COALESCE(agent_id, '') AS agent_id, session_id, session_status, \
+            "SELECT id, conversation_id, agent_backend, agent_source, \
+                    COALESCE(agent_id, '') AS agent_id, acp_session_id, session_status, \
                     session_config, last_active_at, suspended_at \
              FROM acp_session WHERE conversation_id = ?",
         )
@@ -45,13 +47,40 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
 
     async fn create(&self, params: &CreateAcpSessionParams<'_>) -> Result<AcpSessionRow, DbError> {
         let now = now_ms();
-        // Write NULL (not the empty-string sentinel) when no agent is chosen so
-        // the RESTRICT FK to agent_metadata is not evaluated against ''.
+        // Write NULL (not the empty-string sentinel) when no agent is chosen;
+        // agent identity is an application-validated bare UUIDv7 logical
+        // reference.
         let agent_id: Option<&str> = Some(params.agent_id).filter(|s| !s.is_empty());
+        let mut tx = self.pool.begin().await?;
+        let conversation = sqlx::query(
+            "UPDATE conversations SET updated_at = updated_at WHERE conversation_id = ?",
+        )
+        .bind(params.conversation_id)
+        .execute(&mut *tx)
+        .await?;
+        if conversation.rows_affected() == 0 {
+            return Err(DbError::Conflict(format!(
+                "ACP session conversation '{}' does not exist",
+                params.conversation_id
+            )));
+        }
+        if let Some(agent_id) = agent_id {
+            let agent = sqlx::query(
+                "UPDATE agent_metadata SET updated_at = updated_at WHERE agent_id = ?",
+            )
+            .bind(agent_id)
+            .execute(&mut *tx)
+            .await?;
+            if agent.rows_affected() == 0 {
+                return Err(DbError::Conflict(format!(
+                    "ACP session agent '{agent_id}' does not exist"
+                )));
+            }
+        }
         sqlx::query(
             "INSERT INTO acp_session \
                 (conversation_id, agent_backend, agent_source, agent_id, \
-                 session_id, session_status, session_config, last_active_at) \
+                 acp_session_id, session_status, session_config, last_active_at) \
              VALUES (?, ?, ?, ?, NULL, 'idle', '{}', ?)",
         )
         .bind(params.conversation_id)
@@ -59,7 +88,7 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         .bind(params.agent_source)
         .bind(agent_id)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| match &e {
             sqlx::Error::Database(db_err) if is_unique_violation(db_err.as_ref()) => DbError::Conflict(format!(
@@ -68,18 +97,28 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
             )),
             _ => DbError::Query(e),
         })?;
-
-        self.get(params.conversation_id).await?.ok_or_else(|| {
+        let row = sqlx::query_as::<_, AcpSessionRow>(
+            "SELECT id, conversation_id, agent_backend, agent_source, \
+                    COALESCE(agent_id, '') AS agent_id, acp_session_id, session_status, \
+                    session_config, last_active_at, suspended_at \
+             FROM acp_session WHERE conversation_id = ?",
+        )
+        .bind(params.conversation_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
             DbError::Init(format!(
                 "create did not produce acp_session row for '{}'",
                 params.conversation_id
             ))
-        })
+        })?;
+        tx.commit().await?;
+        Ok(row)
     }
 
     async fn update_session_id(&self, conversation_id: &str, session_id: &str) -> Result<bool, DbError> {
         let now = now_ms();
-        let result = sqlx::query("UPDATE acp_session SET session_id = ?, last_active_at = ? WHERE conversation_id = ?")
+        let result = sqlx::query("UPDATE acp_session SET acp_session_id = ?, last_active_at = ? WHERE conversation_id = ?")
             .bind(session_id)
             .bind(now)
             .bind(conversation_id)
@@ -116,7 +155,7 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
 
         let now = now_ms();
         let result = sqlx::query(
-            "UPDATE acp_session SET session_id = NULL, session_status = 'idle', \
+            "UPDATE acp_session SET acp_session_id = NULL, session_status = 'idle', \
              session_config = ?, last_active_at = ? WHERE conversation_id = ?",
         )
         .bind(new_config)
@@ -261,10 +300,9 @@ mod tests {
     use super::*;
     use crate::init_database_memory;
 
-    const CONVERSATION_ID: &str =
-        "conv_019abcdef012-7abc-8abc-0123-456789abcdef";
-    const MISSING_CONVERSATION_ID: &str =
-        "conv_019abcdef012-7abc-8abc-0123-456789abcdee";
+    const CONVERSATION_ID: &str = "019abcde-f012-7abc-8abc-0123456789ab";
+    const MISSING_CONVERSATION_ID: &str = "019abcde-f012-7abc-8abc-0123456789ac";
+    const CLAUDE_AGENT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000101";
 
     async fn setup() -> (SqliteAcpSessionRepository, crate::Database) {
         let db = init_database_memory().await.unwrap();
@@ -277,21 +315,17 @@ mod tests {
             conversation_id,
             agent_backend: "claude",
             agent_source: "builtin",
-            agent_id: "agent_builtin_claude",
+            agent_id: CLAUDE_AGENT_ID,
         }
     }
 
-    /// Insert a conversation so the `acp_session.conversation_id` FK
-    /// (REFERENCES conversations(id) ON DELETE CASCADE) is satisfied before
-    /// `create()` inserts the session row. The installation owner is seeded by
-    /// init_database_memory, satisfying conversations.user_id FK; the
-    /// `agent_builtin_claude` referenced by `create_params` is likewise seeded,
-    /// satisfying the acp_session.agent_id FK.
+    /// Seed the logical parent used by the session fixture. The repository,
+    /// rather than SQLite, owns relation validation and deletion behavior.
     async fn seed_conversation(pool: &SqlitePool, id: &str) {
         let owner = crate::installation_owner_id(pool).await.unwrap();
         sqlx::query(
-            "INSERT INTO conversations (id, user_id, name, type, status, created_at, updated_at) \
-             VALUES (?, ?, 'c', 'normal', 'pending', 1, 1)",
+            "INSERT INTO conversations (conversation_id, user_id, name, type, status, created_at, updated_at) \
+             VALUES (?, ?, 'c', 'acp', 'pending', 1, 1)",
         )
         .bind(id)
         .bind(owner)
@@ -307,7 +341,7 @@ mod tests {
         let row = repo.create(&create_params(CONVERSATION_ID)).await.unwrap();
         assert_eq!(row.conversation_id, CONVERSATION_ID);
         assert_eq!(row.agent_backend, "claude");
-        assert_eq!(row.session_id, None);
+        assert_eq!(row.acp_session_id, None);
         assert_eq!(row.session_status, "idle");
         assert_eq!(row.session_config, "{}");
 
@@ -332,7 +366,7 @@ mod tests {
         assert!(repo.update_session_id(CONVERSATION_ID, "sess-abc").await.unwrap());
 
         let fetched = repo.get(CONVERSATION_ID).await.unwrap().unwrap();
-        assert_eq!(fetched.session_id.as_deref(), Some("sess-abc"));
+        assert_eq!(fetched.acp_session_id.as_deref(), Some("sess-abc"));
         assert!(fetched.last_active_at.is_some());
     }
 
@@ -363,7 +397,7 @@ mod tests {
         assert!(repo.clear_session_id(CONVERSATION_ID).await.unwrap());
 
         let row = repo.get(CONVERSATION_ID).await.unwrap().unwrap();
-        assert_eq!(row.session_id, None, "session_id must be nulled");
+        assert_eq!(row.acp_session_id, None, "acp_session_id must be nulled");
         assert_eq!(row.session_status, "idle");
 
         let state = repo.load_runtime_state(CONVERSATION_ID).await.unwrap().unwrap();

@@ -36,7 +36,7 @@ const McpServerItem: React.FC<McpServerItemProps> = ({
 }) => {
   return (
     <Collapse
-      key={server.id}
+      key={server.mcp_server_id}
       activeKey={isCollapsed ? ['1'] : []}
       onChange={onToggleCollapse}
       className='mb-4 [&_div.arco-collapse-item-header-title]:flex-1'

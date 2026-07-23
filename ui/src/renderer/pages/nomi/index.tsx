@@ -65,10 +65,10 @@ const NomiConfigPage: React.FC = () => {
   const companionParam = searchParams.get('companion');
   const selectedCompanionId = useMemo(() => {
     if (companionParam) {
-      const matched = companions.find((p) => p.id === companionParam);
-      if (matched) return matched.id;
+      const matched = companions.find((p) => p.companion_id === companionParam);
+      if (matched) return matched.companion_id;
     }
-    return companions[0]?.id ?? null;
+    return companions[0]?.companion_id ?? null;
   }, [companionParam, companions]);
 
   const companion = useCompanion(selectedCompanionId);
@@ -104,13 +104,17 @@ const NomiConfigPage: React.FC = () => {
     // Only overlay when the live optimistic profile actually belongs to the
     // selected row. On a companion switch, `companion.profile` briefly still
     // holds the PREVIOUS companion's profile (useCompanion's reset effect runs
-    // AFTER this render); spreading it would rewrite the selected row's id — and
+    // AFTER this render); spreading it would rewrite the selected row's companion_id — and
     // thus its React `key` — to the previous companion's id, producing two rows
     // with the same key and the "切换伙伴时侧栏疯狂复制" duplication that only a
-    // remount (switching sidebar tab) cleared. The `id: c.id` pin is belt-and-
-    // suspenders: with the guard, live.id already equals c.id.
-    if (!live || live.id !== selectedCompanionId) return companions;
-    return companions.map((c) => (c.id === selectedCompanionId ? { ...c, ...live, id: c.id } : c));
+    // remount (switching sidebar tab) cleared. The `companion_id` pin is belt-and-
+    // suspenders: with the guard, both records already carry the selected id.
+    if (!live || live.companion_id !== selectedCompanionId) return companions;
+    return companions.map((c) =>
+      c.companion_id === selectedCompanionId
+        ? { ...c, ...live, companion_id: c.companion_id }
+        : c
+    );
   }, [companions, selectedCompanionId, companion.profile]);
 
   const setTab = useCallback(
@@ -145,7 +149,7 @@ const NomiConfigPage: React.FC = () => {
   );
 
   const handleCreated = useCallback(
-    async (profile: { id: CompanionId }) => {
+    async (profile: { companion_id: CompanionId }) => {
       await companionsApi.refresh();
       void shared.refresh();
       // 新建后落到 总览(overview)：新伙伴尚未配置模型，先在管理中心引导配置，配置后再从
@@ -154,7 +158,7 @@ const NomiConfigPage: React.FC = () => {
       // second would drop the first's `companion=` change.
       setSearchParams(
         (prev) => {
-          prev.set('companion', profile.id);
+          prev.set('companion', profile.companion_id);
           prev.set('tab', 'overview');
           return prev;
         },
@@ -166,10 +170,10 @@ const NomiConfigPage: React.FC = () => {
 
   const handleDeleted = useCallback(
     (deletedId: CompanionId) => {
-      const rest = companions.filter((p) => p.id !== deletedId);
+      const rest = companions.filter((p) => p.companion_id !== deletedId);
       setSearchParams(
         (prev) => {
-          if (rest[0]) prev.set('companion', rest[0].id);
+          if (rest[0]) prev.set('companion', rest[0].companion_id);
           else prev.delete('companion');
           return prev;
         },

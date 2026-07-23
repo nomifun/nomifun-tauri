@@ -191,7 +191,7 @@ function sorted(values) {
 // on a long Rust test run, so concept/schema drift fails the ordinary fast
 // `check` command immediately.
 const canonicalMigration = readFileSync(
-  resolve(ROOT, 'crates/backend/nomifun-db/migrations/001_id_contract_v2.sql'),
+  resolve(ROOT, 'crates/backend/nomifun-db/migrations/001_v3_baseline.sql'),
   'utf8',
 );
 
@@ -200,7 +200,7 @@ const migrationDirectory = resolve(
   'crates/backend/nomifun-db/migrations',
 );
 const nonBaselineExecutionCreates = readdirSync(migrationDirectory)
-  .filter((name) => name.endsWith('.sql') && name !== '001_id_contract_v2.sql')
+  .filter((name) => name.endsWith('.sql') && name !== '001_v3_baseline.sql')
   .flatMap((name) => {
     const source = readFileSync(resolve(migrationDirectory, name), 'utf8');
     return [...source.matchAll(/CREATE TABLE\s+(?:IF NOT EXISTS\s+)?([a-z_]+)/gi)]
@@ -293,8 +293,8 @@ const generatedEventFacts = sorted(
   ),
 );
 invariant(
-  eventFacts.length === 9,
-  `durable execution vocabulary must remain exactly nine facts; found ${eventFacts.join(', ')}`,
+  eventFacts.length === 8,
+  `durable execution vocabulary must remain exactly eight facts; found ${eventFacts.join(', ')}`,
 );
 invariant(
   JSON.stringify(sqlEventFacts) === JSON.stringify(eventFacts),

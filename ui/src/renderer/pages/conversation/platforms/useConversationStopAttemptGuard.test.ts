@@ -9,8 +9,8 @@ import {
   unmountConversationStopAttemptGuard,
 } from './useConversationStopAttemptGuard';
 
-const firstConversation = parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000031');
-const secondConversation = parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000032');
+const firstConversation = parseConversationId('0190f5fe-7c00-7a00-8000-000000000031');
+const secondConversation = parseConversationId('0190f5fe-7c00-7a00-8000-000000000032');
 
 describe('conversation stop attempt guard', () => {
   test('invalidates older attempts when a newer stop starts', () => {

@@ -1,4 +1,4 @@
-use nomifun_common::{ConversationId, PreviewContentType};
+use nomifun_common::{ConversationId, PreviewContentType, PreviewSnapshotId};
 use serde::{Deserialize, Serialize};
 
 /// Preview capabilities carry 256 bits of OS entropy and are encoded as
@@ -18,6 +18,7 @@ pub fn is_preview_capability(value: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StartPreviewRequest {
     pub file_path: String,
     #[serde(default)]
@@ -25,6 +26,7 @@ pub struct StartPreviewRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StopPreviewRequest {
     pub capability: String,
 }
@@ -80,8 +82,9 @@ pub struct PreviewHistoryTargetDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct PreviewSnapshotInfoDto {
-    pub id: String,
+    pub snapshot_id: PreviewSnapshotId,
     pub label: String,
     pub created_at: i64,
     pub size: u64,
@@ -97,20 +100,23 @@ pub struct PreviewSnapshotInfoDto {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SaveSnapshotRequest {
     pub target: PreviewHistoryTargetDto,
     pub content: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListSnapshotsRequest {
     pub target: PreviewHistoryTargetDto,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GetSnapshotContentRequest {
     pub target: PreviewHistoryTargetDto,
-    pub snapshot_id: String,
+    pub snapshot_id: PreviewSnapshotId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -124,6 +130,7 @@ pub struct SnapshotContentResponse {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DetectStarOfficeRequest {
     #[serde(default)]
     pub preferred_url: Option<String>,
@@ -153,6 +160,7 @@ pub enum ConversionTarget {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DocumentConversionRequest {
     pub file_path: String,
     pub to: ConversionTarget,
@@ -404,7 +412,7 @@ mod tests {
 
     #[test]
     fn target_dto_full_fields() {
-        let conversation_id = "conv_0190f5fe-7c00-7a00-8abc-012345678901";
+        let conversation_id = "0190f5fe-7c00-7a00-8abc-012345678901";
         let raw = json!({
             "content_type": "markdown",
             "file_path": "/a.md",
@@ -466,7 +474,7 @@ mod tests {
 
     #[test]
     fn target_dto_roundtrip() {
-        let conversation_id = ConversationId::try_from("conv_0190f5fe-7c00-7a00-8abc-012345678904").unwrap();
+        let conversation_id = ConversationId::try_from("0190f5fe-7c00-7a00-8abc-012345678904").unwrap();
         let t = PreviewHistoryTargetDto {
             content_type: PreviewContentType::Excel,
             file_path: Some("/sheet.xlsx".into()),
@@ -507,7 +515,10 @@ mod tests {
     #[test]
     fn snapshot_info_serialize() {
         let info = PreviewSnapshotInfoDto {
-            id: "1700000000000-abc".into(),
+            snapshot_id: PreviewSnapshotId::try_from(
+                "0190f5fe-7c00-7a00-8000-000000000001",
+            )
+            .unwrap(),
             label: "2023-11-14 12:00".into(),
             created_at: 1700000000000,
             size: 1024,
@@ -516,7 +527,11 @@ mod tests {
             file_path: Some("/a/doc.md".into()),
         };
         let json = serde_json::to_value(&info).unwrap();
-        assert_eq!(json["id"], "1700000000000-abc");
+        assert_eq!(
+            json["snapshot_id"],
+            "0190f5fe-7c00-7a00-8000-000000000001"
+        );
+        assert!(json.get("id").is_none());
         assert_eq!(json["label"], "2023-11-14 12:00");
         assert_eq!(json["created_at"], 1700000000000_i64);
         assert_eq!(json["size"], 1024);
@@ -528,7 +543,10 @@ mod tests {
     #[test]
     fn snapshot_info_without_file_info() {
         let info = PreviewSnapshotInfoDto {
-            id: "snap1".into(),
+            snapshot_id: PreviewSnapshotId::try_from(
+                "0190f5fe-7c00-7a00-8000-000000000002",
+            )
+            .unwrap(),
             label: "Snapshot 1".into(),
             created_at: 1000,
             size: 256,
@@ -544,7 +562,10 @@ mod tests {
     #[test]
     fn snapshot_info_roundtrip() {
         let info = PreviewSnapshotInfoDto {
-            id: "snap2".into(),
+            snapshot_id: PreviewSnapshotId::try_from(
+                "0190f5fe-7c00-7a00-8000-000000000003",
+            )
+            .unwrap(),
             label: "Label".into(),
             created_at: 2000,
             size: 512,
@@ -555,6 +576,18 @@ mod tests {
         let json = serde_json::to_string(&info).unwrap();
         let parsed: PreviewSnapshotInfoDto = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, info);
+    }
+
+    #[test]
+    fn snapshot_info_rejects_removed_generic_id() {
+        let raw = json!({
+            "id": "0190f5fe-7c00-7a00-8000-000000000003",
+            "label": "Legacy",
+            "created_at": 2000,
+            "size": 512,
+            "content_type": "ppt"
+        });
+        assert!(serde_json::from_value::<PreviewSnapshotInfoDto>(raw).is_err());
     }
 
     // -- D. Snapshot requests & responses -------------------------------------
@@ -593,11 +626,14 @@ mod tests {
     fn get_snapshot_content_request_deserialize() {
         let raw = json!({
             "target": {"content_type": "code", "language": "rust"},
-            "snapshot_id": "snap_abc"
+            "snapshot_id": "0190f5fe-7c00-7a00-8000-000000000006"
         });
         let req: GetSnapshotContentRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.target.language.as_deref(), Some("rust"));
-        assert_eq!(req.snapshot_id, "snap_abc");
+        assert_eq!(
+            req.snapshot_id.as_str(),
+            "0190f5fe-7c00-7a00-8000-000000000006"
+        );
     }
 
     #[test]
@@ -610,7 +646,10 @@ mod tests {
     fn snapshot_content_response_serialize() {
         let resp = SnapshotContentResponse {
             snapshot: PreviewSnapshotInfoDto {
-                id: "s1".into(),
+                snapshot_id: PreviewSnapshotId::try_from(
+                    "0190f5fe-7c00-7a00-8000-000000000004",
+                )
+                .unwrap(),
                 label: "L".into(),
                 created_at: 1000,
                 size: 5,
@@ -621,7 +660,11 @@ mod tests {
             content: "hello".into(),
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["snapshot"]["id"], "s1");
+        assert_eq!(
+            json["snapshot"]["snapshot_id"],
+            "0190f5fe-7c00-7a00-8000-000000000004"
+        );
+        assert!(json["snapshot"].get("id").is_none());
         assert_eq!(json["content"], "hello");
     }
 
@@ -629,7 +672,10 @@ mod tests {
     fn snapshot_content_response_roundtrip() {
         let resp = SnapshotContentResponse {
             snapshot: PreviewSnapshotInfoDto {
-                id: "s2".into(),
+                snapshot_id: PreviewSnapshotId::try_from(
+                    "0190f5fe-7c00-7a00-8000-000000000005",
+                )
+                .unwrap(),
                 label: "Lab".into(),
                 created_at: 2000,
                 size: 10,

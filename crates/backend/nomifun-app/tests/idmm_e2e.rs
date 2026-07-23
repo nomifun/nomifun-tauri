@@ -10,12 +10,13 @@
 mod common;
 
 use axum::http::StatusCode;
+use nomifun_common::{IdmmInterventionId, ProviderId};
 use serde_json::json;
 use tower::ServiceExt;
-use nomifun_common::{IdmmInterventionId, ProviderId};
 
 use common::{
-    body_json, build_app, delete_with_token, get_request, get_with_token, json_with_token, setup_and_login,
+    body_json, build_app, delete_with_token, get_request, get_with_token, json_with_token,
+    setup_and_login,
 };
 
 async fn create_conversation(app: &mut axum::Router, token: &str, csrf: &str) -> String {
@@ -26,7 +27,10 @@ async fn create_conversation(app: &mut axum::Router, token: &str, csrf: &str) ->
         .await
         .unwrap();
     let json = body_json(resp).await;
-    json["data"]["id"].as_str().unwrap().to_owned()
+    json["data"]["conversation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned()
 }
 
 async fn create_terminal(app: &mut axum::Router, token: &str, csrf: &str) -> String {
@@ -47,7 +51,7 @@ async fn create_terminal(app: &mut axum::Router, token: &str, csrf: &str) -> Str
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
-    body_json(response).await["data"]["id"]
+    body_json(response).await["data"]["terminal_id"]
         .as_str()
         .unwrap()
         .to_owned()
@@ -59,7 +63,7 @@ async fn create_terminal(app: &mut axum::Router, token: &str, csrf: &str) -> Str
 async fn seed_provider(services: &nomifun_app::AppServices, provider_id: &str, model: &str) {
     nomifun_db::sqlx::query(
         "INSERT INTO providers \
-         (id, platform, name, base_url, api_key_encrypted, models, enabled, \
+         (provider_id, platform, name, base_url, api_key_encrypted, models, enabled, \
           capabilities, created_at, updated_at) \
          VALUES (?, 'openai', ?, 'https://example.invalid', 'encrypted', ?, 1, '[]', 1, 1)",
     )
@@ -647,7 +651,7 @@ async fn deleting_conversation_cascades_idmm_records() {
     // record for a conversation target, delete the conversation via the HTTP route
     // (which fires the OnConversationDelete cascade hook), then assert the record
     // is gone.
-    use nomifun_db::models::IdmmInterventionRow;
+    use nomifun_db::models::NewIdmmInterventionRow;
     use nomifun_db::{IIdmmInterventionRepository, SqliteIdmmInterventionRepository};
 
     let (mut app, services) = build_app().await;
@@ -659,14 +663,16 @@ async fn deleting_conversation_cascades_idmm_records() {
         .await
         .unwrap()
         .unwrap()
-        .id;
+        .user_id
+        .to_string();
 
     let records: SqliteIdmmInterventionRepository =
         SqliteIdmmInterventionRepository::new(services.database.pool().clone());
 
-    let row = IdmmInterventionRow {
-        id: IdmmInterventionId::new().into_string(),
-        user_id: owner_user_id.to_string(),
+    let intervention_id = IdmmInterventionId::new();
+    let row = NewIdmmInterventionRow {
+        intervention_id: intervention_id.as_str().to_owned(),
+        user_id: owner_user_id.clone(),
         target_kind: "conversation".into(),
         target_id: conv.clone(),
         watch: "decision".into(),
@@ -688,6 +694,15 @@ async fn deleting_conversation_cascades_idmm_records() {
         .await
         .unwrap();
     assert_eq!(before.len(), 1, "record must exist before delete");
+    assert_eq!(
+        before[0].intervention_id,
+        intervention_id.as_str(),
+        "repository must preserve the business UUIDv7"
+    );
+    assert!(
+        IdmmInterventionId::parse(before[0].intervention_id.clone()).is_ok(),
+        "stored intervention_id must remain a bare lowercase UUIDv7"
+    );
 
     // Delete the conversation — the cascade hook runs inside the delete path.
     let resp = app
@@ -714,7 +729,7 @@ async fn cross_session_activity_feed_round_trips() {
     // boundary, and bulk clear removes only the owner's rows. Insert records
     // for two users directly so repository deletion isolation remains covered
     // without granting the secondary user access to IDMM.
-    use nomifun_db::models::IdmmInterventionRow;
+    use nomifun_db::models::NewIdmmInterventionRow;
     use nomifun_db::{IIdmmInterventionRepository, SqliteIdmmInterventionRepository};
 
     let (mut app, services) = build_app().await;
@@ -727,14 +742,16 @@ async fn cross_session_activity_feed_round_trips() {
         .await
         .unwrap()
         .unwrap()
-        .id;
+        .user_id
+        .to_string();
     let other_user_id = services
         .user_repo
         .find_by_username("idmm-activity-other")
         .await
         .unwrap()
         .unwrap()
-        .id;
+        .user_id
+        .to_string();
     let owner_conversation_a = create_conversation(&mut app, &token, &csrf).await;
     let owner_conversation_b = create_conversation(&mut app, &token, &csrf).await;
     let owner_terminal = create_terminal(&mut app, &token, &csrf).await;
@@ -743,34 +760,39 @@ async fn cross_session_activity_feed_round_trips() {
     let records: SqliteIdmmInterventionRepository =
         SqliteIdmmInterventionRepository::new(services.database.pool().clone());
 
-    let activity_a = IdmmInterventionId::new().into_string();
-    let activity_b = IdmmInterventionId::new().into_string();
-    let activity_c = IdmmInterventionId::new().into_string();
-    let other_activity = IdmmInterventionId::new().into_string();
-
-    let make_row = |user_id: &str, id: &str, target_kind: &str, target_id: &str, at: i64| IdmmInterventionRow {
-        id: id.into(),
-        user_id: user_id.into(),
-        target_kind: target_kind.into(),
-        target_id: target_id.into(),
-        watch: "decision".into(),
-        at,
-        signal: "decision".into(),
-        tier_used: "rule".into(),
-        category: Some("option".into()),
-        action: "answer_choice".into(),
-        detail: Some("option 2".into()),
-        reason: Some("rule-tier auto-pick".into()),
-        confidence: None,
-        bypass_model: None,
-        outcome: "applied".into(),
-    };
+    let make_row =
+        |intervention_id: &IdmmInterventionId,
+         user_id: &str,
+         target_kind: &str,
+         target_id: &str,
+         at: i64| NewIdmmInterventionRow {
+            intervention_id: intervention_id.as_str().to_owned(),
+            user_id: user_id.into(),
+            target_kind: target_kind.into(),
+            target_id: target_id.into(),
+            watch: "decision".into(),
+            at,
+            signal: "decision".into(),
+            tier_used: "rule".into(),
+            category: Some("option".into()),
+            action: "answer_choice".into(),
+            detail: Some("option 2".into()),
+            reason: Some("rule-tier auto-pick".into()),
+            confidence: None,
+            bypass_model: None,
+            outcome: "applied".into(),
+        };
 
     // Two distinct targets, at interleaved → most-recent-first must mix them.
+    let activity_a = IdmmInterventionId::new();
+    let activity_b = IdmmInterventionId::new();
+    let activity_c = IdmmInterventionId::new();
+    let other_activity = IdmmInterventionId::new();
+
     records
         .insert(&make_row(
-            &owner_user_id,
             &activity_a,
+            &owner_user_id,
             "conversation",
             &owner_conversation_a,
             10,
@@ -779,8 +801,8 @@ async fn cross_session_activity_feed_round_trips() {
         .unwrap();
     records
         .insert(&make_row(
-            &owner_user_id,
             &activity_b,
+            &owner_user_id,
             "terminal",
             &owner_terminal,
             30,
@@ -789,8 +811,8 @@ async fn cross_session_activity_feed_round_trips() {
         .unwrap();
     records
         .insert(&make_row(
-            &owner_user_id,
             &activity_c,
+            &owner_user_id,
             "conversation",
             &owner_conversation_b,
             20,
@@ -799,8 +821,8 @@ async fn cross_session_activity_feed_round_trips() {
         .unwrap();
     records
         .insert(&make_row(
-            &other_user_id,
             &other_activity,
+            &other_user_id,
             "conversation",
             &other_conversation,
             40,
@@ -817,8 +839,38 @@ async fn cross_session_activity_feed_round_trips() {
     assert_eq!(resp.status(), StatusCode::OK);
     let j = body_json(resp).await;
     let items = j["data"].as_array().expect("activity feed is an array");
-    let ids: Vec<&str> = items.iter().map(|r| r["id"].as_str().unwrap()).collect();
-    assert_eq!(ids, vec![activity_b.as_str(), activity_c.as_str(), activity_a.as_str()]);
+    let intervention_ids: Vec<IdmmInterventionId> = items
+        .iter()
+        .map(|record| {
+            assert!(
+                record.get("id").is_none(),
+                "legacy generic id must not be emitted: {record:?}"
+            );
+            assert!(
+                record.get("intervention_row_id").is_none(),
+                "technical row id must not cross the HTTP boundary: {record:?}"
+            );
+            let value = record
+                .get("intervention_id")
+                .expect("intervention_id must be emitted");
+            assert!(
+                value.is_string(),
+                "intervention_id must not be an integer: {record:?}"
+            );
+            let value = value.as_str().unwrap();
+            assert!(
+                !value.bytes().all(|byte| byte.is_ascii_digit()),
+                "numeric-string intervention_id must not be emitted: {record:?}"
+            );
+            assert!(
+                !value.starts_with("idmm_"),
+                "prefixed intervention_id must not be emitted: {record:?}"
+            );
+            IdmmInterventionId::parse(value.to_owned())
+                .expect("intervention_id must be a bare lowercase UUIDv7")
+        })
+        .collect();
+    assert_eq!(intervention_ids, vec![activity_b, activity_c, activity_a]);
     // Spans both targets.
     assert_eq!(items[0]["target_kind"], "terminal");
     assert_eq!(items[1]["target_kind"], "conversation");
@@ -858,7 +910,11 @@ async fn cross_session_activity_feed_round_trips() {
     // user, even though that user cannot access IDMM over HTTP.
     let other_rows = records.list_recent(&other_user_id, 100).await.unwrap();
     assert_eq!(other_rows.len(), 1);
-    assert_eq!(other_rows[0].id, other_activity);
+    assert_eq!(
+        other_rows[0].intervention_id,
+        other_activity.as_str(),
+        "repository isolation must be checked with the business UUIDv7, not the technical row id"
+    );
 
     // The owner-only boundary remains enforced after the owner's mutation.
     let resp = app

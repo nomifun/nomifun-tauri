@@ -35,7 +35,9 @@ impl WebhookSender for RecordingSender {
 
 fn requirement(tag: &str) -> RequirementRow {
     RequirementRow {
-        id: nomifun_common::RequirementId::new().into_string(),
+        id: 17,
+        requirement_id: "0190f5fe-7c00-7a00-8000-000000000017".into(),
+        display_no: 17,
         title: "Build the thing".into(),
         content: "Implement feature X".into(),
         tag: tag.into(),
@@ -76,10 +78,10 @@ async fn ctx() -> Ctx {
     }
 }
 
-async fn add_webhook(ctx: &Ctx, enabled: bool) -> nomifun_common::WebhookId {
+async fn add_webhook(ctx: &Ctx, enabled: bool) -> String {
     ctx.webhooks
         .insert(&WebhookRow {
-            id: nomifun_common::WebhookId::new(),
+            webhook_id: nomifun_api_types::WebhookId::new().into_string(),
             name: "bot".into(),
             platform: "lark".into(),
             url: "https://example.com/hook".into(),
@@ -91,9 +93,10 @@ async fn add_webhook(ctx: &Ctx, enabled: bool) -> nomifun_common::WebhookId {
         })
         .await
         .unwrap()
+        .webhook_id
 }
 
-async fn bind_tag(ctx: &Ctx, tag: &str, webhook_id: Option<nomifun_common::WebhookId>) {
+async fn bind_tag(ctx: &Ctx, tag: &str, webhook_id: Option<String>) {
     ctx.tags
         .upsert(&TagSettingRow {
             tag: tag.into(),

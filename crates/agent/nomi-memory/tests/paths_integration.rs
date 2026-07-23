@@ -13,8 +13,8 @@ use serial_test::serial;
 
 #[test]
 #[serial(env)]
-fn tc_2_1_default_base_dir_uses_platform_config() {
-    // Ensure env override is NOT set
+fn tc_2_1_default_base_dir_uses_platform_data_root() {
+    // Ensure hosted data-dir override is NOT set.
     let saved = std::env::var(env_key()).ok();
     // SAFETY: #[serial(env)] ensures no concurrent env mutation.
     unsafe { std::env::remove_var(env_key()) };
@@ -35,18 +35,18 @@ fn tc_2_1_default_base_dir_uses_platform_config() {
     restore_env(saved);
 }
 
-// -- TC-2.2: Environment variable overrides base directory --------------------
+// -- TC-2.2: Host data directory selects the memory dataset root --------------
 
 #[cfg(unix)]
 #[test]
 #[serial(env)]
-fn tc_2_2_env_var_overrides_base_dir() {
+fn tc_2_2_host_data_dir_selects_base_dir() {
     let saved = std::env::var(env_key()).ok();
     // SAFETY: #[serial(env)] ensures no concurrent env mutation.
-    unsafe { std::env::set_var(env_key(), "/custom/memory/path") };
+    unsafe { std::env::set_var(env_key(), "/custom/nomifun-data") };
 
     let base = paths::memory_base_dir();
-    assert_eq!(base, Some(PathBuf::from("/custom/memory/path")));
+    assert_eq!(base, Some(PathBuf::from("/custom/nomifun-data")));
 
     restore_env(saved);
 }
@@ -54,13 +54,13 @@ fn tc_2_2_env_var_overrides_base_dir() {
 #[cfg(windows)]
 #[test]
 #[serial(env)]
-fn tc_2_2_env_var_overrides_base_dir() {
+fn tc_2_2_host_data_dir_selects_base_dir() {
     let saved = std::env::var(env_key()).ok();
     // SAFETY: #[serial(env)] ensures no concurrent env mutation.
-    unsafe { std::env::set_var(env_key(), "C:\\custom\\memory\\path") };
+    unsafe { std::env::set_var(env_key(), "C:\\custom\\nomifun-data") };
 
     let base = paths::memory_base_dir();
-    assert_eq!(base, Some(PathBuf::from("C:\\custom\\memory\\path")));
+    assert_eq!(base, Some(PathBuf::from("C:\\custom\\nomifun-data")));
 
     restore_env(saved);
 }
@@ -311,7 +311,7 @@ fn entrypoint_name_constant_is_memory_md() {
 // -- Helpers ------------------------------------------------------------------
 
 fn env_key() -> &'static str {
-    "NOMI_MEMORY_DIR"
+    "NOMIFUN_DATA_DIR"
 }
 
 fn restore_env(saved: Option<String>) {

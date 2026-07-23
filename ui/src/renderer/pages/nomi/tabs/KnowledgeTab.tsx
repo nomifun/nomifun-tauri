@@ -40,7 +40,7 @@ const KnowledgeTab: React.FC<Props> = ({ companion }) => {
           <div className='text-12px text-t-tertiary mt-2px'>{t('nomi.settings.knowledgeHint', { companionName })}</div>
         </div>
         <div className='flex-1 min-w-0'>
-          <KnowledgeControl target={{ kind: 'companion', id: profile.id }} />
+          <KnowledgeControl target={{ kind: 'companion', id: profile.companion_id }} />
         </div>
       </div>
     </div>

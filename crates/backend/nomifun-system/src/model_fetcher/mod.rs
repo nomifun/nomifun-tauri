@@ -235,7 +235,7 @@ mod tests {
         let encrypted = encrypt_string(api_key, &TEST_KEY).unwrap();
         let row = repo
             .create(CreateProviderParams {
-                id: None,
+                provider_id: None,
                 platform,
                 name: "Test",
                 base_url,
@@ -243,7 +243,6 @@ mod tests {
                 models: "[]",
                 enabled: true,
                 capabilities: "[]",
-                context_limit: None,
                 model_context_limits: None,
                 model_protocols: None,
                 model_descriptions: None,
@@ -255,7 +254,7 @@ mod tests {
             })
             .await
             .unwrap();
-        row.id
+        row.provider_id
     }
 
     #[test]
@@ -331,11 +330,17 @@ mod tests {
         let resp = svc.fetch_models(&id, &req).await.unwrap();
         assert!(
             resp.models
-                .contains(&nomifun_api_types::ModelInfo::Id("MiniMax-M3".into()))
+                .contains(&nomifun_api_types::ModelInfo {
+                    id: "MiniMax-M3".into(),
+                    name: None,
+                })
         );
         assert!(
             resp.models
-                .contains(&nomifun_api_types::ModelInfo::Id("MiniMax-Text-01".into()))
+                .contains(&nomifun_api_types::ModelInfo {
+                    id: "MiniMax-Text-01".into(),
+                    name: None,
+                })
         );
     }
 
@@ -404,11 +409,17 @@ mod tests {
         let resp = svc.fetch_models_anonymous(&req).await.unwrap();
         assert!(
             resp.models
-                .contains(&nomifun_api_types::ModelInfo::Id("MiniMax-M3".into()))
+                .contains(&nomifun_api_types::ModelInfo {
+                    id: "MiniMax-M3".into(),
+                    name: None,
+                })
         );
         assert!(
             resp.models
-                .contains(&nomifun_api_types::ModelInfo::Id("MiniMax-Text-01".into()))
+                .contains(&nomifun_api_types::ModelInfo {
+                    id: "MiniMax-Text-01".into(),
+                    name: None,
+                })
         );
         assert!(resp.fixed_base_url.is_none());
     }

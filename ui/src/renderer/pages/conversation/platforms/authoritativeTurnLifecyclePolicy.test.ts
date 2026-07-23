@@ -7,8 +7,8 @@ import {
   shouldAcceptAuthoritativeTurnStart,
 } from './authoritativeTurnLifecyclePolicy';
 
-const oldTurnId = parseMessageId('msg_0190f5fe-7c00-7a00-8000-000000000011');
-const newTurnId = parseMessageId('msg_0190f5fe-7c00-7a00-8000-000000000012');
+const oldTurnId = parseMessageId('0190f5fe-7c00-7a00-8000-000000000011');
+const newTurnId = parseMessageId('0190f5fe-7c00-7a00-8000-000000000012');
 
 describe('authoritative turn lifecycle policy', () => {
   test('stop without an observed root rejects a late unannounced start', () => {

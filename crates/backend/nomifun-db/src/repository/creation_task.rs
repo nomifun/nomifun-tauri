@@ -11,8 +11,11 @@ pub trait ICreationTaskRepository: Send + Sync {
     /// Insert a task (typically `status = "queued"`).
     async fn create_task(&self, params: CreateCreationTaskParams<'_>) -> Result<CreationTaskRow, DbError>;
 
-    /// One task by id, or `None`.
-    async fn get_task(&self, id: &str) -> Result<Option<CreationTaskRow>, DbError>;
+    /// One task by stable business id, or `None`.
+    async fn get_task(
+        &self,
+        creation_task_id: &str,
+    ) -> Result<Option<CreationTaskRow>, DbError>;
 
     /// Filtered listing (optional canvas / status), newest-submitted first,
     /// capped by `limit`.
@@ -22,8 +25,12 @@ pub trait ICreationTaskRepository: Send + Sync {
     /// the paginated API listing, this intentionally has no 500-row cap.
     async fn list_all_tasks(&self) -> Result<Vec<CreationTaskRow>, DbError>;
 
-    /// Partial state-machine update. `DbError::NotFound` when the id is unknown.
-    async fn update_task(&self, id: &str, params: UpdateCreationTaskParams<'_>) -> Result<CreationTaskRow, DbError>;
+    /// Partial state-machine update. `DbError::NotFound` when the business id is unknown.
+    async fn update_task(
+        &self,
+        creation_task_id: &str,
+        params: UpdateCreationTaskParams<'_>,
+    ) -> Result<CreationTaskRow, DbError>;
 
     /// Conditional terminal-state write: apply `params` ONLY if the task is
     /// still live (`status IN ('queued','running')`). Returns `Ok(true)` when
@@ -32,23 +39,31 @@ pub trait ICreationTaskRepository: Send + Sync {
     /// overwrites a terminal status — the worker's finalize routes through it so
     /// a `cancel` that lands mid-finalize is not silently flipped to
     /// `succeeded`/`failed` (compare-and-set on `status`, not the token).
-    async fn update_task_if_live(&self, id: &str, params: UpdateCreationTaskParams<'_>) -> Result<bool, DbError>;
+    async fn update_task_if_live(
+        &self,
+        creation_task_id: &str,
+        params: UpdateCreationTaskParams<'_>,
+    ) -> Result<bool, DbError>;
 
     /// Patch only the remote provider handle while the task is live. This is a
     /// single-statement CAS and must never rewrite status from a stale row
     /// snapshot when cancel races async submission.
-    async fn set_remote_task_id_if_live(&self, id: &str, remote_task_id: &str) -> Result<bool, DbError>;
+    async fn set_remote_task_id_if_live(
+        &self,
+        creation_task_id: &str,
+        remote_task_id: &str,
+    ) -> Result<bool, DbError>;
 
     /// Every task currently in a live (`queued`/`running`) state — the boot
     /// reconciliation input.
     async fn list_live_tasks(&self) -> Result<Vec<CreationTaskRow>, DbError>;
 }
 
-/// Params for [`ICreationTaskRepository::create_task`]. `id` / `submitted_at`
-/// are caller-supplied so the service controls minting + clock.
+/// Params for [`ICreationTaskRepository::create_task`]. SQLite allocates the
+/// technical `id`; the caller supplies the stable UUIDv7 business id and clock.
 #[derive(Debug)]
 pub struct CreateCreationTaskParams<'a> {
-    pub id: &'a str,
+    pub creation_task_id: &'a str,
     pub canvas_id: Option<&'a str>,
     pub node_id: Option<&'a str>,
     pub provider_id: &'a str,

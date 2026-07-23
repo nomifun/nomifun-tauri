@@ -1,7 +1,6 @@
 //! Gamification helpers shared by status reporting and the learner.
-//! (The legacy in-crate chat loop was replaced by companion threads — real
-//! `type='nomi'` conversations driven by the full agent engine; see
-//! `companion.rs`.)
+//! Companion chats use real `type='nomi'` threads driven by the full agent
+//! engine; see `companion.rs`.
 
 /// Level curve: Lv = floor(sqrt(xp/100)) + 1.
 pub fn level_for_xp(xp: i64) -> i64 {

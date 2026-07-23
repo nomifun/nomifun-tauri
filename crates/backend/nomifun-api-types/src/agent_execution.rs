@@ -15,12 +15,39 @@ use serde::{Deserialize, Serialize};
 
 use crate::webhook::double_option;
 
+pub(crate) fn deserialize_uuidv7_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+    nomifun_common::validate_uuidv7(&value)
+        .map(|_| value)
+        .map_err(serde::de::Error::custom)
+}
+
+pub(crate) fn deserialize_optional_uuidv7_id<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    value
+        .map(|value| {
+            nomifun_common::validate_uuidv7(&value)
+                .map(|_| value)
+                .map_err(serde::de::Error::custom)
+        })
+        .transpose()
+}
+
 /// A provider/model pair that may execute a participant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionModelRef {
     #[serde(deserialize_with = "crate::serde_util::deserialize_provider_id")]
     pub provider_id: String,
+    #[serde(deserialize_with = "crate::serde_util::deserialize_model_name")]
     pub model: String,
 }
 
@@ -130,13 +157,18 @@ impl ParticipantConstraints {
 
 /// Immutable, execution-scoped snapshot of an Agent configuration. It is not a
 /// reusable team member and exposes no update endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ExecutionParticipant {
-    #[serde(deserialize_with = "crate::serde_util::deserialize_execution_participant_id")]
-    pub id: String,
+    #[serde(deserialize_with = "deserialize_uuidv7_id")]
+    pub participant_id: String,
     #[serde(deserialize_with = "crate::serde_util::deserialize_execution_id")]
     pub execution_id: String,
+    #[serde(deserialize_with = "crate::serde_util::deserialize_agent_id")]
     pub source_agent_id: String,
+    #[serde(
+        default,
+        deserialize_with = "crate::serde_util::deserialize_optional_preset_id"
+    )]
     pub preset_id: Option<String>,
     pub preset_revision: Option<i64>,
     pub preset_snapshot: Option<crate::ResolvedPresetSnapshot>,
@@ -145,6 +177,7 @@ pub struct ExecutionParticipant {
         deserialize_with = "crate::serde_util::deserialize_optional_provider_id"
     )]
     pub provider_id: Option<String>,
+    #[serde(default, deserialize_with = "crate::serde_util::deserialize_optional_model_name")]
     pub model: Option<String>,
     pub role: Option<String>,
     pub capability: Option<ParticipantCapability>,
@@ -161,12 +194,88 @@ pub struct ExecutionParticipant {
     pub created_at: i64,
 }
 
+impl<'de> Deserialize<'de> for ExecutionParticipant {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            #[serde(deserialize_with = "deserialize_uuidv7_id")]
+            participant_id: String,
+            #[serde(deserialize_with = "crate::serde_util::deserialize_execution_id")]
+            execution_id: String,
+            #[serde(deserialize_with = "crate::serde_util::deserialize_agent_id")]
+            source_agent_id: String,
+            #[serde(
+                default,
+                deserialize_with = "crate::serde_util::deserialize_optional_preset_id"
+            )]
+            preset_id: Option<String>,
+            preset_revision: Option<i64>,
+            preset_snapshot: Option<crate::ResolvedPresetSnapshot>,
+            #[serde(
+                default,
+                deserialize_with = "crate::serde_util::deserialize_optional_provider_id"
+            )]
+            provider_id: Option<String>,
+            #[serde(
+                default,
+                deserialize_with = "crate::serde_util::deserialize_optional_model_name"
+            )]
+            model: Option<String>,
+            role: Option<String>,
+            capability: Option<ParticipantCapability>,
+            constraints: Option<ParticipantConstraints>,
+            description: Option<String>,
+            system_prompt: Option<String>,
+            #[serde(default)]
+            enabled_skills: Vec<String>,
+            #[serde(default)]
+            disabled_builtin_skills: Vec<String>,
+            sort_order: i64,
+            introduced_in_revision: i64,
+            retired_in_revision: Option<i64>,
+            created_at: i64,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        crate::serde_util::validate_optional_provider_model_pair(
+            wire.provider_id.as_deref(),
+            wire.model.as_deref(),
+        )
+        .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            participant_id: wire.participant_id,
+            execution_id: wire.execution_id,
+            source_agent_id: wire.source_agent_id,
+            preset_id: wire.preset_id,
+            preset_revision: wire.preset_revision,
+            preset_snapshot: wire.preset_snapshot,
+            provider_id: wire.provider_id,
+            model: wire.model,
+            role: wire.role,
+            capability: wire.capability,
+            constraints: wire.constraints,
+            description: wire.description,
+            system_prompt: wire.system_prompt,
+            enabled_skills: wire.enabled_skills,
+            disabled_builtin_skills: wire.disabled_builtin_skills,
+            sort_order: wire.sort_order,
+            introduced_in_revision: wire.introduced_in_revision,
+            retired_in_revision: wire.retired_in_revision,
+            created_at: wire.created_at,
+        })
+    }
+}
+
 /// Persistent execution aggregate shown in the conversation's collaboration
 /// panel. `version` is the optimistic-concurrency token for every mutation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentExecution {
     #[serde(deserialize_with = "crate::serde_util::deserialize_execution_id")]
-    pub id: String,
+    pub execution_id: String,
     pub goal: String,
     #[serde(
         default,
@@ -234,8 +343,8 @@ pub enum StepControlPolicy {
 /// is not represented by a separate Assignment object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionStep {
-    #[serde(deserialize_with = "crate::serde_util::deserialize_execution_step_id")]
-    pub id: String,
+    #[serde(deserialize_with = "deserialize_uuidv7_id")]
+    pub step_id: String,
     #[serde(deserialize_with = "crate::serde_util::deserialize_execution_id")]
     pub execution_id: String,
     pub title: String,
@@ -251,10 +360,7 @@ pub struct ExecutionStep {
     pub fanout_group: Option<String>,
     pub control_policy: Option<StepControlPolicy>,
     pub failure_policy: StepFailurePolicy,
-    #[serde(
-        default,
-        deserialize_with = "crate::serde_util::deserialize_optional_execution_participant_id"
-    )]
+    #[serde(default, deserialize_with = "deserialize_optional_uuidv7_id")]
     pub assigned_participant_id: Option<String>,
     pub assignment_source: Option<ParticipantAssignmentSource>,
     pub assignment_score: Option<f64>,
@@ -287,9 +393,9 @@ pub struct ExecutionStepProfile {
 pub struct ExecutionStepDependency {
     #[serde(deserialize_with = "crate::serde_util::deserialize_execution_id")]
     pub execution_id: String,
-    #[serde(deserialize_with = "crate::serde_util::deserialize_execution_step_id")]
+    #[serde(deserialize_with = "deserialize_uuidv7_id")]
     pub blocker_step_id: String,
-    #[serde(deserialize_with = "crate::serde_util::deserialize_execution_step_id")]
+    #[serde(deserialize_with = "deserialize_uuidv7_id")]
     pub blocked_step_id: String,
     pub introduced_in_revision: i64,
     pub superseded_in_revision: Option<i64>,
@@ -299,17 +405,14 @@ pub struct ExecutionStepDependency {
 /// the prior transcript, output, error, token count, or actual participant.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionAttempt {
-    #[serde(deserialize_with = "crate::serde_util::deserialize_execution_attempt_id")]
-    pub id: String,
+    #[serde(deserialize_with = "deserialize_uuidv7_id")]
+    pub attempt_id: String,
     #[serde(deserialize_with = "crate::serde_util::deserialize_execution_id")]
     pub execution_id: String,
-    #[serde(deserialize_with = "crate::serde_util::deserialize_execution_step_id")]
+    #[serde(deserialize_with = "deserialize_uuidv7_id")]
     pub step_id: String,
     pub attempt_no: i64,
-    #[serde(
-        default,
-        deserialize_with = "crate::serde_util::deserialize_optional_execution_participant_id"
-    )]
+    #[serde(default, deserialize_with = "deserialize_optional_uuidv7_id")]
     pub participant_id: Option<String>,
     #[serde(
         default,
@@ -345,21 +448,13 @@ pub struct AgentExecutionDetail {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentExecutionEvent {
-    #[serde(deserialize_with = "crate::serde_util::deserialize_execution_event_id")]
-    pub id: String,
     #[serde(deserialize_with = "crate::serde_util::deserialize_execution_id")]
     pub execution_id: String,
     pub sequence: i64,
     pub event_type: AgentExecutionEventKind,
-    #[serde(
-        default,
-        deserialize_with = "crate::serde_util::deserialize_optional_execution_step_id"
-    )]
+    #[serde(default, deserialize_with = "deserialize_optional_uuidv7_id")]
     pub step_id: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::serde_util::deserialize_optional_execution_attempt_id"
-    )]
+    #[serde(default, deserialize_with = "deserialize_optional_uuidv7_id")]
     pub attempt_id: Option<String>,
     pub actor_type: AgentExecutionActorType,
     pub actor_id: Option<String>,
@@ -368,10 +463,7 @@ pub struct AgentExecutionEvent {
         deserialize_with = "crate::serde_util::deserialize_optional_conversation_id"
     )]
     pub actor_conversation_id: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "crate::serde_util::deserialize_optional_execution_attempt_id"
-    )]
+    #[serde(default, deserialize_with = "deserialize_optional_uuidv7_id")]
     pub actor_attempt_id: Option<String>,
     #[serde(deserialize_with = "crate::serde_util::deserialize_user_id")]
     pub on_behalf_of_user_id: String,
@@ -489,7 +581,7 @@ fn default_decision_policy() -> DecisionPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReassignExecutionStepRequest {
-    #[serde(deserialize_with = "crate::serde_util::deserialize_execution_participant_id")]
+    #[serde(deserialize_with = "deserialize_uuidv7_id")]
     pub participant_id: String,
     #[serde(default)]
     pub locked: bool,
@@ -611,9 +703,10 @@ pub struct AgentExecutionEventsQuery {
 mod tests {
     use super::*;
 
-    const CONVERSATION_ID: &str = "conv_0190f5fe-7c00-7a00-8000-000000000001";
-    const PARTICIPANT_ID: &str = "execpart_0190f5fe-7c00-7a00-8000-000000000001";
-    const PROVIDER_ID: &str = "prov_0190f5fe-7c00-7a00-8000-000000000001";
+    const CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const PARTICIPANT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const PROVIDER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const EXECUTION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000002";
 
     #[test]
     fn execution_request_ids_are_strict_at_deserialization() {
@@ -627,7 +720,7 @@ mod tests {
         });
         assert!(serde_json::from_value::<CreateAgentExecutionRequest>(valid).is_ok());
 
-        for invalid in ["1", "conversation-1", "conv_0190f5fe-7c00-4a00-8000-000000000001"] {
+        for invalid in ["1", "conversation-1", "0190f5fe-7c00-4a00-8000-000000000001"] {
             let value = serde_json::json!({
                 "goal": "ship",
                 "model_pool": { "mode": "automatic" },
@@ -652,6 +745,130 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn execution_model_ref_rejects_noncanonical_provider_id_values() {
+        for provider_id in [
+            serde_json::json!(42),
+            serde_json::json!("openai"),
+            serde_json::json!("550e8400-e29b-41d4-a716-446655440000"),
+            serde_json::json!("0190F5FE-7C00-7A00-8000-000000000001"),
+            serde_json::json!("provider_0190f5fe-7c00-7a00-8000-000000000001"),
+        ] {
+            assert!(
+                serde_json::from_value::<ExecutionModelRef>(serde_json::json!({
+                    "provider_id": provider_id,
+                    "model": "model-a"
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn agent_execution_rejects_noncanonical_and_removed_generic_id() {
+        let valid = serde_json::json!({
+            "execution_id": EXECUTION_ID,
+            "goal": "ship",
+            "lead_conversation_id": CONVERSATION_ID,
+            "work_dir": null,
+            "delegation_policy": "automatic",
+            "plan_gate": "automatic",
+            "adaptation_policy": "fixed",
+            "decision_policy": "automatic",
+            "max_parallel": 1,
+            "status": "planning",
+            "summary": null,
+            "total_tokens": null,
+            "version": 1,
+            "plan_revision": 1,
+            "event_sequence": 0,
+            "created_at": 1,
+            "updated_at": 2
+        });
+        assert!(serde_json::from_value::<AgentExecution>(valid.clone()).is_ok());
+
+        for execution_id in [
+            serde_json::json!(42),
+            serde_json::json!("execution-1"),
+            serde_json::json!("550e8400-e29b-41d4-a716-446655440000"),
+            serde_json::json!("0190F5FE-7C00-7A00-8000-000000000002"),
+            serde_json::json!("execution_0190f5fe-7c00-7a00-8000-000000000002"),
+        ] {
+            let mut raw = valid.clone();
+            raw["execution_id"] = execution_id;
+            assert!(serde_json::from_value::<AgentExecution>(raw).is_err());
+        }
+
+        let mut legacy = valid;
+        legacy["id"] = legacy["execution_id"].take();
+        legacy.as_object_mut().unwrap().remove("execution_id");
+        assert!(serde_json::from_value::<AgentExecution>(legacy).is_err());
+    }
+
+    #[test]
+    fn execution_participant_rejects_noncanonical_ids_by_field() {
+        let valid = serde_json::json!({
+            "participant_id": PARTICIPANT_ID,
+            "execution_id": EXECUTION_ID,
+            "source_agent_id": "0190f5fe-7c00-7a00-8000-000000000003",
+            "preset_id": "0190f5fe-7c00-7a00-8000-000000000004",
+            "preset_revision": 1,
+            "preset_snapshot": null,
+            "provider_id": PROVIDER_ID,
+            "model": "model-a",
+            "role": null,
+            "capability": null,
+            "constraints": null,
+            "description": null,
+            "system_prompt": null,
+            "enabled_skills": [],
+            "disabled_builtin_skills": [],
+            "sort_order": 0,
+            "introduced_in_revision": 1,
+            "retired_in_revision": null,
+            "created_at": 1
+        });
+        assert!(serde_json::from_value::<ExecutionParticipant>(valid.clone()).is_ok());
+
+        for field in [
+            "participant_id",
+            "execution_id",
+            "source_agent_id",
+            "preset_id",
+            "provider_id",
+        ] {
+            let mut raw = valid.clone();
+            raw[field] = serde_json::json!("550e8400-e29b-41d4-a716-446655440000");
+            assert!(serde_json::from_value::<ExecutionParticipant>(raw).is_err());
+        }
+    }
+
+    #[test]
+    fn execution_participant_rejects_non_uuid_source_agent_id() {
+        let participant = serde_json::json!({
+            "participant_id": PARTICIPANT_ID,
+            "execution_id": EXECUTION_ID,
+            "source_agent_id": "nomi",
+            "preset_id": null,
+            "preset_revision": null,
+            "preset_snapshot": null,
+            "provider_id": null,
+            "model": null,
+            "role": null,
+            "capability": null,
+            "constraints": null,
+            "description": null,
+            "system_prompt": null,
+            "enabled_skills": [],
+            "disabled_builtin_skills": [],
+            "sort_order": 0,
+            "introduced_in_revision": 0,
+            "retired_in_revision": null,
+            "created_at": 1
+        });
+        assert!(serde_json::from_value::<ExecutionParticipant>(participant).is_err());
     }
 
     #[test]

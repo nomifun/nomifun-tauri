@@ -30,7 +30,6 @@ use tauri_plugin_deep_link::DeepLinkExt;
 
 mod memory_panel_window;
 mod companion_pointer;
-mod relocate;
 mod updater_install_context;
 
 /// Build the webview initialization script. Injects the loopback backend port
@@ -575,11 +574,11 @@ fn main() -> std::process::ExitCode {
     }
 
     // Env mutation + runtime init BEFORE Tauri builds its runtime/threads,
-    // mirroring the nomicore bin's ordering. The relocation (legacy temp dir →
-    // per-user app-data, one-shot) must run first of all: everything below —
-    // runtime cache, backend cli, embedded server — keys off the data dir it
-    // returns. On relocation failure it falls back to the legacy dir.
-    let data_dir = relocate::effective_data_dir(default_data_dir());
+    // mirroring the nomicore bin's ordering. v3 is a hard dataset cut, so the
+    // desktop must never copy or reopen the historical temp-rooted dataset
+    // before the shared dataset gate runs. The backend will quarantine any
+    // incompatible dataset already present at the current data root.
+    let data_dir = default_data_dir();
     nomifun_runtime::init(&data_dir);
     // SAFETY: no worker threads exist yet (Tauri's runtime is built by .run()).
     let merged_path = unsafe { nomifun_runtime::enhance_process_path() };

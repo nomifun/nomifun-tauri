@@ -69,18 +69,21 @@ pub struct PermissionDetailResponse {
 
 /// Request body for `POST /api/hub/install` and `POST /api/hub/update`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InstallExtensionRequest {
     pub name: String,
 }
 
 /// Request body for `POST /api/extensions/enable`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnableExtensionRequest {
     pub name: String,
 }
 
 /// Request body for `POST /api/extensions/disable`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DisableExtensionRequest {
     pub name: String,
     #[serde(default)]
@@ -89,18 +92,21 @@ pub struct DisableExtensionRequest {
 
 /// Request body for `POST /api/extensions/permissions`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GetPermissionsRequest {
     pub name: String,
 }
 
 /// Request body for `POST /api/extensions/risk-level`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GetRiskLevelRequest {
     pub name: String,
 }
 
 /// Request body for `POST /api/extensions/i18n`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GetI18nRequest {
     pub locale: String,
 }

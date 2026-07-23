@@ -18,7 +18,7 @@ export interface TurnDisclosureInputItem {
   processEndedAt?: number;
   processState?: TurnDisclosureProcessState;
   running?: boolean;
-  sourceMessageIds?: string[];
+  sourceMessageIds?: MessageId[];
 }
 
 export type TurnDisclosureOutputItem =
@@ -29,7 +29,7 @@ export type TurnDisclosureOutputItem =
       id: string;
       turnId: MessageId;
       processItemIds: string[];
-      sourceMessageIds: string[];
+      sourceMessageIds: MessageId[];
       startAt: number;
       endAt: number;
       state: TurnDisclosureProcessState;
@@ -48,7 +48,7 @@ export interface AssignTurnIdOptions {
   activeRequestMessageId?: MessageId;
 }
 
-const unique = (values: string[]): string[] => Array.from(new Set(values.filter(Boolean)));
+const unique = <T extends string>(values: T[]): T[] => Array.from(new Set(values.filter(Boolean)));
 
 const toProcessReceipt = (entry: TurnDisclosureInputItem): TurnDisclosureOutputItem => ({
   type: 'process_receipt',
@@ -94,14 +94,14 @@ export function assignTurnIdsFromUserRequests(
     // even when a delayed event is interleaved after a newer user request. A
     // user's message id is only a provisional request boundary: ACP backends
     // mint a distinct root turn id for the response. The first non-retired
-    // explicit id therefore becomes the fallback for later legacy/transient
-    // rows that omit turn_id. Known older ids must not move that boundary back.
+    // explicit id therefore becomes the fallback for later transient rows that
+    // omit turn_id. Known older ids must not move that boundary back.
     if (entry.turnId) {
       if (!authoritativeTurnId && !retiredTurnIds.has(entry.turnId)) {
         authoritativeTurnId = entry.turnId;
         currentTurnId = entry.turnId;
         // Correlate the provisional user/request boundary (and any early
-        // legacy rows) with the backend-owned response root. This keeps the
+        // transient rows) with the backend-owned response root. This keeps the
         // logical turn contiguous even though the durable user row and root
         // response deliberately have different message IDs.
         for (const index of currentRequestFallbackIndices) {
@@ -253,7 +253,7 @@ function buildSegmentOutput(
     id: `turn-disclosure-${turnId}`,
     turnId,
     processItemIds: processItems.map((entry) => entry.id),
-    sourceMessageIds: unique(processItems.flatMap((entry) => entry.sourceMessageIds ?? [entry.id])),
+    sourceMessageIds: unique(processItems.flatMap((entry) => entry.sourceMessageIds ?? [])),
     startAt: Math.min(...processItems.map(getProcessStartAt)),
     endAt: Math.max(...finalOrProcessItems.map(getProcessEndAt)),
     state,

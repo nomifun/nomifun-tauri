@@ -74,7 +74,7 @@ const PromptField: React.FC<PromptFieldProps> = ({ value, mode, selfId, onChange
           if (cancelled) return;
           setAssetCands(
             res.items.map((a) => ({
-              ref: mentionRefForAsset(a.kind, a.id),
+              ref: mentionRefForAsset(a.kind, a.asset_id),
               label: a.title,
               kind: a.kind,
               source: 'asset' as const,

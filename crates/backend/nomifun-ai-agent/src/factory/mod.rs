@@ -122,8 +122,8 @@ pub struct AgentFactoryDeps {
     pub agent_registry: Arc<AgentRegistry>,
     pub acp_agent_service: Arc<AcpSessionSyncService>,
     pub data_dir: PathBuf,
-    /// Root for auto-provisioned temp workspaces
-    /// (`{work_dir}/conversations/{label}-temp-{token}`). Defaults to the data
+    /// Root for auto-provisioned managed workspaces
+    /// (`{work_dir}/conversations/{uuidv7}`). Defaults to the data
     /// dir at composition; kept as its own field so the fallback in
     /// `FactoryContext::resolve` stays in sync with `ConversationService`,
     /// which provisions under `AppConfig.work_dir` — a `--work-dir` /
@@ -272,11 +272,6 @@ async fn build_agent(
 
     let ctx = FactoryContext::resolve(&deps, &options).await?;
     match options.agent_type {
-        AgentType::Gemini => Err(AppError::ConversationArchived(
-            "This conversation was created with the legacy Gemini runtime, which has been \
-             removed. Please start a new conversation with the Gemini ACP backend to continue."
-                .into(),
-        )),
         AgentType::Acp => acp::build(deps, options, ctx).await,
         AgentType::OpenclawGateway => openclaw::build(deps, options, ctx).await,
         AgentType::Nanobot => nanobot::build(deps, options, ctx).await,
@@ -289,7 +284,7 @@ async fn build_agent(
 mod tests {
     use super::*;
 
-    const TEST_OWNER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_OWNER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
 
     #[test]
     fn factory_deps_can_be_constructed() {
@@ -317,11 +312,11 @@ mod tests {
 
     #[test]
     fn runtime_owner_identity_is_first_class_and_canonical() {
-        assert!(validate_runtime_user_id("user_0190f5fe-7c00-7a00-8000-000000000001").is_ok());
+        assert!(validate_runtime_user_id("0190f5fe-7c00-7a00-8000-000000000001").is_ok());
         assert!(validate_runtime_user_id("").is_err());
         assert!(validate_runtime_user_id("   ").is_err());
-        assert!(validate_runtime_user_id(" user_0190f5fe-7c00-7a00-8000-000000000001").is_err());
-        assert!(validate_runtime_user_id("user_0190f5fe-7c00-7a00-8000-000000000001 ").is_err());
+        assert!(validate_runtime_user_id(" 0190f5fe-7c00-7a00-8000-000000000001").is_err());
+        assert!(validate_runtime_user_id("0190f5fe-7c00-7a00-8000-000000000001 ").is_err());
         assert!(validate_runtime_user_id("user-1").is_err());
     }
 }

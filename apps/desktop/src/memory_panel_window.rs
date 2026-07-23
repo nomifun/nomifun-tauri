@@ -214,8 +214,8 @@ mod tests {
     #[test]
     fn stale_request_cannot_hide_new_owner() {
         let state = MemoryPanelWindowState::default();
-        state.place("r1", "companion_0190f5fe-7c00-7a00-8abc-012345678901", PhysicalRect::new(10, 20, 340, 300)).unwrap();
-        state.place("r2", "companion_0190f5fe-7c00-7a00-8abc-012345678902", PhysicalRect::new(30, 40, 340, 300)).unwrap();
+        state.place("r1", "0190f5fe-7c00-7a00-8abc-012345678901", PhysicalRect::new(10, 20, 340, 300)).unwrap();
+        state.place("r2", "0190f5fe-7c00-7a00-8abc-012345678902", PhysicalRect::new(30, 40, 340, 300)).unwrap();
         assert!(!state.finish_hide("r1"));
         assert_eq!(state.snapshot().request_id.as_deref(), Some("r2"));
     }
@@ -230,9 +230,9 @@ mod tests {
     #[test]
     fn invalidates_owner_when_companion_is_disabled() {
         let state = MemoryPanelWindowState::default();
-        state.place("r1", "companion_0190f5fe-7c00-7a00-8abc-012345678901", PhysicalRect::new(10, 20, 340, 300)).unwrap();
+        state.place("r1", "0190f5fe-7c00-7a00-8abc-012345678901", PhysicalRect::new(10, 20, 340, 300)).unwrap();
         assert!(state.invalidate_owner_unless(&HashSet::from([
-            "companion_0190f5fe-7c00-7a00-8abc-012345678902".to_string(),
+            "0190f5fe-7c00-7a00-8abc-012345678902".to_string(),
         ])));
         assert!(state.snapshot().request_id.is_none());
     }
@@ -243,20 +243,20 @@ mod tests {
         let native_task_state = state.clone();
         assert!(native_task_state.is_empty());
 
-        state.place("r1", "companion_0190f5fe-7c00-7a00-8abc-012345678901", PhysicalRect::new(10, 20, 340, 300)).unwrap();
-        assert!(native_task_state.can_show("r1", "companion_0190f5fe-7c00-7a00-8abc-012345678901"));
+        state.place("r1", "0190f5fe-7c00-7a00-8abc-012345678901", PhysicalRect::new(10, 20, 340, 300)).unwrap();
+        assert!(native_task_state.can_show("r1", "0190f5fe-7c00-7a00-8abc-012345678901"));
         assert!(!native_task_state.is_empty());
 
         assert!(state.finish_hide("r1"));
         assert!(native_task_state.is_empty());
-        state.place("r2", "companion_0190f5fe-7c00-7a00-8abc-012345678902", PhysicalRect::new(30, 40, 340, 300)).unwrap();
+        state.place("r2", "0190f5fe-7c00-7a00-8abc-012345678902", PhysicalRect::new(30, 40, 340, 300)).unwrap();
         assert!(!native_task_state.is_empty());
-        assert!(!native_task_state.can_show("r1", "companion_0190f5fe-7c00-7a00-8abc-012345678901"));
-        assert!(native_task_state.can_show("r2", "companion_0190f5fe-7c00-7a00-8abc-012345678902"));
+        assert!(!native_task_state.can_show("r1", "0190f5fe-7c00-7a00-8abc-012345678901"));
+        assert!(native_task_state.can_show("r2", "0190f5fe-7c00-7a00-8abc-012345678902"));
 
         let mut stale_task_ran = false;
         assert!(!native_task_state
-            .run_if_current("r1", "companion_0190f5fe-7c00-7a00-8abc-012345678901", || {
+            .run_if_current("r1", "0190f5fe-7c00-7a00-8abc-012345678901", || {
                 stale_task_ran = true;
                 Ok(())
             })

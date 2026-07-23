@@ -67,7 +67,7 @@ async fn create_provider(
     let encrypted = encrypt_string(api_key, &TEST_KEY).unwrap();
     let row = repo
         .create(CreateProviderParams {
-            id: None,
+            provider_id: None,
             platform,
             name: "Test Provider",
             base_url,
@@ -75,7 +75,6 @@ async fn create_provider(
             models: "[]",
             enabled: true,
             capabilities: "[]",
-            context_limit: None,
             model_context_limits: None,
             model_protocols: None,
             model_descriptions: None,
@@ -87,7 +86,7 @@ async fn create_provider(
         })
         .await
         .unwrap();
-    row.id
+    row.provider_id
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {

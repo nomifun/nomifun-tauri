@@ -50,7 +50,7 @@ mod tests {
     fn metadata_with_yolo_id(yolo_id: Option<&str>) -> AgentMetadata {
         use nomifun_api_types::{AgentSource, AgentSourceInfo, BehaviorPolicy};
         AgentMetadata {
-            id: "test".into(),
+            agent_id: "0190f5fe-7c00-7a00-8000-000000000102".into(),
             icon: None,
             name: "Test".into(),
             name_i18n: None,
@@ -102,7 +102,7 @@ mod tests {
 
     /// Vendor-specific yolo rewrites are entirely data-driven by
     /// `metadata.yolo_id`. Rebuild fixtures with the seed values
-    /// `006_agent_metadata.sql` would hydrate, then assert both yolo
+    /// the v3 baseline would hydrate, then assert both yolo
     /// aliases hit the native mode id for each vendor.
     #[test]
     fn normalize_requested_mode_rewrites_yolo_for_builtin_vendors() {

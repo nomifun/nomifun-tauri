@@ -42,8 +42,8 @@ export interface CustomFigureMeta {
    *  supersedes `sizeTier` in `customDeskSpec` (the 总览 size slider writes it);
    *  absent ⇒ fall back to the tier height. Clamped to [SIZE_MIN, SIZE_MAX]. */
   sizePx?: number;
-  /** Library figure backing this companion (`figure_…`). When set, the image comes
-   *  from the shared figure library; absent for legacy per-companion figures. */
+  /** Library figure backing this companion (canonical lowercase bare UUIDv7).
+   *  When set, the image comes from the shared figure library. */
   figureId?: FigureId;
 }
 

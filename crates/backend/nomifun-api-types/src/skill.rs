@@ -47,6 +47,7 @@ pub struct SkillListItemResponse {
 
 /// Request body for `PUT /api/skills/{name}/tags`.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct SetSkillTagsRequest {
     #[serde(default)]
     pub audience_tags: Vec<String>,
@@ -71,6 +72,7 @@ pub struct BuiltinAutoSkillResponse {
 
 /// Request body for `POST /api/skills/info`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadSkillInfoRequest {
     pub skill_path: String,
 }
@@ -88,6 +90,7 @@ pub struct ReadSkillInfoResponse {
 
 /// Request body for `POST /api/skills/import` and `POST /api/skills/import-symlink`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImportSkillRequest {
     pub skill_path: String,
 }
@@ -102,6 +105,7 @@ pub struct ImportSkillResponse {
 
 /// Request body for `POST /api/skills/export-symlink`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExportSkillRequest {
     pub skill_path: String,
     pub target_dir: String,
@@ -109,6 +113,7 @@ pub struct ExportSkillRequest {
 
 /// Request body for `DELETE /api/skills/:name` (path param, but also usable as body).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteSkillRequest {
     pub skill_name: String,
 }
@@ -119,6 +124,7 @@ pub struct DeleteSkillRequest {
 
 /// Request body for `POST /api/skills/scan`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScanForSkillsRequest {
     pub folder_path: String,
 }
@@ -173,6 +179,7 @@ pub struct SkillPathsResponse {
 /// Request body for `POST /api/skills/preset-rule/read` and
 /// `POST /api/skills/preset-skill/read`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadPresetRuleRequest {
     #[serde(deserialize_with = "crate::serde_util::deserialize_preset_reference")]
     pub preset_id: String,
@@ -183,6 +190,7 @@ pub struct ReadPresetRuleRequest {
 /// Request body for `POST /api/skills/preset-rule/write` and
 /// `POST /api/skills/preset-skill/write`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WritePresetRuleRequest {
     #[serde(deserialize_with = "crate::serde_util::deserialize_preset_reference")]
     pub preset_id: String,
@@ -194,6 +202,7 @@ pub struct WritePresetRuleRequest {
 /// Request body for `POST /api/skills/builtin-rule` and
 /// `POST /api/skills/builtin-skill`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadBuiltinResourceRequest {
     pub file_name: String,
 }
@@ -203,6 +212,7 @@ pub struct ReadBuiltinResourceRequest {
 /// Callers pass the resolved skill snapshot (see
 /// `conversation.extra.skills`).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MaterializeSkillsRequest {
     pub conversation_id: ConversationId,
     #[serde(default)]
@@ -241,6 +251,7 @@ pub struct MaterializeSkillsResponse {
 
 /// Request body for `POST /api/skills/external-paths`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AddExternalPathRequest {
     pub name: String,
     pub path: String,
@@ -248,6 +259,7 @@ pub struct AddExternalPathRequest {
 
 /// Request body for `DELETE /api/skills/external-paths`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RemoveExternalPathRequest {
     pub path: String,
 }
@@ -258,6 +270,7 @@ pub struct RemoveExternalPathRequest {
 
 /// Request body for `POST /api/skills/market/rankings/sync`.
 #[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SkillMarketSyncRequest {
     /// Optional source allow-list. Empty means all supported sources.
     #[serde(default)]
@@ -387,7 +400,7 @@ mod tests {
 
     #[test]
     fn test_materialize_request_roundtrip() {
-        let conversation_id = "conv_0190f5fe-7c00-7a00-8abc-012345678901";
+        let conversation_id = "0190f5fe-7c00-7a00-8abc-012345678901";
         let raw = json!({
             "conversation_id": conversation_id,
             "skills": ["mermaid", "pdf"],
@@ -398,13 +411,12 @@ mod tests {
     }
 
     #[test]
-    fn test_materialize_request_ignores_unknown_legacy_field() {
+    fn test_materialize_request_rejects_unknown_retired_field() {
         let raw = json!({
-            "conversation_id": "conv_0190f5fe-7c00-7a00-8abc-012345678901",
+            "conversation_id": "0190f5fe-7c00-7a00-8abc-012345678901",
             "enabled_skills": ["pdf"],
         });
-        let req: MaterializeSkillsRequest = serde_json::from_value(raw).unwrap();
-        assert!(req.skills.is_empty());
+        assert!(serde_json::from_value::<MaterializeSkillsRequest>(raw).is_err());
     }
 
     #[test]
@@ -418,7 +430,7 @@ mod tests {
 
     #[test]
     fn test_materialize_request_default_enabled() {
-        let raw = json!({"conversation_id": "conv_0190f5fe-7c00-7a00-8abc-012345678901"});
+        let raw = json!({"conversation_id": "0190f5fe-7c00-7a00-8abc-012345678901"});
         let req: MaterializeSkillsRequest = serde_json::from_value(raw).unwrap();
         assert!(req.skills.is_empty());
     }
@@ -634,17 +646,19 @@ mod tests {
 
     // -- Preset rules --
 
+    const PRESET_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+
     #[test]
     fn test_read_preset_rule_request_with_locale() {
-        let raw = json!({"preset_id": "abc123", "locale": "zh-CN"});
+        let raw = json!({"preset_id": PRESET_ID, "locale": "zh-CN"});
         let req: ReadPresetRuleRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.preset_id, "abc123");
+        assert_eq!(req.preset_id, PRESET_ID);
         assert_eq!(req.locale.as_deref(), Some("zh-CN"));
     }
 
     #[test]
     fn test_read_preset_rule_request_without_locale() {
-        let raw = json!({"preset_id": "abc123"});
+        let raw = json!({"preset_id": PRESET_ID});
         let req: ReadPresetRuleRequest = serde_json::from_value(raw).unwrap();
         assert!(req.locale.is_none());
     }
@@ -652,20 +666,32 @@ mod tests {
     #[test]
     fn test_write_preset_rule_request() {
         let raw = json!({
-            "preset_id": "abc123",
+            "preset_id": PRESET_ID,
             "content": "# Rules\nBe helpful.",
             "locale": "en-US"
         });
         let req: WritePresetRuleRequest = serde_json::from_value(raw).unwrap();
-        assert_eq!(req.preset_id, "abc123");
+        assert_eq!(req.preset_id, PRESET_ID);
         assert_eq!(req.content, "# Rules\nBe helpful.");
         assert_eq!(req.locale.as_deref(), Some("en-US"));
     }
 
     #[test]
-    fn preset_rule_request_rejects_malformed_entity_namespace_value() {
-        let raw = json!({ "preset_id": "preset_not-a-uuid" });
+    fn preset_rule_request_rejects_prefixed_uuidv7_entity_value() {
+        let raw = json!({
+            "preset_id": "preset_0190f5fe-7c00-7a00-8abc-012345678901"
+        });
         assert!(serde_json::from_value::<ReadPresetRuleRequest>(raw).is_err());
+    }
+
+    #[test]
+    fn preset_rule_request_rejects_catalog_natural_key() {
+        assert!(
+            serde_json::from_value::<ReadPresetRuleRequest>(json!({
+                "preset_id": "builtin-office"
+            }))
+            .is_err()
+        );
     }
 
     #[test]

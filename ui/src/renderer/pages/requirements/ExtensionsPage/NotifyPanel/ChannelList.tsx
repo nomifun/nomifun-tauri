@@ -49,9 +49,9 @@ const ChannelList: React.FC = () => {
     void loadChannels();
   }, [loadChannels]);
 
-  const handleTest = async (id: WebhookId) => {
+  const handleTest = async (webhook_id: WebhookId) => {
     try {
-      await ipcBridge.webhook.test.invoke({ id });
+      await ipcBridge.webhook.test.invoke({ webhook_id });
       message.success(t('webhook.messages.testOk'));
     } catch (e) {
       if (isHandledAuthExpiredHttpError(e)) return;
@@ -59,9 +59,9 @@ const ChannelList: React.FC = () => {
     }
   };
 
-  const handleDelete = async (id: WebhookId) => {
+  const handleDelete = async (webhook_id: WebhookId) => {
     try {
-      await ipcBridge.webhook.remove.invoke({ id });
+      await ipcBridge.webhook.remove.invoke({ webhook_id });
       message.success(t('webhook.messages.deleteOk'));
       void loadChannels();
     } catch (e) {
@@ -141,10 +141,10 @@ const ChannelList: React.FC = () => {
           <Button size='mini' onClick={() => handleEdit(row)}>
             {t('webhook.actions.edit')}
           </Button>
-          <Button size='mini' onClick={() => void handleTest(row.id)}>
+          <Button size='mini' onClick={() => void handleTest(row.webhook_id)}>
             {t('webhook.actions.test')}
           </Button>
-          <Popconfirm title={t('webhook.actions.deleteConfirm')} onOk={() => void handleDelete(row.id)}>
+          <Popconfirm title={t('webhook.actions.deleteConfirm')} onOk={() => void handleDelete(row.webhook_id)}>
             <Button size='mini' status='danger'>
               {t('webhook.actions.delete')}
             </Button>
@@ -186,7 +186,7 @@ const ChannelList: React.FC = () => {
         </Button>
       </div>
       <Table
-        rowKey='id'
+        rowKey='webhook_id'
         loading={loading}
         columns={visibleColumns}
         data={channels}

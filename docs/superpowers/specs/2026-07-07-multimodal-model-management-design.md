@@ -1,8 +1,18 @@
 # 统一多模态模型能力中心 — 设计文档
 
+> **⚠️ SUPERSEDED / LEGACY 历史设计（非当前架构）**
+>
+> 本文形成于 v3 ID / schema 重构之前，保留用于记录多模态能力中心的
+> 业务背景和设计取舍，不得作为当前数据库实现规范。文中的 `033` 增量
+> migration、历史数据回填、`PRIMARY KEY (provider_id, model)` 以及
+> `FOREIGN KEY ... REFERENCES ... ON DELETE CASCADE` 均已被 v3 hard cut
+> 取代。当前实现必须遵循：所有产品表使用
+> `id INTEGER PRIMARY KEY AUTOINCREMENT`，需要跨边界身份时使用具名裸
+> UUIDv7，关系使用逻辑外键，且新版本不迁移历史数据。
+>
 - **日期**: 2026-07-07
 - **分支**: `feat/multimodal-model-hub`(基于 `feat/creative-workshop`)
-- **状态**: 设计已批准,待实施
+- **状态**: `SUPERSEDED / LEGACY（仅供追溯）`
 
 ---
 

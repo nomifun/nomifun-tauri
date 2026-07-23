@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 use crate::artifacts::{build_skill_suggest_artifact, emit_artifact};
 use crate::error::CronError;
 use crate::prompt::SKILL_SUGGEST_FILENAME;
-use crate::skill_file::{content_hash, has_skill_file, validate_skill_content};
+use crate::skill_file::{content_hash, validate_skill_content};
 
 const RETRY_DELAYS_MS: [u64; 3] = [1000, 2000, 3000];
 
@@ -21,7 +21,6 @@ const RETRY_DELAYS_MS: [u64; 3] = [1000, 2000, 3000];
 pub struct SkillSuggestDetector {
     user_events: Arc<dyn UserEventSink>,
     conversation_repo: Arc<dyn IConversationRepository>,
-    data_dir: PathBuf,
     last_hash_by_job: Arc<Mutex<HashMap<String, String>>>,
 }
 
@@ -29,12 +28,11 @@ impl SkillSuggestDetector {
     pub fn new(
         user_events: Arc<dyn UserEventSink>,
         conversation_repo: Arc<dyn IConversationRepository>,
-        data_dir: PathBuf,
+        _data_dir: PathBuf,
     ) -> Self {
         Self {
             user_events,
             conversation_repo,
-            data_dir,
             last_hash_by_job: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -90,11 +88,6 @@ impl SkillSuggestDetector {
     ) -> Result<bool, CronError> {
         if workspace.trim().is_empty() {
             return Ok(false);
-        }
-
-        if has_skill_file(&self.data_dir, job_id).await? {
-            self.clear_last_hash(job_id);
-            return Ok(true);
         }
 
         let file_path = Path::new(workspace).join(SKILL_SUGGEST_FILENAME);
@@ -232,9 +225,9 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::broadcast;
 
-    const JOB_ID: &str = "cron_0190f5fe-7c00-7a00-8000-000000000001";
-    const CONVERSATION_ID: &str = "conv_0190f5fe-7c00-7a00-8000-000000000001";
-    const CONVERSATION_ID_2: &str = "conv_0190f5fe-7c00-7a00-8000-000000000002";
+    const JOB_ID: &str = "0190f5fe-7c00-7a00-8abc-012345678901";
+    const CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const CONVERSATION_ID_2: &str = "0190f5fe-7c00-7a00-8000-000000000002";
 
     struct TestUserEventBus {
         sender: broadcast::Sender<nomifun_api_types::WebSocketMessage<serde_json::Value>>,
@@ -265,7 +258,8 @@ mod tests {
 
     fn make_conversation(id: &str, installation_owner: &str) -> ConversationRow {
         ConversationRow {
-            id: id.to_owned(),
+            id: 0,
+            conversation_id: id.to_owned(),
             user_id: installation_owner.to_owned(),
             name: "Cron Conversation".into(),
             r#type: "acp".into(),
@@ -289,13 +283,13 @@ mod tests {
         }
     }
 
-    /// Seed a minimal `cron_jobs` row so the
-    /// `conversation_artifacts.cron_job_id → cron_jobs(id)` FK is satisfied
-    /// when a skill-suggest artifact is persisted (foreign_keys=ON).
-    async fn seed_cron_job(pool: &SqlitePool, installation_owner: &str, id: &str) {
+    /// Seed a minimal cron job and return its local SQLite identity.
+    async fn seed_cron_job(pool: &SqlitePool, installation_owner: &str) -> String {
         let repo = SqliteCronRepository::new(pool.clone());
+        let cron_job_id = nomifun_common::CronJobId::new().into_string();
         repo.insert(&CronJobRow {
-            id: id.into(),
+            id: 0,
+            cron_job_id: cron_job_id.clone(),
             user_id: installation_owner.to_owned(),
             name: "Test Cron".into(),
             enabled: true,
@@ -327,6 +321,7 @@ mod tests {
         })
         .await
         .unwrap();
+        cron_job_id
     }
 
     #[tokio::test]
@@ -344,7 +339,7 @@ mod tests {
         let db = init_database_memory().await.unwrap();
         let installation_owner = nomifun_db::installation_owner_id(db.pool()).await.unwrap();
         let repo: Arc<dyn IConversationRepository> = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
-        seed_cron_job(db.pool(), &installation_owner, JOB_ID).await;
+        let job_id = seed_cron_job(db.pool(), &installation_owner).await;
         let conversation_id = CONVERSATION_ID;
         repo.create(&make_conversation(conversation_id, &installation_owner)).await.unwrap();
 
@@ -356,7 +351,7 @@ mod tests {
             .check_and_emit(
                 &installation_owner,
                 conversation_id,
-                JOB_ID,
+                &job_id,
                 &workspace.to_string_lossy(),
             )
             .await
@@ -365,13 +360,18 @@ mod tests {
         assert!(emitted);
         let msg = rx.try_recv().unwrap();
         assert_eq!(msg.name, "conversation.artifact");
+        assert!(msg.data.get("id").is_none());
         assert_eq!(msg.data["kind"], "skill_suggest");
         assert_eq!(msg.data["status"], "pending");
-        assert_eq!(msg.data["payload"]["cron_job_id"], JOB_ID);
+        assert_eq!(msg.data["payload"]["cron_job_id"], job_id);
         assert_eq!(msg.data["payload"]["name"], "daily-report");
 
         let rows = repo.list_artifacts(conversation_id).await.unwrap();
         assert_eq!(rows.len(), 1);
+        assert_eq!(
+            msg.data["conversation_artifact_id"].as_str(),
+            Some(rows[0].conversation_artifact_id.as_str())
+        );
         assert_eq!(rows[0].kind, "skill_suggest");
         assert_eq!(rows[0].status, "pending");
         assert!(rows[0].payload.contains("\"skillContent\""));
@@ -392,7 +392,7 @@ mod tests {
         let db = init_database_memory().await.unwrap();
         let installation_owner = nomifun_db::installation_owner_id(db.pool()).await.unwrap();
         let repo: Arc<dyn IConversationRepository> = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
-        seed_cron_job(db.pool(), &installation_owner, JOB_ID).await;
+        let job_id = seed_cron_job(db.pool(), &installation_owner).await;
         repo.create(&make_conversation(CONVERSATION_ID, &installation_owner)).await.unwrap();
         repo.create(&make_conversation(CONVERSATION_ID_2, &installation_owner)).await.unwrap();
 
@@ -405,7 +405,7 @@ mod tests {
                 .check_and_emit(
                     &installation_owner,
                     CONVERSATION_ID,
-                    JOB_ID,
+                    &job_id,
                     &workspace.to_string_lossy(),
                 )
                 .await
@@ -418,7 +418,7 @@ mod tests {
                 .check_and_emit(
                     &installation_owner,
                     CONVERSATION_ID_2,
-                    JOB_ID,
+                    &job_id,
                     &workspace.to_string_lossy(),
                 )
                 .await
@@ -438,7 +438,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let skill_dir = temp.path().join(format!("cron/skills/cron-{JOB_ID}"));
+        let skill_dir = temp.path().join(format!("cron/skills/{JOB_ID}"));
         tokio::fs::create_dir_all(&skill_dir).await.unwrap();
         tokio::fs::write(
             skill_dir.join("SKILL.md"),

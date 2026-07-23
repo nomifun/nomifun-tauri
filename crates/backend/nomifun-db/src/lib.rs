@@ -100,7 +100,7 @@ pub use sqlx::SqlitePool;
 /// a database invariant violation and fails closed.
 pub async fn installation_owner_id(pool: &SqlitePool) -> Result<String, DbError> {
     let identities: Vec<(String, String)> =
-        sqlx::query_as("SELECT key, owner_user_id FROM installation_identity")
+        sqlx::query_as("SELECT singleton_key, owner_user_id FROM installation_identity")
             .fetch_all(pool)
             .await
             .map_err(DbError::Query)?;
@@ -120,7 +120,7 @@ pub async fn installation_owner_id(pool: &SqlitePool) -> Result<String, DbError>
             "installation owner ID is not canonical: {owner_user_id}: {error}"
         ))
     })?;
-    let owner_exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = ?")
+    let owner_exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE user_id = ?")
         .bind(owner_user_id)
         .fetch_one(pool)
         .await

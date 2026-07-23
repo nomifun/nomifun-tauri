@@ -7,10 +7,10 @@ use sqlx::{Row, sqlite::SqliteRow};
 /// Row in the `knowledge_bases` table — a registered directory of markdown
 /// documents. The directory is the source of truth for content; the row only
 /// stores registration metadata (the user may drop files in at any time).
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnowledgeBaseRow {
-    #[sqlx(try_from = "String")]
-    pub id: KnowledgeBaseId,
+    pub id: i64,
+    pub knowledge_base_id: String,
     pub name: String,
     pub description: String,
     /// Absolute root directory of the base.
@@ -27,21 +27,39 @@ pub struct KnowledgeBaseRow {
     pub tags: Option<String>,
 }
 
+impl<'row> sqlx::FromRow<'row, SqliteRow> for KnowledgeBaseRow {
+    fn from_row(row: &'row SqliteRow) -> Result<Self, sqlx::Error> {
+        let raw_id: String = row.try_get("knowledge_base_id")?;
+        let knowledge_base_id = KnowledgeBaseId::parse(&raw_id)
+            .map_err(|error| sqlx::Error::Decode(Box::new(error)))?
+            .into_string();
+        Ok(Self {
+            id: row.try_get("id")?,
+            knowledge_base_id,
+            name: row.try_get("name")?,
+            description: row.try_get("description")?,
+            root_path: row.try_get("root_path")?,
+            managed: row.try_get("managed")?,
+            extra: row.try_get("extra")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+            tags: row.try_get("tags")?,
+        })
+    }
+}
+
 /// Row in the `knowledge_bindings` table — which bases a target mounts and
-/// whether write-back is allowed. The former composite (target_kind,target_id)
-/// PK + JSON `kb_ids` array is redesigned into a surrogate `binding_id` +
-/// type-discriminated nullable target columns (exactly one non-null, enforced
-/// by a CHECK) + the `knowledge_binding_bases` junction.
-///   - `target_workpath`: normalized workspace path key (not an entity, no FK)
-///   - `target_conv_id` / `target_term_id`: real TEXT FK (CASCADE)
-///   - `target_companion_id`: filesystem companion entity (no FK)
+/// whether write-back is allowed. `id` is the SQLite-local technical key;
+/// `knowledge_binding_id` is the stable UUIDv7 business identity used by the
+/// `knowledge_binding_bases` logical junction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnowledgeBindingRow {
-    pub binding_id: KnowledgeBindingId,
+    pub id: i64,
+    pub knowledge_binding_id: KnowledgeBindingId,
     pub target_kind: String,
     pub target_workpath: Option<String>,
-    pub target_conv_id: Option<ConversationId>,
-    pub target_term_id: Option<TerminalId>,
+    pub target_conversation_id: Option<ConversationId>,
+    pub target_terminal_id: Option<TerminalId>,
     pub target_companion_id: Option<CompanionId>,
     pub enabled: bool,
     pub writeback: bool,
@@ -69,8 +87,11 @@ impl KnowledgeBindingRow {
     pub fn target_id(&self) -> Option<String> {
         match self.target_kind.as_str() {
             "workpath" => self.target_workpath.clone(),
-            "conversation" => self.target_conv_id.as_ref().map(ToString::to_string),
-            "terminal" => self.target_term_id.as_ref().map(ToString::to_string),
+            "conversation" => self
+                .target_conversation_id
+                .as_ref()
+                .map(ToString::to_string),
+            "terminal" => self.target_terminal_id.as_ref().map(ToString::to_string),
             "companion" => self.target_companion_id.as_ref().map(ToString::to_string),
             _ => None,
         }
@@ -96,11 +117,12 @@ impl<'row> sqlx::FromRow<'row, SqliteRow> for KnowledgeBindingRow {
         }
 
         Ok(Self {
-            binding_id: parse_required(row.try_get("binding_id")?)?,
+            id: row.try_get("id")?,
+            knowledge_binding_id: parse_required(row.try_get("knowledge_binding_id")?)?,
             target_kind: row.try_get("target_kind")?,
             target_workpath: row.try_get("target_workpath")?,
-            target_conv_id: parse_optional(row.try_get("target_conv_id")?)?,
-            target_term_id: parse_optional(row.try_get("target_term_id")?)?,
+            target_conversation_id: parse_optional(row.try_get("target_conversation_id")?)?,
+            target_terminal_id: parse_optional(row.try_get("target_terminal_id")?)?,
             target_companion_id: parse_optional(row.try_get("target_companion_id")?)?,
             enabled: row.try_get("enabled")?,
             writeback: row.try_get("writeback")?,
@@ -115,6 +137,7 @@ impl<'row> sqlx::FromRow<'row, SqliteRow> for KnowledgeBindingRow {
 /// Row in the `knowledge_tags` table — a user-defined tag definition.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct KnowledgeTagRow {
+    pub id: i64,
     pub key: String,
     pub label: String,
     pub color: Option<String>,
@@ -147,9 +170,10 @@ mod tests {
 
     #[test]
     fn knowledge_rows_roundtrip() {
-        let base_id = KnowledgeBaseId::new();
+        let base_id = nomifun_common::KnowledgeBaseId::new();
         let base = KnowledgeBaseRow {
-            id: base_id.clone(),
+            id: 1,
+            knowledge_base_id: base_id.to_string(),
             name: "领域知识".into(),
             description: "测试".into(),
             root_path: format!("C:/data/knowledge/{base_id}"),
@@ -160,16 +184,17 @@ mod tests {
             tags: None,
         };
         let back: KnowledgeBaseRow = serde_json::from_str(&serde_json::to_string(&base).unwrap()).unwrap();
-        assert_eq!(back.id, base.id);
+        assert_eq!(back.knowledge_base_id, base.knowledge_base_id);
         assert!(back.managed);
 
         let conversation_id = ConversationId::new();
         let binding = KnowledgeBindingRow {
-            binding_id: KnowledgeBindingId::new(),
+            id: 1,
+            knowledge_binding_id: KnowledgeBindingId::new(),
             target_kind: "conversation".into(),
             target_workpath: None,
-            target_conv_id: Some(conversation_id.clone()),
-            target_term_id: None,
+            target_conversation_id: Some(conversation_id.clone()),
+            target_terminal_id: None,
             target_companion_id: None,
             enabled: true,
             writeback: false,

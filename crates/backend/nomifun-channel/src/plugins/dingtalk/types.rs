@@ -933,12 +933,12 @@ mod tests {
     #[test]
     fn parse_callback_roundtrip_with_params() {
         let mut p = std::collections::HashMap::new();
-        p.insert("agentType".into(), "gemini".into());
+        p.insert("agentType".into(), "acp".into());
         let encoded = format_dingtalk_callback("agent.select", Some(&p));
         let (cat, action, params) = parse_dingtalk_callback(&encoded).unwrap();
         assert_eq!(cat, "system");
         assert_eq!(action, "agent.select");
-        assert_eq!(params.unwrap().get("agentType").unwrap(), "gemini");
+        assert_eq!(params.unwrap().get("agentType").unwrap(), "acp");
     }
 
     #[test]

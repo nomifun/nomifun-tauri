@@ -54,8 +54,8 @@ export function resolveImageGenerationMcpEnv(
   selection: ImageGenerationSelection | undefined,
   providers: IProvider[]
 ): ImageGenerationMcpEnvResolveResult {
-  const providerId = selection?.id;
-  const model = selection?.use_model;
+  const providerId = selection?.provider_id;
+  const model = selection?.model;
 
   if (!providerId) {
     return {

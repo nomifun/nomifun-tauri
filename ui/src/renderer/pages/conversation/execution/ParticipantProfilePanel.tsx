@@ -13,7 +13,12 @@ import type { CreatePresetRequest } from '@/common/types/agent/presetTypes';
 import type { TAgentExecutionDetail } from '@/common/types/agentExecution/agentExecutionTypes';
 import { latestAttemptForStep } from '@/common/types/agentExecution/agentExecutionTypes';
 import { useArcoMessage } from '@/renderer/utils/ui/useArcoMessage';
-import type { ProviderId } from '@/common/types/ids';
+import type {
+  AgentId,
+  ExecutionParticipantId,
+  ExecutionStepId,
+  ProviderId,
+} from '@/common/types/ids';
 import styles from './participantProfilePanel.module.css';
 
 /** A reusable role candidate distilled from one completed execution. */
@@ -30,7 +35,7 @@ interface RoleCandidate {
     model: string;
     required: false;
   }>;
-  agentIds: string[];
+  agentIds: AgentId[];
   instructions: string;
   /** Union of `enabled_skills` over the role's participants. */
   enabledSkills: string[];
@@ -66,18 +71,18 @@ const ParticipantProfilePanel: React.FC<{ detail: TAgentExecutionDetail }> = ({ 
   const [savingNames, setSavingNames] = useState<Set<string>>(() => new Set());
 
   const participantById = useMemo(() => {
-    const map = new Map<string, (typeof detail.participants)[number]>();
-    for (const participant of detail.participants) map.set(participant.id, participant);
+    const map = new Map<ExecutionParticipantId, (typeof detail.participants)[number]>();
+    for (const participant of detail.participants) map.set(participant.participant_id, participant);
     return map;
   }, [detail.participants]);
 
   const participantByStep = useMemo(() => {
-    const map = new Map<string, (typeof detail.participants)[number]>();
+    const map = new Map<ExecutionStepId, (typeof detail.participants)[number]>();
     for (const step of detail.steps.filter((item) => item.superseded_in_revision == null)) {
-      const attempt = latestAttemptForStep(detail.attempts, step.id);
+      const attempt = latestAttemptForStep(detail.attempts, step.step_id);
       const participantId = attempt?.participant_id ?? step.assigned_participant_id;
       const participant = participantId ? participantById.get(participantId) : undefined;
-      if (participant) map.set(step.id, participant);
+      if (participant) map.set(step.step_id, participant);
     }
     return map;
   }, [detail.attempts, detail.steps, participantById]);
@@ -91,7 +96,7 @@ const ParticipantProfilePanel: React.FC<{ detail: TAgentExecutionDetail }> = ({ 
       memberDescription?: string;
       models: Set<string>;
       modelPreferences: Map<string, { provider_id?: ProviderId; model: string; required: false }>;
-      agentIds: Set<string>;
+      agentIds: Set<AgentId>;
       enabledSkills: Set<string>;
       disabledBuiltinSkills: Set<string>;
     }
@@ -108,7 +113,7 @@ const ParticipantProfilePanel: React.FC<{ detail: TAgentExecutionDetail }> = ({ 
           taskCount: 0,
           models: new Set<string>(),
           modelPreferences: new Map(),
-          agentIds: new Set<string>(),
+          agentIds: new Set<AgentId>(),
           enabledSkills: new Set<string>(),
           disabledBuiltinSkills: new Set<string>(),
         };
@@ -117,7 +122,7 @@ const ParticipantProfilePanel: React.FC<{ detail: TAgentExecutionDetail }> = ({ 
       acc.taskCount += 1;
       const title = step.title?.trim();
       if (title && acc.titles.length < 3 && !acc.titles.includes(title)) acc.titles.push(title);
-      const participant = participantByStep.get(step.id);
+      const participant = participantByStep.get(step.step_id);
       if (participant) {
         const model = participant.model?.trim();
         if (model) {
@@ -129,7 +134,7 @@ const ParticipantProfilePanel: React.FC<{ detail: TAgentExecutionDetail }> = ({ 
             required: false,
           });
         }
-        if (participant.source_agent_id?.trim()) acc.agentIds.add(participant.source_agent_id.trim());
+        acc.agentIds.add(participant.source_agent_id);
         collect(acc.enabledSkills, participant.enabled_skills);
         collect(acc.disabledBuiltinSkills, participant.disabled_builtin_skills);
         const desc = participant.description?.trim();

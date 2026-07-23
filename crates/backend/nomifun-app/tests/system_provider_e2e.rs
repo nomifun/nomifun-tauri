@@ -30,7 +30,7 @@ async fn provider_full_crud_with_auth() {
     let json = body_json(resp).await;
     let providers = json["data"].as_array().unwrap();
     assert_eq!(providers.len(), 1);
-    ProviderId::parse(providers[0]["id"].as_str().unwrap()).unwrap();
+    ProviderId::parse(providers[0]["provider_id"].as_str().unwrap()).unwrap();
     assert_eq!(providers[0]["platform"], "nomifun-free-model");
 
     // 2. Create
@@ -49,7 +49,7 @@ async fn provider_full_crud_with_auth() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let json = body_json(resp).await;
-    let id = json["data"]["id"].as_str().unwrap().to_string();
+    let id = json["data"]["provider_id"].as_str().unwrap().to_string();
     assert_eq!(json["data"]["platform"], "anthropic");
     assert_eq!(json["data"]["name"], "Anthropic");
     let api_key = json["data"]["api_key"].as_str().unwrap();
@@ -75,7 +75,7 @@ async fn provider_full_crud_with_auth() {
     assert!(
         providers
             .iter()
-            .any(|provider| provider["id"].as_str() == Some(id.as_str()))
+            .any(|provider| provider["provider_id"].as_str() == Some(id.as_str()))
     );
 
     // 4. Update
@@ -105,7 +105,7 @@ async fn provider_full_crud_with_auth() {
     let json = body_json(resp).await;
     let providers = json["data"].as_array().unwrap();
     assert_eq!(providers.len(), 1);
-    ProviderId::parse(providers[0]["id"].as_str().unwrap()).unwrap();
+    ProviderId::parse(providers[0]["provider_id"].as_str().unwrap()).unwrap();
     assert_eq!(providers[0]["platform"], "nomifun-free-model");
 }
 
@@ -204,7 +204,7 @@ async fn model_fetch_openai_with_auth() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let json = body_json(resp).await;
-    let id = json["data"]["id"].as_str().unwrap().to_string();
+    let id = json["data"]["provider_id"].as_str().unwrap().to_string();
 
     let req = json_with_token(
         "POST",

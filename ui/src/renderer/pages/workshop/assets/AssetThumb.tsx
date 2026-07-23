@@ -28,7 +28,7 @@ const AssetThumb: React.FC<AssetThumbProps> = ({ asset, enabled = true }) => {
   // binary for images (small enough) and to an icon poster for videos.
   const wantThumb = Boolean(asset.thumb_url);
   const canPreview = asset.kind === 'image' || (asset.kind === 'video' && wantThumb);
-  const { url, status } = useWorkshopObjectUrl(canPreview ? asset.id : null, {
+  const { url, status } = useWorkshopObjectUrl(canPreview ? asset.asset_id : null, {
     thumb: wantThumb,
     enabled: enabled && canPreview,
   });

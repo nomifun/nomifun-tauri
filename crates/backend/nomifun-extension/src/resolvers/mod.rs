@@ -21,6 +21,43 @@ use std::path::Path;
 
 use crate::types::{LoadedExtension, ResolvedContributions};
 
+/// Build one unambiguous global identity for an extension catalog item.
+///
+/// Product entity IDs remain bare UUIDv7 values. Extension manifest identities
+/// are natural keys and live exclusively in `source_key`.
+pub(super) fn extension_source_key(
+    extension_name: &str,
+    local_key: &str,
+) -> Result<String, crate::ExtensionError> {
+    let valid_part = |value: &str| {
+        !value.is_empty()
+            && value.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'_' | b'-' | b'.')
+            })
+    };
+    let prefixed_uuidv7 = local_key
+        .rsplit_once('_')
+        .is_some_and(|(_, suffix)| nomifun_common::validate_uuidv7(suffix).is_ok());
+    let bare_uuidv7 = nomifun_common::validate_uuidv7(local_key).is_ok();
+    let source_key = format!("{extension_name}:{local_key}");
+    if !valid_part(extension_name)
+        || !valid_part(local_key)
+        || source_key.len() > 255
+        || bare_uuidv7
+        || prefixed_uuidv7
+    {
+        return Err(crate::ExtensionError::ResolutionFailed {
+            extension_name: extension_name.to_owned(),
+            reason: format!(
+                "catalog source_key must use '<extension-name>:<local-key>' with lowercase ASCII natural-key parts and must not use UUIDv7-derived product identity; got '{source_key}'"
+            ),
+        });
+    }
+    Ok(source_key)
+}
+
 /// Resolve all contributions from a single extension.
 ///
 /// Failures in individual contribution types are logged and skipped —
@@ -122,6 +159,16 @@ mod tests {
     use super::*;
     use crate::types::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn extension_source_key_rejects_uuidv7_derived_product_ids() {
+        for local_key in [
+            "0190f5fe-7c00-7a00-8000-000000000001",
+            "preset_0190f5fe-7c00-7a00-8000-000000000001",
+        ] {
+            assert!(extension_source_key("my-ext", local_key).is_err());
+        }
+    }
 
     fn make_extension(name: &str, enabled: bool, contributes: Option<ExtContributes>) -> LoadedExtension {
         LoadedExtension {
@@ -235,7 +282,7 @@ mod tests {
             true,
             Some(ExtContributes {
                 mcp_servers: vec![ExtMcpServer {
-                    id: "mcp-a".into(),
+                    source_key: "mcp-a".into(),
                     name: "MCP A".into(),
                     description: None,
                     config: serde_json::json!({}),
@@ -248,7 +295,7 @@ mod tests {
             true,
             Some(ExtContributes {
                 mcp_servers: vec![ExtMcpServer {
-                    id: "mcp-b".into(),
+                    source_key: "mcp-b".into(),
                     name: "MCP B".into(),
                     description: None,
                     config: serde_json::json!({}),

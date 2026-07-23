@@ -12,9 +12,11 @@ import {
 } from './turnDisclosureModel';
 import { parseMessageId } from '@/common/types/ids';
 
-const TURN_1 = parseMessageId('msg_0190f5fe-7c00-7a00-8000-000000000001');
-const TURN_2 = parseMessageId('msg_0190f5fe-7c00-7a00-8000-000000000002');
-const ACP_ROOT_1 = parseMessageId('msg_0190f5fe-7c00-7a00-8000-000000000011');
+const TURN_1 = parseMessageId('0190f5fe-7c00-7a00-8000-000000000001');
+const TURN_2 = parseMessageId('0190f5fe-7c00-7a00-8000-000000000002');
+const ACP_ROOT_1 = parseMessageId('0190f5fe-7c00-7a00-8000-000000000011');
+const SOURCE_1 = parseMessageId('0190f5fe-7c00-7a00-8000-000000000021');
+const SOURCE_2 = parseMessageId('0190f5fe-7c00-7a00-8000-000000000022');
 const DISCLOSURE_1 = `turn-disclosure-${TURN_1}`;
 const DISCLOSURE_2 = `turn-disclosure-${TURN_2}`;
 
@@ -27,7 +29,7 @@ const item = (
   turnId: TURN_1,
   role,
   createdAt: options.createdAt ?? 1000,
-  sourceMessageIds: options.sourceMessageIds ?? [id],
+  sourceMessageIds: options.sourceMessageIds ?? [],
   ...options,
 });
 
@@ -36,8 +38,8 @@ describe('buildTurnDisclosureItems', () => {
     const result = buildTurnDisclosureItems(
       [
         item('user', 'user', { createdAt: 1000 }),
-        item('analysis', 'process', { createdAt: 2000 }),
-        item('tool', 'process', { createdAt: 3000 }),
+        item('analysis', 'process', { createdAt: 2000, sourceMessageIds: [SOURCE_1] }),
+        item('tool', 'process', { createdAt: 3000, sourceMessageIds: [SOURCE_2] }),
         item('final', 'assistant', { createdAt: 5000 }),
       ],
       { tailClosed: true }
@@ -57,7 +59,7 @@ describe('buildTurnDisclosureItems', () => {
     expect(disclosure.processItemIds).toEqual(['analysis', 'tool']);
     expect(disclosure.startAt).toBe(2000);
     expect(disclosure.endAt).toBe(5000);
-    expect(disclosure.sourceMessageIds).toEqual(['analysis', 'tool']);
+    expect(disclosure.sourceMessageIds).toEqual([SOURCE_1, SOURCE_2]);
   });
 
   test('uses completed process intervals when calculating disclosure duration', () => {
@@ -793,7 +795,7 @@ describe('assignTurnIdsFromUserRequests', () => {
   });
 
   test('does not promote a retired provisional request id before the current root arrives', () => {
-    const userTurn2 = parseMessageId('msg_0190f5fe-7c00-7a00-8000-000000000022');
+    const userTurn2 = parseMessageId('0190f5fe-7c00-7a00-8000-000000000022');
     const result = assignTurnIdsFromUserRequests([
       item('user-1', 'user', { turnId: TURN_1, createdAt: 1000 }),
       item('root-1', 'process', { turnId: ACP_ROOT_1, createdAt: 1500 }),

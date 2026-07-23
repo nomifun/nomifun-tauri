@@ -63,21 +63,12 @@ impl ClientPrefService {
             }
         }
 
-        if !upserts.is_empty() {
-            let entries: Vec<(&str, &str)> = upserts.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-            self.repo
-                .upsert_batch(&entries)
-                .await
-                .map_err(|e| AppError::Internal(format!("Failed to upsert preferences: {e}")))?;
-        }
-
-        if !deletes.is_empty() {
-            let keys: Vec<&str> = deletes.iter().map(|k| k.as_str()).collect();
-            self.repo
-                .delete_keys(&keys)
-                .await
-                .map_err(|e| AppError::Internal(format!("Failed to delete preferences: {e}")))?;
-        }
+        let entries: Vec<(&str, &str)> = upserts
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect();
+        let keys: Vec<&str> = deletes.iter().map(String::as_str).collect();
+        self.repo.update_batch(&entries, &keys).await?;
 
         Ok(())
     }
@@ -259,5 +250,26 @@ mod tests {
         assert_eq!(prefs.len(), 2);
         assert_eq!(prefs["keep"], json!(1));
         assert_eq!(prefs["new"], json!(3));
+    }
+
+    #[tokio::test]
+    async fn provider_reference_conflict_is_not_reported_as_internal_error() {
+        let svc = setup().await;
+        let mut req = UpdateClientPreferencesRequest::new();
+        req.insert("theme".into(), json!("dark"));
+        req.insert(
+            "knowledge.autogenModel".into(),
+            json!({
+                "provider_id": "0190f5fe-7c00-7a00-8000-000000000099",
+                "model": "missing"
+            }),
+        );
+
+        let error = svc.update_preferences(req).await.unwrap_err();
+        assert_eq!(error.status_code(), axum::http::StatusCode::CONFLICT);
+        assert!(
+            svc.get_preferences(None).await.unwrap().is_empty(),
+            "the generic endpoint must not partially persist a mixed batch"
+        );
     }
 }

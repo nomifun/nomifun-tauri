@@ -173,7 +173,7 @@ const GuidCollaboratorSelector: React.FC<GuidCollaboratorSelectorProps> = ({
         )}
         <GuidCollaborationTemplatePicker
           visible={open}
-          selectedTemplateId={selectedTemplate?.id ?? null}
+          selectedTemplateId={selectedTemplate?.execution_template_id ?? null}
           models={value}
           mainModel={mainModel}
           workDir={workDir}

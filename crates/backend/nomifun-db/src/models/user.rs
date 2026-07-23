@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 /// Optional fields correspond to nullable columns.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct User {
+    pub id: i64,
     #[sqlx(try_from = "String")]
-    pub id: UserId,
+    pub user_id: UserId,
     pub username: String,
     pub email: Option<String>,
     pub password_hash: String,

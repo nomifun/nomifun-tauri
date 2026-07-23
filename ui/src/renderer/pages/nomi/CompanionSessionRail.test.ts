@@ -9,6 +9,7 @@ import { describe, expect, test } from 'bun:test';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { ICompanionWithStatus } from '@/common/adapter/ipcBridge';
+import { parseCompanionId } from '@/common/types/ids';
 import CompanionSessionRail from './CompanionSessionRail';
 
 const source = readFileSync(new URL('./CompanionSessionRail.tsx', import.meta.url), 'utf8');
@@ -16,15 +17,28 @@ const source = readFileSync(new URL('./CompanionSessionRail.tsx', import.meta.ur
 describe('CompanionSessionRail layout', () => {
   test('renders a freshly created companion without a configured model', () => {
     const companion = {
-      id: 'companion_0198f6b1-0ef0-7000-8000-000000000001',
+      companion_id: '0198f6b1-0ef0-7000-8000-000000000001',
+      seq: 1,
       name: 'Fresh companion',
       character: 'mochi',
-      persona: {},
+      persona: {
+        identity: '',
+        user_info: '',
+        character_setting: '',
+        speaking_style: '',
+        scenario: '',
+        relationship: '',
+        rules: '',
+      },
       model: null,
-      appearance: {},
+      appearance: {
+        companion_enabled: false,
+        quiet_start: '',
+        quiet_end: '',
+      },
       created_at: 0,
       status: {
-        companion_id: 'companion_0198f6b1-0ef0-7000-8000-000000000001',
+        companion_id: '0198f6b1-0ef0-7000-8000-000000000001',
         xp: 0,
         level: 1,
         mood: 'content',
@@ -35,12 +49,14 @@ describe('CompanionSessionRail layout', () => {
         model_configured: false,
         collect_any_enabled: false,
       },
-    } as ICompanionWithStatus;
+    } as unknown as ICompanionWithStatus;
+    companion.companion_id = parseCompanionId(companion.companion_id);
+    companion.status.companion_id = companion.companion_id;
 
     const html = renderToStaticMarkup(
       React.createElement(CompanionSessionRail, {
         companions: [companion],
-        selectedId: companion.id,
+        selectedId: companion.companion_id,
         onSelect: () => undefined,
         onCreated: () => undefined,
         onDeleted: () => undefined,

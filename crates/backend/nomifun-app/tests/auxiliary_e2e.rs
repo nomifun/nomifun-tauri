@@ -11,7 +11,7 @@ use tower::ServiceExt;
 
 use common::{body_json, get_with_token, json_with_token, setup_and_login};
 
-const MISSING_CONVERSATION_ID: &str = "conv_0190f5fe-7c00-7a00-8abc-012345679998";
+const MISSING_CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8abc-012345679998";
 
 // ── Helpers ─────────────────────────────────────────────────────
 
@@ -48,7 +48,7 @@ async fn create_conversation_with_workspace(
     );
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = common::body_json(resp).await;
-    json["data"]["id"].as_str().unwrap().to_owned()
+    json["data"]["conversation_id"].as_str().unwrap().to_owned()
 }
 
 async fn create_conversation(app: &mut axum::Router, token: &str, csrf: &str, name: &str, agent_type: &str) -> String {
@@ -61,7 +61,7 @@ async fn create_conversation(app: &mut axum::Router, token: &str, csrf: &str, na
     );
     let resp = app.clone().oneshot(req).await.unwrap();
     let json = common::body_json(resp).await;
-    json["data"]["id"].as_str().unwrap().to_owned()
+    json["data"]["conversation_id"].as_str().unwrap().to_owned()
 }
 
 async fn build_app() -> (axum::Router, nomifun_app::AppServices) {
@@ -220,7 +220,7 @@ async fn create_terminal_with_cwd(app: &mut axum::Router, token: &str, csrf: &st
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED, "terminal create should succeed");
     let json = common::body_json(resp).await;
-    json["data"]["id"].as_str().unwrap().to_owned()
+    json["data"]["terminal_id"].as_str().unwrap().to_owned()
 }
 
 #[tokio::test]
@@ -228,7 +228,7 @@ async fn terminal_workspace_requires_auth() {
     let (app, _) = build_app().await;
     let req = axum::http::Request::builder()
         .method("GET")
-        .uri("/api/terminals/term_0190f5fe-7c00-7a00-8abc-012345678901/workspace?path=")
+        .uri("/api/terminals/0190f5fe-7c00-7a00-8abc-012345678901/workspace?path=")
         .body(axum::body::Body::empty())
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -268,7 +268,7 @@ async fn terminal_workspace_not_found() {
 
     // Authenticated, but no such terminal session row → 404 (the service
     // surfaces a missing row as NotFound before any filesystem access).
-    let req = get_with_token("/api/terminals/term_0190f5fe-7c00-7a00-8abc-012345679999/workspace?path=", &token);
+    let req = get_with_token("/api/terminals/0190f5fe-7c00-7a00-8abc-012345679999/workspace?path=", &token);
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

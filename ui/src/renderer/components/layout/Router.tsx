@@ -228,7 +228,7 @@ const PanelRoute: React.FC<{ layout: React.ReactElement }> = ({ layout }) => {
           <Route path='/settings' element={<Navigate to='/settings/system' replace />} />
           <Route path='/test/components' element={withRouteFallback(ComponentsShowcase)} />
           <Route path='/scheduled' element={withRouteFallback(ScheduledTasksPage)} />
-          <Route path='/scheduled/:job_id' element={withRouteFallback(TaskDetailPage)} />
+          <Route path='/scheduled/:cron_job_id' element={withRouteFallback(TaskDetailPage)} />
           {/* Requirements platform — nested shell (ContentSider persists across sections) */}
           <Route path='/requirements' element={withRouteFallback(RequirementsLayout)}>
             <Route index element={withRouteFallback(WorkspacePage)} />
@@ -246,7 +246,7 @@ const PanelRoute: React.FC<{ layout: React.ReactElement }> = ({ layout }) => {
           <Route path='/nomi' element={withRouteFallback(NomiConfigPage)} />
           {/* 对外伙伴 (Public Companion) — a first-class domain separate from desktop companions. */}
           <Route path='/public-companions' element={withRouteFallback(PublicCompanionRosterPage)} />
-          <Route path='/public-companions/:id' element={withRouteFallback(PublicAgentDetailPage)} />
+          <Route path='/public-companions/:public_agent_id' element={withRouteFallback(PublicAgentDetailPage)} />
           <Route path='/knowledge' element={withRouteFallback(KnowledgeListPage)} />
           <Route path='/knowledge/:id' element={withRouteFallback(KnowledgeDetailPage)} />
           {/* 资产库 (Asset Library) — platform-level management of workshop assets. */}

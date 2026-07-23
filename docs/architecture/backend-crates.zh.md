@@ -17,11 +17,29 @@
 
 ## 核心、数据、实时、运行时
 
+### v3 数据与 ID 契约
+
+所有后端 crate 遵循统一的 v3 数据契约：
+
+- 每张 NomiFun 产品表都有 `id INTEGER PRIMARY KEY AUTOINCREMENT`；
+- 需要跨数据集稳定识别的实体使用 `user_id`、`conversation_id`、
+  `message_id` 等具名裸标准 UUIDv7；
+- 纯内部行只把表 `id` 作为 repository 实现细节，关系通过 owner UUIDv7、
+  sequence、自然键或复合条件表达；
+- 一条关系只保留一个引用字段，不存在 `*_row_id` 双轨字段；
+- Repository/Service 维护带索引的逻辑关联；产品 DDL 不包含物理
+  `FOREIGN KEY`、`REFERENCES`、`ON DELETE` 或 `ON UPDATE`；
+- v3 启动时发现不兼容的受管数据集，会整体 reset/quarantine，而不是迁移
+  历史行。
+
+技术 `id` 只属于当前数据集，不得当作 API 或跨表身份。稳定 UUIDv7 在边界上
+是字符串，外部协议标识保持不透明。
+
 | Crate | 职责 |
 | --- | --- |
-| [`nomifun-common`](../../crates/backend/nomifun-common/) | `AppError`、错误链、各类枚举（`AgentType`、`ConversationStatus`、`MessageType`、`McpServerStatus` 等）、id 生成（实体 ID 用 `generate_prefixed_id`，令牌用 `generate_id`）、AES-GCM `encrypt_string` / `decrypt_string`、`TimestampMs`、分页辅助、`constants::DEFAULT_HOST/DEFAULT_PORT/BODY_LIMIT/CSRF_*`。 |
+| [`nomifun-common`](../../crates/backend/nomifun-common/) | `AppError`、错误链、各类枚举（`AgentType`、`ConversationStatus`、`MessageType`、`McpServerStatus` 等）、稳定业务 ID 的裸 UUIDv7 生成/校验、数据集 reset 辅助、AES-GCM `encrypt_string` / `decrypt_string`、`TimestampMs`、分页辅助、`constants::DEFAULT_HOST/DEFAULT_PORT/BODY_LIMIT/CSRF_*`。 |
 | [`nomifun-api-types`](../../crates/backend/nomifun-api-types/) | 每个 HTTP 请求 / 响应 DTO，`WebSocketMessage` 信封，ACP / Nomi / OpenClaw / Remote 等扩展。前端 TypeScript 类型镜像该 crate。 |
-| [`nomifun-db`](../../crates/backend/nomifun-db/) | 通过 `sqlx` 操作 SQLite，内嵌迁移，为用户、会话、MCP、需求、cron、ACP 会话、设定、终端会话、伙伴令牌、知识库、渠道、连接器凭据、IDMM 介入、远程 agent、webhook 等提供仓储 trait 与 Sqlite 实现。持有 `Database` 句柄以及 `init_database`。 |
+| [`nomifun-db`](../../crates/backend/nomifun-db/) | 通过 `sqlx` 操作 v3 SQLite baseline，维护 schema contract 与逻辑关联 registry，并为用户、会话、MCP、需求、cron、ACP 会话、设定、终端会话、伙伴令牌、知识库、渠道、连接器凭据、IDMM 介入、远程 agent、webhook 等提供仓储 trait 与 Sqlite 实现。持有 `Database` 句柄并负责 v3 baseline 初始化。 |
 | [`nomifun-realtime`](../../crates/backend/nomifun-realtime/) | `WebSocketManager`、`BroadcastEventBus`，带 token 校验的 `/ws` 升级处理器，消息路由 trait，心跳计时，每连接缓冲常量。 |
 | [`nomifun-runtime`](../../crates/backend/nomifun-runtime/) | 内嵌 Bun 的解压、缓存、命令发现与启动期 `PATH` 增强。子进程所有权统一属于 shared 层的 `nomi-process-runtime`。 |
 | [`nomifun-assets`](../../crates/backend/nomifun-assets/) | 随服务器一同发布的内嵌静态资源（`include_dir!`）。 |

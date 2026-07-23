@@ -3,13 +3,14 @@
 //! events into memories + suggestions), per-companion persona companion chats over
 //! the real agent engine, and the companion config/status API surface.
 //!
-//! Layering: `profile` is the per-companion/shared config split (`config` keeps the
-//! legacy single-companion shape for migration only); `registry` is the companion roster;
+//! Layering: `profile` is the per-companion/shared config split; `registry` is the
+//! companion roster;
 //! `store` owns the shared sqlite db under `{data_dir}/companion/shared/`;
 //! `collector` taps the global event bus and appends JSONL event files;
 //! `learner` is the periodic LLM distillation loop; `companion` is the
 //! per-companion companion chat; `service` bundles them; `routes`/`state` are the
-//! API surface; `migrate` lifts a legacy `companion/nomi/` install into the split.
+//! API surface. v3 starts from a fresh companion dataset; non-v3 layouts are
+//! rejected and must be removed by the app-level dataset reset before this crate opens.
 
 pub mod collector;
 pub mod companion;
@@ -25,7 +26,6 @@ mod fsio;
 pub mod gamify;
 pub mod learner;
 pub mod matting_model;
-pub mod migrate;
 pub mod profile;
 pub mod prompt;
 pub mod registry;
@@ -34,8 +34,8 @@ pub mod service;
 pub mod skill_sink;
 pub mod state;
 pub mod store;
+mod skill_io;
 
-pub use config::CompanionConfig;
 pub use events::CompanionEventEmitter;
 pub use figures::FigureMeta;
 pub use profile::{CustomFigureMeta, HeadBox, CompanionProfileConfig, CompanionWindowConfig, SharedArchiveConfig, SharedLearnConfig, SharedCompanionConfig};
@@ -44,11 +44,6 @@ pub use routes::{companion_public_routes, companion_routes};
 pub use service::CompanionService;
 pub use state::CompanionRouterState;
 pub use store::CompanionStore;
-
-/// Legacy single-companion directory (under the backend data dir). Kept only so
-/// boot can detect and migrate a pre-multi-companion install; new code must use
-/// [`COMPANION_SHARED_REL_DIR`] / [`COMPANION_COMPANIONS_REL_DIR`].
-pub const COMPANION_REL_DIR: &str = "companion/nomi";
 
 /// Shared multi-companion artifacts (under the backend data dir): shared
 /// `config.json`, `events/*.jsonl`, `memory.db`.

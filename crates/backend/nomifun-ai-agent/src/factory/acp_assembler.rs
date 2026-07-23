@@ -159,7 +159,7 @@ fn resolve_mcp_servers(
         let kb_ids: Vec<nomifun_common::KnowledgeBaseId> = config
             .knowledge_mounts
             .iter()
-            .map(|m| m.id.clone())
+            .map(|m| m.knowledge_base_id.clone())
             .collect();
         if let Some((server, lease)) = knowledge_mcp_server(
             cfg,
@@ -639,19 +639,19 @@ mod tests {
     #[test]
     fn knowledge_context_section_is_none_without_mounts() {
         let config = AcpBuildExtra::default();
-        assert_eq!(build_knowledge_context_section(&config, "conv_0190f5fe-7c00-7a00-8abc-012345678963"), None);
+        assert_eq!(build_knowledge_context_section(&config, "0190f5fe-7c00-7a00-8abc-012345678963"), None);
     }
 
     #[test]
     fn process_owned_gateway_config_injects_gateway_mcp_server() {
         let config = AcpBuildExtra {
             gateway_mcp_config: Some(gateway_config(41236, "/usr/bin/nomicore", "owner")),
-            user_id: Some("user_0190f5fe-7c00-7a00-8abc-012345678961".into()),
-            companion_id: Some("companion_0190f5fe-7c00-7a00-8abc-012345678965".into()),
+            user_id: Some("0190f5fe-7c00-7a00-8abc-012345678961".into()),
+            companion_id: Some("0190f5fe-7c00-7a00-8abc-012345678965".into()),
             session_mode: Some("yolo".into()),
             ..Default::default()
         };
-        let (servers, _leases) = resolve_mcp_servers(&config, "conv_0190f5fe-7c00-7a00-8abc-012345678963", "/workspace", vec![]);
+        let (servers, _leases) = resolve_mcp_servers(&config, "0190f5fe-7c00-7a00-8abc-012345678963", "/workspace", vec![]);
         let rendered = serde_json::to_string(&servers).expect("McpServer serializes");
         assert!(rendered.contains("mcp-gateway-stdio"), "got {rendered}");
         assert!(
@@ -667,9 +667,9 @@ mod tests {
             rendered.contains(GatewayMcpConfig::PROFILE_WORK),
             "got {rendered}"
         );
-        assert!(rendered.contains("conv_0190f5fe-7c00-7a00-8abc-012345678963"), "got {rendered}");
-        assert!(rendered.contains("user_0190f5fe-7c00-7a00-8abc-012345678961"), "got {rendered}");
-        assert!(rendered.contains("companion_0190f5fe-7c00-7a00-8abc-012345678965"), "got {rendered}");
+        assert!(rendered.contains("0190f5fe-7c00-7a00-8abc-012345678963"), "got {rendered}");
+        assert!(rendered.contains("0190f5fe-7c00-7a00-8abc-012345678961"), "got {rendered}");
+        assert!(rendered.contains("0190f5fe-7c00-7a00-8abc-012345678965"), "got {rendered}");
         assert!(
             !rendered.contains("gw-root-secret"),
             "root Gateway issuer secret must never leave the backend: {rendered}"
@@ -680,12 +680,12 @@ mod tests {
     fn gateway_env_omits_companion_id_when_unbound() {
         let config = AcpBuildExtra {
             gateway_mcp_config: Some(gateway_config(41236, "/usr/bin/nomicore", "owner")),
-            user_id: Some("user_0190f5fe-7c00-7a00-8abc-012345678961".into()),
+            user_id: Some("0190f5fe-7c00-7a00-8abc-012345678961".into()),
             companion_id: None,
             channel_platform: None,
             ..Default::default()
         };
-        let (servers, _leases) = resolve_mcp_servers(&config, "conv_0190f5fe-7c00-7a00-8abc-012345678963", "/workspace", vec![]);
+        let (servers, _leases) = resolve_mcp_servers(&config, "0190f5fe-7c00-7a00-8abc-012345678963", "/workspace", vec![]);
         let rendered = serde_json::to_string(&servers).expect("McpServer serializes");
         assert!(
             !rendered.contains("companion_id"),
@@ -697,11 +697,11 @@ mod tests {
     fn gateway_env_uses_lite_profile_for_channel_sessions() {
         let config = AcpBuildExtra {
             gateway_mcp_config: Some(gateway_config(41236, "/usr/bin/nomicore", "owner")),
-            user_id: Some("user_0190f5fe-7c00-7a00-8abc-012345678961".into()),
+            user_id: Some("0190f5fe-7c00-7a00-8abc-012345678961".into()),
             channel_platform: Some("lark".into()),
             ..Default::default()
         };
-        let (servers, _leases) = resolve_mcp_servers(&config, "conv_0190f5fe-7c00-7a00-8abc-012345678963", "/workspace", vec![]);
+        let (servers, _leases) = resolve_mcp_servers(&config, "0190f5fe-7c00-7a00-8abc-012345678963", "/workspace", vec![]);
         let rendered = serde_json::to_string(&servers).expect("McpServer serializes");
         assert!(
             rendered.contains(GatewayMcpConfig::PROFILE_LITE),
@@ -715,17 +715,17 @@ mod tests {
             gateway_mcp_config: None,
             ..Default::default()
         };
-        let (servers, _leases) = resolve_mcp_servers(&config, "conv_0190f5fe-7c00-7a00-8abc-012345678963", "/workspace", vec![]);
+        let (servers, _leases) = resolve_mcp_servers(&config, "0190f5fe-7c00-7a00-8abc-012345678963", "/workspace", vec![]);
         let rendered = serde_json::to_string(&servers).expect("McpServer serializes");
         assert!(!rendered.contains("mcp-gateway-stdio"), "got {rendered}");
     }
 
     #[test]
     fn knowledge_context_section_renders_mounts_and_writeback() {
-        let conversation_id = "conv_0190f5fe-7c00-7a00-8abc-012345678963";
+        let conversation_id = "0190f5fe-7c00-7a00-8abc-012345678963";
         let mut config = AcpBuildExtra {
             knowledge_mounts: vec![nomifun_api_types::KnowledgeMountInfo {
-                id: nomifun_common::KnowledgeBaseId::new(),
+                knowledge_base_id: nomifun_common::KnowledgeBaseId::new(),
                 name: "领域知识".into(),
                 description: "团队约定".into(),
                 rel_path: ".nomi/knowledge/领域知识".into(),
@@ -813,7 +813,7 @@ mod tests {
             knowledge_writeback_eagerness: None,
         };
         let user = vec![user_stdio("ctx7"), user_stdio("playwright")];
-        let (servers, _leases) = resolve_mcp_servers(&config, "conv_0190f5fe-7c00-7a00-8abc-012345678963", "/workspace", user);
+        let (servers, _leases) = resolve_mcp_servers(&config, "0190f5fe-7c00-7a00-8abc-012345678963", "/workspace", user);
         assert_eq!(servers.len(), 2);
         let names: Vec<_> = servers
             .iter()
@@ -860,7 +860,7 @@ mod tests {
             knowledge_writeback_eagerness: None,
         };
         let (servers, _leases) =
-            resolve_mcp_servers(&config, "conv_0190f5fe-7c00-7a00-8abc-012345678963", "/workspace", Vec::new());
+            resolve_mcp_servers(&config, "0190f5fe-7c00-7a00-8abc-012345678963", "/workspace", Vec::new());
         assert!(servers.is_empty());
     }
 
@@ -869,12 +869,12 @@ mod tests {
         let config = AcpBuildExtra {
             backend: Some("claude".into()),
             requirement_mcp_config: Some(requirement_config(41000, "/bin/backend")),
-            user_id: Some("user_0190f5fe-7c00-7a00-8abc-012345678962".into()),
+            user_id: Some("0190f5fe-7c00-7a00-8abc-012345678962".into()),
             ..Default::default()
         };
         let (servers, leases) = resolve_mcp_servers(
             &config,
-            "conv_0190f5fe-7c00-7a00-8000-000000000009",
+            "0190f5fe-7c00-7a00-8000-000000000009",
             "/workspace",
             Vec::new(),
         );
@@ -1037,13 +1037,13 @@ mod tests {
         let config = AcpBuildExtra {
             backend: Some("claude".into()),
             requirement_mcp_config: Some(requirement_config(41000, "/bin/backend")),
-            user_id: Some("user_0190f5fe-7c00-7a00-8abc-012345678962".into()),
+            user_id: Some("0190f5fe-7c00-7a00-8abc-012345678962".into()),
             ..Default::default()
         };
         let user = vec![user_stdio("ctx7")];
         let (servers, _leases) = resolve_mcp_servers(
             &config,
-            "conv_0190f5fe-7c00-7a00-8000-000000000001",
+            "0190f5fe-7c00-7a00-8000-000000000001",
             "/workspace",
             user,
         );
@@ -1060,7 +1060,7 @@ mod tests {
 
     fn knowledge_mount(id: &str) -> nomifun_api_types::KnowledgeMountInfo {
         nomifun_api_types::KnowledgeMountInfo {
-            id: nomifun_common::KnowledgeBaseId::parse(id).expect("canonical knowledge base test id"),
+            knowledge_base_id: nomifun_common::KnowledgeBaseId::parse(id).expect("canonical knowledge base test id"),
             name: "领域知识".into(),
             description: "团队约定".into(),
             rel_path: format!(".nomi/knowledge/{id}"),
@@ -1085,12 +1085,12 @@ mod tests {
         let config_a = AcpBuildExtra {
             backend: Some("claude".into()),
             knowledge_mcp_config: Some(cfg.clone()),
-            knowledge_mounts: vec![knowledge_mount("kb_0190f5fe-7c00-7a00-8abc-012345678969")],
-            user_id: Some("user_0190f5fe-7c00-7a00-8abc-012345678962".into()),
+            knowledge_mounts: vec![knowledge_mount("0190f5fe-7c00-7a00-8abc-012345678969")],
+            user_id: Some("0190f5fe-7c00-7a00-8abc-012345678962".into()),
             ..Default::default()
         };
         let (servers, leases) =
-            resolve_mcp_servers(&config_a, "conv_0190f5fe-7c00-7a00-8abc-012345678964", "/workspace", Vec::new());
+            resolve_mcp_servers(&config_a, "0190f5fe-7c00-7a00-8abc-012345678964", "/workspace", Vec::new());
         assert_eq!(leases.len(), 1);
         let kb_server = servers
             .iter()
@@ -1118,7 +1118,7 @@ mod tests {
         let baked = env_val(nomifun_api_types::KnowledgeMcpConfig::ENV_CAPABILITY)
             .expect("knowledge capability bootstrap env must be set");
         assert!(
-            baked.contains("kb_0190f5fe-7c00-7a00-8abc-012345678969"),
+            baked.contains("0190f5fe-7c00-7a00-8abc-012345678969"),
             "baked kb_ids must carry the mount id, got {baked}"
         );
         // Invariant 3: port + access + renewal proof are one immutable value.
@@ -1141,7 +1141,7 @@ mod tests {
             ..Default::default()
         };
         let (servers_b, _leases) =
-            resolve_mcp_servers(&config_b, "conv_0190f5fe-7c00-7a00-8abc-012345678964", "/workspace", Vec::new());
+            resolve_mcp_servers(&config_b, "0190f5fe-7c00-7a00-8abc-012345678964", "/workspace", Vec::new());
         assert!(
             !servers_b.iter().any(|s| matches!(
                 s,
@@ -1154,11 +1154,11 @@ mod tests {
         let config_c = AcpBuildExtra {
             backend: Some("claude".into()),
             knowledge_mcp_config: None,
-            knowledge_mounts: vec![knowledge_mount("kb_0190f5fe-7c00-7a00-8abc-012345678969")],
+            knowledge_mounts: vec![knowledge_mount("0190f5fe-7c00-7a00-8abc-012345678969")],
             ..Default::default()
         };
         let (servers_c, _leases) =
-            resolve_mcp_servers(&config_c, "conv_0190f5fe-7c00-7a00-8abc-012345678964", "/workspace", Vec::new());
+            resolve_mcp_servers(&config_c, "0190f5fe-7c00-7a00-8abc-012345678964", "/workspace", Vec::new());
         assert!(
             !servers_c.iter().any(|s| matches!(
                 s,
@@ -1176,10 +1176,10 @@ mod tests {
         // config + mount → section promises the search tool.
         let with = AcpBuildExtra {
             knowledge_mcp_config: Some(cfg.clone()),
-            knowledge_mounts: vec![knowledge_mount("kb_0190f5fe-7c00-7a00-8abc-012345678969")],
+            knowledge_mounts: vec![knowledge_mount("0190f5fe-7c00-7a00-8abc-012345678969")],
             ..Default::default()
         };
-        let section = build_knowledge_context_section(&with, "conv_0190f5fe-7c00-7a00-8abc-012345678964").expect("section renders");
+        let section = build_knowledge_context_section(&with, "0190f5fe-7c00-7a00-8abc-012345678964").expect("section renders");
         assert!(
             section.contains("knowledge_search"),
             "section must advertise the search tool when injected, got {section}"
@@ -1187,11 +1187,11 @@ mod tests {
         // mount but NO config → no search tool promised (it is not injected).
         let without = AcpBuildExtra {
             knowledge_mcp_config: None,
-            knowledge_mounts: vec![knowledge_mount("kb_0190f5fe-7c00-7a00-8abc-012345678969")],
+            knowledge_mounts: vec![knowledge_mount("0190f5fe-7c00-7a00-8abc-012345678969")],
             ..Default::default()
         };
         let section_no =
-            build_knowledge_context_section(&without, "conv_0190f5fe-7c00-7a00-8abc-012345678964").expect("section renders");
+            build_knowledge_context_section(&without, "0190f5fe-7c00-7a00-8abc-012345678964").expect("section renders");
         assert!(
             !section_no.contains("knowledge_search"),
             "section must NOT advertise an uninjected search tool, got {section_no}"

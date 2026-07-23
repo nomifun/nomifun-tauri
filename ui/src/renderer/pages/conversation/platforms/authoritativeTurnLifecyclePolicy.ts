@@ -9,13 +9,13 @@ export const classifyAuthoritativeTurnStart = ({
   awaitingBackendTurn,
   verifyUnannouncedStartRuntime,
 }: {
-  turnId?: MessageId;
+  turnId: MessageId;
   cancelledTurnIds: ReadonlySet<MessageId>;
   rejectUnannouncedStart: boolean;
   awaitingBackendTurn: boolean;
   verifyUnannouncedStartRuntime: boolean;
 }): AuthoritativeTurnStartAction => {
-  if (turnId && cancelledTurnIds.has(turnId)) return 'ignore';
+  if (cancelledTurnIds.has(turnId)) return 'ignore';
   // With a known stopped root, its tombstone is precise: a different turn id
   // is a genuinely newer turn and must be allowed to invalidate the pending
   // stop continuation. Unknown-root stops retain the runtime-verification

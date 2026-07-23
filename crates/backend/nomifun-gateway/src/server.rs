@@ -336,9 +336,9 @@ mod tests {
     use super::*;
     use nomifun_common::UserId;
 
-    const TEST_OWNER_ID: &str = "user_0190f5fe-7c00-7a00-8000-000000000001";
-    const TEST_CONVERSATION_ID: &str = "conv_0190f5fe-7c00-7a00-8000-000000000001";
-    const OTHER_CONVERSATION_ID: &str = "conv_0190f5fe-7c00-7a00-8000-000000000002";
+    const TEST_OWNER_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const TEST_CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const OTHER_CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000002";
 
     fn child(
         server: &GatewayMcpServer,
@@ -525,7 +525,7 @@ mod tests {
         let claims = GatewayCapabilityClaims::issue(
             TEST_OWNER_ID,
             nomifun_common::LoopbackSessionBinding::terminal(
-                "term_0190f5fe-7c00-7a00-8000-000000000001",
+                "0190f5fe-7c00-7a00-8000-000000000001",
             ),
             [
                 nomifun_api_types::GATEWAY_LIST_TOOLS_OPERATION,
@@ -572,13 +572,13 @@ mod tests {
         let ctx = CallerCtx::default();
         assert_eq!(require_user(&ctx).unwrap(), ctx.user_id.as_str());
         let ctx = CallerCtx {
-            user_id: UserId::parse("user_0190f5fe-7c00-7a00-8000-000000000001")
+            user_id: UserId::parse("0190f5fe-7c00-7a00-8000-000000000001")
                 .unwrap(),
             ..Default::default()
         };
         assert_eq!(
             require_user(&ctx).unwrap(),
-            "user_0190f5fe-7c00-7a00-8000-000000000001"
+            "0190f5fe-7c00-7a00-8000-000000000001"
         );
     }
 }

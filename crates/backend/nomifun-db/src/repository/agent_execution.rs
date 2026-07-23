@@ -99,7 +99,7 @@ pub struct CreateAgentExecutionParams {
 
 #[derive(Debug, Clone)]
 pub struct NewAgentExecutionParticipant {
-    pub id: String,
+    pub participant_id: String,
     pub source_agent_id: String,
     pub preset_id: Option<String>,
     pub preset_revision: Option<i64>,
@@ -128,7 +128,7 @@ pub struct UpdateAgentExecutionParams {
 
 #[derive(Debug, Clone)]
 pub struct NewAgentExecutionStep {
-    pub id: String,
+    pub step_id: String,
     pub title: String,
     pub spec: String,
     pub role: Option<String>,
@@ -240,7 +240,6 @@ pub struct AttemptConversationEffectResult {
 
 #[derive(Debug, Clone)]
 pub struct PendingConversationCleanup {
-    pub link_id: String,
     pub execution_id: String,
     pub user_id: String,
     pub conversation_id: String,
@@ -623,7 +622,8 @@ pub trait IAgentExecutionRepository: Send + Sync {
     ) -> Result<Vec<PendingConversationCleanup>, DbError>;
     async fn mark_conversation_cleanup_completed(
         &self,
-        link_id: &str,
+        execution_id: &str,
+        conversation_id: &str,
         completed_at: i64,
     ) -> Result<bool, DbError>;
 
@@ -647,7 +647,8 @@ pub trait IAgentExecutionRepository: Send + Sync {
     ) -> Result<Vec<AgentExecutionEventRow>, DbError>;
     async fn mark_event_published(
         &self,
-        event_id: &str,
+        execution_id: &str,
+        sequence: i64,
         published_at: i64,
     ) -> Result<bool, DbError>;
 

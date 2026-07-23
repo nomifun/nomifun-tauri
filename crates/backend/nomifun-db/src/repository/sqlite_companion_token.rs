@@ -100,7 +100,15 @@ mod tests {
     #[tokio::test]
     async fn list_all_rejects_noncanonical_persisted_owner() {
         let db = init_database_memory().await.unwrap();
+        sqlx::query("PRAGMA ignore_check_constraints = ON")
+            .execute(db.pool())
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO companion_access_token (companion_id, token_hash, created_at) VALUES ('1', 'hash', 1)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA ignore_check_constraints = OFF")
             .execute(db.pool())
             .await
             .unwrap();

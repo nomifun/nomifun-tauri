@@ -17,9 +17,9 @@ use nomifun_api_types::{
 };
 use nomifun_common::{
     AdaptationPolicy, AgentDelegationTask, AgentExecutionActor, AgentExecutionActorType,
-    AgentExecutionEventKind, AgentExecutionReceipt, AgentExecutionStatus, AgentStepMode,
-    AgentToolPolicy, DecisionPolicy, DelegationPolicy, ExecutionStepKind,
-    ParallelDelegationRequest, PlanGate, StepFailurePolicy,
+    AgentExecutionEventKind, AgentExecutionId, AgentExecutionReceipt, AgentExecutionStatus,
+    AgentStepMode, AgentToolPolicy, DecisionPolicy, DelegationPolicy, ExecutionStepKind, PlanGate,
+    ProviderId, StepFailurePolicy,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -34,17 +34,42 @@ use crate::provider_support;
 
 const MAX_EXPLICIT_STEPS: usize = 16;
 
+fn deserialize_uuidv7_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+    nomifun_common::validate_uuidv7(&value)
+        .map(|_| value)
+        .map_err(serde::de::Error::custom)
+}
+
+fn deserialize_model_name<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() || value.trim() != value {
+        return Err(serde::de::Error::custom(
+            "model must be a non-empty trimmed natural key",
+        ));
+    }
+    Ok(value)
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ModelRefParam {
-    provider_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    provider_id: ProviderId,
+    #[serde(deserialize_with = "deserialize_model_name")]
     model: String,
 }
 
 impl From<ModelRefParam> for ExecutionModelRef {
     fn from(value: ModelRefParam) -> Self {
         Self {
-            provider_id: value.provider_id,
+            provider_id: value.provider_id.into_string(),
             model: value.model,
         }
     }
@@ -138,60 +163,51 @@ impl From<DecisionPolicyParam> for DecisionPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum PlannedDelegationStrategy {
-    Planned,
-}
-
-/// Platform-only aggregate settings belong to planned execution creation;
-/// `strategy=parallel` uses the exact shared DTO accepted by embedded hosts.
 #[derive(Clone, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct PlannedDelegationRequest {
-    /// Exactly `planned`. Planned requests never include `tasks` or
-    /// `synthesize`; those fields belong only to `strategy=parallel`.
-    #[serde(rename = "strategy")]
-    _strategy: PlannedDelegationStrategy,
-    /// Complete objective for the lead Agent to decompose into a dependency DAG.
-    goal: String,
-    /// Optional execution directory. Omit to inherit the conversation workspace.
-    #[serde(default)]
-    work_dir: Option<String>,
-    /// Optional model authority as a native JSON object, never a JSON string.
-    #[serde(default)]
-    model_pool: Option<ModelPoolParam>,
-    /// Optional planning approval policy.
-    #[serde(default)]
-    plan_gate: Option<PlanGateParam>,
-    /// Optional fixed/adaptive replanning policy.
-    #[serde(default)]
-    adaptation_policy: Option<AdaptationPolicyParam>,
-    /// Optional integer concurrency limit.
-    #[serde(default)]
-    max_parallel: Option<i64>,
-}
-
-#[derive(Clone, Deserialize, JsonSchema)]
-#[serde(untagged)]
+#[serde(tag = "strategy", rename_all = "snake_case", deny_unknown_fields)]
 enum DelegateParams {
     /// Let the lead Agent create a dependency DAG from one goal.
-    Planned(PlannedDelegationRequest),
+    Planned {
+        /// Complete objective for the lead Agent to decompose into a dependency DAG.
+        goal: String,
+        /// Optional execution directory. Omit to inherit the conversation workspace.
+        #[serde(default)]
+        work_dir: Option<String>,
+        /// Optional model authority as a native JSON object, never a JSON string.
+        #[serde(default)]
+        model_pool: Option<ModelPoolParam>,
+        /// Optional planning approval policy.
+        #[serde(default)]
+        plan_gate: Option<PlanGateParam>,
+        /// Optional fixed/adaptive replanning policy.
+        #[serde(default)]
+        adaptation_policy: Option<AdaptationPolicyParam>,
+        /// Optional integer concurrency limit.
+        #[serde(default)]
+        max_parallel: Option<i64>,
+    },
     /// Execute independent Agent steps, optionally followed by one synthesis.
-    Parallel(ParallelDelegationRequest),
+    Parallel {
+        #[schemars(length(min = 1, max = 16))]
+        tasks: Vec<AgentDelegationTask>,
+        #[serde(default)]
+        synthesize: bool,
+    },
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ExecutionGetParams {
-    execution_id: String,
+    #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+    execution_id: AgentExecutionId,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 enum ExecutionUpdateParams {
     Replan {
-        execution_id: String,
+        #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+        execution_id: AgentExecutionId,
         expected_version: i64,
         #[serde(default)]
         goal: Option<String>,
@@ -207,24 +223,30 @@ enum ExecutionUpdateParams {
         decision_policy: Option<DecisionPolicyParam>,
     },
     Adjust {
-        execution_id: String,
+        #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+        execution_id: AgentExecutionId,
         expected_version: i64,
         intent: String,
     },
     Add {
-        execution_id: String,
+        #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+        execution_id: AgentExecutionId,
         expected_version: i64,
         steps: Vec<AgentDelegationTask>,
         #[serde(default)]
         synthesize: bool,
     },
     Rename {
-        execution_id: String,
+        #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+        execution_id: AgentExecutionId,
         expected_version: i64,
         goal: String,
     },
     UpdateStep {
-        execution_id: String,
+        #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+        execution_id: AgentExecutionId,
+        /// Stable execution-step business ID.
+        #[serde(deserialize_with = "deserialize_uuidv7_id")]
         step_id: String,
         expected_execution_version: i64,
         expected_step_version: i64,
@@ -234,16 +256,24 @@ enum ExecutionUpdateParams {
         spec: Option<String>,
     },
     Reassign {
-        execution_id: String,
+        #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+        execution_id: AgentExecutionId,
+        /// Stable execution-step business ID.
+        #[serde(deserialize_with = "deserialize_uuidv7_id")]
         step_id: String,
         expected_execution_version: i64,
         expected_step_version: i64,
+        /// Stable execution-participant business ID.
+        #[serde(deserialize_with = "deserialize_uuidv7_id")]
         participant_id: String,
         #[serde(default)]
         locked: bool,
     },
     Configure {
-        execution_id: String,
+        #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+        execution_id: AgentExecutionId,
+        /// Stable execution-step business ID.
+        #[serde(deserialize_with = "deserialize_uuidv7_id")]
         step_id: String,
         expected_execution_version: i64,
         expected_step_version: i64,
@@ -257,32 +287,42 @@ enum ExecutionUpdateParams {
         clear_preset_prompt: bool,
     },
     Steer {
-        execution_id: String,
+        #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+        execution_id: AgentExecutionId,
+        /// Stable execution-step business ID.
+        #[serde(deserialize_with = "deserialize_uuidv7_id")]
         step_id: String,
         expected_execution_version: i64,
         expected_step_version: i64,
         text: String,
     },
     Retry {
-        execution_id: String,
+        #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+        execution_id: AgentExecutionId,
+        /// Stable execution-step business ID.
+        #[serde(deserialize_with = "deserialize_uuidv7_id")]
         step_id: String,
         expected_execution_version: i64,
         expected_step_version: i64,
     },
     Approve {
-        execution_id: String,
+        #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+        execution_id: AgentExecutionId,
         expected_version: i64,
     },
     Pause {
-        execution_id: String,
+        #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+        execution_id: AgentExecutionId,
         expected_version: i64,
     },
     Resume {
-        execution_id: String,
+        #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+        execution_id: AgentExecutionId,
         expected_version: i64,
     },
     Cancel {
-        execution_id: String,
+        #[schemars(schema_with = "crate::id_schema::canonical_uuid_v7_schema")]
+        execution_id: AgentExecutionId,
         expected_version: i64,
         /// Cancelling is the sole destructive operation in this multiplexed
         /// tool. Desktop and Remote require an explicit second call; Channel
@@ -324,7 +364,7 @@ fn update_operation_gate(params: &ExecutionUpdateParams, surface: Surface) -> Op
 }
 
 impl ExecutionUpdateParams {
-    fn execution_id(&self) -> Option<&str> {
+    fn execution_id(&self) -> Option<&AgentExecutionId> {
         match self {
             Self::Replan { execution_id, .. }
             | Self::Adjust { execution_id, .. }
@@ -477,7 +517,7 @@ async fn create_context(
         .get(ctx.user_id.as_str(), &conversation_id)
         .await
         .map_err(|error| error.to_string())?;
-    let conversation_id = conversation.id.clone();
+    let conversation_id = conversation.conversation_id.clone();
     let lead_model = conversation.model.as_ref().map(|model| {
         ExecutionModelRef {
             provider_id: model.provider_id.clone(),
@@ -603,7 +643,7 @@ async fn remote_create_context(
         Some(id) => deps.conversation_service.get(ctx.user_id.as_str(), &id).await.ok(),
         None => None,
     };
-    let (model, _) = provider_support::resolve_nomi_model(deps, ctx, None, None)
+    let (model, _) = provider_support::resolve_nomi_model(deps, ctx, None)
         .await
         .map_err(|error| {
             error
@@ -736,15 +776,14 @@ async fn delegate(deps: Arc<GatewayDeps>, ctx: CallerCtx, params: DelegateParams
     };
     let (goal, work_dir, model_pool, plan_gate, adaptation_policy, max_parallel, steps) =
         match params {
-            DelegateParams::Planned(PlannedDelegationRequest {
-                _strategy: _,
+            DelegateParams::Planned {
                 goal,
                 work_dir,
                 model_pool,
                 plan_gate,
                 adaptation_policy,
                 max_parallel,
-            }) => (
+            } => (
                 goal,
                 work_dir,
                 model_pool,
@@ -753,15 +792,21 @@ async fn delegate(deps: Arc<GatewayDeps>, ctx: CallerCtx, params: DelegateParams
                 max_parallel,
                 None,
             ),
-            DelegateParams::Parallel(request) => {
-                if let Err(error) = request.validate() {
-                    return json!({"error":error});
+            DelegateParams::Parallel { tasks, synthesize } => {
+                if tasks.is_empty() || tasks.len() > MAX_EXPLICIT_STEPS {
+                    return json!({
+                        "error": format!(
+                            "parallel delegation requires 1-{MAX_EXPLICIT_STEPS} tasks"
+                        )
+                    });
                 }
-                let ParallelDelegationRequest {
-                    strategy: _,
-                    tasks,
-                    synthesize,
-                } = request;
+                for (index, task) in tasks.iter().enumerate() {
+                    if let Err(error) = task.validate() {
+                        return json!({
+                            "error": format!("parallel task {index}: {error}")
+                        });
+                    }
+                }
                 let goal = format!(
                     "Complete the delegated work: {}",
                     tasks
@@ -776,7 +821,7 @@ async fn delegate(deps: Arc<GatewayDeps>, ctx: CallerCtx, params: DelegateParams
                 };
                 (goal, None, None, None, None, None, steps)
             }
-    };
+        };
     let explicit_model_pool = model_pool.is_some();
     // Keep the caller's semantic request separate from the resolved effective
     // pool. The latter may change after a successful commit; replay identity
@@ -818,11 +863,16 @@ async fn delegate(deps: Arc<GatewayDeps>, ctx: CallerCtx, params: DelegateParams
         {
             Ok((detail, added_step_ids)) => ok(
                 delegate_receipt(
-                    detail.execution.id,
+                    detail.execution.execution_id,
                     detail.execution.status,
                     "Delegated steps were appended to the current execution. End this Attempt turn now; the aggregate scheduler will run them when capacity is available.",
                 )
-                .with_step_ids(added_step_ids),
+                .with_step_ids(
+                    added_step_ids
+                        .into_iter()
+                        .map(|id| id.to_string())
+                        .collect(),
+                ),
             ),
             Err(error) => json!({"error":error.to_string()}),
         };
@@ -892,7 +942,7 @@ async fn delegate(deps: Arc<GatewayDeps>, ctx: CallerCtx, params: DelegateParams
     };
     match created {
         Ok(execution) => ok(delegate_receipt(
-            execution.id,
+            execution.execution_id,
             execution.status,
             "Delegated work was accepted. It will continue in the collaboration panel; inspect it only when progress is needed.",
         )),
@@ -1366,12 +1416,12 @@ mod tests {
     use super::*;
     use crate::registry::Registry;
 
-    const ATTEMPT_ID: &str = "eattempt_0190f5fe-7c00-7a00-8000-000000000001";
-    const CONVERSATION_ID: &str = "conv_0190f5fe-7c00-7a00-8000-000000000001";
-    const EXECUTION_ID: &str = "exec_0190f5fe-7c00-7a00-8000-000000000001";
-    const PROVIDER_ID_A: &str = "prov_0190f5fe-7c00-7a00-8000-000000000001";
-    const PROVIDER_ID_B: &str = "prov_0190f5fe-7c00-7a00-8000-000000000002";
-    const STEP_ID: &str = "execstep_0190f5fe-7c00-7a00-8000-000000000001";
+    const ATTEMPT_ID: &str = "0190f5fe-7c00-7a00-8000-000000000003";
+    const CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const EXECUTION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const PROVIDER_ID_A: &str = "0190f5fe-7c00-7a00-8000-000000000001";
+    const PROVIDER_ID_B: &str = "0190f5fe-7c00-7a00-8000-000000000002";
+    const STEP_ID: &str = "0190f5fe-7c00-7a00-8000-000000000004";
 
     #[test]
     fn model_surface_is_exactly_three_execution_tools() {
@@ -1502,7 +1552,7 @@ mod tests {
             "synthesize": true
         }))
         .unwrap();
-        assert!(matches!(parsed, DelegateParams::Parallel(_)));
+        assert!(matches!(parsed, DelegateParams::Parallel { .. }));
 
         for forbidden in ["work_dir", "model_pool", "plan_gate", "adaptation_policy", "max_parallel"] {
             let mut request = json!({
@@ -1606,7 +1656,7 @@ mod tests {
     fn attempt_actor_cannot_bypass_delegate_with_generic_graph_commands() {
         let actor = AgentExecutionActor::agent(CONVERSATION_ID, Some(ATTEMPT_ID.to_owned()));
         let add = ExecutionUpdateParams::Add {
-            execution_id: EXECUTION_ID.to_owned(),
+            execution_id: AgentExecutionId::parse(EXECUTION_ID).unwrap(),
             expected_version: 1,
             steps: vec![AgentDelegationTask {
                 name: "bypass".to_owned(),
@@ -1632,7 +1682,7 @@ mod tests {
     #[test]
     fn cancel_dispatch_gate_uses_the_destructive_surface_matrix() {
         let cancel = |confirm| ExecutionUpdateParams::Cancel {
-            execution_id: EXECUTION_ID.to_owned(),
+            execution_id: AgentExecutionId::parse(EXECUTION_ID).unwrap(),
             expected_version: 3,
             confirm,
         };

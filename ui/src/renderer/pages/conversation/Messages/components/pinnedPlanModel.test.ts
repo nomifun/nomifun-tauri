@@ -15,7 +15,7 @@ function planMsg(entries: PlanEntry[], id = 'p1', status?: IMessagePlan['status'
   return {
     id,
     type: 'plan',
-    conversation_id: parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000006'),
+    conversation_id: parseConversationId('0190f5fe-7c00-7a00-8000-000000000006'),
     content: { session_id: 's1', entries },
     status,
   };
@@ -25,7 +25,7 @@ function textMsg(id = 't1'): TMessage {
   return {
     id,
     type: 'text',
-    conversation_id: parseConversationId('conv_0190f5fe-7c00-7a00-8000-000000000006'),
+    conversation_id: parseConversationId('0190f5fe-7c00-7a00-8000-000000000006'),
     content: { content: 'hi' },
   } as TMessage;
 }

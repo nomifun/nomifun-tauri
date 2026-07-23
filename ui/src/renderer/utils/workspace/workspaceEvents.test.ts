@@ -10,17 +10,17 @@ import { isWorkspacePanelEventForTarget } from '@/renderer/pages/conversation/co
 
 describe('workspace event targets', () => {
   test('uses both kind and id when matching a session', () => {
-    const conversation = conversationTarget('conv_0190f5fe-7c00-7a00-8000-000000000001');
+    const conversation = conversationTarget('0190f5fe-7c00-7a00-8000-000000000001');
     expect(isWorkspacePanelEventForTarget(conversation, conversation)).toBe(true);
     expect(
       isWorkspacePanelEventForTarget(
-        terminalTarget('term_0190f5fe-7c00-7a00-8000-000000000001'),
+        terminalTarget('0190f5fe-7c00-7a00-8000-000000000001'),
         conversation,
       ),
     ).toBe(false);
     expect(
       isWorkspacePanelEventForTarget(
-        conversationTarget('conv_0190f5fe-7c00-7a00-8000-000000000002'),
+        conversationTarget('0190f5fe-7c00-7a00-8000-000000000002'),
         conversation,
       ),
     ).toBe(false);
@@ -30,7 +30,7 @@ describe('workspace event targets', () => {
     expect(
       isWorkspacePanelEventForTarget(
         undefined,
-        conversationTarget('conv_0190f5fe-7c00-7a00-8000-000000000001'),
+        conversationTarget('0190f5fe-7c00-7a00-8000-000000000001'),
       ),
     ).toBe(false);
   });

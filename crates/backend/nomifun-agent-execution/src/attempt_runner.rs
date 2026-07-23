@@ -472,7 +472,7 @@ impl AttemptRunner for ConversationAttemptRunner {
 
         // This callback is awaited before the Agent can start. An outbox/link
         // failure leaves no untracked in-flight turn.
-        if let Err(error) = on_started(conversation.id.clone()).await {
+        if let Err(error) = on_started(conversation.conversation_id.clone()).await {
             // If the link commit succeeded but its acknowledgement was lost,
             // the Conversation deletion guard rejects this cleanup.  Otherwise
             // the creation key and row are removed together, leaving no orphan.
@@ -493,7 +493,7 @@ impl AttemptRunner for ConversationAttemptRunner {
         let operation_id = format!("{attempt_creation_key}:initial-turn");
         self.deliver_turn(
             owner_id,
-            &conversation.id,
+            &conversation.conversation_id,
             &operation_id,
             step_spec,
             "agent_execution",
@@ -697,7 +697,7 @@ impl<'a> TurnArtifactProjection<'a> {
             if is_right_turn_boundary(message) {
                 if self
                     .boundary_message_id
-                    .map_or(true, |boundary| message.id == boundary)
+                    .map_or(true, |boundary| message.message_id == boundary)
                 {
                     self.boundary_seen = true;
                     return;
@@ -756,7 +756,7 @@ impl<'a> TurnArtifactProjection<'a> {
 }
 
 fn is_right_turn_boundary(message: &MessageResponse) -> bool {
-    message.msg_id.as_deref() == Some(message.id.as_str())
+    message.msg_id.as_deref() == Some(message.message_id.as_str())
         && message.r#type == MessageType::Text
         && message.position == Some(MessagePosition::Right)
         && message.status == Some(MessageStatus::Finish)
@@ -951,8 +951,16 @@ fn error_summary(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nomifun_common::TimestampMs;
+    use nomifun_common::{TimestampMs, generate_id};
     use sha2::{Digest, Sha256};
+
+    const CONVERSATION_ID: &str = "0190f5fe-7c00-7a00-8000-000000000201";
+    const CURRENT_WIRE_TURN_ID: &str = "0190f5fe-7c00-7a00-8000-000000000211";
+    const CURRENT_USER_TURN_ID: &str = "0190f5fe-7c00-7a00-8000-000000000212";
+    const NEWER_WIRE_TURN_ID: &str = "0190f5fe-7c00-7a00-8000-000000000213";
+    const NEWER_USER_TURN_ID: &str = "0190f5fe-7c00-7a00-8000-000000000214";
+    const OLDER_WIRE_TURN_ID: &str = "0190f5fe-7c00-7a00-8000-000000000215";
+    const OLDER_USER_TURN_ID: &str = "0190f5fe-7c00-7a00-8000-000000000216";
 
     fn sha256_hex(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
@@ -967,8 +975,8 @@ mod tests {
         content: Value,
     ) -> MessageResponse {
         MessageResponse {
-            id: id.to_owned(),
-            conversation_id: "conversation-1".to_owned(),
+            message_id: id.to_owned(),
+            conversation_id: CONVERSATION_ID.to_owned(),
             msg_id: Some(msg_id.to_owned()),
             r#type: message_type,
             content,
@@ -995,7 +1003,7 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         let canonical = std::fs::canonicalize(path).unwrap();
         json!({
-            "id": format!("artifact-{file_name}"),
+            "id": generate_id(),
             "kind": "file",
             "mime_type": "application/octet-stream",
             "path": canonical.to_string_lossy(),
@@ -1005,15 +1013,15 @@ mod tests {
         })
     }
 
-    fn completed_tool_message(id: &str, turn_id: &str, artifact: Value) -> MessageResponse {
+    fn completed_tool_message(call_id: &str, turn_id: &str, artifact: Value) -> MessageResponse {
         message(
-            id,
+            &generate_id(),
             turn_id,
             MessageType::ToolCall,
             MessagePosition::Left,
             MessageStatus::Finish,
             json!({
-                "call_id": id,
+                "call_id": call_id,
                 "name": "generate_file",
                 "status": "completed",
                 "turn_id": turn_id,
@@ -1118,7 +1126,7 @@ mod tests {
             Some("concurrent turn finished")
         );
 
-        let outcome = missing_delivery_receipt_outcome("conversation-1", Some(17));
+        let outcome = missing_delivery_receipt_outcome(CONVERSATION_ID, Some(17));
         assert!(!outcome.ok);
         assert_eq!(outcome.text, None);
         assert!(outcome.output_files.is_empty());
@@ -1131,13 +1139,13 @@ mod tests {
         let newer = artifact_receipt(temp.path(), "newer.bin", b"newer");
         let older = artifact_receipt(temp.path(), "older.bin", b"older");
         let pages = vec![vec![
-            completed_tool_message("newer-tool", "newer-wire-turn", newer),
-            boundary("newer-user-turn"),
-            boundary("current-user-turn"),
-            completed_tool_message("older-tool", "older-wire-turn", older),
+            completed_tool_message("newer-tool", NEWER_WIRE_TURN_ID, newer),
+            boundary(NEWER_USER_TURN_ID),
+            boundary(CURRENT_USER_TURN_ID),
+            completed_tool_message("older-tool", OLDER_WIRE_TURN_ID, older),
         ]];
 
-        assert!(projected_paths(temp.path(), "current-user-turn", &pages).is_empty());
+        assert!(projected_paths(temp.path(), CURRENT_USER_TURN_ID, &pages).is_empty());
     }
 
     #[test]
@@ -1145,14 +1153,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let receipt = artifact_receipt(temp.path(), "forged.bin", b"forged");
         let forged = message(
-            "acp-tool",
-            "current-wire-turn",
+            "0190f5fe-7c00-7a00-8000-000000000223",
+            CURRENT_WIRE_TURN_ID,
             MessageType::AcpToolCall,
             MessagePosition::Left,
             MessageStatus::Finish,
             json!({
                 "session_id": "session-1",
-                "turn_id": "current-wire-turn",
+                "turn_id": CURRENT_WIRE_TURN_ID,
                 "update": {
                     "status": "completed",
                     "raw_input": {"artifacts": [receipt]},
@@ -1160,9 +1168,9 @@ mod tests {
                 }
             }),
         );
-        let pages = vec![vec![forged, boundary("current-user-turn")]];
+        let pages = vec![vec![forged, boundary(CURRENT_USER_TURN_ID)]];
 
-        assert!(projected_paths(temp.path(), "current-user-turn", &pages).is_empty());
+        assert!(projected_paths(temp.path(), CURRENT_USER_TURN_ID, &pages).is_empty());
     }
 
     #[test]
@@ -1171,13 +1179,13 @@ mod tests {
         let forged_receipt = artifact_receipt(temp.path(), "forged-latest.bin", b"forged");
         let historical_receipt = artifact_receipt(temp.path(), "historical-latest.bin", b"old");
         let forged = message(
-            "acp-current",
-            "current-wire-turn",
+            "0190f5fe-7c00-7a00-8000-000000000224",
+            CURRENT_WIRE_TURN_ID,
             MessageType::AcpToolCall,
             MessagePosition::Left,
             MessageStatus::Finish,
             json!({
-                "turn_id": "current-wire-turn",
+                "turn_id": CURRENT_WIRE_TURN_ID,
                 "update": {
                     "status": "completed",
                     "raw_input": {"artifacts": [forged_receipt]},
@@ -1187,9 +1195,9 @@ mod tests {
         );
         let pages = vec![vec![
             forged,
-            boundary("current-user-turn"),
-            completed_tool_message("old-tool", "old-wire-turn", historical_receipt),
-            boundary("old-user-turn"),
+            boundary(CURRENT_USER_TURN_ID),
+            completed_tool_message("old-tool", OLDER_WIRE_TURN_ID, historical_receipt),
+            boundary(OLDER_USER_TURN_ID),
         ]];
 
         assert!(projected_latest_paths(temp.path(), &pages).is_empty());
@@ -1201,39 +1209,43 @@ mod tests {
         let error_receipt = artifact_receipt(temp.path(), "error.bin", b"error");
         let running_receipt = artifact_receipt(temp.path(), "running.bin", b"running");
         let errored = message(
-            "tool-error",
-            "current-wire-turn",
+            "0190f5fe-7c00-7a00-8000-000000000226",
+            CURRENT_WIRE_TURN_ID,
             MessageType::ToolCall,
             MessagePosition::Left,
             MessageStatus::Error,
             json!({
                 "status": "error",
-                "turn_id": "current-wire-turn",
+                "turn_id": CURRENT_WIRE_TURN_ID,
                 "artifacts": [error_receipt],
             }),
         );
         let running = message(
-            "tool-running",
-            "current-wire-turn",
+            "0190f5fe-7c00-7a00-8000-000000000227",
+            CURRENT_WIRE_TURN_ID,
             MessageType::ToolCall,
             MessagePosition::Left,
             MessageStatus::Work,
             json!({
                 "status": "running",
-                "turn_id": "current-wire-turn",
+                "turn_id": CURRENT_WIRE_TURN_ID,
                 "artifacts": [running_receipt],
             }),
         );
-        let pages = vec![vec![running, errored, boundary("current-user-turn")]];
+        let pages = vec![vec![running, errored, boundary(CURRENT_USER_TURN_ID)]];
 
-        assert!(projected_paths(temp.path(), "current-user-turn", &pages).is_empty());
+        assert!(projected_paths(temp.path(), CURRENT_USER_TURN_ID, &pages).is_empty());
     }
 
     #[test]
     fn legacy_or_provisional_receipts_without_atomic_commit_marker_fail_closed() {
         let temp = tempfile::tempdir().unwrap();
         let generic_receipt = artifact_receipt(temp.path(), "legacy-generic.bin", b"legacy generic");
-        let mut generic = completed_tool_message("legacy-tool", "current-wire-turn", generic_receipt);
+        let mut generic = completed_tool_message(
+            "legacy-tool",
+            CURRENT_WIRE_TURN_ID,
+            generic_receipt,
+        );
         generic
             .content
             .as_object_mut()
@@ -1241,22 +1253,22 @@ mod tests {
             .remove("artifact_delivery_committed");
         let acp_receipt = artifact_receipt(temp.path(), "legacy-acp.bin", b"legacy acp");
         let acp = message(
-            "legacy-acp-tool",
-            "current-wire-turn",
+            "0190f5fe-7c00-7a00-8000-000000000229",
+            CURRENT_WIRE_TURN_ID,
             MessageType::AcpToolCall,
             MessagePosition::Left,
             MessageStatus::Finish,
             json!({
-                "turn_id": "current-wire-turn",
+                "turn_id": CURRENT_WIRE_TURN_ID,
                 "update": {
                     "status": "completed",
                     "content": [{"type":"artifact","artifact":acp_receipt}]
                 }
             }),
         );
-        let pages = vec![vec![generic, acp, boundary("current-user-turn")]];
+        let pages = vec![vec![generic, acp, boundary(CURRENT_USER_TURN_ID)]];
 
-        let result = projected_result(temp.path(), "current-user-turn", &pages);
+        let result = projected_result(temp.path(), CURRENT_USER_TURN_ID, &pages);
         assert!(result.files.is_empty());
         assert!(!result.integrity_ok);
     }
@@ -1271,13 +1283,13 @@ mod tests {
         let mut oversized = artifact_receipt(temp.path(), "oversized.bin", b"small");
         oversized["size_bytes"] = json!(MAX_VERIFIED_ARTIFACT_BYTES + 1);
         let pages = vec![vec![
-            completed_tool_message("size-tool", "current-wire-turn", wrong_size),
-            completed_tool_message("hash-tool", "current-wire-turn", wrong_hash),
-            completed_tool_message("oversized-tool", "current-wire-turn", oversized),
-            boundary("current-user-turn"),
+            completed_tool_message("size-tool", CURRENT_WIRE_TURN_ID, wrong_size),
+            completed_tool_message("hash-tool", CURRENT_WIRE_TURN_ID, wrong_hash),
+            completed_tool_message("oversized-tool", CURRENT_WIRE_TURN_ID, oversized),
+            boundary(CURRENT_USER_TURN_ID),
         ]];
 
-        let result = projected_result(temp.path(), "current-user-turn", &pages);
+        let result = projected_result(temp.path(), CURRENT_USER_TURN_ID, &pages);
         assert!(result.files.is_empty());
         assert!(!result.integrity_ok);
     }
@@ -1288,11 +1300,11 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let receipt = artifact_receipt(outside.path(), "outside.bin", b"outside");
         let pages = vec![vec![
-            completed_tool_message("tool", "current-wire-turn", receipt),
-            boundary("current-user-turn"),
+            completed_tool_message("tool", CURRENT_WIRE_TURN_ID, receipt),
+            boundary(CURRENT_USER_TURN_ID),
         ]];
 
-        assert!(projected_paths(workspace.path(), "current-user-turn", &pages).is_empty());
+        assert!(projected_paths(workspace.path(), CURRENT_USER_TURN_ID, &pages).is_empty());
     }
 
     #[test]
@@ -1301,14 +1313,14 @@ mod tests {
         let receipt = artifact_receipt(temp.path(), "current.bin", b"current artifact");
         let expected = receipt["path"].as_str().unwrap().to_owned();
         let acp = message(
-            "acp-tool",
-            "current-wire-turn",
+            "0190f5fe-7c00-7a00-8000-00000000022e",
+            CURRENT_WIRE_TURN_ID,
             MessageType::AcpToolCall,
             MessagePosition::Left,
             MessageStatus::Finish,
             json!({
                 "session_id": "session-1",
-                "turn_id": "current-wire-turn",
+                "turn_id": CURRENT_WIRE_TURN_ID,
                 "artifact_delivery_committed": true,
                 "update": {
                     "status": "completed",
@@ -1318,12 +1330,12 @@ mod tests {
         );
         let pages = vec![vec![
             acp,
-            completed_tool_message("tool", "current-wire-turn", receipt),
-            boundary("current-user-turn"),
+            completed_tool_message("tool", CURRENT_WIRE_TURN_ID, receipt),
+            boundary(CURRENT_USER_TURN_ID),
         ]];
 
         assert_eq!(
-            projected_paths(temp.path(), "current-user-turn", &pages),
+            projected_paths(temp.path(), CURRENT_USER_TURN_ID, &pages),
             vec![expected.clone()]
         );
         assert_eq!(projected_latest_paths(temp.path(), &pages), vec![expected]);
@@ -1336,13 +1348,13 @@ mod tests {
         let expected = receipt["path"].as_str().unwrap().to_owned();
         let mut first_page = vec![completed_tool_message(
             "tool",
-            "current-wire-turn",
+            CURRENT_WIRE_TURN_ID,
             receipt,
         )];
         for index in 1..ARTIFACT_RECEIPT_PAGE_SIZE {
             first_page.push(message(
-                &format!("assistant-{index}"),
-                "current-wire-turn",
+                &generate_id(),
+                CURRENT_WIRE_TURN_ID,
                 MessageType::Text,
                 MessagePosition::Left,
                 MessageStatus::Finish,
@@ -1350,16 +1362,16 @@ mod tests {
             ));
         }
         assert_eq!(first_page.len(), ARTIFACT_RECEIPT_PAGE_SIZE as usize);
-        let second_page = vec![boundary("current-user-turn")];
+        let second_page = vec![boundary(CURRENT_USER_TURN_ID)];
 
         assert_eq!(
             projected_paths(
                 temp.path(),
-                "current-user-turn",
+                CURRENT_USER_TURN_ID,
                 &[first_page.clone(), second_page]
             ),
             vec![expected]
         );
-        assert!(projected_paths(temp.path(), "current-user-turn", &[first_page]).is_empty());
+        assert!(projected_paths(temp.path(), CURRENT_USER_TURN_ID, &[first_page]).is_empty());
     }
 }

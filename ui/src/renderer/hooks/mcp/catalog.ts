@@ -1,6 +1,4 @@
-import { httpRequest } from '@/common/adapter/httpBridge';
 import { mcpService } from '@/common/adapter/ipcBridge';
-import { configService } from '@/common/config/configService';
 import type { IMcpServer, IMcpServerTransport, ISessionMcpServer } from '@/common/config/storage';
 
 type BackendMcpTransport = Exclude<IMcpServerTransport, { type: 'streamable_http' }>;
@@ -17,12 +15,12 @@ const isBuiltinServer = (server: IMcpServer) => server.builtin === true;
 
 const normalizeServerName = (name: string) => name.trim().toLowerCase();
 
-const getCatalogServerKey = (server: Pick<IMcpServer, 'id' | 'name' | 'builtin'>) => {
+const getCatalogServerKey = (server: Pick<IMcpServer, 'mcp_server_id' | 'name' | 'builtin'>) => {
   const normalizedName = normalizeServerName(server.name);
   if (server.builtin === true) {
-    return `builtin:${normalizedName || server.id}`;
+    return `builtin:${normalizedName || server.mcp_server_id}`;
   }
-  return `user:${normalizedName || server.id}`;
+  return `user:${normalizedName || server.mcp_server_id}`;
 };
 
 const dedupeServers = (servers: IMcpServer[]) => {
@@ -62,57 +60,20 @@ export const toBackendMcpPayload = (
   builtin: Boolean(server.builtin),
 });
 
-export const toSessionMcpServer = (server: Pick<IMcpServer, 'id' | 'name' | 'transport'>): ISessionMcpServer => ({
-  id: String(server.id),
+export const toSessionMcpServer = (server: Pick<IMcpServer, 'mcp_server_id' | 'name' | 'transport'>): ISessionMcpServer => ({
+  mcp_server_id: server.mcp_server_id,
   name: server.name,
   transport: server.transport,
 });
-
-const toggleImportedEnabledServers = async (servers: IMcpServer[], imported: IMcpServer[]) => {
-  const enabledNames = new Set(servers.filter((server) => server.enabled).map((server) => server.name));
-  const toggledServers: IMcpServer[] = [];
-
-  for (const server of imported) {
-    if (!enabledNames.has(server.name) || server.enabled) {
-      toggledServers.push(server);
-      continue;
-    }
-
-    const toggled = await mcpService.toggleServer.invoke({ id: server.id });
-    toggledServers.push(toggled);
-  }
-
-  return toggledServers;
-};
 
 export const ensureBackendMcpCatalog = async (): Promise<{
   userServers: IMcpServer[];
   builtinServers: IMcpServer[];
   allServers: IMcpServer[];
 }> => {
-  const settings: Record<string, unknown> =
-    (await httpRequest<Record<string, unknown>>('GET', '/api/settings/client').catch(
-      () => ({}) as Record<string, unknown>
-    )) || {};
-  const localServers = Array.isArray(settings['mcp.config'])
-    ? (settings['mcp.config'] as IMcpServer[])
-    : (configService.get('mcp.config') ?? []);
-  const builtinServers = dedupeServers(localServers.filter(isBuiltinServer));
-  let userServers = dedupeServers(await mcpService.listServers.invoke());
-
-  if (userServers.length === 0) {
-    const legacyUserServers = localServers.filter((server) => !isBuiltinServer(server));
-    if (legacyUserServers.length > 0) {
-      const imported = await mcpService.importServers.invoke({
-        servers: legacyUserServers.map((server) => toBackendMcpPayload(server)),
-      });
-      await toggleImportedEnabledServers(legacyUserServers, imported);
-      userServers = dedupeServers(await mcpService.listServers.invoke());
-    }
-  }
-
-  const allServers = dedupeServers([...userServers, ...builtinServers]);
-  configService.setLocal('mcp.config', allServers);
+  const allServers = dedupeServers(await mcpService.listServers.invoke());
+  const builtinServers = allServers.filter(isBuiltinServer);
+  const userServers = allServers.filter((server) => !isBuiltinServer(server));
 
   return {
     userServers,

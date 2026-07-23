@@ -3,7 +3,7 @@
  * Displays avatar, name, source badge, description, engine/model capsule, tag chips,
  * radio indicator (top-right), and hover "使用 →" CTA.
  */
-import type { Preset, PresetReference } from '@/common/types/agent/presetTypes';
+import type { Preset, PresetReference, PresetTag } from '@/common/types/agent/presetTypes';
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import PresetAvatar from '@/renderer/pages/settings/PresetSettings/PresetAvatar';
@@ -15,6 +15,7 @@ export type DrawerPresetCardProps = {
   selected: boolean;
   localeKey: string;
   avatarImageMap: Record<string, string>;
+  tagById: Map<string, PresetTag>;
   onSelect: (presetId: PresetReference) => void;
 };
 
@@ -23,6 +24,7 @@ const DrawerPresetCard: React.FC<DrawerPresetCardProps> = ({
   selected,
   localeKey,
   avatarImageMap,
+  tagById,
   onSelect,
 }) => {
   const { t } = useTranslation();
@@ -35,10 +37,14 @@ const DrawerPresetCard: React.FC<DrawerPresetCardProps> = ({
       : preset.source === 'extension'
         ? t('guid.drawer.sourceExtension', { defaultValue: '扩展' })
         : t('guid.drawer.sourceBuiltin', { defaultValue: '内置' });
+  const visibleTags = [...preset.audience_tag_ids, ...preset.scenario_tag_ids]
+    .map((presetTagId) => tagById.get(presetTagId))
+    .filter((tag): tag is PresetTag => Boolean(tag))
+    .slice(0, 4);
   const handleKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
     if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault();
-      onSelect(preset.id);
+      onSelect(preset.preset_id);
     }
   };
 
@@ -50,7 +56,7 @@ const DrawerPresetCard: React.FC<DrawerPresetCardProps> = ({
         styles.drawerCard,
         selected ? styles.drawerCardSelected : '',
       ].filter(Boolean).join(' ')}
-      onClick={() => onSelect(preset.id)}
+      onClick={() => onSelect(preset.preset_id)}
       onKeyDown={handleKeyDown}
     >
       {/* Radio indicator */}
@@ -95,14 +101,9 @@ const DrawerPresetCard: React.FC<DrawerPresetCardProps> = ({
               {preset.model_preferences[0].model}
             </span>
           )}
-          {preset.audience_tags?.slice(0, 2).map((tag) => (
-            <span key={tag} className={styles.drawerTagChip}>
-              {tag}
-            </span>
-          ))}
-          {preset.scenario_tags?.slice(0, 2).map((tag) => (
-            <span key={tag} className={styles.drawerTagChip}>
-              {tag}
+          {visibleTags.map((tag) => (
+            <span key={tag.preset_tag_id} className={styles.drawerTagChip}>
+              {tag.label_i18n?.[localeKey] || tag.label}
             </span>
           ))}
         </div>

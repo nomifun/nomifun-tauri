@@ -174,8 +174,8 @@ const CollectTab: React.FC<Props> = ({ shared }) => {
                 {t('nomi.collect.rawEmpty', { defaultValue: '还没有采集到任何内容。' })}
               </span>
             ) : (
-              rawEvents.map((ev, i) => (
-                <div key={`${ev.ts}-${i}`} className='flex items-start gap-8px text-12px'>
+              rawEvents.map((ev) => (
+                <div key={ev.event_id} className='flex items-start gap-8px text-12px'>
                   <Tag size='small' color='arcoblue'>
                     {ev.source}
                   </Tag>

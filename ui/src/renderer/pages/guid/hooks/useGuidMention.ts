@@ -63,9 +63,8 @@ export const useGuidMention = ({
     return agents.map((agent) => {
       const key = getAgentKey(agent);
       const label = agent.name || agent.backend || agent.agent_type;
-      const avatarValue = agent.custom_agent_id
-        ? agent.avatar || customAgentAvatarMap.get(agent.custom_agent_id)
-        : undefined;
+      const agentIdentity = agent.id;
+      const avatarValue = agentIdentity ? agent.avatar || customAgentAvatarMap.get(agentIdentity) : agent.avatar;
       const avatar = avatarValue ? avatarValue.trim() : undefined;
       const tokens = new Set<string>();
       const normalizedLabel = label.toLowerCase();
@@ -76,8 +75,8 @@ export const useGuidMention = ({
       if (agent.backend) {
         tokens.add(agent.backend.toLowerCase());
       }
-      if (agent.custom_agent_id) {
-        tokens.add(agent.custom_agent_id.toLowerCase());
+      if (agentIdentity) {
+        tokens.add(agentIdentity.toLowerCase());
       }
       const mappedAvatarImage = avatar ? CUSTOM_AVATAR_IMAGE_MAP[avatar] : undefined;
       const avatarImage =
@@ -92,7 +91,7 @@ export const useGuidMention = ({
           resolveAgentLogo({
             icon: agent.icon,
             backend: agent.backend || agent.agent_type,
-            custom_agent_id: agent.custom_agent_id,
+            agentId: agentIdentity,
             isExtension: agent.isExtension,
           }) || undefined,
         isExtension: agent.isExtension,
