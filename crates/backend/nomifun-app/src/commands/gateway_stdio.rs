@@ -363,8 +363,39 @@ mod tests {
         assert!(names.contains(&"nomi_delegate"));
         assert!(names.contains(&"nomi_execution_get"));
         assert!(names.contains(&"nomi_execution_update"));
+        assert!(!names.contains(&"nomi_workshop_generate"));
         assert!(!names.contains(&"nomi_system_update_settings"));
         assert!(!names.contains(&"nomi_mcp_add_server"));
+    }
+
+    #[test]
+    fn work_profile_blocks_workshop_for_conversations_and_companions() {
+        let mut claims = test_claims();
+        claims.scope.profile = GatewayMcpConfig::PROFILE_WORK.into();
+
+        for companion_id in [
+            None,
+            Some(
+                nomifun_common::CompanionId::parse(
+                    "0190f5fe-7c00-7a00-8000-000000000001",
+                )
+                .unwrap(),
+            ),
+        ] {
+            claims.scope.companion_id = companion_id;
+            let names: Vec<&str> = GatewayStdioServer::visible_tool_specs(&claims)
+                .iter()
+                .map(|spec| spec.name)
+                .collect();
+            assert!(!names.iter().any(|name| name.starts_with("nomi_workshop_")));
+            assert!(
+                GatewayStdioServer::blocked_tool_message(
+                    &claims,
+                    "nomi_workshop_generate",
+                )
+                .is_some()
+            );
+        }
     }
 
     #[test]

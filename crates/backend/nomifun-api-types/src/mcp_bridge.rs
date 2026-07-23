@@ -520,10 +520,6 @@ impl GatewayMcpConfig {
         // work and inspect it (nomi_delegate/nomi_execution_get).
         // Remote projects the same domain through companion-scoped auth.
         "agent_execution",
-        // 创意工坊 (Creative Workshop) canvas assistant: companion + desktop/
-        // conversation agents read canvases, apply node ops, and trigger
-        // generation (nomi_workshop_*). Desktop-side domain.
-        "workshop",
     ];
     pub const DESKTOP_DOMAINS: &'static [&'static str] = &[
         "conversation",
@@ -1061,11 +1057,10 @@ mod tests {
                 .unwrap()
                 .contains(&"requirement")
         );
-        // 创意工坊 tools must be exposed to the working/desktop/admin profiles
-        // (companion + desktop/conversation agents drive the canvas assistant)
-        // but NOT to the lite/channel profile (IM sessions don't manipulate a
-        // canvas). Guards against the domain silently dropping out of a profile.
-        assert!(GatewayMcpConfig::WORK_DOMAINS.contains(&"workshop"));
+        // Ordinary conversations and companion sessions both use the work
+        // profile, so neither may call 创意工坊 tools. The dedicated desktop and
+        // admin profiles retain the domain for explicitly privileged surfaces.
+        assert!(!GatewayMcpConfig::WORK_DOMAINS.contains(&"workshop"));
         assert!(GatewayMcpConfig::DESKTOP_DOMAINS.contains(&"workshop"));
         assert!(GatewayMcpConfig::ADMIN_DOMAINS.contains(&"workshop"));
         assert!(!GatewayMcpConfig::LITE_DOMAINS.contains(&"workshop"));
