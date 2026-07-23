@@ -53,7 +53,9 @@ use crate::convert::{
 };
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::compute_initial_skills;
-use crate::stream_relay::{RelayTerminal, StreamRelay, run_turn_writeback_report};
+use crate::stream_relay::{
+    RelayTerminal, StreamRelay, TurnWritebackAttempt, run_turn_writeback_report,
+};
 use std::sync::RwLock;
 
 const MAX_CRON_CONTINUATIONS_PER_TURN: usize = 4;
@@ -67,6 +69,7 @@ const CANCEL_COMPLETION_GRACE: Duration = Duration::from_secs(2);
 const CANCEL_HANDLER_GRACE: Duration = Duration::from_secs(11);
 const CANCEL_AUTH_PREFLIGHT_GRACE: Duration = Duration::from_secs(2);
 const TURN_WRITEBACK_GRACE: Duration = Duration::from_secs(5);
+const TURN_WRITEBACK_TERMINAL_GRACE: Duration = Duration::from_secs(3);
 /// One relay terminal may trigger session persistence, failover/image rebuild,
 /// and ACP eviction. They share one deadline so several individually bounded
 /// operations cannot add up to an apparently permanent Running turn.
@@ -4574,37 +4577,52 @@ impl ConversationService {
             if !turn_token.is_cancelled()
                 && let Some((knowledge_service, request, msg_id, final_text)) = final_turn_writeback
             {
-                let writeback = AssertUnwindSafe(run_turn_writeback_report(
-                    knowledge_service,
-                    request,
+                let attempt = TurnWritebackAttempt::new(
                     Arc::clone(&repo),
                     Arc::clone(&user_events),
-                    // The helper owns Strings because progress callbacks may
-                    // outlive individual knowledge-service awaits.
-                    // Cloning here keeps the exact turn owner in charge until
-                    // the bounded report returns or is cancelled.
                     user_id_owned.clone(),
                     conv_id.clone(),
                     msg_id,
+                );
+                let writeback = AssertUnwindSafe(run_turn_writeback_report(
+                    knowledge_service,
+                    request,
                     final_text,
+                    attempt.clone(),
                 ))
                 .catch_unwind();
-                tokio::select! {
+                let interrupted_reason = tokio::select! {
                     biased;
                     _ = turn_token.cancelled() => {
                         info!(conversation_id = %conv_id, "Post-turn write-back cancelled");
+                        Some("Knowledge write-back was cancelled after the turn completed")
                     }
                     result = tokio::time::timeout(TURN_WRITEBACK_GRACE, writeback) => {
                         match result {
-                            Ok(Ok(())) => {}
+                            Ok(Ok(())) => None,
                             Ok(Err(_)) => {
                                 warn!(conversation_id = %conv_id, "Post-turn write-back panicked");
+                                Some("Knowledge write-back stopped unexpectedly after the turn completed")
                             }
                             Err(_) => {
                                 warn!(conversation_id = %conv_id, "Turn write-back exceeded the hard bound");
+                                Some("Knowledge write-back timed out after the turn completed")
                             }
                         }
                     }
+                };
+                if let Some(reason) = interrupted_reason
+                    && tokio::time::timeout(
+                        TURN_WRITEBACK_TERMINAL_GRACE,
+                        attempt.interrupt(reason),
+                    )
+                    .await
+                    .is_err()
+                {
+                    warn!(
+                        conversation_id = %conv_id,
+                        "Timed out publishing interrupted write-back terminal state"
+                    );
                 }
             }
             })

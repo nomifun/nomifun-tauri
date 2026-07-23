@@ -37,6 +37,10 @@ const TURN_COMPLETION_PERSIST_GRACE: Duration = Duration::from_secs(1);
 const TERMINAL_FINALIZATION_GRACE: Duration = Duration::from_secs(5);
 const ARTIFACT_COMMIT_GRACE: Duration = Duration::from_secs(5);
 const EVENT_SIDE_EFFECT_GRACE: Duration = Duration::from_secs(1);
+/// Write-back status persistence is observability, not turn ownership. A
+/// wedged repository must not suppress the corresponding realtime event or
+/// keep the post-turn worker alive indefinitely.
+const TURN_WRITEBACK_STATE_PERSIST_GRACE: Duration = Duration::from_secs(1);
 const MAX_TERMINAL_ACTIVE_ITEMS: usize = 256;
 const ARTIFACT_DELIVERY_COMMITTED_FIELD: &str = "artifact_delivery_committed";
 const ARTIFACT_DELIVERY_PENDING_OUTPUT: &str =
@@ -347,6 +351,30 @@ fn turn_writeback_running_state(status: &str, attempt_id: &str, started_at: i64,
     })
 }
 
+fn turn_writeback_interrupted_state(
+    attempt_id: &str,
+    started_at: i64,
+    interrupted_at: i64,
+    reason: &str,
+) -> Value {
+    json!({
+        "status": "interrupted",
+        "attempt_id": attempt_id,
+        "started_at": started_at,
+        "updated_at": interrupted_at,
+        "finished_at": interrupted_at,
+        "interrupted_at": interrupted_at,
+        "retryable": true,
+        "candidates": 0,
+        "written": [],
+        "failures": [{
+            "kb_id": Value::Null,
+            "rel_path": Value::Null,
+            "error": reason,
+        }],
+    })
+}
+
 fn turn_writeback_final_state(
     report: &nomifun_knowledge::TurnWritebackReport,
     status: &str,
@@ -390,18 +418,31 @@ async fn persist_turn_writeback_state(
     msg_id: &str,
     state: &Value,
 ) {
-    let row = match repo.get_message(conversation_id, msg_id).await {
-        Ok(Some(row)) => row,
-        Ok(None) => {
+    let row = match tokio::time::timeout(
+        TURN_WRITEBACK_STATE_PERSIST_GRACE,
+        repo.get_message(conversation_id, msg_id),
+    )
+    .await
+    {
+        Ok(Ok(Some(row))) => row,
+        Ok(Ok(None)) => {
             debug!(conversation_id, msg_id, "skip writeback state persist; assistant message row not found");
             return;
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             warn!(
                 conversation_id,
                 msg_id,
                 error = %ErrorChain(&e),
                 "failed to load assistant message for writeback state"
+            );
+            return;
+        }
+        Err(_) => {
+            warn!(
+                conversation_id,
+                msg_id,
+                "timed out loading assistant message for writeback state"
             );
             return;
         }
@@ -421,13 +462,28 @@ async fn persist_turn_writeback_state(
         status: None,
         hidden: None,
     };
-    if let Err(e) = repo.update_message(&row.message_id, &update).await {
-        warn!(
-            conversation_id,
-            msg_id,
-            error = %ErrorChain(&e),
-            "failed to persist assistant message writeback state"
-        );
+    match tokio::time::timeout(
+        TURN_WRITEBACK_STATE_PERSIST_GRACE,
+        repo.update_message(&row.message_id, &update),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!(
+                conversation_id,
+                msg_id,
+                error = %ErrorChain(&e),
+                "failed to persist assistant message writeback state"
+            );
+        }
+        Err(_) => {
+            warn!(
+                conversation_id,
+                msg_id,
+                "timed out persisting assistant message writeback state"
+            );
+        }
     }
 }
 
@@ -449,58 +505,103 @@ async fn emit_turn_writeback_state(
     );
 }
 
-pub(crate) async fn run_turn_writeback_report(
-    service: Arc<nomifun_knowledge::KnowledgeService>,
-    mut request: nomifun_knowledge::TurnWritebackRequest,
+#[derive(Clone)]
+pub(crate) struct TurnWritebackAttempt {
     repo: Arc<dyn IConversationRepository>,
     user_events: Arc<dyn UserEventSink>,
     user_id: String,
     conversation_id: String,
     msg_id: String,
+    attempt_id: String,
+    started_at: i64,
+}
+
+impl TurnWritebackAttempt {
+    pub(crate) fn new(
+        repo: Arc<dyn IConversationRepository>,
+        user_events: Arc<dyn UserEventSink>,
+        user_id: String,
+        conversation_id: String,
+        msg_id: String,
+    ) -> Self {
+        let started_at = now_ms();
+        Self {
+            repo,
+            user_events,
+            user_id,
+            conversation_id,
+            attempt_id: format!("{msg_id}:{started_at}"),
+            msg_id,
+            started_at,
+        }
+    }
+
+    async fn emit(&self, state: Value) {
+        emit_turn_writeback_state(
+            &self.repo,
+            &self.user_events,
+            &self.user_id,
+            &self.conversation_id,
+            &self.msg_id,
+            state,
+        )
+        .await;
+    }
+
+    /// Publish a real terminal state when the bounded post-turn worker is
+    /// cancelled, times out, or panics. This is deliberately independent of
+    /// the conversation turn handle: write-back is optional post-processing
+    /// and must never resurrect or prolong the authoritative turn lifecycle.
+    pub(crate) async fn interrupt(&self, reason: &'static str) {
+        let interrupted_at = now_ms();
+        self.emit(turn_writeback_interrupted_state(
+            &self.attempt_id,
+            self.started_at,
+            interrupted_at,
+            reason,
+        ))
+        .await;
+    }
+}
+
+pub(crate) async fn run_turn_writeback_report(
+    service: Arc<nomifun_knowledge::KnowledgeService>,
+    mut request: nomifun_knowledge::TurnWritebackRequest,
     final_text: String,
+    attempt: TurnWritebackAttempt,
 ) {
     if final_text.trim().is_empty() {
         return;
     }
     request.assistant_text = final_text;
-    let started_at = now_ms();
-    let attempt_id = format!("{msg_id}:{started_at}");
-    emit_turn_writeback_state(
-        &repo,
-        &user_events,
-        &user_id,
-        &conversation_id,
-        &msg_id,
-        turn_writeback_running_state("started", &attempt_id, started_at, started_at),
-    )
-    .await;
+    let started_at = attempt.started_at;
+    let attempt_id = attempt.attempt_id.clone();
+    attempt
+        .emit(turn_writeback_running_state(
+            "started",
+            &attempt_id,
+            started_at,
+            started_at,
+        ))
+        .await;
 
-    let progress_repo = Arc::clone(&repo);
-    let progress_user_events = Arc::clone(&user_events);
-    let progress_user_id = user_id.clone();
-    let progress_conversation_id = conversation_id.clone();
-    let progress_msg_id = msg_id.clone();
+    let progress_attempt = attempt.clone();
     let progress_attempt_id = attempt_id.clone();
     let report = service
         .finalize_turn_writeback_with_progress(request, move |phase| {
-            let repo = Arc::clone(&progress_repo);
-            let user_events = Arc::clone(&progress_user_events);
-            let user_id = progress_user_id.clone();
-            let conversation_id = progress_conversation_id.clone();
-            let msg_id = progress_msg_id.clone();
+            let attempt = progress_attempt.clone();
             let attempt_id = progress_attempt_id.clone();
             let status = turn_writeback_phase_label(phase);
             async move {
                 let updated_at = now_ms();
-                emit_turn_writeback_state(
-                    &repo,
-                    &user_events,
-                    &user_id,
-                    &conversation_id,
-                    &msg_id,
-                    turn_writeback_running_state(status, &attempt_id, started_at, updated_at),
-                )
-                .await;
+                attempt
+                    .emit(turn_writeback_running_state(
+                        status,
+                        &attempt_id,
+                        started_at,
+                        updated_at,
+                    ))
+                    .await;
             }
         })
         .await;
@@ -509,8 +610,8 @@ pub(crate) async fn run_turn_writeback_report(
         nomifun_knowledge::TurnWritebackStatus::Written
         | nomifun_knowledge::TurnWritebackStatus::Partial => {
             info!(
-                conversation_id = %conversation_id,
-                msg_id = %msg_id,
+                conversation_id = %attempt.conversation_id,
+                msg_id = %attempt.msg_id,
                 candidates = report.candidates,
                 written = report.written.len(),
                 failures = report.failures.len(),
@@ -519,8 +620,8 @@ pub(crate) async fn run_turn_writeback_report(
         }
         nomifun_knowledge::TurnWritebackStatus::Failed => {
             warn!(
-                conversation_id = %conversation_id,
-                msg_id = %msg_id,
+                conversation_id = %attempt.conversation_id,
+                msg_id = %attempt.msg_id,
                 candidates = report.candidates,
                 failures = report.failures.len(),
                 "turn-final knowledge write-back failed"
@@ -528,23 +629,23 @@ pub(crate) async fn run_turn_writeback_report(
         }
         other => {
             debug!(
-                conversation_id = %conversation_id,
-                msg_id = %msg_id,
+                conversation_id = %attempt.conversation_id,
+                msg_id = %attempt.msg_id,
                 status = ?other,
                 "turn-final knowledge write-back skipped"
             );
         }
     }
     let finished_at = now_ms();
-    emit_turn_writeback_state(
-        &repo,
-        &user_events,
-        &user_id,
-        &conversation_id,
-        &msg_id,
-        turn_writeback_final_state(&report, status, &attempt_id, started_at, finished_at),
-    )
-    .await;
+    attempt
+        .emit(turn_writeback_final_state(
+            &report,
+            status,
+            &attempt_id,
+            started_at,
+            finished_at,
+        ))
+        .await;
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

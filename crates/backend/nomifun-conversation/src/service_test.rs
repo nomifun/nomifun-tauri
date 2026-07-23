@@ -3520,6 +3520,7 @@ struct BlockingFirstKnowledgeCompleter {
     response: String,
     prompts: Mutex<Vec<(String, String)>>,
     calls: AtomicUsize,
+    has_started: AtomicBool,
     started: Notify,
     release: Notify,
 }
@@ -3530,13 +3531,22 @@ impl BlockingFirstKnowledgeCompleter {
             response,
             prompts: Mutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
+            has_started: AtomicBool::new(false),
             started: Notify::new(),
             release: Notify::new(),
         }
     }
 
     async fn wait_started(&self) {
-        self.started.notified().await;
+        loop {
+            let notified = self.started.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.has_started.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     fn release(&self) {
@@ -3549,6 +3559,7 @@ impl KnowledgeCompleter for BlockingFirstKnowledgeCompleter {
     async fn complete(&self, system: &str, user: &str) -> Result<String, AppError> {
         self.prompts.lock().unwrap().push((system.to_owned(), user.to_owned()));
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.has_started.store(true, Ordering::Release);
             self.started.notify_waiters();
             self.release.notified().await;
         }
@@ -4377,10 +4388,12 @@ async fn send_message_turn_writeback_runs_after_system_continuation_final_answer
     .execute(knowledge_db.pool())
     .await
     .unwrap();
+    let workpath_key =
+        nomifun_knowledge::session_workpath_key(&workspace, &std::env::temp_dir());
     knowledge
         .set_binding(
-            "conversation",
-            &conv.conversation_id,
+            "workpath",
+            &workpath_key,
             KnowledgeBinding {
                 enabled: true,
                 writeback: true,
@@ -4533,7 +4546,7 @@ async fn send_message_turn_writeback_runs_after_system_continuation_final_answer
 
 #[tokio::test]
 async fn send_message_releases_turn_before_slow_turn_writeback_finishes() {
-    let (svc, _broadcaster, _repo, _default_runtime_registry) = make_service();
+    let (svc, broadcaster, repo, _default_runtime_registry) = make_service();
     let runtime_registry = Arc::new(MockAgentRuntimeRegistry::new());
     let workspace = unique_test_dir("conv-knowledge-workspace-slow-writeback");
     tokio::fs::create_dir_all(&workspace).await.unwrap();
@@ -4570,10 +4583,12 @@ async fn send_message_releases_turn_before_slow_turn_writeback_finishes() {
     .execute(knowledge_db.pool())
     .await
     .unwrap();
+    let workpath_key =
+        nomifun_knowledge::session_workpath_key(&workspace, &std::env::temp_dir());
     knowledge
         .set_binding(
-            "conversation",
-            &conv.conversation_id,
+            "workpath",
+            &workpath_key,
             KnowledgeBinding {
                 enabled: true,
                 writeback: true,
@@ -4620,7 +4635,6 @@ async fn send_message_releases_turn_before_slow_turn_writeback_finishes() {
     let second = svc
         .send_message(TEST_USER_1, &conv.conversation_id, second_req, &runtime_registry_dyn)
         .await;
-    completer.release();
     wait_for_turn_released(&svc, &conv.conversation_id).await;
 
     assert!(
@@ -4628,6 +4642,48 @@ async fn send_message_releases_turn_before_slow_turn_writeback_finishes() {
         "slow turn-final writeback must not keep the conversation running: {second:?}"
     );
 
+    let interrupted = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Some(event) = broadcaster
+                .take_events()
+                .into_iter()
+                .find(|event| {
+                    event.name == "knowledge.writeback"
+                        && event.data["status"] == "interrupted"
+                })
+            {
+                break event;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("timed-out turn-final writeback should publish an interrupted terminal state");
+    assert_eq!(interrupted.data["retryable"], true);
+    assert_eq!(
+        interrupted.data["failures"][0]["error"],
+        "Knowledge write-back timed out after the turn completed"
+    );
+
+    let interrupted_msg_id = interrupted.data["msg_id"]
+        .as_str()
+        .expect("interrupted writeback msg_id");
+    let stored = repo
+        .get_message(&conv.conversation_id, interrupted_msg_id)
+        .await
+        .unwrap()
+        .expect("assistant message should retain interrupted writeback state");
+    let stored_content: serde_json::Value = serde_json::from_str(&stored.content).unwrap();
+    assert_eq!(
+        stored_content["knowledge_writeback"]["status"],
+        "interrupted"
+    );
+    assert_eq!(
+        stored_content["knowledge_writeback"]["finished_at"],
+        stored_content["knowledge_writeback"]["interrupted_at"]
+    );
+
+    completer.release();
     let _ = tokio::fs::remove_dir_all(&workspace).await;
     let _ = tokio::fs::remove_dir_all(&data_dir).await;
 }
