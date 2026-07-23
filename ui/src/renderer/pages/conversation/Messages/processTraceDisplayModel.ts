@@ -16,6 +16,7 @@ export const shouldShowToolRowDetail = (
   row: ToolReceiptDetailRow,
   options: { fileRowCount?: number } = {}
 ): boolean => {
+  if (row.attempts?.length) return true;
   if (row.action === 'run_commands') return true;
 
   if (isFileReceiptRow(row)) {

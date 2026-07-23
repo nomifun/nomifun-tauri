@@ -1909,6 +1909,8 @@ export type I18nKey =
   | 'messages.toolDetailLoading'
   | 'messages.toolDetailOutput'
   | 'messages.toolGroupViewSteps'
+  | 'messages.toolRetryAttempt'
+  | 'messages.toolRetryCount'
   | 'messages.toolSummary.canceled'
   | 'messages.toolSummary.completed'
   | 'messages.toolSummary.failed'

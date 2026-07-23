@@ -48,7 +48,73 @@ export interface ToolReceiptDetailRow {
   truncated?: boolean;
   skipped?: boolean;
   notExecutedReason?: NormalizedToolNotExecutedReason;
+  retryCount?: number;
+  attempts?: ToolReceiptAttemptRow[];
 }
+
+export interface ToolReceiptAttemptRow {
+  key: string;
+  attemptNo: number;
+  state: TurnDisclosureProcessState;
+  input?: string;
+  output?: string;
+  truncated?: boolean;
+  notExecutedReason?: NormalizedToolNotExecutedReason;
+}
+
+interface ToolRetryGroup {
+  attempts: NormalizedToolCall[];
+  latest: NormalizedToolCall;
+}
+
+/**
+ * Collapse only a complete explicit retry chain. Legacy calls and malformed,
+ * ambiguous, or out-of-order metadata fail closed as independent rows.
+ */
+export const groupExplicitToolRetries = (tools: NormalizedToolCall[]): ToolRetryGroup[] => {
+  const groups: ToolRetryGroup[] = [];
+  const openGroups = new Map<string, ToolRetryGroup>();
+
+  for (const tool of tools) {
+    const retry = tool.retry;
+    if (
+      retry &&
+      retry.attemptNo === 1 &&
+      retry.retryGroupId === tool.key &&
+      retry.retryOfCallId === undefined
+    ) {
+      if (openGroups.has(retry.retryGroupId)) {
+        openGroups.delete(retry.retryGroupId);
+        groups.push({ attempts: [tool], latest: tool });
+        continue;
+      }
+      const group = { attempts: [tool], latest: tool };
+      groups.push(group);
+      openGroups.set(retry.retryGroupId, group);
+      continue;
+    }
+
+    const existing = retry ? openGroups.get(retry.retryGroupId) : undefined;
+    const previous = existing?.latest;
+    if (
+      retry &&
+      existing &&
+      previous &&
+      tool.name === previous.name &&
+      retry.attemptNo === existing.attempts.length + 1 &&
+      retry.retryOfCallId === previous.key
+    ) {
+      existing.attempts.push(tool);
+      existing.latest = tool;
+      continue;
+    }
+
+    if (retry && existing) openGroups.delete(retry.retryGroupId);
+    groups.push({ attempts: [tool], latest: tool });
+  }
+
+  return groups;
+};
 
 const toolReceiptIconByAction: Record<ToolReceiptAction, ToolReceiptIcon> = {
   read_files: 'file',
@@ -363,7 +429,7 @@ export const buildToolReceiptSummaryParts = (
     }
   >();
 
-  tools.forEach((tool) => {
+  groupExplicitToolRetries(tools).forEach(({ latest: tool }) => {
     const action = classifyToolForReceipt(tool);
     const target = getToolReceiptTarget(tool, action);
     // A pre-dispatch rejection is a different receipt outcome from a tool that
@@ -403,12 +469,15 @@ export const getToolReceiptIconFromSummaryParts = (parts: ToolReceiptSummaryPart
 };
 
 export const buildToolReceiptDetailRows = (tools: NormalizedToolCall[]): ToolReceiptDetailRow[] =>
-  tools.map((tool) => {
+  groupExplicitToolRetries(tools).map(({ attempts, latest: tool }) => {
     const action = classifyToolForReceipt(tool);
     const title = compactToolText(formatToolDisplayName(tool.name)) || tool.key;
     const target = getToolReceiptDetailTarget(tool, action);
     return {
-      key: tool.key,
+      // Keep the rendered detail row anchored to the immutable retry root.
+      // Using the latest call id here remounted the row whenever a retry
+      // arrived, which discarded its expanded/collapsed state.
+      key: attempts[0]?.key ?? tool.key,
       action,
       state: getToolProcessState(tool),
       title,
@@ -418,6 +487,20 @@ export const buildToolReceiptDetailRows = (tools: NormalizedToolCall[]): ToolRec
       ...(tool.truncated ? { truncated: tool.truncated } : {}),
       ...(tool.skipped ? { skipped: true } : {}),
       ...(tool.notExecutedReason ? { notExecutedReason: tool.notExecutedReason } : {}),
+      ...(attempts.length > 1
+        ? {
+            retryCount: attempts.length - 1,
+            attempts: attempts.map((attempt, index) => ({
+              key: attempt.key,
+              attemptNo: attempt.retry?.attemptNo ?? index + 1,
+              state: getToolProcessState(attempt),
+              ...(attempt.input ? { input: attempt.input } : {}),
+              ...(attempt.output ? { output: attempt.output } : {}),
+              ...(attempt.truncated ? { truncated: attempt.truncated } : {}),
+              ...(attempt.notExecutedReason ? { notExecutedReason: attempt.notExecutedReason } : {}),
+            })),
+          }
+        : {}),
     };
   });
 
@@ -425,13 +508,14 @@ export const buildToolSummaryDescriptor = (
   tools: NormalizedToolCall[],
   state: TurnDisclosureProcessState
 ): ToolSummaryDescriptor | null => {
-  if (!tools.length) return null;
+  const logicalTools = groupExplicitToolRetries(tools).map(({ latest }) => latest);
+  if (!logicalTools.length) return null;
 
-  const focusedTool = tools.findLast((tool) => stateMatchesTool(state, tool)) ?? tools.at(-1);
+  const focusedTool = logicalTools.findLast((tool) => stateMatchesTool(state, tool)) ?? logicalTools.at(-1);
   if (!focusedTool) return null;
 
   return {
     target: formatToolTarget(focusedTool),
-    count: tools.length,
+    count: logicalTools.length,
   };
 };

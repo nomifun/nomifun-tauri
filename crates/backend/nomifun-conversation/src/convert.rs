@@ -427,6 +427,7 @@ fn generic_completed_artifact_contract_fails(message: &MessageResponse) -> bool 
         output: None,
         description: None,
         artifacts,
+        retry: None,
     };
     validate_completed_artifact_contract(&data).is_err()
 }
@@ -502,6 +503,7 @@ fn acp_completed_artifact_contract_fails(message: &MessageResponse) -> bool {
             output: None,
             description: None,
             artifacts: artifacts.clone(),
+            retry: None,
         })
         .is_err()
     })
@@ -545,6 +547,7 @@ fn tool_group_completed_artifact_contract_fails(message: &MessageResponse) -> bo
             output: None,
             description: None,
             artifacts: Vec::new(),
+            retry: None,
         })
         .is_err()
     })
@@ -624,6 +627,7 @@ fn invalidate_historical_artifact_projection(message: &mut MessageResponse) {
                     output: None,
                     description: None,
                     artifacts: Vec::new(),
+                    retry: None,
                 })
                 .is_err();
                 if !requires_artifact {

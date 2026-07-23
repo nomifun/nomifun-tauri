@@ -1416,6 +1416,7 @@ mod tests {
             input: None,
             output: None,
             artifacts: Vec::new(),
+            retry: None,
         });
         let action = ChannelMessageService::process_stream_event(&event);
         match action {
@@ -1447,6 +1448,7 @@ mod tests {
                     .into(),
             ),
             artifacts: Vec::new(),
+            retry: None,
         });
         match ChannelMessageService::process_stream_event(&event) {
             Some(StreamAction::MediaProduced(ids)) => {
@@ -1476,6 +1478,7 @@ mod tests {
             input: None,
             output: Some("done".into()),
             artifacts: vec![artifact.clone()],
+            retry: None,
         });
 
         match ChannelMessageService::process_stream_event(&event) {
@@ -1568,6 +1571,7 @@ mod tests {
             input: None,
             output: None,
             artifacts: Vec::new(),
+            retry: None,
         });
         assert!(matches!(
             ChannelMessageService::process_stream_event(&event),
@@ -1586,6 +1590,7 @@ mod tests {
             input: None,
             output: Some("just some text output".into()),
             artifacts: Vec::new(),
+            retry: None,
         });
         assert!(matches!(
             ChannelMessageService::process_stream_event(&event),

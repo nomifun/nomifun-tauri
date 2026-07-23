@@ -15,6 +15,7 @@ describe('conversation execution canvas integration', () => {
     const layoutSource = readSource(new URL('./ExecutionConversationLayout.tsx', import.meta.url));
     const panelSource = readSource(new URL('./ExecutionTopPanel.tsx', import.meta.url));
     const canvasSource = readSource(new URL('./DagCanvas.tsx', import.meta.url));
+    const edgeSource = readSource(new URL('./executionDagEdges.ts', import.meta.url));
     const nodeSource = readSource(new URL('./nodes/StepNode.tsx', import.meta.url));
     const canvasCss = readSource(new URL('./dag-canvas.css', import.meta.url));
     const profileSource = readSource(new URL('./ParticipantProfilePanel.tsx', import.meta.url));
@@ -35,8 +36,9 @@ describe('conversation execution canvas integration', () => {
     expect(panelSource.includes('<ParticipantProfilePanel')).toBe(true);
     expect(canvasSource.includes('<ParticipantProfilePanel')).toBe(false);
     expect(canvasSource.includes('overviewOpen && (')).toBe(true);
-    expect(canvasSource.includes("type: 'smoothstep'")).toBe(true);
-    expect(canvasSource.includes('MarkerType.ArrowClosed')).toBe(true);
+    expect(canvasSource.includes('buildExecutionDagEdges')).toBe(true);
+    expect(edgeSource.includes("type: 'smoothstep'")).toBe(true);
+    expect(edgeSource.includes('MarkerType.ArrowClosed')).toBe(true);
     expect(canvasSource.includes('nodesDraggable={false}')).toBe(true);
     expect(canvasSource.includes('nodesFocusable={false}')).toBe(true);
     expect(canvasSource.includes('edgesFocusable={false}')).toBe(true);

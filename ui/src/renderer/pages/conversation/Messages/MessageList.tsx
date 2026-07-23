@@ -62,6 +62,7 @@ import {
 import { getProcessItemState } from './turnProcessState';
 import { isSupersededPlanToolFailure } from './planToolVisibility';
 import type { MessageId } from '@/common/types/ids';
+import { ExplicitToolRetryReceiptIndex } from './toolRetryReceiptModel';
 
 type SourceMessageId = MessageId;
 
@@ -85,6 +86,7 @@ type IMessageVO =
       sourceMessageIds: SourceMessageId[];
       created_at: number;
     };
+type ToolSummaryVO = Extract<IMessageVO, { type: 'tool_summary' }>;
 type IArtifactVO = { type: 'artifact'; id: string; artifact: IConversationArtifact; created_at: number };
 type IRenderableItem = IMessageVO | IArtifactVO;
 type ITurnProcessDisclosureVO = {
@@ -705,6 +707,7 @@ const MessageList: React.FC<{
     let diffsTurnId: MessageId | undefined;
     let toolList: Array<IMessageToolGroup | IMessageAcpToolCall | IMessageToolCall> = [];
     let toolSourceMessageIds: SourceMessageId[] = [];
+    const retrySummaries = new ExplicitToolRetryReceiptIndex<ToolSummaryVO>();
 
     const pushFileDffChanges = (
       changes: FileChangeInfo,
@@ -736,6 +739,21 @@ const MessageList: React.FC<{
       toolSourceMessageIds = [];
     };
     const pushToolList = (message: IMessageToolGroup | IMessageAcpToolCall | IMessageToolCall) => {
+      const existingRetry = message.type === 'tool_call' ? retrySummaries.takeContinuation(message) : undefined;
+      if (message.type === 'tool_call' && existingRetry) {
+        existingRetry.messages.push(message);
+        const sourceMessageId = getMessageBusinessIdentity(message);
+        if (sourceMessageId) existingRetry.sourceMessageIds.push(sourceMessageId);
+        // A retry can be separated from its first attempt by thinking/text.
+        // Keep the durable summary reference above, but do not accidentally
+        // append an unrelated following tool to that earlier receipt.
+        toolList = [];
+        toolSourceMessageIds = [];
+        diffsChanges = [];
+        diffsSourceMessageIds = [];
+        diffsTurnId = undefined;
+        return;
+      }
       const groupedTurnId = toolList.find((tool) => tool.turn_id)?.turn_id;
       if (groupedTurnId && message.turn_id && groupedTurnId !== message.turn_id) {
         // A delayed event from another explicit turn must start a new receipt;
@@ -746,7 +764,7 @@ const MessageList: React.FC<{
       }
       if (!toolList.length) {
         toolSourceMessageIds = [];
-        result.push({
+        const summary: ToolSummaryVO = {
           type: 'tool_summary',
           id: `tool-summary-${message.id}`,
           msg_id: message.msg_id,
@@ -754,11 +772,20 @@ const MessageList: React.FC<{
           messages: toolList,
           sourceMessageIds: toolSourceMessageIds,
           created_at: message.created_at ?? 0,
-        });
+        };
+        result.push(summary);
       }
       toolList.push(message);
       const sourceMessageId = getMessageBusinessIdentity(message);
       if (sourceMessageId) toolSourceMessageIds.push(sourceMessageId);
+      if (message.type === 'tool_call') {
+        const summary = result.findLast(
+          (item): item is ToolSummaryVO => item.type === 'tool_summary' && item.messages === toolList
+        );
+        if (summary) {
+          retrySummaries.rememberFirst(message, summary);
+        }
+      }
       diffsChanges = [];
       diffsSourceMessageIds = [];
       diffsTurnId = undefined;

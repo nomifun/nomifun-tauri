@@ -2,6 +2,8 @@
   "toolGroupViewSteps": "View Steps",
   "toolDetailInput": "Input",
   "toolDetailOutput": "Output",
+  "toolRetryCount": "Retried {{count}} times",
+  "toolRetryAttempt": "Attempt {{number}}",
   "toolDetailLoading": "Loading...",
   "toolDetailLoadFailed": "Failed to load full output",
   "toolSummary": {
