@@ -3,8 +3,6 @@
 //! `<img>`/`<video>` subresource loads work under the desktop's local-trust
 //! policy), while every management route stays authenticated.
 
-mod common;
-
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use http_body_util::BodyExt;

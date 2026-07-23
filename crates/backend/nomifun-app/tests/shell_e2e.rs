@@ -1,5 +1,3 @@
-mod common;
-
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;

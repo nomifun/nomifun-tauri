@@ -1,7 +1,5 @@
 //! E2E tests for file operations (/api/fs/*).
 
-mod common;
-
 use axum::http::StatusCode;
 use serde_json::json;
 use tower::ServiceExt;

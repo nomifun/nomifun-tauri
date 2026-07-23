@@ -2,10 +2,163 @@
 name = "nomifun-app"
 version.workspace = true
 edition.workspace = true
+autotests = false
 
 [[bin]]
 name = "nomicore"
 path = "src/main.rs"
+
+# Content E2E tests have been verified together and share one linked binary.
+# All other integration tests stay in separate processes because several use
+# shared filesystem state. The content suite includes a coverage guard so a new
+# top-level test file cannot be silently omitted while autotests is disabled.
+[[test]]
+name = "custom_agent_e2e"
+path = "tests/custom_agent_e2e.rs"
+
+[[test]]
+name = "webui_lan_smoke"
+path = "tests/webui_lan_smoke.rs"
+
+[[test]]
+name = "skills_builtin_e2e"
+path = "tests/skills_builtin_e2e.rs"
+
+[[test]]
+name = "mcp_e2e"
+path = "tests/mcp_e2e.rs"
+
+[[test]]
+name = "webhook_e2e"
+path = "tests/webhook_e2e.rs"
+
+[[test]]
+name = "websocket_e2e"
+path = "tests/websocket_e2e.rs"
+
+[[test]]
+name = "gateway_e2e"
+path = "tests/gateway_e2e.rs"
+
+[[test]]
+name = "channel_e2e"
+path = "tests/channel_e2e.rs"
+
+[[test]]
+name = "requirements_e2e"
+path = "tests/requirements_e2e.rs"
+
+[[test]]
+name = "agent_execution_e2e"
+path = "tests/agent_execution_e2e.rs"
+
+[[test]]
+name = "autowork_idmm_cooperation_e2e"
+path = "tests/autowork_idmm_cooperation_e2e.rs"
+
+[[test]]
+name = "acp_e2e"
+path = "tests/acp_e2e.rs"
+
+[[test]]
+name = "agent_integration_e2e"
+path = "tests/agent_integration_e2e.rs"
+
+[[test]]
+name = "agent_provider_health_e2e"
+path = "tests/agent_provider_health_e2e.rs"
+
+[[test]]
+name = "connection_test_e2e"
+path = "tests/connection_test_e2e.rs"
+
+[[test]]
+name = "model_failover_e2e"
+path = "tests/model_failover_e2e.rs"
+
+[[test]]
+name = "remote_agent_e2e"
+path = "tests/remote_agent_e2e.rs"
+
+[[test]]
+name = "auxiliary_e2e"
+path = "tests/auxiliary_e2e.rs"
+
+[[test]]
+name = "companion_e2e"
+path = "tests/companion_e2e.rs"
+
+[[test]]
+name = "conversation_e2e"
+path = "tests/conversation_e2e.rs"
+
+[[test]]
+name = "cron_e2e"
+path = "tests/cron_e2e.rs"
+
+[[test]]
+name = "idmm_e2e"
+path = "tests/idmm_e2e.rs"
+
+[[test]]
+name = "idmm_intervention_e2e"
+path = "tests/idmm_intervention_e2e.rs"
+
+[[test]]
+name = "message_e2e"
+path = "tests/message_e2e.rs"
+
+[[test]]
+name = "auth_e2e"
+path = "tests/auth_e2e.rs"
+
+[[test]]
+name = "health"
+path = "tests/health.rs"
+
+[[test]]
+name = "local_mode"
+path = "tests/local_mode.rs"
+
+[[test]]
+name = "removed_surfaces_e2e"
+path = "tests/removed_surfaces_e2e.rs"
+
+[[test]]
+name = "startup_smoke"
+path = "tests/startup_smoke.rs"
+
+[[test]]
+name = "system_auth_e2e"
+path = "tests/system_auth_e2e.rs"
+
+[[test]]
+name = "system_provider_e2e"
+path = "tests/system_provider_e2e.rs"
+
+[[test]]
+name = "system_settings_e2e"
+path = "tests/system_settings_e2e.rs"
+
+[[test]]
+name = "system_version_e2e"
+path = "tests/system_version_e2e.rs"
+
+[[test]]
+name = "work_dir_e2e"
+path = "tests/work_dir_e2e.rs"
+
+[[test]]
+name = "mcp_crud_e2e"
+path = "tests/mcp_crud_e2e.rs"
+
+[[test]]
+name = "remote_mcp_smoke"
+path = "tests/remote_mcp_smoke.rs"
+
+[[test]]
+name = "content_e2e_suite"
+path = "tests/suites/content.rs"
 
 [features]
 default = ["telegram", "lark", "dingtalk", "weixin", "wecom", "discord", "matrix", "mattermost", "slack", "twitch", "nostr", "qqbot"]
@@ -150,3 +303,4 @@ tower = { workspace = true, features = ["util"] }
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
 wiremock = "0.6"
+toml.workspace = true
