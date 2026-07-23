@@ -106,7 +106,11 @@ impl ModelFetchService {
                 models,
                 fixed_base_url: None,
             }),
-            Err(err) if try_fix && supports_url_fix(&config.platform) => {
+            Err(err)
+                if try_fix
+                    && supports_url_fix(&config.platform)
+                    && is_url_fix_candidate(&err) =>
+            {
                 url_fixer::try_fix_url(&http_client, &config)
                     .await
                     .map_err(|_| err)
@@ -210,6 +214,20 @@ fn supports_url_fix(platform: &str) -> bool {
     )
 }
 
+/// URL suffix probing can repair an incorrect API path. It cannot repair
+/// credentials, DNS, TLS, firewall, proxy, rate-limit, or upstream 5xx
+/// failures; probing every suffix in those cases only multiplies traffic and
+/// delays the real error.
+fn is_url_fix_candidate(error: &AppError) -> bool {
+    match error {
+        AppError::BadRequest(_) => true,
+        AppError::BadGateway(message) => {
+            message == "Remote models response was not valid JSON"
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +302,27 @@ mod tests {
         assert!(!supports_url_fix("dashscope-coding"));
         assert!(!supports_url_fix("glm-coding-plan"));
         assert!(!supports_url_fix("qianfan-coding-plan"));
+    }
+
+    #[test]
+    fn url_fix_only_runs_for_path_shape_failures() {
+        assert!(is_url_fix_candidate(&AppError::BadRequest(
+            "Remote API rejected the model-list request (404 Not Found)".into()
+        )));
+        assert!(is_url_fix_candidate(&AppError::BadGateway(
+            "Remote models response was not valid JSON".into()
+        )));
+
+        assert!(!is_url_fix_candidate(&AppError::Unauthorized(
+            "bad key".into()
+        )));
+        assert!(!is_url_fix_candidate(&AppError::Timeout("slow".into())));
+        assert!(!is_url_fix_candidate(&AppError::BadGateway(
+            "Could not connect to the remote API".into()
+        )));
+        assert!(!is_url_fix_candidate(&AppError::BadGateway(
+            "Remote API returned 503 Service Unavailable".into()
+        )));
     }
 
     #[tokio::test]

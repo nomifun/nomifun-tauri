@@ -5,7 +5,11 @@
  */
 
 import { describe, expect, test } from 'bun:test';
-import { isNewApiPlatform, platformHasNoModelsEndpoint } from './platformConstants';
+import {
+  isNewApiPlatform,
+  platformHasNoModelsEndpoint,
+  platformSkipsPreSaveKeyProbe,
+} from './platformConstants';
 
 describe('platformHasNoModelsEndpoint', () => {
   test('true for subscription plan gateways without a /models catalog', () => {
@@ -32,6 +36,20 @@ describe('platformHasNoModelsEndpoint', () => {
     expect(platformHasNoModelsEndpoint('')).toBe(false);
     expect(platformHasNoModelsEndpoint(undefined)).toBe(false);
     expect(platformHasNoModelsEndpoint(null)).toBe(false);
+  });
+});
+
+describe('platformSkipsPreSaveKeyProbe', () => {
+  test('true for catalog-less plans and StepFun transport fallback', () => {
+    expect(platformSkipsPreSaveKeyProbe('ark-agent-plan')).toBe(true);
+    expect(platformSkipsPreSaveKeyProbe('stepfun-plan')).toBe(true);
+    expect(platformSkipsPreSaveKeyProbe('stepfun')).toBe(true);
+  });
+
+  test('false for providers whose catalog probe remains authoritative', () => {
+    expect(platformSkipsPreSaveKeyProbe('openai')).toBe(false);
+    expect(platformSkipsPreSaveKeyProbe('custom')).toBe(false);
+    expect(platformSkipsPreSaveKeyProbe(undefined)).toBe(false);
   });
 });
 

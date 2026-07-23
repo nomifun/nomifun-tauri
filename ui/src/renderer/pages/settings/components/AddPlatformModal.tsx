@@ -4,7 +4,7 @@ import { ipcBridge } from '@/common';
 import { uuidv7 } from '@/common/utils';
 import { parseProviderId } from '@/common/types/ids';
 import { normalizeApiKeyList, validateApiKeysForSave } from '@/common/utils/apiKeys';
-import { platformHasNoModelsEndpoint } from '@/common/utils/platformConstants';
+import { platformSkipsPreSaveKeyProbe } from '@/common/utils/platformConstants';
 import { isGoogleApisHost } from '@/common/utils/urlValidation';
 import ModalHOC from '@/renderer/utils/ui/ModalHOC';
 import { copyText } from '@/renderer/utils/ui/clipboard';
@@ -429,9 +429,9 @@ const AddPlatformModal = ModalHOC<{
         const providerBaseUrl = isBedrock ? '' : values.base_url || selectedPlatform?.base_url || '';
         let normalizedApiKey = '';
 
-        // 订阅套餐网关（Coding/Agent Plan）没有 /models 目录，用 /models 探测会把
-        // 合法 Key 误判为不可用 —— 跳过保存前探测，交由心跳检测校验。
-        if (!isBedrock && !isFullUrl && !platformHasNoModelsEndpoint(providerPlatform)) {
+        // 套餐网关没有 /models；StepFun 官方目录在部分代理链路会被 TLS 重置。
+        // 这些平台跳过重复的保存前探测，交由保存后的模型心跳做端到端校验。
+        if (!isBedrock && !isFullUrl && !platformSkipsPreSaveKeyProbe(providerPlatform)) {
           setIsSaving(true);
           const validation = await validateApiKeysForSave(values.api_key, (key) =>
             testApiKeyForProvider(key, providerBaseUrl)
@@ -899,7 +899,7 @@ const AddPlatformModal = ModalHOC<{
                               if (typeof v === 'string') {
                                 return { label: v, value: v };
                               } else {
-                                return { label: v.name, value: v.id };
+                                return { label: v.name || v.id, value: v.id };
                               }
                             }) || [];
                           // Update the model list state manually
@@ -984,8 +984,8 @@ const AddPlatformModal = ModalHOC<{
           void modelListState.mutate();
         }}
         onTestKey={async (key) => {
-          // 套餐网关无 /models 目录，探测会误判为无效；交给心跳检测（真实对话）校验。
-          if (platformHasNoModelsEndpoint(selectedPlatform?.platform)) return true;
+          // 套餐网关无目录；StepFun 目录可能受代理链路影响。交给模型心跳校验。
+          if (platformSkipsPreSaveKeyProbe(selectedPlatform?.platform)) return true;
           return testApiKeyForProvider(key, actualBaseUrl);
         }}
       />

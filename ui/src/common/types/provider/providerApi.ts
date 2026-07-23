@@ -145,7 +145,7 @@ export interface UpdateProviderRequest {
  */
 export interface FetchModelsResponse {
   /** Mixed-shape array: bare id strings or `{ id, name }` pairs. */
-  models: Array<string | { id: string; name: string }>;
+  models: Array<string | { id: string; name?: string | null }>;
   /** Present when backend auto-corrected the provider's base_url. */
   fixed_base_url?: string;
 }
