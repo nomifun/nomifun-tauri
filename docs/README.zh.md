@@ -1,8 +1,8 @@
 # NomiFun 文档
 
-本目录保存 **NomiFun** 当前的技术文档、运维文档与贡献者文档。这里只保留与
-当前实现一致的内容；历史设计稿与审计记录不在仓库中维护，需要时请查阅 git
-历史。
+本目录保存 **NomiFun** 当前的技术文档、运维文档与贡献者文档。当前规范性内容
+位于 `architecture/` 与 `contributing/`。`continuity/` 保留历史决策、交接
+背景和发布审计，不得覆盖当前架构或贡献者规范。
 
 > 初次接触项目请从
 > [入门 -> 项目介绍](getting-started/introduction.zh.md) 开始。
@@ -19,6 +19,7 @@
 | 构建或打包项目 | [contributing/building-and-packaging.zh.md](contributing/building-and-packaging.zh.md) |
 | 查询参数、环境变量或 API 分组 | [reference/](reference/) |
 | 参与贡献 | [../CONTRIBUTING.zh-CN.md](../CONTRIBUTING.zh-CN.md)、[../CONTRIBUTING.md](../CONTRIBUTING.md) |
+| 修改数据库 schema 或 ID | [contributing/data-and-identifier-standards.zh.md](contributing/data-and-identifier-standards.zh.md) |
 | 社区行为准则 | [../CODE_OF_CONDUCT.md](../CODE_OF_CONDUCT.md) |
 | 报告安全问题 | [../SECURITY.md](../SECURITY.md) |
 | 版本记录与发布流程 | [../CHANGELOG.md](../CHANGELOG.md)、[../RELEASING.md](../RELEASING.md) |
@@ -31,7 +32,8 @@ docs/
 ├── guides/               当前产品与运维指南
 ├── architecture/         当前系统架构与实现地图
 ├── reference/            配置、API 概览、排障、FAQ
-├── contributing/         开发、项目结构、构建与打包
+├── contributing/         开发、项目结构、数据/ID 规范、构建与打包
+├── continuity/           历史决策、交接说明与发布审计
 ├── skills/               面向外部 agent 的 skill 文档
 └── images/               截图清单与图片资源
 ```
@@ -49,3 +51,6 @@ computer/browser 自动化能力。前端路由真相来源是
 - 如果某功能没有出现在 `Router.tsx` 的当前产品路由中，即使后端仍有
   route，也不要把它写成活跃用户功能。
 - 脚本说明以 `package.json` 和 `bun run help` 为准。
+- 数据库和 ID 改动以
+  [数据与标识符规范](contributing/data-and-identifier-standards.zh.md)
+  以及其链接的可执行 schema/registry 为准。

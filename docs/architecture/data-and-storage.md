@@ -1,5 +1,10 @@
 # Data and Storage
 
+Database and identifier changes must also follow the repository-wide
+[Data and Identifier Standards](../contributing/data-and-identifier-standards.md).
+This page describes storage behavior; the executable schema and
+logical-reference registry remain the implementation-level sources of truth.
+
 NomiFun keeps its state in three places: a SQLite database (the source of
 truth for everything structured), a per-installation **data directory**
 (database file, logs, OS-cached runtimes), and per-conversation **work

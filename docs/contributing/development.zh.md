@@ -149,6 +149,8 @@ NOMIFUN_LOG_LEVEL='info,nomifun_mcp=trace' bun run serve:web
 ## 继续阅读
 
 - [`project-structure.zh.md`](project-structure.zh.md)
+- 修改数据库 schema、ID、逻辑关联、reset 行为或 backup/restore 契约前，
+  阅读 [`data-and-identifier-standards.zh.md`](data-and-identifier-standards.zh.md)。
 - [`../architecture/backend-crates.md`](../architecture/backend-crates.md)
 - [`../architecture/frontend.md`](../architecture/frontend.md)
 - [`building-and-packaging.zh.md`](building-and-packaging.zh.md)

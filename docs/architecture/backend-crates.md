@@ -35,6 +35,8 @@ go through the normal seam or one of those bridge surfaces.
 
 ### v3 data and identifier contract
 
+Contributor changes must follow
+[Data and Identifier Standards](../contributing/data-and-identifier-standards.md).
 All backend crates follow the v3 data contract:
 
 - every NomiFun product table has `id INTEGER PRIMARY KEY AUTOINCREMENT`;

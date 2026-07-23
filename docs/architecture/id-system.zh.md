@@ -1,7 +1,10 @@
 ﻿# ID 体系
 
-本文档是 NomiFun v3 标识符的权威契约，适用于产品数据库表、Rust 领域模型、
-HTTP/WebSocket/MCP 协议、运行时注册表、受管文件、备份与导入。
+本文是 NomiFun v3 ID 体系的架构权威契约，适用于产品数据库表、Rust 领域模型、
+HTTP/WebSocket/MCP 协议、运行时注册表、受管文件、备份与导入。面向贡献者的
+强制执行规范见
+[数据与标识符规范](../contributing/data-and-identifier-standards.zh.md)。
+`continuity/` 文档只提供历史/审计背景，不能覆盖本文契约。
 
 ## 核心规则
 

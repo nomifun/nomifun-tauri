@@ -1,8 +1,12 @@
 # Identifier System
 
-This document is the canonical v3 identifier contract for NomiFun. It applies
-to product database tables, Rust domain models, HTTP/WebSocket/MCP payloads,
-runtime registries, managed files, backups, and imports.
+This document is the canonical v3 identifier architecture contract for
+NomiFun. It applies to product database tables, Rust domain models,
+HTTP/WebSocket/MCP payloads, runtime registries, managed files, backups, and
+imports. The contributor-facing mandatory workflow is
+[Data and Identifier Standards](../contributing/data-and-identifier-standards.md).
+The continuity documents are historical/audit context and cannot override this
+contract.
 
 ## Core rules
 

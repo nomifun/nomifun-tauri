@@ -156,6 +156,9 @@ or pass `--log-level` to `nomicore` / `nomifun-web` directly. The value is a
 ## Where to Read Next
 
 - [`project-structure.md`](project-structure.md) for the repo map.
+- [`data-and-identifier-standards.md`](data-and-identifier-standards.md) before
+  changing database schema, IDs, logical references, reset behavior, or
+  backup/restore contracts.
 - [`../architecture/backend-crates.md`](../architecture/backend-crates.md) for crate ownership.
 - [`../architecture/frontend.md`](../architecture/frontend.md) for routes and host adapters.
 - [`building-and-packaging.md`](building-and-packaging.md) for release artifacts.

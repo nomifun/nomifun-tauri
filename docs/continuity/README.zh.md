@@ -8,6 +8,11 @@ all-targets check、UI typecheck/check/production build 已通过，workspace
 本目录是跨账号、跨平台、跨工作区的唯一接力入口。任何接手本专项的
 开发者先阅读本文件和 `00-current-state.md`，再阅读当前工作流的 brief。
 
+本目录不是仓库级全局开发规范入口。当前强制规则请阅读
+[数据与标识符规范](../contributing/data-and-identifier-standards.zh.md) 和
+[ID 体系架构契约](../architecture/id-system.zh.md)。本目录只记录决策、交接
+背景、实施证据和发布审计状态，不能覆盖当前权威来源。
+
 ## 当前基线
 
 - 仓库：`nomifun-tauri`

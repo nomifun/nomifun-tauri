@@ -19,6 +19,8 @@
 
 ### v3 数据与 ID 契约
 
+贡献者改动必须遵守
+[数据与标识符规范](../contributing/data-and-identifier-standards.zh.md)。
 所有后端 crate 遵循统一的 v3 数据契约：
 
 - 每张 NomiFun 产品表都有 `id INTEGER PRIMARY KEY AUTOINCREMENT`；
