@@ -2965,9 +2965,13 @@ mod tests {
 
         let autos = list_builtin_auto_skills(&paths).await.unwrap();
         assert!(
-            autos.len() >= 4,
-            "expected ≥4 auto-inject entries, got {}",
+            autos.len() >= 3,
+            "expected ≥3 auto-inject entries, got {}",
             autos.len()
+        );
+        assert!(
+            !autos.iter().any(|item| item.name == "officecli"),
+            "officecli must remain an opt-in builtin skill"
         );
         for item in &autos {
             assert!(
@@ -3073,6 +3077,15 @@ mod tests {
                 s.location
             );
         }
+
+        let officecli = builtins
+            .iter()
+            .find(|skill| skill.name == "officecli")
+            .expect("officecli builtin skill listed");
+        assert_eq!(
+            officecli.relative_location.as_deref(),
+            Some("officecli/SKILL.md")
+        );
     }
 
     // -----------------------------------------------------------------------

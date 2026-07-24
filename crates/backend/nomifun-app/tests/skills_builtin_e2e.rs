@@ -126,9 +126,13 @@ async fn builtin_auto_lists_entries_from_embedded_corpus() {
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     let arr = json["data"].as_array().unwrap();
-    assert!(arr.len() >= 4, "expected ≥4 auto-inject entries, got {}", arr.len());
+    assert!(arr.len() >= 3, "expected ≥3 auto-inject entries, got {}", arr.len());
     for item in arr {
         assert!(item["name"].is_string());
+        assert_ne!(
+            item["name"], "officecli",
+            "officecli must remain an opt-in builtin skill"
+        );
         assert!(item["description"].is_string());
         let loc = item["location"].as_str().unwrap();
         assert!(loc.starts_with("auto-inject/"), "location={loc}");
@@ -288,6 +292,12 @@ async fn list_skills_builtin_entries_carry_relative_location() {
     }
     assert!(saw_builtin, "expected at least one builtin entry");
     assert!(saw_custom, "expected the seeded custom entry");
+
+    let officecli = arr
+        .iter()
+        .find(|item| item["name"] == "officecli")
+        .expect("officecli builtin skill listed");
+    assert_eq!(officecli["relative_location"], "officecli/SKILL.md");
 }
 
 #[tokio::test]
