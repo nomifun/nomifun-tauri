@@ -74,7 +74,7 @@ mod tests {
         let db = init_database_memory().await.unwrap();
         let r = SqliteSkillTagRepository::new(db.pool().clone());
         r.upsert(&UpsertSkillTagParams {
-            skill_name: "mermaid",
+            skill_name: "diagram-helper",
             audience_tags: Some(r#"["developer"]"#),
             scenario_tags: Some(r#"["dataviz"]"#),
         })
@@ -82,11 +82,11 @@ mod tests {
         .unwrap();
         let all = r.get_all().await.unwrap();
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].skill_name, "mermaid");
+        assert_eq!(all[0].skill_name, "diagram-helper");
         assert_eq!(all[0].audience_tags.as_deref(), Some(r#"["developer"]"#));
         // upsert overwrites
         r.upsert(&UpsertSkillTagParams {
-            skill_name: "mermaid",
+            skill_name: "diagram-helper",
             audience_tags: Some(r#"["developer","office"]"#),
             scenario_tags: None,
         })
@@ -96,8 +96,8 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].audience_tags.as_deref(), Some(r#"["developer","office"]"#));
         assert!(all[0].scenario_tags.is_none());
-        assert!(r.delete("mermaid").await.unwrap());
+        assert!(r.delete("diagram-helper").await.unwrap());
         assert!(r.get_all().await.unwrap().is_empty());
-        assert!(!r.delete("mermaid").await.unwrap());
+        assert!(!r.delete("diagram-helper").await.unwrap());
     }
 }

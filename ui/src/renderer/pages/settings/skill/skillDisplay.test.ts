@@ -9,18 +9,18 @@ import { describe, expect, test } from 'bun:test';
 import { resolveSkillDisplay } from './skillDisplay';
 
 const skill: SkillInfo = {
-  name: 'mermaid',
+  name: 'planning-with-files',
   description:
-    'Render Mermaid diagrams as SVG or ASCII art using beautiful-mermaid. Use when users need to create flowcharts.',
-  location: '/tmp/builtin-skills/mermaid/SKILL.md',
-  relative_location: 'mermaid/SKILL.md',
+    'Maintain durable task plans, findings, and progress files for long-running work.',
+  location: '/tmp/builtin-skills/planning-with-files/SKILL.md',
+  relative_location: 'planning-with-files/SKILL.md',
   is_custom: false,
   source: 'builtin',
   name_i18n: {
-    'zh-CN': '图表绘制',
+    'zh-CN': '文件化规划',
   },
   description_i18n: {
-    'zh-CN': '使用 Mermaid 渲染流程图、时序图、状态图、类图或 ER 图，可输出 SVG 或终端友好的 ASCII/Unicode 图。',
+    'zh-CN': '为长期任务维护持久的计划、发现与进度文件。',
   },
 };
 
@@ -34,7 +34,7 @@ describe('skill display localization', () => {
   });
 
   test('uses the same resolver for localized names and language-family locale variants', () => {
-    expect(resolveSkillDisplay(skill, 'zh').name).toBe('图表绘制');
+    expect(resolveSkillDisplay(skill, 'zh').name).toBe('文件化规划');
     expect(resolveSkillDisplay(skill, 'ZH-hans').description).toBe(skill.description_i18n?.['zh-CN']);
   });
 

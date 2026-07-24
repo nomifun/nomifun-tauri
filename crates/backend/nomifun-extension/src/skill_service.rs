@@ -301,7 +301,8 @@ pub async fn read_builtin_rule(
 /// Read a built-in skill file by name.
 ///
 /// `file_name` is a relative path inside the built-in skills corpus
-/// (e.g. `"auto-inject/cron/SKILL.md"` or `"mermaid/SKILL.md"`). Returns
+/// (e.g. `"auto-inject/cron/SKILL.md"` or
+/// `"planning-with-files/SKILL.md"`). Returns
 /// the file content as a string, or an empty string if the file does not
 /// exist (preserves the legacy graceful-degradation contract consumed by
 /// the renderer).
@@ -409,8 +410,8 @@ pub enum SkillSource {
 /// [`crate::startup_materialize::materialize_if_needed`]). The
 /// `relative_location` carries the relative path suitable for
 /// `POST /api/skills/builtin-skill` (e.g. `"auto-inject/cron/SKILL.md"`
-/// or `"mermaid/SKILL.md"`). Other sources leave `relative_location`
-/// `None`.
+/// or `"planning-with-files/SKILL.md"`). Other sources leave
+/// `relative_location` `None`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SkillListItem {
     pub name: String,
@@ -1950,23 +1951,27 @@ mod tests {
     async fn load_builtin_skill_tags_has_known_entries() {
         let m = super::load_builtin_skill_tags();
         assert!(!m.is_empty());
-        let mermaid = m.get("mermaid").expect("mermaid seeded");
-        assert!(mermaid.1.iter().any(|s| s == "dataviz"));
+        let planning = m
+            .get("planning-with-files")
+            .expect("planning-with-files seeded");
+        assert!(planning.1.iter().any(|s| s == "planning"));
     }
 
     #[tokio::test]
     async fn load_builtin_skill_display_metadata_has_known_entries() {
         let m = super::load_builtin_skill_display_metadata();
-        let mermaid = m.get("mermaid").expect("mermaid display metadata seeded");
+        let planning = m
+            .get("planning-with-files")
+            .expect("planning-with-files display metadata seeded");
         assert_eq!(
-            mermaid.name_i18n.get("zh-CN").map(String::as_str),
-            Some("mermaid")
+            planning.name_i18n.get("zh-CN").map(String::as_str),
+            Some("文件化规划")
         );
         assert!(
-            mermaid
+            planning
                 .description_i18n
                 .get("zh-CN")
-                .is_some_and(|desc| desc.contains("流程图"))
+                .is_some_and(|desc| desc.contains("计划"))
         );
     }
 
@@ -2010,12 +2015,12 @@ mod tests {
 
     #[test]
     fn parse_frontmatter_block_scalar_pipe() {
-        // Mirrors the shipped weixin-file-send/SKILL.md shape.
-        let content = "---\nname: weixin-file-send\ndescription: |\n  Use when the user wants a local file sent back, such as \"send me the file\"\n  or \"发给我\".\n---\nBody";
+        let content =
+            "---\nname: multiline\ndescription: |\n  First line of the description.\n  Second line of the description.\n---\nBody";
         let (name, desc) = parse_frontmatter_fields(content).unwrap();
-        assert_eq!(name, "weixin-file-send");
-        assert!(desc.contains("Use when the user wants a local file sent back"));
-        assert!(desc.contains("发给我"));
+        assert_eq!(name, "multiline");
+        assert!(desc.contains("First line of the description."));
+        assert!(desc.contains("Second line of the description."));
         // Literal block preserves the line break...
         assert!(desc.contains('\n'));
         // ...and the raw indicator must never leak as the value.
@@ -3115,12 +3120,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = make_embedded_paths(tmp.path()).await;
 
-        let resolved = materialize_skills_for_agent(&paths, "conv-opt", &["mermaid".to_owned()])
-            .await
-            .unwrap();
+        let resolved = materialize_skills_for_agent(
+            &paths,
+            "conv-opt",
+            &["planning-with-files".to_owned()],
+        )
+        .await
+        .unwrap();
         assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].name, "mermaid");
-        let expected = paths.builtin_skills_dir.join("mermaid");
+        assert_eq!(resolved[0].name, "planning-with-files");
+        let expected = paths.builtin_skills_dir.join("planning-with-files");
         assert_eq!(resolved[0].source_path, expected);
     }
 
@@ -3208,13 +3217,13 @@ mod tests {
         let resolved = materialize_skills_for_agent(
             &paths,
             "conv-sorted",
-            &["mermaid".to_owned(), "cron".to_owned()],
+            &["planning-with-files".to_owned(), "cron".to_owned()],
         )
         .await
         .unwrap();
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].name, "cron");
-        assert_eq!(resolved[1].name, "mermaid");
+        assert_eq!(resolved[1].name, "planning-with-files");
         for entry in &resolved {
             assert!(entry.source_path.is_absolute());
             assert!(entry.source_path.is_dir());

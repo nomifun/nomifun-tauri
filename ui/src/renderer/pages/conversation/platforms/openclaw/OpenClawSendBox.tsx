@@ -293,7 +293,6 @@ const OpenClawSendBox: React.FC<{ conversation_id: ConversationId }> = ({ conver
         const result = await ipcBridge.openclawConversation.sendMessage.invoke({
           input: text,
           conversation_id: deliveryConversationId,
-          inject_skills: ['star-office-helper'],
           idempotency_key,
           initial_only: initialOnly,
         });
