@@ -5039,10 +5039,9 @@ async fn autowork_receipt_payload_authority_is_exactly_bound_before_persistence(
     sqlx::query(
         "INSERT INTO requirements (\
             requirement_id, display_no, title, tag, status, created_by, created_at, updated_at\
-         ) VALUES (?, 900001, 'authority binding', 'authority-binding', 'pending', ?, 100, 100)",
+         ) VALUES (?, 900001, 'authority binding', 'authority-binding', 'pending', 'user', 100, 100)",
     )
     .bind(&requirement_id)
-    .bind(USER_ID)
     .execute(db.pool())
     .await
     .unwrap();
