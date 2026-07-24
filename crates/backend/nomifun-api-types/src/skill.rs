@@ -403,11 +403,11 @@ mod tests {
         let conversation_id = "0190f5fe-7c00-7a00-8abc-012345678901";
         let raw = json!({
             "conversation_id": conversation_id,
-            "skills": ["mermaid", "pdf"],
+            "skills": ["planning-with-files", "pdf"],
         });
         let req: MaterializeSkillsRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.conversation_id.as_str(), conversation_id);
-        assert_eq!(req.skills, vec!["mermaid", "pdf"]);
+        assert_eq!(req.skills, vec!["planning-with-files", "pdf"]);
     }
 
     #[test]
@@ -444,8 +444,8 @@ mod tests {
                     source_path: "/tmp/builtin-skills/auto-inject/cron".into(),
                 },
                 MaterializedSkillRef {
-                    name: "mermaid".into(),
-                    source_path: "/tmp/builtin-skills/mermaid".into(),
+                    name: "planning-with-files".into(),
+                    source_path: "/tmp/builtin-skills/planning-with-files".into(),
                 },
             ],
         };

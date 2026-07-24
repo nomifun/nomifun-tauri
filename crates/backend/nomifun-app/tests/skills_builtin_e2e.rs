@@ -126,9 +126,13 @@ async fn builtin_auto_lists_entries_from_embedded_corpus() {
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     let arr = json["data"].as_array().unwrap();
-    assert!(arr.len() >= 4, "expected ≥4 auto-inject entries, got {}", arr.len());
+    assert!(arr.len() >= 3, "expected ≥3 auto-inject entries, got {}", arr.len());
     for item in arr {
         assert!(item["name"].is_string());
+        assert_ne!(
+            item["name"], "officecli",
+            "officecli must remain an opt-in builtin skill"
+        );
         assert!(item["description"].is_string());
         let loc = item["location"].as_str().unwrap();
         assert!(loc.starts_with("auto-inject/"), "location={loc}");
@@ -168,14 +172,14 @@ async fn builtin_skill_read_auto_inject_returns_frontmatter_content() {
 async fn builtin_skill_read_opt_in_returns_frontmatter_content() {
     let fx = fixture_embedded().await;
 
-    // mermaid is a well-known opt-in skill in the corpus.
+    // planning-with-files is a stable opt-in skill in the corpus.
     let resp = fx
         .app
         .clone()
         .oneshot(json_with_token(
             "POST",
             "/api/skills/builtin-skill",
-            json!({"file_name": "mermaid/SKILL.md"}),
+            json!({"file_name": "planning-with-files/SKILL.md"}),
             &fx.token,
             &fx.csrf,
         ))
@@ -184,7 +188,10 @@ async fn builtin_skill_read_opt_in_returns_frontmatter_content() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     let content = json["data"].as_str().unwrap();
-    assert!(!content.is_empty(), "mermaid SKILL.md is empty");
+    assert!(
+        !content.is_empty(),
+        "planning-with-files SKILL.md is empty"
+    );
 }
 
 #[tokio::test]
@@ -285,6 +292,12 @@ async fn list_skills_builtin_entries_carry_relative_location() {
     }
     assert!(saw_builtin, "expected at least one builtin entry");
     assert!(saw_custom, "expected the seeded custom entry");
+
+    let officecli = arr
+        .iter()
+        .find(|item| item["name"] == "officecli")
+        .expect("officecli builtin skill listed");
+    assert_eq!(officecli["relative_location"], "officecli/SKILL.md");
 }
 
 #[tokio::test]
@@ -300,21 +313,21 @@ async fn list_skills_builtin_entries_include_display_i18n_metadata() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     let arr = json["data"].as_array().unwrap();
-    let mermaid = arr
+    let planning = arr
         .iter()
-        .find(|item| item["name"] == "mermaid")
-        .expect("mermaid builtin skill listed");
+        .find(|item| item["name"] == "planning-with-files")
+        .expect("planning-with-files builtin skill listed");
 
-    assert_eq!(mermaid["source"], "builtin");
-    let zh_desc = mermaid["description_i18n"]["zh-CN"]
+    assert_eq!(planning["source"], "builtin");
+    let zh_desc = planning["description_i18n"]["zh-CN"]
         .as_str()
-        .expect("mermaid should expose zh-CN display description");
+        .expect("planning-with-files should expose zh-CN display description");
     assert!(
-        zh_desc.contains("Mermaid") && zh_desc.contains("流程图"),
+        zh_desc.contains("计划"),
         "unexpected zh-CN display description: {zh_desc}"
     );
     assert!(
-        mermaid.get("name_i18n").is_some(),
+        planning.get("name_i18n").is_some(),
         "builtin skills should expose display name metadata, even when it preserves the canonical name"
     );
 }
@@ -379,7 +392,7 @@ async fn materialize_for_agent_returns_source_path_for_opt_in_skill() {
             "/api/skills/materialize-for-agent",
             json!({
                 "conversation_id": "0190f5fe-7c00-7a00-8abc-012345678901",
-                "skills": ["mermaid"],
+                "skills": ["planning-with-files"],
             }),
             &fx.token,
             &fx.csrf,
@@ -390,11 +403,11 @@ async fn materialize_for_agent_returns_source_path_for_opt_in_skill() {
     let json: Value = body_json(resp).await;
     let skills = json["data"]["skills"].as_array().unwrap();
     assert_eq!(skills.len(), 1);
-    assert_eq!(skills[0]["name"], "mermaid");
+    assert_eq!(skills[0]["name"], "planning-with-files");
     let source_path = skills[0]["source_path"].as_str().unwrap();
     assert!(
         std::path::Path::new(source_path).join("SKILL.md").exists(),
-        "mermaid source_path must exist: {source_path}",
+        "planning-with-files source_path must exist: {source_path}",
     );
 }
 
@@ -461,7 +474,7 @@ async fn materialize_for_agent_returns_sorted_list() {
             "/api/skills/materialize-for-agent",
             json!({
                 "conversation_id": "0190f5fe-7c00-7a00-8abc-012345678901",
-                "skills": ["mermaid", "cron"],
+                "skills": ["planning-with-files", "cron"],
             }),
             &fx.token,
             &fx.csrf,
@@ -473,7 +486,7 @@ async fn materialize_for_agent_returns_sorted_list() {
     let skills = json["data"]["skills"].as_array().unwrap();
     assert_eq!(skills.len(), 2);
     assert_eq!(skills[0]["name"], "cron");
-    assert_eq!(skills[1]["name"], "mermaid");
+    assert_eq!(skills[1]["name"], "planning-with-files");
 }
 
 #[tokio::test]
