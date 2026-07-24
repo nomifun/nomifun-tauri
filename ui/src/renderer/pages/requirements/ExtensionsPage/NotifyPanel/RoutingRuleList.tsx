@@ -18,6 +18,10 @@ type RuleRow = ITagSummary & {
   setting?: ITagSetting;
 };
 
+type RoutingRuleListProps = {
+  channels: IWebhook[];
+};
+
 /**
  * ROUTING RULES list — one row per tag, rendered as a readable rule:
  *   {当} [标签=<tag>] {的需求} [events 多选] {→ 通知} [channel 选择]
@@ -32,26 +36,18 @@ type RuleRow = ITagSummary & {
  * - A disabled greyed "全局兜底规则（即将支持）" row is shown as a forward hint;
  *   global rules are intentionally NOT implemented here.
  */
-const RoutingRuleList: React.FC = () => {
+const RoutingRuleList: React.FC<RoutingRuleListProps> = ({ channels }) => {
   const { t } = useTranslation();
   const [message, ctx] = useArcoMessage();
   const [tags, setTags] = useState<ITagSummary[]>([]);
-  const [channels, setChannels] = useState<IWebhook[]>([]);
   const [settings, setSettings] = useState<Record<string, ITagSetting>>({});
   const [loading, setLoading] = useState(false);
 
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
-      // Tags are the spine of this list; the channel list is secondary (only the
-      // per-tag picker needs it). Load independently so a transient channel-list
-      // failure never blanks the whole panel.
-      const [tagList, channelList] = await Promise.all([
-        ipcBridge.requirements.tags.invoke(),
-        ipcBridge.webhook.list.invoke().catch(() => [] as IWebhook[]),
-      ]);
+      const tagList = await ipcBridge.requirements.tags.invoke();
       setTags(tagList);
-      setChannels(channelList);
 
       // No list-all endpoint for tag settings exists — fetch per tag (best-effort).
       const next: Record<string, ITagSetting> = {};

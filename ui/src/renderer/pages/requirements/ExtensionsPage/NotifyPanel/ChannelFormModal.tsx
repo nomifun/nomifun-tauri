@@ -9,7 +9,7 @@ type ChannelFormModalProps = {
   visible: boolean;
   editing: IWebhook | null;
   onClose: () => void;
-  onSuccess: () => void;
+  onSuccess: () => void | Promise<void>;
 };
 
 /**
@@ -105,7 +105,7 @@ const ChannelFormModal: React.FC<ChannelFormModalProps> = ({ visible, editing, o
         message.success(t('webhook.messages.createOk'));
       }
 
-      onSuccess();
+      await onSuccess();
     } catch (e) {
       if (e && typeof e === 'object' && 'errorFields' in e) {
         // form validation error — do not show Message
