@@ -5,9 +5,36 @@ notes at a high level rather than a complete historical log.
 
 ## Unreleased
 
+## v0.3.0 - 2026-07-24
+
+- Rebuilt the persistence and identifier architecture around a v3 data
+  contract: local technical rows use integer identities, stable business
+  references use canonical UUIDv7 values, and cross-domain relationships use
+  explicit logical-reference policies.
+- Added a guarded whole-dataset reset lifecycle for pre-v3 installations,
+  including managed-root inventory, quarantine/retired-dataset receipts,
+  crash-safe recovery, generation isolation, and stricter v3-only
+  backup/restore validation.
+- Improved conversation and agent reliability with idempotent message delivery,
+  durable execution state, safer retries, stronger terminal/process cleanup,
+  bounded knowledge writeback, and more consistent provider/model routing.
+- Hardened AutoWork, requirement execution, scheduled-task delivery, channel
+  routing, and notification synchronization across reconnects and retries.
 - Added a Skill Market tab to the independent Skills capability, with bounded
   ClawHub and SkillHub ranking sync, tag/search filtering, localized skill
   descriptions, and a reviewed installation draft handoff to Nomi.
+- Reduced bundled built-in skills and made OfficeCLI opt-in to keep default
+  installations smaller and avoid injecting unused capabilities.
+- **Breaking upgrade:** upgrading from an earlier data contract does not migrate
+  local product data into v3. On first launch, the previous managed dataset is
+  retired/quarantined and a clean v3 dataset is initialized. Dataset-owned
+  credentials and integrations must be configured again; arbitrary external
+  user workspaces are not deleted.
+- Packaging note: this Windows-first release publishes the Windows x64
+  installer and signed Tauri updater assets. macOS and Linux packages can be
+  appended later from their native build machines.
+- The Windows installer is updater-signed but not Authenticode-signed, so manual
+  downloads may show a SmartScreen or unknown-publisher warning.
 
 ## v0.1.13 - 2026-07-01
 
