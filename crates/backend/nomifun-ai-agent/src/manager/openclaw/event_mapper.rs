@@ -276,6 +276,7 @@ fn map_tool_event(data: &Value) -> Vec<AgentStreamEvent> {
         input: None,
         output: None,
         description: None,
+        retry: None,
         artifacts: Vec::new(),
     })]
 }

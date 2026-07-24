@@ -18,7 +18,9 @@ use zip::write::SimpleFileOptions;
 /// App tag stamped into (and verified from) a manifest.
 pub(crate) const ARCHIVE_APP: &str = "nomifun-workshop";
 /// Archive schema version.
-pub(crate) const ARCHIVE_VERSION: u32 = 1;
+pub(crate) const ARCHIVE_VERSION: u32 = 2;
+/// Stable-ID contract required by every importable archive.
+pub(crate) const ARCHIVE_ID_CONTRACT: &str = "canonical-uuidv7-v3";
 
 pub(crate) const CANVAS_ENTRY: &str = "canvas.json";
 pub(crate) const MANIFEST_ENTRY: &str = "manifest.json";

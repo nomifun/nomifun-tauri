@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use nomifun_ai_agent::nomi_config;
 use nomifun_ai_agent::{one_shot_completion, resolve_provider_config, user_message};
-use nomifun_common::{AppError, generate_id, now_ms};
+use nomifun_common::{AppError, CompanionLearnRunId, now_ms};
 use nomifun_db::IProviderRepository;
 use tokio::sync::Mutex;
 
@@ -116,7 +116,7 @@ impl Learner {
 
         let model = { self.config.read().await.learn.model.clone() };
         let mut run = CompanionLearnRun {
-            learn_run_id: generate_id(),
+            learn_run_id: CompanionLearnRunId::new().into_string(),
             started_at,
             finished_at: None,
             status: "ok".into(),

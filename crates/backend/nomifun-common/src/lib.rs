@@ -1,5 +1,4 @@
 //! Shared primitives: error types, enums, ID generation, crypto, timestamps, and pagination.
-pub mod channel;
 pub mod constants;
 pub mod agent_execution;
 
@@ -48,16 +47,18 @@ pub use execution_authority::ExecutionAuthority;
 pub use fsname::sanitize_dir_segment;
 pub use hooks::{OnConversationDelete, OnTerminalDelete, RequirementCreator};
 pub use id::{
-    AgentExecutionAttemptId, AgentExecutionId, AgentExecutionStepId, AgentExecutionTemplateId,
+    AgentExecutionAttemptId, AgentExecutionId, AgentExecutionParticipantId,
+    AgentExecutionStepId, AgentExecutionTemplateId, AgentExecutionTemplateParticipantId,
     AgentId, AttachmentId, ChannelPluginId, ChannelSessionId, ChannelUserId,
-    CompanionEvolutionFeedbackId, CompanionId, CompanionLearnRunId, CompanionMemoryId,
-    CompanionSessionWindowId, CompanionSuggestionId, ConnectorCredentialId, ConversationId,
-    CronJobId, CronJobRunId,
+    CompanionEventId, CompanionEvolutionFeedbackId, CompanionId, CompanionLearnRunId,
+    CompanionMemoryId, CompanionSessionWindowId, CompanionSkillId, CompanionSkillPatternId,
+    CompanionSuggestionId, ConnectorCredentialId,
+    ConversationArtifactId, ConversationId, CreationTaskId, CronJobId, CronJobRunId,
     EntityId, FigureId,
-    IdmmInterventionId, KnowledgeBaseId, KnowledgeBindingId, MessageId, PersistedArtifactId,
-    PresetId, PreviewSnapshotId, ProviderId,
+    IdmmInterventionId, KnowledgeBaseId, KnowledgeBindingId, McpServerId, MessageId,
+    PersistedArtifactId, PresetId, PresetTagId, PreviewSnapshotId, ProviderId,
     PublicAgentAuditEntryId, PublicAgentId, RemoteAgentId, TerminalId, UUID_STRING_LEN,
-    RequirementId, UserId, UuidV7Error,
+    RequirementId, UserId, UuidV7Error, WebhookId,
     WorkshopAssetId, WorkshopCanvasId, WorkshopEdgeId, WorkshopNodeId, generate_id,
     validate_uuidv7,
 };

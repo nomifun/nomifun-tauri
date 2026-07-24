@@ -1,61 +1,8 @@
-use std::fmt;
-
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::requirement::{AutoWorkRunState, AutoWorkTargetKind};
 
-/// Stable webhook business identity.
-///
-/// Only canonical lowercase hyphenated RFC-4122 UUIDv7 strings are accepted.
-/// Integer IDs, numeric strings, UUIDv4, uppercase and prefixed IDs are
-/// intentionally unsupported.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
-#[serde(transparent)]
-pub struct WebhookId(String);
-
-impl WebhookId {
-    pub fn new() -> Self {
-        Self(nomifun_common::generate_id())
-    }
-
-    pub fn parse(value: impl Into<String>) -> Result<Self, nomifun_common::UuidV7Error> {
-        let value = value.into();
-        nomifun_common::validate_uuidv7(&value)?;
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn into_string(self) -> String {
-        self.0
-    }
-}
-
-impl fmt::Display for WebhookId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::str::FromStr for WebhookId {
-    type Err = nomifun_common::UuidV7Error;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::parse(value)
-    }
-}
-
-impl<'de> Deserialize<'de> for WebhookId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::parse(value).map_err(serde::de::Error::custom)
-    }
-}
+pub use nomifun_common::WebhookId;
 
 /// Deserialize a present field (including explicit `null`) into `Some(_)`, so an
 /// absent field is `None` (keep) while `null` is `Some(None)` (clear). Without

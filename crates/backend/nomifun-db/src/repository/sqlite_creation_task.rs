@@ -1,4 +1,8 @@
-use nomifun_common::{ProviderId, WorkshopAssetId, WorkshopCanvasId, validate_uuidv7};
+use nomifun_common::{
+    CreationTaskId, ProviderId, WorkshopAssetId, WorkshopCanvasId, WorkshopNodeId,
+};
+#[cfg(test)]
+use nomifun_common::validate_uuidv7;
 use serde_json::Value;
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
@@ -62,6 +66,31 @@ impl TryFrom<CreationTaskDbRow> for CreationTaskRow {
             finished_at,
         } = row;
         validate_creation_task_id(&creation_task_id)?;
+        if let Some(canvas_id) = &canvas_id {
+            WorkshopCanvasId::parse(canvas_id).map_err(|error| {
+                DbError::Conflict(format!(
+                    "creation task {creation_task_id} has invalid canvas_id {canvas_id:?}: {error}"
+                ))
+            })?;
+        }
+        if let Some(node_id) = &node_id {
+            WorkshopNodeId::parse(node_id).map_err(|error| {
+                DbError::Conflict(format!(
+                    "creation task {creation_task_id} has invalid node_id {node_id:?}: {error}"
+                ))
+            })?;
+        }
+        ProviderId::parse(&provider_id).map_err(|error| {
+            DbError::Conflict(format!(
+                "creation task {creation_task_id} has invalid provider_id {provider_id:?}: {error}"
+            ))
+        })?;
+        let canonical_result_asset_ids = canonicalize_result_asset_ids(&result_asset_ids)?;
+        if canonical_result_asset_ids != result_asset_ids {
+            return Err(DbError::Conflict(format!(
+                "creation task {creation_task_id} result_asset_ids is not canonically encoded"
+            )));
+        }
         Ok(Self {
             creation_task_id,
             canvas_id,
@@ -83,7 +112,7 @@ impl TryFrom<CreationTaskDbRow> for CreationTaskRow {
 }
 
 fn validate_creation_task_id(creation_task_id: &str) -> Result<(), DbError> {
-    validate_uuidv7(creation_task_id).map_err(|error| {
+    CreationTaskId::parse(creation_task_id).map_err(|error| {
         DbError::Conflict(format!(
             "Creation task creation_task_id '{creation_task_id}' is not a canonical UUIDv7: {error}"
         ))
@@ -220,6 +249,15 @@ impl ICreationTaskRepository for SqliteCreationTaskRepository {
         }
 
         let canvas_id = lock_canvas(&mut tx, params.canvas_id).await?;
+        let node_id = params
+            .node_id
+            .map(WorkshopNodeId::parse)
+            .transpose()
+            .map_err(|error| {
+                DbError::Conflict(format!(
+                    "Creation task node_id must be a canonical UUIDv7: {error}"
+                ))
+            })?;
         sqlx::query(
             "INSERT INTO creation_tasks \
                 (creation_task_id, canvas_id, node_id, provider_id, model, capability, params, status, error, \
@@ -228,7 +266,7 @@ impl ICreationTaskRepository for SqliteCreationTaskRepository {
         )
         .bind(params.creation_task_id)
         .bind(&canvas_id)
-        .bind(params.node_id)
+        .bind(node_id.as_ref().map(WorkshopNodeId::as_str))
         .bind(provider_id.as_str())
         .bind(params.model)
         .bind(params.capability)
@@ -242,7 +280,7 @@ impl ICreationTaskRepository for SqliteCreationTaskRepository {
         Ok(CreationTaskRow {
             creation_task_id: params.creation_task_id.to_string(),
             canvas_id,
-            node_id: params.node_id.map(str::to_string),
+            node_id: node_id.map(WorkshopNodeId::into_string),
             provider_id: provider_id.into_string(),
             model: params.model.to_string(),
             capability: params.capability.to_string(),

@@ -85,7 +85,7 @@ pub fn announce_bound_port(data_dir: &Path, host: &str, port: u16) {
     let announcement = PortAnnouncement {
         host: host.to_string(),
         port,
-        channel: nomifun_common::channel::channel().to_string(),
+        channel: crate::channel::channel().to_string(),
         pid: std::process::id(),
     };
     println!(

@@ -22,7 +22,7 @@ NomiFun 交付的是**一个**统一的 Rust 后端（`nomifun-app`，二进制
 |---|---|---|---|
 | `--host` | `NOMIFUN_WEB_HOST` | `127.0.0.1` | 绑定的 IP。`0.0.0.0` 会接受 LAN/VPN/公网流量；大范围暴露前请先预置或完成首次设置。不解析主机名；非法输入将在启动阶段直接失败。 |
 | `--port` | `NOMIFUN_WEB_PORT` | `8787` | TCP 端口。在同一个 socket 上提供 API、`/ws` WebSocket 与 SPA。 |
-| `--data-dir` | `NOMIFUN_DATA_DIR` | 按用户的应用数据目录 | 后端数据目录（SQLite 数据库、智能体状态、日志、Bun 缓存）。默认是所有宿主共享的按用户位置——Windows 上是 `%LOCALAPPDATA%\NomiFun\Nomi`，macOS 上是 `~/Library/Application Support/NomiFun/Nomi`，Linux 上是 `$XDG_DATA_HOME/NomiFun/Nomi`。可用本参数或 `NOMIFUN_DATA_DIR`（按字面值，不附加后缀）覆盖；生产环境请使用绝对路径。 |
+| `--data-dir` | `NOMIFUN_DATA_DIR` | 按用户的应用数据目录 | 后端数据目录（SQLite 数据库、智能体状态、日志、Bun 缓存）。默认是当前 channel 的宿主共享的按用户位置；stable 使用 `Nomi`，dev 使用同级的 `Nomi-dev`。可用本参数或 `NOMIFUN_DATA_DIR`（按字面值，不附加后缀）覆盖；生产环境请使用绝对路径。 |
 | `--dist` | `NOMIFUN_WEB_DIST` | `../../ui/dist` | 已构建 SPA 所在目录。在仓库之外部署时务必显式指定。 |
 | `--admin-user` | `NOMIFUN_ADMIN_USERNAME` | `admin` | 预置首位管理员时使用的用户名。管理员存在后将被忽略。 |
 | `--admin-password` | `NOMIFUN_ADMIN_PASSWORD` | — | 在启动时预置首位管理员密码，跳过交互式设置。管理员存在后将被忽略。 |
@@ -41,7 +41,7 @@ NomiFun 交付的是**一个**统一的 Rust 后端（`nomifun-app`，二进制
 |---|---|---|
 | `--host` | `127.0.0.1`（`DEFAULT_HOST`） | 监听的主机地址。 |
 | `--port` | `25808`（`DEFAULT_PORT`） | 监听端口。 |
-| `--data-dir` | 按用户的应用数据目录 | 数据库 + 文件存储根目录。通过 clap 绑定 `NOMIFUN_DATA_DIR` 环境变量（按字面值）；两者都未设置时解析 `default_data_dir()`——所有宿主共享的那个按用户位置。 |
+| `--data-dir` | 按用户的应用数据目录 | 数据库 + 文件存储根目录。通过 clap 绑定 `NOMIFUN_DATA_DIR` 环境变量（按字面值）；两者都未设置时解析 `default_data_dir()`——当前 build channel 的宿主共享的按用户位置。 |
 | `--work-dir` | （无） | 会话工作区目录。回退顺序：`NOMIFUN_WORK_DIR` 环境变量 → 数据目录本身。 |
 | `--app-version` | crate 版本 | 报告给扩展引擎用于做兼容性检查的宿主应用版本。 |
 | `--local` | `false` | 独立 `nomicore` 的无鉴权本地模式。`nomifun-web --insecure-no-auth` 映射到同一策略。桌面外壳不使用该 flag，而是使用 `TrustLocalToken`。 |
@@ -105,16 +105,13 @@ NomiFun 交付的是**一个**统一的 Rust 后端（`nomifun-app`，二进制
   对待——做好备份、限制权限。两个同时运行的后端共享它的情况已被机制
   性地阻止（见下面的服务器锁）。
 - 三个宿主（`nomifun-desktop`、`nomifun-web`、独立的 `nomicore`
-  二进制）通过 `nomifun_app::cli::default_data_dir()` 解析出**同一个
-  默认**数据目录：Windows 上是 `%LOCALAPPDATA%\NomiFun\Nomi`，macOS
-  上是 `~/Library/Application Support/NomiFun/Nomi`，Linux 上是
-  `$XDG_DATA_HOME/NomiFun/Nomi`（通常为 `~/.local/share/NomiFun/Nomi`），
-  经 `dirs` crate 解析；当 OS 报告不出用户目录时的极端回退是
-  `<system temp>/nomifun-data/Nomi`。所有宿主共用一个默认值是有意为
-  之：开发循环（`bun run serve:web`、`dev:web`、`dev`）与已安装
-  的桌面应用读写同一份状态——配置一次提供商或伙伴，处处可测；排查
-  问题也只需要看一个目录。想要隔离的沙箱时，把 `NOMIFUN_DATA_DIR`
-  或 `--data-dir` 指到别处即可。
+  二进制）都通过 `nomifun_app::cli::default_data_dir()` 解析默认目录。
+  同一 build channel 的宿主共享它：stable 使用 `Nomi` 叶目录，非
+  stable channel 使用 `Nomi-dev` 等同级目录。根脚本中的 `dev`、
+  `dev:web`、`build:fast` 选择 dev；已安装应用、`serve:web` 与 release
+  构建保持 stable。需要把 stable 快照复制到开发目录时运行
+  `bun run seed:dev`；需要显式位置时则使用 `NOMIFUN_DATA_DIR` 或
+  `--data-dir`。
 - 后端启动时（早于打开数据库）会对 `{data_dir}/server.lock` 取一把
   OS 级**排他锁**。同一数据目录上的第二个后端进程会快速失败，错误
   信息会指出持有者（pid + 可执行文件名）并给出两条出路：关掉另一个
@@ -127,7 +124,7 @@ NomiFun 交付的是**一个**统一的 Rust 后端（`nomifun-app`，二进制
   `--work-dir` → 非空的 `NOMIFUN_WORK_DIR` 环境变量 → 数据目录本身。
   会话会在 `<work-dir>/conversations/` 下创建子目录；删除会话同时
   删除其工作区。
-- 桌面外壳使用上述共享默认值。设置 `NOMIFUN_DATA_DIR` 后会附加
+- 桌面外壳使用上述当前 channel 的共享默认值。设置 `NOMIFUN_DATA_DIR` 后会附加
   `/Nomi`：目录变为 `$NOMIFUN_DATA_DIR/Nomi`——覆盖语义不变。旧版
   构建默认在 `<system temp>/nomifun-data/Nomi`；首次以新默认启动时，
   既有的 temp 根安装会被自动搬迁（一次性；旧目录保留为备份，数据库

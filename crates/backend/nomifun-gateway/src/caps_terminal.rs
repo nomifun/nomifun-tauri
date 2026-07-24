@@ -16,6 +16,7 @@ use nomifun_common::KnowledgeBaseId;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 
 use crate::deps::{CallerCtx, GatewayDeps};
 use crate::registry::{Capability, CapabilityMeta, DangerTier, Surface};
@@ -39,7 +40,8 @@ struct CreateTerminalParams {
     /// CLI "claude" | "codex" | "gemini".
     #[serde(default)]
     preset: Option<String>,
-    /// Working directory (defaults to the user's home directory).
+    /// Working directory inside the current conversation workspace. Relative
+    /// paths are resolved from that workspace; omitted means the workspace root.
     #[serde(default)]
     cwd: Option<String>,
     /// Permission level for agent presets: "default" (interactive approvals)
@@ -75,6 +77,14 @@ async fn create(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: CreateTerminalParams)
     if nomifun_common::UserId::parse(ctx.user_id.as_str()).is_err() {
         return json!({"error": "missing caller user identity in signed Gateway capability"});
     }
+    let conversation_id = match ctx.conversation_id.as_deref() {
+        Some(id) if nomifun_common::ConversationId::parse(id).is_ok() => id.to_owned(),
+        _ => {
+            return json!({
+                "error": "terminal creation requires a signed conversation context; refusing to create a global terminal"
+            });
+        }
+    };
     let user_id = ctx.user_id;
 
     let preset = p.preset.unwrap_or_else(|| "shell".to_owned());
@@ -98,14 +108,35 @@ async fn create(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: CreateTerminalParams)
         cmd_args = arr;
     }
 
-    let cwd = match p.cwd {
-        Some(c) => c,
-        None => match dirs::home_dir() {
-            Some(h) => h.to_string_lossy().into_owned(),
-            None => {
-                return json!({"error": "no cwd given and the user home directory could not be determined"})
-            }
-        },
+    let conversation = match deps
+        .conversation_service
+        .get(user_id.as_str(), &conversation_id)
+        .await
+    {
+        Ok(conversation) => conversation,
+        Err(error) => {
+            return json!({
+                "error": format!("could not resolve the terminal's owning conversation: {error}")
+            });
+        }
+    };
+    let workspace = match conversation
+        .extra
+        .get("workspace")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|workspace| !workspace.is_empty())
+    {
+        Some(workspace) => workspace,
+        None => {
+            return json!({
+                "error": "the current conversation has no workspace; refusing to fall back to the user home directory"
+            });
+        }
+    };
+    let cwd = match resolve_conversation_terminal_cwd(workspace, p.cwd.as_deref()) {
+        Ok(cwd) => cwd,
+        Err(error) => return json!({"error": error}),
     };
 
     // Optional create-time knowledge binding: the bases get bound to this
@@ -135,7 +166,11 @@ async fn create(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: CreateTerminalParams)
         knowledge_base_ids: p.knowledge_base_ids,
     };
 
-    match deps.terminal_service.create(user_id.as_str(), req).await {
+    match deps
+        .terminal_service
+        .create_for_conversation(user_id.as_str(), &conversation_id, req)
+        .await
+    {
         Ok(resp) => ok(json!({
             "terminal_id": resp.terminal_id,
             "name": resp.name,
@@ -148,7 +183,8 @@ async fn create(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: CreateTerminalParams)
             // Echo the validated bind-on-create request count (0 = none
             // requested); the mount itself remains best-effort.
             "knowledge_bases_bound": knowledge_bases_bound,
-            "note": "terminal created, its process is running; use nomi_list_terminals to check status. Agent terminals (claude/codex/gemini) are eligible AutoWork targets via nomi_set_autowork."
+            "owner_conversation_id": resp.owner_conversation_id,
+            "note": "conversation-owned terminal created in the conversation workspace. It is visible in this conversation's terminal panel and excluded from the global terminal sidebar. You own its lifecycle: call nomi_terminal_kill when its process is no longer needed, and nomi_terminal_delete when its record is no longer needed."
         })),
         Err(e) => json!({"error": e.to_string()}),
     }
@@ -159,8 +195,20 @@ async fn list(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: ListTerminalsParams) ->
         return json!({"error": "missing caller user identity in signed Gateway capability"});
     }
     let user_id = ctx.user_id.as_str();
+    let conversation_id = match ctx.conversation_id.as_deref() {
+        Some(id) if nomifun_common::ConversationId::parse(id).is_ok() => id,
+        _ => {
+            return json!({
+                "error": "terminal listing requires a signed conversation context"
+            });
+        }
+    };
 
-    match deps.terminal_service.list(user_id).await {
+    match deps
+        .terminal_service
+        .list_for_conversation(user_id, conversation_id)
+        .await
+    {
         Ok(rows) => {
             let items: Vec<Value> = rows
                 .iter()
@@ -176,12 +224,123 @@ async fn list(deps: Arc<GatewayDeps>, ctx: CallerCtx, p: ListTerminalsParams) ->
                         "mode": t.mode,
                         "exit_code": t.exit_code,
                         "created_at": t.created_at,
+                        "owner_conversation_id": t.owner_conversation_id,
                     })
                 })
                 .collect();
             ok(json!({"total": items.len(), "terminals": items}))
         }
         Err(e) => json!({"error": e.to_string()}),
+    }
+}
+
+/// Resolve and confine a gateway-created terminal cwd to its authoritative
+/// conversation workspace. Canonicalization prevents `..` and symlink escapes;
+/// relative paths are a convenience for agents and are rooted at the workspace.
+fn resolve_conversation_terminal_cwd(
+    workspace: &str,
+    requested: Option<&str>,
+) -> Result<String, String> {
+    let workspace = Path::new(workspace);
+    let canonical_workspace = std::fs::canonicalize(workspace).map_err(|error| {
+        format!(
+            "could not resolve conversation workspace '{}': {error}",
+            workspace.display()
+        )
+    })?;
+    if !canonical_workspace.is_dir() {
+        return Err(format!(
+            "conversation workspace '{}' is not a directory",
+            canonical_workspace.display()
+        ));
+    }
+
+    let requested = requested.map(str::trim).filter(|value| !value.is_empty());
+    let candidate = match requested {
+        None => canonical_workspace.clone(),
+        Some(value) => {
+            let value = PathBuf::from(value);
+            if value.is_absolute() {
+                value
+            } else {
+                canonical_workspace.join(value)
+            }
+        }
+    };
+    let canonical_candidate = std::fs::canonicalize(&candidate).map_err(|error| {
+        format!(
+            "could not resolve terminal working directory '{}': {error}",
+            candidate.display()
+        )
+    })?;
+    if !canonical_candidate.is_dir() {
+        return Err(format!(
+            "terminal working directory '{}' is not a directory",
+            canonical_candidate.display()
+        ));
+    }
+    if !canonical_candidate.starts_with(&canonical_workspace) {
+        return Err(format!(
+            "terminal working directory '{}' is outside the current conversation workspace '{}'",
+            canonical_candidate.display(),
+            canonical_workspace.display()
+        ));
+    }
+    Ok(persistable_canonical_path(&canonical_candidate)
+        .to_string_lossy()
+        .into_owned())
+}
+
+/// Keep canonical paths for containment checks, but avoid persisting Windows'
+/// `\\?\C:\...` representation as a terminal cwd. That prefix is useful to the
+/// Win32 filesystem API but is noisy in the UI and is rejected by some CLIs.
+fn persistable_canonical_path(canonical: &Path) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(simplified) = strip_windows_verbatim_prefix(canonical)
+        && matches!(std::fs::canonicalize(&simplified), Ok(round_trip) if round_trip == canonical)
+    {
+        return simplified;
+    }
+
+    canonical.to_path_buf()
+}
+
+#[cfg(windows)]
+fn strip_windows_verbatim_prefix(path: &Path) -> Option<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Component, Prefix};
+
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return None;
+    };
+    let encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    match prefix.kind() {
+        Prefix::VerbatimDisk(_) => {
+            const PREFIX: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+            encoded
+                .strip_prefix(&PREFIX)
+                .map(OsString::from_wide)
+                .map(PathBuf::from)
+        }
+        Prefix::VerbatimUNC(_, _) => {
+            const PREFIX: [u16; 8] = [
+                b'\\' as u16,
+                b'\\' as u16,
+                b'?' as u16,
+                b'\\' as u16,
+                b'U' as u16,
+                b'N' as u16,
+                b'C' as u16,
+                b'\\' as u16,
+            ];
+            encoded.strip_prefix(&PREFIX).map(|rest| {
+                let mut simplified = vec![b'\\' as u16, b'\\' as u16];
+                simplified.extend_from_slice(rest);
+                PathBuf::from(OsString::from_wide(&simplified))
+            })
+        }
+        _ => None,
     }
 }
 
@@ -193,7 +352,7 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
         CapabilityMeta::new(
             "nomi_create_terminal",
             "terminal",
-            "Spawn a new PTY terminal session (shell or agent CLI). Use preset to pick the program; mode to enable full-auto permissions for agent CLIs.",
+            "Spawn a conversation-owned PTY in the current conversation workspace (shell or agent CLI). It stays out of the global sidebar. Use preset to pick the program; close it with nomi_terminal_kill/delete when no longer needed.",
             DangerTier::Write,
         )
         .deny_on(&[Surface::Channel]),
@@ -203,7 +362,7 @@ pub(crate) fn register(out: &mut Vec<Capability>) {
         CapabilityMeta::new(
             "nomi_list_terminals",
             "terminal",
-            "List every terminal session of the calling user (filter by status: running | exited).",
+            "List only terminal sessions owned by the current conversation (filter by status: running | exited). Use this to observe lifecycle changes, including terminals the user closed from the conversation panel.",
             DangerTier::Read,
         ),
         |deps, ctx, p| list(deps, ctx, p),
@@ -265,6 +424,48 @@ mod tests {
         let mode = "yolo";
         let valid = mode == "default" || mode == "full-auto";
         assert!(!valid);
+    }
+
+    #[test]
+    fn terminal_cwd_defaults_to_and_is_confined_by_conversation_workspace() {
+        let test_root = std::env::temp_dir().join(format!(
+            "nomifun-gateway-terminal-cwd-{}",
+            nomifun_common::TerminalId::new()
+        ));
+        let workspace = test_root.join("workspace");
+        let nested = workspace.join("nested");
+        let outside = test_root.join("outside");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let defaulted =
+            resolve_conversation_terminal_cwd(workspace.to_str().unwrap(), None).unwrap();
+        assert_eq!(
+            PathBuf::from(defaulted),
+            persistable_canonical_path(&std::fs::canonicalize(&workspace).unwrap())
+        );
+        let relative =
+            resolve_conversation_terminal_cwd(workspace.to_str().unwrap(), Some("nested"))
+                .unwrap();
+        assert_eq!(
+            PathBuf::from(relative),
+            persistable_canonical_path(&std::fs::canonicalize(&nested).unwrap())
+        );
+        #[cfg(windows)]
+        assert!(
+            !resolve_conversation_terminal_cwd(workspace.to_str().unwrap(), None)
+                .unwrap()
+                .starts_with(r"\\?\"),
+            "persisted terminal cwd must not expose the Windows verbatim prefix"
+        );
+        let error = resolve_conversation_terminal_cwd(
+            workspace.to_str().unwrap(),
+            Some(outside.to_str().unwrap()),
+        )
+        .unwrap_err();
+        assert!(error.contains("outside"), "{error}");
+
+        std::fs::remove_dir_all(test_root).unwrap();
     }
 
     /// Knowledge base ids: serde correctly deserializes typed params.

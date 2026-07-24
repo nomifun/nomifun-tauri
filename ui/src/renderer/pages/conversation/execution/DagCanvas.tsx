@@ -4,7 +4,6 @@ import {
   Background,
   BackgroundVariant,
   Controls,
-  MarkerType,
   MiniMap,
   Panel,
   ReactFlow,
@@ -23,7 +22,8 @@ import type {
 import { latestAttemptForStep } from '@/common/types/agentExecution/agentExecutionTypes';
 import type { ExecutionId, ExecutionStepId } from '@/common/types/ids';
 import { resolveExecutionCanvasFocusStepId, summarizeExecutionText } from './executionCanvasPresentation';
-import { collectExecutionDagFocus, executionDagEdgeId, layoutExecutionDag } from './layoutExecutionDag';
+import { buildExecutionDagEdges } from './executionDagEdges';
+import { collectExecutionDagFocus, layoutExecutionDag } from './layoutExecutionDag';
 import { participantLogo, participantShortLabel } from './participantLabel';
 import StepNode, { type JudgeWinner, type LoopState, normalizeStepKind, type StepFlowNode, type VerifyVerdict } from './nodes/StepNode';
 import type { LeadThinkingState } from './useLeadThinking';
@@ -324,43 +324,10 @@ const DagCanvas: React.FC<DagCanvasProps> = ({ executionId, detail, loading, ref
 
   const edges = useMemo<Edge[]>(() => {
     const statusById = new Map(activeSteps.map((step) => [step.step_id, step.status]));
-    return activeDependencies.map((dependency) => {
-      const id = executionDagEdgeId(dependency.blocker_step_id, dependency.blocked_step_id);
-      const pathFocused = focusedPath?.edgeIds.has(id) ?? false;
-      const dimmed = focusedPath != null && !pathFocused;
-      const animated = !dimmed && statusById.get(dependency.blocked_step_id) === 'running';
-      const stroke = pathFocused
-        ? 'rgb(var(--primary-6))'
-        : animated
-          ? 'rgb(var(--primary-6))'
-          : 'var(--border-base)';
-      return {
-        id,
-        source: String(dependency.blocker_step_id),
-        target: String(dependency.blocked_step_id),
-        type: 'smoothstep',
-        animated,
-        className: [
-          animated ? 'nomi-dag-edge-live' : '',
-          pathFocused ? 'nomi-dag-edge-focused' : '',
-          dimmed ? 'nomi-dag-edge-muted' : '',
-        ]
-          .filter(Boolean)
-          .join(' '),
-        style: {
-          stroke,
-          strokeWidth: pathFocused || animated ? 2 : 1.25,
-          opacity: dimmed ? 0.16 : 1,
-        },
-        markerEnd: {
-          type: MarkerType.ArrowClosed,
-          color: stroke,
-          width: 12,
-          height: 12,
-        },
-        interactionWidth: 16,
-        zIndex: pathFocused ? 2 : 0,
-      };
+    return buildExecutionDagEdges({
+      dependencies: activeDependencies,
+      statusByStepId: statusById,
+      focusedEdgeIds: focusedPath?.edgeIds ?? null,
     });
   }, [activeDependencies, activeSteps, focusedPath]);
 

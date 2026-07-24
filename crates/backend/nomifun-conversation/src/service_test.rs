@@ -6369,6 +6369,7 @@ async fn failover_post_toolcall_fault_does_not_switch_and_surfaces_error() {
                     input: None,
                     output: Some("ok".into()),
                     artifacts: Vec::new(),
+                    retry: None,
                 }),
                 AgentStreamEvent::Error(ErrorEventData::legacy(
                     "rate limited",

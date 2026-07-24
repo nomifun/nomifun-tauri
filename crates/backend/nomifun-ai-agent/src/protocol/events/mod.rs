@@ -19,7 +19,7 @@ pub use session_updates::{
 pub use tool_call::{
     AcpToolCallContentItem, AcpToolCallEventData, AcpToolCallKind, AcpToolCallLocationItem,
     AcpToolCallSessionUpdateKind, AcpToolCallStatus, AcpToolCallTextBlock, AcpToolCallTextBlockType,
-    AcpToolCallUpdateData, ToolCallEventData, ToolCallStatus, ToolGroupEntry,
+    AcpToolCallUpdateData, ToolCallEventData, ToolCallRetryData, ToolCallStatus, ToolGroupEntry,
     validate_artifact_receipt_integrity, validate_completed_artifact_contract,
 };
 pub(crate) use translate::{
@@ -246,6 +246,7 @@ mod tests {
             input: None,
             output: None,
             description: None,
+            retry: None,
             artifacts: Vec::new(),
         });
         let json = serde_json::to_value(&event).unwrap();
@@ -264,6 +265,7 @@ mod tests {
             input: Some(json!({ "pattern": "**/*.rs" })),
             output: Some("src/main.rs\nsrc/lib.rs".into()),
             description: Some("Search for Rust files".into()),
+            retry: None,
             artifacts: Vec::new(),
         });
         let json = serde_json::to_value(&event).unwrap();
@@ -271,6 +273,53 @@ mod tests {
         assert_eq!(json["data"]["input"]["pattern"], "**/*.rs");
         assert_eq!(json["data"]["output"], "src/main.rs\nsrc/lib.rs");
         assert_eq!(json["data"]["description"], "Search for Rust files");
+    }
+
+    #[test]
+    fn tool_call_retry_identity_roundtrips_and_legacy_events_default_to_none() {
+        let event = AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "nomi-call-2".into(),
+            name: "nomi_delegate".into(),
+            args: json!({ "strategy": "parallel" }),
+            status: ToolCallStatus::Completed,
+            input: None,
+            output: Some("ok".into()),
+            description: None,
+            retry: Some(ToolCallRetryData {
+                retry_group_id: "nomi-call-1".into(),
+                attempt_no: 2,
+                retry_of_call_id: Some("nomi-call-1".into()),
+            }),
+            artifacts: Vec::new(),
+        });
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["data"]["retry"]["retry_group_id"], "nomi-call-1");
+        assert_eq!(json["data"]["retry"]["attempt_no"], 2);
+        assert_eq!(json["data"]["retry"]["retry_of_call_id"], "nomi-call-1");
+        let parsed: AgentStreamEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            parsed,
+            AgentStreamEvent::ToolCall(ToolCallEventData {
+                retry: Some(ToolCallRetryData { attempt_no: 2, .. }),
+                ..
+            })
+        ));
+
+        let legacy: AgentStreamEvent = serde_json::from_value(json!({
+            "type": "tool_call",
+            "data": {
+                "call_id": "legacy-call",
+                "name": "Read",
+                "args": {},
+                "status": "completed",
+                "artifacts": []
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            AgentStreamEvent::ToolCall(ToolCallEventData { retry: None, .. })
+        ));
     }
 
     #[test]
@@ -283,6 +332,7 @@ mod tests {
             input: None,
             output: None,
             description: None,
+            retry: None,
             artifacts: Vec::new(),
         });
         let json = serde_json::to_value(&event).unwrap();

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use nomifun_common::{
-    AppError, CompanionId, ProviderId, ProviderUsage, ProviderUsageFeature,
+    AppError, CompanionId, CompanionSkillId, ProviderId, ProviderUsage, ProviderUsageFeature,
     ProviderWithModel, SharedProviderLifecycleBarrier,
 };
 use nomifun_db::IProviderRepository;
@@ -1642,7 +1642,7 @@ impl CompanionService {
         .await?;
         let now = nomifun_common::now_ms();
         let gifted = CompanionSkill {
-            companion_skill_id: nomifun_common::generate_id(),
+            companion_skill_id: CompanionSkillId::new().into_string(),
             skill_name: src.skill_name.clone(),
             scope_kind: "companion".into(),
             scope_companion_id: Some(to_companion_id.to_owned()),

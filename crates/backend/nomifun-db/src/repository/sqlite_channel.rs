@@ -1,6 +1,6 @@
 use nomifun_common::{
     ChannelPluginId, ChannelSessionId, ChannelUserId, CompanionId, ConversationId,
-    PublicAgentId, generate_id,
+    PublicAgentId,
 };
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
@@ -146,7 +146,7 @@ impl IChannelRepository for SqliteChannelRepository {
     }
 
     async fn create_plugin(&self, row: &NewChannelPluginRow) -> Result<ChannelPluginRow, DbError> {
-        let channel_plugin_id = generate_id();
+        let channel_plugin_id = ChannelPluginId::new().into_string();
         let (companion_id, public_agent_id) = canonical_plugin_binding_ids(
             row.companion_id.as_deref(),
             row.public_agent_id.as_deref(),
@@ -494,7 +494,7 @@ impl IChannelRepository for SqliteChannelRepository {
             "channel user",
         )
         .await?;
-        let channel_user_id = generate_id();
+        let channel_user_id = ChannelUserId::new().into_string();
         let inserted = sqlx::query_as::<_, ChannelUserRow>(
             "INSERT INTO channel_users \
                 (channel_user_id, platform_user_id, platform_type, channel_plugin_id, \

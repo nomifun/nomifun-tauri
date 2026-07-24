@@ -15,6 +15,7 @@
 //! (which dispatches with real deps) and the `mcp-gateway-stdio` bridge (which
 //! only reads `tool_specs()` to answer `tools/list`).
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -346,27 +347,126 @@ fn schema_for_params<P: JsonSchema>() -> Map<String, Value> {
     map.remove("$schema");
     map.remove("title");
     map.entry("type").or_insert_with(|| json!("object"));
-    map.entry("additionalProperties")
-        .or_insert_with(|| json!(false));
-    // Tools with no fields still need a `properties` object so clients render an
-    // empty-args form rather than rejecting the schema.
-    map.entry("properties").or_insert_with(|| json!({}));
+    let is_composed = ["allOf", "anyOf", "oneOf"]
+        .iter()
+        .any(|keyword| map.contains_key(*keyword))
+        || map.contains_key("$ref");
+    if !is_composed {
+        map.entry("additionalProperties")
+            .or_insert_with(|| json!(false));
+        // Plain tools with no fields still need a `properties` object so clients
+        // render an empty-args form rather than rejecting the schema.
+        map.entry("properties").or_insert_with(|| json!({}));
+    }
     map
 }
 
 /// Add the cross-cutting `confirm` argument to a confirm-gated tool's schema so
 /// the LLM can discover it.
+///
+/// A composed root (`oneOf` / `anyOf` / `allOf`) can contain strict object
+/// branches with `additionalProperties: false`. Adding `confirm` only to the
+/// root does not make it legal in those branches, so walk the top-level
+/// composition graph (including local `$ref`s) and add it to every reachable
+/// object schema. Deliberately do not descend through `properties`: `confirm`
+/// belongs to the tool call, not to nested request objects.
 fn inject_confirm_property(schema: &mut Map<String, Value>) {
-    let props = schema.entry("properties").or_insert_with(|| json!({}));
-    if let Some(obj) = props.as_object_mut() {
-        obj.insert(
-            "confirm".into(),
-            json!({
-                "type": "boolean",
-                "description": "Set true ONLY after restating the exact destructive/sensitive action and its target to the user and getting explicit agreement. Required to execute confirm-gated actions."
-            }),
-        );
+    let mut root = Value::Object(std::mem::take(schema));
+    let mut object_paths = BTreeSet::new();
+    let mut visited_paths = BTreeSet::new();
+    collect_composed_object_paths(
+        &root,
+        &root,
+        "",
+        &mut object_paths,
+        &mut visited_paths,
+    );
+
+    let confirm_schema = json!({
+        "type": "boolean",
+        "description": "Set true ONLY after restating the exact destructive/sensitive action and its target to the user and getting explicit agreement. Required to execute confirm-gated actions."
+    });
+    for path in object_paths {
+        let Some(object) = root.pointer_mut(&path).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let properties = object.entry("properties").or_insert_with(|| json!({}));
+        if let Some(properties) = properties.as_object_mut() {
+            properties.insert("confirm".into(), confirm_schema.clone());
+        }
     }
+
+    let Value::Object(root) = root else {
+        unreachable!("the schema root was constructed as an object")
+    };
+    *schema = root;
+}
+
+fn collect_composed_object_paths(
+    root: &Value,
+    node: &Value,
+    path: &str,
+    object_paths: &mut BTreeSet<String>,
+    visited_paths: &mut BTreeSet<String>,
+) {
+    if !visited_paths.insert(path.to_owned()) {
+        return;
+    }
+    let Some(object) = node.as_object() else {
+        return;
+    };
+
+    if schema_describes_object(object) {
+        object_paths.insert(path.to_owned());
+    }
+
+    if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+        if let Some(pointer) = reference.strip_prefix('#') {
+            if let Some(target) = (pointer.is_empty() || pointer.starts_with('/'))
+                .then(|| root.pointer(pointer))
+                .flatten()
+            {
+                // Use the JSON pointer from the schema itself as the canonical
+                // path, so cycles and duplicate references are naturally
+                // deduplicated by `visited_paths`.
+                collect_composed_object_paths(
+                    root,
+                    target,
+                    pointer,
+                    object_paths,
+                    visited_paths,
+                );
+            }
+        }
+    }
+
+    for keyword in ["allOf", "anyOf", "oneOf"] {
+        let Some(branches) = object.get(keyword).and_then(Value::as_array) else {
+            continue;
+        };
+        for (index, branch) in branches.iter().enumerate() {
+            let branch_path = format!("{path}/{keyword}/{index}");
+            collect_composed_object_paths(
+                root,
+                branch,
+                &branch_path,
+                object_paths,
+                visited_paths,
+            );
+        }
+    }
+}
+
+fn schema_describes_object(schema: &Map<String, Value>) -> bool {
+    let object_type = match schema.get("type") {
+        Some(Value::String(kind)) => kind == "object",
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "object"),
+        _ => false,
+    };
+    object_type
+        || schema.contains_key("properties")
+        || schema.contains_key("required")
+        || schema.contains_key("additionalProperties")
 }
 
 /// Remove the gate-only `confirm` key before typed deserialization.
@@ -613,5 +713,150 @@ mod tests {
     fn generated_capability_schema_is_closed_by_default() {
         let schema = schema_for_params::<FixedShapeParams>();
         assert_eq!(schema.get("additionalProperties"), Some(&json!(false)));
+    }
+
+    #[derive(Debug, Deserialize, JsonSchema)]
+    #[serde(tag = "strategy", rename_all = "snake_case", deny_unknown_fields)]
+    #[allow(dead_code)]
+    enum TaggedUnionParams {
+        Planned { goal: String },
+        Parallel { tasks: Vec<String> },
+    }
+
+    #[test]
+    fn generated_tagged_union_schema_does_not_close_the_composed_root() {
+        let schema = schema_for_params::<TaggedUnionParams>();
+        assert!(
+            schema.contains_key("oneOf") || schema.contains_key("anyOf"),
+            "schemars should represent a tagged enum as a composed root schema"
+        );
+        assert_ne!(
+            schema.get("additionalProperties"),
+            Some(&json!(false)),
+            "closing an empty composed root rejects every property declared by its variants"
+        );
+
+        // The typed execution contract still rejects fields outside the chosen
+        // variant; root closure is unnecessary because each generated branch is
+        // already strict through `deny_unknown_fields`.
+        assert!(
+            serde_json::from_value::<TaggedUnionParams>(json!({
+                "strategy": "parallel",
+                "tasks": ["research"]
+            }))
+            .is_ok()
+        );
+        assert!(
+            serde_json::from_value::<TaggedUnionParams>(json!({
+                "strategy": "parallel",
+                "tasks": ["research"],
+                "goal": "must not mix variants"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn confirm_is_injected_into_strict_composed_branches_and_local_refs() {
+        let mut schema = json!({
+            "type": "object",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "strategy": { "const": "planned" },
+                        "goal": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                },
+                { "$ref": "#/$defs/parallel" }
+            ],
+            "$defs": {
+                "parallel": {
+                    "type": "object",
+                    "properties": {
+                        "strategy": { "const": "parallel" },
+                        "tasks": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "prompt": { "type": "string" }
+                                },
+                                "additionalProperties": false
+                            }
+                        }
+                    },
+                    "additionalProperties": false
+                },
+                "unreferenced": {
+                    "type": "object",
+                    "properties": {
+                        "value": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        })
+        .as_object()
+        .expect("test schema is an object")
+        .clone();
+
+        inject_confirm_property(&mut schema);
+        let schema = Value::Object(schema);
+
+        for pointer in [
+            "/properties/confirm/type",
+            "/oneOf/0/properties/confirm/type",
+            "/$defs/parallel/properties/confirm/type",
+        ] {
+            assert_eq!(
+                schema.pointer(pointer),
+                Some(&json!("boolean")),
+                "confirm must be accepted by every strict top-level branch: {pointer}"
+            );
+        }
+        assert!(
+            schema
+                .pointer("/$defs/parallel/properties/tasks/items/properties/confirm")
+                .is_none(),
+            "confirm must not leak into nested request objects"
+        );
+        assert!(
+            schema
+                .pointer("/$defs/unreferenced/properties/confirm")
+                .is_none(),
+            "unreferenced definitions are not part of the top-level composition"
+        );
+    }
+
+    #[test]
+    fn confirm_is_injected_into_generated_tagged_union_variants() {
+        let mut schema = schema_for_params::<TaggedUnionParams>();
+        inject_confirm_property(&mut schema);
+        let schema = Value::Object(schema);
+
+        assert_eq!(
+            schema.pointer("/properties/confirm/type"),
+            Some(&json!("boolean"))
+        );
+        let alternatives = schema
+            .get("oneOf")
+            .or_else(|| schema.get("anyOf"))
+            .and_then(Value::as_array)
+            .expect("tagged union must expose alternatives");
+        for alternative in alternatives {
+            let variant = alternative
+                .get("$ref")
+                .and_then(Value::as_str)
+                .and_then(|reference| reference.strip_prefix('#'))
+                .and_then(|pointer| schema.pointer(pointer))
+                .unwrap_or(alternative);
+            assert_eq!(
+                variant.pointer("/properties/confirm/type"),
+                Some(&json!("boolean")),
+                "each strict tagged-union variant must accept confirm"
+            );
+        }
     }
 }

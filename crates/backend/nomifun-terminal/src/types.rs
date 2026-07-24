@@ -1,10 +1,88 @@
 use nomifun_api_types::TerminalSessionResponse;
+use nomifun_common::ConversationId;
 use nomifun_db::TerminalSessionRow;
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Sentinel `command` value meaning "use the platform login shell". Resolved at
 /// spawn time so the stored row stays portable across machines.
 pub const SHELL_SENTINEL: &str = "$SHELL";
+
+/// Reserved key stored only inside `terminal_sessions.env` until a dedicated
+/// owner column can be introduced. It is backend metadata, never a real child
+/// process environment variable.
+///
+/// Every create path removes a caller-supplied value first, and every spawn
+/// path removes it again before constructing the PTY environment. Keeping the
+/// key private to this crate makes that invariant hard to bypass accidentally.
+pub(crate) const OWNER_CONVERSATION_ID_ENV_KEY: &str =
+    "__NOMIFUN_INTERNAL_OWNER_CONVERSATION_ID";
+
+/// Parsed owner classification for one persisted terminal row.
+///
+/// Malformed JSON or an invalid reserved value is kept separate from
+/// `Standalone`: callers must fail closed instead of accidentally exposing a
+/// corrupted conversation terminal in the standalone sidebar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TerminalOwnerScope {
+    Standalone,
+    Conversation(ConversationId),
+    Invalid,
+}
+
+/// Remove all backend-only metadata before a map is passed to a child process.
+pub(crate) fn strip_internal_terminal_env(
+    env: Option<HashMap<String, String>>,
+) -> Option<HashMap<String, String>> {
+    let mut env = env.unwrap_or_default();
+    env.remove(OWNER_CONVERSATION_ID_ENV_KEY);
+    (!env.is_empty()).then_some(env)
+}
+
+/// Build the authoritative map persisted in `terminal_sessions.env`.
+///
+/// A caller cannot forge ownership: its reserved entry is removed first, then
+/// the server-selected owner (if any) is written back.
+pub(crate) fn persisted_terminal_env(
+    env: Option<HashMap<String, String>>,
+    owner_conversation_id: Option<&ConversationId>,
+) -> Option<HashMap<String, String>> {
+    let mut env = strip_internal_terminal_env(env).unwrap_or_default();
+    if let Some(owner_conversation_id) = owner_conversation_id {
+        env.insert(
+            OWNER_CONVERSATION_ID_ENV_KEY.to_owned(),
+            owner_conversation_id.to_string(),
+        );
+    }
+    (!env.is_empty()).then_some(env)
+}
+
+/// Parse a persisted environment for PTY use while stripping backend metadata.
+/// Malformed legacy JSON is tolerated as an empty environment, matching the
+/// terminal service's previous relaunch behavior.
+pub(crate) fn process_env_from_persisted(
+    env_json: Option<&str>,
+) -> Option<HashMap<String, String>> {
+    let env = env_json.and_then(|json| serde_json::from_str(json).ok());
+    strip_internal_terminal_env(env)
+}
+
+/// Decode the conversation owner from a persisted row.
+pub(crate) fn terminal_owner_scope(env_json: Option<&str>) -> TerminalOwnerScope {
+    let Some(env_json) = env_json else {
+        return TerminalOwnerScope::Standalone;
+    };
+    let Ok(env) = serde_json::from_str::<HashMap<String, String>>(env_json) else {
+        return TerminalOwnerScope::Invalid;
+    };
+    let Some(raw_owner) = env.get(OWNER_CONVERSATION_ID_ENV_KEY) else {
+        return TerminalOwnerScope::Standalone;
+    };
+    match ConversationId::parse(raw_owner) {
+        Ok(owner) => TerminalOwnerScope::Conversation(owner),
+        Err(_) => TerminalOwnerScope::Invalid,
+    }
+}
 
 /// Resolve the launch (program, argv) for a session, expanding the shell
 /// sentinel to the platform default shell and resolving a bare program name
@@ -87,8 +165,13 @@ pub fn row_to_response(
     // path "start with" it, and an empty cwd carries no grouping signal.
     let is_default_workpath =
         !row.cwd.is_empty() && !work_dir.as_os_str().is_empty() && Path::new(&row.cwd).starts_with(work_dir);
+    let owner_conversation_id = match terminal_owner_scope(row.env.as_deref()) {
+        TerminalOwnerScope::Conversation(owner) => Some(owner),
+        TerminalOwnerScope::Standalone | TerminalOwnerScope::Invalid => None,
+    };
     TerminalSessionResponse {
         terminal_id: row.terminal_id.clone(),
+        owner_conversation_id,
         name: row.name.clone(),
         cwd: row.cwd.clone(),
         is_default_workpath,
@@ -220,6 +303,55 @@ mod tests {
     }
 
     #[test]
+    fn persisted_owner_is_server_authoritative_and_never_reaches_process_env() {
+        let forged = ConversationId::new();
+        let authoritative = ConversationId::new();
+        let mut caller_env = HashMap::from([
+            ("VISIBLE".to_owned(), "yes".to_owned()),
+            (
+                OWNER_CONVERSATION_ID_ENV_KEY.to_owned(),
+                forged.to_string(),
+            ),
+        ]);
+
+        let persisted = persisted_terminal_env(
+            Some(std::mem::take(&mut caller_env)),
+            Some(&authoritative),
+        )
+        .expect("owner metadata should be persisted");
+        assert_eq!(
+            persisted.get(OWNER_CONVERSATION_ID_ENV_KEY),
+            Some(&authoritative.to_string())
+        );
+        let json = serde_json::to_string(&persisted).unwrap();
+        assert_eq!(
+            terminal_owner_scope(Some(&json)),
+            TerminalOwnerScope::Conversation(authoritative)
+        );
+
+        let process_env =
+            process_env_from_persisted(Some(&json)).expect("visible env should remain");
+        assert_eq!(process_env.get("VISIBLE").map(String::as_str), Some("yes"));
+        assert!(!process_env.contains_key(OWNER_CONVERSATION_ID_ENV_KEY));
+    }
+
+    #[test]
+    fn malformed_owner_metadata_fails_closed() {
+        let invalid_owner = serde_json::json!({
+            OWNER_CONVERSATION_ID_ENV_KEY: "not-a-conversation-id"
+        })
+        .to_string();
+        assert_eq!(
+            terminal_owner_scope(Some(&invalid_owner)),
+            TerminalOwnerScope::Invalid
+        );
+        assert_eq!(
+            terminal_owner_scope(Some("not-json")),
+            TerminalOwnerScope::Invalid
+        );
+    }
+
+    #[test]
     fn row_to_response_parses_args_and_maps_fields() {
         let resp = row_to_response(&sample_row(), Some("c2I=".into()), Path::new("/work"));
         assert!(nomifun_common::validate_uuidv7(resp.terminal_id.as_str()).is_ok());
@@ -227,6 +359,21 @@ mod tests {
         assert_eq!((resp.cols, resp.rows), (100, 30));
         assert_eq!(resp.scrollback_b64.as_deref(), Some("c2I="));
         assert_eq!(resp.last_status, "running");
+        assert!(resp.owner_conversation_id.is_none());
+    }
+
+    #[test]
+    fn row_to_response_exposes_conversation_owner() {
+        let owner = ConversationId::new();
+        let mut row = sample_row();
+        row.env = Some(
+            serde_json::to_string(
+                &persisted_terminal_env(None, Some(&owner)).expect("owner metadata"),
+            )
+            .unwrap(),
+        );
+        let resp = row_to_response(&row, None, Path::new("/work"));
+        assert_eq!(resp.owner_conversation_id, Some(owner));
     }
 
     #[test]

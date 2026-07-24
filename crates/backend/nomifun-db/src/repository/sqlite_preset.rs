@@ -838,13 +838,15 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
+        let execution_template_id = nomifun_common::AgentExecutionTemplateId::new();
         sqlx::query(
             "INSERT INTO agent_execution_template_participants \
                 (template_participant_id, template_id, source_agent_id, preset_id, preset_revision, preset_snapshot, \
                  created_at, updated_at) \
-             VALUES (?, 'template-fixture', ?, ?, 1, '{}', ?, ?)",
+             VALUES (?, ?, ?, ?, 1, '{}', ?, ?)",
         )
         .bind(nomifun_common::generate_id())
+        .bind(execution_template_id.as_str())
         .bind(NOMI_AGENT_ID)
         .bind(PRESET_ID)
         .bind(now)
@@ -920,8 +922,9 @@ mod tests {
                 .unwrap();
         let template_preset: Option<String> = sqlx::query_scalar(
             "SELECT preset_id FROM agent_execution_template_participants \
-             WHERE template_id = 'template-fixture'",
+             WHERE template_id = ?",
         )
+        .bind(execution_template_id.as_str())
         .fetch_one(db.pool())
         .await
         .unwrap();

@@ -117,23 +117,9 @@ const UUIDV7_BUSINESS_COLUMNS: &[(&str, &str)] = &[
     ("workshop_canvases", "canvas_id"),
 ];
 
-/// Populated logical-reference columns that must always contain bare UUIDv7
-/// values but are not unique entity identities themselves.
-const UUIDV7_REFERENCE_COLUMNS: &[(&str, &str)] = &[
-    ("agent_execution_participants", "source_agent_id"),
-    (
-        "agent_execution_template_participants",
-        "source_agent_id",
-    ),
-    ("conversation_mcp_servers", "mcp_server_id"),
-    ("idmm_interventions", "target_id"),
-];
-
-/// Nullable logical-reference columns whose populated values are bare UUIDv7.
-const OPTIONAL_UUIDV7_REFERENCE_COLUMNS: &[(&str, &str)] = &[
-    ("creation_tasks", "canvas_id"),
-    ("tag_settings", "webhook_id"),
-];
+/// Canonical UUIDv7 values owned by a managed side store rather than a
+/// relational entity row in SQLite.
+const UUIDV7_MANAGED_VALUE_COLUMNS: &[(&str, &str)] = &[("creation_tasks", "node_id")];
 
 /// `_id` columns that are identities, operation tokens, platform handles, or
 /// opaque remote handles rather than relational links. Every other physical
@@ -685,6 +671,11 @@ pub(crate) const JSON_LOGICAL_REFERENCES: &[JsonLogicalReference] = &[
         "SELECT json_extract(origin, '$.creation_task_id') AS value FROM workshop_assets WHERE origin IS NOT NULL" =>
         "creation_tasks", "creation_task_id", "idx_workshop_assets_origin_creation_task_id", KeepHistory, AllowMissingHistoricalParent
     ),
+    json_external_ref!(
+        "workshop_assets", "origin", "$.node_id",
+        "SELECT json_extract(origin, '$.node_id') AS value FROM workshop_assets WHERE origin IS NOT NULL",
+        "idx_workshop_assets_origin_node_id", KeepHistory
+    ),
     json_text_ref!(
         "creation_tasks", "result_asset_ids", "$[]",
         "SELECT item.value AS value FROM creation_tasks, json_each(creation_tasks.result_asset_ids) item" =>
@@ -784,7 +775,7 @@ pub async fn validate_id_schema_contract(pool: &SqlitePool) -> Result<(), DbErro
     validate_logical_reference_registry(pool).await?;
     validate_logical_reference_coverage(pool).await?;
     validate_json_logical_reference_registry(pool).await?;
-    require_workshop_asset_origin_creation_task_contract(pool).await?;
+    require_workshop_asset_origin_id_contract(pool).await?;
     for contract in PARTIAL_UNIQUE_INDEXES {
         require_partial_unique_index(
             pool,
@@ -798,18 +789,57 @@ pub async fn validate_id_schema_contract(pool: &SqlitePool) -> Result<(), DbErro
     Ok(())
 }
 
-/// v3 backup/restore value validation for explicitly registered business IDs.
+/// Validate every populated stable business ID, managed UUID value and
+/// canonical logical-reference column in the v3 registry.
 pub(crate) async fn validate_id_value_contract(pool: &SqlitePool) -> Result<(), DbError> {
     for (table, column) in UUIDV7_BUSINESS_COLUMNS {
         validate_uuidv7_column_values(pool, table, column, None).await?;
     }
-    for (table, column) in UUIDV7_REFERENCE_COLUMNS {
+    for (table, column) in UUIDV7_MANAGED_VALUE_COLUMNS {
         validate_uuidv7_column_values(pool, table, column, None).await?;
     }
-    for (table, column) in OPTIONAL_UUIDV7_REFERENCE_COLUMNS {
-        validate_uuidv7_column_values(pool, table, column, None).await?;
+    for reference in LOGICAL_REFERENCES {
+        if reference.value_contract == LogicalReferenceValueContract::CanonicalUuidV7 {
+            validate_uuidv7_column_values(
+                pool,
+                reference.child_table,
+                reference.child_column,
+                reference.child_predicate,
+            )
+            .await?;
+        }
     }
     Ok(())
+}
+
+/// Validate the complete durable v3 ID data contract. Any failure identifies
+/// the current managed dataset as incompatible; callers must quarantine/reset
+/// the dataset rather than rewrite IDs.
+pub async fn validate_id_data_contract(pool: &SqlitePool) -> Result<(), DbError> {
+    validate_id_value_contract(pool).await?;
+    validate_workshop_asset_origin_values(pool).await?;
+    validate_creation_task_result_asset_ids(pool).await?;
+    let findings = audit_logical_reference_orphans(pool).await?;
+    if findings.is_empty() {
+        return Ok(());
+    }
+    let details = findings
+        .iter()
+        .map(|finding| {
+            format!(
+                "{}.{} -> {}.{}: {} invalid/orphan value(s)",
+                finding.child_table,
+                finding.child_column,
+                finding.parent_table,
+                finding.parent_column,
+                finding.count
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(DbError::Init(format!(
+        "v3 ID data contract audit failed: {details}"
+    )))
 }
 
 /// Read-only database orphan audit. Cross-store registry entries are skipped;
@@ -1022,11 +1052,7 @@ async fn validate_business_id_registry(pool: &SqlitePool) -> Result<(), DbError>
         require_single_column_unique_index(pool, table, column).await?;
         require_uuidv7_check(pool, table, column).await?;
     }
-    for (table, column) in UUIDV7_REFERENCE_COLUMNS {
-        require_column(pool, table, column, "TEXT", true).await?;
-        require_uuidv7_check(pool, table, column).await?;
-    }
-    for (table, column) in OPTIONAL_UUIDV7_REFERENCE_COLUMNS {
+    for (table, column) in UUIDV7_MANAGED_VALUE_COLUMNS {
         require_column(pool, table, column, "TEXT", false).await?;
         require_uuidv7_check(pool, table, column).await?;
     }
@@ -1154,7 +1180,7 @@ async fn validate_json_logical_reference_registry(pool: &SqlitePool) -> Result<(
     Ok(())
 }
 
-async fn require_workshop_asset_origin_creation_task_contract(
+async fn require_workshop_asset_origin_id_contract(
     pool: &SqlitePool,
 ) -> Result<(), DbError> {
     let create_sql: String = sqlx::query_scalar(
@@ -1163,18 +1189,171 @@ async fn require_workshop_asset_origin_creation_task_contract(
     .fetch_one(pool)
     .await?;
     let normalized = normalize_sql(&create_sql);
-    for fragment in [
-        "COALESCE(JSON_TYPE(ORIGIN, '$.TASK_ID'), 'MISSING') = 'MISSING'",
-        "JSON_TYPE(ORIGIN, '$.CREATION_TASK_ID') = 'TEXT'",
-        "LENGTH(JSON_EXTRACT(ORIGIN, '$.CREATION_TASK_ID')) = 36",
-        "LOWER(JSON_EXTRACT(ORIGIN, '$.CREATION_TASK_ID')) = JSON_EXTRACT(ORIGIN, '$.CREATION_TASK_ID')",
-        "JSON_EXTRACT(ORIGIN, '$.CREATION_TASK_ID') GLOB '????????-????-7???-[89AB]???-????????????'",
-        "REPLACE(JSON_EXTRACT(ORIGIN, '$.CREATION_TASK_ID'), '-', '') NOT GLOB '*[^0-9A-F]*'",
+    for retired_key in [
+        "TASK_ID",
+        "PROVIDERID",
+        "CANVASID",
+        "NODEID",
+        "CREATIONTASKID",
     ] {
-        if !normalized.contains(fragment) {
+        let fragment = format!("JSON_TYPE(ORIGIN, '$.{retired_key}') IS NULL");
+        if !normalized.contains(&fragment) {
             return Err(DbError::Init(format!(
-                "v3 workshop_assets.origin creation_task_id contract is missing CHECK fragment {fragment}"
+                "v3 workshop_assets.origin contract permits unsupported field {retired_key}"
             )));
+        }
+    }
+    for key in [
+        "PROVIDER_ID",
+        "CANVAS_ID",
+        "NODE_ID",
+        "CREATION_TASK_ID",
+    ] {
+        let fragments = [
+            format!("JSON_TYPE(ORIGIN, '$.{key}') IS NULL"),
+            format!("JSON_TYPE(ORIGIN, '$.{key}') = 'TEXT'"),
+            format!("LENGTH(JSON_EXTRACT(ORIGIN, '$.{key}')) = 36"),
+            format!(
+                "JSON_EXTRACT(ORIGIN, '$.{key}') GLOB '????????-????-7???-[89AB]???-????????????'"
+            ),
+            format!(
+                "REPLACE(JSON_EXTRACT(ORIGIN, '$.{key}'), '-', '') NOT GLOB '*[^0-9A-F]*'"
+            ),
+        ];
+        for fragment in fragments {
+            if !normalized.contains(&fragment) {
+                return Err(DbError::Init(format!(
+                    "v3 workshop_assets.origin {key} contract is missing CHECK fragment {fragment}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn validate_workshop_asset_origin_values(pool: &SqlitePool) -> Result<(), DbError> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT asset_id, origin FROM workshop_assets WHERE origin IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (asset_id, encoded) in rows {
+        let value: serde_json::Value = serde_json::from_str(&encoded).map_err(|error| {
+            DbError::Init(format!(
+                "v3 workshop asset {asset_id} has invalid origin JSON: {error}"
+            ))
+        })?;
+        let object = value.as_object().ok_or_else(|| {
+            DbError::Init(format!(
+                "v3 workshop asset {asset_id} origin must be a JSON object"
+            ))
+        })?;
+        for retired_key in [
+            "task_id",
+            "providerId",
+            "canvasId",
+            "nodeId",
+            "creationTaskId",
+        ] {
+            if object.contains_key(retired_key) {
+                return Err(DbError::Init(format!(
+                    "v3 workshop asset {asset_id} origin contains unsupported ID field {retired_key:?}"
+                )));
+            }
+        }
+        for key in [
+            "provider_id",
+            "canvas_id",
+            "node_id",
+            "creation_task_id",
+        ] {
+            let Some(value) = object.get(key) else {
+                continue;
+            };
+            let value = value.as_str().ok_or_else(|| {
+                DbError::Init(format!(
+                    "v3 workshop asset {asset_id} origin.{key} must be omitted or a canonical UUIDv7 string"
+                ))
+            })?;
+            nomifun_common::validate_uuidv7(value).map_err(|error| {
+                DbError::Init(format!(
+                    "v3 workshop asset {asset_id} origin.{key}={value:?} is invalid: {error}"
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
+
+async fn validate_creation_task_result_asset_ids(pool: &SqlitePool) -> Result<(), DbError> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT creation_task_id, status, result_asset_ids FROM creation_tasks",
+    )
+    .fetch_all(pool)
+    .await?;
+    for (creation_task_id, status, encoded) in rows {
+        let values: serde_json::Value = serde_json::from_str(&encoded).map_err(|error| {
+            DbError::Init(format!(
+                "v3 creation task {creation_task_id} has invalid result_asset_ids JSON: {error}"
+            ))
+        })?;
+        let values = values.as_array().ok_or_else(|| {
+            DbError::Init(format!(
+                "v3 creation task {creation_task_id} result_asset_ids must be a JSON array"
+            ))
+        })?;
+        if status == "succeeded" && values.is_empty() {
+            return Err(DbError::Init(format!(
+                "v3 creation task {creation_task_id} is succeeded but has no result assets"
+            )));
+        }
+        if status != "succeeded" && !values.is_empty() {
+            return Err(DbError::Init(format!(
+                "v3 creation task {creation_task_id} is {status:?} but claims committed result assets"
+            )));
+        }
+        let mut seen = BTreeSet::new();
+        for value in values {
+            let value = value.as_str().ok_or_else(|| {
+                DbError::Init(format!(
+                    "v3 creation task {creation_task_id} result_asset_ids must contain only canonical UUIDv7 strings"
+                ))
+            })?;
+            nomifun_common::WorkshopAssetId::parse(value).map_err(|error| {
+                DbError::Init(format!(
+                    "v3 creation task {creation_task_id} result asset {value:?} is invalid: {error}"
+                ))
+            })?;
+            if !seen.insert(value) {
+                return Err(DbError::Init(format!(
+                    "v3 creation task {creation_task_id} contains duplicate result asset {value}"
+                )));
+            }
+            let origin: Option<String> =
+                sqlx::query_scalar("SELECT origin FROM workshop_assets WHERE asset_id = ?")
+                    .bind(value)
+                    .fetch_optional(pool)
+                    .await?
+                    .flatten();
+            let origin = origin.ok_or_else(|| {
+                DbError::Init(format!(
+                    "v3 creation task {creation_task_id} result asset {value} is missing or has no managed origin"
+                ))
+            })?;
+            let owner = serde_json::from_str::<serde_json::Value>(&origin)
+                .ok()
+                .and_then(|origin| {
+                    origin
+                        .get("creation_task_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                });
+            if owner.as_deref() != Some(creation_task_id.as_str()) {
+                return Err(DbError::Init(format!(
+                    "v3 creation task {creation_task_id} result asset {value} belongs to {:?}",
+                    owner.as_deref()
+                )));
+            }
         }
     }
     Ok(())
@@ -1254,7 +1433,7 @@ async fn validate_uuidv7_column_values(
         .map(|value| format!(" AND ({value})"))
         .unwrap_or_default();
     let sql = format!(
-        "SELECT {column} FROM {table} WHERE {column} IS NOT NULL{predicate}",
+        "SELECT child.{column} FROM {table} child WHERE child.{column} IS NOT NULL{predicate}",
         table = quote_sqlite_identifier(table),
         column = quote_sqlite_identifier(column),
     );
@@ -1811,6 +1990,49 @@ mod tests {
                 && finding.child_column == "mcp_server_id"
                 && finding.count == 1
         }));
+    }
+
+    #[tokio::test]
+    async fn data_contract_rejects_succeeded_creation_without_committed_assets() {
+        let database = init_database_memory().await.expect("database");
+        let pool = database.pool();
+        let provider_id = nomifun_common::ProviderId::new();
+        sqlx::query(
+            "INSERT INTO providers \
+             (provider_id, platform, name, base_url, api_key_encrypted, created_at, updated_at) \
+             VALUES (?, 'contract', 'Creation audit provider', 'https://example.invalid', '', 1, 1)",
+        )
+        .bind(provider_id.as_str())
+        .execute(pool)
+        .await
+        .expect("provider");
+        let creation_task_id = nomifun_common::CreationTaskId::new();
+        sqlx::query(
+            "INSERT INTO creation_tasks \
+             (creation_task_id, provider_id, model, capability, params, status, \
+              result_asset_ids, submitted_at, finished_at) \
+             VALUES (?, ?, 'model', 't2i', '{}', 'succeeded', '[]', 1, 2)",
+        )
+        .bind(creation_task_id.as_str())
+        .bind(provider_id.as_str())
+        .execute(pool)
+        .await
+        .expect("invalid current-lineage fixture");
+
+        let error = validate_id_data_contract(pool).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("succeeded but has no result assets")
+        );
+        let unchanged: String = sqlx::query_scalar(
+            "SELECT status FROM creation_tasks WHERE creation_task_id = ?",
+        )
+        .bind(creation_task_id.as_str())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(unchanged, "succeeded");
     }
 
     #[tokio::test]

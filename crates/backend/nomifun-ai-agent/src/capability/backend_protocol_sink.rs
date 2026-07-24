@@ -7,7 +7,7 @@ use serde_json::json;
 use tokio::sync::broadcast;
 use tracing::debug;
 
-use crate::protocol::events::{AcpPermissionEventData, AgentStreamEvent, ToolCallEventData, ToolCallStatus};
+use crate::protocol::events::{AcpPermissionEventData, AgentStreamEvent};
 
 /// Implements `ProtocolEmitter` for the nomicore context.
 ///
@@ -89,17 +89,15 @@ impl ProtocolEmitter for BackendProtocolSink {
                 if let Ok(mut confs) = self.confirmations.write() {
                     confs.retain(|c| c.call_id != *call_id);
                 }
-
-                let _ = self.event_tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
-                    call_id: call_id.clone(),
-                    name: format!("cancelled: {reason}"),
-                    args: serde_json::Value::Null,
-                    status: ToolCallStatus::Error,
-                    input: None,
-                    output: None,
-                    description: None,
-                    artifacts: Vec::new(),
-                }));
+                // The authoritative terminal ToolCall (including canonical
+                // call id, original args, and retry identity) is emitted by
+                // BackendOutputSink from the denied ToolResult. Emitting a
+                // second raw-provider-id row here would duplicate one denial.
+                debug!(
+                    call_id,
+                    reason,
+                    "BackendProtocolSink: cleared cancelled tool confirmation"
+                );
             }
 
             _ => {}
@@ -168,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_cancelled_removes_confirmation_and_emits_error() {
+    fn tool_cancelled_only_removes_confirmation() {
         let (sink, mut rx, confs) = make_sink();
 
         let req = ProtocolEvent::ToolRequest {
@@ -193,15 +191,7 @@ mod tests {
         };
         sink.emit(&cancel).unwrap();
 
-        let received = rx.try_recv().unwrap();
-        match received {
-            AgentStreamEvent::ToolCall(data) => {
-                assert_eq!(data.call_id, "c1");
-                assert_eq!(data.status, ToolCallStatus::Error);
-            }
-            other => panic!("Expected ToolCall error, got {:?}", other),
-        }
-
+        assert!(rx.try_recv().is_err());
         assert_eq!(confs.read().unwrap().len(), 0);
     }
 

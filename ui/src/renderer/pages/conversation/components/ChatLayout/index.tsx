@@ -420,11 +420,9 @@ const ChatLayoutInner: React.FC<ChatLayoutProps> = (props) => {
             type='button'
             className='workspace-tool-rail-mobile-trigger'
             onClick={() => {
-              setActiveWorkspaceTab('files');
-              if (workspaceTarget) dispatchWorkspacePanelTabEvent('files', workspaceTarget);
               persistRightSiderCollapsed(false);
             }}
-            aria-label={t('conversation.workspace.changes.filesTab')}
+            aria-label={t('conversation.workspace.expand', { defaultValue: '展开侧栏' })}
           >
             <span className='workspace-tool-rail-mobile-trigger__dot' />
             <span className='workspace-tool-rail-mobile-trigger__dot' />
@@ -510,6 +508,17 @@ const ChatLayoutInner: React.FC<ChatLayoutProps> = (props) => {
             workspaceTarget={workspaceTarget}
             activeTab={activeWorkspaceTab}
             activeTitle={activeWorkspaceTitle}
+            toolRail={
+              <WorkspaceToolRail
+                t={t}
+                activeTab={activeWorkspaceTab}
+                expanded={!rightSiderCollapsed}
+                onSelect={selectWorkspaceTool}
+                changeCount={workspaceChangeCount}
+                extraTabs={props.workspaceExtraTabs}
+                collaboration={workspaceCollaboration}
+              />
+            }
           />
         )}
       </div>

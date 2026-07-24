@@ -1,12 +1,16 @@
 //! Build channel (`NOMI_CHANNEL`) — the single source of truth that lets a
 //! non-stable build (e.g. `dev`) coexist with the installed stable app by
-//! deriving a per-channel suffix for the data directory and OS identity.
+//! deriving a per-channel data-directory suffix and runtime announcement.
 //!
 //! The channel is baked at compile time from the `NOMI_CHANNEL` env var (set by
-//! the dev build script); unset means `stable`. Only the exact string `stable`
-//! maps to the production data directory — every other value (including typos)
-//! gets an isolated suffix, so a mis-set channel can never write into the
-//! installed app's state.
+//! the development scripts); unset means `stable`. Only the exact string
+//! `stable` maps to the production data directory — every other value
+//! (including typos) gets an isolated suffix, so a mis-set channel can never
+//! write into the installed app's state.
+//!
+//! This module lives in the top-level application crate because only app hosts
+//! consume it. Changing channels therefore recompiles the host boundary instead
+//! of invalidating `nomifun-common` and every domain crate downstream of it.
 
 /// The compile-time channel. `stable` when `NOMI_CHANNEL` is unset.
 pub fn channel() -> &'static str {

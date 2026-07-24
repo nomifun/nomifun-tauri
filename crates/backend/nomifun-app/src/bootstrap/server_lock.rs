@@ -1,10 +1,10 @@
 //! Exclusive per-data-dir server lock.
 //!
-//! Every host (the desktop shell's embedded backend, `nomifun-web`, the
-//! `nomicore` bin) defaults to ONE shared data directory (see
-//! [`crate::cli::default_data_dir`]). Two live backends on the same directory
-//! would double-fire every cron job (each process arms its own timers from
-//! the shared DB), fight over channel polling (Telegram allows a single
+//! Every host built for the same channel (the desktop shell's embedded backend,
+//! `nomifun-web`, the `nomicore` bin) defaults to one shared data directory
+//! (see [`crate::cli::default_data_dir`]). Two live backends on the same
+//! directory would double-fire every cron job (each process arms its own timers
+//! from the shared DB), fight over channel polling (Telegram allows a single
 //! `getUpdates` consumer and the on-disk update watermark is
 //! last-writer-wins, reopening the dedup window), interleave writes to the
 //! rolling log file, and — worst — race the SQLite corruption-recovery path,

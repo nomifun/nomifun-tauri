@@ -1478,6 +1478,50 @@ mod tests {
     }
 
     #[test]
+    fn delegate_advertised_schema_accepts_both_wire_variants() {
+        let spec = Registry::global()
+            .tool_specs_for_caller(Surface::Desktop, Some(&["agent_execution"]), true)
+            .into_iter()
+            .find(|spec| spec.name == "nomi_delegate")
+            .expect("nomi_delegate must be advertised to the owner");
+        let schema = Value::Object(spec.input_schema);
+        let validator = jsonschema::options()
+            .build(&schema)
+            .expect("advertised nomi_delegate schema must compile");
+
+        for payload in [
+            json!({
+                "strategy": "planned",
+                "goal": "inspect the workspace",
+                "max_parallel": 3
+            }),
+            json!({
+                "strategy": "parallel",
+                "tasks": [
+                    {"name": "planner", "prompt": "make a plan"},
+                    {"name": "reviewer", "prompt": "review the result"}
+                ],
+                "synthesize": true
+            }),
+        ] {
+            assert!(
+                validator.is_valid(&payload),
+                "advertised nomi_delegate schema rejected a valid payload: {payload}"
+            );
+        }
+
+        let mixed_variant = json!({
+            "strategy": "parallel",
+            "tasks": [{"name": "reviewer", "prompt": "review"}],
+            "goal": "must not mix tagged variants"
+        });
+        assert!(
+            !validator.is_valid(&mixed_variant),
+            "variant-level unknown-field rejection must remain intact"
+        );
+    }
+
+    #[test]
     fn explicit_parallel_plan_has_one_optional_synthesis_node() {
         let steps = explicit_plan(
             vec![

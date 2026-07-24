@@ -160,6 +160,7 @@ async fn weixin_buffers_pending_text_through_tool_call_until_finish() {
             input: None,
             output: None,
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
     event_tx
@@ -215,6 +216,7 @@ async fn telegram_does_not_flush_text_before_tool_call() {
             input: None,
             output: None,
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
     event_tx
@@ -254,6 +256,7 @@ async fn weixin_skips_flush_when_buffer_is_empty() {
             input: None,
             output: None,
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
     event_tx
@@ -381,6 +384,7 @@ async fn telegram_tool_call_edit_stays_plain_text() {
             input: None,
             output: None,
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
     event_tx
@@ -763,6 +767,7 @@ async fn weixin_inline_think_merged_final_is_stripped() {
             input: None,
             output: None,
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
     event_tx
@@ -815,6 +820,7 @@ async fn weixin_all_think_buffer_skips_flush_then_recovers() {
             input: None,
             output: None,
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
     event_tx

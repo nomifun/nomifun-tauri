@@ -19,6 +19,66 @@ const tool = (item: Partial<NormalizedToolCall> & Pick<NormalizedToolCall, 'key'
 });
 
 describe('buildToolReceiptSummaryParts', () => {
+  test('collapses a complete explicit retry chain and preserves attempt history', () => {
+    const firstAttempt = tool({
+      key: 'call-1',
+      name: 'nomi_delegate',
+      status: 'canceled',
+      input: '{"tasks":["bad"]}',
+      output: 'invalid arguments',
+      retry: { retryGroupId: 'call-1', attemptNo: 1 },
+    });
+    const beforeRetry = buildToolReceiptDetailRows([firstAttempt]);
+    const rows = buildToolReceiptDetailRows([
+      firstAttempt,
+      tool({
+        key: 'call-2',
+        name: 'nomi_delegate',
+        input: '{"tasks":[{"title":"ok"}]}',
+        output: 'planned',
+        retry: { retryGroupId: 'call-1', attemptNo: 2, retryOfCallId: 'call-1' },
+      }),
+    ]);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].key).toBe('call-1');
+    expect(rows[0].key).toBe(beforeRetry[0].key);
+    expect(rows[0].retryCount).toBe(1);
+    expect(rows[0].state).toBe('completed');
+    expect(rows[0].attempts?.map(({ key, attemptNo }) => ({ key, attemptNo }))).toEqual([
+      { key: 'call-1', attemptNo: 1 },
+      { key: 'call-2', attemptNo: 2 },
+    ]);
+  });
+
+  test('fails closed for malformed or ambiguous retry metadata', () => {
+    const rows = buildToolReceiptDetailRows([
+      tool({
+        key: 'call-1',
+        name: 'nomi_delegate',
+        retry: { retryGroupId: 'call-1', attemptNo: 1 },
+      }),
+      tool({
+        key: 'call-2',
+        name: 'nomi_delegate',
+        retry: { retryGroupId: 'call-1', attemptNo: 3, retryOfCallId: 'call-1' },
+      }),
+      tool({
+        key: 'call-3',
+        name: 'other_tool',
+        retry: { retryGroupId: 'call-1', attemptNo: 2, retryOfCallId: 'call-1' },
+      }),
+      tool({
+        key: 'call-4',
+        name: 'nomi_delegate',
+        retry: { retryGroupId: 'call-1', attemptNo: 2, retryOfCallId: 'call-1' },
+      }),
+    ]);
+
+    expect(rows).toHaveLength(4);
+    expect(rows.every((row) => row.retryCount === undefined)).toBe(true);
+  });
+
   test('does not classify update_plan as a file edit', () => {
     const parts = buildToolReceiptSummaryParts(
       [tool({ key: 'plan-1', name: 'update_plan', status: 'completed' })],

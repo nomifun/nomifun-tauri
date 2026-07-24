@@ -126,6 +126,7 @@ fn validate_completed_acp_artifact_contract(
             output: None,
             description: None,
             artifacts: artifacts.clone(),
+            retry: None,
         })
         .map_err(|error| format!("ACP {error}"))?;
     }
@@ -233,6 +234,7 @@ fn tool_group_artifact_contract_errors(
                 artifacts: paired_delivery
                     .map(|delivery| delivery.artifacts.clone())
                     .unwrap_or_default(),
+                retry: None,
             });
             result.err().map(|error| (index, error))
         })
@@ -251,6 +253,7 @@ fn tool_group_entry_has_artifact_contract(
         output: None,
         description: entry.description.clone(),
         artifacts: Vec::new(),
+        retry: None,
     })
     .is_err()
 }
@@ -2382,6 +2385,7 @@ impl StreamRelay {
                                         output: None,
                                         description: None,
                                         artifacts: Vec::new(),
+                                        retry: None,
                                     }
                                 });
                                 source.status = ToolCallStatus::Completed;
@@ -5161,6 +5165,7 @@ mod tests {
             output: Some("generated".into()),
             description: None,
             artifacts: vec![artifact],
+            retry: None,
         }))
         .unwrap();
         for _ in 0..FLUSH_INTERVAL {
@@ -5592,6 +5597,7 @@ mod tests {
             output: None,
             description: None,
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Plan(PlanEventData {
@@ -5704,6 +5710,7 @@ mod tests {
             input: None,
             output: None,
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Text(TextEventData { content: "Beta".into() }))
@@ -5756,6 +5763,7 @@ mod tests {
             output: Some("ok".into()),
             description: None,
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Text(TextEventData { content: "After".into() }))
@@ -5902,6 +5910,7 @@ mod tests {
             input: None,
             output: Some("ok".into()),
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Error(ErrorEventData::legacy(
@@ -5948,6 +5957,7 @@ mod tests {
             input: Some(json!({"file_path": "/tmp/index.html"})),
             output: None,
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData {
@@ -6003,6 +6013,7 @@ mod tests {
                 output: Some("ok".into()),
                 description: None,
                 artifacts: Vec::new(),
+                retry: None,
             }))
             .unwrap();
             tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -6052,6 +6063,7 @@ mod tests {
                 output,
                 description: None,
                 artifacts: Vec::new(),
+                retry: None,
             })
         };
         tx.send(event(ToolCallStatus::Completed, Some("ok".into()))).unwrap();
@@ -6099,6 +6111,7 @@ mod tests {
                 output: None,
                 description: None,
                 artifacts,
+                retry: None,
             })
         };
         tx.send(event(ToolCallStatus::Error, Vec::new())).unwrap();
@@ -6171,6 +6184,7 @@ mod tests {
             output: Some("generated".into()),
             description: None,
             artifacts: vec![artifact],
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -6247,6 +6261,7 @@ mod tests {
             output: Some("generated".into()),
             description: None,
             artifacts: vec![test_artifact("commit-fails")],
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -6314,6 +6329,7 @@ mod tests {
             output: Some("generated".into()),
             description: None,
             artifacts: vec![test_artifact("commit-timeout")],
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -6374,6 +6390,7 @@ mod tests {
             output: Some("generated".into()),
             description: None,
             artifacts: vec![test_artifact("identity-failure")],
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -6429,6 +6446,7 @@ mod tests {
             output: Some("generated".into()),
             description: None,
             artifacts: vec![test_artifact("retracted")],
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Error(ErrorEventData::legacy(
@@ -6509,6 +6527,7 @@ mod tests {
             output: Some("generated".into()),
             description: None,
             artifacts: vec![test_artifact("wedged-db")],
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Error(ErrorEventData::legacy(
@@ -6690,6 +6709,7 @@ mod tests {
             output: Some("generated".into()),
             description: None,
             artifacts: vec![test_artifact("generic-close")],
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::AcpToolCall(AcpToolCallEventData {
@@ -6794,6 +6814,7 @@ mod tests {
                 output: Some("generated".into()),
                 description: None,
                 artifacts: vec![test_artifact(&format!("artifact-{index}"))],
+                retry: None,
             }))
             .unwrap();
         }
@@ -6934,6 +6955,7 @@ mod tests {
                 output: (status == ToolCallStatus::Completed).then(|| "ok".into()),
                 description: None,
                 artifacts: Vec::new(),
+                retry: None,
             }))
             .unwrap();
             tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -7255,6 +7277,7 @@ mod tests {
             input: None,
             output: None,
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Thinking(ThinkingEventData {
@@ -8010,6 +8033,7 @@ mod tests {
             output: None,
             description: Some("Read file".into()),
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
         // Second event: Completed with output but no input
@@ -8022,6 +8046,7 @@ mod tests {
             output: Some("contents".into()),
             description: None,
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -8082,6 +8107,7 @@ mod tests {
             output: None,
             description: Some("Generate image".into()),
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
@@ -8093,6 +8119,7 @@ mod tests {
             output: Some("success".into()),
             description: None,
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -8683,6 +8710,7 @@ mod tests {
             output: Some("generated".into()),
             description: None,
             artifacts: vec![first, duplicate],
+            retry: None,
         };
         let completed = HashMap::from([(paired.call_id.clone(), paired)]);
         let entries = vec![ToolGroupEntry {
@@ -8734,6 +8762,7 @@ mod tests {
             output: Some("generated".into()),
             description: None,
             artifacts: vec![artifact],
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::ToolGroup(vec![ToolGroupEntry {
@@ -8817,6 +8846,7 @@ mod tests {
             output: Some("generated".into()),
             description: None,
             artifacts: vec![artifact],
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::ToolGroup(vec![ToolGroupEntry {

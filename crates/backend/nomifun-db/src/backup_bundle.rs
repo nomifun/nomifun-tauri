@@ -28,7 +28,7 @@ use crate::{
     Database, DbError, init_database,
     id_schema_contract::{
         JSON_LOGICAL_REFERENCES, LOGICAL_REFERENCES, PRODUCT_TABLES, RebuildPolicy,
-        audit_logical_reference_orphans, validate_id_schema_contract, validate_id_value_contract,
+        validate_id_data_contract, validate_id_schema_contract,
     },
 };
 
@@ -989,7 +989,7 @@ async fn rebuild_v3_database_contents(
     }
 
     validate_id_schema_contract(destination).await?;
-    validate_id_value_contract(destination).await?;
+    validate_id_data_contract(destination).await?;
     let quick_check: Vec<String> = sqlx::query_scalar("PRAGMA quick_check")
         .fetch_all(destination)
         .await
@@ -998,28 +998,6 @@ async fn rebuild_v3_database_contents(
         return Err(BackupError::Database(DbError::Init(format!(
             "restore SQLite quick_check failed: {}",
             quick_check.join("; ")
-        ))));
-    }
-    let findings = audit_logical_reference_orphans(destination).await?;
-    if !findings.is_empty() {
-        let details = findings
-            .iter()
-            .map(|finding| {
-                format!(
-                    "{}.{} -> {}.{}: {} orphan(s), delete={}, rebuild={}",
-                    finding.child_table,
-                    finding.child_column,
-                    finding.parent_table,
-                    finding.parent_column,
-                    finding.count,
-                    finding.delete_policy,
-                    finding.rebuild_policy
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(BackupError::Database(DbError::Init(format!(
-            "restore logical-reference orphan audit failed: {details}"
         ))));
     }
     Ok(())

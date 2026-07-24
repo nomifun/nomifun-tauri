@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use nomifun_common::{KnowledgeBaseId, TerminalId, TimestampMs};
+use nomifun_common::{ConversationId, KnowledgeBaseId, TerminalId, TimestampMs};
 use serde::{Deserialize, Serialize};
 
 fn default_cols() -> u16 {
@@ -23,6 +23,11 @@ fn default_rows() -> u16 {
 #[serde(deny_unknown_fields)]
 pub struct TerminalSessionResponse {
     pub terminal_id: TerminalId,
+    /// Conversation that owns this terminal when it was created from an
+    /// interactive agent session. Standalone sidebar terminals leave this
+    /// unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_conversation_id: Option<ConversationId>,
     pub name: String,
     pub cwd: String,
     /// Derived on every read —never persisted: whether `cwd` equals or sits
@@ -281,6 +286,7 @@ mod tests {
     fn session_response_roundtrip_and_omits_none() {
         let resp = TerminalSessionResponse {
             terminal_id: nomifun_common::TerminalId::new(),
+            owner_conversation_id: None,
             name: "shell".into(),
             cwd: "/tmp".into(),
             is_default_workpath: false,
@@ -300,6 +306,7 @@ mod tests {
         };
         let v = serde_json::to_value(&resp).unwrap();
         assert!(v.get("backend").is_none());
+        assert!(v.get("owner_conversation_id").is_none());
         assert!(v.get("exit_code").is_none());
         assert!(v.get("scrollback_b64").is_none());
         assert!(v.get("id").is_none());
@@ -309,6 +316,26 @@ mod tests {
         );
         let parsed: TerminalSessionResponse = serde_json::from_value(v).unwrap();
         assert_eq!(parsed, resp);
+    }
+
+    #[test]
+    fn session_response_roundtrips_conversation_owner() {
+        let owner = nomifun_common::ConversationId::new();
+        let raw = json!({
+            "terminal_id": nomifun_common::TerminalId::new(),
+            "owner_conversation_id": owner,
+            "name": "session shell",
+            "cwd": "/tmp",
+            "command": "$SHELL",
+            "args": [],
+            "cols": 80,
+            "rows": 24,
+            "created_at": 1,
+            "updated_at": 1,
+            "last_status": "running"
+        });
+        let parsed: TerminalSessionResponse = serde_json::from_value(raw).unwrap();
+        assert_eq!(parsed.owner_conversation_id.as_ref(), Some(&owner));
     }
 
     #[test]

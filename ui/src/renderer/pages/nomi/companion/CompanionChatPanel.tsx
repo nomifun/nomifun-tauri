@@ -13,12 +13,15 @@ import ExecutionConversationLayout from '@/renderer/pages/conversation/execution
 import { useCompanion } from '../useNomi';
 import CompanionConversation from './CompanionConversation';
 import CompanionModelControl from '../CompanionModelControl';
+import type { WorkspaceExtraTab } from '@/renderer/pages/conversation/Workspace/types';
 
 type NomiConversation = Extract<TChatConversation, { type: 'nomi' }>;
 
 interface Props {
   /** A desktop-companion's single per-companion nomi session (extra.companion_session). */
   conversation: NomiConversation;
+  /** Conversation-owned resources exposed in the shared right-hand tool rail. */
+  extraTabs?: WorkspaceExtraTab[];
 }
 
 /**
@@ -35,7 +38,7 @@ interface Props {
  * + 乐观 patch 通道）；② 模型未配置态的引导（含模型配置入口）；③ 交给
  * CompanionConversation 渲染受限会话主体。
  */
-const CompanionChatPanel: React.FC<Props> = ({ conversation }) => {
+const CompanionChatPanel: React.FC<Props> = ({ conversation, extraTabs }) => {
   const { t } = useTranslation();
   const companionId = conversation.extra?.companion_id ?? null;
   const companion = useCompanion(companionId);
@@ -50,8 +53,9 @@ const CompanionChatPanel: React.FC<Props> = ({ conversation }) => {
       disableRename
       workspaceEnabled={Boolean(workspace)}
       workspacePath={workspace || undefined}
-      sider={<ChatSlider conversation={conversation} />}
+      sider={<ChatSlider conversation={conversation} extraTabs={extraTabs} />}
       siderTitle={<span className='text-16px font-bold text-t-primary'>{t('conversation.workspace.title')}</span>}
+      workspaceExtraTabs={extraTabs}
       headerExtra={showModelControl ? <CompanionModelControl companion={companion} /> : undefined}
     >
       {content}

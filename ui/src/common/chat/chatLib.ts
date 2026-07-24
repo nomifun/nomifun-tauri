@@ -217,8 +217,8 @@ export type IMessageToolCall = IMessage<
     name: string;
     /**
      * Provider arguments when they were decoded as a JSON object. Local
-     * pre-execution validation failures can legitimately persist `null` here
-     * because no valid argument object reached the tool.
+     * Pre-execution validation failures preserve the rejected object so users
+     * can inspect exactly what the model sent.
      */
     args?: Record<string, unknown> | null;
     error?: string;
@@ -226,6 +226,15 @@ export type IMessageToolCall = IMessage<
     input?: Record<string, unknown>;
     output?: string;
     description?: string;
+    /**
+     * Engine-authored retry identity. The UI must require a complete,
+     * contiguous chain and never infer retries from timing or similar args.
+     */
+    retry?: {
+      retry_group_id: string;
+      attempt_no: number;
+      retry_of_call_id?: string;
+    };
     /** Verified, durable outputs emitted by the backend. */
     artifacts?: PersistedToolArtifact[];
     /** Persisted rows expose receipts only after the enclosing turn commits. */

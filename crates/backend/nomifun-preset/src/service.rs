@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use nomifun_api_types::*;
-use nomifun_common::{AgentId, AppError, KnowledgeBaseId, PresetId, ProviderId};
+use nomifun_common::{AgentId, AppError, KnowledgeBaseId, PresetId, PresetTagId, ProviderId};
 use nomifun_db::{
     CreatePresetTagParams, IAgentMetadataRepository, IPresetRepository, IPresetStateRepository,
     IPresetTagRepository, IProviderRepository, PresetRecord, PresetWriteParams,
@@ -124,7 +124,7 @@ impl PresetService {
         for tag in self.builtin.tags() {
             validate_preset_tag_key(&tag.key)?;
             if self.tag_repo.get_by_key(&tag.key).await?.is_none() {
-                let preset_tag_id = nomifun_common::generate_id();
+                let preset_tag_id = PresetTagId::new().into_string();
                 self.tag_repo
                     .create(&CreatePresetTagParams {
                         preset_tag_id: &preset_tag_id,
@@ -459,7 +459,7 @@ impl PresetService {
             .collect::<HashSet<_>>();
         let key = deduplicate_tag_key(&base_key, &existing_keys);
         let dimension = dimension_str(request.dimension);
-        let preset_tag_id = nomifun_common::generate_id();
+        let preset_tag_id = PresetTagId::new().into_string();
         let row = self.tag_repo.create(&CreatePresetTagParams {
             preset_tag_id: &preset_tag_id,
             key: &key,

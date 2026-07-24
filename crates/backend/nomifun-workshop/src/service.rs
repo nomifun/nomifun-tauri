@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use nomifun_common::{
-    AppError, ProviderId, SharedProviderLifecycleBarrier, WorkshopAssetId, generate_id, now_ms,
+    AppError, ProviderId, SharedProviderLifecycleBarrier, WorkshopAssetId, WorkshopCanvasId, now_ms,
 };
 use nomifun_db::{AssetSort, IWorkshopRepository, ListAssetsParams, UpdateAssetParams, WorkshopAssetRow};
 use serde_json::{Value, json};
@@ -217,16 +217,98 @@ impl WorkshopService {
         Ok(self.repo.list_canvases().await?.into_iter().map(WorkshopCanvasMeta::from).collect())
     }
 
+    /// Read-only startup audit for the Workshop database index and every
+    /// managed canvas/asset file. Any failure makes the current dataset
+    /// incompatible; callers must retire/reset it as a whole.
+    pub async fn audit_managed_data_on_boot(&self) -> Result<(), AppError> {
+        let canvases = self.repo.list_canvases().await?;
+        let mut referenced_assets = BTreeSet::new();
+        for canvas in &canvases {
+            let doc = self.read_doc(&canvas.canvas_id).await?;
+            referenced_assets.extend(docscan::collect_asset_refs(&doc));
+        }
+
+        let assets = self.repo.list_all_assets().await?;
+        let indexed_assets = assets
+            .iter()
+            .map(|asset| asset.asset_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if let Some(asset_id) = referenced_assets
+            .iter()
+            .find(|asset_id| !indexed_assets.contains(asset_id.as_str()))
+        {
+            return Err(AppError::Internal(format!(
+                "managed workshop canvas references missing asset {asset_id}"
+            )));
+        }
+
+        for asset in assets {
+            let tags = serde_json::from_str::<Value>(&asset.tags).map_err(|error| {
+                AppError::Internal(format!(
+                    "managed workshop asset {} has invalid tags JSON: {error}",
+                    asset.asset_id
+                ))
+            })?;
+            if !tags.is_array() {
+                return Err(AppError::Internal(format!(
+                    "managed workshop asset {} tags must be a JSON array",
+                    asset.asset_id
+                )));
+            }
+
+            match asset.rel_path.as_deref() {
+                Some(rel_path) => {
+                    let path = self.resolve_within_workshop(rel_path)?;
+                    let metadata = tokio::fs::metadata(&path).await.map_err(|error| {
+                        AppError::Internal(format!(
+                            "managed workshop asset {} payload is unavailable: {error}",
+                            asset.asset_id
+                        ))
+                    })?;
+                    if !metadata.is_file() {
+                        return Err(AppError::Internal(format!(
+                            "managed workshop asset {} payload is not a regular file",
+                            asset.asset_id
+                        )));
+                    }
+                }
+                None if asset.kind != "text" => {
+                    return Err(AppError::Internal(format!(
+                        "managed binary workshop asset {} has no payload path",
+                        asset.asset_id
+                    )));
+                }
+                None => {}
+            }
+
+            if let Some(thumb_rel_path) = asset.thumb_rel_path.as_deref() {
+                let path = self.resolve_within_workshop(thumb_rel_path)?;
+                let metadata = tokio::fs::metadata(&path).await.map_err(|error| {
+                    AppError::Internal(format!(
+                        "managed workshop asset {} thumbnail is unavailable: {error}",
+                        asset.asset_id
+                    ))
+                })?;
+                if !metadata.is_file() {
+                    return Err(AppError::Internal(format!(
+                        "managed workshop asset {} thumbnail is not a regular file",
+                        asset.asset_id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn create_canvas(&self, title: Option<String>) -> Result<WorkshopCanvasMeta, AppError> {
-        let id = generate_id();
+        let id = WorkshopCanvasId::new().into_string();
         let title = title
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| "未命名画布".to_string());
         let now = now_ms();
-        // Write the empty doc first so a crash between INSERT and write can't
-        // leave a row whose file is missing (the read path tolerates a missing
-        // file, but writing first keeps disk ⊇ index).
+        // Write the empty doc first so a crash between INSERT and write cannot
+        // leave an indexed canvas without its managed document.
         fsio::save_bytes_atomic(&self.canvas_dir(&id), "canvas.json", DEFAULT_DOC.as_bytes())
             .await
             .map_err(|e| AppError::Internal(format!("write canvas doc: {e}")))?;
@@ -240,40 +322,43 @@ impl WorkshopService {
             .get_canvas(id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("workshop canvas {id} not found")))?;
-        let doc = self.read_doc(id).await;
+        let doc = self.read_doc(id).await?;
         Ok(CanvasWithDoc { meta: row.into(), doc })
     }
 
-    /// Read + parse the canvas doc; a missing, corrupt, or identity-invalid
-    /// file falls back to the default empty doc (never fails the read).
-    ///
     /// The document payload remains frontend-owned, but its durable identity
     /// envelope is a backend invariant: every node/edge ID and every declared
     /// node reference must be canonical before data is served back to clients.
-    async fn read_doc(&self, id: &str) -> Value {
+    async fn read_doc(&self, id: &str) -> Result<Value, AppError> {
         let path = self.canvas_dir(id).join("canvas.json");
-        match fsio::read_bytes_opt(&path).await {
-            Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
-                Ok(doc) => match docscan::validate_canvas_doc_ids(&doc)
-                    .and_then(|_| docscan::collect_generator_provider_refs(&doc).map(|_| ()))
-                {
-                    Ok(()) => doc,
-                    Err(error) => {
-                        tracing::warn!(id, %error, "workshop canvas doc has invalid durable references; serving default");
-                        default_doc_value()
-                    }
-                },
-                Err(error) => {
-                    tracing::warn!(id, %error, "workshop canvas doc unreadable; serving default");
-                    default_doc_value()
-                }
-            },
-            Ok(None) => default_doc_value(),
-            Err(e) => {
-                tracing::warn!(id, error = %e, "workshop canvas doc read failed; serving default");
-                default_doc_value()
-            }
-        }
+        let bytes = fsio::read_bytes_opt(&path)
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "read managed workshop canvas {id} document: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                AppError::Internal(format!(
+                    "managed workshop canvas {id} document is missing"
+                ))
+            })?;
+        let doc: Value = serde_json::from_slice(&bytes).map_err(|error| {
+            AppError::Internal(format!(
+                "managed workshop canvas {id} document is invalid JSON: {error}"
+            ))
+        })?;
+        docscan::validate_canvas_doc_ids(&doc).map_err(|error| {
+            AppError::Internal(format!(
+                "managed workshop canvas {id} has invalid durable IDs: {error}"
+            ))
+        })?;
+        docscan::collect_generator_provider_refs(&doc).map_err(|error| {
+            AppError::Internal(format!(
+                "managed workshop canvas {id} has invalid provider references: {error}"
+            ))
+        })?;
+        Ok(doc)
     }
 
     /// Persist a frontend-owned doc (≤ [`MAX_DOC_BYTES`]), sync `node_count`
@@ -399,7 +484,7 @@ impl WorkshopService {
     pub async fn delete_canvas(&self, id: &str) -> Result<(), AppError> {
         // Snapshot this canvas's asset references before its doc disappears, so
         // we can GC canvas-internal assets it alone kept alive.
-        let doc = self.read_doc(id).await;
+        let doc = self.read_doc(id).await?;
         let own_refs = docscan::collect_asset_refs(&doc);
 
         self.repo.delete_canvas(id).await?;
@@ -438,7 +523,7 @@ impl WorkshopService {
     async fn collect_all_referenced_asset_ids(&self) -> Result<BTreeSet<String>, AppError> {
         let mut out = BTreeSet::new();
         for canvas in self.repo.list_canvases().await? {
-            let doc = self.read_doc(&canvas.canvas_id).await;
+            let doc = self.read_doc(&canvas.canvas_id).await?;
             out.extend(docscan::collect_asset_refs(&doc));
         }
         Ok(out)
@@ -495,7 +580,7 @@ impl WorkshopService {
             let op_id = agent_ops::new_op_id();
             if !open && op.direct_applicable() {
                 if doc.is_none() {
-                    doc = Some(self.read_doc(canvas_id).await);
+                    doc = Some(self.read_doc(canvas_id).await?);
                 }
                 let d = doc.as_mut().expect("doc loaded above");
                 match op {
@@ -716,7 +801,7 @@ impl WorkshopService {
             (None, None)
         };
 
-        let id = generate_id();
+        let id = WorkshopAssetId::new().into_string();
         let disk_name = format!("{id}.{}", input.ext);
         let rel_path = format!("{WORKSHOP_REL_DIR}/assets/{disk_name}");
         fsio::save_bytes_atomic(&self.assets_dir(), &disk_name, &input.bytes)
@@ -835,7 +920,7 @@ impl WorkshopService {
         let now = now_ms();
         let row = WorkshopAssetRow {
             id: 0,
-            asset_id: generate_id(),
+            asset_id: WorkshopAssetId::new().into_string(),
             kind: "text".to_string(),
             title: title.to_string(),
             collection: normalize_opt(input.collection),
@@ -954,15 +1039,17 @@ impl WorkshopService {
             .get_canvas(id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("workshop canvas {id} not found")))?;
-        let doc = self.read_doc(id).await;
+        let doc = self.read_doc(id).await?;
         let refs = docscan::collect_asset_refs(&doc);
 
         let mut manifest_assets: Vec<Value> = Vec::new();
         let mut files: Vec<(String, Vec<u8>)> = Vec::new();
         for asset_id in &refs {
-            let Some(row) = self.repo.get_asset(asset_id).await? else {
-                continue; // dangling reference — skip
-            };
+            let row = self.repo.get_asset(asset_id).await?.ok_or_else(|| {
+                AppError::Internal(format!(
+                    "canvas {id} references missing managed asset {asset_id}"
+                ))
+            })?;
             // Copy the binary in (if any) and note its archive path.
             let mut file_entry: Option<String> = None;
             if let Some(rel) = row.rel_path.as_deref() {
@@ -971,14 +1058,27 @@ impl WorkshopService {
                     .and_then(|e| e.to_str())
                     .unwrap_or("bin");
                 let entry = format!("assets/{}.{ext}", row.asset_id);
-                if let Ok(abs) = self.resolve_within_workshop(rel)
-                    && let Ok(bytes) = tokio::fs::read(&abs).await
-                {
-                    files.push((entry.clone(), bytes));
-                    file_entry = Some(entry);
-                }
+                let abs = self.resolve_within_workshop(rel)?;
+                let bytes = tokio::fs::read(&abs).await.map_err(|error| {
+                    AppError::Internal(format!(
+                        "read managed workshop asset {} for export: {error}",
+                        row.asset_id
+                    ))
+                })?;
+                files.push((entry.clone(), bytes));
+                file_entry = Some(entry);
+            } else if row.kind != "text" {
+                return Err(AppError::Internal(format!(
+                    "managed binary workshop asset {} has no payload path",
+                    row.asset_id
+                )));
             }
-            let tags = serde_json::from_str::<Value>(&row.tags).unwrap_or_else(|_| json!([]));
+            let tags = serde_json::from_str::<Value>(&row.tags).map_err(|error| {
+                AppError::Internal(format!(
+                    "workshop asset {} has invalid tags JSON: {error}",
+                    row.asset_id
+                ))
+            })?;
             let origin = row
                 .origin
                 .as_deref()
@@ -1010,6 +1110,7 @@ impl WorkshopService {
         let manifest = json!({
             "version": archive::ARCHIVE_VERSION,
             "app": archive::ARCHIVE_APP,
+            "id_contract": archive::ARCHIVE_ID_CONTRACT,
             "exported_at": now_ms(),
             "canvas": { "title": canvas.title },
             "assets": manifest_assets,
@@ -1048,23 +1149,43 @@ impl WorkshopService {
             .map_err(|error| AppError::BadRequest(format!("canvas.json has invalid durable ids: {error}")))?;
         let manifest: Value = extracted
             .get(archive::MANIFEST_ENTRY)
-            .and_then(|b| serde_json::from_slice(b).ok())
-            .unwrap_or_else(|| json!({}));
+            .ok_or_else(|| AppError::BadRequest("archive is missing manifest.json".into()))
+            .and_then(|bytes| {
+                serde_json::from_slice(bytes).map_err(|error| {
+                    AppError::BadRequest(format!("manifest.json is not valid JSON: {error}"))
+                })
+            })?;
+        if manifest.get("app").and_then(Value::as_str) != Some(archive::ARCHIVE_APP)
+            || manifest.get("version").and_then(Value::as_u64)
+                != Some(archive::ARCHIVE_VERSION as u64)
+            || manifest.get("id_contract").and_then(Value::as_str)
+                != Some(archive::ARCHIVE_ID_CONTRACT)
+        {
+            return Err(AppError::BadRequest(
+                "archive does not match the current Workshop v3 ID contract".into(),
+            ));
+        }
 
         // Re-register every asset the manifest describes; build old→new id remap.
         let mut remap: HashMap<String, String> = HashMap::new();
-        if let Some(assets) = manifest.get("assets").and_then(Value::as_array) {
-            for a in assets {
-                let Some(old_id) = a.get("id").and_then(Value::as_str) else { continue };
-                match self.reregister_imported_asset(a, &extracted).await {
-                    Ok(Some(new_id)) => {
-                        remap.insert(old_id.to_string(), new_id);
-                    }
-                    Ok(None) => {} // no binary present / unsupported — drop the ref
-                    Err(e) => {
-                        tracing::warn!(old_id, error = %e, "workshop import: asset re-register failed");
-                    }
-                }
+        let assets = manifest
+            .get("assets")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AppError::BadRequest("manifest.assets must be an array".into()))?;
+        for asset in assets {
+            let old_id = asset.get("id").and_then(Value::as_str).ok_or_else(|| {
+                AppError::BadRequest("manifest asset is missing its canonical id".into())
+            })?;
+            WorkshopAssetId::parse(old_id).map_err(|error| {
+                AppError::BadRequest(format!(
+                    "manifest asset id {old_id:?} is not canonical: {error}"
+                ))
+            })?;
+            let new_id = self.reregister_imported_asset(asset, &extracted).await?;
+            if remap.insert(old_id.to_owned(), new_id).is_some() {
+                return Err(AppError::BadRequest(format!(
+                    "manifest contains duplicate asset id {old_id}"
+                )));
             }
         }
         docscan::remap_asset_ids(&mut doc, &remap);
@@ -1088,15 +1209,21 @@ impl WorkshopService {
         Ok(row.into())
     }
 
-    /// Re-register one manifest asset entry under a fresh id. Returns the new id,
-    /// or `None` when the entry has no usable payload.
+    /// Re-register one current-contract manifest asset under a fresh ID.
     async fn reregister_imported_asset(
         &self,
         entry: &Value,
         files: &HashMap<String, Vec<u8>>,
-    ) -> Result<Option<String>, AppError> {
-        let kind = entry.get("kind").and_then(Value::as_str).unwrap_or("image");
-        let title = entry.get("title").and_then(Value::as_str).unwrap_or("导入的资产").to_string();
+    ) -> Result<String, AppError> {
+        let kind = entry
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::BadRequest("manifest asset.kind must be a string".into()))?;
+        let title = entry
+            .get("title")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::BadRequest("manifest asset.title must be a string".into()))?
+            .to_string();
         let collection = entry.get("collection").and_then(Value::as_str).map(str::to_string);
         let tags: Option<Vec<String>> = entry.get("tags").and_then(Value::as_array).map(|arr| {
             arr.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
@@ -1105,21 +1232,60 @@ impl WorkshopService {
         let origin = entry.get("origin").cloned().filter(|v| !v.is_null());
 
         if kind == "text" {
-            let text_content = entry.get("text_content").and_then(Value::as_str).unwrap_or("").to_string();
-            let row = self
-                .create_text_asset(NewTextAsset { title, text_content, collection, tags, in_library: Some(in_library) })
-                .await?;
-            return Ok(Some(row.asset_id));
+            let text_content = entry
+                .get("text_content")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    AppError::BadRequest(
+                        "manifest text asset.text_content must be a string".into(),
+                    )
+                })?
+                .to_string();
+            let asset_id = WorkshopAssetId::new().into_string();
+            let now = now_ms();
+            let origin = origin
+                .map(|value| serde_json::to_string(&value))
+                .transpose()
+                .map_err(|error| {
+                    AppError::BadRequest(format!(
+                        "manifest text asset origin is not serializable: {error}"
+                    ))
+                })?;
+            let row = WorkshopAssetRow {
+                id: 0,
+                asset_id: asset_id.clone(),
+                kind: "text".into(),
+                title,
+                collection,
+                tags: tags_json(tags),
+                rel_path: None,
+                thumb_rel_path: None,
+                mime: None,
+                width: None,
+                height: None,
+                bytes: None,
+                text_content: Some(text_content),
+                in_library,
+                origin,
+                created_at: now,
+                updated_at: now,
+            };
+            self.repo.create_asset(&row).await?;
+            return Ok(asset_id);
         }
 
         // Binary asset: needs a file in the archive.
-        let Some(file_path) = entry.get("file").and_then(Value::as_str) else {
-            return Ok(None);
-        };
-        let Some(bytes) = files.get(file_path) else {
-            return Ok(None);
-        };
-        let mime = entry.get("mime").and_then(Value::as_str).unwrap_or("application/octet-stream");
+        let file_path = entry
+            .get("file")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::BadRequest("manifest binary asset.file is missing".into()))?;
+        let bytes = files.get(file_path).ok_or_else(|| {
+            AppError::BadRequest(format!("archive is missing asset payload {file_path:?}"))
+        })?;
+        let mime = entry
+            .get("mime")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::BadRequest("manifest binary asset.mime is missing".into()))?;
         let ext = Path::new(file_path).extension().and_then(|e| e.to_str()).unwrap_or("bin").to_string();
         let row = self
             .store_binary_asset(BinaryAsset {
@@ -1134,7 +1300,7 @@ impl WorkshopService {
                 origin,
             })
             .await?;
-        Ok(Some(row.asset_id))
+        Ok(row.asset_id)
     }
 
     /// Return `base` if unused, else `base (2)`, `base (3)`, … (first free).
@@ -1214,6 +1380,7 @@ impl WorkshopService {
     }
 }
 
+#[cfg(test)]
 fn default_doc_value() -> Value {
     serde_json::from_str(DEFAULT_DOC).expect("DEFAULT_DOC is valid json")
 }
@@ -1419,6 +1586,23 @@ mod tests {
         svc.delete_canvas(&meta.canvas_id).await.unwrap();
         assert!(!dir.path().join("workshop/canvases").join(&meta.canvas_id).exists());
         assert!(svc.get_canvas(&meta.canvas_id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn managed_data_audit_rejects_invalid_canvas_ids_without_rewriting_the_file() {
+        let (svc, dir) = service().await;
+        let canvas = svc.create_canvas(None).await.unwrap();
+        let path = dir
+            .path()
+            .join("workshop/canvases")
+            .join(&canvas.canvas_id)
+            .join("canvas.json");
+        let corrupt = br#"{"schema":1,"nodes":[{"id":"node_legacy"}],"edges":[]}"#;
+        tokio::fs::write(&path, corrupt).await.unwrap();
+
+        let error = svc.audit_managed_data_on_boot().await.unwrap_err();
+        assert!(error.to_string().contains("invalid durable IDs"));
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), corrupt);
     }
 
     #[tokio::test]
@@ -1641,7 +1825,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_doc_read_falls_back_when_disk_ids_are_not_canonical() {
+    async fn canvas_doc_read_fails_closed_when_disk_ids_are_not_canonical() {
         let (svc, dir) = service().await;
         let canvas = svc.create_canvas(Some("corrupt identity".into())).await.unwrap();
         let path = dir
@@ -1656,8 +1840,12 @@ mod tests {
         .await
         .unwrap();
 
-        let read = svc.get_canvas(&canvas.canvas_id).await.unwrap();
-        assert_eq!(read.doc, default_doc_value());
+        let Err(error) = svc.get_canvas(&canvas.canvas_id).await else {
+            panic!("corrupt managed canvas must not be served");
+        };
+        assert!(
+            matches!(error, AppError::Internal(message) if message.contains("invalid durable IDs"))
+        );
     }
 
     #[tokio::test]

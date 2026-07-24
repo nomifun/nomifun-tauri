@@ -2,6 +2,8 @@
   "toolGroupViewSteps": "查看步骤",
   "toolDetailInput": "输入",
   "toolDetailOutput": "输出",
+  "toolRetryCount": "已重试 {{count}} 次",
+  "toolRetryAttempt": "第 {{number}} 次尝试",
   "toolDetailLoading": "加载中...",
   "toolDetailLoadFailed": "加载完整输出失败",
   "toolSummary": {

@@ -31,3 +31,5 @@ pub use supervisor::{
     ProcessHandle, PollResult, ProcessSupervisor, ShutdownReport, ShutdownSessionReport,
     SupervisorConfig,
 };
+#[cfg(windows)]
+pub use platform::windows::WindowsProcessJob;

@@ -687,6 +687,13 @@ impl AppServices {
             Arc::new(nomifun_db::SqliteWorkshopRepository::new(database.pool().clone())),
             provider_lifecycle.clone(),
         );
+        if let Err(error) = workshop_service.audit_managed_data_on_boot().await {
+            nomifun_common::factory_reset::request_v3_dataset_reset(&data_dir)?;
+            anyhow::bail!(
+                "managed Workshop data failed its startup integrity audit; \
+                 a full dataset reset has been scheduled: {error}"
+            );
+        }
         // The generation engine resolves provider rows (endpoint + decrypted key,
         // same machine-bound AES key the provider column uses), runs the media
         // adapters over a proxy-aware HTTP client, and reads/writes canvas assets
@@ -715,7 +722,21 @@ impl AppServices {
         // Running this synchronously closes the race where a newly-created task
         // could persist an asset between the task snapshot and Workshop scan
         // and be mistaken for an orphan by detached boot cleanup.
-        creation_service.reconcile_on_boot().await;
+        if let Err(error) = creation_service.audit_managed_data_on_boot().await {
+            nomifun_common::factory_reset::request_v3_dataset_reset(&data_dir)?;
+            anyhow::bail!(
+                "managed creation data failed its startup integrity audit; \
+                 a full dataset reset has been scheduled: {error}"
+            );
+        }
+        creation_service
+            .reconcile_on_boot()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "creation startup reconciliation failed without changing dataset lineage: {error}"
+                )
+            })?;
 
         // Headless seed: bind a Remote access token to the default companion so an
         // operator can configure the front door via env on a headless server.

@@ -806,6 +806,17 @@ button.turn-process-trace__row:focus-visible {
   min-width: 0;
 }
 
+.turn-process-trace-detail__attempt {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  padding: 6px 0;
+}
+
+.turn-process-trace-detail__attempt + .turn-process-trace-detail__attempt {
+  border-top: 1px solid var(--border-base);
+}
+
 .turn-process-trace-detail__label {
   color: var(--color-text-3, #86909c);
   font-size: 12px;

@@ -15,6 +15,9 @@ const MAX_TOOL_SCHEMA_DEPTH: usize = 64;
 const MAX_INPUT_VALIDATION_ERRORS: usize = 6;
 const MAX_SINGLE_VALIDATION_ERROR_BYTES: usize = 512;
 const MAX_INPUT_VALIDATION_MESSAGE_BYTES: usize = 4 * 1024;
+const MAX_INPUT_SCHEMA_TRAVERSAL_WORK: usize = 4_096;
+const INPUT_VALIDATION_RETRY_SUFFIX: &str =
+    "Correct the arguments and retry; the tool was not executed.";
 
 /// Session-scoped state for deferred tools whose full schemas have been
 /// activated by [`crate::tool_search::ToolSearchTool`].
@@ -545,9 +548,17 @@ impl ToolRegistry {
             Err(error) => error,
         };
 
-        let candidate = coerce_object_fields_to_schema(&contract.schema, input.clone());
-        if candidate != input && validate_input_contract(name, contract, &candidate).is_ok() {
-            return Ok(candidate);
+        let normalization = normalize_input_to_schema(&contract.schema, input.clone());
+        if normalization.value != input {
+            if validate_input_contract(name, contract, &normalization.value).is_ok() {
+                return Ok(normalization.value);
+            }
+            return Err(format_normalized_validation_error(
+                name,
+                contract,
+                &normalization.value,
+                &normalization.repairs,
+            ));
         }
 
         Err(original_error)
@@ -668,92 +679,550 @@ fn validate_input_contract(
         return Ok(());
     };
 
-    let mut messages = Vec::with_capacity(MAX_INPUT_VALIDATION_ERRORS);
-    messages.push(format_validation_error(&first));
-    for error in validation_errors
-        .by_ref()
-        .take(MAX_INPUT_VALIDATION_ERRORS - 1)
-    {
-        messages.push(format_validation_error(&error));
+    let mut work = SchemaWorkBudget::new();
+    let selection = select_diagnostic_branch(&contract.schema, input, &mut work);
+    let branch_label = selection
+        .as_ref()
+        .map(|selection| branch_label(&contract.schema, selection.schema, input, &mut work));
+    let mut diagnostics = selection
+        .as_ref()
+        .map(|selection| {
+            branch_validation_messages(
+                &contract.schema,
+                selection.schema,
+                input,
+                branch_label.as_deref().unwrap_or("candidate"),
+                &mut work,
+            )
+        })
+        .unwrap_or_default();
+    if diagnostics.messages.is_empty() {
+        diagnostics.messages.push(format_validation_error(&first));
+        for error in validation_errors
+            .by_ref()
+            .take(MAX_INPUT_VALIDATION_ERRORS - 1)
+        {
+            diagnostics.messages.push(format_validation_error(&error));
+        }
+        diagnostics.more = validation_errors.next().is_some();
     }
-    let more = validation_errors.next().is_some();
-    let suffix = if more {
-        format!(
-            "; additional validation errors omitted after {MAX_INPUT_VALIDATION_ERRORS} issues"
-        )
-    } else {
-        String::new()
-    };
+    let branch_context = branch_label
+        .filter(|_| !diagnostics.messages.is_empty())
+        .map(|label| format!(" (selected closest branch '{label}')"))
+        .unwrap_or_default();
+    let omitted = diagnostic_omission_suffix(diagnostics.more, work.exhausted);
     let message = format!(
-        "Invalid arguments for tool '{name}': JSON Schema validation failed: {}{suffix}. Correct the arguments and retry; the tool was not executed.",
-        messages.join("; ")
+        "Invalid arguments for tool '{name}': JSON Schema validation failed{branch_context}: {}{omitted}. {INPUT_VALIDATION_RETRY_SUFFIX}",
+        diagnostics.messages.join("; ")
     );
-    Err(truncate_error_text(
-        message,
-        MAX_INPUT_VALIDATION_MESSAGE_BYTES,
+    Err(truncate_validation_message(message))
+}
+
+fn format_normalized_validation_error(
+    name: &str,
+    contract: &ToolInputContract,
+    input: &Value,
+    repairs: &[String],
+) -> String {
+    let mut work = SchemaWorkBudget::new();
+    let selection = select_diagnostic_branch(&contract.schema, input, &mut work);
+    let branch_label = selection
+        .as_ref()
+        .map(|selection| branch_label(&contract.schema, selection.schema, input, &mut work));
+    let mut diagnostics = selection
+        .as_ref()
+        .map(|selection| {
+            branch_validation_messages(
+                &contract.schema,
+                selection.schema,
+                input,
+                branch_label.as_deref().unwrap_or("candidate"),
+                &mut work,
+            )
+        })
+        .unwrap_or_default();
+
+    if diagnostics.messages.is_empty() {
+        let mut errors = contract.validator.iter_errors(input);
+        for error in errors.by_ref().take(MAX_INPUT_VALIDATION_ERRORS) {
+            diagnostics.messages.push(format_validation_error(&error));
+        }
+        diagnostics.more = errors.next().is_some();
+    }
+    let branch_context = branch_label
+        .map(|label| format!(" (selected closest branch '{label}')"))
+        .unwrap_or_default();
+    let repair_context = if repairs.is_empty() {
+        String::new()
+    } else {
+        format!(" Applied schema-guided repairs: {}.", repairs.join(", "))
+    };
+    let omitted = diagnostic_omission_suffix(diagnostics.more, work.exhausted);
+    truncate_validation_message(format!(
+        "Invalid arguments for tool '{name}' after schema-guided normalization{branch_context}: {}{omitted}.{repair_context} Unknown properties were preserved. {INPUT_VALIDATION_RETRY_SUFFIX}",
+        diagnostics.messages.join("; ")
     ))
 }
 
-fn coerce_object_fields_to_schema(schema: &Value, mut input: Value) -> Value {
-    let Some(object) = input.as_object_mut() else {
-        return input;
-    };
-
-    // Schemars represents tagged and untagged request enums with root-level
-    // oneOf/anyOf branches, often through local $defs references. Walk every
-    // branch that defines a supplied property instead of relying on the root
-    // `properties`, which may intentionally be empty.
-    let keys = object.keys().cloned().collect::<Vec<_>>();
-    for key in keys {
-        let mut property_schemas = Vec::new();
-        collect_property_schemas(schema, schema, &key, &mut property_schemas, 0);
-        let mut expected = Vec::new();
-        for property_schema in property_schemas {
-            collect_schema_type_names(schema, property_schema, &mut expected, 0);
-        }
-        // A union that genuinely permits a string is ambiguous. Preserve the
-        // provider value and let the complete validator choose the branch.
-        if expected.contains(&"string") {
-            continue;
-        }
-        let Some(raw) = object.get(&key).and_then(Value::as_str).map(str::to_owned) else {
-            continue;
-        };
-        if let Some(coerced) = coerce_string_to_types(&raw, &expected) {
-            object.insert(key, coerced);
-        }
+fn diagnostic_omission_suffix(more_errors: bool, budget_exhausted: bool) -> String {
+    let mut suffix = String::new();
+    if more_errors {
+        suffix.push_str(&format!(
+            "; additional validation errors omitted after {MAX_INPUT_VALIDATION_ERRORS} issues"
+        ));
     }
-
-    input
+    if budget_exhausted {
+        suffix.push_str("; diagnostic detail truncated at the schema traversal safety limit");
+    }
+    suffix
 }
 
-fn collect_property_schemas<'a>(
+fn select_diagnostic_branch<'a>(
     root: &'a Value,
-    schema: &'a Value,
-    key: &str,
-    out: &mut Vec<&'a Value>,
+    input: &Value,
+    work: &mut SchemaWorkBudget,
+) -> Option<BranchSelection<'a>> {
+    if let Some(selection) = select_union_branch(root, root, input, work, 0) {
+        return Some(selection);
+    }
+
+    let schema = resolve_schema(root, root, work, 0)?;
+    for keyword in ["oneOf", "anyOf"] {
+        let Some(branches) = schema.get(keyword).and_then(Value::as_array) else {
+            continue;
+        };
+        return branches
+            .iter()
+            .map(|branch| {
+                (
+                    branch_structural_distance(root, branch, input, work, 0),
+                    BranchSelection {
+                        schema: branch,
+                        discriminator_matches: 0,
+                    },
+                )
+            })
+            .min_by_key(|(distance, _)| *distance)
+            .map(|(_, selection)| selection);
+    }
+    None
+}
+
+#[derive(Default)]
+struct BranchObjectShape {
+    properties: BTreeSet<String>,
+    required: BTreeSet<String>,
+    closed: bool,
+}
+
+struct SchemaWorkBudget {
+    remaining: usize,
+    exhausted: bool,
+    active_refs: Vec<String>,
+}
+
+impl SchemaWorkBudget {
+    fn new() -> Self {
+        Self {
+            remaining: MAX_INPUT_SCHEMA_TRAVERSAL_WORK,
+            exhausted: false,
+            active_refs: Vec::new(),
+        }
+    }
+
+    fn visit(&mut self) -> bool {
+        if self.remaining == 0 {
+            self.exhausted = true;
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+
+    fn enter_ref(&mut self, key: &str) -> bool {
+        if self.active_refs.iter().any(|active| active == key) {
+            return false;
+        }
+        self.active_refs.push(key.to_owned());
+        true
+    }
+
+    fn leave_ref(&mut self) {
+        self.active_refs.pop();
+    }
+}
+
+fn collect_branch_object_shape(
+    root: &Value,
+    schema: &Value,
+    shape: &mut BranchObjectShape,
+    work: &mut SchemaWorkBudget,
     depth: usize,
 ) {
-    if depth > 32 {
+    if depth > 32 || !work.visit() {
         return;
     }
-    if let Some(resolved) = resolve_local_schema_ref(root, schema) {
-        collect_property_schemas(root, resolved, key, out, depth + 1);
-        return;
-    }
-    if let Some(property) = schema
-        .get("properties")
-        .and_then(Value::as_object)
-        .and_then(|properties| properties.get(key))
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str)
+        && let Some(resolved) = resolve_local_schema_ref(root, schema)
+        && work.enter_ref(reference)
     {
-        out.push(property);
+        collect_branch_object_shape(root, resolved, shape, work, depth + 1);
+        work.leave_ref();
     }
-    for branch_key in ["oneOf", "anyOf", "allOf"] {
-        if let Some(branches) = schema.get(branch_key).and_then(Value::as_array) {
-            for branch in branches {
-                collect_property_schemas(root, branch, key, out, depth + 1);
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        shape.properties.extend(properties.keys().cloned());
+    }
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        shape
+            .required
+            .extend(required.iter().filter_map(Value::as_str).map(str::to_owned));
+    }
+    shape.closed |= schema.get("additionalProperties") == Some(&Value::Bool(false));
+    if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
+        for branch in branches {
+            if work.exhausted {
+                break;
+            }
+            collect_branch_object_shape(root, branch, shape, work, depth + 1);
+        }
+    }
+}
+
+fn branch_structural_distance(
+    root: &Value,
+    schema: &Value,
+    input: &Value,
+    work: &mut SchemaWorkBudget,
+    depth: usize,
+) -> usize {
+    let Some(object) = input.as_object() else {
+        return usize::MAX / 2;
+    };
+    let mut shape = BranchObjectShape::default();
+    collect_branch_object_shape(root, schema, &mut shape, work, depth);
+    let missing = shape
+        .required
+        .iter()
+        .filter(|name| !object.contains_key(*name))
+        .count();
+    let unknown = if shape.closed {
+        object
+            .keys()
+            .filter(|name| !shape.properties.contains(*name))
+            .count()
+    } else {
+        0
+    };
+    let discriminator_penalty =
+        usize::from(discriminator_match_score(root, schema, input, work, depth).is_none()) * 16;
+    missing * 4 + unknown * 2 + discriminator_penalty
+}
+
+#[derive(Default)]
+struct DiagnosticMessages {
+    messages: Vec<String>,
+    more: bool,
+}
+
+impl DiagnosticMessages {
+    fn push(&mut self, message: String) {
+        if self.messages.contains(&message) {
+            return;
+        }
+        if self.messages.len() >= MAX_INPUT_VALIDATION_ERRORS {
+            self.more = true;
+            return;
+        }
+        self.messages.push(message);
+    }
+}
+
+fn branch_validation_messages(
+    root: &Value,
+    schema: &Value,
+    input: &Value,
+    label: &str,
+    work: &mut SchemaWorkBudget,
+) -> DiagnosticMessages {
+    let mut shape = BranchObjectShape::default();
+    collect_branch_object_shape(root, root, &mut shape, work, 0);
+    collect_branch_object_shape(root, schema, &mut shape, work, 0);
+
+    let mut diagnostics = DiagnosticMessages::default();
+    if let Some(object) = input.as_object() {
+        if shape.closed {
+            for name in object
+                .keys()
+                .filter(|name| !shape.properties.contains(*name))
+            {
+                diagnostics.push(format!(
+                    "at {}: unexpected property for branch '{label}'",
+                    join_instance_path("$", name)
+                ));
             }
         }
+        for name in shape
+            .required
+            .iter()
+            .filter(|name| !object.contains_key(*name))
+        {
+            diagnostics.push(format!(
+                "at {}: required property is missing for branch '{label}'",
+                join_instance_path("$", name)
+            ));
+        }
+    }
+
+    if let Some(branch_schema) = branch_schema_with_root_constraints(root, schema, work)
+        && let Ok(validator) = jsonschema::options()
+            .with_pattern_options(PatternOptions::regex())
+            .build(&branch_schema)
+    {
+        for error in validator.iter_errors(input) {
+            let lower = error.to_string().to_ascii_lowercase();
+            let root_level = error.instance_path().to_string().is_empty();
+            if root_level
+                && (lower.contains("additional properties")
+                    || lower.contains("required propert")
+                    || lower.contains("is a required property"))
+            {
+                continue;
+            }
+            let formatted = format_validation_error(&error);
+            if diagnostics.messages.contains(&formatted) {
+                continue;
+            }
+            if diagnostics.messages.len() >= MAX_INPUT_VALIDATION_ERRORS {
+                diagnostics.more = true;
+                break;
+            }
+            diagnostics.messages.push(formatted);
+        }
+    }
+
+    diagnostics
+}
+
+fn branch_schema_with_root_constraints(
+    root: &Value,
+    schema: &Value,
+    work: &mut SchemaWorkBudget,
+) -> Option<Value> {
+    let mut common = resolve_schema(root, root, work, 0)?.clone();
+    let common_object = common.as_object_mut()?;
+    common_object.remove("oneOf");
+    common_object.remove("anyOf");
+    common_object.remove("$defs");
+    common_object.remove("definitions");
+
+    let branch = resolve_schema(root, schema, work, 0)?.clone();
+    let mut combined = serde_json::Map::new();
+    combined.insert(
+        "allOf".to_owned(),
+        Value::Array(vec![common, branch]),
+    );
+    for keyword in ["$defs", "definitions"] {
+        if let Some(definitions) = root.get(keyword) {
+            combined.insert(keyword.to_owned(), definitions.clone());
+        }
+    }
+    Some(Value::Object(combined))
+}
+
+fn branch_label(
+    root: &Value,
+    schema: &Value,
+    input: &Value,
+    work: &mut SchemaWorkBudget,
+) -> String {
+    let Some(schema) = resolve_schema(root, schema, work, 0) else {
+        return "candidate".to_owned();
+    };
+    if let (Some(properties), Some(input)) = (
+        schema.get("properties").and_then(Value::as_object),
+        input.as_object(),
+    ) {
+        for (name, property_schema) in properties {
+            let Some(actual) = input.get(name).and_then(Value::as_str) else {
+                continue;
+            };
+            if schema_string_literals(property_schema)
+                .is_some_and(|allowed| allowed.contains(&actual))
+            {
+                return actual.to_owned();
+            }
+        }
+    }
+    schema
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("candidate")
+        .to_owned()
+}
+
+fn resolve_schema<'a>(
+    root: &'a Value,
+    mut schema: &'a Value,
+    work: &mut SchemaWorkBudget,
+    mut depth: usize,
+) -> Option<&'a Value> {
+    let mut entered_refs = 0usize;
+    while depth <= 32 && work.visit() {
+        let Some(reference) = schema.get("$ref").and_then(Value::as_str) else {
+            for _ in 0..entered_refs {
+                work.leave_ref();
+            }
+            return Some(schema);
+        };
+        let Some(resolved) = resolve_local_schema_ref(root, schema) else {
+            for _ in 0..entered_refs {
+                work.leave_ref();
+            }
+            return None;
+        };
+        if !work.enter_ref(reference) {
+            for _ in 0..entered_refs {
+                work.leave_ref();
+            }
+            return None;
+        }
+        entered_refs += 1;
+        schema = resolved;
+        depth += 1;
+    }
+    for _ in 0..entered_refs {
+        work.leave_ref();
+    }
+    None
+}
+
+struct InputNormalization {
+    value: Value,
+    repairs: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+struct BranchSelection<'a> {
+    schema: &'a Value,
+    discriminator_matches: usize,
+}
+
+fn normalize_input_to_schema(schema: &Value, mut input: Value) -> InputNormalization {
+    let mut repairs = Vec::new();
+    let mut work = SchemaWorkBudget::new();
+    normalize_value(
+        schema,
+        schema,
+        &mut input,
+        "$",
+        &mut repairs,
+        &mut work,
+        0,
+    );
+    InputNormalization {
+        value: input,
+        repairs,
+    }
+}
+
+/// Apply only lossless, schema-directed conversions. This routine is recursive
+/// so JSON strings nested in arrays/objects receive the same treatment as
+/// top-level fields. Unknown fields are never visited or removed.
+fn normalize_value(
+    root: &Value,
+    schema: &Value,
+    value: &mut Value,
+    path: &str,
+    repairs: &mut Vec<String>,
+    work: &mut SchemaWorkBudget,
+    depth: usize,
+) {
+    if depth > 32 || !work.visit() {
+        return;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str)
+        && let Some(resolved) = resolve_local_schema_ref(root, schema)
+    {
+        let ref_key = format!("normalize:{reference}@{path}");
+        if work.enter_ref(&ref_key) {
+            normalize_value(root, resolved, value, path, repairs, work, depth + 1);
+            work.leave_ref();
+        }
+    }
+
+    let mut expected = Vec::new();
+    collect_schema_type_names(root, schema, &mut expected, work, depth);
+    if path != "$"
+        && !expected.contains(&"string")
+        && let Some(raw) = value.as_str().map(str::to_owned)
+        && let Some(coerced) = coerce_string_to_types(&raw, &expected)
+    {
+        let new_kind = json_value_kind(&coerced);
+        *value = coerced;
+        repairs.push(format!("{path}: string -> {new_kind}"));
+    }
+
+    if let (Some(object), Some(properties)) = (
+        value.as_object_mut(),
+        schema.get("properties").and_then(Value::as_object),
+    ) {
+        let keys = object.keys().cloned().collect::<Vec<_>>();
+        for key in keys {
+            let Some(property_schema) = properties.get(&key) else {
+                continue;
+            };
+            let Some(property_value) = object.get_mut(&key) else {
+                continue;
+            };
+            let child_path = join_instance_path(path, &key);
+            normalize_value(
+                root,
+                property_schema,
+                property_value,
+                &child_path,
+                repairs,
+                work,
+                depth + 1,
+            );
+            if work.exhausted {
+                break;
+            }
+        }
+    }
+
+    if let (Some(items), Some(array)) = (schema.get("items"), value.as_array_mut()) {
+        for (index, item) in array.iter_mut().enumerate() {
+            if work.exhausted {
+                break;
+            }
+            let child_path = if path == "$" {
+                format!("/{index}")
+            } else {
+                format!("{path}/{index}")
+            };
+            normalize_value(root, items, item, &child_path, repairs, work, depth + 1);
+        }
+    }
+
+    if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
+        for branch in branches {
+            if work.exhausted {
+                break;
+            }
+            normalize_value(root, branch, value, path, repairs, work, depth + 1);
+        }
+    }
+
+    if let Some(selection) = select_union_branch(root, schema, value, work, depth + 1) {
+        normalize_value(
+            root,
+            selection.schema,
+            value,
+            path,
+            repairs,
+            work,
+            depth + 1,
+        );
     }
 }
 
@@ -761,14 +1230,20 @@ fn collect_schema_type_names<'a>(
     root: &'a Value,
     schema: &'a Value,
     out: &mut Vec<&'a str>,
+    work: &mut SchemaWorkBudget,
     depth: usize,
 ) {
-    if depth > 32 {
+    if depth > 32 || !work.visit() {
         return;
     }
-    if let Some(resolved) = resolve_local_schema_ref(root, schema) {
-        collect_schema_type_names(root, resolved, out, depth + 1);
-        return;
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str)
+        && let Some(resolved) = resolve_local_schema_ref(root, schema)
+    {
+        let ref_key = format!("types:{reference}");
+        if work.enter_ref(&ref_key) {
+            collect_schema_type_names(root, resolved, out, work, depth + 1);
+            work.leave_ref();
+        }
     }
     match schema.get("type") {
         Some(Value::String(kind)) => out.push(kind),
@@ -784,7 +1259,10 @@ fn collect_schema_type_names<'a>(
     for branch_key in ["oneOf", "anyOf", "allOf"] {
         if let Some(branches) = schema.get(branch_key).and_then(Value::as_array) {
             for branch in branches {
-                collect_schema_type_names(root, branch, out, depth + 1);
+                if work.exhausted {
+                    break;
+                }
+                collect_schema_type_names(root, branch, out, work, depth + 1);
             }
         }
     }
@@ -809,15 +1287,16 @@ fn coerce_string_to_types(raw: &str, expected: &[&str]) -> Option<Value> {
     if trimmed.is_empty() {
         return None;
     }
-    if expected.contains(&"integer")
-        && let Ok(number) = trimmed.parse::<i64>()
+    if (expected.contains(&"integer") || expected.contains(&"number"))
+        && let Ok(parsed) = serde_json::from_str::<Value>(trimmed)
+        && let Value::Number(number) = &parsed
     {
-        return Some(Value::Number(number.into()));
-    }
-    if expected.contains(&"number")
-        && let Ok(number) = trimmed.parse::<f64>()
-    {
-        return serde_json::Number::from_f64(number).map(Value::Number);
+        if expected.contains(&"integer") && (number.is_i64() || number.is_u64()) {
+            return Some(parsed);
+        }
+        if expected.contains(&"number") {
+            return Some(parsed);
+        }
     }
     if expected.contains(&"boolean") {
         if trimmed.eq_ignore_ascii_case("true") {
@@ -828,6 +1307,173 @@ fn coerce_string_to_types(raw: &str, expected: &[&str]) -> Option<Value> {
         }
     }
     None
+}
+
+fn select_union_branch<'a>(
+    root: &'a Value,
+    schema: &'a Value,
+    value: &Value,
+    work: &mut SchemaWorkBudget,
+    depth: usize,
+) -> Option<BranchSelection<'a>> {
+    if depth > 32 || !work.visit() {
+        return None;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str)
+        && let Some(resolved) = resolve_local_schema_ref(root, schema)
+    {
+        let ref_key = format!("select:{reference}");
+        if work.enter_ref(&ref_key) {
+            let selection = select_union_branch(root, resolved, value, work, depth + 1);
+            work.leave_ref();
+            if selection.is_some() {
+                return selection;
+            }
+        }
+    }
+
+    for keyword in ["oneOf", "anyOf"] {
+        let Some(branches) = schema.get(keyword).and_then(Value::as_array) else {
+            continue;
+        };
+        let mut candidates = branches
+            .iter()
+            .filter_map(|branch| {
+                let discriminator_matches =
+                    discriminator_match_score(root, branch, value, work, depth + 1)?;
+                Some(BranchSelection {
+                    schema: branch,
+                    discriminator_matches,
+                })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.discriminator_matches));
+        if let Some(best) = candidates.first().copied()
+            && best.discriminator_matches > 0
+            && candidates
+                .get(1)
+                .is_none_or(|next| next.discriminator_matches < best.discriminator_matches)
+        {
+            return Some(best);
+        }
+
+        // Nullable and other type unions often do not have a discriminator.
+        // Select a branch only when exactly one can accept the current value;
+        // ambiguity stays untouched and is left to the complete validator.
+        let compatible = branches
+            .iter()
+            .filter(|branch| {
+                schema_accepts_value_kind(root, branch, value, work, depth + 1)
+            })
+            .collect::<Vec<_>>();
+        if compatible.len() == 1 {
+            return Some(BranchSelection {
+                schema: compatible[0],
+                discriminator_matches: 0,
+            });
+        }
+    }
+    None
+}
+
+fn discriminator_match_score(
+    root: &Value,
+    schema: &Value,
+    value: &Value,
+    work: &mut SchemaWorkBudget,
+    depth: usize,
+) -> Option<usize> {
+    let object = value.as_object()?;
+    if depth > 32 || !work.visit() {
+        return None;
+    }
+    let mut matches = 0usize;
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        let resolved = resolve_local_schema_ref(root, schema)?;
+        let ref_key = format!("discriminator:{reference}");
+        if work.enter_ref(&ref_key) {
+            let score = discriminator_match_score(root, resolved, value, work, depth + 1);
+            work.leave_ref();
+            matches += score?;
+        }
+    }
+
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        for (name, property_schema) in properties {
+            let Some(actual) = object.get(name) else {
+                continue;
+            };
+            let Some(allowed) = schema_string_literals(property_schema) else {
+                continue;
+            };
+            let actual = actual.as_str()?;
+            if allowed.contains(&actual) {
+                matches += 1;
+            } else {
+                return None;
+            }
+        }
+    }
+    if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
+        for branch in branches {
+            if work.exhausted {
+                break;
+            }
+            matches += discriminator_match_score(root, branch, value, work, depth + 1)?;
+        }
+    }
+    Some(matches)
+}
+
+fn schema_string_literals(schema: &Value) -> Option<Vec<&str>> {
+    if let Some(literal) = schema.get("const").and_then(Value::as_str) {
+        return Some(vec![literal]);
+    }
+    let values = schema.get("enum")?.as_array()?;
+    if values.is_empty() || values.iter().any(|value| !value.is_string()) {
+        return None;
+    }
+    Some(values.iter().filter_map(Value::as_str).collect())
+}
+
+fn schema_accepts_value_kind(
+    root: &Value,
+    schema: &Value,
+    value: &Value,
+    work: &mut SchemaWorkBudget,
+    depth: usize,
+) -> bool {
+    let mut expected = Vec::new();
+    collect_schema_type_names(root, schema, &mut expected, work, depth);
+    let kind = json_value_kind(value);
+    if expected.contains(&kind) || (kind == "integer" && expected.contains(&"number")) {
+        return true;
+    }
+    value
+        .as_str()
+        .and_then(|raw| coerce_string_to_types(raw, &expected))
+        .is_some()
+}
+
+fn join_instance_path(parent: &str, key: &str) -> String {
+    let escaped = key.replace('~', "~0").replace('/', "~1");
+    if parent == "$" {
+        format!("/{escaped}")
+    } else {
+        format!("{parent}/{escaped}")
+    }
+}
+
+fn json_value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(number) if number.is_i64() || number.is_u64() => "integer",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 fn compile_input_validator(tool_name: &str, schema: &Value) -> Result<Validator, String> {
@@ -908,6 +1554,22 @@ fn format_validation_error(error: &jsonschema::ValidationError<'_>) -> String {
     truncate_error_text(
         format!("at {path}: {error}"),
         MAX_SINGLE_VALIDATION_ERROR_BYTES,
+    )
+}
+
+fn truncate_validation_message(message: String) -> String {
+    if message.len() <= MAX_INPUT_VALIDATION_MESSAGE_BYTES {
+        return message;
+    }
+    const OMISSION: &str = "...[validation details truncated]. ";
+    let prefix = message
+        .strip_suffix(INPUT_VALIDATION_RETRY_SUFFIX)
+        .unwrap_or(&message);
+    let content_budget = MAX_INPUT_VALIDATION_MESSAGE_BYTES
+        .saturating_sub(OMISSION.len() + INPUT_VALIDATION_RETRY_SUFFIX.len());
+    format!(
+        "{}{OMISSION}{INPUT_VALIDATION_RETRY_SUFFIX}",
+        crate::truncate_utf8(prefix, content_budget)
     )
 }
 
@@ -1225,6 +1887,315 @@ mod tests {
         assert_eq!(prepared["tasks"][0]["name"], "research");
         assert_eq!(prepared["synthesize"], true);
         assert!(registry.validate_input("nomi_delegate", &prepared).is_ok());
+    }
+
+    #[test]
+    fn prepare_input_reports_only_remaining_parallel_branch_violation() {
+        let registry = delegate_union_registry();
+        let raw = serde_json::json!({
+            "strategy": "parallel",
+            "tasks": "[{\"name\":\"research\",\"prompt\":\"inspect\"}]",
+            "synthesize": "True",
+            "model_pool": "{\"mode\":\"automatic\"}"
+        });
+
+        let error = registry
+            .prepare_input("nomi_delegate", raw)
+            .expect_err("parallel must not silently accept planned-only model_pool");
+
+        assert!(error.contains("selected closest branch 'parallel'"));
+        assert!(error.contains("at /model_pool: unexpected property"));
+        assert!(!error.contains("at /tasks:"));
+        assert!(!error.contains("at /synthesize:"));
+        assert!(!error.contains("oneOf"));
+        assert!(!error.contains("anyOf"));
+        assert!(error.contains("/tasks: string -> array"));
+        assert!(error.contains("/synthesize: string -> boolean"));
+        assert!(error.ends_with(
+            "Correct the arguments and retry; the tool was not executed."
+        ));
+    }
+
+    #[test]
+    fn native_values_still_receive_branch_aware_diagnostics() {
+        let registry = delegate_union_registry();
+        let error = registry
+            .validate_input(
+                "nomi_delegate",
+                &serde_json::json!({
+                    "strategy": "parallel",
+                    "tasks": [{"name": "research", "prompt": "inspect"}],
+                    "synthesize": true,
+                    "model_pool": {"mode": "automatic"}
+                }),
+            )
+            .expect_err("native arguments still contain a cross-branch property");
+
+        assert!(error.contains("selected closest branch 'parallel'"));
+        assert!(error.contains("at /model_pool: unexpected property"));
+        assert!(!error.contains("oneOf"));
+        assert!(!error.contains("anyOf"));
+        assert!(error.ends_with(INPUT_VALIDATION_RETRY_SUFFIX));
+    }
+
+    #[test]
+    fn branch_diagnostics_keep_nested_validation_paths() {
+        let registry = delegate_union_registry();
+        let error = registry
+            .validate_input(
+                "nomi_delegate",
+                &serde_json::json!({
+                    "strategy": "parallel",
+                    "tasks": [{"name": "research"}]
+                }),
+            )
+            .expect_err("parallel task is missing its prompt");
+
+        assert!(error.contains("selected closest branch 'parallel'"));
+        assert!(error.contains("/tasks/0"));
+        assert!(error.contains("prompt"));
+        assert!(!error.contains("oneOf"));
+        assert!(!error.contains("anyOf"));
+        assert!(error.ends_with(INPUT_VALIDATION_RETRY_SUFFIX));
+    }
+
+    #[test]
+    fn branch_diagnostics_include_root_constraints_and_selected_branch_errors() {
+        let mut registry = ToolRegistry::new();
+        assert!(registry.register(schema_tool(
+            "root_and_branch",
+            serde_json::json!({
+                "$defs": {
+                    "Parallel": {
+                        "type": "object",
+                        "properties": {
+                            "strategy": {"const": "parallel"},
+                            "request_id": {},
+                            "tasks": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {"prompt": {"type": "string"}},
+                                    "required": ["prompt"],
+                                    "additionalProperties": false
+                                }
+                            }
+                        },
+                        "required": ["strategy", "tasks"],
+                        "additionalProperties": false
+                    },
+                    "Planned": {
+                        "type": "object",
+                        "properties": {
+                            "strategy": {"const": "planned"},
+                            "request_id": {},
+                            "goal": {"type": "string"}
+                        },
+                        "required": ["strategy", "goal"],
+                        "additionalProperties": false
+                    }
+                },
+                "type": "object",
+                "properties": {"request_id": {"type": "integer"}},
+                "required": ["request_id"],
+                "anyOf": [
+                    {"$ref": "#/$defs/Planned"},
+                    {"$ref": "#/$defs/Parallel"}
+                ]
+            }),
+        )));
+
+        let error = registry
+            .validate_input(
+                "root_and_branch",
+                &serde_json::json!({
+                    "strategy": "parallel",
+                    "request_id": "not-an-integer",
+                    "tasks": [{}]
+                }),
+            )
+            .expect_err("root and selected branch are both invalid");
+
+        assert!(error.contains("selected closest branch 'parallel'"));
+        assert!(error.contains("/request_id"), "{error}");
+        assert!(error.contains("integer"), "{error}");
+        assert!(error.contains("/tasks/0"), "{error}");
+        assert!(error.contains("prompt"), "{error}");
+        assert!(error.ends_with(INPUT_VALIDATION_RETRY_SUFFIX));
+    }
+
+    #[test]
+    fn branch_diagnostics_report_omitted_errors_after_limit() {
+        let registry = delegate_union_registry();
+        let mut input = serde_json::Map::new();
+        input.insert("strategy".to_owned(), Value::String("parallel".to_owned()));
+        input.insert(
+            "tasks".to_owned(),
+            serde_json::json!([{"name": "research", "prompt": "inspect"}]),
+        );
+        for index in 0..(MAX_INPUT_VALIDATION_ERRORS + 2) {
+            input.insert(format!("extra_{index}"), Value::Bool(true));
+        }
+
+        let error = registry
+            .validate_input("nomi_delegate", &Value::Object(input))
+            .expect_err("parallel branch rejects every extra property");
+
+        assert!(error.contains(&format!(
+            "additional validation errors omitted after {MAX_INPUT_VALIDATION_ERRORS} issues"
+        )));
+        assert!(error.ends_with(INPUT_VALIDATION_RETRY_SUFFIX));
+    }
+
+    #[test]
+    fn diagnostic_suffix_distinguishes_error_count_from_traversal_limit() {
+        assert_eq!(
+            diagnostic_omission_suffix(false, true),
+            "; diagnostic detail truncated at the schema traversal safety limit"
+        );
+        assert_eq!(
+            diagnostic_omission_suffix(true, false),
+            format!(
+                "; additional validation errors omitted after {MAX_INPUT_VALIDATION_ERRORS} issues"
+            )
+        );
+        assert_eq!(
+            diagnostic_omission_suffix(true, true),
+            format!(
+                "; additional validation errors omitted after {MAX_INPUT_VALIDATION_ERRORS} issues; diagnostic detail truncated at the schema traversal safety limit"
+            )
+        );
+    }
+
+    #[test]
+    fn removing_cross_branch_property_allows_parallel_repair() {
+        let registry = delegate_union_registry();
+        let prepared = registry
+            .prepare_input(
+                "nomi_delegate",
+                serde_json::json!({
+                    "strategy": "parallel",
+                    "tasks": "[{\"name\":\"research\",\"prompt\":\"inspect\"}]",
+                    "synthesize": "True"
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(prepared["tasks"][0]["name"], "research");
+        assert_eq!(prepared["synthesize"], true);
+        assert!(prepared.get("model_pool").is_none());
+    }
+
+    #[test]
+    fn prepare_input_recursively_repairs_nested_schema_values() {
+        let mut registry = ToolRegistry::new();
+        assert!(registry.register(schema_tool(
+            "nested",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "max_turns": {"type": "integer"},
+                                "enabled": {"type": "boolean"},
+                                "options": {
+                                    "type": "object",
+                                    "properties": {
+                                        "temperature": {"type": "number"}
+                                    },
+                                    "required": ["temperature"],
+                                    "additionalProperties": false
+                                }
+                            },
+                            "required": ["max_turns", "enabled", "options"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["tasks"],
+                "additionalProperties": false
+            }),
+        )));
+
+        let prepared = registry
+            .prepare_input(
+                "nested",
+                serde_json::json!({
+                    "tasks": "[{\"max_turns\":\"4\",\"enabled\":\"FALSE\",\"options\":\"{\\\"temperature\\\":\\\"0.25\\\"}\"}]"
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(prepared["tasks"][0]["max_turns"], 4);
+        assert_eq!(prepared["tasks"][0]["enabled"], false);
+        assert_eq!(prepared["tasks"][0]["options"]["temperature"], 0.25);
+    }
+
+    #[test]
+    fn repeated_refs_share_a_hard_schema_traversal_budget() {
+        let mut definitions = serde_json::Map::new();
+        definitions.insert("Leaf".to_owned(), serde_json::json!({"type": "integer"}));
+        let mut previous = "Leaf".to_owned();
+        for index in 0..8 {
+            let name = format!("Layer{index}");
+            definitions.insert(
+                name.clone(),
+                serde_json::json!({
+                    "allOf": [
+                        {"$ref": format!("#/$defs/{previous}")},
+                        {"$ref": format!("#/$defs/{previous}")}
+                    ]
+                }),
+            );
+            previous = name;
+        }
+        let traversal_schema = serde_json::json!({
+            "$defs": definitions.clone(),
+            "$ref": format!("#/$defs/{previous}")
+        });
+
+        let mut expected = Vec::new();
+        let mut work = SchemaWorkBudget {
+            // Enough to reach the first leaf, far below the repeated expansion.
+            remaining: 24,
+            exhausted: false,
+            active_refs: Vec::new(),
+        };
+        collect_schema_type_names(
+            &traversal_schema,
+            &traversal_schema,
+            &mut expected,
+            &mut work,
+            0,
+        );
+
+        assert!(expected.contains(&"integer"));
+        assert!(work.exhausted);
+        assert_eq!(work.remaining, 0);
+
+        let mut registry = ToolRegistry::new();
+        assert!(registry.register(schema_tool(
+            "repeated_refs",
+            serde_json::json!({
+                "$defs": definitions,
+                "type": "object",
+                "properties": {
+                    "count": {"$ref": format!("#/$defs/{previous}")}
+                },
+                "required": ["count"],
+                "additionalProperties": false
+            }),
+        )));
+        let prepared = registry
+            .prepare_input(
+                "repeated_refs",
+                serde_json::json!({"count": "7"}),
+            )
+            .unwrap();
+        assert_eq!(prepared["count"], 7);
     }
 
     #[test]

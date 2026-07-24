@@ -3,8 +3,8 @@
 //! this module's ownership).
 
 use nomifun_common::{
-    AppError, ProviderId, TimestampMs, WorkshopAssetId, WorkshopCanvasId, WorkshopNodeId,
-    validate_uuidv7,
+    AppError, CreationTaskId, ProviderId, TimestampMs, WorkshopAssetId, WorkshopCanvasId,
+    WorkshopNodeId,
 };
 use nomifun_db::CreationTaskRow;
 use serde::Serialize;
@@ -36,7 +36,7 @@ impl TryFrom<CreationTaskRow> for CreationTask {
     type Error = AppError;
 
     fn try_from(row: CreationTaskRow) -> Result<Self, Self::Error> {
-        validate_uuidv7(&row.creation_task_id)
+        CreationTaskId::parse(&row.creation_task_id)
             .map_err(|error| corrupt_id("creation_tasks.creation_task_id", error))?;
         if let Some(id) = row.canvas_id.as_deref() {
             WorkshopCanvasId::parse(id).map_err(|error| corrupt_id("creation_tasks.canvas_id", error))?;
@@ -48,7 +48,7 @@ impl TryFrom<CreationTaskRow> for CreationTask {
 
         let params = serde_json::from_str::<Value>(&row.params)
             .map_err(|error| AppError::Internal(format!("invalid creation_tasks.params JSON: {error}")))?;
-        let mut error = row
+        let error = row
             .error
             .as_deref()
             .map(serde_json::from_str::<Value>)
@@ -60,17 +60,11 @@ impl TryFrom<CreationTaskRow> for CreationTask {
             WorkshopAssetId::parse(id)
                 .map_err(|error| corrupt_id("creation_tasks.result_asset_ids[]", error))?;
         }
-
-        // Last-resort wire-boundary guard for historical corruption. The
-        // async service path also audits/persists this repair, but direct DTO
-        // conversion must never serialize `succeeded` with no artifacts.
-        let mut status = row.status;
-        if status == "succeeded" && result_asset_ids.is_empty() {
-            status = "failed".to_string();
-            error = Some(serde_json::json!({
-                "kind": "invalid_artifact",
-                "message": "historical succeeded task has no result artifacts"
-            }));
+        if row.status == "succeeded" && result_asset_ids.is_empty() {
+            return Err(AppError::Internal(format!(
+                "managed creation task {} is succeeded without result artifacts",
+                row.creation_task_id
+            )));
         }
 
         Ok(Self {
@@ -81,7 +75,7 @@ impl TryFrom<CreationTaskRow> for CreationTask {
             model: row.model,
             capability: row.capability,
             params,
-            status,
+            status: row.status,
             error,
             result_asset_ids,
             attempt: row.attempt,
@@ -136,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn succeeded_without_artifacts_is_never_exposed_as_success() {
+    fn succeeded_without_artifacts_fails_closed() {
         let row = CreationTaskRow {
             creation_task_id: generate_id(),
             canvas_id: None,
@@ -154,10 +148,10 @@ mod tests {
             started_at: Some(1),
             finished_at: Some(2),
         };
-        let dto = CreationTask::try_from(row).unwrap();
-        assert_eq!(dto.status, "failed");
-        assert!(dto.result_asset_ids.is_empty());
-        assert_eq!(dto.error.unwrap()["kind"], "invalid_artifact");
+        assert!(matches!(
+            CreationTask::try_from(row),
+            Err(AppError::Internal(message)) if message.contains("without result artifacts")
+        ));
     }
 
     #[test]

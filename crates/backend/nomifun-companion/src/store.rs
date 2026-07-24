@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use nomifun_common::{
     AppError, CompanionId, CompanionLearnRunId, CompanionMemoryId,
-    CompanionSessionWindowId, CompanionSuggestionId, ConversationId, TimestampMs,
-    now_ms, validate_uuidv7,
+    CompanionSessionWindowId, CompanionSkillPatternId, CompanionSuggestionId, ConversationId,
+    TimestampMs, now_ms, validate_uuidv7,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
@@ -3420,7 +3420,7 @@ impl CompanionStore {
         let skill_pattern_id = existing
             .as_ref()
             .map(|row| row.get::<String, _>("skill_pattern_id"))
-            .unwrap_or_else(nomifun_common::generate_id);
+            .unwrap_or_else(|| CompanionSkillPatternId::new().into_string());
         validate_uuidv7(&skill_pattern_id).map_err(|error| {
             invalid_disk_id("skill pattern id", &skill_pattern_id, error)
         })?;

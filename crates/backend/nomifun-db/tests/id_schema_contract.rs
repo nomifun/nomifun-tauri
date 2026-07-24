@@ -1045,8 +1045,8 @@ async fn contract_rejects_legacy_workshop_asset_origin_task_path() {
     .await
     .expect("workshop_assets table SQL");
     let tampered = original.replace(
-        "coalesce(json_type(origin, '$.task_id'), 'missing') = 'missing'",
-        "coalesce(json_type(origin, '$.task_id'), 'missing') <> 'forbidden'",
+        "json_type(origin, '$.task_id') IS NULL",
+        "json_type(origin, '$.task_id') <> 'forbidden'",
     );
     assert_ne!(
         tampered, original,

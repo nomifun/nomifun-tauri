@@ -73,6 +73,14 @@ pub fn validate_artifact_receipt_integrity(
 }
 
 /// Data for the `ToolCall` event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCallRetryData {
+    pub retry_group_id: String,
+    pub attempt_no: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_of_call_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallEventData {
     pub call_id: String,
@@ -86,6 +94,11 @@ pub struct ToolCallEventData {
     pub output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Explicit, engine-authored retry identity. Consumers must fail closed
+    /// when this chain is absent or malformed instead of guessing by timing or
+    /// similar arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry: Option<ToolCallRetryData>,
     /// Verified user-visible outputs. Inline base64 is never placed on the
     /// event bus or in conversation history; only durable metadata is stored.
     // Keep an explicit empty array on Running/Error correction frames. Live
@@ -255,6 +268,7 @@ mod tests {
             input: None,
             output: None,
             description: None,
+            retry: None,
             artifacts,
         }
     }

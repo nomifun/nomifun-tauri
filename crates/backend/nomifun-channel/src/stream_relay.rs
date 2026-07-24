@@ -1100,6 +1100,7 @@ mod media_tests {
                         .into(),
                 ),
                 artifacts: Vec::new(),
+                retry: None,
             })).unwrap();
         }
         tx.send(AgentStreamEvent::Finish(FinishEventData { session_id: None, stop_reason: None })).unwrap();
@@ -1140,6 +1141,7 @@ mod media_tests {
                     .into(),
             ),
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData {
@@ -1195,6 +1197,7 @@ mod media_tests {
                     .into(),
             ),
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default()))
@@ -1253,6 +1256,7 @@ mod media_tests {
                     .into(),
             ),
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default()))
@@ -1303,6 +1307,7 @@ mod media_tests {
                     .into(),
             ),
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default()))
@@ -1371,6 +1376,7 @@ mod media_tests {
             output: Some("done".into()),
             description: None,
             artifacts,
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData {
@@ -1427,6 +1433,7 @@ mod media_tests {
             output: Some("done".into()),
             description: None,
             artifacts: vec![artifact.clone()],
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default()))
@@ -1487,6 +1494,7 @@ mod media_tests {
             output: Some("done".into()),
             description: None,
             artifacts: vec![artifact],
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default()))
@@ -1681,6 +1689,7 @@ mod media_tests {
             output: Some("done".into()),
             description: None,
             artifacts: vec![artifact.clone()],
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData {
@@ -1749,6 +1758,7 @@ mod media_tests {
             output: Some("artifact batch failed".into()),
             description: None,
             artifacts: vec![artifact],
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Error(ErrorEventData::legacy(
@@ -1801,6 +1811,7 @@ mod media_tests {
             output: Some("done".into()),
             description: None,
             artifacts: vec![artifact],
+            retry: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Error(ErrorEventData::legacy(
@@ -1846,6 +1857,7 @@ mod media_tests {
                 output: None,
                 description: None,
                 artifacts,
+                retry: None,
             })
         };
         let recorder = Arc::new(MessageRecorder::new());
@@ -1904,6 +1916,7 @@ mod media_tests {
                 size_bytes: bytes.len() as u64,
                 sha256: format!("{:x}", Sha256::digest(bytes)),
             }],
+            retry: None,
         }))
         .unwrap();
         drop(tx);
@@ -1944,6 +1957,7 @@ mod media_tests {
             output: None,
             description: None,
             artifacts: Vec::new(),
+            retry: None,
         }))
         .unwrap();
         drop(tx);
@@ -2062,6 +2076,7 @@ mod media_tests {
                     .into(),
             ),
             artifacts: Vec::new(),
+            retry: None,
         })).unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData { session_id: None, stop_reason: None })).unwrap();
         drop(tx);

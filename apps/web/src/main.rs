@@ -47,9 +47,9 @@ struct Args {
     #[arg(long, env = "NOMIFUN_WEB_PORT", default_value_t = 8787)]
     port: u16,
     /// Data directory for the backend (db + storage). Defaults to the same
-    /// per-user dir as the desktop shell (`%LOCALAPPDATA%\NomiFun\Nomi` on
-    /// Windows, see `nomifun_app::cli::default_data_dir`) so every host and
-    /// dev loop shares one state by default. The env value is taken literally
+    /// per-user dir as hosts built for the active channel (for example,
+    /// `%LOCALAPPDATA%\NomiFun\Nomi-dev` for `NOMI_CHANNEL=dev`; see
+    /// `nomifun_app::cli::default_data_dir`). The env value is taken literally
     /// (no `/Nomi` suffix) — production deployments (Docker `/data`, systemd
     /// `/var/lib/nomifun`) rely on that.
     #[arg(

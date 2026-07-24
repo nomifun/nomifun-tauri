@@ -3,6 +3,21 @@
   "category": "终端",
   "untitled": "终端",
   "empty": "暂无终端",
+  "conversationPanel": {
+    "tab": "会话终端",
+    "summary": "共 {{total}} 个，{{running}} 个运行中",
+    "empty": "当前会话暂无终端",
+    "status": "状态",
+    "stopping": "正在关闭",
+    "cwd": "工作目录",
+    "command": "命令",
+    "exitCode": "退出码",
+    "output": "终端输出",
+    "noOutput": "暂无输出",
+    "closeConfirm": "确认关闭“{{name}}”？正在运行的进程会被终止。",
+    "remove": "移除记录",
+    "removeConfirm": "确认移除“{{name}}”的终端记录？"
+  },
   "extended": {
     "autoworkApplyFailed": "终端已创建，但自动工作启用失败，可在终端内重试",
     "autoworkDesc": "让自动任务按需求标签驱动该终端并确认完成（Claude / Codex，含 stepcode claude 等代理形式）",

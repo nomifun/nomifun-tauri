@@ -14,14 +14,18 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use nomifun_common::{
-    AppError, ProviderId, WorkshopAssetId, WorkshopCanvasId, WorkshopNodeId, decrypt_string,
-    generate_id, now_ms, validate_uuidv7,
+    AppError, CreationTaskId, ProviderId, WorkshopAssetId, WorkshopCanvasId, WorkshopNodeId,
+    decrypt_string, now_ms, validate_uuidv7,
 };
+#[cfg(test)]
+use nomifun_common::generate_id;
 use nomifun_db::{
     CreateCreationTaskParams, CreationTaskRow, ICreationTaskRepository, IProviderRepository,
     ListCreationTasksParams, UpdateCreationTaskParams,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -80,8 +84,6 @@ pub struct NewCreationTask {
 /// A produced artifact ready for persistence: resolved bytes (URL artifacts are
 /// fetched by the engine first) + MIME + provenance.
 pub struct PersistAsset {
-    pub canvas_id: Option<String>,
-    pub node_id: Option<String>,
     pub bytes: Vec<u8>,
     pub mime: String,
     /// Whether the produced asset appears in the asset library. Generated
@@ -378,7 +380,7 @@ impl CreationService {
 
         let params_json = serde_json::to_string(&req.params)
             .map_err(|e| AppError::BadRequest(format!("invalid params json: {e}")))?;
-        let creation_task_id = generate_id();
+        let creation_task_id = CreationTaskId::new().into_string();
         let now = now_ms();
         let row = self
             .repo
@@ -562,74 +564,26 @@ impl CreationService {
         (manifests, issues)
     }
 
-    async fn downgrade_invalid_successes(
-        &self,
-        rows: &mut [CreationTaskRow],
-        issues: impl IntoIterator<Item = TaskArtifactIssue>,
-    ) {
-        let mut reasons = HashMap::<String, String>::new();
-        for issue in issues {
-            reasons
-                .entry(issue.creation_task_id)
-                .and_modify(|reason| {
-                    if !reason.contains(&issue.reason) {
-                        reason.push_str("; ");
-                        reason.push_str(&issue.reason);
-                    }
-                })
-                .or_insert(issue.reason);
-        }
-        for row in rows {
-            let Some(reason) = reasons.get(&row.creation_task_id) else {
-                continue;
-            };
-            if row.status != TaskStatus::Succeeded.as_str() {
-                continue;
-            }
-            let error = CreationError::new(
-                "invalid_artifact",
-                format!("historical succeeded task failed artifact integrity audit: {reason}"),
-            );
-            let error_json = serde_json::to_string(&error).unwrap_or_else(|_| {
-                r#"{"kind":"invalid_artifact","message":"artifact integrity audit failed"}"#.to_string()
-            });
-            match self
-                .repo
-                .update_task(
-                    &row.creation_task_id,
-                    UpdateCreationTaskParams {
-                        status: Some(TaskStatus::Failed.as_str()),
-                        error: Some(Some(&error_json)),
-                        result_asset_ids: Some("[]"),
-                        finished_at: Some(Some(row.finished_at.unwrap_or_else(now_ms))),
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(updated) => *row = updated,
-                Err(write_error) => {
-                    // Read-time callers still receive a synthetic failed row;
-                    // the next boot/query retries the durable repair.
-                    tracing::error!(
-                        id = %row.creation_task_id,
-                        error = %write_error,
-                        "creation: persist invalid historical success repair failed"
-                    );
-                    row.status = TaskStatus::Failed.as_str().to_string();
-                    row.error = Some(error_json);
-                    row.result_asset_ids = "[]".to_string();
-                    row.finished_at.get_or_insert_with(now_ms);
-                }
-            }
-        }
+    fn artifact_contract_error(issues: &[TaskArtifactIssue]) -> AppError {
+        let details = issues
+            .iter()
+            .map(|issue| format!("{}: {}", issue.creation_task_id, issue.reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        AppError::Internal(format!(
+            "managed creation artifact contract failed: {details}"
+        ))
     }
 
-    async fn audit_rows_for_output(&self, mut rows: Vec<CreationTaskRow>) -> Result<Vec<CreationTaskRow>, AppError> {
+    async fn verify_artifact_manifests(
+        &self,
+        rows: &[CreationTaskRow],
+    ) -> Result<Vec<TaskArtifactManifest>, AppError> {
         let (manifests, mut issues) = Self::artifact_manifests(&rows);
         let committed = manifests
-            .into_iter()
+            .iter()
             .filter(|manifest| manifest.committed && !manifest.asset_ids.is_empty())
+            .cloned()
             .collect::<Vec<_>>();
         if !committed.is_empty() {
             let sink = self.asset_sink.as_ref().ok_or_else(|| {
@@ -642,62 +596,79 @@ impl CreationService {
                 ))
             })?);
         }
-        self.downgrade_invalid_successes(&mut rows, issues).await;
+        if !issues.is_empty() {
+            return Err(Self::artifact_contract_error(&issues));
+        }
+        Ok(manifests)
+    }
+
+    async fn audit_rows_for_output(
+        &self,
+        rows: Vec<CreationTaskRow>,
+    ) -> Result<Vec<CreationTaskRow>, AppError> {
+        self.verify_artifact_manifests(&rows).await?;
         Ok(rows)
+    }
+
+    /// Read-only startup audit for durable creation rows and their managed
+    /// asset files. A failure means the current dataset is incompatible and
+    /// must be retired/reset as a whole; this method never repairs rows.
+    pub async fn audit_managed_data_on_boot(&self) -> Result<(), AppError> {
+        let rows = self.repo.list_all_tasks().await?;
+        self.verify_artifact_manifests(&rows).await?;
+        Ok(())
     }
 
     /// Boot reconciliation ("running ⟺ active executor" invariant). Async tasks that
     /// have a remote job id are RESUMED (their poll loop restarts); every other
     /// live task (queued, or running with no remote handle) is converged to
     /// `failed(interrupted)`. Returns the count settled as failed.
-    pub async fn reconcile_on_boot(self: &Arc<Self>) -> usize {
-        let mut all_rows = match self.repo.list_all_tasks().await {
-            Ok(rows) => rows,
-            Err(e) => {
-                tracing::warn!(error = %e, "creation boot reconcile: list complete task inventory failed");
-                return 0;
-            }
-        };
-        let (manifests, mut integrity_issues) = Self::artifact_manifests(&all_rows);
+    pub async fn reconcile_on_boot(self: &Arc<Self>) -> Result<usize, AppError> {
+        let all_rows = self.repo.list_all_tasks().await?;
+        let manifests = self.verify_artifact_manifests(&all_rows).await?;
         if let Some(sink) = self.asset_sink.as_ref() {
-            match sink.reconcile_task_artifacts(&manifests).await {
-                Ok(report) => {
-                    integrity_issues.extend(report.invalid_committed_tasks);
-                    if report.removed_assets > 0 {
-                        tracing::info!(
-                            removed = report.removed_assets,
-                            "creation boot reconcile: removed uncommitted or orphan task assets"
-                        );
-                    }
-                    for failure in report.cleanup_failures {
-                        tracing::error!(
-                            creation_task_id = failure.creation_task_id.as_ref().map(String::as_str).unwrap_or("unknown"),
-                            asset_id = %failure.asset_id,
-                            reason = %failure.reason,
-                            "creation boot reconcile: asset cleanup failed after retry; state recovery will continue"
-                        );
-                    }
-                }
-                Err(error) => {
-                    tracing::error!(
-                        error_kind = %error.kind,
-                        error_message = %error.message,
-                        "creation boot reconcile: complete artifact inventory reconciliation failed; state recovery will continue"
-                    );
-                }
+            let report = sink
+                .reconcile_task_artifacts(&manifests)
+                .await
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "managed creation artifact reconciliation failed: {}",
+                        error.message
+                    ))
+                })?;
+            if !report.invalid_committed_tasks.is_empty() {
+                return Err(Self::artifact_contract_error(
+                    &report.invalid_committed_tasks,
+                ));
             }
-        } else {
-            integrity_issues.extend(
-                manifests
+            if report.removed_assets > 0 {
+                tracing::info!(
+                    removed = report.removed_assets,
+                    "creation boot reconcile: removed uncommitted or orphan task assets"
+                );
+            }
+            if !report.cleanup_failures.is_empty() {
+                let details = report
+                    .cleanup_failures
                     .iter()
-                    .filter(|manifest| manifest.committed && !manifest.asset_ids.is_empty())
-                    .map(|manifest| TaskArtifactIssue {
-                        creation_task_id: manifest.creation_task_id.clone(),
-                        reason: "no asset sink is configured to verify committed artifacts".into(),
-                    }),
-            );
+                    .map(|failure| {
+                        format!(
+                            "{}:{}: {}",
+                            failure
+                                .creation_task_id
+                                .as_deref()
+                                .unwrap_or("unknown-task"),
+                            failure.asset_id,
+                            failure.reason
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(AppError::Internal(format!(
+                    "managed creation artifact cleanup failed: {details}"
+                )));
+            }
         }
-        self.downgrade_invalid_successes(&mut all_rows, integrity_issues).await;
 
         let live = all_rows
             .into_iter()
@@ -770,7 +741,7 @@ impl CreationService {
         if settled > 0 || resumed > 0 {
             tracing::info!(settled, resumed, "creation boot reconcile complete");
         }
-        settled
+        Ok(settled)
     }
 
     // -----------------------------------------------------------------------
@@ -1093,8 +1064,6 @@ impl CreationService {
         for (bytes, mime) in resolved {
             let raw_id = match sink
                 .persist(PersistAsset {
-                    canvas_id: job.canvas_id.clone(),
-                    node_id: job.node_id.clone(),
                     bytes,
                     mime,
                     in_library: true, // generated products land in the library by default
@@ -1292,16 +1261,39 @@ fn primary_api_key(raw: &str) -> Option<String> {
 
 /// Build the provenance object stamped onto every produced asset's `origin`.
 fn build_origin(job: &WorkerJob) -> Value {
-    json!({
-        "prompt": job.params.get("prompt").and_then(|v| v.as_str()).unwrap_or_default(),
-        "model": job.model,
-        "provider_id": job.provider_id,
-        "capability": job.capability.as_str(),
-        "params": job.params,
-        "canvas_id": job.canvas_id,
-        "node_id": job.node_id,
-        "creation_task_id": job.creation_task_id.as_str(),
-    })
+    let mut origin = serde_json::Map::from_iter([
+        (
+            "prompt".into(),
+            Value::String(
+                job.params
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+            ),
+        ),
+        ("model".into(), Value::String(job.model.clone())),
+        (
+            "provider_id".into(),
+            Value::String(job.provider_id.clone()),
+        ),
+        (
+            "capability".into(),
+            Value::String(job.capability.as_str().to_owned()),
+        ),
+        ("params".into(), job.params.clone()),
+        (
+            "creation_task_id".into(),
+            Value::String(job.creation_task_id.as_str().to_owned()),
+        ),
+    ]);
+    if let Some(canvas_id) = &job.canvas_id {
+        origin.insert("canvas_id".into(), Value::String(canvas_id.clone()));
+    }
+    if let Some(node_id) = &job.node_id {
+        origin.insert("node_id".into(), Value::String(node_id.clone()));
+    }
+    Value::Object(origin)
 }
 
 impl TaskStatus {
@@ -2319,8 +2311,6 @@ mod tests {
 
         let queued_asset = sink
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: valid_png(),
                 mime: "image/png".into(),
                 in_library: true,
@@ -2330,8 +2320,6 @@ mod tests {
             .unwrap();
         let running_asset = sink
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: valid_png(),
                 mime: "image/png".into(),
                 in_library: true,
@@ -2342,8 +2330,6 @@ mod tests {
         let unrelated_task = generate_id();
         let unrelated_asset = sink
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: valid_png(),
                 mime: "image/png".into(),
                 in_library: true,
@@ -2352,7 +2338,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(svc.reconcile_on_boot().await, 2);
+        assert_eq!(svc.reconcile_on_boot().await.unwrap(), 2);
         assert_eq!(svc.get_task(&queued_id).await.unwrap().status, "failed");
         assert_eq!(svc.get_task(&running_id).await.unwrap().status, "failed");
         assert!(!sink.contains(&queued_asset));
@@ -2360,12 +2346,12 @@ mod tests {
         assert!(!sink.contains(&unrelated_asset), "assets for a missing task must also be removed");
 
         // Re-running complete-inventory recovery is idempotent.
-        assert_eq!(svc.reconcile_on_boot().await, 0);
+        assert_eq!(svc.reconcile_on_boot().await.unwrap(), 0);
         assert_eq!(sink.live_count(), 0);
     }
 
     #[tokio::test]
-    async fn boot_asset_cleanup_failure_does_not_block_state_recovery_and_retries_next_pass() {
+    async fn boot_asset_cleanup_failure_aborts_before_state_recovery_and_retries_next_pass() {
         let adapter = MockAdapter::sync("openai_images");
         let tracked = TransactionalTestSink::new(None, None);
         let flaky = Arc::new(FlakyReconcileSink {
@@ -2377,8 +2363,6 @@ mod tests {
         let creation_task_id = create_test_task(svc.repo.as_ref(), &provider_id, "t2i", "{}").await;
         let asset_id = flaky
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: valid_png(),
                 mime: "image/png".into(),
                 in_library: true,
@@ -2387,86 +2371,55 @@ mod tests {
             .await
             .unwrap();
 
-        // The first inventory scan fails globally, but the queued task still
-        // converges to failed instead of blocking every task behind cleanup.
-        assert_eq!(svc.reconcile_on_boot().await, 1);
-        assert_eq!(svc.repo.get_task(&creation_task_id).await.unwrap().unwrap().status, "failed");
+        let error = svc.reconcile_on_boot().await.unwrap_err();
+        assert!(error.to_string().contains("artifact reconciliation failed"));
+        assert_eq!(
+            svc.repo
+                .get_task(&creation_task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "queued",
+            "a failed managed-data audit must not partially mutate task state"
+        );
         assert!(tracked.contains(&asset_id));
 
-        // Complete-inventory reconciliation includes terminal rows, so the
-        // next pass retries and removes the failed task's leftover asset.
-        assert_eq!(svc.reconcile_on_boot().await, 0);
+        assert_eq!(svc.reconcile_on_boot().await.unwrap(), 1);
+        assert_eq!(
+            svc.repo
+                .get_task(&creation_task_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed"
+        );
         assert!(!tracked.contains(&asset_id));
     }
 
     #[tokio::test]
-    async fn boot_inventory_preserves_valid_success_and_cleans_every_uncommitted_terminal_batch() {
+    async fn boot_inventory_fails_closed_before_cleanup_for_invalid_committed_task() {
         let adapter = MockAdapter::sync("openai_images");
         let sink = TransactionalTestSink::new(None, None);
         let (svc, provider_id, _db) =
             harness_with_sink_and_repo(adapter, "openai", sink.clone(), None).await;
 
-        let succeeded = seed_test_task(&svc, &provider_id, "t2i", "{}", "succeeded", "[]").await;
-        let succeeded_asset = sink
-            .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
-                bytes: valid_png(),
-                mime: "image/png".into(),
-                in_library: true,
-                origin: json!({"creation_task_id": succeeded}),
-            })
-            .await
-            .unwrap();
-        let succeeded_asset_ids = serde_json::to_string(&[&succeeded_asset]).unwrap();
-        svc.repo
-            .update_task(
-                &succeeded,
-                UpdateCreationTaskParams {
-                    result_asset_ids: Some(&succeeded_asset_ids),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        let mut removed_ids = Vec::new();
-        for status in ["canceled", "failed", "future_unknown_status"] {
-            let creation_task_id = seed_test_task(&svc, &provider_id, "t2i", "{}", status, "[]").await;
-            let asset_id = sink
-                .persist(PersistAsset {
-                    canvas_id: None,
-                    node_id: None,
-                    bytes: valid_png(),
-                    mime: "image/png".into(),
-                    in_library: true,
-                    origin: json!({"creation_task_id": creation_task_id}),
-                })
-                .await
-                .unwrap();
-            removed_ids.push(asset_id);
-        }
-
-        let empty_success =
+        let invalid_success =
             seed_test_task(&svc, &provider_id, "t2i", "{}", "succeeded", "[]").await;
-        let empty_success_asset = sink
+        let invalid_success_asset = sink
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: valid_png(),
                 mime: "image/png".into(),
                 in_library: true,
-                origin: json!({"creation_task_id": empty_success}),
+                origin: json!({"creation_task_id": invalid_success}),
             })
             .await
             .unwrap();
-        removed_ids.push(empty_success_asset);
 
         let missing_task = generate_id();
         let missing_task_asset = sink
             .persist(PersistAsset {
-                canvas_id: None,
-                node_id: None,
                 bytes: valid_png(),
                 mime: "image/png".into(),
                 in_library: true,
@@ -2474,21 +2427,19 @@ mod tests {
             })
             .await
             .unwrap();
-        removed_ids.push(missing_task_asset);
 
-        assert_eq!(svc.reconcile_on_boot().await, 0);
-        assert!(sink.contains(&succeeded_asset));
-        for id in removed_ids {
-            assert!(!sink.contains(&id), "uncommitted terminal/missing-task asset must be removed");
-        }
-        let repaired = svc.repo.get_task(&empty_success).await.unwrap().unwrap();
-        assert_eq!(repaired.status, "failed");
-        assert_eq!(repaired.result_asset_ids, "[]");
-        assert!(repaired.error.unwrap().contains("invalid_artifact"));
+        let error = svc.reconcile_on_boot().await.unwrap_err();
+        assert!(error.to_string().contains("succeeded task has no result artifacts"));
+        assert!(sink.contains(&invalid_success_asset));
+        assert!(sink.contains(&missing_task_asset));
+        let unchanged = svc.repo.get_task(&invalid_success).await.unwrap().unwrap();
+        assert_eq!(unchanged.status, "succeeded");
+        assert_eq!(unchanged.result_asset_ids, "[]");
+        assert!(unchanged.error.is_none());
     }
 
     #[tokio::test]
-    async fn query_downgrades_succeeded_task_when_claimed_asset_is_missing() {
+    async fn query_fails_closed_when_succeeded_task_claims_missing_asset() {
         let adapter = MockAdapter::sync("openai_images");
         let sink = TransactionalTestSink::new(None, None);
         let (svc, provider_id, _db) =
@@ -2509,15 +2460,15 @@ mod tests {
             .await
             .unwrap();
 
-        let task = svc.get_task(&creation_task_id).await.unwrap();
-        assert_eq!(task.status, "failed");
-        assert!(task.result_asset_ids.is_empty());
-        assert_eq!(task.error.unwrap()["kind"], "invalid_artifact");
-        assert_eq!(svc.repo.get_task(&creation_task_id).await.unwrap().unwrap().status, "failed");
+        let error = svc.get_task(&creation_task_id).await.unwrap_err();
+        assert!(error.to_string().contains("committed assets are missing"));
+        let unchanged = svc.repo.get_task(&creation_task_id).await.unwrap().unwrap();
+        assert_eq!(unchanged.status, "succeeded");
+        assert_eq!(unchanged.result_asset_ids, ids_json);
     }
 
     #[tokio::test]
-    async fn get_and_list_fail_closed_for_historical_image_successes_with_too_few_results() {
+    async fn get_and_list_fail_closed_for_short_image_successes_without_rewriting_rows() {
         let h = harness(MockAdapter::sync("openai_images"), "openai").await;
 
         async fn seed_short_success(
@@ -2547,25 +2498,28 @@ mod tests {
         }
 
         let get_id = seed_short_success(&h.svc, &h.provider_id, r#"{"count":2}"#, 1).await;
-        let get_task = h.svc.get_task(&get_id).await.unwrap();
-        assert_eq!(get_task.status, "failed");
-        assert!(get_task.result_asset_ids.is_empty());
-        assert_eq!(get_task.error.unwrap()["kind"], "invalid_artifact");
+        let get_error = h.svc.get_task(&get_id).await.unwrap_err();
+        assert!(get_error.to_string().contains("requires at least 2"));
+        assert_eq!(
+            h.svc.repo.get_task(&get_id).await.unwrap().unwrap().status,
+            "succeeded"
+        );
 
         let list_id = seed_short_success(&h.svc, &h.provider_id, r#"{"n":3}"#, 2).await;
-        let exposed_successes = h.svc.list_tasks(None, Some("succeeded"), 20).await.unwrap();
-        assert!(
-            exposed_successes.is_empty(),
-            "a short historical batch must never remain visible as succeeded"
+        let list_error = h
+            .svc
+            .list_tasks(None, Some("succeeded"), 20)
+            .await
+            .unwrap_err();
+        assert!(list_error.to_string().contains("requires at least"));
+        assert_eq!(
+            h.svc.repo.get_task(&list_id).await.unwrap().unwrap().status,
+            "succeeded"
         );
-        let repaired = h.svc.repo.get_task(&list_id).await.unwrap().unwrap();
-        assert_eq!(repaired.status, "failed");
-        assert_eq!(repaired.result_asset_ids, "[]");
-        assert!(repaired.error.unwrap().contains("requires at least 3"));
     }
 
     #[tokio::test]
-    async fn boot_reconciliation_downgrades_and_cleans_short_or_invalid_count_successes() {
+    async fn boot_reconciliation_rejects_short_or_invalid_count_successes_without_cleanup() {
         let sink = TransactionalTestSink::new(None, None);
         let (svc, provider_id, _db) = harness_with_sink_and_repo(
             MockAdapter::sync("openai_images"),
@@ -2584,8 +2538,6 @@ mod tests {
             let id = create_test_task(svc.repo.as_ref(), provider_id, "t2i", params).await;
             let asset_id = sink
                 .persist(PersistAsset {
-                    canvas_id: None,
-                    node_id: None,
                     bytes: valid_png(),
                     mime: "image/png".into(),
                     in_library: true,
@@ -2614,21 +2566,21 @@ mod tests {
         let (invalid_id, invalid_asset) =
             seed_with_one_asset(&svc, sink.as_ref(), &provider_id, r#"{"count":0}"#).await;
 
-        assert_eq!(svc.reconcile_on_boot().await, 0);
+        let error = svc.reconcile_on_boot().await.unwrap_err();
+        assert!(error.to_string().contains("managed creation artifact contract failed"));
         for (creation_task_id, asset_id) in [
             (short_id, short_asset.as_str()),
             (invalid_id, invalid_asset.as_str()),
         ] {
             let row = svc.repo.get_task(&creation_task_id).await.unwrap().unwrap();
-            assert_eq!(row.status, "failed");
-            assert_eq!(row.result_asset_ids, "[]");
-            assert!(row.error.unwrap().contains("invalid_artifact"));
-            assert!(!sink.contains(asset_id));
+            assert_eq!(row.status, "succeeded");
+            assert!(row.error.is_none());
+            assert!(sink.contains(asset_id));
         }
     }
 
     #[tokio::test]
-    async fn cancel_endpoint_audits_terminal_success_before_returning_it() {
+    async fn cancel_endpoint_fails_closed_for_invalid_terminal_success() {
         let adapter = MockAdapter::sync("openai_images");
         let sink = TransactionalTestSink::new(None, None);
         let (svc, provider_id, _db) =
@@ -2649,10 +2601,11 @@ mod tests {
             .await
             .unwrap();
 
-        let returned = svc.cancel_task(&creation_task_id).await.unwrap();
-        assert_eq!(returned.status, "failed");
-        assert!(returned.result_asset_ids.is_empty());
-        assert_eq!(returned.error.unwrap()["kind"], "invalid_artifact");
+        let error = svc.cancel_task(&creation_task_id).await.unwrap_err();
+        assert!(error.to_string().contains("committed assets are missing"));
+        let unchanged = svc.repo.get_task(&creation_task_id).await.unwrap().unwrap();
+        assert_eq!(unchanged.status, "succeeded");
+        assert_eq!(unchanged.result_asset_ids, ids_json);
     }
 
     #[tokio::test]
@@ -2689,7 +2642,7 @@ mod tests {
         .await
         .unwrap();
 
-        let settled = h.svc.reconcile_on_boot().await;
+        let settled = h.svc.reconcile_on_boot().await.unwrap();
         assert_eq!(settled, 2, "queued + running-without-remote settle as failed");
 
         assert_eq!(h.svc.get_task(&queued_id).await.unwrap().status, "failed");
@@ -2745,7 +2698,7 @@ mod tests {
         .await
         .unwrap();
 
-        let settled = h.svc.reconcile_on_boot().await;
+        let settled = h.svc.reconcile_on_boot().await.unwrap();
         assert_eq!(settled, 0, "the resumable task is resumed, not settled as failed");
         // With a resume-relative deadline it polls to completion instead of an
         // instant timeout.
@@ -2804,10 +2757,31 @@ mod tests {
         assert_eq!(o["creation_task_id"], creation_task_id.as_str());
         assert!(
             o.get("task_id").is_none(),
-            "technical/legacy task_id must never be emitted into Workshop Asset origin"
+            "only creation_task_id is valid in Workshop Asset origin"
         );
         assert_eq!(o["capability"], "t2i");
         assert_eq!(o["params"]["count"], 2);
+    }
+
+    #[test]
+    fn build_origin_omits_absent_optional_ids_instead_of_writing_null() {
+        let job = WorkerJob {
+            creation_task_id: CreationTaskId::new().into_string(),
+            canvas_id: None,
+            node_id: None,
+            provider_id: ProviderId::new().into_string(),
+            model: "gpt-image-1".into(),
+            capability: MediaCapability::T2i,
+            params: json!({"prompt": "sunset"}),
+            required_artifact_count: 1,
+            inputs: vec![],
+            submitted_at: 1,
+            remote_task_id: None,
+        };
+
+        let origin = build_origin(&job);
+        assert!(!origin.as_object().unwrap().contains_key("canvas_id"));
+        assert!(!origin.as_object().unwrap().contains_key("node_id"));
     }
 }
 

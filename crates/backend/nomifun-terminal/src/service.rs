@@ -9,7 +9,10 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use dashmap::DashMap;
 use nomifun_api_types::{CreateTerminalRequest, TerminalSessionResponse};
-use nomifun_common::{KnowledgeBaseId, LoopbackCapabilityLeaseSet, OnTerminalDelete, TerminalId, UserId};
+use nomifun_common::{
+    ConversationId, KnowledgeBaseId, LoopbackCapabilityLeaseSet, OnTerminalDelete, TerminalId,
+    UserId,
+};
 use nomifun_db::{CreateTerminalParams, ITerminalRepository};
 use tracing::{info, warn};
 
@@ -17,7 +20,10 @@ use crate::driver::{TerminalDescription, TerminalDriver};
 use crate::error::TerminalError;
 use crate::events::TerminalEventEmitter;
 use crate::pty::{PtyHandle, SpawnParams};
-use crate::types::{resolve_command, row_to_response};
+use crate::types::{
+    TerminalOwnerScope, persisted_terminal_env, process_env_from_persisted, resolve_command,
+    row_to_response, strip_internal_terminal_env, terminal_owner_scope,
+};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TerminalKnowledgeScope {
@@ -553,16 +559,44 @@ impl TerminalService {
     ) -> Result<TerminalSessionResponse, TerminalError> {
         let service = self.clone();
         let user_id = user_id.to_owned();
-        tokio::spawn(async move { service.create_coordinated(user_id, req).await })
+        tokio::spawn(async move { service.create_coordinated(user_id, None, req).await })
             .await
             .map_err(|error| {
                 TerminalError::Spawn(format!("terminal create coordinator failed: {error}"))
             })?
     }
 
+    /// Create a terminal owned by one interactive conversation.
+    ///
+    /// The owner is supplied out-of-band by the authenticated Gateway caller.
+    /// Any reserved owner key present in `req.env` is discarded before this
+    /// authoritative value is persisted.
+    pub async fn create_for_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        req: CreateTerminalRequest,
+    ) -> Result<TerminalSessionResponse, TerminalError> {
+        let conversation_id = ConversationId::parse(conversation_id).map_err(|error| {
+            TerminalError::InvalidInput(format!("invalid conversation_id: {error}"))
+        })?;
+        let service = self.clone();
+        let user_id = user_id.to_owned();
+        tokio::spawn(async move {
+            service
+                .create_coordinated(user_id, Some(conversation_id), req)
+                .await
+        })
+        .await
+        .map_err(|error| {
+            TerminalError::Spawn(format!("terminal create coordinator failed: {error}"))
+        })?
+    }
+
     async fn create_coordinated(
         &self,
         user_id: String,
+        owner_conversation_id: Option<ConversationId>,
         req: CreateTerminalRequest,
     ) -> Result<TerminalSessionResponse, TerminalError> {
         let _shutdown_guard = self.enter_operation().await?;
@@ -573,7 +607,13 @@ impl TerminalService {
             .filter(|n| !n.trim().is_empty())
             .unwrap_or_else(|| default_name(&req.command, req.backend.as_deref()));
         let args_json = serde_json::to_string(&req.args)?;
-        let env_json = req.env.as_ref().map(serde_json::to_string).transpose()?;
+        // The request environment is untrusted. Strip any forged internal
+        // owner, then add only the server-selected conversation owner to the
+        // persisted copy. The PTY receives the stripped process copy.
+        let persisted_env =
+            persisted_terminal_env(req.env.clone(), owner_conversation_id.as_ref());
+        let process_env = strip_internal_terminal_env(persisted_env.clone());
+        let env_json = persisted_env.as_ref().map(serde_json::to_string).transpose()?;
         let id = TerminalId::new();
         let user_id = UserId::parse(&user_id)
             .map_err(|error| TerminalError::InvalidInput(format!("invalid user_id: {error}")))?;
@@ -642,7 +682,7 @@ impl TerminalService {
             &req.command,
             &req.args,
             &req.cwd,
-            req.env.clone(),
+            process_env,
             req.cols,
             req.rows,
             kb_ids,
@@ -714,7 +754,11 @@ impl TerminalService {
             self.live_capability_leases
                 .insert(id.to_string(), (epoch, capability_leases));
         }
-        let mut env: HashMap<String, String> = env.unwrap_or_default();
+        // Defense in depth: even if a future caller passes a persisted env map
+        // directly, backend ownership metadata must never become a child
+        // process environment variable.
+        let mut env: HashMap<String, String> =
+            strip_internal_terminal_env(env).unwrap_or_default();
         // Describe the xterm.js emulator the PTY talks to (TERM/COLORTERM), so a
         // Finder/launchd-launched macOS app —which inherits no TERM —still gets
         // color + correct backspace rendering. Defaults only; explicit env wins.
@@ -778,7 +822,6 @@ impl TerminalService {
                     return;
                 }
 
-                emitter_exit.emit_exit(&exit_owner_id, &exit_terminal_id, code);
                 if let Err(e) = repo
                     .update_status(exit_terminal_id.as_str(), "exited", code.map(i64::from))
                     .await
@@ -791,6 +834,11 @@ impl TerminalService {
                 if let Err(e) = repo.save_scrollback(exit_terminal_id.as_str(), &scrollback).await {
                     warn!(terminal_id = %exit_terminal_id, error = %e, "failed to persist final terminal scrollback");
                 }
+                // Publish only after the durable state and final scrollback have
+                // been attempted. Consumers commonly reconcile an exit event
+                // with an immediate GET; emitting first let that GET observe a
+                // stale `running` row and overwrite the newer UI state.
+                emitter_exit.emit_exit(&exit_owner_id, &exit_terminal_id, code);
                 // Retain the slot through final scrollback persistence. A
                 // relaunch clears predecessor output; this prevents a late exit
                 // write from restoring stale scrollback afterwards.
@@ -1000,13 +1048,88 @@ impl TerminalService {
         }
     }
 
-    /// List sessions for a user.
+    /// List standalone sessions for a user. Conversation-owned terminals are
+    /// intentionally omitted from the global/sidebar collection.
     pub async fn list(&self, user_id: &str) -> Result<Vec<TerminalSessionResponse>, TerminalError> {
         let rows = self.repo.list_by_user(user_id).await?;
         Ok(rows
             .iter()
+            .filter(|row| {
+                matches!(
+                    terminal_owner_scope(row.env.as_deref()),
+                    TerminalOwnerScope::Standalone
+                )
+            })
             .map(|r| row_to_response(r, None, &self.work_dir))
             .collect())
+    }
+
+    /// List terminals owned by one conversation for the authenticated user.
+    pub async fn list_for_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<TerminalSessionResponse>, TerminalError> {
+        let conversation_id = ConversationId::parse(conversation_id).map_err(|error| {
+            TerminalError::InvalidInput(format!("invalid conversation_id: {error}"))
+        })?;
+        let rows = self.repo.list_by_user(user_id).await?;
+        Ok(rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    terminal_owner_scope(row.env.as_deref()),
+                    TerminalOwnerScope::Conversation(owner) if owner == conversation_id
+                )
+            })
+            .map(|row| row_to_response(row, None, &self.work_dir))
+            .collect())
+    }
+
+    /// Verify that a terminal belongs to the authenticated desktop user.
+    ///
+    /// Ownership mismatches deliberately map to `NotFound`, matching
+    /// conversation access and avoiding cross-owner existence disclosure.
+    pub async fn authorize_user(&self, user_id: &str, id: &str) -> Result<(), TerminalError> {
+        let user_id = UserId::parse(user_id)
+            .map_err(|error| TerminalError::InvalidInput(format!("invalid user_id: {error}")))?;
+        let row = self
+            .repo
+            .get_by_id(id)
+            .await?
+            .filter(|row| row.user_id == user_id)
+            .ok_or_else(|| TerminalError::NotFound(id.to_owned()))?;
+        drop(row);
+        Ok(())
+    }
+
+    /// Verify that a Gateway caller owns the terminal through its signed
+    /// `(user_id, conversation_id)` identity.
+    pub async fn authorize_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        id: &str,
+    ) -> Result<(), TerminalError> {
+        let user_id = UserId::parse(user_id)
+            .map_err(|error| TerminalError::InvalidInput(format!("invalid user_id: {error}")))?;
+        let conversation_id = ConversationId::parse(conversation_id).map_err(|error| {
+            TerminalError::InvalidInput(format!("invalid conversation_id: {error}"))
+        })?;
+        let row = self
+            .repo
+            .get_by_id(id)
+            .await?
+            .filter(|row| row.user_id == user_id)
+            .filter(|row| {
+                matches!(
+                    terminal_owner_scope(row.env.as_deref()),
+                    TerminalOwnerScope::Conversation(owner) if owner == conversation_id
+                )
+            })
+            .ok_or_else(|| TerminalError::NotFound(id.to_owned()))?;
+        drop(row);
+        Ok(())
     }
 
     /// Get one session, including a base64 scrollback snapshot. A live session
@@ -1543,10 +1666,7 @@ impl TerminalService {
                 DeferredSpawnFailure::Preflight(TerminalError::NotFound(id.to_string()))
             })?;
         let args = crate::types::parse_args(&row.args);
-        let env: Option<HashMap<String, String>> = row
-            .env
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok());
+        let env = process_env_from_persisted(row.env.as_deref());
         let kb_ids = self
             .sync_knowledge_workspace(id, &row.cwd, &row.command, &args)
             .await;
@@ -1639,20 +1759,31 @@ impl TerminalService {
             }
         };
 
-        // COMMIT ORDER: keep state + live PTY untouched until the durable delete
-        // succeeds. After this await returns, finish the in-memory half without
-        // another yield so cancellation cannot expose a deleted row with a live
-        // process (the outer caller may be gone; this task still continues).
+        // PROCESS ORDER: a durable management row must never disappear while a
+        // kill is known to have failed. Windows `PtyHandle::kill` returns only
+        // after the exact child has exited and its Job is proven empty; on any
+        // error we leave both row and live handle available for inspection and
+        // retry. The detached coordinator still protects the following DB
+        // commit from HTTP request cancellation.
+        if let Some(handle) = self
+            .live
+            .get(&id)
+            .map(|entry| Arc::clone(entry.value()))
+        {
+            self.live_capability_leases.remove(&id);
+            handle.kill()?;
+        }
+
+        // Once tree cleanup is proven, commit deletion. If SQLite fails, the
+        // row remains as the durable management/relaunch entry; the ordinary
+        // exit callback records the now-exited process after this lifecycle
+        // guard is released.
         self.repo.delete(&id).await?;
         *lifecycle = TerminalLifecycleState::Cancelled;
         self.titled.remove(&id);
         self.first_input.remove(&id);
         self.live_capability_leases.remove(&id);
-        if let Some((_, handle)) = self.live.remove(&id) {
-            if let Err(error) = handle.kill() {
-                warn!(terminal_id = id, error = %error, "failed to kill PTY after durable terminal delete");
-            }
-        }
+        self.live.remove(&id);
         self.remove_lifecycle_slot_if_same(&id, &lifecycle_slot);
         // Waiters retain their cloned Arc and therefore still observe Cancelled;
         // release them before invoking arbitrary async delete hooks.
@@ -1711,10 +1842,7 @@ impl TerminalService {
         };
         let (cols, rows) = validate_stored_pty_size(row.cols, row.rows)?;
         let args = crate::types::parse_args(&row.args);
-        let env: Option<HashMap<String, String>> = row
-            .env
-            .as_deref()
-            .and_then(|s| serde_json::from_str(s).ok());
+        let env = process_env_from_persisted(row.env.as_deref());
         // Re-sync knowledge mounts + README on every relaunch: this is the
         // documented moment a binding change (via KnowledgeControl) takes
         // effect for a terminal session.
@@ -1938,8 +2066,9 @@ impl TerminalService {
     ///
     /// MUST be called only on a real quit (desktop tray-quit / `RunEvent::Exit`),
     /// never on close-to-tray —see `apps/desktop/src/main.rs`. Returns the number
-    /// of rows deleted. Best-effort on the PTY kills (a failed kill only warns; the
-    /// OS reaps the tree on process exit anyway).
+    /// of rows deleted. Live process trees are terminated before `delete_all`;
+    /// an explicit kill failure aborts deletion so their durable management
+    /// entries remain available for retry.
     pub async fn shutdown_cleanup(&self) -> Result<u64, TerminalError> {
         self.shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
@@ -1964,8 +2093,31 @@ impl TerminalService {
         // not bypass the same logical-reference hooks as individual delete().
         let deleted_rows = self.repo.list_all().await?;
 
-        // Keep live processes and lifecycle states intact until the durable
-        // delete-all succeeds. On failure the service is reopened unchanged.
+        // Never erase the management rows until every live process tree reports
+        // a successful bounded cleanup. Some earlier handles may already be
+        // stopped if a later one fails, but all rows remain and their queued
+        // exit callbacks make the durable status honest after guards release.
+        let live_handles: Vec<(String, Arc<PtyHandle>)> = self
+            .live
+            .iter()
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect();
+        for (id, handle) in live_handles {
+            self.live_capability_leases.remove(&id);
+            if let Err(error) = handle.kill() {
+                self.shutting_down
+                    .store(false, std::sync::atomic::Ordering::Release);
+                warn!(
+                    terminal_id = id,
+                    error = %error,
+                    "terminal shutdown cleanup aborted before deleting rows"
+                );
+                return Err(error);
+            }
+        }
+
+        // All process trees are proven stopped. On a DB failure the rows remain
+        // available and the service is reopened.
         let n = match self.repo.delete_all().await {
             Ok(n) => n,
             Err(error) => {
@@ -1976,11 +2128,6 @@ impl TerminalService {
         };
         for state in &mut lifecycle_guards {
             **state = TerminalLifecycleState::Cancelled;
-        }
-        for entry in self.live.iter() {
-            if let Err(e) = entry.value().kill() {
-                warn!(terminal_id = *entry.key(), error = %e, "failed to kill PTY during shutdown cleanup");
-            }
         }
         self.live.clear();
         self.live_capability_leases.clear();
@@ -2870,6 +3017,149 @@ mod tests {
             defer_spawn: false,
             knowledge_base_ids: None,
         }
+    }
+
+    #[tokio::test]
+    async fn standalone_create_strips_forged_conversation_owner() {
+        let (svc, _events, repo) = service_with_repo();
+        let forged_owner = ConversationId::new();
+        let mut request = req("unused-deferred-command", &[]);
+        request.defer_spawn = true;
+        request.env = Some(HashMap::from([
+            ("VISIBLE".to_owned(), "yes".to_owned()),
+            (
+                crate::types::OWNER_CONVERSATION_ID_ENV_KEY.to_owned(),
+                forged_owner.to_string(),
+            ),
+        ]));
+
+        let response = svc.create(TEST_USER_ID, request).await.unwrap();
+        assert!(
+            response.owner_conversation_id.is_none(),
+            "ordinary REST/service create must never accept a forged owner"
+        );
+
+        let row = repo
+            .get_by_id(response.terminal_id.as_str())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            terminal_owner_scope(row.env.as_deref()),
+            TerminalOwnerScope::Standalone
+        );
+        let process_env = process_env_from_persisted(row.env.as_deref()).unwrap();
+        assert_eq!(process_env.get("VISIBLE").map(String::as_str), Some("yes"));
+        assert!(
+            !process_env.contains_key(crate::types::OWNER_CONVERSATION_ID_ENV_KEY),
+            "backend owner metadata must never reach the PTY environment"
+        );
+
+        assert_eq!(svc.list(TEST_USER_ID).await.unwrap().len(), 1);
+        assert!(
+            svc.list_for_conversation(TEST_USER_ID, forged_owner.as_str())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_terminals_are_scoped_and_authorized_by_user_and_conversation() {
+        let (svc, _events, _repo) = service_with_repo();
+        let owner_a = ConversationId::new();
+        let owner_b = ConversationId::new();
+
+        let mut standalone_request = req("unused-standalone", &[]);
+        standalone_request.defer_spawn = true;
+        let standalone = svc
+            .create(TEST_USER_ID, standalone_request)
+            .await
+            .unwrap();
+
+        let mut request_a = req("unused-a", &[]);
+        request_a.defer_spawn = true;
+        let terminal_a = svc
+            .create_for_conversation(TEST_USER_ID, owner_a.as_str(), request_a)
+            .await
+            .unwrap();
+        assert_eq!(
+            terminal_a.owner_conversation_id.as_ref(),
+            Some(&owner_a)
+        );
+
+        let mut request_b = req("unused-b", &[]);
+        request_b.defer_spawn = true;
+        let terminal_b = svc
+            .create_for_conversation(TEST_USER_ID, owner_b.as_str(), request_b)
+            .await
+            .unwrap();
+
+        let standalone_items = svc.list(TEST_USER_ID).await.unwrap();
+        assert_eq!(
+            standalone_items
+                .iter()
+                .map(|item| item.terminal_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![standalone.terminal_id.as_str()]
+        );
+        let owner_a_items = svc
+            .list_for_conversation(TEST_USER_ID, owner_a.as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            owner_a_items
+                .iter()
+                .map(|item| item.terminal_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![terminal_a.terminal_id.as_str()]
+        );
+
+        svc.authorize_user(TEST_USER_ID, terminal_a.terminal_id.as_str())
+            .await
+            .unwrap();
+        svc.authorize_conversation(
+            TEST_USER_ID,
+            owner_a.as_str(),
+            terminal_a.terminal_id.as_str(),
+        )
+        .await
+        .unwrap();
+
+        let wrong_user = UserId::new();
+        assert!(matches!(
+            svc.authorize_user(wrong_user.as_str(), terminal_a.terminal_id.as_str())
+                .await,
+            Err(TerminalError::NotFound(_))
+        ));
+        assert!(matches!(
+            svc.authorize_conversation(
+                TEST_USER_ID,
+                owner_b.as_str(),
+                terminal_a.terminal_id.as_str()
+            )
+            .await,
+            Err(TerminalError::NotFound(_))
+        ));
+        assert!(matches!(
+            svc.authorize_conversation(
+                TEST_USER_ID,
+                owner_a.as_str(),
+                standalone.terminal_id.as_str()
+            )
+            .await,
+            Err(TerminalError::NotFound(_))
+        ));
+
+        // Keep the second owner live in the fixture and prove it never leaks
+        // into owner A's collection.
+        assert_eq!(
+            svc.list_for_conversation(TEST_USER_ID, owner_b.as_str())
+                .await
+                .unwrap()[0]
+                .terminal_id,
+            terminal_b.terminal_id
+        );
     }
 
     // --- In-memory knowledge repo + fixture ------------------------------
@@ -3941,14 +4231,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_db_failure_preserves_non_deferred_live_session() {
+    async fn delete_db_failure_preserves_durable_management_row() {
         let (svc, _bc, repo) = service_with_repo();
         let id = svc
             .create(TEST_USER_ID, req("cat", &[]))
             .await
             .unwrap()
             .terminal_id;
-        let old_epoch = svc.live.get(id.as_str()).unwrap().epoch();
         repo.fail_next_delete
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
@@ -3956,17 +4245,58 @@ mod tests {
             svc.delete(&id).await.unwrap_err(),
             TerminalError::Database(_)
         ));
-        assert_eq!(svc.live.get(id.as_str()).unwrap().epoch(), old_epoch);
-        assert_eq!(svc.get(&id).await.unwrap().last_status, "running");
+        assert!(
+            repo.get_by_id(id.as_str()).await.unwrap().is_some(),
+            "a failed durable delete must retain the management row"
+        );
+        assert!(
+            wait_for(|| !svc.live.contains_key(id.as_str()), 2000).await,
+            "the successfully killed process should still complete its exit callback"
+        );
+        assert_eq!(svc.get(&id).await.unwrap().last_status, "exited");
         let slot = svc.lifecycle_slot(&id);
         assert!(matches!(
             *slot.lock().await,
             TerminalLifecycleState::Ready
         ));
-        svc.input(&id, &BASE64.encode("still-alive\n"))
+        // The retained row remains a usable retry entry rather than becoming
+        // an unmanaged process/session orphan.
+        svc.delete(&id).await.unwrap();
+        assert!(repo.get_by_id(id.as_str()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_kill_failure_never_deletes_management_row_or_live_handle() {
+        let (svc, _bc, repo) = service_with_repo();
+        let id = svc
+            .create(TEST_USER_ID, req("cat", &[]))
             .await
-            .unwrap();
-        svc.kill(&id).await.unwrap();
+            .unwrap()
+            .terminal_id;
+        svc.live
+            .get(id.as_str())
+            .expect("live PTY")
+            .fail_next_kill_for_test();
+
+        assert!(matches!(
+            svc.delete(&id).await.unwrap_err(),
+            TerminalError::Spawn(message) if message.contains("injected PTY process-tree kill failure")
+        ));
+        assert!(
+            repo.get_by_id(id.as_str()).await.unwrap().is_some(),
+            "kill failure must happen before and prevent the durable delete"
+        );
+        assert!(
+            svc.live.contains_key(id.as_str()),
+            "the live management handle must remain available for retry"
+        );
+        svc.input(&id, &BASE64.encode("still-managed\n"))
+            .await
+            .expect("the injected failure must not signal the process");
+
+        svc.delete(&id).await.unwrap();
+        assert!(repo.get_by_id(id.as_str()).await.unwrap().is_none());
+        assert!(!svc.live.contains_key(id.as_str()));
     }
 
     #[tokio::test]
@@ -4329,14 +4659,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_db_failure_preserves_live_sessions_and_reopens_gate() {
+    async fn shutdown_db_failure_preserves_rows_and_reopens_gate() {
         let (svc, _bc, repo) = service_with_repo();
         let id = svc
             .create(TEST_USER_ID, req("cat", &[]))
             .await
             .unwrap()
             .terminal_id;
-        let old_epoch = svc.live.get(id.as_str()).unwrap().epoch();
         repo.fail_next_delete_all
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
@@ -4345,8 +4674,15 @@ mod tests {
             TerminalError::Database(_)
         ));
         assert!(!svc.shutting_down.load(std::sync::atomic::Ordering::Acquire));
-        assert_eq!(svc.live.get(id.as_str()).unwrap().epoch(), old_epoch);
-        assert!(svc.get(&id).await.is_ok());
+        assert!(
+            repo.get_by_id(id.as_str()).await.unwrap().is_some(),
+            "delete_all failure must retain every durable management row"
+        );
+        assert!(
+            wait_for(|| !svc.live.contains_key(id.as_str()), 2000).await,
+            "pre-delete process cleanup should finish before a retry"
+        );
+        assert_eq!(svc.get(&id).await.unwrap().last_status, "exited");
 
         let second = svc.create(TEST_USER_ID, req("cat", &[])).await.unwrap().terminal_id;
         assert!(svc.live.contains_key(second.as_str()));
@@ -4811,7 +5147,18 @@ mod tests {
             .env
             .get(K::ENV_CAPABILITY)
             .expect("single capability bootstrap");
-        assert!(bootstrap.contains("\"kb_ids\":[\"kb_") && bootstrap.contains("/workspace"));
+        let bootstrap: serde_json::Value =
+            serde_json::from_str(bootstrap).expect("knowledge capability bootstrap JSON");
+        let scope = &bootstrap["access"]["claims"]["scope"];
+        assert_eq!(scope["workspace_path"], "/workspace");
+        let kb_ids = scope["kb_ids"]
+            .as_array()
+            .expect("knowledge capability kb_ids array");
+        assert_eq!(kb_ids.len(), 2);
+        assert!(kb_ids.iter().all(|id| {
+            id.as_str()
+                .is_some_and(|id| KnowledgeBaseId::parse(id).is_ok())
+        }));
     }
 
     #[tokio::test]

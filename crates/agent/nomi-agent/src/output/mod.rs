@@ -948,6 +948,19 @@ pub fn is_context_only_image_tool(name: &str) -> bool {
 }
 
 /// Abstraction over output channels (terminal vs JSON stream protocol)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallRetryContext {
+    pub retry_group_id: String,
+    pub attempt_no: u32,
+    pub retry_of_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCallExecutionContext {
+    pub input: serde_json::Value,
+    pub retry: ToolCallRetryContext,
+}
+
 pub trait OutputSink: Send + Sync {
     /// Stream text delta from LLM
     fn emit_text_delta(&self, text: &str, msg_id: &str);
@@ -965,6 +978,24 @@ pub trait OutputSink: Send + Sync {
         input: &str,
     ) {
         self.emit_tool_call(tool_use_id, name, input);
+    }
+    /// Publish a committed tool call with durable execution identity. Existing
+    /// sinks remain compatible; structured sinks can override this to persist
+    /// retry grouping without changing terminal/CLI output.
+    fn emit_tool_call_with_context(
+        &self,
+        tool_use_id: &str,
+        name: &str,
+        artifact_identity: &str,
+        input: &str,
+        _context: &ToolCallExecutionContext,
+    ) {
+        self.emit_tool_call_with_artifact_identity(
+            tool_use_id,
+            name,
+            artifact_identity,
+            input,
+        );
     }
     /// Surface non-terminal model activity when the provider stream is still
     /// alive but has not produced a new visible event for a short period.
@@ -1035,6 +1066,28 @@ pub trait OutputSink: Send + Sync {
         images: &[ToolImage],
     ) -> ToolMediaDelivery {
         self.emit_tool_result_with_images(tool_use_id, name, is_error, content, images)
+    }
+    /// Deliver a result with the same immutable execution identity used for
+    /// the Running event. This is also used for pre-dispatch validation errors,
+    /// where no Running event was emitted.
+    fn emit_tool_result_with_images_and_context(
+        &self,
+        tool_use_id: &str,
+        name: &str,
+        artifact_identity: &str,
+        is_error: bool,
+        content: &str,
+        images: &[ToolImage],
+        _context: &ToolCallExecutionContext,
+    ) -> ToolMediaDelivery {
+        self.emit_tool_result_with_images_and_artifact_identity(
+            tool_use_id,
+            name,
+            artifact_identity,
+            is_error,
+            content,
+            images,
+        )
     }
     /// Signal start of a new message stream
     fn emit_stream_start(&self, msg_id: &str);

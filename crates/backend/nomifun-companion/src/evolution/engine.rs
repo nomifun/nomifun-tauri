@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use nomifun_common::{AppError, generate_id, now_ms};
+use nomifun_common::{AppError, CompanionSkillId, generate_id, now_ms};
 use nomifun_extension::constants::SKILL_MANIFEST_FILE;
 use nomifun_extension::skill_service::{self, SkillDraftInput, SkillPaths, SkillScope};
 use tokio::sync::Mutex;
@@ -392,7 +392,7 @@ impl EvolutionEngine {
         }
         let now = now_ms();
         let skill = CompanionSkill {
-            companion_skill_id: nomifun_common::generate_id(),
+            companion_skill_id: CompanionSkillId::new().into_string(),
             skill_name: name.clone(),
             scope_kind: "companion".into(),
             scope_companion_id: Some(owner.to_owned()),
@@ -525,7 +525,7 @@ impl EvolutionEngine {
         if let Err(error) = self
             .store
             .insert_skill(&CompanionSkill {
-                companion_skill_id: nomifun_common::generate_id(),
+                companion_skill_id: CompanionSkillId::new().into_string(),
                 skill_name: name.clone(),
                 scope_kind: "companion".into(),
                 scope_companion_id: Some(owner.to_owned()),

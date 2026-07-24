@@ -29,6 +29,12 @@ const OUTPUT_BROADCAST_CAP: usize = 512;
 /// the ConPTY master does not reach EOF on child exit).
 const EXIT_DRAIN_GRACE: Duration = Duration::from_millis(120);
 
+/// Upper bound for proving that a Windows PTY's whole process Job is empty.
+/// Close/delete must never block forever; a timeout is surfaced so the service
+/// can retain the durable management row for a later retry.
+#[cfg(windows)]
+const PROCESS_TREE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A live PTY: master handle + writer + child + scrollback.
 pub struct PtyHandle {
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -36,6 +42,11 @@ pub struct PtyHandle {
     /// A killer split from the child (via `clone_killer`) so `kill()` can signal
     /// the process while the waiter thread is parked in the blocking `wait()`.
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
+    /// Owns the full Windows descendant tree. `portable-pty`'s killer only
+    /// targets the direct child, while this kill-on-close Job provides bounded
+    /// terminate + reap semantics for every process in the PTY epoch.
+    #[cfg(windows)]
+    process_tree: Arc<nomi_process_runtime::WindowsProcessJob>,
     scrollback: Arc<Mutex<Vec<u8>>>,
     /// Set whenever new bytes land in `scrollback`, cleared by
     /// [`take_dirty_scrollback`]. Lets the debounced persistence flusher skip
@@ -49,6 +60,10 @@ pub struct PtyHandle {
     /// (portable-pty calls `setsid()` on the slave), so this is also the
     /// process-group id used to kill the whole tree.
     pid: Option<u32>,
+    /// Deterministic service-ordering test seam. Production builds have no
+    /// synthetic failure state.
+    #[cfg(test)]
+    fail_next_kill: AtomicBool,
     /// Monotonic spawn generation, assigned by the service. The exit callback
     /// only tears the session down if this epoch is still the live one for the
     /// id — a relaunch kills the old child then immediately spawns a
@@ -132,38 +147,83 @@ impl PtyHandle {
             cmd.env(k, v);
         }
 
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| TerminalError::Spawn(format!("spawn '{}': {e}", params.program)))?;
+        let pid = child.process_id();
+        #[cfg(windows)]
+        let process_tree = {
+            let pid = match pid {
+                Some(pid) => pid,
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(TerminalError::Spawn(format!(
+                        "spawn '{}': child process id is unavailable",
+                        params.program
+                    )));
+                }
+            };
+            match nomi_process_runtime::WindowsProcessJob::attach(pid) {
+                Ok(job) => job,
+                Err(error) => {
+                    // Never return a live, unowned Windows child when Job
+                    // assignment fails. The row remains available for retry.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(TerminalError::Spawn(format!(
+                        "attach '{}' (pid {pid}) to process Job: {error}",
+                        params.program
+                    )));
+                }
+            }
+        };
         // Drop the slave so the master sees EOF when the child exits.
         drop(pair.slave);
 
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| TerminalError::Spawn(format!("take_writer: {e}")))?;
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| TerminalError::Spawn(format!("clone_reader: {e}")))?;
+        let writer = match pair.master.take_writer() {
+            Ok(writer) => writer,
+            Err(error) => {
+                #[cfg(windows)]
+                let _ = process_tree.terminate_and_wait(PROCESS_TREE_CLEANUP_TIMEOUT);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(TerminalError::Spawn(format!("take_writer: {error}")));
+            }
+        };
+        let mut reader = match pair.master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(error) => {
+                #[cfg(windows)]
+                let _ = process_tree.terminate_and_wait(PROCESS_TREE_CLEANUP_TIMEOUT);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(TerminalError::Spawn(format!("clone_reader: {error}")));
+            }
+        };
 
         let scrollback = Arc::new(Mutex::new(Vec::<u8>::new()));
         let dirty = Arc::new(AtomicBool::new(false));
-        let pid = child.process_id();
         let (out_tx, _) = broadcast::channel::<Vec<u8>>(OUTPUT_BROADCAST_CAP);
         // Split a killer off the child so `kill()` can signal the process while
         // the waiter thread below is parked in the blocking `child.wait()`.
         let killer = child.clone_killer();
+        #[cfg(windows)]
+        let process_tree = Arc::new(process_tree);
 
         let handle = Arc::new(PtyHandle {
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
             killer: Mutex::new(killer),
+            #[cfg(windows)]
+            process_tree: Arc::clone(&process_tree),
             scrollback: scrollback.clone(),
             dirty: dirty.clone(),
             out_tx: out_tx.clone(),
             pid,
+            #[cfg(test)]
+            fail_next_kill: AtomicBool::new(false),
             epoch,
         });
 
@@ -198,9 +258,21 @@ impl PtyHandle {
         // EOF would never fire on Windows ConPTY (the master stays open after
         // the child dies).
         let scrollback_waiter = scrollback.clone();
+        #[cfg(windows)]
+        let process_tree_waiter = Arc::clone(&process_tree);
         std::thread::spawn(move || {
             let mut child = child;
             let code = child.wait().ok().map(|status| status.exit_code() as i32);
+            #[cfg(windows)]
+            if let Err(error) =
+                process_tree_waiter.terminate_and_wait(PROCESS_TREE_CLEANUP_TIMEOUT)
+            {
+                tracing::warn!(
+                    pid,
+                    %error,
+                    "PTY child exited but its Windows process Job could not be proven empty"
+                );
+            }
             // Brief grace so the reader can drain output still buffered in the
             // PTY before the caller tears the session down on this signal.
             std::thread::sleep(EXIT_DRAIN_GRACE);
@@ -243,18 +315,55 @@ impl PtyHandle {
     /// with `setsid()`), so on Unix we additionally SIGKILL the whole process
     /// group via the negative pid to reap the entire tree.
     pub fn kill(&self) -> Result<(), TerminalError> {
-        #[cfg(unix)]
-        if let Some(pid) = self.pid {
-            // Negative pid → signal the process group led by `pid`.
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
+        #[cfg(test)]
+        if self.fail_next_kill.swap(false, Ordering::SeqCst) {
+            return Err(TerminalError::Spawn(
+                "injected PTY process-tree kill failure".to_owned(),
+            ));
         }
-        // Best-effort direct kill too (covers the non-group / Windows path).
-        // Uses the split killer, which works even while the waiter thread is
-        // blocked in `child.wait()`.
-        let _ = self.killer.lock().expect("pty killer lock").kill();
-        Ok(())
+
+        #[cfg(windows)]
+        {
+            if let Err(tree_error) = self
+                .process_tree
+                .terminate_and_wait(PROCESS_TREE_CLEANUP_TIMEOUT)
+            {
+                // Still try the portable direct-child path, but never turn that
+                // fallback into false success: descendants may remain alive.
+                let direct_error = self
+                    .killer
+                    .lock()
+                    .expect("pty killer lock")
+                    .kill()
+                    .err();
+                return Err(TerminalError::Spawn(match direct_error {
+                    Some(direct_error) => format!(
+                        "failed to terminate Windows PTY process tree: {tree_error}; \
+                         direct-child fallback also failed: {direct_error}"
+                    ),
+                    None => format!(
+                        "failed to prove Windows PTY process-tree cleanup: {tree_error}; \
+                         direct child was signalled but descendants may remain"
+                    ),
+                }));
+            }
+            return Ok(());
+        }
+
+        #[cfg(not(windows))]
+        {
+            #[cfg(unix)]
+            if let Some(pid) = self.pid {
+                // Negative pid -> signal the process group led by `pid`.
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            }
+            // Best-effort direct kill too for a process that escaped the group.
+            // Preserve the established Unix behavior.
+            let _ = self.killer.lock().expect("pty killer lock").kill();
+            Ok(())
+        }
     }
 
     /// Snapshot of the current scrollback bytes (for reconnect).
@@ -293,6 +402,11 @@ impl PtyHandle {
     /// service to ignore a stale exit callback from a relaunched-over PTY.
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_kill_for_test(&self) {
+        self.fail_next_kill.store(true, Ordering::SeqCst);
     }
 }
 
@@ -506,5 +620,117 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert!(gone, "kill() should terminate the child and trigger on_exit");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn kill_terminates_windows_descendant_job_before_returning() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Instant;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let gate_path = temp.path().join("spawn-child.gate");
+        let pid_path = temp.path().join("descendant.pid");
+        let quote = |path: &std::path::Path| path.display().to_string().replace('\'', "''");
+        let powershell = std::path::PathBuf::from(
+            std::env::var_os("SystemRoot").expect("SystemRoot"),
+        )
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe");
+        let script = format!(
+            "while (-not (Test-Path -LiteralPath '{}')) {{ \
+                 Start-Sleep -Milliseconds 10 \
+             }}; \
+             $child = Start-Process -FilePath $env:ComSpec \
+                 -ArgumentList '/d','/c','ping.exe -n 61 127.0.0.1 > NUL' \
+                 -WindowStyle Hidden -PassThru; \
+             [System.IO.File]::WriteAllText('{}', [string]$child.Id); \
+             Wait-Process -Id $child.Id",
+            quote(&gate_path),
+            quote(&pid_path)
+        );
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_cb = Arc::clone(&exited);
+        let handle = PtyHandle::spawn(
+            SpawnParams {
+                program: powershell.display().to_string(),
+                args: vec![
+                    "-NoLogo".to_owned(),
+                    "-NoProfile".to_owned(),
+                    "-NonInteractive".to_owned(),
+                    "-Command".to_owned(),
+                    script,
+                ],
+                cwd: temp.path().display().to_string(),
+                env: HashMap::new(),
+                cols: 80,
+                rows: 24,
+            },
+            0,
+            |_chunk| {},
+            move |_code, _sb| exited_cb.store(true, Ordering::SeqCst),
+        )
+        .expect("spawn PowerShell PTY in a process Job");
+
+        // The gate makes descendant creation happen strictly after
+        // `PtyHandle::spawn` has attached the PowerShell leader to its Job.
+        std::fs::write(&gate_path, b"go").expect("open descendant gate");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let descendant_pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_path)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PowerShell did not publish its descendant pid"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        assert!(
+            windows_process_exists(&powershell, descendant_pid),
+            "descendant should be alive before terminal close"
+        );
+        let started = Instant::now();
+        handle
+            .kill()
+            .expect("terminate and reap the entire Windows process Job");
+        assert!(
+            started.elapsed() < PROCESS_TREE_CLEANUP_TIMEOUT + Duration::from_secs(1),
+            "process-tree cleanup exceeded its bounded wait"
+        );
+        assert!(
+            !windows_process_exists(&powershell, descendant_pid),
+            "kill must not return while a descendant remains alive"
+        );
+
+        for _ in 0..250 {
+            if exited.load(Ordering::SeqCst) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("process-tree kill should trigger the PTY exit callback");
+    }
+
+    #[cfg(windows)]
+    fn windows_process_exists(powershell: &std::path::Path, pid: u32) -> bool {
+        std::process::Command::new(powershell)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) \
+                     {{ exit 0 }} else {{ exit 1 }}"
+                ),
+            ])
+            .status()
+            .is_ok_and(|status| status.success())
     }
 }

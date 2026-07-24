@@ -43,8 +43,9 @@ use windows_sys::Win32::{
         Threading::{
             CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
             CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess,
-            OpenThread, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-            STARTUPINFOEXW, THREAD_SUSPEND_RESUME, TerminateProcess, WaitForSingleObject,
+            OpenProcess, OpenThread, PROCESS_INFORMATION, PROCESS_SET_QUOTA, PROCESS_SYNCHRONIZE,
+            PROCESS_TERMINATE, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+            THREAD_SUSPEND_RESUME, TerminateProcess, WaitForSingleObject,
         },
     },
 };
@@ -68,6 +69,80 @@ const WRITE_CHUNK_BYTES: usize = 64 * 1024;
 const LIFECYCLE_WAIT_HORIZON: Duration = Duration::from_secs(60 * 60 * 24 * 365);
 const MAX_COMMAND_LINE_UNITS: usize = 32_767;
 const TERMINATED_BY_HOST_EXIT_CODE: u32 = 0xC000_013A;
+
+/// Owns a kill-on-close Windows Job attached to an already-started process.
+///
+/// The guard retains both the exact process handle and the Job handle. Dropping
+/// it closes the Job and therefore terminates any remaining Job members.
+pub struct WindowsProcessJob {
+    process: OwnedHandle,
+    job: JobControl,
+}
+
+impl WindowsProcessJob {
+    /// Opens `pid` and assigns the process to a fresh kill-on-close Job.
+    ///
+    /// Only the rights required for Job assignment, Job termination, and exact
+    /// process waiting are requested from `OpenProcess`.
+    pub fn attach(pid: u32) -> io::Result<Self> {
+        if pid == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot attach a process Job to PID 0",
+            ));
+        }
+
+        // SAFETY: OpenProcess validates the PID and returns a fresh,
+        // non-inheritable exact process handle on success.
+        let process = unsafe {
+            OpenProcess(
+                PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        // SAFETY: a non-null OpenProcess result is a fresh owned handle.
+        let process = unsafe { OwnedHandle::from_raw(process) }.map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("open process {pid} for Job attachment: {error}"),
+            )
+        })?;
+        let job = JobControl::new(create_process_job()?);
+        let job_handle = job
+            .raw_handle()
+            .ok_or_else(|| io::Error::other("new process Job closed before assignment"))?;
+
+        // SAFETY: both handles remain live for the duration of this call and
+        // the requested process rights permit Job assignment.
+        if unsafe { AssignProcessToJobObject(job_handle, process.as_raw()) } == 0 {
+            let error = io::Error::last_os_error();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("assign process {pid} to process Job: {error}"),
+            ));
+        }
+
+        Ok(Self { process, job })
+    }
+
+    /// Terminates all Job members and proves both exact-process exit and empty
+    /// Job membership before returning.
+    ///
+    /// All waits share one deadline, so the total waiting time is bounded by
+    /// `timeout`. A timeout leaves the guard armed; dropping it still closes
+    /// the kill-on-close Job.
+    pub fn terminate_and_wait(&self, timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "timeout is too large"))?;
+
+        self.job.terminate()?;
+        wait_handle_until(self.process.as_raw(), deadline)?;
+        self.job.wait_empty_until(deadline)?;
+        self.job.close_proven_empty()
+    }
+}
 
 pub(super) async fn spawn_pipe(
     request: NormalizedProcessRequest,
@@ -2369,6 +2444,15 @@ mod tests {
         Created,
         Assigned,
         Resumed,
+    }
+
+    #[test]
+    fn process_job_rejects_zero_pid_without_opening_a_process() {
+        let error = match WindowsProcessJob::attach(0) {
+            Ok(_) => panic!("PID 0 must be rejected before OpenProcess is attempted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]

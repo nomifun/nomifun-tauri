@@ -2285,6 +2285,11 @@ export interface ICreateCronJobParams {
 export interface ITerminalSession {
   /** Canonical terminal entity id on the wire. */
   terminal_id: TerminalId;
+  /**
+   * Conversation that owns an agent-created terminal. Absent for standalone
+   * terminals created explicitly by the user.
+   */
+  owner_conversation_id?: ConversationId;
   name: string;
   cwd: string;
   /** 派生字段（不落库）：cwd 等于或位于默认工作路径之下 / Derived: cwd equals or sits under the backend default work dir. */
@@ -2347,18 +2352,26 @@ export interface IKnowledgeGlobalRegistrationStatus {
   gemini: boolean | null;
 }
 
-type ApiTerminalSession = Omit<ITerminalSession, 'terminal_id'> & {
+type ApiTerminalSession = Omit<ITerminalSession, 'terminal_id' | 'owner_conversation_id'> & {
   terminal_id: unknown;
+  owner_conversation_id?: unknown;
 };
 
 const fromApiTerminalSession = (raw: ApiTerminalSession): ITerminalSession => ({
   ...raw,
   terminal_id: parseTerminalId(raw.terminal_id),
+  owner_conversation_id: parseOptionalEntityId('conversation', raw.owner_conversation_id),
 });
 
 export const terminal = {
   list: withResponseMap(
     httpGet<ApiTerminalSession[], void>('/api/terminals'),
+    (items) => items.map(fromApiTerminalSession),
+  ),
+  listConversation: withResponseMap(
+    httpGet<ApiTerminalSession[], { conversation_id: ConversationId }>(
+      (p) => `/api/conversations/${p.conversation_id}/terminals`,
+    ),
     (items) => items.map(fromApiTerminalSession),
   ),
   get: withResponseMap(

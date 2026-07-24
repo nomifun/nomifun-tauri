@@ -408,6 +408,7 @@ fn generic_completed_artifact_contract_fails(message: &MessageResponse) -> bool 
         output: None,
         description: None,
         artifacts,
+        retry: None,
     };
     validate_completed_artifact_contract(&data).is_err()
 }
@@ -483,6 +484,7 @@ fn acp_completed_artifact_contract_fails(message: &MessageResponse) -> bool {
             output: None,
             description: None,
             artifacts: artifacts.clone(),
+            retry: None,
         })
         .is_err()
     })
@@ -526,6 +528,7 @@ fn tool_group_completed_artifact_contract_fails(message: &MessageResponse) -> bo
             output: None,
             description: None,
             artifacts: Vec::new(),
+            retry: None,
         })
         .is_err()
     })
@@ -605,6 +608,7 @@ fn invalidate_historical_artifact_projection(message: &mut MessageResponse) {
                     output: None,
                     description: None,
                     artifacts: Vec::new(),
+                    retry: None,
                 })
                 .is_err();
                 if !requires_artifact {
@@ -1275,7 +1279,8 @@ mod tests {
         let conversation_id = ConversationId::new().into_string();
         let cron_job_id = nomifun_common::CronJobId::new().into_string();
         let row = ConversationArtifactRow {
-            conversation_artifact_id: nomifun_common::generate_id(),
+            conversation_artifact_id:
+                nomifun_common::ConversationArtifactId::new().into_string(),
             conversation_id,
             cron_job_id: Some(cron_job_id.clone()),
             kind: "cron_trigger".into(),
@@ -1304,7 +1309,8 @@ mod tests {
         let conversation_id = ConversationId::new().into_string();
         let cron_job_id = CronJobId::new().into_string();
         let row = ConversationArtifactRow {
-            conversation_artifact_id: nomifun_common::generate_id(),
+            conversation_artifact_id:
+                nomifun_common::ConversationArtifactId::new().into_string(),
             conversation_id,
             cron_job_id: None,
             kind: "cron_trigger".into(),
