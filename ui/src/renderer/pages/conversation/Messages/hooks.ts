@@ -1123,6 +1123,18 @@ export const useMessageLstCache = (key: ConversationId, opts?: { windowed?: bool
     });
   }, [key, loadMessages]);
 
+  // Knowledge write-back finishes after the turn and WebSocket delivery has no
+  // replay. Reload the durable projection after reconnect so a frame lost while
+  // offline cannot leave the message stuck at "writing".
+  useEffect(() => {
+    if (!key) return;
+    return ipcBridge.conversation.reconnected.on(() => {
+      void loadMessages().catch((error) => {
+        console.warn('[useMessageLstCache] Failed to refresh messages after WebSocket reconnect:', error);
+      });
+    });
+  }, [key, loadMessages]);
+
   return { loadOlder, hasMore, loadingOlder };
 };
 

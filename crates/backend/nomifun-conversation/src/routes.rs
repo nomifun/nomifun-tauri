@@ -42,6 +42,10 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
             post(edit_resubmit),
         )
         .route(
+            "/api/conversations/{conversation_id}/messages/{message_id}/knowledge-writeback/retry",
+            post(retry_knowledge_writeback),
+        )
+        .route(
             "/api/conversations/{conversation_id}/artifacts",
             get(list_artifacts),
         )
@@ -245,6 +249,11 @@ struct MessagePathParams {
     message_id: MessageId,
 }
 
+#[derive(serde::Deserialize)]
+struct RetryKnowledgeWritebackRequest {
+    attempt_id: String,
+}
+
 async fn get_msg(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
@@ -282,6 +291,25 @@ async fn edit_resubmit(
         StatusCode::ACCEPTED,
         Json(ApiResponse::ok(SendMessageResponse { msg_id })),
     ))
+}
+
+async fn retry_knowledge_writeback(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<MessagePathParams>,
+    body: Result<Json<RetryKnowledgeWritebackRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<()>>), AppError> {
+    let Json(req) = body.map_err(|error| AppError::BadRequest(error.to_string()))?;
+    state
+        .service
+        .retry_knowledge_writeback(
+            &user.id,
+            params.conversation_id.as_str(),
+            params.message_id.as_str(),
+            &req.attempt_id,
+        )
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(ApiResponse::ok(()))))
 }
 
 async fn send_msg(

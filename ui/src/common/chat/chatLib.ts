@@ -136,6 +136,7 @@ export type KnowledgeWritebackFailure = {
 export type KnowledgeWritebackState = {
   status: KnowledgeWritebackStatus;
   attempt_id?: string;
+  attempt_generation?: number;
   started_at?: number;
   updated_at?: number;
   finished_at?: number | null;
@@ -490,6 +491,9 @@ export const normalizeKnowledgeWritebackState = (value: unknown): KnowledgeWrite
   return {
     status: value.status as KnowledgeWritebackStatus,
     ...(typeof value.attempt_id === 'string' ? { attempt_id: value.attempt_id } : {}),
+    ...(Number.isSafeInteger(value.attempt_generation) && (value.attempt_generation as number) >= 0
+      ? { attempt_generation: value.attempt_generation as number }
+      : {}),
     ...(typeof value.started_at === 'number' ? { started_at: value.started_at } : {}),
     ...(typeof value.updated_at === 'number' ? { updated_at: value.updated_at } : {}),
     ...(typeof value.finished_at === 'number' || value.finished_at === null ? { finished_at: value.finished_at } : {}),
@@ -506,12 +510,78 @@ const knowledgeWritebackTime = (state: KnowledgeWritebackState | undefined): num
   return state.updated_at ?? state.finished_at ?? state.interrupted_at ?? state.started_at;
 };
 
-const preferKnowledgeWritebackState = (
+const RUNNING_KNOWLEDGE_WRITEBACK_STATUSES = new Set<KnowledgeWritebackStatus>([
+  'started',
+  'extracting',
+  'writing',
+]);
+
+const TERMINAL_KNOWLEDGE_WRITEBACK_STATUSES = new Set<KnowledgeWritebackStatus>([
+  'written',
+  'partial',
+  'failed',
+  'no_candidate',
+  'no_completer',
+  'disabled',
+  'interrupted',
+]);
+
+export const preferKnowledgeWritebackState = (
   existing: KnowledgeWritebackState | undefined,
   incoming: KnowledgeWritebackState | undefined
 ): KnowledgeWritebackState | undefined => {
   if (!existing) return incoming;
   if (!incoming) return existing;
+
+  const existingAttempt = existing.attempt_id;
+  const incomingAttempt = incoming.attempt_id;
+
+  // An identified attempt is authoritative over a legacy/unidentified state.
+  // This also prevents an old persisted projection from replacing the first
+  // frame of a manual retry.
+  if (existingAttempt && !incomingAttempt) return existing;
+  if (!existingAttempt && incomingAttempt) return incoming;
+
+  if (existingAttempt && incomingAttempt && existingAttempt !== incomingAttempt) {
+    const existingGeneration = existing.attempt_generation;
+    const incomingGeneration = incoming.attempt_generation;
+    if (existingGeneration !== undefined || incomingGeneration !== undefined) {
+      if (existingGeneration === undefined) return incoming;
+      if (incomingGeneration === undefined) return existing;
+      if (incomingGeneration !== existingGeneration) {
+        return incomingGeneration > existingGeneration ? incoming : existing;
+      }
+    }
+    // Attempt IDs are opaque; started_at is the generation ordering contract.
+    // Fall back to each attempt's best event timestamp only for legacy frames
+    // that omitted started_at.
+    const existingStarted = existing.started_at ?? knowledgeWritebackTime(existing);
+    const incomingStarted = incoming.started_at ?? knowledgeWritebackTime(incoming);
+    if (existingStarted === undefined && incomingStarted === undefined) return incoming;
+    if (existingStarted === undefined) return incoming;
+    if (incomingStarted === undefined) return existing;
+    if (incomingStarted !== existingStarted) {
+      return incomingStarted > existingStarted ? incoming : existing;
+    }
+    const existingTime = knowledgeWritebackTime(existing);
+    const incomingTime = knowledgeWritebackTime(incoming);
+    if (existingTime === undefined && incomingTime === undefined) return incoming;
+    if (existingTime === undefined) return incoming;
+    if (incomingTime === undefined) return existing;
+    return incomingTime >= existingTime ? incoming : existing;
+  }
+
+  // Within one attempt, terminal states are monotonic. A delayed extracting or
+  // writing frame must never resurrect a completed/failed attempt.
+  const existingTerminal = TERMINAL_KNOWLEDGE_WRITEBACK_STATUSES.has(existing.status);
+  const incomingTerminal = TERMINAL_KNOWLEDGE_WRITEBACK_STATUSES.has(incoming.status);
+  if (existingTerminal && RUNNING_KNOWLEDGE_WRITEBACK_STATUSES.has(incoming.status)) {
+    return existing;
+  }
+  if (incomingTerminal && RUNNING_KNOWLEDGE_WRITEBACK_STATUSES.has(existing.status)) {
+    return incoming;
+  }
+
   const existingTime = knowledgeWritebackTime(existing);
   const incomingTime = knowledgeWritebackTime(incoming);
   if (existingTime === undefined && incomingTime === undefined) return incoming;
@@ -1415,6 +1485,7 @@ export const transformKnowledgeWritebackEvent = (event: IKnowledgeWritebackEvent
       knowledge_writeback: {
         status: event.status,
         attempt_id: event.attempt_id,
+        attempt_generation: event.attempt_generation,
         started_at: event.started_at,
         updated_at: event.updated_at,
         finished_at: event.finished_at,

@@ -1,19 +1,21 @@
 //! Platform-aware mount engine: materializes knowledge bases inside a
 //! workspace at `.nomi/knowledge/{link_name}` using NTFS junctions on
 //! Windows (no privilege required), symlinks on Unix, and a recursive copy
-//! as last-resort fallback (same degradation strategy as the skill linker in
-//! `nomifun-extension`).
+//! is intentionally not used as a fallback: a detached copy would look
+//! writable to the agent while silently diverging from the real knowledge
+//! base.
 //!
 //! The mount directory is wholly owned by this module: anything inside it
 //! that is not in the desired set (or in [`MANAGED_KEEP`]) gets removed on
-//! the next sync. Targets are never touched — removal only deletes the link
-//! (or the fallback copy). Sibling `.nomi/` trees (`.nomi/skills`, …) are
+//! the next sync. Targets are never touched — removal only deletes the link.
+//! Sibling `.nomi/` trees (`.nomi/skills`, …) are
 //! never touched either.
 
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::service::portable_path_component_identity;
 use crate::KB_MOUNT_REL_DIR;
 
 /// One desired mount: `{workspace}/.nomi/knowledge/{link_name}` → `target`.
@@ -49,13 +51,21 @@ fn sync_mounts_blocking(workspace: &Path, specs: &[MountSpec]) -> Vec<String> {
 
 fn sync_mounts_inner(workspace: &Path, specs: &[MountSpec]) -> Vec<String> {
     let mount_root = workspace.join(KB_MOUNT_REL_DIR);
+    if let Err(error) = prepare_mount_root(workspace, &mount_root, !specs.is_empty()) {
+        tracing::warn!(
+            path = %mount_root.display(),
+            %error,
+            "knowledge mount root is unavailable or unsafe; skipping sync"
+        );
+        return Vec::new();
+    }
 
     if specs.is_empty() {
         // Nothing should be mounted: clear our directory if it exists, then
         // try to remove the (now empty) scaffolding. The parent `.nomi/` is
         // only removed when empty — sibling trees keep it alive. Errors are
         // non-fatal.
-        if mount_root.exists() {
+        if std::fs::symlink_metadata(&mount_root).is_ok() {
             if let Ok(entries) = std::fs::read_dir(&mount_root) {
                 for entry in entries.flatten() {
                     remove_mount_entry(&entry.path());
@@ -66,11 +76,6 @@ fn sync_mounts_inner(workspace: &Path, specs: &[MountSpec]) -> Vec<String> {
                 let _ = std::fs::remove_dir(parent);
             }
         }
-        return Vec::new();
-    }
-
-    if let Err(e) = std::fs::create_dir_all(&mount_root) {
-        tracing::warn!(path = %mount_root.display(), error = %e, "failed to create knowledge mount dir");
         return Vec::new();
     }
 
@@ -86,28 +91,39 @@ fn sync_mounts_inner(workspace: &Path, specs: &[MountSpec]) -> Vec<String> {
         }
     }
 
-    let desired: HashMap<&str, &MountSpec> = specs.iter().map(|s| (s.link_name.as_str(), s)).collect();
+    let desired: HashMap<String, &MountSpec> = specs
+        .iter()
+        .map(|spec| {
+            (
+                portable_path_component_identity(&spec.link_name),
+                spec,
+            )
+        })
+        .collect();
 
     // Pass 1: drop stale entries and stale links whose target changed.
     if let Ok(entries) = std::fs::read_dir(&mount_root) {
         for entry in entries.flatten() {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            if MANAGED_KEEP.contains(&name.as_str()) {
+            let identity = portable_path_component_identity(&name);
+            if MANAGED_KEEP.iter().any(|kept| {
+                portable_path_component_identity(kept) == identity
+            }) {
                 continue;
             }
-            match desired.get(name.as_str()) {
+            match desired.get(&identity) {
                 None => remove_mount_entry(&path),
                 Some(spec) => {
-                    if let Some(current) = read_link_target(&path)
-                        && current != spec.target
+                    if !spec.target.is_dir()
+                        || name != spec.link_name
+                        || read_link_target(&path)
+                            .is_some_and(|current| current != spec.target)
                     {
                         remove_mount_entry(&path);
                     }
-                    // A non-link entry (copy fallback) is left in place: we
-                    // cannot cheaply verify it, and re-copying every session
-                    // start would be wasteful. It gets refreshed whenever the
-                    // base set changes its name (different link_name).
+                    // A non-link entry is left in place only when it matches a
+                    // desired name. New syncs never create such entries.
                 }
             }
         }
@@ -117,16 +133,16 @@ fn sync_mounts_inner(workspace: &Path, specs: &[MountSpec]) -> Vec<String> {
     let mut present = Vec::new();
     for spec in specs {
         let link = mount_root.join(&spec.link_name);
-        if link.exists() || read_link_target(&link).is_some() {
-            present.push(spec.link_name.clone());
-            continue;
-        }
         if !spec.target.is_dir() {
             tracing::warn!(
                 target = %spec.target.display(),
                 name = %spec.link_name,
                 "knowledge base root missing; skipping mount"
             );
+            continue;
+        }
+        if link.exists() || read_link_target(&link).is_some() {
+            present.push(spec.link_name.clone());
             continue;
         }
         match create_link(&spec.target, &link) {
@@ -137,14 +153,8 @@ fn sync_mounts_inner(workspace: &Path, specs: &[MountSpec]) -> Vec<String> {
                     link = %link.display(),
                     error = %e,
                     raw_os_error = ?e.raw_os_error(),
-                    "knowledge link failed; falling back to copy"
+                    "knowledge link failed; skipping mount to avoid a stale writable copy"
                 );
-                match copy_dir_recursive(&spec.target, &link) {
-                    Ok(()) => present.push(spec.link_name.clone()),
-                    Err(e) => {
-                        tracing::warn!(link = %link.display(), error = %e, "knowledge copy fallback failed");
-                    }
-                }
             }
         }
     }
@@ -153,12 +163,21 @@ fn sync_mounts_inner(workspace: &Path, specs: &[MountSpec]) -> Vec<String> {
 
 /// Remove one entry inside the mount dir without ever touching the link
 /// target's contents: junctions/symlinks are removed as links; plain
-/// directories (copy fallback leftovers) are removed recursively — they are
-/// copies we created, never user originals.
+/// directories are legacy copy-fallback leftovers owned by this mount root.
 fn remove_mount_entry(path: &Path) {
-    let result = if read_link_target(path).is_some() {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "failed to inspect stale knowledge mount entry");
+            return;
+        }
+    };
+    let result = if metadata.file_type().is_symlink()
+        || read_link_target(path).is_some()
+    {
         remove_link_entry(path)
-    } else if path.is_dir() {
+    } else if metadata.is_dir() {
         std::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)
@@ -166,6 +185,67 @@ fn remove_mount_entry(path: &Path) {
     if let Err(e) = result {
         tracing::warn!(path = %path.display(), error = %e, "failed to remove stale knowledge mount entry");
     }
+}
+
+/// Validate/create `.nomi/knowledge` one component at a time without ever
+/// traversing an existing symlink or junction. `create_dir_all` and
+/// `Path::exists` both follow links and would let a hostile workspace redirect
+/// the stale-entry sweep outside the workspace.
+fn prepare_mount_root(
+    workspace: &Path,
+    mount_root: &Path,
+    create: bool,
+) -> io::Result<()> {
+    let nomi_root = mount_root.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "mount root has no parent")
+    })?;
+    for path in [nomi_root, mount_root] {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink()
+                    || read_link_target(path).is_some()
+                    || !metadata.is_dir()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "mount path must be a real directory: {}",
+                            path.display()
+                        ),
+                    ));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if !create {
+                    return Ok(());
+                }
+                std::fs::create_dir(path)?;
+                let metadata = std::fs::symlink_metadata(path)?;
+                if metadata.file_type().is_symlink()
+                    || read_link_target(path).is_some()
+                    || !metadata.is_dir()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "created mount path is not a real directory: {}",
+                            path.display()
+                        ),
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    // `workspace/.nomi` can only be created safely when the workspace exists;
+    // surface a clearer error than `create_dir`'s parent-not-found case.
+    if !workspace.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("workspace directory does not exist: {}", workspace.display()),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -209,27 +289,6 @@ fn create_link(src: &Path, dst: &Path) -> io::Result<()> {
     // Junctions work without SeCreateSymbolicLink (Developer Mode/Admin),
     // which most users don't have — mirrors the skill linker's rationale.
     junction::create(src, dst)
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in walkdir::WalkDir::new(src).min_depth(1) {
-        let entry = entry.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let rel = entry
-            .path()
-            .strip_prefix(src)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let to = dst.join(rel);
-        if entry.file_type().is_dir() {
-            std::fs::create_dir_all(&to)?;
-        } else if entry.file_type().is_file() {
-            if let Some(parent) = to.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::copy(entry.path(), &to)?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -310,6 +369,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn portable_writeback_missing_target_is_not_reported_as_mounted() {
+        let bases = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let target = make_base(&bases, "gone");
+        let spec = MountSpec {
+            link_name: "Gone".into(),
+            target: target.clone(),
+        };
+        assert_eq!(
+            sync_mounts(ws.path(), vec![spec.clone()]).await,
+            vec!["Gone"]
+        );
+
+        std::fs::remove_dir_all(&target).unwrap();
+        let present = sync_mounts(ws.path(), vec![spec]).await;
+
+        assert!(present.is_empty());
+        assert!(
+            !ws.path().join(KB_MOUNT_REL_DIR).join("Gone").exists()
+                && read_link_target(
+                    &ws.path().join(KB_MOUNT_REL_DIR).join("Gone")
+                )
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn gitignore_written_inside_knowledge_dir() {
         let bases = TempDir::new().unwrap();
         let ws = TempDir::new().unwrap();
@@ -377,6 +463,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn portable_writeback_mount_root_link_never_sweeps_external_files() {
+        let ws = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let nomi = ws.path().join(".nomi");
+        std::fs::create_dir(&nomi).unwrap();
+        let mount_root = nomi.join("knowledge");
+        let sentinel = outside.path().join("sentinel.md");
+        std::fs::write(&sentinel, "keep").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &mount_root).unwrap();
+        #[cfg(windows)]
+        junction::create(outside.path(), &mount_root).unwrap();
+
+        let present = sync_mounts(ws.path(), Vec::new()).await;
+
+        assert!(present.is_empty());
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "keep");
+        assert!(read_link_target(&mount_root).is_some());
+    }
+
+    #[tokio::test]
     async fn writes_through_mount_reach_target() {
         let bases = TempDir::new().unwrap();
         let ws = TempDir::new().unwrap();
@@ -392,11 +499,11 @@ mod tests {
         .await;
 
         let mounted = ws.path().join(KB_MOUNT_REL_DIR).join("w");
-        // Skip the assertion when the platform degraded to a copy (no link
-        // semantics) — detectable because read_link_target returns None.
-        if read_link_target(&mounted).is_some() {
-            std::fs::write(mounted.join("written.md"), "wb").unwrap();
-            assert!(kb.join("written.md").exists(), "write-back must land in the base root");
-        }
+        assert!(
+            read_link_target(&mounted).is_some(),
+            "a reported mount must be a live link, never a detached copy"
+        );
+        std::fs::write(mounted.join("written.md"), "wb").unwrap();
+        assert!(kb.join("written.md").exists(), "write-back must land in the base root");
     }
 }

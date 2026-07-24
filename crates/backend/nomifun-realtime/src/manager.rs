@@ -7,6 +7,7 @@ use nomifun_api_types::WebSocketMessage;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::broadcaster::{EventBroadcaster, UserEventSink};
@@ -46,6 +47,7 @@ impl WebSocketManager {
             token,
             last_ping: Instant::now(),
             tx,
+            cancellation: CancellationToken::new(),
         };
         self.connections.insert(id, info);
         debug!(%id, "client added");
@@ -54,9 +56,19 @@ impl WebSocketManager {
 
     /// Remove a client connection by ID.
     pub fn remove_client(&self, conn_id: ConnectionId) {
-        if self.connections.remove(&conn_id).is_some() {
+        if let Some((_, client)) = self.connections.remove(&conn_id) {
+            client.cancellation.cancel();
             debug!(%conn_id, "client removed");
         }
+    }
+
+    pub(crate) fn connection_cancellation(
+        &self,
+        conn_id: ConnectionId,
+    ) -> Option<CancellationToken> {
+        self.connections
+            .get(&conn_id)
+            .map(|client| client.cancellation.clone())
     }
 
     /// Update the last heartbeat timestamp for a connection.
@@ -73,8 +85,9 @@ impl WebSocketManager {
 
     /// Send a message to all connected clients.
     ///
-    /// Uses `try_send` for backpressure — full channels drop the message
-    /// with a warning; closed channels trigger client removal.
+    /// Uses `try_send` for backpressure. A full channel is disconnected just
+    /// like a closed one: silently dropping a durable-state event would leave
+    /// the renderer stale, while reconnect reliably reloads persisted state.
     pub fn broadcast_all(&self, msg: WebSocketMessage<serde_json::Value>) {
         let text = match serde_json::to_string(&msg) {
             Ok(t) => t,
@@ -90,7 +103,8 @@ impl WebSocketManager {
             match entry.value().tx.try_send(WsOutbound::Text(text.clone())) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(%conn_id, "outbound channel full, message dropped");
+                    warn!(%conn_id, "outbound channel full, disconnecting client for durable resync");
+                    disconnected.push(conn_id);
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     disconnected.push(conn_id);
@@ -125,7 +139,8 @@ impl WebSocketManager {
             match entry.value().tx.try_send(WsOutbound::Text(text.clone())) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(%conn_id, user_id, "outbound channel full, user-scoped message dropped");
+                    warn!(%conn_id, user_id, "outbound channel full, disconnecting client for durable resync");
+                    disconnected.push(conn_id);
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => disconnected.push(conn_id),
             }
@@ -156,17 +171,21 @@ impl WebSocketManager {
     ///
     /// Used for non-`WebSocketMessage` payloads (e.g. error responses).
     pub fn send_raw_to(&self, conn_id: ConnectionId, outbound: WsOutbound) {
+        let mut disconnect = false;
         if let Some(client) = self.connections.get(&conn_id) {
             match client.tx.try_send(outbound) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(%conn_id, "outbound channel full, message dropped");
+                    warn!(%conn_id, "outbound channel full, disconnecting client for durable resync");
+                    disconnect = true;
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    drop(client);
-                    self.remove_client(conn_id);
+                    disconnect = true;
                 }
             }
+        }
+        if disconnect {
+            self.remove_client(conn_id);
         }
     }
 
@@ -237,6 +256,9 @@ fn heartbeat_tick(
     token_authenticator: &TokenAuthenticator,
 ) {
     let now = Instant::now();
+    // A queued policy close must be allowed to drain in order so the browser
+    // observes the intended close code. Cancellation is reserved for a full
+    // or already-closed channel where no close frame can be queued.
     let mut to_remove = Vec::new();
 
     for entry in connections.iter() {
@@ -246,11 +268,11 @@ fn heartbeat_tick(
         // 1. Heartbeat timeout
         if now.duration_since(client.last_ping) > HEARTBEAT_TIMEOUT {
             info!(%conn_id, "heartbeat timeout, closing connection");
-            let _ = client.tx.try_send(WsOutbound::Close(
+            let force_close = client.tx.try_send(WsOutbound::Close(
                 WebSocketCloseCode::PolicyViolation,
                 "heartbeat timeout".into(),
-            ));
-            to_remove.push(conn_id);
+            )).is_err();
+            to_remove.push((conn_id, force_close));
             continue;
         }
 
@@ -261,11 +283,11 @@ fn heartbeat_tick(
             if let Ok(text) = serde_json::to_string(&auth_expired) {
                 let _ = client.tx.try_send(WsOutbound::Text(text));
             }
-            let _ = client.tx.try_send(WsOutbound::Close(
+            let force_close = client.tx.try_send(WsOutbound::Close(
                 WebSocketCloseCode::PolicyViolation,
                 "token expired".into(),
-            ));
-            to_remove.push(conn_id);
+            )).is_err();
+            to_remove.push((conn_id, force_close));
             continue;
         }
 
@@ -278,17 +300,22 @@ fn heartbeat_tick(
             match client.tx.try_send(WsOutbound::Text(text)) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(%conn_id, "outbound channel full, ping dropped");
+                    warn!(%conn_id, "outbound channel full, disconnecting client for durable resync");
+                    to_remove.push((conn_id, true));
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    to_remove.push(conn_id);
+                    to_remove.push((conn_id, true));
                 }
             }
         }
     }
 
-    for conn_id in to_remove {
-        connections.remove(&conn_id);
+    for (conn_id, force_close) in to_remove {
+        if let Some((_, client)) = connections.remove(&conn_id)
+            && force_close
+        {
+            client.cancellation.cancel();
+        }
         debug!(%conn_id, "connection removed by heartbeat");
     }
 }
@@ -410,18 +437,21 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_all_handles_full_channel() {
+    fn broadcast_all_disconnects_full_channel_for_resync() {
         let mgr = WebSocketManager::new();
         // Use a channel with capacity 1
         let (tx, _rx) = mpsc::channel(1);
-        mgr.add_client("user".into(), "tok".into(), tx);
+        let conn_id = mgr.add_client("user".into(), "tok".into(), tx);
+        let cancellation = mgr.connection_cancellation(conn_id).unwrap();
 
         // Fill the channel
         mgr.broadcast_all(WebSocketMessage::new("e1", json!(null)));
-        // This should warn but not remove the client
+        // A silent drop would strand durable UI state; removal closes the
+        // receiver once its queued frame drains and makes the client reconnect.
         mgr.broadcast_all(WebSocketMessage::new("e2", json!(null)));
 
-        assert_eq!(mgr.client_count(), 1);
+        assert_eq!(mgr.client_count(), 0);
+        assert!(cancellation.is_cancelled());
     }
 
     #[test]
@@ -490,6 +520,7 @@ mod tests {
                 token: "valid".into(),
                 last_ping: Instant::now(),
                 tx,
+                cancellation: CancellationToken::new(),
             },
         );
 
@@ -514,6 +545,7 @@ mod tests {
     fn heartbeat_tick_removes_timed_out_connection() {
         let connections = Arc::new(DashMap::new());
         let (tx, mut rx) = new_client_tx();
+        let cancellation = CancellationToken::new();
 
         // Set last_ping to well past the timeout
         let old_ping = Instant::now() - (HEARTBEAT_TIMEOUT * 2);
@@ -525,6 +557,7 @@ mod tests {
                 token: "valid".into(),
                 last_ping: old_ping,
                 tx,
+                cancellation: cancellation.clone(),
             },
         );
 
@@ -538,6 +571,37 @@ mod tests {
         assert_eq!(
             msg,
             WsOutbound::Close(WebSocketCloseCode::PolicyViolation, "heartbeat timeout".into())
+        );
+        assert!(
+            !cancellation.is_cancelled(),
+            "a queued policy close must drain with its original close code"
+        );
+    }
+
+    #[test]
+    fn heartbeat_tick_cancels_a_full_channel_for_resync() {
+        let connections = Arc::new(DashMap::new());
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(WsOutbound::Text("already full".into()))
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        connections.insert(
+            ConnectionId(1),
+            ClientInfo {
+                user_id: "user".into(),
+                token: "valid".into(),
+                last_ping: Instant::now(),
+                tx,
+                cancellation: cancellation.clone(),
+            },
+        );
+
+        heartbeat_tick(&connections, &always_valid());
+
+        assert!(connections.is_empty());
+        assert!(
+            cancellation.is_cancelled(),
+            "a full heartbeat channel cannot queue a close and must force the socket task to exit"
         );
     }
 
@@ -553,6 +617,7 @@ mod tests {
                 token: "expired-token".into(),
                 last_ping: Instant::now(),
                 tx,
+                cancellation: CancellationToken::new(),
             },
         );
 
@@ -592,6 +657,7 @@ mod tests {
                 token: "expired".into(),
                 last_ping: old_ping,
                 tx,
+                cancellation: CancellationToken::new(),
             },
         );
 
@@ -622,6 +688,7 @@ mod tests {
                 token: "good".into(),
                 last_ping: Instant::now(),
                 tx: tx1,
+                cancellation: CancellationToken::new(),
             },
         );
 
@@ -634,6 +701,7 @@ mod tests {
                 token: "good".into(),
                 last_ping: Instant::now() - (HEARTBEAT_TIMEOUT * 2),
                 tx: tx2,
+                cancellation: CancellationToken::new(),
             },
         );
 
@@ -657,6 +725,7 @@ mod tests {
                 token: "valid-but-remapped".into(),
                 last_ping: Instant::now(),
                 tx,
+                cancellation: CancellationToken::new(),
             },
         );
         let remapped: TokenAuthenticator = Arc::new(|_| Some("bob".to_owned()));

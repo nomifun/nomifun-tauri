@@ -8,20 +8,26 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use futures_util::{StreamExt, stream};
 use nomifun_api_types::{ConnectorCredentialSummary, ConnectorSyncState, KnowledgeMountInfo, KnowledgeSource, KnowledgeSourceEntry, KnowledgeSourceMode, KnowledgeTag, UpdateKnowledgeTagRequest};
 use nomifun_common::{
     AppError, CompanionId, ConnectorCredentialId, ConversationId, KnowledgeBaseId,
-    TerminalId, TimestampMs, UuidV7Error, now_ms,
+    ProviderWithModel, TerminalId, TimestampMs, UuidV7Error, generate_id,
+    now_ms,
 };
 use nomifun_db::models::{CreateKnowledgeTagParams, KnowledgeBaseRow, KnowledgeBindingRow};
 use nomifun_db::{IConnectorCredentialRepository, IKnowledgeRepository};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio::sync::{
+    Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard,
+    OwnedRwLockWriteGuard, RwLock as AsyncRwLock, Semaphore,
+};
+use tokio_util::sync::CancellationToken;
+use unicode_normalization::UnicodeNormalization;
 use url::Url;
 
 use crate::autogen::{self, KnowledgeCompleter};
@@ -54,6 +60,18 @@ pub const WRITEBACK_EAGERNESS: &[&str] = &["conservative", "aggressive"];
 /// navigation.
 pub const KB_INBOX_REL_DIR: &str = "_inbox";
 const TURN_WRITEBACK_LLM_TIMEOUT: Duration = Duration::from_secs(45);
+const KNOWLEDGE_PATH_INSPECTION_TIMEOUT: Duration = Duration::from_secs(6);
+const KNOWLEDGE_FILE_IO_TIMEOUT: Duration = Duration::from_secs(20);
+const KNOWLEDGE_BLOCKING_INSPECTION_CONCURRENCY: usize = 32;
+const TURN_WRITEBACK_MAX_CANDIDATES: usize = 8;
+const TURN_WRITEBACK_MAX_CANDIDATE_CHARS: usize = 32_000;
+const TURN_WRITEBACK_MAX_TOTAL_CHARS: usize = 128_000;
+
+static ROOT_BLOCKING_INSPECTION_LOCKS:
+    OnceLock<StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>> =
+    OnceLock::new();
+static ROOT_BLOCKING_INSPECTION_LIMIT: OnceLock<Arc<Semaphore>> =
+    OnceLock::new();
 
 /// Opaque, copy-pasteable document handle: `kdoc_` + URL-safe base64 (no pad)
 /// of `{kb_id}\x1f{rel_path}`. The model treats it as an opaque token and
@@ -326,6 +344,19 @@ pub struct WriteRequest {
 }
 
 #[derive(Debug, Clone)]
+enum StagedBaseSnapshot {
+    Missing,
+    Content(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StagedProposalMetadata {
+    version: u8,
+    base_sha256: Option<String>,
+    proposal_sha256: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct WriteOutcome {
     pub kb_id: KnowledgeBaseId,
     pub final_rel_path: String,
@@ -345,6 +376,20 @@ pub struct TurnWritebackRequest {
     pub scope: String,
     pub user_text: String,
     pub assistant_text: String,
+    /// Effective model for this write-back. Conversation callers resolve the
+    /// explicit knowledge-model preference first and otherwise capture the
+    /// model that actually answered the turn. `None` is retained for callers
+    /// without a provider-backed conversation model.
+    pub model: Option<ProviderWithModel>,
+    /// On a manual retry of a partial result, logical targets already written
+    /// by the previous attempt are excluded. Failed paths are deliberately not
+    /// a whitelist: a new extraction may correct casing or a wrong-folder
+    /// suggestion and must remain eligible.
+    pub excluded_targets: Option<Vec<(KnowledgeBaseId, String)>>,
+    /// Process-local cancellation for explicit conversation clear/reset/delete.
+    /// It is observed only at cancel-safe boundaries; an atomic filesystem
+    /// publication already in progress is always awaited to completion.
+    pub cancellation: Option<CancellationToken>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,7 +428,7 @@ impl TurnWritebackReport {
         Self { status, candidates: 0, written: Vec::new(), failures: Vec::new() }
     }
 
-    fn failed(error: impl Into<String>) -> Self {
+    pub fn failed(error: impl Into<String>) -> Self {
         Self {
             status: TurnWritebackStatus::Failed,
             candidates: 0,
@@ -468,7 +513,9 @@ struct CachedDoc {
 /// optimization: it avoids re-reading + UTF-8-decoding unchanged `.md` files on
 /// every query. Invalidation is per-file via mtime (write_file's atomic rename
 /// and delete_file both bump it), so the cache self-heals with NO watcher and NO
-/// index — results are byte-for-byte identical to the uncached path. Bounded by
+/// index. Service-owned writes explicitly evict their path because coarse
+/// FAT/SMB/NAS mtimes can retain the same tick after a same-size replacement.
+/// Results remain byte-for-byte identical to the uncached path. Bounded by
 /// [`MAX_SEARCH_CACHE_BYTES`]; oversized files are simply not cached.
 #[derive(Default)]
 struct SearchCacheInner {
@@ -510,6 +557,19 @@ pub struct KnowledgeService {
     /// whole file; this lock prevents concurrent turns from merging against the
     /// same stale base body and losing one update.
     turn_writeback_locks: Arc<StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
+    /// Serializes publication with base deletion per canonical root group.
+    /// Duplicate and ancestor/descendant roots are assigned the same lock.
+    base_lifecycle_locks:
+        Arc<StdMutex<HashMap<String, Weak<AsyncRwLock<()>>>>>,
+    /// Coordinates whole-tree mutations with per-document writes for one
+    /// canonical (including overlapping) root group, without letting a slow
+    /// external base block unrelated knowledge bases.
+    document_tree_locks:
+        Arc<StdMutex<HashMap<String, Weak<AsyncRwLock<()>>>>>,
+    /// Canonical root identity is immutable for a registration; caching it
+    /// avoids repeating slow NAS/OneDrive canonicalization at tree, target and
+    /// lifecycle lock boundaries in the same write.
+    root_lock_identity_cache: Arc<StdMutex<HashMap<String, String>>>,
     /// **P3 connectors**: registered source connectors keyed by `kind()`
     /// (e.g. `"feishu"`). Late-wired at boot (`register_connector`) — same
     /// discipline as [`Self::completer`], since a connector may depend on the
@@ -531,24 +591,57 @@ pub struct KnowledgeService {
 }
 
 /// One source entry's fetched-and-condensed body, ready to be slugged and
-/// written to disk (the serial phase of [`KnowledgeService::fetch_source_snapshots`]).
+/// assembled in memory (the serial phase of
+/// [`KnowledgeService::prepare_source_snapshots`]).
 struct PreparedSnapshot {
     /// Page `<title>` (HTML responses only) — backfills an empty entry title.
     title: Option<String>,
     body: String,
 }
 
+/// A fetched source snapshot that has not yet crossed the filesystem
+/// publication boundary. Network and LLM work produces these in memory; they
+/// are written only after the source configuration is revalidated under the
+/// per-base lifecycle writer.
+struct PreparedSourceFile {
+    rel_path: String,
+    source_label: String,
+    content: String,
+    /// Exact connector source identity used to migrate snapshots written by
+    /// the legacy lossy filename scheme. URL-source files leave this unset.
+    connector_source_url: Option<String>,
+}
+
+struct SourcePublicationOutcome {
+    fetched: usize,
+    errors: Vec<String>,
+    persisted_stamp: Option<TimestampMs>,
+    fatal_error: Option<AppError>,
+}
+
 impl KnowledgeService {
     pub fn new(repo: Arc<dyn IKnowledgeRepository>, data_dir: &Path, emitter: KnowledgeEventEmitter) -> Self {
+        if let Err(error) = std::fs::create_dir_all(data_dir) {
+            tracing::warn!(
+                path = %data_dir.display(),
+                %error,
+                "could not provision the knowledge data directory"
+            );
+        }
+        let data_dir = std::fs::canonicalize(data_dir)
+            .unwrap_or_else(|_| data_dir.to_path_buf());
         Self {
             repo,
-            data_dir: data_dir.to_path_buf(),
+            data_dir,
             emitter,
             completer: RwLock::new(None),
             fetcher: Arc::new(HttpFetcher::default()),
             render_fetcher: RwLock::new(None),
             search_cache: Arc::new(RwLock::new(SearchCacheInner::default())),
             turn_writeback_locks: Arc::new(StdMutex::new(HashMap::new())),
+            base_lifecycle_locks: Arc::new(StdMutex::new(HashMap::new())),
+            document_tree_locks: Arc::new(StdMutex::new(HashMap::new())),
+            root_lock_identity_cache: Arc::new(StdMutex::new(HashMap::new())),
             connectors: RwLock::new(HashMap::new()),
             cred_repo: RwLock::new(None),
             cred_key: RwLock::new(None),
@@ -773,7 +866,6 @@ impl KnowledgeService {
         let cursor = SyncCursor { last_sync_at: prev_watermark, opaque: prev_sync.cursor.clone() };
 
         let root = PathBuf::from(&row.root_path);
-        let snap_dir = root.join(source_url::SNAPSHOT_REL_DIR);
 
         // Phase 1 — paginate list_documents, collecting refs + tombstones.
         // A mid-pagination failure is NON-fatal: keep whatever pages we got and
@@ -813,13 +905,13 @@ impl KnowledgeService {
         // the last page since the same input cursor is passed each page).
         let batch_max_edit = all_docs.iter().map(|d| d.edit_time).max();
 
-        // Phase 2 — serial fetch → compress → snapshot (deterministic slug per
-        // remote_id, so deletions below can target files without frontmatter
-        // matching).
+        // Phase 2 — serial fetch → compress → prepare snapshots in memory
+        // (deterministic slug per remote_id, so deletions below can target
+        // files without frontmatter matching). No filesystem side effect is
+        // allowed until the source config is revalidated in phase 3.
         let completer = self.completer();
-        let mut fetched = 0usize;
         let mut errors: Vec<String> = Vec::new();
-        let mut used_slugs: HashSet<String> = HashSet::new();
+        let mut prepared_files = Vec::new();
         for doc in &all_docs {
             let fetched_doc = match connector.fetch_document(&cred, doc).await {
                 Ok(d) => d,
@@ -831,13 +923,11 @@ impl KnowledgeService {
 
             let body = condense_snapshot_body(fetched_doc.markdown, completer.as_deref()).await;
 
-            let slug_base = connector_doc_slug(&fetched_doc.remote_id);
-            let mut slug = slug_base.clone();
-            let mut n = 2;
-            while !used_slugs.insert(slug.clone()) {
-                slug = format!("{slug_base}-{n}");
-                n += 1;
-            }
+            // The filename is a pure, order-independent function of the
+            // exact remote id. In particular, ids which differ only by case
+            // or punctuation must never be assigned `slug` / `slug-2`
+            // according to whichever pagination order happened to arrive.
+            let slug = connector_doc_slug(&fetched_doc.remote_id);
 
             let fetched_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
             // Prefer the canonical web URL for citation; fall back to a stable
@@ -846,38 +936,120 @@ impl KnowledgeService {
                 .source_url
                 .clone()
                 .unwrap_or_else(|| format!("{}://{}", source.kind, fetched_doc.remote_id));
-            let content =
-                source_url::snapshot_markdown(&src_url, &fetched_at, Some(&fetched_doc.title), &body);
-            match write_text_atomic(&snap_dir.join(format!("{slug}.md")), &content).await {
-                Ok(()) => fetched += 1,
-                Err(e) => {
-                    tracing::warn!(remote_id = %fetched_doc.remote_id, error = %e, "failed to write connector snapshot");
-                    errors.push(format!("{}: {e}", fetched_doc.title));
+            let content = connector_snapshot_markdown(
+                &src_url,
+                &fetched_at,
+                Some(&fetched_doc.title),
+                &fetched_doc.remote_id,
+                &body,
+            );
+            let rel_path =
+                format!("{}/{slug}.md", source_url::SNAPSHOT_REL_DIR);
+            prepared_files.push(PreparedSourceFile {
+                rel_path,
+                source_label: fetched_doc.title,
+                content,
+                connector_source_url: Some(src_url),
+            });
+        }
+
+        // Phase 3 — one source commit boundary. A user source switch/detach
+        // that wins during the long remote work causes a conflict here before
+        // any old snapshot is written or moved.
+        let _tree_guard =
+            self.acquire_document_tree_write_lock(&row).await?;
+        let _base_guard =
+            self.acquire_base_lifecycle_write_lock(&row).await?;
+        let mut current = self.current_source_publication_row(&row).await?;
+        validate_knowledge_root_bounded(root.clone()).await?;
+
+        let mut published_connector_urls = HashSet::new();
+        let mut fetched = 0usize;
+        for file in prepared_files {
+            let path = match safe_md_path_bounded(
+                root.clone(),
+                file.rel_path.clone(),
+            )
+            .await
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    errors.push(format!("{}: {error}", file.source_label));
+                    continue;
+                }
+            };
+            match write_text_atomic(&path, &file.content).await {
+                Ok(()) => {
+                    fetched += 1;
+                    self.invalidate_search_cache_path(&path);
+                    if let Some(source_url) = &file.connector_source_url {
+                        published_connector_urls.insert(source_url.clone());
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        source = %file.source_label,
+                        %error,
+                        "failed to publish connector snapshot"
+                    );
+                    errors.push(format!("{}: {error}", file.source_label));
                 }
             }
         }
 
-        // Phase 3 — move vanished docs to `snapshots/_trash/` (never hard-delete;
-        // "the directory is the truth", users audit the trash).
-        if !deleted_ids.is_empty() {
-            let trash_dir = snap_dir.join("_trash");
-            for id in &deleted_ids {
-                let slug = connector_doc_slug(id);
-                let from = snap_dir.join(format!("{slug}.md"));
-                if tokio::fs::try_exists(&from).await.unwrap_or(false) {
-                    if let Err(e) = tokio::fs::create_dir_all(&trash_dir).await {
-                        tracing::warn!(error = %e, "failed to create connector snapshot _trash dir");
-                        continue;
-                    }
-                    let to = trash_dir.join(format!("{slug}.md"));
-                    if let Err(e) = tokio::fs::rename(&from, &to).await {
-                        tracing::warn!(remote_id = id, error = %e, "failed to move deleted snapshot to _trash");
-                    }
-                }
-            }
+        // Upgrade compatibility: older releases named connector snapshots
+        // with a lossy lower-cased slug. Incremental connectors may never list
+        // an unchanged document again, so migration is lazy and file-based:
+        // when a document is updated, identify old aliases by their exact
+        // source_url frontmatter and quarantine them only after the new hashed
+        // snapshot has been published.
+        if !published_connector_urls.is_empty()
+            && let Err(error) = quarantine_connector_snapshot_aliases(
+                &root,
+                &published_connector_urls,
+            )
+            .await
+        {
+            tracing::warn!(%error, "failed to migrate legacy connector snapshots");
+            errors.push(format!("legacy connector snapshot migration: {error}"));
         }
 
-        // Persist the cursor + watermark + last-sync stamp + any error summary.
+        // Move vanished docs to a unique, recoverable trash name. Fixed trash
+        // names overwrite on Unix but fail on Windows after a re-add/delete
+        // cycle, so every quarantine entry is no-clobber on every platform.
+        let mut deleted_source_urls = HashSet::new();
+        for id in &deleted_ids {
+            if let Err(error) =
+                quarantine_connector_snapshot(&root, id).await
+            {
+                tracing::warn!(
+                    remote_id = id,
+                    %error,
+                    "failed to quarantine deleted connector snapshot"
+                );
+                errors.push(format!("deleted {id}: {error}"));
+            }
+            deleted_source_urls.insert(format!("{}://{id}", source.kind));
+            if let Some(source_url) = connector.source_url_for_remote_id(id) {
+                deleted_source_urls.insert(source_url);
+            }
+        }
+        // A tombstone can refer to a snapshot written before hashed
+        // filenames existed. Match its exact connector URL instead of the
+        // old lossy slug, which could target another document.
+        if !deleted_source_urls.is_empty()
+            && let Err(error) = quarantine_connector_snapshot_aliases(
+                &root,
+                &deleted_source_urls,
+            )
+            .await
+        {
+            tracing::warn!(%error, "failed to quarantine legacy deleted connector snapshots");
+            errors.push(format!("legacy deleted connector snapshots: {error}"));
+        }
+
+        // Persist the cursor + watermark + last-sync stamp + any error summary
+        // while the same lifecycle writer still excludes source changes.
         let had_errors = list_errored || !errors.is_empty();
         let last_error = if errors.is_empty() {
             list_errored.then(|| "pagination failed mid-run; partial sync".to_owned())
@@ -908,7 +1080,9 @@ impl KnowledgeService {
         if fetched > 0 {
             source.last_fetched_at = last_sync_at;
         }
-        self.persist_source(&mut row, &source).await?;
+        self.persist_source_in_current_row(&mut current, &source)
+            .await?;
+        row = current;
         let info = self.row_to_info(row).await?;
         self.emitter.emit_base_updated(&info);
         Ok(RefreshSourceSummary {
@@ -1079,28 +1253,100 @@ impl KnowledgeService {
         let id = KnowledgeBaseId::new();
         let (root, managed) = match root_path.map(str::trim).filter(|p| !p.is_empty()) {
             None => {
-                let dir = self.data_dir.join(KB_MANAGED_REL_DIR).join(id.as_str());
+                let managed_parent =
+                    self.data_dir.join(KB_MANAGED_REL_DIR);
+                tokio::fs::create_dir_all(&managed_parent)
+                    .await
+                    .map_err(|e| AppError::Internal(format!("failed to create managed knowledge root: {e}")))?;
+                let parent_metadata =
+                    tokio::fs::symlink_metadata(&managed_parent)
+                        .await
+                        .map_err(|e| AppError::Internal(format!("failed to inspect managed knowledge root: {e}")))?;
+                if metadata_is_link_or_reparse(
+                    &managed_parent,
+                    &parent_metadata,
+                ) {
+                    return Err(AppError::Conflict(
+                        "managed knowledge root must not be a symlink, junction, or name-surrogate reparse point"
+                            .into(),
+                    ));
+                }
+                let dir = managed_parent.join(id.as_str());
                 tokio::fs::create_dir_all(&dir)
                     .await
                     .map_err(|e| AppError::Internal(format!("failed to create knowledge dir: {e}")))?;
                 (dir, true)
             }
             Some(path) => {
-                let dir = PathBuf::from(path);
-                if !dir.is_absolute() {
+                let requested_dir = PathBuf::from(path);
+                if !requested_dir.is_absolute() {
                     return Err(AppError::BadRequest("external root_path must be absolute".into()));
                 }
-                // Off the async worker: an external root may be a slow/stale NAS
-                // mount and `Path::is_dir()` is a blocking stat — running it on a
-                // tokio worker thread would stall the runtime. `tokio::fs` routes
-                // the stat to the blocking pool instead.
-                let is_dir = tokio::fs::metadata(&dir).await.map(|m| m.is_dir()).unwrap_or(false);
-                if !is_dir {
-                    return Err(AppError::BadRequest(format!("directory does not exist: {path}")));
+                if !requested_dir
+                    .components()
+                    .any(|component| matches!(component, Component::Normal(_)))
+                {
+                    return Err(AppError::BadRequest(
+                        "a filesystem, drive, or network-share root cannot be registered as a knowledge base"
+                            .into(),
+                    ));
+                }
+                let root_metadata = tokio::fs::symlink_metadata(&requested_dir)
+                    .await
+                    .map_err(|_| {
+                        AppError::BadRequest(format!(
+                            "directory does not exist: {path}"
+                        ))
+                    })?;
+                if !root_metadata.is_dir()
+                    || metadata_is_link_or_reparse(&requested_dir, &root_metadata)
+                {
+                    return Err(AppError::BadRequest(
+                        "knowledge base root must be a real directory, not a symlink, junction, or name-surrogate reparse point"
+                            .into(),
+                    ));
+                }
+                // Persist the physical root. A parent symlink can otherwise be
+                // retargeted after registration while the process-wide lock
+                // cache still protects the old target.
+                let dir = tokio::fs::canonicalize(&requested_dir)
+                    .await
+                    .map_err(|error| {
+                        AppError::BadRequest(format!(
+                            "failed to resolve knowledge directory {path}: {error}"
+                        ))
+                    })?;
+                if !dir
+                    .components()
+                    .any(|component| matches!(component, Component::Normal(_)))
+                {
+                    return Err(AppError::BadRequest(
+                        "a filesystem, drive, or network-share root cannot be registered as a knowledge base"
+                            .into(),
+                    ));
                 }
                 (dir, false)
             }
         };
+
+        // Persist one physical, Unicode path for both managed and external
+        // roots. Lossy conversion would replace non-UTF-8 bytes with U+FFFD,
+        // leaving a permanently broken registration and potentially merging
+        // unrelated lock identities.
+        let root = tokio::fs::canonicalize(&root).await.map_err(|error| {
+            AppError::BadRequest(format!(
+                "failed to resolve the physical knowledge directory: {error}"
+            ))
+        })?;
+        let root_path = root
+            .to_str()
+            .ok_or_else(|| {
+                AppError::BadRequest(
+                    "the physical knowledge directory must have a Unicode path on every supported platform"
+                        .into(),
+                )
+            })?
+            .to_owned();
 
         let extra = match &source {
             Some(src) => serde_json::json!({ "source": src }).to_string(),
@@ -1112,7 +1358,7 @@ impl KnowledgeService {
             knowledge_base_id: id.into_string(),
             name: name.to_owned(),
             description: description.trim().to_owned(),
-            root_path: root.to_string_lossy().to_string(),
+            root_path,
             managed,
             extra,
             created_at: now,
@@ -1197,26 +1443,33 @@ impl KnowledgeService {
         mut row: KnowledgeBaseRow,
         mut src: KnowledgeSource,
     ) -> Result<KnowledgeBaseInfo, AppError> {
-        let root = PathBuf::from(&row.root_path);
-        let (fetched, errors) = self.fetch_source_snapshots(&root, &mut src.entries).await;
+        let (files, mut errors) =
+            self.prepare_source_snapshots(&mut src.entries).await;
+        let publication = self
+            .publish_prepared_url_source(
+                &mut row,
+                &mut src,
+                files,
+                false,
+            )
+            .await;
+        let fetched = publication.fetched;
+        errors.extend(publication.errors);
         if !errors.is_empty() {
             tracing::warn!(kb_id = %row.knowledge_base_id, ?errors, "some URL sources failed to fetch at create time");
-        }
-        let prev_stamp = src.last_fetched_at;
-        if fetched > 0 {
-            src.last_fetched_at = Some(now_ms());
         }
         // The stamp the summary may honestly claim: only a PERSISTED stamp
         // counts. When persisting fails, the registry still holds the old
         // value — reporting the aspirational new stamp would lie to the
         // client about freshness state.
-        let persisted_stamp = match self.persist_source(&mut row, &src).await {
-            Ok(()) => src.last_fetched_at,
-            Err(e) => {
-                tracing::warn!(kb_id = %row.knowledge_base_id, error = %e, "failed to persist source fetch state");
-                prev_stamp
-            }
-        };
+        let persisted_stamp = publication.persisted_stamp;
+        if let Some(error) = publication.fatal_error {
+            tracing::warn!(
+                kb_id = %row.knowledge_base_id,
+                %error,
+                "failed to publish or persist source fetch state"
+            );
+        }
         // Chained creation-time autogen: best-effort, silently skipped
         // when no completer is wired (or nothing was fetched). A
         // user-supplied description is preserved — autogen only
@@ -1250,7 +1503,16 @@ impl KnowledgeService {
         description: Option<&str>,
         tags: Option<Vec<String>>,
     ) -> Result<KnowledgeBaseInfo, AppError> {
+        let initial = self.require_base(id).await?;
+        let _base_guard =
+            self.acquire_base_lifecycle_write_lock(&initial).await?;
         let mut row = self.require_base(id).await?;
+        if row.root_path != initial.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while metadata was being updated; retry"
+                    .into(),
+            ));
+        }
         if let Some(name) = name {
             let name = name.trim();
             if name.is_empty() {
@@ -1270,6 +1532,7 @@ impl KnowledgeService {
         }
         row.updated_at = now_ms();
         self.repo.update_base(&row).await?;
+        drop(_base_guard);
         let info = self.row_to_info(row).await?;
         self.emitter.emit_base_updated(&info);
         Ok(info)
@@ -1283,6 +1546,14 @@ impl KnowledgeService {
     /// directory is logged as an orphan and the registration is not restored.
     pub async fn delete_base(&self, id: &str, purge: bool) -> Result<(), AppError> {
         let row = self.require_base(id).await?;
+        let _base_guard =
+            self.acquire_base_lifecycle_write_lock(&row).await?;
+        let current = self.require_base(id).await?;
+        if current.root_path != row.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while deletion was starting; retry".into(),
+            ));
+        }
         if purge && !row.managed {
             return Err(AppError::BadRequest(
                 "cannot purge an external knowledge base; delete only removes its registration"
@@ -1291,7 +1562,24 @@ impl KnowledgeService {
         }
         if purge {
             let root = PathBuf::from(&row.root_path);
-            let managed_parent = self.data_dir.join(KB_MANAGED_REL_DIR);
+            validate_knowledge_root_bounded(root.clone()).await?;
+            let managed_parent_lexical =
+                self.data_dir.join(KB_MANAGED_REL_DIR);
+            let managed_parent = tokio::time::timeout(
+                KNOWLEDGE_PATH_INSPECTION_TIMEOUT,
+                tokio::fs::canonicalize(&managed_parent_lexical),
+            )
+            .await
+            .map_err(|_| {
+                AppError::Timeout(
+                    "managed knowledge root inspection timed out".into(),
+                )
+            })?
+            .map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to resolve managed knowledge root: {error}"
+                ))
+            })?;
             if !root.starts_with(&managed_parent) || root == managed_parent {
                 return Err(AppError::Internal(format!(
                     "managed knowledge base {} has unsafe purge path '{}'",
@@ -1301,6 +1589,13 @@ impl KnowledgeService {
             }
         }
         self.repo.delete_base(id).await?;
+        self.root_lock_identity_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&format!(
+                "{}\0{}",
+                row.knowledge_base_id, row.root_path
+            ));
 
         if purge {
             let root = PathBuf::from(&row.root_path);
@@ -1327,23 +1622,42 @@ impl KnowledgeService {
     pub async fn list_files(&self, id: &str) -> Result<Vec<KbFileEntry>, AppError> {
         let row = self.require_base(id).await?;
         let root = PathBuf::from(&row.root_path);
+        let lock_root = root.clone();
         // Bounded so a slow/stale NAS root degrades to an empty listing instead
         // of hanging the detail view (and the agent write-path collision check).
-        Ok(bounded_blocking(BASE_WALK_BUDGET, Vec::new(), move || list_md_files(&root)).await)
+        Ok(
+            bounded_root_blocking(
+                &lock_root,
+                BASE_WALK_BUDGET,
+                Vec::new(),
+                move || list_md_files(&root),
+            )
+            .await,
+        )
     }
 
     pub async fn list_tree(&self, id: &str, rel_path: &str) -> Result<Vec<KbTreeEntry>, AppError> {
         let row = self.require_base(id).await?;
         let root = PathBuf::from(&row.root_path);
+        let lock_root = root.clone();
         let rel_path = normalize_tree_rel_path(rel_path)?;
-        Ok(bounded_blocking(BASE_WALK_BUDGET, Ok(Vec::new()), move || {
-            list_tree_level(&root, &rel_path)
-        })
-        .await?)
+        Ok(
+            bounded_root_blocking(
+                &lock_root,
+                BASE_WALK_BUDGET,
+                Ok(Vec::new()),
+                move || list_tree_level(&root, &rel_path),
+            )
+            .await?,
+        )
     }
 
     pub async fn create_folder(&self, id: &str, rel_path: &str) -> Result<KbTreeEntry, AppError> {
         let row = self.require_base(id).await?;
+        let _tree_guard =
+            self.acquire_document_tree_write_lock(&row).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+        self.require_base(id).await?;
         let root = PathBuf::from(&row.root_path);
         let rel_path = normalize_tree_rel_path(rel_path)?;
         if rel_path.is_empty() {
@@ -1356,6 +1670,10 @@ impl KnowledgeService {
 
     pub async fn delete_folder(&self, id: &str, rel_path: &str) -> Result<(), AppError> {
         let row = self.require_base(id).await?;
+        let _tree_guard =
+            self.acquire_document_tree_write_lock(&row).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+        self.require_base(id).await?;
         let root = PathBuf::from(&row.root_path);
         let rel_path = normalize_tree_rel_path(rel_path)?;
         if rel_path.is_empty() {
@@ -1368,6 +1686,10 @@ impl KnowledgeService {
 
     pub async fn rename_tree_entry(&self, id: &str, rel_path: &str, new_name: &str) -> Result<KbTreeEntry, AppError> {
         let row = self.require_base(id).await?;
+        let _tree_guard =
+            self.acquire_document_tree_write_lock(&row).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+        self.require_base(id).await?;
         let root = PathBuf::from(&row.root_path);
         let rel_path = normalize_tree_rel_path(rel_path)?;
         if rel_path.is_empty() {
@@ -1381,12 +1703,37 @@ impl KnowledgeService {
 
     pub async fn read_file(&self, id: &str, rel_path: &str) -> Result<KbFileContent, AppError> {
         let row = self.require_base(id).await?;
-        let path = safe_md_path(Path::new(&row.root_path), rel_path)?;
-        let meta = tokio::fs::metadata(&path)
+        let path = safe_md_path_bounded(
+            PathBuf::from(&row.root_path),
+            rel_path.to_owned(),
+        )
+        .await?;
+        let meta = tokio::time::timeout(
+            KNOWLEDGE_PATH_INSPECTION_TIMEOUT,
+            tokio::fs::metadata(&path),
+        )
             .await
-            .map_err(|_| AppError::NotFound(format!("file not found: {rel_path}")))?;
-        let content = tokio::fs::read_to_string(&path)
+            .map_err(|_| AppError::Timeout(format!("file inspection timed out: {rel_path}")))?
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    AppError::NotFound(format!("file not found: {rel_path}"))
+                } else {
+                    AppError::Internal(format!(
+                        "failed to inspect knowledge file {rel_path}: {error}"
+                    ))
+                }
+            })?;
+        if !meta.is_file() {
+            return Err(AppError::BadRequest(format!(
+                "knowledge document is not a regular file: {rel_path}"
+            )));
+        }
+        let content = tokio::time::timeout(
+            KNOWLEDGE_FILE_IO_TIMEOUT,
+            tokio::fs::read_to_string(&path),
+        )
             .await
+            .map_err(|_| AppError::Timeout(format!("file read timed out: {rel_path}")))?
             .map_err(|e| AppError::Internal(format!("failed to read file: {e}")))?;
         Ok(KbFileContent {
             rel_path: rel_path.replace('\\', "/"),
@@ -1398,21 +1745,185 @@ impl KnowledgeService {
 
     /// Create or overwrite a markdown file (atomic temp + rename).
     pub async fn write_file(&self, id: &str, rel_path: &str, content: &str) -> Result<(), AppError> {
+        let kb_id = KnowledgeBaseId::parse(id)
+            .map_err(|error| AppError::BadRequest(format!("invalid knowledge base id: {error}")))?;
         let row = self.require_base(id).await?;
-        let path = safe_md_path(Path::new(&row.root_path), rel_path)?;
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| AppError::Internal(format!("failed to create parent dirs: {e}")))?;
+        let _tree_guard = self.acquire_document_tree_read_lock(&row).await?;
+        let root = PathBuf::from(&row.root_path);
+        let resolved = resolve_portable_md_path(root.clone(), rel_path.to_owned()).await?;
+        let lock_path = portable_turn_writeback_lock_path(
+            &logical_writeback_target_from_storage_path(&resolved.rel_path),
+        );
+        let _target_guard = self
+            .acquire_turn_writeback_target_lock(&kb_id, &lock_path)
+            .await?;
+        // Re-resolve after acquiring the portable target lock so a racing
+        // create cannot slip in between resolution and no-clobber publication.
+        let resolved = resolve_portable_md_path(root, resolved.rel_path).await?;
+        self.write_file_under_target_lock(
+            id,
+            &resolved.rel_path,
+            None,
+            content,
+        )
+            .await
+    }
+
+    /// Create a markdown file only when no portable path alias exists.
+    ///
+    /// The portable target lock deliberately spans both the existence check
+    /// and no-clobber publication. This is used by background producers such
+    /// as README autogen so they cannot overwrite a write-back that created
+    /// the same path between a preliminary directory scan and publication.
+    async fn write_file_if_portably_absent(
+        &self,
+        id: &str,
+        rel_path: &str,
+        content: &str,
+    ) -> Result<bool, AppError> {
+        let kb_id = KnowledgeBaseId::parse(id)
+            .map_err(|error| AppError::BadRequest(format!("invalid knowledge base id: {error}")))?;
+        let row = self.require_base(id).await?;
+        let _tree_guard = self.acquire_document_tree_read_lock(&row).await?;
+        let root = PathBuf::from(&row.root_path);
+        let resolved = resolve_portable_md_path(root.clone(), rel_path.to_owned()).await?;
+        let lock_path = portable_turn_writeback_lock_path(
+            &logical_writeback_target_from_storage_path(&resolved.rel_path),
+        );
+        let _target_guard = self
+            .acquire_turn_writeback_target_lock(&kb_id, &lock_path)
+            .await?;
+        let resolved = resolve_portable_md_path(root.clone(), resolved.rel_path).await?;
+        if resolved.exists {
+            return Ok(false);
         }
-        let tmp = atomic_tmp_path(&path);
-        tokio::fs::write(&tmp, content)
+
+        match self
+            .write_file_if_absent(
+                id,
+                &resolved.rel_path,
+                &resolved.rel_path,
+                content,
+            )
             .await
-            .map_err(|e| AppError::Internal(format!("failed to write file: {e}")))?;
-        tokio::fs::rename(&tmp, &path)
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to finalize file: {e}")))?;
+        {
+            Ok(()) => Ok(true),
+            Err(error @ AppError::Conflict(_)) => {
+                // A process outside this service may still create the exact
+                // destination concurrently. Preserve it just like an
+                // in-process writer; do not turn a benign README race into a
+                // failed background task.
+                let current =
+                    resolve_portable_md_path(root, resolved.rel_path).await?;
+                if current.exists {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn write_file_under_target_lock(
+        &self,
+        id: &str,
+        storage_rel_path: &str,
+        logical_rel_path: Option<&str>,
+        content: &str,
+    ) -> Result<(), AppError> {
+        let row = self.require_base(id).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+        let current = self.require_base(id).await?;
+        if current.root_path != row.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while write-back was starting; retry".into(),
+            ));
+        }
+        if let Some(logical_rel_path) = logical_rel_path {
+            validate_source_owned_write_target(&current, logical_rel_path)?;
+        }
+        let path = safe_md_path_bounded(
+            PathBuf::from(&row.root_path),
+            storage_rel_path.to_owned(),
+        )
+        .await?;
+        // Do not timeout-and-drop the mutating future: Tokio filesystem calls
+        // may already be running on the blocking pool, and a late atomic rename
+        // could otherwise overwrite a user's manual retry after its guard was
+        // released. The target/message guards remain owned until publication
+        // has definitively completed or failed.
+        write_text_atomic(&path, content).await?;
+        self.invalidate_search_cache_path(&path);
         Ok(())
+    }
+
+    async fn write_file_if_unchanged(
+        &self,
+        id: &str,
+        storage_rel_path: &str,
+        logical_rel_path: &str,
+        expected: &str,
+        content: &str,
+    ) -> Result<(), AppError> {
+        let row = self.require_base(id).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+        let current = self.require_base(id).await?;
+        if current.root_path != row.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while write-back was starting; retry".into(),
+            ));
+        }
+        validate_source_owned_write_target(&current, logical_rel_path)?;
+        let path = safe_md_path_bounded(
+            PathBuf::from(&row.root_path),
+            storage_rel_path.to_owned(),
+        )
+        .await?;
+        write_text_atomic_if_unchanged(&path, expected, content).await?;
+        self.invalidate_search_cache_path(&path);
+        Ok(())
+    }
+
+    async fn write_file_if_absent(
+        &self,
+        id: &str,
+        storage_rel_path: &str,
+        logical_rel_path: &str,
+        content: &str,
+    ) -> Result<(), AppError> {
+        let row = self.require_base(id).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+        let current = self.require_base(id).await?;
+        if current.root_path != row.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while write-back was starting; retry".into(),
+            ));
+        }
+        validate_source_owned_write_target(&current, logical_rel_path)?;
+        let path = safe_md_path_bounded(
+            PathBuf::from(&row.root_path),
+            storage_rel_path.to_owned(),
+        )
+        .await?;
+        write_text_atomic_if_absent(&path, content).await?;
+        self.invalidate_search_cache_path(&path);
+        Ok(())
+    }
+
+    fn invalidate_search_cache_path(&self, path: &Path) {
+        let mut guard = self.search_cache.write().unwrap_or_else(|e| e.into_inner());
+        let target_identity = portable_absolute_path_identity(path);
+        let mut freed = 0usize;
+        guard.entries.retain(|cached_path, cached| {
+            if portable_absolute_path_identity(cached_path) == target_identity {
+                freed = freed.saturating_add(cached.bytes);
+                false
+            } else {
+                true
+            }
+        });
+        guard.total_bytes = guard.total_bytes.saturating_sub(freed);
     }
 
     // ── P4 inbox review (staged write-back proposals) ─────────────────
@@ -1422,9 +1933,17 @@ impl KnowledgeService {
     pub async fn list_inbox(&self, id: &str) -> Result<Vec<InboxEntry>, AppError> {
         let row = self.require_base(id).await?;
         let root = PathBuf::from(&row.root_path);
-        tokio::task::spawn_blocking(move || list_inbox_entries(&root))
-            .await
-            .map_err(|e| AppError::Internal(format!("inbox list task join error: {e}")))
+        let task =
+            tokio::task::spawn_blocking(move || list_inbox_entries_strict(&root));
+        match tokio::time::timeout(KNOWLEDGE_PATH_INSPECTION_TIMEOUT, task).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(AppError::Internal(format!(
+                "inbox list task join error: {error}"
+            ))),
+            Err(_) => Err(AppError::Timeout(
+                "knowledge review inbox scan timed out".into(),
+            )),
+        }
     }
 
     /// Unified diff of a staged proposal vs. the current base document
@@ -1433,12 +1952,38 @@ impl KnowledgeService {
         let row = self.require_base(id).await?;
         let root = PathBuf::from(&row.root_path);
         validate_inbox_scope(scope)?;
-        let inbox_abs = safe_md_path(&root, &format!("{KB_INBOX_REL_DIR}/{scope}/{rel_path}"))?;
-        let inbox_content = tokio::fs::read_to_string(&inbox_abs)
+        let inbox_rel =
+            format!("{KB_INBOX_REL_DIR}/{scope}/{rel_path}");
+        let inbox_abs =
+            safe_md_path_bounded(root.clone(), inbox_rel).await?;
+        let inbox_content = tokio::time::timeout(
+            KNOWLEDGE_FILE_IO_TIMEOUT,
+            tokio::fs::read_to_string(&inbox_abs),
+        )
             .await
-            .map_err(|_| AppError::NotFound(format!("inbox proposal not found: {scope}/{rel_path}")))?;
-        let base_abs = safe_md_path(&root, rel_path)?;
-        let base_content = tokio::fs::read_to_string(&base_abs).await.ok();
+            .map_err(|_| {
+                AppError::Timeout(format!(
+                    "inbox proposal read timed out: {scope}/{rel_path}"
+                ))
+            })?
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    AppError::NotFound(format!(
+                        "inbox proposal not found: {scope}/{rel_path}"
+                    ))
+                } else {
+                    AppError::Internal(format!(
+                        "failed to read inbox proposal: {error}"
+                    ))
+                }
+            })?;
+        let base_content = match self.read_file(id, rel_path).await {
+            Ok(file) => Some(file.content),
+            Err(AppError::NotFound(_)) => None,
+            Err(error) => {
+                return Err(error);
+            }
+        };
         let is_new = base_content.is_none();
         let unified_diff = unified_md_diff(base_content.as_deref().unwrap_or(""), &inbox_content, rel_path);
         Ok(InboxDiff {
@@ -1451,21 +1996,118 @@ impl KnowledgeService {
         })
     }
 
-    /// Accept a staged proposal: overwrite the base document with it, delete
-    /// the inbox copy, prune emptied scope dirs, and emit `base-updated`.
-    /// Idempotent across a mid-merge crash (re-running overwrites identically).
+    /// Accept a staged proposal only if the base still matches the version the
+    /// user reviewed. This prevents an older proposal from overwriting edits
+    /// made after staging. Publication is version-checked under this service's
+    /// portable target lock and remains idempotent across a crash after the
+    /// base write but before inbox cleanup.
     pub async fn merge_inbox(&self, id: &str, scope: &str, rel_path: &str) -> Result<InboxMergeResult, AppError> {
         let row = self.require_base(id).await?;
+        let _tree_guard = self.acquire_document_tree_read_lock(&row).await?;
         let root = PathBuf::from(&row.root_path);
         validate_inbox_scope(scope)?;
-        let inbox_abs = safe_md_path(&root, &format!("{KB_INBOX_REL_DIR}/{scope}/{rel_path}"))?;
-        let content = tokio::fs::read_to_string(&inbox_abs)
+        validate_canonical_write_target(rel_path)?;
+        let kb_id = KnowledgeBaseId::parse(id)
+            .map_err(|error| AppError::BadRequest(format!("invalid knowledge base id: {error}")))?;
+        let lock_path = portable_turn_writeback_lock_path(rel_path);
+        let _target_guard = self
+            .acquire_turn_writeback_target_lock(&kb_id, &lock_path)
+            .await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+        let current_row = self.require_base(id).await?;
+        if current_row.root_path != row.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while the proposal was being accepted; retry".into(),
+            ));
+        }
+        // Source configuration may have been attached after this proposal was
+        // staged. Revalidate under the base lifecycle lock so accepting an old
+        // proposal can never publish into source-owned snapshots.
+        validate_source_owned_write_target(&current_row, rel_path)?;
+        let inbox_rel =
+            format!("{KB_INBOX_REL_DIR}/{scope}/{rel_path}");
+        let inbox_abs =
+            safe_md_path_bounded(root.clone(), inbox_rel).await?;
+        let content = tokio::time::timeout(
+            KNOWLEDGE_FILE_IO_TIMEOUT,
+            tokio::fs::read_to_string(&inbox_abs),
+        )
             .await
-            .map_err(|_| AppError::NotFound(format!("inbox proposal not found: {scope}/{rel_path}")))?;
-        // Overwrite the base body first; only then drop the staged copy, so a
-        // crash in between leaves the proposal recoverable (re-merge is a no-op).
-        self.write_file(id, rel_path, &content).await?;
-        let _ = tokio::fs::remove_file(&inbox_abs).await;
+            .map_err(|_| {
+                AppError::Timeout(format!(
+                    "inbox proposal read timed out: {scope}/{rel_path}"
+                ))
+            })?
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    AppError::NotFound(format!(
+                        "inbox proposal not found: {scope}/{rel_path}"
+                    ))
+                } else {
+                    AppError::Internal(format!(
+                        "failed to read inbox proposal: {error}"
+                    ))
+                }
+            })?;
+        let metadata_abs = staged_proposal_metadata_path(&inbox_abs);
+        let current_base = match self.read_file(id, rel_path).await {
+            Ok(file) => Some(file.content),
+            Err(AppError::NotFound(_)) => None,
+            Err(error) => return Err(error),
+        };
+        let proposal_hash = content_sha256(&content);
+        let already_merged = current_base
+            .as_ref()
+            .is_some_and(|current| content_sha256(current) == proposal_hash);
+        if !already_merged {
+            let metadata = self
+                .read_staged_proposal_metadata(
+                    id,
+                    &format!("{KB_INBOX_REL_DIR}/{scope}/{rel_path}"),
+                    &content,
+                )
+                .await?;
+            let base_matches = match (&metadata.base_sha256, &current_base) {
+                (None, None) => true,
+                (Some(expected), Some(current)) => {
+                    content_sha256(current) == *expected
+                }
+                _ => false,
+            };
+            if !base_matches {
+                return Err(AppError::Conflict(
+                    "the knowledge document changed after this proposal was staged; discard it and retry write-back before accepting"
+                        .into(),
+                ));
+            }
+            let base_abs = safe_md_path_bounded(root.clone(), rel_path.to_owned()).await?;
+            if let Some(expected) = current_base.as_deref() {
+                write_text_atomic_if_unchanged(&base_abs, expected, &content).await?;
+            } else {
+                write_text_atomic_if_absent(&base_abs, &content).await?;
+            }
+            self.invalidate_search_cache_path(&base_abs);
+        }
+        // Publish first; only then remove proposal + version metadata. A crash
+        // between these steps is recognized by `already_merged` above.
+        match tokio::fs::remove_file(&inbox_abs).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AppError::Internal(format!(
+                    "knowledge proposal was accepted but its review copy could not be removed; retry acceptance to finish cleanup: {error}"
+                )));
+            }
+        }
+        if let Err(error) = tokio::fs::remove_file(&metadata_abs).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %metadata_abs.display(),
+                %error,
+                "accepted knowledge proposal metadata could not be removed"
+            );
+        }
         if let Some(parent) = inbox_abs.parent() {
             prune_empty_inbox_dirs(&root.join(KB_INBOX_REL_DIR), parent.to_path_buf()).await;
         }
@@ -1477,12 +2119,31 @@ impl KnowledgeService {
     /// Discard a staged proposal (delete the inbox copy + prune emptied dirs).
     pub async fn discard_inbox(&self, id: &str, scope: &str, rel_path: &str) -> Result<(), AppError> {
         let row = self.require_base(id).await?;
+        let _tree_guard =
+            self.acquire_document_tree_write_lock(&row).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+        self.require_base(id).await?;
         let root = PathBuf::from(&row.root_path);
         validate_inbox_scope(scope)?;
-        let inbox_abs = safe_md_path(&root, &format!("{KB_INBOX_REL_DIR}/{scope}/{rel_path}"))?;
+        let inbox_rel =
+            format!("{KB_INBOX_REL_DIR}/{scope}/{rel_path}");
+        let inbox_abs =
+            safe_md_path_bounded(root.clone(), inbox_rel).await?;
+        let metadata_abs = staged_proposal_metadata_path(&inbox_abs);
         tokio::fs::remove_file(&inbox_abs)
             .await
-            .map_err(|_| AppError::NotFound(format!("inbox proposal not found: {scope}/{rel_path}")))?;
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    AppError::NotFound(format!(
+                        "inbox proposal not found: {scope}/{rel_path}"
+                    ))
+                } else {
+                    AppError::Internal(format!(
+                        "failed to discard inbox proposal: {error}"
+                    ))
+                }
+            })?;
+        let _ = tokio::fs::remove_file(metadata_abs).await;
         if let Some(parent) = inbox_abs.parent() {
             prune_empty_inbox_dirs(&root.join(KB_INBOX_REL_DIR), parent.to_path_buf()).await;
         }
@@ -1547,9 +2208,9 @@ impl KnowledgeService {
 
     /// Resolve a model-supplied write target to a canonical document + op.
     /// `bound_kb_ids` scopes what the session may write to — a handle or path
-    /// pointing outside it is `Forbidden`. A `Path` whose basename matches
-    /// exactly one existing file elsewhere returns a `Conflict` suggesting the
-    /// handle, rather than silently creating a duplicate (the wrong-folder bug).
+    /// pointing outside it is `Forbidden`. Path resolution only inspects the
+/// requested ancestor chain; it never walks the entire vault, so an
+/// unrelated slow or unreadable subtree cannot make a write-back fail.
     pub async fn resolve_write_target(
         &self,
         bound_kb_ids: &[KnowledgeBaseId],
@@ -1562,9 +2223,28 @@ impl KnowledgeService {
                 if !bound_kb_ids.iter().any(|b| b == &kb_id) {
                     return Err(AppError::Forbidden("handle points to a base not mounted in this session".into()));
                 }
+                validate_canonical_write_target(&rel_path)?;
                 let row = self.require_base(kb_id.as_str()).await?;
-                let abs = safe_md_path(Path::new(&row.root_path), &rel_path)?;
-                if !tokio::fs::try_exists(&abs).await.unwrap_or(false) {
+                validate_source_owned_write_target(&row, &rel_path)?;
+                let abs = safe_md_path_bounded(PathBuf::from(&row.root_path), rel_path.clone())
+                    .await?;
+                let exists = tokio::time::timeout(
+                    KNOWLEDGE_PATH_INSPECTION_TIMEOUT,
+                    tokio::fs::try_exists(&abs),
+                )
+                .await
+                .map_err(|_| {
+                    AppError::Timeout(format!(
+                        "knowledge document inspection timed out: {rel_path}"
+                    ))
+                })?
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "failed to inspect knowledge document {}: {error}",
+                        abs.display()
+                    ))
+                })?;
+                if !exists {
                     return Err(AppError::NotFound(format!("document for handle no longer exists: {rel_path}")));
                 }
                 Ok(WriteResolution { kb_id, canonical_rel_path: rel_path, op: WriteOp::Update })
@@ -1574,28 +2254,34 @@ impl KnowledgeService {
                     return Err(AppError::Forbidden("target base is not mounted in this session".into()));
                 }
                 let canonical = deconfuse_rel_path(rel_path);
+                validate_canonical_write_target(&canonical)?;
                 let row = self.require_base(kb_id.as_str()).await?;
-                let abs = safe_md_path(Path::new(&row.root_path), &canonical)?;
-                if tokio::fs::try_exists(&abs).await.unwrap_or(false) {
-                    return Ok(WriteResolution { kb_id: kb_id.clone(), canonical_rel_path: canonical, op: WriteOp::Update });
+                validate_source_owned_write_target(&row, &canonical)?;
+                let root = PathBuf::from(&row.root_path);
+                // Validate traversal/portable components up front, including
+                // missing parents that the eventual create may need.
+                safe_md_path_bounded(
+                    root.clone(),
+                    canonical.clone(),
+                )
+                .await?;
+                let resolved_path = resolve_portable_md_path(
+                    PathBuf::from(&row.root_path),
+                    canonical,
+                )
+                .await?;
+                if resolved_path.exists {
+                    return Ok(WriteResolution {
+                        kb_id: kb_id.clone(),
+                        canonical_rel_path: resolved_path.rel_path,
+                        op: WriteOp::Update,
+                    });
                 }
-                // No exact match: a unique basename match elsewhere is almost
-                // certainly the intended update — suggest the handle, don't dupe.
-                let basename = canonical.rsplit('/').next().unwrap_or(&canonical).to_owned();
-                let files = self.list_files(kb_id.as_str()).await.unwrap_or_default();
-                let collisions: Vec<&KbFileEntry> = files
-                    .iter()
-                    .filter(|f| f.rel_path.rsplit('/').next().is_some_and(|n| n.eq_ignore_ascii_case(&basename)))
-                    .collect();
-                if collisions.len() == 1 {
-                    let existing = &collisions[0].rel_path;
-                    let handle = encode_doc_handle(kb_id, existing);
-                    return Err(AppError::Conflict(format!(
-                        "No document at \"{canonical}\". A document named \"{basename}\" already exists at \"{existing}\". \
-                         To UPDATE it, call knowledge_write with handle=\"{handle}\". To create a new file, choose a distinct rel_path."
-                    )));
-                }
-                Ok(WriteResolution { kb_id: kb_id.clone(), canonical_rel_path: canonical, op: WriteOp::Create })
+                Ok(WriteResolution {
+                    kb_id: kb_id.clone(),
+                    canonical_rel_path: resolved_path.rel_path,
+                    op: WriteOp::Create,
+                })
             }
         }
     }
@@ -1606,35 +2292,323 @@ impl KnowledgeService {
     /// staged = `_inbox/{scope}/{rel_path}` mirroring the original, which is left
     /// untouched), and writes atomically. All agent surfaces funnel here.
     pub async fn write_document(&self, req: WriteRequest) -> Result<WriteOutcome, AppError> {
-        if req.content.trim().is_empty() {
-            return Err(AppError::BadRequest("refusing to write empty knowledge content".into()));
-        }
-        if matches!(req.policy.mode, WriteMode::Disabled) {
-            return Err(AppError::Forbidden("write-back is disabled for this session".into()));
-        }
-        let mut res = self.resolve_write_target(&req.bound_kb_ids, &req.spec).await?;
-        let _direct_guard = if matches!(req.policy.mode, WriteMode::Direct) {
-            let guard = self
-                .acquire_turn_writeback_target_lock(&res.kb_id, &res.canonical_rel_path)
-                .await;
-            res = self.resolve_write_target(&req.bound_kb_ids, &req.spec).await?;
-            Some(guard)
-        } else {
-            None
+        validate_write_request(&req)?;
+        let target_kb_id = match &req.spec {
+            WriteTargetSpec::Path { kb_id, .. } => kb_id.clone(),
+            WriteTargetSpec::Handle(handle) => decode_doc_handle(handle)
+                .map(|(kb_id, _)| kb_id)
+                .ok_or_else(|| {
+                    AppError::BadRequest(format!(
+                        "invalid document handle: {handle}"
+                    ))
+                })?,
         };
+        let row = self.require_base(target_kb_id.as_str()).await?;
+        let _tree_guard = self.acquire_document_tree_read_lock(&row).await?;
+        let res = self.resolve_write_target(&req.bound_kb_ids, &req.spec).await?;
+        let lock_path = portable_turn_writeback_lock_path(&res.canonical_rel_path);
+        let _guard = self
+            .acquire_turn_writeback_target_lock(&res.kb_id, &lock_path)
+            .await?;
+        self.write_resolved_document_under_target_lock(req, res, None)
+            .await
+    }
+
+    async fn write_resolved_document_under_target_lock(
+        &self,
+        req: WriteRequest,
+        res: WriteResolution,
+        staged_base_snapshot: Option<StagedBaseSnapshot>,
+    ) -> Result<WriteOutcome, AppError> {
+        validate_write_request(&req)?;
+        validate_canonical_write_target(&res.canonical_rel_path)?;
+        let row = self.require_base(res.kb_id.as_str()).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+        let current = self.require_base(res.kb_id.as_str()).await?;
+        if current.root_path != row.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while write-back was starting; retry"
+                    .into(),
+            ));
+        }
+        validate_source_owned_write_target(
+            &current,
+            &res.canonical_rel_path,
+        )?;
+        drop(_base_guard);
         if res.op == WriteOp::Create && !req.policy.allow_create {
             return Err(AppError::Forbidden("creating new knowledge documents is not allowed for this session".into()));
         }
-        let (final_rel_path, staged) = match &req.policy.mode {
+        let (mut final_rel_path, staged) = match &req.policy.mode {
             WriteMode::Staged { scope } => (
                 format!("{KB_INBOX_REL_DIR}/{}/{}", scope.trim_matches('/'), res.canonical_rel_path),
                 true,
             ),
             WriteMode::Direct => (res.canonical_rel_path.clone(), false),
-            WriteMode::Disabled => unreachable!("disabled handled above"),
+            WriteMode::Disabled => unreachable!("disabled handled by validate_write_request"),
         };
-        self.write_file(res.kb_id.as_str(), &final_rel_path, &req.content).await?;
+        if staged {
+            let row = self.require_base(res.kb_id.as_str()).await?;
+            let resolved_proposal = resolve_portable_md_path(
+                PathBuf::from(&row.root_path),
+                final_rel_path.clone(),
+            )
+            .await?;
+            final_rel_path = resolved_proposal.rel_path;
+            match self.read_file(res.kb_id.as_str(), &final_rel_path).await {
+                Ok(existing)
+                    if markdown_identity(&existing.content)
+                        == markdown_identity(&req.content) =>
+                {
+                    self.require_valid_staged_proposal_metadata(
+                        res.kb_id.as_str(),
+                        &final_rel_path,
+                        &existing.content,
+                    )
+                    .await?;
+                    return Ok(WriteOutcome {
+                        kb_id: res.kb_id,
+                        final_rel_path,
+                        op: res.op,
+                        staged: true,
+                    });
+                }
+                Ok(_) => {
+                    return Err(AppError::Conflict(format!(
+                        "a different pending review proposal already targets {}",
+                        res.canonical_rel_path
+                    )));
+                }
+                Err(AppError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+
+            let base_snapshot = match staged_base_snapshot {
+                Some(snapshot) => snapshot,
+                None => self
+                    .capture_staged_base_snapshot(
+                        res.kb_id.as_str(),
+                        &res.canonical_rel_path,
+                        res.op,
+                    )
+                    .await?,
+            };
+            self.ensure_staged_base_snapshot_is_current(
+                res.kb_id.as_str(),
+                &res.canonical_rel_path,
+                &base_snapshot,
+            )
+            .await?;
+            self.write_staged_proposal_metadata(
+                res.kb_id.as_str(),
+                &final_rel_path,
+                &base_snapshot,
+                &req.content,
+            )
+            .await?;
+            if let Err(error) = self.write_file_if_absent(
+                res.kb_id.as_str(),
+                &final_rel_path,
+                &res.canonical_rel_path,
+                &req.content,
+            )
+            .await
+            {
+                self.remove_staged_proposal_metadata(
+                    res.kb_id.as_str(),
+                    &final_rel_path,
+                )
+                .await;
+                return Err(error);
+            }
+        } else if res.op == WriteOp::Create {
+            self.write_file_if_absent(
+                res.kb_id.as_str(),
+                &final_rel_path,
+                &res.canonical_rel_path,
+                &req.content,
+            )
+            .await?;
+        } else {
+            self.write_file_under_target_lock(
+                res.kb_id.as_str(),
+                &final_rel_path,
+                Some(&res.canonical_rel_path),
+                &req.content,
+            )
+            .await?;
+        }
         Ok(WriteOutcome { kb_id: res.kb_id, final_rel_path, op: res.op, staged })
+    }
+
+    async fn capture_staged_base_snapshot(
+        &self,
+        id: &str,
+        rel_path: &str,
+        op: WriteOp,
+    ) -> Result<StagedBaseSnapshot, AppError> {
+        match self.read_file(id, rel_path).await {
+            Ok(_file) if op == WriteOp::Create => Err(AppError::Conflict(format!(
+                "knowledge document appeared while the staged write was preparing: {rel_path}"
+            ))),
+            Ok(file) => Ok(StagedBaseSnapshot::Content(file.content)),
+            Err(AppError::NotFound(_)) if op == WriteOp::Update => {
+                Err(AppError::Conflict(format!(
+                    "knowledge document disappeared while the staged write was preparing: {rel_path}"
+                )))
+            }
+            Err(AppError::NotFound(_)) => Ok(StagedBaseSnapshot::Missing),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn ensure_staged_base_snapshot_is_current(
+        &self,
+        id: &str,
+        rel_path: &str,
+        snapshot: &StagedBaseSnapshot,
+    ) -> Result<(), AppError> {
+        match (snapshot, self.read_file(id, rel_path).await) {
+            (StagedBaseSnapshot::Missing, Err(AppError::NotFound(_))) => Ok(()),
+            (StagedBaseSnapshot::Content(expected), Ok(current))
+                if current.content.as_bytes() == expected.as_bytes() =>
+            {
+                Ok(())
+            }
+            (StagedBaseSnapshot::Missing, Ok(_))
+            | (StagedBaseSnapshot::Content(_), Err(AppError::NotFound(_)))
+            | (StagedBaseSnapshot::Content(_), Ok(_)) => Err(AppError::Conflict(format!(
+                "knowledge document changed while the staged write was preparing; retry against the latest content: {rel_path}"
+            ))),
+            (_, Err(error)) => Err(error),
+        }
+    }
+
+    async fn staged_proposal_paths(
+        &self,
+        id: &str,
+        proposal_rel_path: &str,
+    ) -> Result<(PathBuf, PathBuf), AppError> {
+        let row = self.require_base(id).await?;
+        let proposal_path = safe_md_path_bounded(
+            PathBuf::from(&row.root_path),
+            proposal_rel_path.to_owned(),
+        )
+        .await?;
+        let metadata_path = staged_proposal_metadata_path(&proposal_path);
+        Ok((proposal_path, metadata_path))
+    }
+
+    async fn read_staged_proposal_metadata(
+        &self,
+        id: &str,
+        proposal_rel_path: &str,
+        proposal_content: &str,
+    ) -> Result<StagedProposalMetadata, AppError> {
+        let (_, metadata_path) =
+            self.staged_proposal_paths(id, proposal_rel_path).await?;
+        let raw =
+            tokio::time::timeout(
+                KNOWLEDGE_FILE_IO_TIMEOUT,
+                tokio::fs::read_to_string(&metadata_path),
+            )
+                .await
+                .map_err(|_| {
+                    AppError::Timeout(
+                        "review proposal base-version metadata read timed out"
+                            .into(),
+                    )
+                })?
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        AppError::Conflict(
+                            "this review proposal has no safe base version; discard it and retry the knowledge write-back"
+                                .into(),
+                        )
+                    } else {
+                        AppError::Internal(format!(
+                            "failed to read review proposal base-version metadata: {error}"
+                        ))
+                    }
+                })?;
+        let metadata: StagedProposalMetadata =
+            serde_json::from_str(&raw).map_err(|_| {
+                AppError::Conflict(
+                    "this review proposal has invalid base-version metadata; discard it and retry the knowledge write-back"
+                        .into(),
+                )
+            })?;
+        if metadata.version != 1
+            || metadata.proposal_sha256 != content_sha256(proposal_content)
+        {
+            return Err(AppError::Conflict(
+                "this review proposal changed after it was staged; discard it and retry the knowledge write-back"
+                    .into(),
+            ));
+        }
+        Ok(metadata)
+    }
+
+    async fn require_valid_staged_proposal_metadata(
+        &self,
+        id: &str,
+        proposal_rel_path: &str,
+        proposal_content: &str,
+    ) -> Result<(), AppError> {
+        self.read_staged_proposal_metadata(id, proposal_rel_path, proposal_content)
+            .await
+            .map(|_| ())
+    }
+
+    async fn write_staged_proposal_metadata(
+        &self,
+        id: &str,
+        proposal_rel_path: &str,
+        base_snapshot: &StagedBaseSnapshot,
+        proposal_content: &str,
+    ) -> Result<(), AppError> {
+        let row = self.require_base(id).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+        let current = self.require_base(id).await?;
+        if current.root_path != row.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while write-back was starting; retry".into(),
+            ));
+        }
+        let proposal_path = safe_md_path_bounded(
+            PathBuf::from(&row.root_path),
+            proposal_rel_path.to_owned(),
+        )
+        .await?;
+        let metadata_path = staged_proposal_metadata_path(&proposal_path);
+        let metadata = StagedProposalMetadata {
+            version: 1,
+            base_sha256: match base_snapshot {
+                StagedBaseSnapshot::Missing => None,
+                StagedBaseSnapshot::Content(content) => {
+                    Some(content_sha256(content))
+                }
+            },
+            proposal_sha256: content_sha256(proposal_content),
+        };
+        let encoded = serde_json::to_string(&metadata).map_err(|error| {
+            AppError::Internal(format!(
+                "failed to encode staged proposal metadata: {error}"
+            ))
+        })?;
+        write_text_atomic(&metadata_path, &encoded).await
+    }
+
+    async fn remove_staged_proposal_metadata(
+        &self,
+        id: &str,
+        proposal_rel_path: &str,
+    ) {
+        if let Ok((_, metadata_path)) =
+            self.staged_proposal_paths(id, proposal_rel_path).await
+        {
+            let _ = tokio::fs::remove_file(metadata_path).await;
+        }
     }
 
     /// Run the turn-final write-back trigger after an assistant answer has been
@@ -1659,6 +2633,11 @@ impl KnowledgeService {
         if req.mounts.is_empty() {
             return TurnWritebackReport::status(TurnWritebackStatus::Disabled);
         }
+        if turn_writeback_is_cancelled(&req) {
+            return TurnWritebackReport::failed(
+                "knowledge write-back was cancelled because the conversation changed",
+            );
+        }
 
         let policy = resolve_write_policy(req.surface, &req.binding, &req.scope);
         if matches!(policy.mode, WriteMode::Disabled) {
@@ -1674,8 +2653,9 @@ impl KnowledgeService {
         };
         progress(TurnWritebackPhase::Extracting).await;
 
-        let redacted_user = nomi_redact::redact_secrets_owned(req.user_text);
-        let redacted_assistant = nomi_redact::redact_secrets_owned(req.assistant_text);
+        let redacted_user = nomi_redact::redact_secrets_owned(req.user_text.clone());
+        let redacted_assistant =
+            nomi_redact::redact_secrets_owned(req.assistant_text.clone());
         let eagerness = crate::context::WritebackEagerness::parse(Some(req.binding.writeback_eagerness.as_str()));
         let prompt = crate::turn_writeback::build_turn_writeback_prompt(
             &req.mounts,
@@ -1684,45 +2664,54 @@ impl KnowledgeService {
             &redacted_assistant,
         );
 
-        let mut parsed = None;
-        let mut last_parse_error = None;
-        for _ in 0..2 {
-            let raw = match complete_turn_writeback_llm(
-                &completer,
-                crate::turn_writeback::TURN_WRITEBACK_SYSTEM,
-                &prompt,
-                "extract",
-            )
-            .await
-            {
-                Ok(raw) => raw,
-                Err(e) => {
-                    tracing::debug!(error = %e, "turn writeback provider call failed");
-                    return TurnWritebackReport::failed(e);
+        let completion = complete_turn_writeback_llm(
+            &completer,
+            req.model.as_ref(),
+            crate::turn_writeback::TURN_WRITEBACK_SYSTEM,
+            &prompt,
+            "extract",
+        );
+        let completion_result = if let Some(cancellation) = req.cancellation.as_ref() {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    Err("knowledge write-back was cancelled because the conversation changed".to_owned())
                 }
-            };
-
-            match crate::turn_writeback::parse_turn_writeback_output(&raw) {
-                Ok(out) => {
-                    parsed = Some(out);
-                    break;
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "turn writeback output unparseable");
-                    last_parse_error = Some(e);
-                }
+                result = completion => result,
             }
-        }
-
-        let Some(out) = parsed else {
+        } else {
+            completion.await
+        };
+        let raw = match completion_result {
+            Ok(raw) => raw,
+            Err(e) => {
+                tracing::debug!(error = %e, "turn writeback provider call failed");
+                return TurnWritebackReport::failed(e);
+            }
+        };
+        if turn_writeback_is_cancelled(&req) {
             return TurnWritebackReport::failed(
-                last_parse_error.unwrap_or_else(|| "turn writeback output unparseable".to_owned()),
+                "knowledge write-back was cancelled because the conversation changed",
             );
+        }
+        let out = match crate::turn_writeback::parse_turn_writeback_output(&raw) {
+            Ok(out) => out,
+            Err(e) => {
+                tracing::debug!(error = %e, "turn writeback output unparseable");
+                return TurnWritebackReport::failed(e);
+            }
         };
 
         let candidate_count = out.candidates.len();
         if candidate_count == 0 {
             return TurnWritebackReport::status(TurnWritebackStatus::NoCandidate);
+        }
+        if candidate_count > TURN_WRITEBACK_MAX_CANDIDATES {
+            let mut report = TurnWritebackReport::failed(format!(
+                "turn writeback produced {candidate_count} candidates; maximum is {TURN_WRITEBACK_MAX_CANDIDATES}"
+            ));
+            report.candidates = candidate_count;
+            return report;
         }
         progress(TurnWritebackPhase::Writing).await;
 
@@ -1730,13 +2719,37 @@ impl KnowledgeService {
             req.mounts.iter().map(|m| m.knowledge_base_id.clone()).collect();
         let bound_kb_ids: Vec<KnowledgeBaseId> =
             req.mounts.iter().map(|m| m.knowledge_base_id.clone()).collect();
+        let excluded_targets = req.excluded_targets.as_ref().map(|targets| {
+            targets
+                .iter()
+                .map(|(kb_id, rel_path)| {
+                    (
+                        kb_id.clone(),
+                        portable_turn_writeback_lock_path(rel_path),
+                    )
+                })
+                .collect::<HashSet<_>>()
+        });
         let mut seen = HashSet::new();
         let mut written = Vec::new();
         let mut failures = Vec::new();
-
+        let mut accepted_chars = 0usize;
         for candidate in out.candidates {
+            if turn_writeback_is_cancelled(&req) {
+                failures.push(TurnWritebackFailure {
+                    kb_id: None,
+                    rel_path: None,
+                    error:
+                        "knowledge write-back was cancelled because the conversation changed"
+                            .into(),
+                });
+                break;
+            }
             let kb_id = candidate.kb_id;
-            let rel_path = candidate.rel_path.trim().trim_start_matches("./").to_owned();
+            // Canonicalize the mount-prefixed spelling before every policy
+            // check. Otherwise `.nomi/knowledge/<mount>/_inbox/x.md` can hide
+            // an inbox target until after the rejection boundary.
+            let rel_path = deconfuse_rel_path(candidate.rel_path.trim());
             let content = candidate.content.trim();
 
             if rel_path.is_empty() || content.is_empty() {
@@ -1744,6 +2757,17 @@ impl KnowledgeService {
                     kb_id: Some(kb_id),
                     rel_path: if rel_path.is_empty() { None } else { Some(rel_path) },
                     error: "candidate must include kb_id, rel_path and content".into(),
+                });
+                continue;
+            }
+            let content_chars = content.chars().count();
+            if content_chars > TURN_WRITEBACK_MAX_CANDIDATE_CHARS
+                || accepted_chars.saturating_add(content_chars) > TURN_WRITEBACK_MAX_TOTAL_CHARS
+            {
+                failures.push(TurnWritebackFailure {
+                    kb_id: Some(kb_id),
+                    rel_path: Some(rel_path),
+                    error: "candidate content exceeds the bounded write-back size".into(),
                 });
                 continue;
             }
@@ -1755,8 +2779,16 @@ impl KnowledgeService {
                 });
                 continue;
             }
-            let normalized_rel_path = rel_path.replace('\\', "/");
-            if normalized_rel_path == KB_INBOX_REL_DIR || normalized_rel_path.starts_with("_inbox/") {
+            if rel_path
+                .split('/')
+                .next()
+                .is_some_and(|component| {
+                    portable_path_component_identity(component)
+                        == portable_path_component_identity(
+                            KB_INBOX_REL_DIR,
+                        )
+                })
+            {
                 failures.push(TurnWritebackFailure {
                     kb_id: Some(kb_id),
                     rel_path: Some(rel_path),
@@ -1764,28 +2796,72 @@ impl KnowledgeService {
                 });
                 continue;
             }
-            if !seen.insert((kb_id.clone(), rel_path.clone())) {
-                continue;
-            }
+            accepted_chars += content_chars;
 
+            let row = match self.require_base(kb_id.as_str()).await {
+                Ok(row) => row,
+                Err(error) => {
+                    failures.push(TurnWritebackFailure {
+                        kb_id: Some(kb_id),
+                        rel_path: Some(rel_path),
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let _tree_guard = match self.acquire_document_tree_read_lock(&row).await {
+                Ok(guard) => guard,
+                Err(error) => {
+                    failures.push(TurnWritebackFailure {
+                        kb_id: Some(kb_id),
+                        rel_path: Some(rel_path),
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
             let mut content = nomi_redact::redact_secrets_owned(content.to_owned());
             let spec = WriteTargetSpec::Path { kb_id: kb_id.clone(), rel_path: rel_path.clone() };
+            let resolution = match self.resolve_write_target(&bound_kb_ids, &spec).await {
+                Ok(resolution) => resolution,
+                Err(error) => {
+                    failures.push(TurnWritebackFailure {
+                        kb_id: Some(kb_id),
+                        rel_path: Some(rel_path),
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let portable_lock_path =
+                portable_turn_writeback_lock_path(&resolution.canonical_rel_path);
+            if excluded_targets
+                .as_ref()
+                .is_some_and(|targets| {
+                    targets.contains(&(kb_id.clone(), portable_lock_path.clone()))
+                })
+            {
+                continue;
+            }
+            if !seen.insert((kb_id.clone(), portable_lock_path.clone())) {
+                continue;
+            }
+            let _candidate_guard = match self
+                .acquire_turn_writeback_target_lock(&kb_id, &portable_lock_path)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    failures.push(TurnWritebackFailure {
+                        kb_id: Some(kb_id),
+                        rel_path: Some(rel_path),
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
             if matches!(policy.mode, WriteMode::Direct) {
-                let canonical_lock_path = deconfuse_rel_path(&rel_path);
-                let _direct_guard = self
-                    .acquire_turn_writeback_target_lock(&kb_id, &canonical_lock_path)
-                    .await;
-                let resolution = match self.resolve_write_target(&bound_kb_ids, &spec).await {
-                    Ok(resolution) => resolution,
-                    Err(e) => {
-                        failures.push(TurnWritebackFailure {
-                            kb_id: Some(kb_id),
-                            rel_path: Some(rel_path),
-                            error: e.to_string(),
-                        });
-                        continue;
-                    }
-                };
+                let mut expected_existing = None;
                 if resolution.op == WriteOp::Update {
                     let existing = match self.read_file(kb_id.as_str(), &resolution.canonical_rel_path).await {
                         Ok(file) => file.content,
@@ -1798,30 +2874,54 @@ impl KnowledgeService {
                             continue;
                         }
                     };
-                    if existing.trim() == content.trim() {
+                    if markdown_identity(&existing) == markdown_identity(&content) {
                         continue;
                     }
-                    match self.merge_direct_turn_writeback(&completer, &existing, &content).await {
-                        Ok(merged) => content = merged,
-                        Err(e) => {
-                            failures.push(TurnWritebackFailure {
-                                kb_id: Some(kb_id),
-                                rel_path: Some(resolution.canonical_rel_path),
-                                error: e,
-                            });
-                            continue;
-                        }
+                    content = merge_direct_turn_writeback(&existing, &content);
+                    if markdown_identity(&existing) == markdown_identity(&content) {
+                        continue;
                     }
+                    expected_existing = Some(existing);
                 }
 
                 let final_rel_path = resolution.canonical_rel_path.clone();
-                match self.write_file(kb_id.as_str(), &final_rel_path, &content).await {
-                    Ok(()) => written.push(WriteOutcome {
-                        kb_id,
-                        final_rel_path,
-                        op: resolution.op,
-                        staged: false,
-                    }),
+                if turn_writeback_is_cancelled(&req) {
+                    failures.push(TurnWritebackFailure {
+                        kb_id: Some(kb_id),
+                        rel_path: Some(final_rel_path),
+                        error:
+                            "knowledge write-back was cancelled because the conversation changed"
+                                .into(),
+                    });
+                    break;
+                }
+                let write_result = if let Some(expected) = expected_existing.as_deref() {
+                    self.write_file_if_unchanged(
+                        kb_id.as_str(),
+                        &final_rel_path,
+                        &final_rel_path,
+                        expected,
+                        &content,
+                    )
+                    .await
+                } else {
+                    self.write_file_if_absent(
+                        kb_id.as_str(),
+                        &final_rel_path,
+                        &final_rel_path,
+                        &content,
+                    )
+                    .await
+                };
+                match write_result {
+                    Ok(()) => {
+                        written.push(WriteOutcome {
+                            kb_id,
+                            final_rel_path,
+                            op: resolution.op,
+                            staged: false,
+                        });
+                    }
                     Err(e) => failures.push(TurnWritebackFailure {
                         kb_id: Some(kb_id),
                         rel_path: Some(final_rel_path),
@@ -1831,19 +2931,34 @@ impl KnowledgeService {
                 continue;
             }
 
-            let resolution = match self.resolve_write_target(&bound_kb_ids, &spec).await {
-                Ok(resolution) => resolution,
-                Err(e) => {
-                    failures.push(TurnWritebackFailure {
-                        kb_id: Some(kb_id),
-                        rel_path: Some(rel_path),
-                        error: e.to_string(),
-                    });
+            let staged_base_snapshot = if resolution.op == WriteOp::Update {
+                let existing = match self
+                    .read_file(kb_id.as_str(), &resolution.canonical_rel_path)
+                    .await
+                {
+                    Ok(file) => file.content,
+                    Err(e) => {
+                        failures.push(TurnWritebackFailure {
+                            kb_id: Some(kb_id),
+                            rel_path: Some(resolution.canonical_rel_path),
+                            error: e.to_string(),
+                        });
+                        continue;
+                    }
+                };
+                if markdown_identity(&existing) == markdown_identity(&content) {
                     continue;
                 }
+                content = merge_direct_turn_writeback(&existing, &content);
+                if markdown_identity(&existing) == markdown_identity(&content) {
+                    continue;
+                }
+                StagedBaseSnapshot::Content(existing)
+            } else {
+                StagedBaseSnapshot::Missing
             };
 
-            let mut write_rel_path = resolution.canonical_rel_path.clone();
+            let write_rel_path = resolution.canonical_rel_path.clone();
             if let WriteMode::Staged { scope } = &policy.mode {
                 match self
                     .staged_turn_writeback_candidate_already_present(
@@ -1865,25 +2980,6 @@ impl KnowledgeService {
                         continue;
                     }
                 }
-                match self
-                    .staged_turn_writeback_rel_path_without_overwrite(
-                        &kb_id,
-                        scope,
-                        &resolution.canonical_rel_path,
-                        &content,
-                    )
-                    .await
-                {
-                    Ok(rel_path) => write_rel_path = rel_path,
-                    Err(e) => {
-                        failures.push(TurnWritebackFailure {
-                            kb_id: Some(kb_id),
-                            rel_path: Some(resolution.canonical_rel_path),
-                            error: e,
-                        });
-                        continue;
-                    }
-                }
             }
 
             let write = WriteRequest {
@@ -1892,7 +2988,32 @@ impl KnowledgeService {
                 policy: policy.clone(),
                 bound_kb_ids: bound_kb_ids.clone(),
             };
-            match self.write_document(write).await {
+            if turn_writeback_is_cancelled(&req) {
+                failures.push(TurnWritebackFailure {
+                    kb_id: Some(kb_id),
+                    rel_path: Some(rel_path),
+                    error:
+                        "knowledge write-back was cancelled because the conversation changed"
+                            .into(),
+                });
+                break;
+            }
+            let write_resolution = WriteResolution {
+                kb_id: resolution.kb_id,
+                canonical_rel_path: match &write.spec {
+                    WriteTargetSpec::Path { rel_path, .. } => rel_path.clone(),
+                    WriteTargetSpec::Handle(_) => unreachable!("turn write-back stages by path"),
+                },
+                op: resolution.op,
+            };
+            match self
+                .write_resolved_document_under_target_lock(
+                    write,
+                    write_resolution,
+                    Some(staged_base_snapshot),
+                )
+                .await
+            {
                 Ok(outcome) => written.push(outcome),
                 Err(e) => failures.push(TurnWritebackFailure {
                     kb_id: Some(kb_id),
@@ -1916,8 +3037,15 @@ impl KnowledgeService {
         &self,
         kb_id: &KnowledgeBaseId,
         rel_path: &str,
-    ) -> OwnedMutexGuard<()> {
-        let key = format!("{kb_id}\0{rel_path}");
+    ) -> Result<OwnedMutexGuard<()>, AppError> {
+        let row = self.require_base(kb_id.as_str()).await?;
+        let root_identity = self.canonical_root_lock_key(&row).await?;
+        let rel_identity = portable_turn_writeback_lock_path(rel_path);
+        let key = if rel_identity.is_empty() {
+            root_identity
+        } else {
+            format!("{root_identity}/{rel_identity}")
+        };
         let lock = {
             let mut locks = self
                 .turn_writeback_locks
@@ -1932,39 +3060,94 @@ impl KnowledgeService {
                 lock
             }
         };
-        lock.lock_owned().await
+        Ok(lock.lock_owned().await)
     }
 
-    async fn merge_direct_turn_writeback(
+    async fn acquire_base_lifecycle_lock(
         &self,
-        completer: &Arc<dyn KnowledgeCompleter>,
-        existing: &str,
-        proposal: &str,
-    ) -> Result<String, String> {
-        if existing.trim() == proposal.trim() {
-            return Ok(proposal.to_owned());
+        row: &KnowledgeBaseRow,
+    ) -> Result<Vec<OwnedRwLockReadGuard<()>>, AppError> {
+        let key = self.canonical_root_lock_key(row).await?;
+        let locks = root_group_locks(&self.base_lifecycle_locks, key);
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in locks {
+            guards.push(lock.read_owned().await);
         }
+        Ok(guards)
+    }
 
-        let prompt = crate::turn_writeback::build_turn_writeback_merge_prompt(existing, proposal);
-        let raw = complete_turn_writeback_llm(
-            completer,
-            crate::turn_writeback::TURN_WRITEBACK_MERGE_SYSTEM,
-            &prompt,
-            "merge",
-        )
-        .await?;
-        let out = crate::turn_writeback::parse_turn_writeback_merge_output(&raw)?;
-        let merged = nomi_redact::redact_secrets_owned(out.content.trim().to_owned());
-        if merged.trim().is_empty() {
-            return Err("turn writeback merge produced empty content".into());
+    async fn acquire_base_lifecycle_write_lock(
+        &self,
+        row: &KnowledgeBaseRow,
+    ) -> Result<Vec<OwnedRwLockWriteGuard<()>>, AppError> {
+        let key = self.canonical_root_lock_key(row).await?;
+        let locks = root_group_locks(&self.base_lifecycle_locks, key);
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in locks {
+            guards.push(lock.write_owned().await);
         }
-        if !existing.trim().is_empty()
-            && existing.trim() != proposal.trim()
-            && merged.trim() == proposal.trim()
+        Ok(guards)
+    }
+
+    async fn acquire_document_tree_read_lock(
+        &self,
+        row: &KnowledgeBaseRow,
+    ) -> Result<Vec<OwnedRwLockReadGuard<()>>, AppError> {
+        let key = self.canonical_root_lock_key(row).await?;
+        let locks = root_group_locks(&self.document_tree_locks, key);
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in locks {
+            guards.push(lock.read_owned().await);
+        }
+        Ok(guards)
+    }
+
+    async fn acquire_document_tree_write_lock(
+        &self,
+        row: &KnowledgeBaseRow,
+    ) -> Result<Vec<OwnedRwLockWriteGuard<()>>, AppError> {
+        let key = self.canonical_root_lock_key(row).await?;
+        let locks = root_group_locks(&self.document_tree_locks, key);
+        let mut guards = Vec::with_capacity(locks.len());
+        for lock in locks {
+            guards.push(lock.write_owned().await);
+        }
+        Ok(guards)
+    }
+
+    async fn canonical_root_lock_key(
+        &self,
+        row: &KnowledgeBaseRow,
+    ) -> Result<String, AppError> {
+        let cache_key = format!(
+            "{}\0{}",
+            row.knowledge_base_id, row.root_path
+        );
+        if let Some(identity) = self
+            .root_lock_identity_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&cache_key)
+            .cloned()
         {
-            return Err("turn writeback merge refused because it would overwrite the existing document".into());
+            return Ok(identity);
         }
-        Ok(merged)
+        // Validate the first lock-key resolution. Later mutations still
+        // perform a no-follow root/path validation at their publication
+        // boundary; re-walking every root ancestor for each tree, target and
+        // lifecycle lock acquisition made one NAS candidate pay the same
+        // latency many times.
+        validate_knowledge_root_bounded(PathBuf::from(&row.root_path)).await?;
+        // Registration persists a canonical physical path, so after the
+        // no-link chain validation above the lexical path is the lock
+        // identity. Avoid a second potentially slow NAS canonicalization.
+        let identity =
+            portable_absolute_path_identity(Path::new(&row.root_path));
+        self.root_lock_identity_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(cache_key, identity.clone());
+        Ok(identity)
     }
 
     async fn staged_turn_writeback_candidate_already_present(
@@ -1975,67 +3158,57 @@ impl KnowledgeService {
         content: &str,
     ) -> Result<bool, String> {
         let scope = scope.trim_matches('/');
-        let mut scopes = vec![scope.to_owned()];
-        if let Some((root_scope, _)) = scope.split_once('/') {
-            if !root_scope.is_empty() {
-                scopes.push(root_scope.to_owned());
-            }
+        let requested =
+            format!("{KB_INBOX_REL_DIR}/{scope}/{canonical_rel_path}");
+        let row = self
+            .require_base(kb_id.as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        let resolved = resolve_portable_md_path(
+            PathBuf::from(&row.root_path),
+            requested,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        if !resolved.exists {
+            return Ok(false);
         }
-        scopes.sort();
-        scopes.dedup();
-
-        for scope in scopes {
-            let inbox_rel_path = format!("{KB_INBOX_REL_DIR}/{scope}/{canonical_rel_path}");
-            match self.read_file(kb_id.as_str(), &inbox_rel_path).await {
-                Ok(existing) if existing.content == content => return Ok(true),
-                Ok(_) | Err(AppError::NotFound(_)) => {}
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-        Ok(false)
-    }
-
-    async fn staged_turn_writeback_rel_path_without_overwrite(
-        &self,
-        kb_id: &KnowledgeBaseId,
-        scope: &str,
-        canonical_rel_path: &str,
-        content: &str,
-    ) -> Result<String, String> {
-        let scope = scope.trim_matches('/');
-        let inbox_rel_path = format!("{KB_INBOX_REL_DIR}/{scope}/{canonical_rel_path}");
+        let inbox_rel_path = resolved.rel_path;
         match self.read_file(kb_id.as_str(), &inbox_rel_path).await {
-            Ok(existing) if existing.content == content => return Ok(canonical_rel_path.to_owned()),
-            Ok(_) => {}
-            Err(AppError::NotFound(_)) => return Ok(canonical_rel_path.to_owned()),
+            Ok(existing)
+                if markdown_identity(&existing.content) == markdown_identity(content) =>
+            {
+                self.require_valid_staged_proposal_metadata(
+                    kb_id.as_str(),
+                    &inbox_rel_path,
+                    &existing.content,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                return Ok(true);
+            }
+            Ok(_) | Err(AppError::NotFound(_)) => {}
             Err(e) => return Err(e.to_string()),
         }
 
-        let suffix = short_content_hash(content);
-        for attempt in 1..=100 {
-            let candidate_rel_path = if attempt == 1 {
-                append_markdown_path_suffix(canonical_rel_path, &suffix)
-            } else {
-                append_markdown_path_suffix(canonical_rel_path, &format!("{suffix}-{attempt}"))
-            };
-            let candidate_inbox_rel_path = format!("{KB_INBOX_REL_DIR}/{scope}/{candidate_rel_path}");
-            match self.read_file(kb_id, &candidate_inbox_rel_path).await {
-                Ok(existing) if existing.content == content => return Ok(candidate_rel_path),
-                Ok(_) => continue,
-                Err(AppError::NotFound(_)) => return Ok(candidate_rel_path),
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-
-        Err("unable to allocate a non-overwriting staged writeback path".into())
+        Ok(false)
     }
 
     pub async fn delete_file(&self, id: &str, rel_path: &str) -> Result<(), AppError> {
         let row = self.require_base(id).await?;
-        let path = safe_md_path(Path::new(&row.root_path), rel_path)?;
+        let _tree_guard =
+            self.acquire_document_tree_write_lock(&row).await?;
+        let _base_guard = self.acquire_base_lifecycle_lock(&row).await?;
+        self.require_base(id).await?;
+        let path = safe_md_path_bounded(
+            PathBuf::from(&row.root_path),
+            rel_path.to_owned(),
+        )
+        .await?;
         tokio::fs::remove_file(&path)
             .await
             .map_err(|_| AppError::NotFound(format!("file not found: {rel_path}")))?;
+        self.invalidate_search_cache_path(&path);
         Ok(())
     }
 
@@ -2109,15 +3282,24 @@ impl KnowledgeService {
 
         let mut readme_written = false;
         if !readme.is_empty() {
-            // Case-insensitive existence check: on case-sensitive filesystems
-            // an existing `readme.md` must count as "README exists" (and be
-            // overwritten in place) — never get a parallel `README.md`.
-            let existing = find_readme_path(&root).await;
-            if overwrite_readme || existing.is_none() {
-                let readme_path = existing.unwrap_or_else(|| root.join("README.md"));
-                write_text_atomic(&readme_path, &format!("{readme}\n")).await?;
-                readme_written = true;
-            }
+            let content = format!("{readme}\n");
+            readme_written = if overwrite_readme {
+                // `write_file` resolves case/Unicode aliases under the same
+                // portable target lock, so an existing `readme.md` is
+                // overwritten in place rather than shadowed by `README.md`.
+                self.write_file(kb_id, "README.md", &content).await?;
+                true
+            } else {
+                // The absence check and publication are one locked,
+                // no-clobber operation. A concurrent write-back therefore
+                // always wins and is preserved.
+                self.write_file_if_portably_absent(
+                    kb_id,
+                    "README.md",
+                    &content,
+                )
+                .await?
+            };
         }
 
         let keep_description =
@@ -2214,20 +3396,21 @@ impl KnowledgeService {
             return Err(AppError::BadRequest("URL source has no entries".into()));
         }
 
-        let root = PathBuf::from(&row.root_path);
-        let (fetched, errors) = self.fetch_source_snapshots(&root, &mut source.entries).await;
-        // Align with the create path: only a run that actually wrote a
-        // snapshot may claim a fresh stamp — after a fully-failed refresh
-        // the snapshots on disk are still the old ones.
-        if fetched > 0 {
-            source.last_fetched_at = Some(now_ms());
+        let (files, mut errors) =
+            self.prepare_source_snapshots(&mut source.entries).await;
+        let publication = self
+            .publish_prepared_url_source(
+                &mut row,
+                &mut source,
+                files,
+                true,
+            )
+            .await;
+        errors.extend(publication.errors);
+        if let Some(error) = publication.fatal_error {
+            return Err(error);
         }
-        self.persist_source(&mut row, &source).await?;
-        // The entry list may have shrunk since the snapshots were written —
-        // sweep snapshot files whose frontmatter source_url no longer matches
-        // any configured entry. User-authored files (no source_url
-        // frontmatter) are never touched.
-        prune_orphan_snapshots(&root, &source.entries).await;
+        let fetched = publication.fetched;
         let last_fetched_at = source.last_fetched_at;
         let info = self.row_to_info(row).await?;
         self.emitter.emit_base_updated(&info);
@@ -2239,23 +3422,22 @@ impl KnowledgeService {
         })
     }
 
-    /// Fetch every entry and write `{root}/snapshots/{slug}.md` (frontmatter
-    /// + markdown body). Per-entry failures are collected, never fatal.
+    /// Fetch every entry and prepare `{root}/snapshots/{slug}.md`
+    /// (frontmatter + markdown body) entirely in memory. Per-entry failures
+    /// are collected, never fatal.
     /// Pages larger than the compression threshold are condensed via the
     /// completer when one is wired (raw-but-truncated otherwise). Entries
     /// without a title are backfilled from the page `<title>`.
     ///
     /// The network/LLM work runs concurrently ([`SOURCE_FETCH_CONCURRENCY`]
-    /// at a time); slug assignment, title backfill and the disk writes then
-    /// happen serially in entry order, so duplicate-slug numbering and error
-    /// aggregation stay deterministic regardless of completion order.
-    async fn fetch_source_snapshots(
+    /// at a time); slug assignment and title backfill then happen serially in
+    /// entry order, so duplicate-slug numbering and error aggregation stay
+    /// deterministic regardless of completion order.
+    async fn prepare_source_snapshots(
         &self,
-        root: &Path,
         entries: &mut [KnowledgeSourceEntry],
-    ) -> (usize, Vec<String>) {
+    ) -> (Vec<PreparedSourceFile>, Vec<String>) {
         let completer = self.completer();
-        let snap_dir = root.join(source_url::SNAPSHOT_REL_DIR);
 
         // Phase 1 — fetch (and condense oversized pages) concurrently,
         // re-indexed by entry position. The futures own their URL (and are
@@ -2283,7 +3465,7 @@ impl KnowledgeService {
 
         // Phase 2 — serial, in entry order.
         let mut used_slugs: HashSet<String> = HashSet::new();
-        let mut fetched = 0usize;
+        let mut files = Vec::new();
         let mut errors: Vec<String> = Vec::new();
         for (entry, result) in entries.iter_mut().zip(prepared) {
             let page = match result.expect("every entry yields exactly one fetch result") {
@@ -2314,15 +3496,16 @@ impl KnowledgeService {
 
             let fetched_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
             let content = source_url::snapshot_markdown(&entry.url, &fetched_at, entry.title.as_deref(), &page.body);
-            match write_text_atomic(&snap_dir.join(format!("{slug}.md")), &content).await {
-                Ok(()) => fetched += 1,
-                Err(e) => {
-                    tracing::warn!(url = %entry.url, error = %e, "failed to write knowledge snapshot");
-                    errors.push(format!("{}: {e}", entry.url));
-                }
-            }
+            let rel_path =
+                format!("{}/{slug}.md", source_url::SNAPSHOT_REL_DIR);
+            files.push(PreparedSourceFile {
+                rel_path,
+                source_label: entry.url.clone(),
+                content,
+                connector_source_url: None,
+            });
         }
-        (fetched, errors)
+        (files, errors)
     }
 
     /// Fetch one source URL and condense/truncate the body to snapshot size.
@@ -2355,9 +3538,62 @@ impl KnowledgeService {
         })
     }
 
-    /// Write `source` back into the row's `extra.source` and persist the row
-    /// (other `extra` keys are preserved).
-    async fn persist_source(&self, row: &mut KnowledgeBaseRow, source: &KnowledgeSource) -> Result<(), AppError> {
+    /// Re-read the registration at a source publication boundary and verify
+    /// that neither its physical root nor its source configuration changed
+    /// during the preceding network/LLM work. The caller must hold the base
+    /// lifecycle writer while using the returned row.
+    async fn current_source_publication_row(
+        &self,
+        expected_row: &KnowledgeBaseRow,
+    ) -> Result<KnowledgeBaseRow, AppError> {
+        let expected_source = source_from_extra(&expected_row.extra)
+            .map_err(|error| {
+                knowledge_row_json_error(&expected_row.knowledge_base_id, error)
+            })?;
+        let registered =
+            self.require_base(&expected_row.knowledge_base_id).await?;
+        if registered.root_path != expected_row.root_path {
+            return Err(AppError::Conflict(
+                "knowledge base root changed while source state was being persisted; retry"
+                    .into(),
+            ));
+        }
+        let current_source = source_from_extra(&registered.extra)
+            .map_err(|error| {
+                knowledge_row_json_error(
+                    &registered.knowledge_base_id,
+                    error,
+                )
+            })?;
+        let expected_value =
+            serde_json::to_value(&expected_source).map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to compare prior knowledge source state: {error}"
+                ))
+            })?;
+        let current_value =
+            serde_json::to_value(&current_source).map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to compare current knowledge source state: {error}"
+                ))
+            })?;
+        if current_value != expected_value {
+            return Err(AppError::Conflict(
+                "knowledge source configuration changed while refresh/sync was running; the newer configuration was preserved"
+                    .into(),
+            ));
+        }
+        Ok(registered)
+    }
+
+    /// Update only `extra.source` on an already re-read row. The caller owns
+    /// the lifecycle writer, so this DB update and any preceding snapshot
+    /// publication form one in-process source commit boundary.
+    async fn persist_source_in_current_row(
+        &self,
+        row: &mut KnowledgeBaseRow,
+        source: &KnowledgeSource,
+    ) -> Result<(), AppError> {
         let mut extra: serde_json::Value = serde_json::from_str(&row.extra).map_err(|error| {
             AppError::Internal(format!(
                 "knowledge base {} has invalid extra JSON: {error}",
@@ -2376,6 +3612,125 @@ impl KnowledgeService {
         row.updated_at = now_ms();
         self.repo.update_base(row).await?;
         Ok(())
+    }
+
+    /// Write `source` back into the row's `extra.source` and persist the row
+    /// (other `extra` keys are preserved).
+    async fn persist_source(
+        &self,
+        row: &mut KnowledgeBaseRow,
+        source: &KnowledgeSource,
+    ) -> Result<(), AppError> {
+        let registered = self.require_base(&row.knowledge_base_id).await?;
+        let _base_guard =
+            self.acquire_base_lifecycle_write_lock(&registered).await?;
+        let mut registered = self.current_source_publication_row(row).await?;
+        self.persist_source_in_current_row(&mut registered, source)
+            .await?;
+        *row = registered;
+        Ok(())
+    }
+
+    /// Publish prepared URL snapshots only after revalidating the exact source
+    /// configuration under tree + lifecycle writers. This prevents an old
+    /// fetch from leaving files behind after the user switches or detaches the
+    /// source while network work is still running.
+    async fn publish_prepared_url_source(
+        &self,
+        row: &mut KnowledgeBaseRow,
+        source: &mut KnowledgeSource,
+        files: Vec<PreparedSourceFile>,
+        prune_orphans: bool,
+    ) -> SourcePublicationOutcome {
+        let previous_stamp = source.last_fetched_at;
+        let mut outcome = SourcePublicationOutcome {
+            fetched: 0,
+            errors: Vec::new(),
+            persisted_stamp: previous_stamp,
+            fatal_error: None,
+        };
+
+        let _tree_guard = match self.acquire_document_tree_write_lock(row).await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                outcome.fatal_error = Some(error);
+                return outcome;
+            }
+        };
+        let _base_guard = match self.acquire_base_lifecycle_write_lock(row).await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                outcome.fatal_error = Some(error);
+                return outcome;
+            }
+        };
+        let mut current = match self.current_source_publication_row(row).await {
+            Ok(current) => current,
+            Err(error) => {
+                outcome.fatal_error = Some(error);
+                return outcome;
+            }
+        };
+        let root = PathBuf::from(&current.root_path);
+        if let Err(error) = validate_knowledge_root_bounded(root.clone()).await {
+            outcome.fatal_error = Some(error);
+            return outcome;
+        }
+
+        for file in files {
+            let path = match safe_md_path_bounded(
+                root.clone(),
+                file.rel_path.clone(),
+            )
+            .await
+            {
+                Ok(path) => path,
+                Err(error) => {
+                    outcome
+                        .errors
+                        .push(format!("{}: {error}", file.source_label));
+                    continue;
+                }
+            };
+            match write_text_atomic(&path, &file.content).await {
+                Ok(()) => {
+                    outcome.fetched += 1;
+                    self.invalidate_search_cache_path(&path);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        source = %file.source_label,
+                        %error,
+                        "failed to publish knowledge source snapshot"
+                    );
+                    outcome
+                        .errors
+                        .push(format!("{}: {error}", file.source_label));
+                }
+            }
+        }
+        if outcome.fetched > 0 {
+            source.last_fetched_at = Some(now_ms());
+        }
+        if prune_orphans
+            && let Err(error) =
+                prune_orphan_snapshots(&root, &source.entries).await
+        {
+            outcome.fatal_error = Some(error);
+            return outcome;
+        }
+        if let Err(error) = self
+            .persist_source_in_current_row(&mut current, source)
+            .await
+        {
+            outcome.fatal_error = Some(error);
+            return outcome;
+        }
+        *row = current;
+        outcome.persisted_stamp = source.last_fetched_at;
+        outcome
     }
 
     /// Attach, replace, or clear a base's source config (`extra.source`).
@@ -2406,6 +3761,10 @@ impl KnowledgeService {
                 self.persist_source(&mut row, &src).await?;
             }
             None => {
+                let registered = self.require_base(kb_id).await?;
+                let _base_guard =
+                    self.acquire_base_lifecycle_write_lock(&registered).await?;
+                row = self.require_base(kb_id).await?;
                 let mut extra: serde_json::Value = serde_json::from_str(&row.extra).map_err(|error| {
                     AppError::Internal(format!(
                         "knowledge base {} has invalid extra JSON: {error}",
@@ -2595,6 +3954,18 @@ impl KnowledgeService {
                         continue;
                     }
                 };
+                if let Err(error) =
+                    validate_knowledge_root_bounded(PathBuf::from(&row.root_path))
+                        .await
+                {
+                    tracing::warn!(
+                        kb_id = %kb_id,
+                        root = %row.root_path,
+                        %error,
+                        "bound knowledge base root is unavailable or unsafe; skipping mount"
+                    );
+                    continue;
+                }
                 let link_name = unique_link_name(&row, &mut used_names);
                 specs.push(MountSpec {
                     link_name: link_name.clone(),
@@ -2698,97 +4069,42 @@ impl KnowledgeService {
                     );
                     continue;
                 };
-                roots.push((kb_id, row.name.clone(), PathBuf::from(&row.root_path)));
+                roots.push((
+                    kb_id,
+                    row.name.clone(),
+                    PathBuf::from(&row.root_path),
+                ));
             }
         }
         if roots.is_empty() {
             return Ok(Vec::new());
         }
         let query = query.to_owned();
-        let cache = Arc::clone(&self.search_cache);
-        let mut hits = bounded_blocking(SEARCH_WALK_BUDGET, Vec::new(), move || {
-            let query_lc = query.to_lowercase();
-            let terms = query_terms(&query_lc);
-            let mut all: Vec<KnowledgeSearchHit> = Vec::new();
-            for (kb_id, kb_name, root) in &roots {
-                for entry in vault_walker(root) {
-                    if !entry.file_type().is_file() {
-                        continue;
-                    }
-                    let path = entry.path();
-                    if !is_md(path) {
-                        continue;
-                    }
-                    let Ok(rel) = path.strip_prefix(root) else { continue };
-                    let rel = rel.to_string_lossy().replace('\\', "/");
-                    if rel == KB_INBOX_REL_DIR || rel.starts_with(&format!("{KB_INBOX_REL_DIR}/")) {
-                        continue;
-                    }
-                    // mtime-keyed cache: reuse decoded content+heading when the
-                    // file is unchanged; otherwise read, score, and cache.
-                    let (mtime_ms, size) = match entry.metadata() {
-                        Ok(m) => (
-                            m.modified()
-                                .ok()
-                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                .map(|d| d.as_millis() as u64)
-                                .unwrap_or(0),
-                            m.len(),
-                        ),
-                        Err(_) => (0, 0),
-                    };
-                    let abs = path.to_path_buf();
-                    // Invalidate on mtime OR size change (size guards against
-                    // coarse-mtime filesystems where an edit keeps the tick).
-                    let cached = {
-                        let guard = cache.read().unwrap_or_else(|e| e.into_inner());
-                        guard
-                            .entries
-                            .get(&abs)
-                            .filter(|c| c.mtime_ms == mtime_ms && c.bytes as u64 == size)
-                            .map(|c| (Arc::clone(&c.content), Arc::clone(&c.heading)))
-                    };
-                    let (content, heading): (Arc<str>, Arc<str>) = if let Some(hit) = cached {
-                        hit
-                    } else {
-                        let Ok(raw) = std::fs::read_to_string(path) else { continue };
-                        let heading: Arc<str> = first_heading_text(&raw).into();
-                        let content: Arc<str> = raw.into();
-                        if content.len() <= MAX_SEARCH_CACHE_FILE_BYTES {
-                            let mut guard = cache.write().unwrap_or_else(|e| e.into_inner());
-                            if let Some(old) = guard.entries.remove(&abs) {
-                                guard.total_bytes = guard.total_bytes.saturating_sub(old.bytes);
-                            }
-                            if guard.total_bytes + content.len() <= MAX_SEARCH_CACHE_BYTES {
-                                guard.total_bytes += content.len();
-                                guard.entries.insert(
-                                    abs,
-                                    CachedDoc {
-                                        mtime_ms,
-                                        content: Arc::clone(&content),
-                                        heading: Arc::clone(&heading),
-                                        bytes: content.len(),
-                                    },
-                                );
-                            }
-                        }
-                        (content, heading)
-                    };
-                    if let Some((score, snippet)) = score_md(&rel, &heading, &content, &query_lc, &terms) {
-                        all.push(KnowledgeSearchHit {
-                            kb_id: kb_id.clone(),
-                            kb_name: kb_name.clone(),
-                            rel_path: rel,
-                            heading: heading.to_string(),
-                            snippet,
-                            score,
-                        });
-                    }
-                }
+        let searches = roots.into_iter().map(|(kb_id, kb_name, root)| {
+            let query = query.clone();
+            let cache = Arc::clone(&self.search_cache);
+            async move {
+                let lock_root = root.clone();
+                bounded_root_blocking(
+                    &lock_root,
+                    SEARCH_WALK_BUDGET,
+                    Vec::new(),
+                    move || {
+                        search_one_knowledge_root(
+                            kb_id, kb_name, root, query, cache,
+                        )
+                    },
+                )
+                .await
             }
-            all
-        })
-        .await;
+        });
+        let mut hits = stream::iter(searches)
+            .buffer_unordered(LIST_BASES_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
 
         hits.sort_by(|a, b| b.score.cmp(&a.score).then(a.rel_path.cmp(&b.rel_path)));
         hits.truncate(limit);
@@ -2928,8 +4244,9 @@ impl KnowledgeService {
     /// dodge the check; a path that fails to canonicalize (not yet existing)
     /// is compared as-is.
     fn workspace_overlaps_managed_root(&self, workspace: &Path) -> bool {
-        let data_root = std::fs::canonicalize(&self.data_dir).unwrap_or_else(|_| self.data_dir.clone());
-        let managed = data_root.join(KB_MANAGED_REL_DIR);
+        let managed_lexical = self.data_dir.join(KB_MANAGED_REL_DIR);
+        let managed = std::fs::canonicalize(&managed_lexical)
+            .unwrap_or(managed_lexical);
         let ws = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
         managed.starts_with(&ws) || ws.starts_with(&managed)
     }
@@ -2943,6 +4260,128 @@ impl KnowledgeService {
             .await?
             .ok_or_else(|| AppError::NotFound(format!("knowledge base {} not found", id.as_str())))
     }
+}
+
+fn search_one_knowledge_root(
+    kb_id: KnowledgeBaseId,
+    kb_name: String,
+    root: PathBuf,
+    query: String,
+    cache: Arc<RwLock<SearchCacheInner>>,
+) -> Vec<KnowledgeSearchHit> {
+    if let Err(error) = validate_knowledge_root(&root) {
+        tracing::warn!(
+            knowledge_base_id = %kb_id,
+            root = %root.display(),
+            %error,
+            "skipping unavailable or unsafe knowledge search root"
+        );
+        return Vec::new();
+    }
+    let query_lc = query.to_lowercase();
+    let terms = query_terms(&query_lc);
+    let mut hits = Vec::new();
+    for entry in vault_walker(&root) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if !is_md(path) {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(&root) else {
+            continue;
+        };
+        let Some(rel) = rel.to_str().map(|rel| rel.replace('\\', "/")) else {
+            tracing::warn!(
+                path = %path.display(),
+                "skipping non-Unicode knowledge path during search"
+            );
+            continue;
+        };
+        if rel_path_starts_with_dir(&rel, KB_INBOX_REL_DIR) {
+            continue;
+        }
+        let (mtime_ms, size) = match entry.metadata() {
+            Ok(metadata) => (
+                metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| {
+                        time.duration_since(std::time::UNIX_EPOCH).ok()
+                    })
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or(0),
+                metadata.len(),
+            ),
+            Err(_) => (0, 0),
+        };
+        let absolute = path.to_path_buf();
+        let cached = {
+            let guard =
+                cache.read().unwrap_or_else(|error| error.into_inner());
+            guard
+                .entries
+                .get(&absolute)
+                .filter(|cached| {
+                    cached.mtime_ms == mtime_ms
+                        && cached.bytes as u64 == size
+                })
+                .map(|cached| {
+                    (
+                        Arc::clone(&cached.content),
+                        Arc::clone(&cached.heading),
+                    )
+                })
+        };
+        let (content, heading): (Arc<str>, Arc<str>) =
+            if let Some(cached) = cached {
+                cached
+            } else {
+                let Ok(raw) = std::fs::read_to_string(path) else {
+                    continue;
+                };
+                let heading: Arc<str> = first_heading_text(&raw).into();
+                let content: Arc<str> = raw.into();
+                if content.len() <= MAX_SEARCH_CACHE_FILE_BYTES {
+                    let mut guard = cache
+                        .write()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if let Some(old) = guard.entries.remove(&absolute) {
+                        guard.total_bytes =
+                            guard.total_bytes.saturating_sub(old.bytes);
+                    }
+                    if guard.total_bytes + content.len()
+                        <= MAX_SEARCH_CACHE_BYTES
+                    {
+                        guard.total_bytes += content.len();
+                        guard.entries.insert(
+                            absolute,
+                            CachedDoc {
+                                mtime_ms,
+                                content: Arc::clone(&content),
+                                heading: Arc::clone(&heading),
+                                bytes: content.len(),
+                            },
+                        );
+                    }
+                }
+                (content, heading)
+            };
+        if let Some((score, snippet)) =
+            score_md(&rel, &heading, &content, &query_lc, &terms)
+        {
+            hits.push(KnowledgeSearchHit {
+                kb_id: kb_id.clone(),
+                kb_name: kb_name.clone(),
+                rel_path: rel,
+                heading: heading.to_string(),
+                snippet,
+                score,
+            });
+        }
+    }
+    hits
 }
 
 /// Conversation-delete hook: drop the conversation's knowledge binding so
@@ -2968,12 +4407,17 @@ impl KnowledgeService {
             .map_err(|error| knowledge_row_json_error(&row.knowledge_base_id, error))?;
         let root = PathBuf::from(&row.root_path);
         let root_for_inbox = root.clone();
+        let root_for_stats_lock = root.clone();
         // Bounded so a slow/stale NAS mount degrades (assume present, counts
         // unknown) instead of hanging the list/detail response past the
         // client's request timeout — the reported "加载失败" failure mode.
         let (file_count, total_size, root_exists) =
-            bounded_blocking(BASE_WALK_BUDGET, (0u64, 0u64, true), move || {
-                if !root.is_dir() {
+            bounded_root_blocking(
+                &root_for_stats_lock,
+                BASE_WALK_BUDGET,
+                (0u64, 0u64, true),
+                move || {
+                if validate_knowledge_root(&root).is_err() {
                     return (0u64, 0u64, false);
                 }
                 let mut count = 0u64;
@@ -2985,12 +4429,17 @@ impl KnowledgeService {
                     }
                 }
                 (count, size, true)
-            })
+            },
+            )
             .await;
 
-        let pending_inbox = bounded_blocking(BASE_WALK_BUDGET, 0u64, move || {
-            list_inbox_entries(&root_for_inbox).len() as u64
-        })
+        let root_for_inbox_lock = root_for_inbox.clone();
+        let pending_inbox = bounded_root_blocking(
+            &root_for_inbox_lock,
+            BASE_WALK_BUDGET,
+            0u64,
+            move || list_inbox_entries(&root_for_inbox).len() as u64,
+        )
         .await;
 
         let tags = tags_from_row(&row)?;
@@ -3247,22 +4696,80 @@ fn validate_source(source: &KnowledgeSource) -> Result<(), AppError> {
 }
 
 /// A filesystem-safe, deterministic slug for a connector document, derived
-/// from its stable `remote_id`. Used as the snapshot filename so re-syncs
-/// overwrite in place and deletions can target `{slug}.md` directly.
+/// from its exact stable `remote_id`. The readable prefix alone is not an
+/// identity: lower-casing and punctuation folding make values such as `A:B`
+/// and `a/b` collide. Appending the full SHA-256 digest makes publication and
+/// deletion order-independent while keeping the component comfortably below
+/// the 255-byte cross-platform limit.
 fn connector_doc_slug(remote_id: &str) -> String {
-    let mut slug = String::with_capacity(remote_id.len());
+    const READABLE_PREFIX_MAX: usize = 80;
+
+    let mut slug = String::with_capacity(READABLE_PREFIX_MAX);
     let mut last_dash = false;
     for ch in remote_id.chars() {
         if ch.is_ascii_alphanumeric() {
+            if slug.len() == READABLE_PREFIX_MAX {
+                break;
+            }
             slug.push(ch.to_ascii_lowercase());
             last_dash = false;
         } else if !last_dash {
+            if slug.len() == READABLE_PREFIX_MAX {
+                break;
+            }
             slug.push('-');
             last_dash = true;
         }
     }
     let trimmed = slug.trim_matches('-');
-    if trimmed.is_empty() { "doc".to_owned() } else { trimmed.to_owned() }
+    let readable = if trimmed.is_empty() { "doc" } else { trimmed };
+    format!("{readable}-{}", content_sha256(remote_id))
+}
+
+const CONNECTOR_REMOTE_ID_HASH_FIELD: &str = "connector_remote_id_sha256";
+
+/// Extend generic URL snapshot frontmatter with a stable connector identity.
+/// The remote id itself is not exposed; its full hash distinguishes current
+/// files from legacy aliases even when a provider reuses one source URL.
+fn connector_snapshot_markdown(
+    source_url: &str,
+    fetched_at: &str,
+    title: Option<&str>,
+    remote_id: &str,
+    body: &str,
+) -> String {
+    let markdown =
+        source_url::snapshot_markdown(source_url, fetched_at, title, body);
+    let Some(rest) = markdown.strip_prefix("---\n") else {
+        return markdown;
+    };
+    format!(
+        "---\n{CONNECTOR_REMOTE_ID_HASH_FIELD}: {}\n{rest}",
+        content_sha256(remote_id)
+    )
+}
+
+fn has_connector_snapshot_identity(content: &str) -> bool {
+    let mut lines = content.lines();
+    if lines.next() != Some("---") {
+        return false;
+    }
+    for line in lines {
+        if line.trim() == "---" {
+            return false;
+        }
+        let Some(value) = line
+            .trim()
+            .strip_prefix(CONNECTOR_REMOTE_ID_HASH_FIELD)
+            .and_then(|line| line.strip_prefix(':'))
+            .map(str::trim)
+        else {
+            continue;
+        };
+        return value.len() == 64
+            && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    }
+    false
 }
 
 fn validate_url_source(source: &KnowledgeSource) -> Result<(), AppError> {
@@ -3288,40 +4795,357 @@ fn validate_url_source(source: &KnowledgeSource) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Delete `{root}/snapshots/*.md` files whose frontmatter `source_url` no
-/// longer appears in the configured entries (orphans left behind after the
-/// entry list shrank). Files WITHOUT a `source_url` frontmatter line are
-/// user-authored and never touched. Best-effort: IO failures are logged,
-/// never propagated.
-async fn prune_orphan_snapshots(root: &Path, entries: &[KnowledgeSourceEntry]) {
-    let urls: HashSet<&str> = entries.iter().map(|e| e.url.trim()).collect();
-    let snap_dir = root.join(source_url::SNAPSHOT_REL_DIR);
-    let Ok(mut dir) = tokio::fs::read_dir(&snap_dir).await else {
-        return;
+async fn ensure_snapshot_trash_dir(root: &Path) -> Result<PathBuf, AppError> {
+    validate_knowledge_root_bounded(root.to_path_buf()).await?;
+    let snapshots = root.join(source_url::SNAPSHOT_REL_DIR);
+    let snapshots_metadata =
+        tokio::fs::symlink_metadata(&snapshots).await.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to inspect knowledge snapshots directory: {error}"
+            ))
+        })?;
+    if metadata_is_link_or_reparse(&snapshots, &snapshots_metadata)
+        || !snapshots_metadata.is_dir()
+    {
+        return Err(AppError::Conflict(
+            "knowledge snapshots directory must be a real directory".into(),
+        ));
+    }
+    let trash = snapshots.join("_trash");
+    match tokio::fs::symlink_metadata(&trash).await {
+        Ok(metadata) => {
+            if metadata_is_link_or_reparse(&trash, &metadata)
+                || !metadata.is_dir()
+            {
+                return Err(AppError::Conflict(
+                    "knowledge snapshot trash must be a real directory"
+                        .into(),
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match tokio::fs::create_dir(&trash).await {
+                Ok(()) => {}
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(AppError::Internal(format!(
+                        "failed to create knowledge snapshot trash: {error}"
+                    )));
+                }
+            }
+            let metadata =
+                tokio::fs::symlink_metadata(&trash).await.map_err(|error| {
+                    AppError::Internal(format!(
+                        "failed to inspect created knowledge snapshot trash: {error}"
+                    ))
+                })?;
+            if metadata_is_link_or_reparse(&trash, &metadata)
+                || !metadata.is_dir()
+            {
+                return Err(AppError::Conflict(
+                    "knowledge snapshot trash was replaced during creation"
+                        .into(),
+                ));
+            }
+        }
+        Err(error) => {
+            return Err(AppError::Internal(format!(
+                "failed to inspect knowledge snapshot trash: {error}"
+            )));
+        }
+    }
+    Ok(trash)
+}
+
+/// Move one managed snapshot into a unique recoverable trash entry. When
+/// `expected_content` is supplied, an editor replacement detected immediately
+/// before the atomic no-clobber move is preserved in place.
+async fn quarantine_snapshot_file(
+    root: &Path,
+    source: &Path,
+    expected_content: Option<&str>,
+) -> Result<bool, AppError> {
+    validate_knowledge_root_bounded(root.to_path_buf()).await?;
+    let metadata = match tokio::fs::symlink_metadata(source).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(error) => {
+            return Err(AppError::Internal(format!(
+                "failed to inspect knowledge snapshot {}: {error}",
+                source.display()
+            )));
+        }
     };
-    while let Ok(Some(entry)) = dir.next_entry().await {
+    if metadata_is_link_or_reparse(source, &metadata) || !metadata.is_file() {
+        return Err(AppError::Conflict(format!(
+            "knowledge snapshot is not a real file: {}",
+            source.display()
+        )));
+    }
+    if let Some(expected) = expected_content {
+        let current = tokio::time::timeout(
+            KNOWLEDGE_FILE_IO_TIMEOUT,
+            tokio::fs::read_to_string(source),
+        )
+        .await
+        .map_err(|_| {
+            AppError::Timeout(format!(
+                "knowledge snapshot compare timed out: {}",
+                source.display()
+            ))
+        })?
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "failed to compare knowledge snapshot {}: {error}",
+                source.display()
+            ))
+        })?;
+        if current != expected {
+            tracing::info!(
+                path = %source.display(),
+                "preserving snapshot because its contents changed before quarantine"
+            );
+            return Ok(false);
+        }
+    }
+    let trash = ensure_snapshot_trash_dir(root).await?;
+    let destination = trash.join(format!(
+        "snapshot-{}.md",
+        generate_id()
+    ));
+    publish_file_no_clobber(source, &destination)
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "failed to quarantine knowledge snapshot {}: {error}",
+                source.display()
+            ))
+        })?;
+    Ok(true)
+}
+
+async fn quarantine_connector_snapshot(
+    root: &Path,
+    remote_id: &str,
+) -> Result<bool, AppError> {
+    let slug = connector_doc_slug(remote_id);
+    let source = safe_md_path_bounded(
+        root.to_path_buf(),
+        format!(
+            "{}/{slug}.md",
+            source_url::SNAPSHOT_REL_DIR
+        ),
+    )
+    .await?;
+    quarantine_snapshot_file(root, &source, None).await
+}
+
+/// Quarantine connector snapshots written under an older filename scheme by
+/// matching their exact `source_url` frontmatter. This is intentionally a
+/// directory scan rather than a legacy-slug lookup: the old slug was lossy
+/// and could point at a different remote document. Current-format snapshots
+/// carry an identity marker and are never treated as aliases, even if an
+/// incremental batch omits them and a provider reuses a source URL.
+async fn quarantine_connector_snapshot_aliases(
+    root: &Path,
+    source_urls: &HashSet<String>,
+) -> Result<usize, AppError> {
+    validate_knowledge_root_bounded(root.to_path_buf()).await?;
+    let snap_dir = root.join(source_url::SNAPSHOT_REL_DIR);
+    let snapshot_metadata = match tokio::fs::symlink_metadata(&snap_dir).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(0);
+        }
+        Err(error) => {
+            return Err(AppError::Internal(format!(
+                "failed to inspect connector snapshots directory: {error}"
+            )));
+        }
+    };
+    if metadata_is_link_or_reparse(&snap_dir, &snapshot_metadata)
+        || !snapshot_metadata.is_dir()
+    {
+        return Err(AppError::Conflict(
+            "connector snapshots directory must be a real directory, not a link or reparse point"
+                .into(),
+        ));
+    }
+
+    let mut legacy_matches: HashMap<String, Vec<(PathBuf, String)>> =
+        HashMap::new();
+    let mut dir = tokio::fs::read_dir(&snap_dir).await.map_err(|error| {
+        AppError::Internal(format!(
+            "failed to read connector snapshots directory: {error}"
+        ))
+    })?;
+    while let Some(entry) = dir.next_entry().await.map_err(|error| {
+        AppError::Internal(format!(
+            "failed to scan connector snapshots directory: {error}"
+        ))
+    })? {
         let path = entry.path();
-        if !entry.file_type().await.is_ok_and(|t| t.is_file()) || !is_md(&path) {
+        let metadata = match tokio::fs::symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(error) => {
+                return Err(AppError::Internal(format!(
+                    "failed to inspect connector snapshot {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        if metadata_is_link_or_reparse(&path, &metadata) {
+            return Err(AppError::Conflict(format!(
+                "connector snapshot is a link or reparse point: {}",
+                path.display()
+            )));
+        }
+        if !metadata.is_file() || !is_md(&path) {
             continue;
         }
-        let Ok(content) = tokio::fs::read_to_string(&path).await else {
+        let content = tokio::time::timeout(
+            KNOWLEDGE_FILE_IO_TIMEOUT,
+            tokio::fs::read_to_string(&path),
+        )
+        .await
+        .map_err(|_| {
+            AppError::Timeout(format!(
+                "connector snapshot read timed out: {}",
+                path.display()
+            ))
+        })?
+        .map_err(|error| {
+            AppError::Internal(format!(
+                "failed to read connector snapshot {}: {error}",
+                path.display()
+            ))
+        })?;
+        if has_connector_snapshot_identity(&content) {
+            continue;
+        }
+        let Some(source_url) = source_url::snapshot_source_url(&content) else {
             continue;
         };
+        if !source_urls.contains(source_url.trim()) {
+            continue;
+        }
+        legacy_matches
+            .entry(source_url.trim().to_owned())
+            .or_default()
+            .push((path, content));
+    }
+
+    // A legacy file has no remote-id marker. When more than one such file
+    // shares a URL, there is no safe way to know which remote id it belongs
+    // to. Detect every ambiguity before moving anything, keep all candidates
+    // live, and surface a retryable sync error instead of deleting a sibling.
+    if let Some((source_url, candidates)) =
+        legacy_matches.iter().find(|(_, candidates)| candidates.len() > 1)
+    {
+        return Err(AppError::Conflict(format!(
+            "cannot safely migrate or delete {} legacy connector snapshots sharing source URL {source_url}",
+            candidates.len()
+        )));
+    }
+
+    let mut quarantined = 0usize;
+    for candidates in legacy_matches.into_values() {
+        let (path, content) = candidates
+            .into_iter()
+            .next()
+            .expect("non-empty legacy snapshot group");
+        if quarantine_snapshot_file(root, &path, Some(&content)).await? {
+            quarantined += 1;
+        } else {
+            return Err(AppError::Conflict(format!(
+                "connector snapshot changed while it was being migrated or deleted: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(quarantined)
+}
+
+/// Quarantine `{root}/snapshots/*.md` files whose frontmatter `source_url` no
+/// longer appears in the configured entries (orphans left behind after the
+/// entry list shrank). Files WITHOUT a `source_url` frontmatter line are
+/// user-authored and never touched. The entire mutation boundary is no-follow,
+/// recoverable, and fail-closed.
+async fn prune_orphan_snapshots(
+    root: &Path,
+    entries: &[KnowledgeSourceEntry],
+) -> Result<(), AppError> {
+    validate_knowledge_root_bounded(root.to_path_buf()).await?;
+    let urls: HashSet<&str> = entries.iter().map(|e| e.url.trim()).collect();
+    let snap_dir = root.join(source_url::SNAPSHOT_REL_DIR);
+    let snapshot_metadata = match tokio::fs::symlink_metadata(&snap_dir).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(error) => {
+            return Err(AppError::Internal(format!(
+                "failed to inspect knowledge snapshots directory: {error}"
+            )));
+        }
+    };
+    if metadata_is_link_or_reparse(&snap_dir, &snapshot_metadata)
+        || !snapshot_metadata.is_dir()
+    {
+        return Err(AppError::Conflict(
+            "knowledge snapshots directory must be a real directory, not a link or reparse point"
+                .into(),
+        ));
+    }
+    let mut dir = tokio::fs::read_dir(&snap_dir).await.map_err(|error| {
+        AppError::Internal(format!(
+            "failed to read knowledge snapshots directory: {error}"
+        ))
+    })?;
+    while let Some(entry) = dir.next_entry().await.map_err(|error| {
+        AppError::Internal(format!(
+            "failed to scan knowledge snapshots directory: {error}"
+        ))
+    })? {
+        let path = entry.path();
+        let metadata = tokio::fs::symlink_metadata(&path).await.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to inspect knowledge snapshot {}: {error}",
+                path.display()
+            ))
+        })?;
+        if metadata_is_link_or_reparse(&path, &metadata) {
+            return Err(AppError::Conflict(format!(
+                "knowledge snapshot is a link or reparse point: {}",
+                path.display()
+            )));
+        }
+        if !metadata.is_file() || !is_md(&path) {
+            continue;
+        }
+        let content = tokio::fs::read_to_string(&path).await.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to read knowledge snapshot {}: {error}",
+                path.display()
+            ))
+        })?;
         // No source_url frontmatter ⇒ not ours ⇒ keep.
         let Some(src_url) = source_url::snapshot_source_url(&content) else {
             continue;
         };
         if !urls.contains(src_url.trim()) {
-            match tokio::fs::remove_file(&path).await {
-                Ok(()) => {
-                    tracing::info!(path = %path.display(), source_url = src_url, "removed orphan knowledge snapshot");
-                }
-                Err(e) => {
-                    tracing::warn!(path = %path.display(), error = %e, "failed to remove orphan knowledge snapshot");
-                }
+            if quarantine_snapshot_file(root, &path, Some(&content)).await? {
+                tracing::info!(path = %path.display(), source_url = src_url, "quarantined orphan knowledge snapshot");
             }
         }
     }
+    Ok(())
 }
 
 /// Atomic text write (temp sibling + rename), creating parent dirs.
@@ -3370,34 +5194,725 @@ async fn condense_snapshot_body(body: String, completer: Option<&dyn KnowledgeCo
 }
 
 async fn write_text_atomic(path: &Path, content: &str) -> Result<(), AppError> {
+    use tokio::io::AsyncWriteExt;
+
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|e| AppError::Internal(format!("failed to create parent dirs: {e}")))?;
     }
     let tmp = atomic_tmp_path(path);
-    tokio::fs::write(&tmp, content)
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp)
         .await
         .map_err(|e| AppError::Internal(format!("failed to write file: {e}")))?;
-    if let Err(e) = tokio::fs::rename(&tmp, path).await {
+    let write_result = async {
+        file.write_all(content.as_bytes()).await?;
+        file.sync_all().await
+    }
+    .await;
+    drop(file);
+    if let Err(e) = write_result {
         let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(AppError::Internal(format!("failed to finalize file: {e}")));
+        return Err(AppError::Internal(format!("failed to write file: {e}")));
+    }
+    if let Err(error) = preserve_replaced_file_metadata(path, &tmp).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(AppError::Internal(format!(
+            "failed to preserve knowledge document metadata: {error}"
+        )));
+    }
+    if let Err(error) = replace_file_atomic(&tmp, path).await {
+        if error.source_can_be_removed {
+            let _ = tokio::fs::remove_file(&tmp).await;
+        } else {
+            tracing::error!(
+                temp_path = %tmp.display(),
+                "atomic replacement recovery could not restore the destination; preserving the only new-content copy"
+            );
+        }
+        return Err(AppError::Internal(format!(
+            "failed to finalize file: {error}"
+        )));
     }
     Ok(())
 }
 
-/// A collision-free sibling temp path for atomic write+rename. Two concurrent
-/// writers targeting the same file MUST NOT share a temp name (they would
-/// truncate each other); the pid+counter suffix makes each unique. The `.tmp`
-/// tail keeps the temp out of `is_md` listings/search, and an orphan left by a
-/// crash is harmless (never listed).
+/// Publish a replacement only if the source-of-truth bytes still match the
+/// snapshot used to build it. This closes the common editor/sync race between
+/// direct write-back's read+append and atomic rename. The compare is performed
+/// immediately before publication; a conflict is retryable against fresh
+/// content instead of overwriting an out-of-band edit.
+async fn write_text_atomic_if_unchanged(
+    path: &Path,
+    expected: &str,
+    content: &str,
+) -> Result<(), AppError> {
+    use tokio::io::AsyncWriteExt;
+
+    let Some(parent) = path.parent() else {
+        return Err(AppError::BadRequest(
+            "knowledge document path has no parent".into(),
+        ));
+    };
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to create parent dirs: {e}")))?;
+    let tmp = atomic_tmp_path(path);
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to write file: {e}")))?;
+    let write_result = async {
+        file.write_all(content.as_bytes()).await?;
+        file.sync_all().await
+    }
+    .await;
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(AppError::Internal(format!(
+            "failed to write file: {error}"
+        )));
+    }
+    if let Err(error) = preserve_replaced_file_metadata(path, &tmp).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(AppError::Internal(format!(
+            "failed to preserve knowledge document metadata: {error}"
+        )));
+    }
+
+    let current = match tokio::time::timeout(
+        KNOWLEDGE_FILE_IO_TIMEOUT,
+        tokio::fs::read(path),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(AppError::Timeout(format!(
+                "knowledge document compare timed out: {}",
+                path.display()
+            )));
+        }
+    };
+    match current {
+        Ok(bytes) if bytes == expected.as_bytes() => {}
+        Ok(_) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(AppError::Conflict(
+                "Knowledge document changed while write-back was preparing; retry against the latest content"
+                    .into(),
+            ));
+        }
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(AppError::Conflict(format!(
+                "Knowledge document changed or disappeared while write-back was preparing: {error}"
+            )));
+        }
+    }
+
+    if let Err(error) = replace_file_atomic(&tmp, path).await {
+        if error.source_can_be_removed {
+            let _ = tokio::fs::remove_file(&tmp).await;
+        } else {
+            tracing::error!(
+                temp_path = %tmp.display(),
+                "atomic replacement recovery could not restore the destination; preserving the only new-content copy"
+            );
+        }
+        return Err(AppError::Internal(format!(
+            "failed to finalize file: {error}"
+        )));
+    }
+    Ok(())
+}
+
+async fn write_text_atomic_if_absent(path: &Path, content: &str) -> Result<(), AppError> {
+    use tokio::io::AsyncWriteExt;
+
+    let Some(parent) = path.parent() else {
+        return Err(AppError::BadRequest(
+            "knowledge document path has no parent".into(),
+        ));
+    };
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!("failed to create parent dirs: {error}"))
+        })?;
+    let tmp = atomic_tmp_path(path);
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp)
+        .await
+        .map_err(|error| AppError::Internal(format!("failed to write file: {error}")))?;
+    let write_result = async {
+        file.write_all(content.as_bytes()).await?;
+        file.sync_all().await
+    }
+    .await;
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(AppError::Internal(format!(
+            "failed to write file: {error}"
+        )));
+    }
+
+    if let Err(error) = publish_file_no_clobber(&tmp, path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            return Err(AppError::Conflict(
+                "Knowledge document appeared while write-back was preparing; retry against the new file"
+                    .into(),
+            ));
+        }
+        return Err(AppError::Internal(format!(
+            "failed to finalize file: {error}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn preserve_replaced_file_metadata(
+    destination: &Path,
+    replacement: &Path,
+) -> std::io::Result<()> {
+    let destination = destination.to_owned();
+    let replacement = replacement.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let metadata = match std::fs::metadata(&destination) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        std::fs::set_permissions(&replacement, metadata.permissions())?;
+        match xattr::list(&destination) {
+            Ok(names) => {
+                for name in names {
+                    let copy_result = xattr::get(&destination, &name).and_then(|value| {
+                        if let Some(value) = value {
+                            xattr::set(&replacement, &name, &value)
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    if let Err(error) = copy_result {
+                        tracing::debug!(
+                            attribute = %name.to_string_lossy(),
+                            %error,
+                            "knowledge document extended attribute could not be preserved"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    "knowledge filesystem does not expose copyable extended attributes"
+                );
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| {
+        std::io::Error::other(format!("metadata preservation task failed: {error}"))
+    })?
+}
+
+#[cfg(not(unix))]
+async fn preserve_replaced_file_metadata(
+    _destination: &Path,
+    _replacement: &Path,
+) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+const WINDOWS_ATOMIC_RETRY_DELAYS_MS: &[u64] =
+    &[0, 10, 25, 50, 100, 200, 400, 800];
+
+#[cfg(unix)]
+fn hard_link_move_no_clobber_with<F>(
+    source: &Path,
+    destination: &Path,
+    remove_file: F,
+) -> std::io::Result<()>
+where
+    F: Fn(&Path) -> std::io::Result<()>,
+{
+    std::fs::hard_link(source, destination)?;
+    if let Err(unlink_error) = remove_file(source) {
+        return match remove_file(destination) {
+            Ok(()) => Err(unlink_error),
+            Err(rollback_error) => Err(std::io::Error::new(
+                unlink_error.kind(),
+                format!(
+                    "failed to remove source after no-clobber link: {unlink_error}; \
+                     failed to roll back destination copy: {rollback_error}"
+                ),
+            )),
+        };
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn publish_file_no_clobber(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = source.to_owned();
+    let destination = destination.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let source_c = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "knowledge temp path contains NUL",
+            )
+        })?;
+        let destination_c =
+            CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "knowledge destination path contains NUL",
+                )
+            })?;
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        // SAFETY: the C strings remain alive for this no-replace syscall.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                source_c.as_ptr(),
+                libc::AT_FDCWD,
+                destination_c.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        // SAFETY: the C strings remain alive for this no-replace syscall.
+        let result = unsafe {
+            libc::renamex_np(
+                source_c.as_ptr(),
+                destination_c.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        } as libc::c_long;
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        let result = -1;
+
+        let sync_parent = |path: &Path| -> std::io::Result<()> {
+            if let Some(parent) = path.parent() {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        };
+
+        if result == 0 {
+            sync_parent(&destination)?;
+            if source.parent() != destination.parent() {
+                sync_parent(&source)?;
+            }
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let unsupported = matches!(
+            error.raw_os_error(),
+            Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP)
+        );
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let unsupported =
+            matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOTSUP));
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        )))]
+        let unsupported = true;
+
+        if !unsupported {
+            return Err(error);
+        }
+        hard_link_move_no_clobber_with(
+            &source,
+            &destination,
+            |path| std::fs::remove_file(path),
+        )?;
+        sync_parent(&destination)?;
+        if source.parent() != destination.parent() {
+            sync_parent(&source)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| {
+        std::io::Error::other(format!("atomic create task failed: {error}"))
+    })?
+}
+
+#[cfg(windows)]
+async fn publish_file_no_clobber(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{
+        ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source = windows_api_path(source);
+    let destination = windows_api_path(destination);
+    tokio::task::spawn_blocking(move || {
+        // SAFETY: both buffers are NUL-terminated UTF-16 paths and remain
+        // alive for the synchronous MoveFileExW call.
+        for &retry_delay_ms in WINDOWS_ATOMIC_RETRY_DELAYS_MS {
+            if retry_delay_ms != 0 {
+                std::thread::sleep(Duration::from_millis(retry_delay_ms));
+            }
+            if unsafe {
+                MoveFileExW(
+                    source.as_ptr(),
+                    destination.as_ptr(),
+                    MOVEFILE_WRITE_THROUGH,
+                )
+            } != 0
+            {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            let retryable = error.raw_os_error().is_some_and(|code| {
+                code as u32 == ERROR_SHARING_VIOLATION
+                    || code as u32 == ERROR_LOCK_VIOLATION
+            });
+            if !retryable
+                || retry_delay_ms
+                    == *WINDOWS_ATOMIC_RETRY_DELAYS_MS
+                        .last()
+                        .expect("retry schedule is non-empty")
+            {
+                return Err(error);
+            }
+        }
+        unreachable!("bounded MoveFileExW attempts always return")
+    })
+    .await
+    .map_err(|error| {
+        std::io::Error::other(format!("atomic create task failed: {error}"))
+    })?
+}
+
+#[derive(Debug)]
+struct AtomicReplaceError {
+    error: std::io::Error,
+    /// False only when an OS reported a partial commit and recovery could not
+    /// restore the destination. The temp file may then be the sole copy of the
+    /// requested new bytes and must never be deleted by generic cleanup.
+    source_can_be_removed: bool,
+}
+
+impl AtomicReplaceError {
+    fn unchanged(error: std::io::Error) -> Self {
+        Self {
+            error,
+            source_can_be_removed: true,
+        }
+    }
+
+    #[cfg(windows)]
+    fn preserve_source(error: std::io::Error) -> Self {
+        Self {
+            error,
+            source_can_be_removed: false,
+        }
+    }
+}
+
+impl std::fmt::Display for AtomicReplaceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for AtomicReplaceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+#[cfg(not(windows))]
+async fn replace_file_atomic(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), AtomicReplaceError> {
+    tokio::fs::rename(source, destination)
+        .await
+        .map_err(AtomicReplaceError::unchanged)?;
+    #[cfg(unix)]
+    if let Some(parent) = destination.parent() {
+        let parent = parent.to_owned();
+        tokio::task::spawn_blocking(move || {
+            std::fs::File::open(parent)?.sync_all()
+        })
+        .await
+        .map_err(|error| {
+            AtomicReplaceError::unchanged(std::io::Error::other(format!(
+                "parent directory sync task failed: {error}"
+            )))
+        })?
+        .map_err(AtomicReplaceError::unchanged)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn replace_file_atomic(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), AtomicReplaceError> {
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION, ERROR_PATH_NOT_FOUND,
+        ERROR_SHARING_VIOLATION, ERROR_UNABLE_TO_MOVE_REPLACEMENT,
+        ERROR_UNABLE_TO_MOVE_REPLACEMENT_2,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        DeleteFileW, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        REPLACEFILE_IGNORE_ACL_ERRORS, ReplaceFileW,
+    };
+
+    let backup_path = atomic_backup_path(destination);
+    let source = windows_api_path(source);
+    let destination = windows_api_path(destination);
+    let backup = windows_api_path(&backup_path);
+    tokio::task::spawn_blocking(move || {
+        let move_without_clobber = |from: &[u16], to: &[u16]| {
+            for &retry_delay_ms in WINDOWS_ATOMIC_RETRY_DELAYS_MS {
+                if retry_delay_ms != 0 {
+                    std::thread::sleep(Duration::from_millis(retry_delay_ms));
+                }
+                // SAFETY: both slices are NUL-terminated UTF-16 paths and
+                // remain alive for this synchronous call.
+                if unsafe {
+                    MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH)
+                } != 0
+                {
+                    return Ok(());
+                }
+                let error = std::io::Error::last_os_error();
+                let retryable = error.raw_os_error().is_some_and(|code| {
+                    code as u32 == ERROR_SHARING_VIOLATION
+                        || code as u32 == ERROR_LOCK_VIOLATION
+                });
+                if !retryable
+                    || retry_delay_ms
+                        == *WINDOWS_ATOMIC_RETRY_DELAYS_MS
+                            .last()
+                            .expect("retry schedule is non-empty")
+                {
+                    return Err(error);
+                }
+            }
+            unreachable!("bounded MoveFileExW attempts always return")
+        };
+        let remove_backup = || {
+            // SAFETY: `backup` is a live, NUL-terminated UTF-16 path.
+            if unsafe { DeleteFileW(backup.as_ptr()) } == 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        %error,
+                        "could not remove completed knowledge replacement backup"
+                    );
+                }
+            }
+        };
+
+        for &retry_delay_ms in WINDOWS_ATOMIC_RETRY_DELAYS_MS {
+            if retry_delay_ms != 0 {
+                std::thread::sleep(Duration::from_millis(retry_delay_ms));
+            }
+            // ReplaceFileW preserves the destination file's ACL, attributes,
+            // creation time and identity metadata. A unique same-directory
+            // backup also makes the API's documented partial-commit states
+            // recoverable instead of allowing generic cleanup to lose data.
+            if unsafe {
+                ReplaceFileW(
+                    destination.as_ptr(),
+                    source.as_ptr(),
+                    backup.as_ptr(),
+                    REPLACEFILE_IGNORE_ACL_ERRORS,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            } != 0 {
+                remove_backup();
+                return Ok(());
+            }
+            let mut error = std::io::Error::last_os_error();
+            let error_code = error.raw_os_error().map(|code| code as u32);
+
+            if error_code == Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2) {
+                // The old destination has moved to `backup`; `source` still
+                // contains the requested new bytes. Finish the commit when
+                // possible, otherwise restore the old destination.
+                match move_without_clobber(&source, &destination) {
+                    Ok(()) => {
+                        remove_backup();
+                        return Ok(());
+                    }
+                    Err(commit_error) => {
+                        return match move_without_clobber(&backup, &destination) {
+                            Ok(()) => Err(AtomicReplaceError::unchanged(
+                                std::io::Error::other(format!(
+                                    "Windows partially replaced the file; the original was restored after the new file could not be published: {commit_error}"
+                                )),
+                            )),
+                            Err(restore_error) => Err(AtomicReplaceError::preserve_source(
+                                std::io::Error::other(format!(
+                                    "Windows partially replaced the file and recovery could not restore the destination (publish: {commit_error}; restore: {restore_error})"
+                                )),
+                            )),
+                        };
+                    }
+                }
+            }
+            if error_code == Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT) {
+                // With a backup name supplied, Microsoft documents that both
+                // files retain their original names. The caller may safely
+                // remove the unpublished source temp.
+                return Err(AtomicReplaceError::unchanged(error));
+            }
+
+            let destination_missing = error.raw_os_error().is_some_and(|code| {
+                code as u32 == ERROR_FILE_NOT_FOUND
+                    || code as u32 == ERROR_PATH_NOT_FOUND
+            });
+            if destination_missing {
+                match move_without_clobber(&source, &destination) {
+                    Ok(()) => {
+                        remove_backup();
+                        return Ok(());
+                    }
+                    Err(move_error) => {
+                        error = move_error;
+                    }
+                }
+            }
+            let retryable = error.raw_os_error().is_some_and(|code| {
+                code as u32 == ERROR_SHARING_VIOLATION
+                    || code as u32 == ERROR_LOCK_VIOLATION
+            });
+            if !retryable
+                || retry_delay_ms
+                    == *WINDOWS_ATOMIC_RETRY_DELAYS_MS
+                        .last()
+                        .expect("retry schedule is non-empty")
+            {
+                return Err(AtomicReplaceError::unchanged(error));
+            }
+        }
+        unreachable!("bounded ReplaceFileW attempts always return")
+    })
+    .await
+    .map_err(|error| {
+        AtomicReplaceError::unchanged(std::io::Error::other(format!(
+            "atomic replace task failed: {error}"
+        )))
+    })?
+}
+
+#[cfg(windows)]
+fn windows_api_path(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let slash = b'\\' as u16;
+    let question = b'?' as u16;
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    let raw: Vec<u16> = normalized
+        .as_os_str()
+        .encode_wide()
+        .map(|unit| if unit == b'/' as u16 { slash } else { unit })
+        .collect();
+    let already_extended =
+        raw.starts_with(&[slash, slash, question, slash]);
+    let mut out = if already_extended || !normalized.is_absolute() {
+        raw
+    } else if raw.starts_with(&[slash, slash]) {
+        let mut extended = "\\\\?\\UNC\\"
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        extended.extend_from_slice(&raw[2..]);
+        extended
+    } else {
+        let mut extended = "\\\\?\\".encode_utf16().collect::<Vec<_>>();
+        extended.extend_from_slice(&raw);
+        extended
+    };
+    out.push(0);
+    out
+}
+
+/// A collision-free sibling temp path for atomic write+replace. The UUIDv7
+/// suffix remains unique across process restarts, so an orphan from a crash
+/// cannot collide when an OS later reuses the same process id. The `.tmp` tail
+/// keeps orphaned files out of markdown listings and search.
 fn atomic_tmp_path(path: &Path) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut name = path.as_os_str().to_owned();
-    name.push(format!(".{}.{}.tmp", std::process::id(), n));
-    PathBuf::from(name)
+    let temp_name = format!(".nomifun-write-{}.tmp", generate_id());
+    path.parent()
+        .map(|parent| parent.join(&temp_name))
+        .unwrap_or_else(|| PathBuf::from(temp_name))
+}
+
+fn content_sha256(content: &str) -> String {
+    hex::encode(Sha256::digest(content.as_bytes()))
+}
+
+fn staged_proposal_metadata_path(proposal_path: &Path) -> PathBuf {
+    let identity = portable_absolute_path_identity(proposal_path);
+    let metadata_name = format!(
+        ".nomifun-base-{}.json",
+        content_sha256(&identity)
+    );
+    proposal_path
+        .parent()
+        .map(|parent| parent.join(&metadata_name))
+        .unwrap_or_else(|| PathBuf::from(metadata_name))
+}
+
+#[cfg(windows)]
+fn atomic_backup_path(path: &Path) -> PathBuf {
+    let backup_name = format!(".nomifun-backup-{}.tmp", generate_id());
+    path.parent()
+        .map(|parent| parent.join(&backup_name))
+        .unwrap_or_else(|| PathBuf::from(backup_name))
 }
 
 /// Max chars of the mount-time `summary` extracted from a base's README.
@@ -3432,6 +5947,7 @@ async fn find_readme_path(root: &Path) -> Option<PathBuf> {
 /// base has no README (yet) — the AI-autogen README task fills these in over
 /// time.
 async fn read_base_summary(root: &Path) -> Option<String> {
+    validate_knowledge_root_bounded(root.to_path_buf()).await.ok()?;
     let path = find_readme_path(root).await?;
     let text = tokio::fs::read_to_string(path).await.ok()?;
     extract_readme_summary(&text)
@@ -3499,18 +6015,19 @@ fn toc_rank(rel: &str) -> (u8, usize) {
 /// [`crate::context::apply_toc_budgets`].
 async fn build_toc(root: &Path) -> Vec<String> {
     let root = root.to_path_buf();
+    let lock_root = root.clone();
     // Bounded + machinery-pruned: at session mount this opens every note for its
     // first heading, so a slow/large NAS vault must degrade to an empty toc
     // rather than block session start.
-    bounded_blocking(BASE_WALK_BUDGET, Vec::new(), move || {
-        if !root.is_dir() {
+    bounded_root_blocking(&lock_root, BASE_WALK_BUDGET, Vec::new(), move || {
+        if validate_knowledge_root(&root).is_err() {
             return Vec::new();
         }
         let mut rels: Vec<String> = vault_walker(&root)
             .filter(|e| e.file_type().is_file() && is_md(e.path()))
             .filter_map(|e| {
-                let rel = e.path().strip_prefix(&root).ok()?.to_string_lossy().replace('\\', "/");
-                (!rel.starts_with(&format!("{KB_INBOX_REL_DIR}/"))).then_some(rel)
+                let rel = e.path().strip_prefix(&root).ok()?.to_str()?.replace('\\', "/");
+                (!rel_path_starts_with_dir(&rel, KB_INBOX_REL_DIR)).then_some(rel)
             })
             .collect();
         rels.sort_by(|a, b| toc_rank(a).cmp(&toc_rank(b)).then_with(|| a.cmp(b)));
@@ -3594,11 +6111,23 @@ fn first_heading(path: &Path) -> Option<String> {
 
 async fn complete_turn_writeback_llm(
     completer: &Arc<dyn KnowledgeCompleter>,
+    model: Option<&ProviderWithModel>,
     system: &'static str,
     prompt: &str,
     stage: &'static str,
 ) -> Result<String, String> {
-    match tokio::time::timeout(TURN_WRITEBACK_LLM_TIMEOUT, completer.complete(system, prompt)).await {
+    let completion = async {
+        match model {
+            Some(model) => {
+                let effective_model = model.use_model.as_deref().unwrap_or(&model.model);
+                completer
+                    .complete_with(system, prompt, &model.provider_id, effective_model)
+                    .await
+            }
+            None => completer.complete(system, prompt).await,
+        }
+    };
+    match tokio::time::timeout(TURN_WRITEBACK_LLM_TIMEOUT, completion).await {
         Ok(Ok(raw)) => Ok(raw),
         Ok(Err(e)) => Err(e.to_string()),
         Err(_) => Err(format!(
@@ -3608,23 +6137,58 @@ async fn complete_turn_writeback_llm(
     }
 }
 
+/// Direct write-back must never ask a model to recreate an existing document:
+/// a prompt excerpt cannot represent an arbitrarily large file and would make
+/// silent truncation/data loss possible. Preserve the original bytes exactly
+/// and append only a genuinely new proposal.
+fn merge_direct_turn_writeback(existing: &str, proposal: &str) -> String {
+    let proposal = proposal.trim();
+    if proposal.is_empty() || contains_markdown_block(existing, proposal) {
+        return existing.to_owned();
+    }
+    let separator = if existing.is_empty() || existing.ends_with("\n\n") {
+        ""
+    } else if existing.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    format!("{existing}{separator}{proposal}\n")
+}
+
+/// Treat a proposal as already present only when it occupies complete markdown
+/// line boundaries. A plain substring check would incorrectly discard a new
+/// proposal such as `foo` merely because an existing paragraph contains
+/// `foobar`. Normalize CRLF for retry idempotence across platforms without
+/// changing the original bytes that are ultimately preserved on disk.
+fn contains_markdown_block(existing: &str, proposal: &str) -> bool {
+    let existing = existing.replace("\r\n", "\n").replace('\r', "\n");
+    let proposal = proposal.replace("\r\n", "\n").replace('\r', "\n");
+    let proposal = proposal.trim();
+    if proposal.is_empty() {
+        return true;
+    }
+
+    existing.match_indices(proposal).any(|(start, matched)| {
+        let end = start + matched.len();
+        let starts_on_boundary = start == 0 || existing.as_bytes().get(start - 1) == Some(&b'\n');
+        let ends_on_boundary = end == existing.len() || existing.as_bytes().get(end) == Some(&b'\n');
+        starts_on_boundary && ends_on_boundary
+    })
+}
+
 pub(crate) fn is_md(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("md"))
 }
 
-fn short_content_hash(content: &str) -> String {
-    let digest = Sha256::digest(content.as_bytes());
-    hex::encode(digest).chars().take(8).collect()
-}
-
-fn append_markdown_path_suffix(rel_path: &str, suffix: &str) -> String {
-    let normalized = rel_path.replace('\\', "/");
-    match normalized.rsplit_once('.') {
-        Some((stem, ext)) if ext.eq_ignore_ascii_case("md") => format!("{stem}--{suffix}.{ext}"),
-        _ => format!("{normalized}--{suffix}.md"),
-    }
+fn markdown_identity(content: &str) -> String {
+    content
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim()
+        .to_owned()
 }
 
 /// True for a directory that is knowledge-base *machinery*, never a source of
@@ -3640,11 +6204,28 @@ fn append_markdown_path_suffix(rel_path: &str, suffix: &str) -> String {
 /// network round-trip per entry — on a slow NAS mount that is what pushes the
 /// per-base walk past the client request timeout and surfaces as "加载失败".
 fn is_machinery_dir(entry: &walkdir::DirEntry) -> bool {
-    if entry.depth() == 0 || !entry.file_type().is_dir() {
+    if entry.depth() == 0 {
         return false;
     }
-    let name = entry.file_name().to_string_lossy();
-    name.starts_with('.') || name == "node_modules"
+    // WalkDir's `follow_links(false)` handles ordinary symlinks, but Windows
+    // junctions/name-surrogate reparse directories are not consistently
+    // reported as symlinks. Apply the same no-follow rule used by write paths.
+    if std::fs::symlink_metadata(entry.path())
+        .is_ok_and(|metadata| {
+            metadata_is_link_or_reparse(entry.path(), &metadata)
+        })
+    {
+        return true;
+    }
+    if !entry.file_type().is_dir() {
+        return false;
+    }
+    let Some(name) = entry.file_name().to_str() else {
+        // A path that cannot be represented by the cross-platform API must
+        // never leak into handles/TOCs or be traversed as agent context.
+        return true;
+    };
+    is_excluded_tree_dir_name(name)
 }
 
 /// The canonical markdown walker for a knowledge-base `root`: a [`walkdir`]
@@ -3655,6 +6236,8 @@ fn is_machinery_dir(entry: &walkdir::DirEntry) -> bool {
 /// through here so the traversal policy is defined once.
 fn vault_walker(root: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
     walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .follow_root_links(false)
         .into_iter()
         .filter_entry(|e| !is_machinery_dir(e))
         .flatten()
@@ -3679,6 +6262,70 @@ async fn bounded_blocking<T: Send + 'static>(
         // Slow/stale mount exceeded the budget → degrade; the detached walk
         // finishes on its own and its result is discarded.
         Err(_elapsed) => on_timeout,
+    }
+}
+
+fn root_blocking_inspection_lock(root: &Path) -> Arc<AsyncMutex<()>> {
+    let key = portable_absolute_path_identity(root);
+    let locks =
+        ROOT_BLOCKING_INSPECTION_LOCKS.get_or_init(|| {
+            StdMutex::new(HashMap::new())
+        });
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        lock
+    } else {
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+}
+
+/// Root-keyed single-flight wrapper for non-cancellable filesystem blockers.
+/// The semaphore permit and root guard are moved into the blocking closure, so
+/// they remain held even when the caller times out and drops the JoinHandle.
+/// A manual retry then waits on the existing inspector instead of spawning
+/// another permanently blocked stat/walk for the same offline NAS root.
+async fn bounded_root_blocking<T: Send + 'static>(
+    root: &Path,
+    budget: Duration,
+    on_timeout: T,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let started = std::time::Instant::now();
+    let limit = ROOT_BLOCKING_INSPECTION_LIMIT
+        .get_or_init(|| {
+            Arc::new(Semaphore::new(
+                KNOWLEDGE_BLOCKING_INSPECTION_CONCURRENCY,
+            ))
+        })
+        .clone();
+    let root_lock = root_blocking_inspection_lock(root);
+    let acquired = tokio::time::timeout(budget, async move {
+        let root_guard = root_lock.lock_owned().await;
+        let permit = limit
+            .acquire_owned()
+            .await
+            .expect("root inspection semaphore is never closed");
+        (permit, root_guard)
+    })
+    .await;
+    let (permit, root_guard) = match acquired {
+        Ok(acquired) => acquired,
+        Err(_) => return on_timeout,
+    };
+    let remaining = budget.saturating_sub(started.elapsed());
+    let handle = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _root_guard = root_guard;
+        f()
+    });
+    match tokio::time::timeout(remaining, handle).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(_)) | Err(_) => on_timeout,
     }
 }
 
@@ -3776,37 +6423,588 @@ fn best_snippet(content: &str, query_lc: &str, terms: &[String]) -> String {
 fn deconfuse_rel_path(rel_path: &str) -> String {
     let normalized = rel_path.trim().replace('\\', "/");
     let p = normalized.strip_prefix("./").unwrap_or(&normalized);
-    if let Some(rest) = p.strip_prefix(&format!("{KB_MOUNT_REL_DIR}/")) {
-        // rest = "{link_name}/…"; drop the mount link segment.
-        return match rest.split_once('/') {
-            Some((_link, tail)) => tail.to_owned(),
-            None => rest.to_owned(),
-        };
+    let components: Vec<&str> = p.split('/').collect();
+    let mount_components: Vec<&str> = KB_MOUNT_REL_DIR.split('/').collect();
+    if components.len() > mount_components.len()
+        && components
+            .iter()
+            .zip(mount_components.iter())
+            .all(|(actual, expected)| {
+                portable_path_component_identity(actual)
+                    == portable_path_component_identity(expected)
+            })
+    {
+        // Drop both the portable mount prefix and its link-name segment.
+        return components[mount_components.len() + 1..].join("/");
     }
     p.to_owned()
+}
+
+pub(crate) fn portable_path_component_identity(component: &str) -> String {
+    // Canonical normalization plus full Unicode case folding matches the
+    // caseless aliases exposed by default Windows/macOS filesystems without
+    // collapsing unrelated compatibility characters (for example ① and 1).
+    let normalized = component.nfc().collect::<String>();
+    unicase::UniCase::unicode(normalized.as_str())
+        .to_folded_case()
+        .nfc()
+        .collect()
+}
+
+fn turn_writeback_is_cancelled(req: &TurnWritebackRequest) -> bool {
+    req.cancellation
+        .as_ref()
+        .is_some_and(CancellationToken::is_cancelled)
+}
+
+fn portable_turn_writeback_lock_path(rel_path: &str) -> String {
+    portable_writeback_path_identity(rel_path)
+}
+
+pub fn portable_writeback_path_identity(rel_path: &str) -> String {
+    deconfuse_rel_path(rel_path)
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .map(portable_path_component_identity)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+pub fn logical_writeback_target_from_storage_path(rel_path: &str) -> String {
+    let canonical = deconfuse_rel_path(rel_path);
+    let components: Vec<&str> = canonical.split('/').collect();
+    if components.len() < 3
+        || portable_path_component_identity(components[0])
+            != portable_path_component_identity(KB_INBOX_REL_DIR)
+    {
+        return canonical;
+    }
+    components[2..].join("/")
+}
+
+fn portable_absolute_path_identity(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .map(portable_path_component_identity)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn root_identities_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn root_group_locks(
+    registry: &StdMutex<HashMap<String, Weak<AsyncRwLock<()>>>>,
+    key: String,
+) -> Vec<Arc<AsyncRwLock<()>>> {
+    let mut locks = registry
+        .lock()
+        .expect("knowledge root lock map poisoned");
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    // `strong_count`/`contains_key` is not sufficient: the final owner can
+    // disappear between those observations and a later Weak::upgrade. Hold
+    // the requested strong Arc while the registry mutex is still held, and
+    // immediately replace an expired Weak.
+    let requested = if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        lock
+    } else {
+        let lock = Arc::new(AsyncRwLock::new(()));
+        locks.insert(key.clone(), Arc::downgrade(&lock));
+        lock
+    };
+    let mut overlapping = locks
+        .iter()
+        .filter_map(|(existing_key, lock)| {
+            root_identities_overlap(existing_key, &key)
+                .then(|| Weak::upgrade(lock))
+                .flatten()
+                .map(|lock| (existing_key.clone(), lock))
+        })
+        .collect::<Vec<_>>();
+    debug_assert!(
+        overlapping
+            .iter()
+            .any(|(_, lock)| Arc::ptr_eq(lock, &requested)),
+        "requested knowledge root lock must remain in its overlap group"
+    );
+    overlapping.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut seen = HashSet::new();
+    overlapping
+        .into_iter()
+        .filter_map(|(_, lock)| {
+            let identity = Arc::as_ptr(&lock) as usize;
+            seen.insert(identity).then_some(lock)
+        })
+        .collect()
+}
+
+fn validate_canonical_write_target(rel_path: &str) -> Result<(), AppError> {
+    let components: Vec<&str> = rel_path.split('/').collect();
+    if components
+        .first()
+        .is_some_and(|component| {
+            portable_path_component_identity(component)
+                == portable_path_component_identity(KB_INBOX_REL_DIR)
+        })
+    {
+        return Err(AppError::BadRequest(
+            "knowledge writes must target the base body, not the review inbox".into(),
+        ));
+    }
+    if components
+        .iter()
+        .take(components.len().saturating_sub(1))
+        .any(|component| is_excluded_tree_dir_name(component))
+    {
+        return Err(AppError::BadRequest(
+            "knowledge writes cannot target a directory hidden from review and search".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_source_owned_write_target(
+    row: &KnowledgeBaseRow,
+    rel_path: &str,
+) -> Result<(), AppError> {
+    let has_source = source_from_extra(&row.extra)
+        .map_err(|error| knowledge_row_json_error(&row.knowledge_base_id, error))?
+        .is_some();
+    if has_source
+        && rel_path
+            .split('/')
+            .next()
+            .is_some_and(|component| {
+                portable_path_component_identity(component)
+                    == portable_path_component_identity(
+                        source_url::SNAPSHOT_REL_DIR,
+                    )
+            })
+    {
+        return Err(AppError::Forbidden(
+            "source snapshots are managed by refresh/sync and cannot be changed by knowledge write-back"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_write_request(req: &WriteRequest) -> Result<(), AppError> {
+    if req.content.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "refusing to write empty knowledge content".into(),
+        ));
+    }
+    if matches!(req.policy.mode, WriteMode::Disabled) {
+        return Err(AppError::Forbidden(
+            "write-back is disabled for this session".into(),
+        ));
+    }
+    if let WriteMode::Staged { scope } = &req.policy.mode {
+        validate_inbox_scope(scope)?;
+    }
+    Ok(())
+}
+
+async fn safe_md_path_bounded(
+    root: PathBuf,
+    rel_path: String,
+) -> Result<PathBuf, AppError> {
+    let display_path = rel_path.clone();
+    let timeout = AppError::Timeout(format!(
+            "knowledge path inspection timed out for {display_path}"
+        ));
+    let lock_root = root.clone();
+    bounded_root_blocking(
+        &lock_root,
+        KNOWLEDGE_PATH_INSPECTION_TIMEOUT,
+        Err(timeout),
+        move || safe_md_path(&root, &rel_path),
+    )
+    .await
+}
+
+#[derive(Debug)]
+struct PortablePathResolution {
+    rel_path: String,
+    exists: bool,
+}
+
+/// Resolve only the requested path chain using the same Unicode/case identity
+/// on every supported OS. This avoids a full-vault collision walk while still
+/// preventing Linux from creating a second spelling that would alias on
+/// default Windows/macOS filesystems.
+async fn resolve_portable_md_path(
+    root: PathBuf,
+    rel_path: String,
+) -> Result<PortablePathResolution, AppError> {
+    let display_path = rel_path.clone();
+    let timeout_display_path = display_path.clone();
+    tokio::time::timeout(KNOWLEDGE_PATH_INSPECTION_TIMEOUT, async move {
+        let components = rel_path.split('/').collect::<Vec<_>>();
+        let mut directory = root;
+        let mut actual_components = Vec::with_capacity(components.len());
+
+        for (index, requested) in components.iter().enumerate() {
+            let requested_identity = portable_path_component_identity(requested);
+            let mut entries = tokio::fs::read_dir(&directory)
+                .await
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "failed to inspect knowledge path {}: {error}",
+                        directory.display()
+                    ))
+                })?;
+            let mut matches = Vec::new();
+            while let Some(entry) = entries.next_entry().await.map_err(|error| {
+                AppError::Internal(format!(
+                    "failed to inspect knowledge path {}: {error}",
+                    directory.display()
+                ))
+            })? {
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if portable_path_component_identity(&name) == requested_identity {
+                    matches.push((name, entry.path()));
+                }
+            }
+            if matches.is_empty() {
+                actual_components.extend(
+                    components[index..]
+                        .iter()
+                        .map(|component| (*component).to_owned()),
+                );
+                return Ok(PortablePathResolution {
+                    rel_path: actual_components.join("/"),
+                    exists: false,
+                });
+            }
+            if matches.len() > 1 {
+                return Err(AppError::Conflict(format!(
+                    "more than one knowledge path entry aliases \"{requested}\" across Windows, Linux and macOS; rename the duplicates before writing"
+                )));
+            }
+
+            let (actual_name, actual_path) =
+                matches.pop().expect("one portable path match");
+            if index == 0
+                && requested_identity
+                    == portable_path_component_identity(KB_INBOX_REL_DIR)
+                && actual_name != KB_INBOX_REL_DIR
+            {
+                return Err(AppError::Conflict(format!(
+                    "the knowledge root contains a portable alias \"{actual_name}\" for the reserved \"{KB_INBOX_REL_DIR}\" directory; rename it before staging write-back"
+                )));
+            }
+            let metadata = tokio::fs::symlink_metadata(&actual_path)
+                .await
+                .map_err(|error| {
+                    AppError::Internal(format!(
+                        "failed to inspect knowledge path {}: {error}",
+                        actual_path.display()
+                    ))
+                })?;
+            if metadata_is_link_or_reparse(&actual_path, &metadata) {
+                return Err(AppError::BadRequest(
+                    "knowledge paths must not traverse symlinks, junctions, or other name-surrogate reparse points"
+                        .into(),
+                ));
+            }
+            let is_last = index + 1 == components.len();
+            if is_last {
+                if !metadata.is_file() || !is_md(&actual_path) {
+                    return Err(AppError::BadRequest(format!(
+                        "knowledge document is not a regular markdown file: {display_path}"
+                    )));
+                }
+            } else if !metadata.is_dir() {
+                return Err(AppError::BadRequest(format!(
+                    "knowledge path parent is not a directory: {}",
+                    actual_components
+                        .iter()
+                        .chain(std::iter::once(&actual_name))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("/")
+                )));
+            }
+            actual_components.push(actual_name);
+            directory = actual_path;
+        }
+        Ok(PortablePathResolution {
+            rel_path: actual_components.join("/"),
+            exists: true,
+        })
+    })
+    .await
+    .map_err(|_| {
+        AppError::Timeout(format!(
+            "knowledge path inspection timed out: {timeout_display_path}"
+        ))
+    })?
 }
 
 /// Join `rel_path` onto `root`, rejecting traversal (absolute paths, `..`,
 /// drive prefixes) and non-markdown extensions.
 fn safe_md_path(root: &Path, rel_path: &str) -> Result<PathBuf, AppError> {
+    validate_knowledge_root(root)?;
     let rel = Path::new(rel_path);
     if rel.as_os_str().is_empty() {
         return Err(AppError::BadRequest("path must not be empty".into()));
     }
+    let mut resolved = root.to_path_buf();
     for comp in rel.components() {
         match comp {
-            Component::Normal(_) => {}
+            Component::Normal(component) => {
+                let component = component
+                    .to_str()
+                    .ok_or_else(|| AppError::BadRequest("path must be valid Unicode".into()))?;
+                validate_portable_path_component(component)?;
+                resolved.push(component);
+                match std::fs::symlink_metadata(&resolved) {
+                    Ok(metadata) if metadata_is_link_or_reparse(&resolved, &metadata) => {
+                        return Err(AppError::BadRequest(
+                            "knowledge paths must not traverse symlinks, junctions, or other reparse points".into(),
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(AppError::Internal(format!(
+                            "failed to inspect knowledge path component {}: {error}",
+                            resolved.display()
+                        )));
+                    }
+                }
+            }
             _ => return Err(AppError::BadRequest(format!("invalid path: {rel_path}"))),
         }
     }
     if !is_md(rel) {
         return Err(AppError::BadRequest("only .md files are supported".into()));
     }
-    Ok(root.join(rel))
+    Ok(resolved)
+}
+
+/// Verify every physical root component without following a name-surrogate
+/// entry. Registration stores a canonical path, so any symlink/junction in
+/// this chain indicates that the root was retargeted after registration.
+fn validate_knowledge_root(root: &Path) -> Result<(), AppError> {
+    if !root.is_absolute() {
+        return Err(AppError::BadRequest(
+            "knowledge base root must be absolute".into(),
+        ));
+    }
+    let mut cursor = PathBuf::new();
+    let mut saw_normal = false;
+    for component in root.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                cursor.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(AppError::BadRequest(
+                    "knowledge base root must be a canonical physical path"
+                        .into(),
+                ));
+            }
+            Component::Normal(_) => {
+                saw_normal = true;
+                cursor.push(component.as_os_str());
+                let metadata =
+                    std::fs::symlink_metadata(&cursor).map_err(|error| {
+                        AppError::Internal(format!(
+                            "failed to inspect knowledge root {}: {error}",
+                            cursor.display()
+                        ))
+                    })?;
+                if metadata_is_link_or_reparse(&cursor, &metadata) {
+                    return Err(AppError::Conflict(format!(
+                        "knowledge base root was replaced or retargeted through a symlink, junction, or name-surrogate reparse point: {}",
+                        cursor.display()
+                    )));
+                }
+                if !metadata.is_dir() {
+                    return Err(AppError::Conflict(format!(
+                        "knowledge base root component is no longer a directory: {}",
+                        cursor.display()
+                    )));
+                }
+            }
+        }
+    }
+    if !saw_normal {
+        return Err(AppError::BadRequest(
+            "a filesystem, drive, or network-share root cannot be used as a knowledge base"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_knowledge_root_bounded(
+    root: PathBuf,
+) -> Result<(), AppError> {
+    let display = root.display().to_string();
+    let timeout = AppError::Timeout(format!(
+            "knowledge root inspection timed out: {display}"
+        ));
+    let lock_root = root.clone();
+    bounded_root_blocking(
+        &lock_root,
+        KNOWLEDGE_PATH_INSPECTION_TIMEOUT,
+        Err(timeout),
+        move || validate_knowledge_root(&root),
+    )
+    .await
+}
+
+#[cfg(not(windows))]
+fn metadata_is_link_or_reparse(_path: &Path, metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn metadata_is_link_or_reparse(path: &Path, metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    if !windows_file_attributes_are_reparse_point(metadata.file_attributes()) {
+        return false;
+    }
+    // Cloud Files/OneDrive placeholders are reparse points but not path
+    // redirections. Reject only name-surrogate tags (symlink/junction-like);
+    // fail closed if a tagged entry cannot be inspected.
+    windows_reparse_tag(path)
+        .map(|tag| tag & 0x2000_0000 != 0)
+        .unwrap_or(true)
+}
+
+#[cfg(windows)]
+fn windows_file_attributes_are_reparse_point(attributes: u32) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn windows_reparse_tag(path: &Path) -> std::io::Result<u32> {
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FileAttributeTagInfo, GetFileInformationByHandleEx,
+        OPEN_EXISTING,
+    };
+
+    let path = windows_api_path(path);
+    // SAFETY: path is NUL-terminated; the returned handle is closed below.
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the output buffer has the exact Win32 structure size and the
+    // valid handle remains open for the call.
+    let mut info: FILE_ATTRIBUTE_TAG_INFO = unsafe { zeroed() };
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileAttributeTagInfo,
+            (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    // SAFETY: handle was returned by CreateFileW above.
+    unsafe {
+        CloseHandle(handle);
+    }
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(info.ReparseTag)
+    }
+}
+
+fn validate_portable_path_component(component: &str) -> Result<(), AppError> {
+    let invalid_character = component.chars().any(|character| {
+        character.is_control()
+            || matches!(character, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+    });
+    if component.is_empty()
+        || component.ends_with([' ', '.'])
+        || component.as_bytes().len() > 255
+        || component.encode_utf16().count() > 255
+        || invalid_character
+    {
+        return Err(AppError::BadRequest(format!(
+            "path component is not portable across Windows, Linux and macOS: {component}"
+        )));
+    }
+
+    let portable_component = portable_path_component_identity(component);
+    let basename = portable_component
+        .split_once('.')
+        .map(|(basename, _)| basename)
+        .unwrap_or(portable_component.as_str());
+    let reserved = matches!(basename, "con" | "prn" | "aux" | "nul")
+        || basename
+            .strip_prefix("com")
+            .or_else(|| basename.strip_prefix("lpt"))
+            .is_some_and(|suffix| {
+                (suffix.len() == 1
+                    && matches!(suffix.as_bytes()[0], b'1'..=b'9'))
+                    || matches!(suffix, "¹" | "²" | "³")
+            });
+    if reserved {
+        return Err(AppError::BadRequest(format!(
+            "path component is reserved on Windows: {component}"
+        )));
+    }
+    Ok(())
 }
 
 fn is_excluded_tree_dir_name(name: &str) -> bool {
-    name.starts_with('.') || name == "node_modules" || name == KB_INBOX_REL_DIR
+    let identity = portable_path_component_identity(name);
+    identity.starts_with('.')
+        || identity == portable_path_component_identity("node_modules")
+        || identity == portable_path_component_identity("_trash")
+        || identity == portable_path_component_identity(KB_INBOX_REL_DIR)
+}
+
+fn rel_path_starts_with_dir(rel_path: &str, directory: &str) -> bool {
+    rel_path
+        .split('/')
+        .next()
+        .is_some_and(|component| {
+            portable_path_component_identity(component)
+                == portable_path_component_identity(directory)
+        })
 }
 
 fn looks_like_windows_drive_prefix(segment: &str) -> bool {
@@ -3830,6 +7028,7 @@ fn normalize_tree_rel_path(rel_path: &str) -> Result<String, AppError> {
         {
             return Err(AppError::BadRequest(format!("invalid path: {rel_path}")));
         }
+        validate_portable_path_component(segment)?;
         if is_excluded_tree_dir_name(segment) {
             return Err(AppError::BadRequest(format!(
                 "directory is excluded: {segment}"
@@ -3849,9 +7048,7 @@ fn join_tree_rel_path(parent: &str, name: &str) -> String {
 }
 
 fn list_tree_level(root: &Path, rel_path: &str) -> Result<Vec<KbTreeEntry>, AppError> {
-    if !root.is_dir() {
-        return Ok(Vec::new());
-    }
+    validate_knowledge_root(root)?;
     let dir = if rel_path.is_empty() {
         root.to_path_buf()
     } else {
@@ -3874,16 +7071,18 @@ fn list_tree_level(root: &Path, rel_path: &str) -> Result<Vec<KbTreeEntry>, AppE
 
     let mut out = Vec::new();
     for entry in entries.flatten() {
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
+        let metadata = match std::fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
             Err(_) => continue,
         };
-        if file_type.is_symlink() {
+        if metadata_is_link_or_reparse(&entry.path(), &metadata) {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
         let child_rel = join_tree_rel_path(rel_path, &name);
-        if file_type.is_dir() {
+        if metadata.is_dir() {
             if is_excluded_tree_dir_name(&name) {
                 continue;
             }
@@ -3897,15 +7096,14 @@ fn list_tree_level(root: &Path, rel_path: &str) -> Result<Vec<KbTreeEntry>, AppE
             });
             continue;
         }
-        if file_type.is_file() && is_md(&entry.path()) {
-            let meta = entry.metadata().ok();
+        if metadata.is_file() && is_md(&entry.path()) {
             out.push(KbTreeEntry {
                 name,
                 rel_path: child_rel,
                 is_dir: false,
                 is_file: true,
-                size: meta.as_ref().map(|m| m.len()),
-                modified_at: meta.as_ref().and_then(modified_ms),
+                size: Some(metadata.len()),
+                modified_at: modified_ms(&metadata),
             });
         }
     }
@@ -3920,9 +7118,7 @@ fn list_tree_level(root: &Path, rel_path: &str) -> Result<Vec<KbTreeEntry>, AppE
 }
 
 fn create_tree_folder(root: &Path, rel_path: &str) -> Result<KbTreeEntry, AppError> {
-    if !root.is_dir() {
-        return Err(AppError::NotFound("knowledge base directory not found".into()));
-    }
+    validate_knowledge_root(root)?;
 
     let segments: Vec<&str> = rel_path
         .split('/')
@@ -3933,15 +7129,15 @@ fn create_tree_folder(root: &Path, rel_path: &str) -> Result<KbTreeEntry, AppErr
     }
 
     let mut cursor = root.to_path_buf();
+    let mut actual_segments = Vec::with_capacity(segments.len());
     for (idx, segment) in segments.iter().enumerate() {
-        cursor.push(segment);
         let is_final = idx + 1 == segments.len();
-        match std::fs::symlink_metadata(&cursor) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() {
+        match find_portable_tree_child(&cursor, segment)? {
+            Some(child) => {
+                if metadata_is_link_or_reparse(&child.path, &child.metadata) {
                     return Err(AppError::BadRequest(format!("path crosses a symlink: {rel_path}")));
                 }
-                if !meta.file_type().is_dir() {
+                if !child.metadata.file_type().is_dir() {
                     return Err(AppError::BadRequest(format!(
                         "path is not a directory: {}",
                         segments[..=idx].join("/")
@@ -3950,19 +7146,35 @@ fn create_tree_folder(root: &Path, rel_path: &str) -> Result<KbTreeEntry, AppErr
                 if is_final {
                     return Err(AppError::Conflict(format!("folder already exists: {rel_path}")));
                 }
+                actual_segments.push(child.name);
+                cursor = child.path;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&cursor)
-                    .map_err(|e| AppError::Internal(format!("failed to create folder: {e}")))?;
+            None => {
+                let path = cursor.join(segment);
+                std::fs::create_dir(&path).map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        AppError::Conflict(format!(
+                            "a portable folder alias appeared while creating: {rel_path}"
+                        ))
+                    } else {
+                        AppError::Internal(format!(
+                            "failed to create folder: {error}"
+                        ))
+                    }
+                })?;
+                actual_segments.push((*segment).to_owned());
+                cursor = path;
             }
-            Err(e) => return Err(AppError::Internal(format!("failed to inspect folder path: {e}"))),
         }
     }
 
     let meta = std::fs::metadata(&cursor).ok();
     Ok(KbTreeEntry {
-        name: segments.last().unwrap_or(&rel_path).to_string(),
-        rel_path: rel_path.to_owned(),
+        name: actual_segments
+            .last()
+            .cloned()
+            .unwrap_or_else(|| rel_path.to_owned()),
+        rel_path: actual_segments.join("/"),
         is_dir: true,
         is_file: false,
         size: None,
@@ -3975,6 +7187,7 @@ fn validate_tree_entry_name(name: &str) -> Result<String, AppError> {
     if normalized.is_empty() || normalized.contains('/') || normalized == "." || normalized == ".." || looks_like_windows_drive_prefix(&normalized) {
         return Err(AppError::BadRequest(format!("invalid name: {name}")));
     }
+    validate_portable_path_component(&normalized)?;
     if is_excluded_tree_dir_name(&normalized) {
         return Err(AppError::BadRequest(format!(
             "directory is excluded: {normalized}"
@@ -3984,9 +7197,7 @@ fn validate_tree_entry_name(name: &str) -> Result<String, AppError> {
 }
 
 fn resolve_tree_existing_path(root: &Path, rel_path: &str) -> Result<(PathBuf, std::fs::Metadata), AppError> {
-    if !root.is_dir() {
-        return Err(AppError::NotFound("knowledge base directory not found".into()));
-    }
+    validate_knowledge_root(root)?;
     let segments: Vec<&str> = rel_path.split('/').filter(|segment| !segment.is_empty()).collect();
     if segments.is_empty() {
         return Err(AppError::BadRequest("path must not be empty".into()));
@@ -3994,10 +7205,11 @@ fn resolve_tree_existing_path(root: &Path, rel_path: &str) -> Result<(PathBuf, s
 
     let mut cursor = root.to_path_buf();
     for (idx, segment) in segments.iter().enumerate() {
-        cursor.push(segment);
-        let meta = std::fs::symlink_metadata(&cursor)
-            .map_err(|_| AppError::NotFound(format!("path not found: {rel_path}")))?;
-        if meta.file_type().is_symlink() {
+        let child = find_portable_tree_child(&cursor, segment)?
+            .ok_or_else(|| AppError::NotFound(format!("path not found: {rel_path}")))?;
+        cursor = child.path;
+        let meta = child.metadata;
+        if metadata_is_link_or_reparse(&cursor, &meta) {
             return Err(AppError::BadRequest(format!("path crosses a symlink: {rel_path}")));
         }
         if idx + 1 < segments.len() && !meta.file_type().is_dir() {
@@ -4014,6 +7226,17 @@ fn resolve_tree_existing_path(root: &Path, rel_path: &str) -> Result<(PathBuf, s
 }
 
 fn remove_tree_dir_no_follow(path: &Path) -> Result<(), AppError> {
+    let root_metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        AppError::Internal(format!(
+            "failed to inspect folder before delete: {error}"
+        ))
+    })?;
+    if metadata_is_link_or_reparse(path, &root_metadata) {
+        return Err(AppError::BadRequest(
+            "refusing to delete through a symlink, junction, or name-surrogate reparse point"
+                .into(),
+        ));
+    }
     let entries = std::fs::read_dir(path)
         .map_err(|e| AppError::Internal(format!("failed to read folder before delete: {e}")))?;
     for entry in entries {
@@ -4021,6 +7244,12 @@ fn remove_tree_dir_no_follow(path: &Path) -> Result<(), AppError> {
         let child = entry.path();
         let meta = std::fs::symlink_metadata(&child)
             .map_err(|e| AppError::Internal(format!("failed to inspect folder entry before delete: {e}")))?;
+        if metadata_is_link_or_reparse(&child, &meta) {
+            return Err(AppError::BadRequest(format!(
+                "refusing to delete folder containing a symlink, junction, or name-surrogate reparse point: {}",
+                child.display()
+            )));
+        }
         if meta.file_type().is_dir() {
             remove_tree_dir_no_follow(&child)?;
         } else {
@@ -4063,14 +7292,53 @@ fn rename_tree_entry(root: &Path, rel_path: &str, new_name: &str) -> Result<KbTr
         .parent()
         .ok_or_else(|| AppError::BadRequest(format!("invalid path: {rel_path}")))?;
     let to = parent.join(new_name);
-    match std::fs::symlink_metadata(&to) {
-        Ok(_) => return Err(AppError::Conflict(format!("path already exists: {}", join_tree_rel_path(&parent_rel, new_name)))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(AppError::Internal(format!("failed to inspect target path: {e}"))),
+    if let Some(existing) = find_portable_tree_child(parent, new_name)? {
+        if existing.path != from {
+            return Err(AppError::Conflict(format!(
+                "a portable path alias already exists: {}",
+                join_tree_rel_path(&parent_rel, &existing.name)
+            )));
+        }
+        if to == from {
+            return Err(AppError::Conflict(format!(
+                "path already has that name: {}",
+                join_tree_rel_path(&parent_rel, new_name)
+            )));
+        }
     }
 
-    std::fs::rename(&from, &to)
-        .map_err(|e| AppError::Internal(format!("failed to rename tree entry: {e}")))?;
+    let old_name = from
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AppError::BadRequest("path must be valid Unicode".into()))?;
+    if portable_path_component_identity(old_name)
+        == portable_path_component_identity(new_name)
+    {
+        // A two-step rename makes case/normalization-only changes behave the
+        // same on case-insensitive Windows/macOS and case-sensitive Linux.
+        let temporary = parent.join(format!(
+            ".nomi-tree-rename-{}.tmp",
+            KnowledgeBaseId::new()
+        ));
+        std::fs::rename(&from, &temporary).map_err(|error| {
+            AppError::Internal(format!(
+                "failed to prepare portable tree rename: {error}"
+            ))
+        })?;
+        if let Err(error) = std::fs::rename(&temporary, &to) {
+            let restore = std::fs::rename(&temporary, &from);
+            return Err(AppError::Internal(format!(
+                "failed to finish portable tree rename: {error}; original restore: {}",
+                restore
+                    .err()
+                    .map(|restore_error| restore_error.to_string())
+                    .unwrap_or_else(|| "ok".into())
+            )));
+        }
+    } else {
+        std::fs::rename(&from, &to)
+            .map_err(|e| AppError::Internal(format!("failed to rename tree entry: {e}")))?;
+    }
 
     let target_meta = std::fs::metadata(&to).ok();
     Ok(KbTreeEntry {
@@ -4081,6 +7349,57 @@ fn rename_tree_entry(root: &Path, rel_path: &str, new_name: &str) -> Result<KbTr
         size: if is_file { target_meta.as_ref().map(|m| m.len()) } else { None },
         modified_at: target_meta.as_ref().and_then(modified_ms),
     })
+}
+
+struct PortableTreeChild {
+    name: String,
+    path: PathBuf,
+    metadata: std::fs::Metadata,
+}
+
+fn find_portable_tree_child(
+    parent: &Path,
+    requested: &str,
+) -> Result<Option<PortableTreeChild>, AppError> {
+    let requested_identity = portable_path_component_identity(requested);
+    let entries = std::fs::read_dir(parent).map_err(|error| {
+        AppError::Internal(format!(
+            "failed to inspect knowledge directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+    let mut matches = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to inspect knowledge directory entry: {error}"
+            ))
+        })?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if portable_path_component_identity(&name) != requested_identity {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            AppError::Internal(format!(
+                "failed to inspect knowledge path {}: {error}",
+                path.display()
+            ))
+        })?;
+        matches.push(PortableTreeChild {
+            name,
+            path,
+            metadata,
+        });
+    }
+    if matches.len() > 1 {
+        return Err(AppError::Conflict(format!(
+            "more than one knowledge path entry aliases \"{requested}\" across Windows, Linux and macOS; rename the duplicates outside the app before continuing"
+        )));
+    }
+    Ok(matches.pop())
 }
 
 /// Sanitize a base name into a directory-safe mount link name, deduplicating
@@ -4103,15 +7422,51 @@ fn unique_link_name(row: &KnowledgeBaseRow, used: &mut HashSet<String>) -> Strin
     if name.is_empty() {
         name = row.knowledge_base_id.clone();
     }
-    // `MANAGED_KEEP` entries (`.gitignore`, `README.md`) are exempt from the
-    // mount sweep and owned by the platform — a link with such a name would
-    // collide with them. Windows file names are case-insensitive, so compare
-    // accordingly.
-    if mount::MANAGED_KEEP.iter().any(|kept| kept.eq_ignore_ascii_case(&name)) || used.contains(&name) {
-        name = format!("{name}-{}", row.knowledge_base_id);
+
+    let identity = portable_path_component_identity(&name);
+    let reserved_by_mount = mount::MANAGED_KEEP.iter().any(|kept| {
+        portable_path_component_identity(kept) == identity
+    });
+    if validate_portable_path_component(&name).is_err()
+        || reserved_by_mount
+        || used.contains(&identity)
+    {
+        // Put the ID before any extension-like punctuation by replacing dots,
+        // otherwise `CON.md-{id}` is still a reserved Windows basename.
+        let suffix = format!("-{}", row.knowledge_base_id);
+        let readable = name.replace('.', "_");
+        let mut prefix = String::new();
+        let max_bytes = 255usize.saturating_sub(suffix.len());
+        let max_utf16 =
+            255usize.saturating_sub(suffix.encode_utf16().count());
+        let mut utf16_len = 0usize;
+        for character in readable.chars() {
+            let next_bytes = prefix.len() + character.len_utf8();
+            let next_utf16 = utf16_len + character.len_utf16();
+            if next_bytes > max_bytes || next_utf16 > max_utf16 {
+                break;
+            }
+            prefix.push(character);
+            utf16_len = next_utf16;
+        }
+        let prefix = prefix.trim().trim_end_matches('.').trim();
+        let prefix = if prefix.is_empty() { "kb" } else { prefix };
+        name = format!("{prefix}{suffix}");
+        if validate_portable_path_component(&name).is_err() {
+            name = format!("kb-{}", row.knowledge_base_id);
+        }
     }
-    used.insert(name.clone());
-    name
+
+    // IDs make the fallback unique; this loop also handles a corrupt binding
+    // that repeats the exact same base more than once.
+    let mut candidate = name;
+    let mut counter = 2usize;
+    while used.contains(&portable_path_component_identity(&candidate)) {
+        candidate = format!("kb-{}-{counter}", row.knowledge_base_id);
+        counter += 1;
+    }
+    used.insert(portable_path_component_identity(&candidate));
+    candidate
 }
 
 fn modified_ms(meta: &std::fs::Metadata) -> Option<TimestampMs> {
@@ -4122,63 +7477,155 @@ fn modified_ms(meta: &std::fs::Metadata) -> Option<TimestampMs> {
 }
 
 fn list_md_files(root: &Path) -> Vec<KbFileEntry> {
-    if !root.is_dir() {
-        return Vec::new();
+    list_md_files_strict(root).unwrap_or_default()
+}
+
+fn list_md_files_strict(root: &Path) -> Result<Vec<KbFileEntry>, AppError> {
+    validate_knowledge_root(root)?;
+
+    let mut entries = Vec::new();
+    let walker = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .follow_root_links(false)
+        .into_iter()
+        .filter_entry(|entry| !is_machinery_dir(entry));
+    for entry in walker {
+        let entry = entry.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to scan knowledge base {}: {error}",
+                root.display()
+            ))
+        })?;
+        if !entry.file_type().is_file() || !is_md(entry.path()) {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(root).map_err(|error| {
+            AppError::Internal(format!("failed to resolve knowledge path: {error}"))
+        })?;
+        let Some(rel_str) = rel.to_str().map(|rel| rel.replace('\\', "/")) else {
+            tracing::warn!(
+                path = %entry.path().display(),
+                "skipping non-Unicode knowledge path during listing"
+            );
+            continue;
+        };
+        // Staged write-back proposals live under `_inbox/` and are shown in
+        // the dedicated review panel, not the main document list.
+        if rel_path_starts_with_dir(&rel_str, KB_INBOX_REL_DIR) {
+            continue;
+        }
+        let meta = entry.metadata().map_err(|error| {
+            AppError::Internal(format!(
+                "failed to inspect knowledge document {}: {error}",
+                entry.path().display()
+            ))
+        })?;
+        entries.push(KbFileEntry {
+            rel_path: rel_str,
+            size: meta.len(),
+            modified_at: modified_ms(&meta),
+        });
     }
-    let mut entries: Vec<KbFileEntry> = vault_walker(root)
-        .filter(|e| e.file_type().is_file() && is_md(e.path()))
-        .filter_map(|e| {
-            let rel = e.path().strip_prefix(root).ok()?;
-            let rel_str = rel.to_string_lossy().replace('\\', "/");
-            // Staged write-back proposals live under `_inbox/` and are shown in
-            // the dedicated review panel, not the main document list.
-            if rel_str == KB_INBOX_REL_DIR || rel_str.starts_with(&format!("{KB_INBOX_REL_DIR}/")) {
-                return None;
-            }
-            let meta = e.metadata().ok();
-            Some(KbFileEntry {
-                rel_path: rel_str,
-                size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
-                modified_at: meta.as_ref().and_then(modified_ms),
-            })
-        })
-        .collect();
     entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-    entries
+    Ok(entries)
 }
 
 /// Walk `{root}/_inbox/{scope}/**/*.md`, deriving `scope` (first path segment)
 /// and `rel_path` (the remainder, mirroring the original base path).
-fn list_inbox_entries(root: &Path) -> Vec<InboxEntry> {
+fn list_inbox_entries_strict(
+    root: &Path,
+) -> Result<Vec<InboxEntry>, AppError> {
+    validate_knowledge_root(root)?;
     let inbox_root = root.join(KB_INBOX_REL_DIR);
-    if !inbox_root.is_dir() {
-        return Vec::new();
-    }
-    let mut entries: Vec<InboxEntry> = vault_walker(&inbox_root)
-        .filter(|e| e.file_type().is_file() && is_md(e.path()))
-        .filter_map(|e| {
-            let rel = e.path().strip_prefix(&inbox_root).ok()?;
-            let rel_str = rel.to_string_lossy().replace('\\', "/");
-            let (scope, rel_path) = rel_str.split_once('/')?;
-            if scope.is_empty() || rel_path.is_empty() {
-                return None;
+    match std::fs::symlink_metadata(&inbox_root) {
+        Ok(metadata) => {
+            if metadata_is_link_or_reparse(&inbox_root, &metadata)
+                || !metadata.is_dir()
+            {
+                return Err(AppError::BadRequest(
+                    "knowledge review inbox is not a real directory".into(),
+                ));
             }
-            let meta = e.metadata().ok();
-            Some(InboxEntry {
-                scope: scope.to_owned(),
-                rel_path: rel_path.to_owned(),
-                size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
-                modified_at: meta.as_ref().and_then(modified_ms),
-            })
-        })
-        .collect();
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(error) => {
+            return Err(AppError::Internal(format!(
+                "failed to inspect knowledge review inbox: {error}"
+            )));
+        }
+    }
+    let walker = walkdir::WalkDir::new(&inbox_root)
+        .follow_links(false)
+        .follow_root_links(false)
+        .into_iter()
+        .filter_entry(|entry| !is_machinery_dir(entry));
+    let mut entries = Vec::new();
+    for entry in walker {
+        let entry = entry.map_err(|error| {
+            AppError::Internal(format!(
+                "failed to scan knowledge review inbox: {error}"
+            ))
+        })?;
+        if !entry.file_type().is_file() || !is_md(entry.path()) {
+            continue;
+        }
+        let rel = entry.path().strip_prefix(&inbox_root).map_err(|error| {
+            AppError::Internal(format!(
+                "failed to resolve knowledge review path: {error}"
+            ))
+        })?;
+        let rel_str = rel
+            .to_str()
+            .ok_or_else(|| {
+                AppError::Internal(
+                    "knowledge review path must be valid Unicode".into(),
+                )
+            })?
+            .replace('\\', "/");
+        let segments: Vec<&str> = rel_str.split('/').collect();
+        if segments.len() < 2 {
+            continue;
+        }
+        let scope = segments[0].to_owned();
+        let rel_path = segments[1..].join("/");
+        if scope.is_empty() || rel_path.is_empty() {
+            continue;
+        }
+        let metadata = entry.metadata().map_err(|error| {
+            AppError::Internal(format!(
+                "failed to inspect knowledge review proposal {}: {error}",
+                entry.path().display()
+            ))
+        })?;
+        entries.push(InboxEntry {
+            scope,
+            rel_path,
+            size: metadata.len(),
+            modified_at: modified_ms(&metadata),
+        });
+    }
     entries.sort_by(|a, b| a.scope.cmp(&b.scope).then(a.rel_path.cmp(&b.rel_path)));
-    entries
+    Ok(entries)
 }
 
-/// A staged-proposal `scope` must be a single, non-traversing path segment.
+fn list_inbox_entries(root: &Path) -> Vec<InboxEntry> {
+    list_inbox_entries_strict(root).unwrap_or_default()
+}
+
+/// A staged-proposal scope is one portable, non-traversing segment.
 fn validate_inbox_scope(scope: &str) -> Result<(), AppError> {
-    if scope.is_empty() || scope.contains('/') || scope.contains('\\') || scope == ".." || scope == "." {
+    let segments: Vec<&str> = scope.split('/').collect();
+    let single_segment = segments.len() == 1;
+    let invalid_component = segments.iter().any(|segment| {
+        segment.is_empty()
+            || *segment == "."
+            || *segment == ".."
+            || segment.contains('\\')
+            || validate_portable_path_component(segment).is_err()
+    });
+    if !single_segment || invalid_component {
         return Err(AppError::BadRequest(format!("invalid inbox scope: {scope}")));
     }
     Ok(())
@@ -4590,16 +8037,87 @@ mod tests {
 
     #[test]
     fn safe_md_path_rejects_traversal() {
-        let root = Path::new("/kb");
-        assert!(safe_md_path(root, "ok.md").is_ok());
-        assert!(safe_md_path(root, "sub/dir/ok.md").is_ok());
-        assert!(safe_md_path(root, "../escape.md").is_err());
-        assert!(safe_md_path(root, "/abs.md").is_err());
-        assert!(safe_md_path(root, "no_extension").is_err());
-        assert!(safe_md_path(root, "script.exe").is_err());
-        assert!(safe_md_path(root, "").is_err());
-        #[cfg(windows)]
-        assert!(safe_md_path(root, "C:\\evil.md").is_err());
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(safe_md_path(&root, "ok.md").is_ok());
+        assert!(safe_md_path(&root, "sub/dir/ok.md").is_ok());
+        assert!(safe_md_path(&root, "../escape.md").is_err());
+        assert!(safe_md_path(&root, "/abs.md").is_err());
+        assert!(safe_md_path(&root, "no_extension").is_err());
+        assert!(safe_md_path(&root, "script.exe").is_err());
+        assert!(safe_md_path(&root, "").is_err());
+        assert!(safe_md_path(&root, "C:\\evil.md").is_err());
+        assert!(safe_md_path(&root, "CON.md").is_err());
+        assert!(safe_md_path(&root, "nested/aux.notes.md").is_err());
+        assert!(safe_md_path(&root, "trailing-space /note.md").is_err());
+        assert!(safe_md_path(&root, "trailing-dot./note.md").is_err());
+        assert!(safe_md_path(&root, "contains:colon/note.md").is_err());
+        assert!(safe_md_path(&root, "contains*glob/note.md").is_err());
+    }
+
+    #[test]
+    fn direct_turn_writeback_append_preserves_bytes_and_is_retry_idempotent() {
+        let existing = "# Existing\r\n\r\nKeep CRLF bytes exactly.\r\n";
+        let proposal = "# New\n\nDurable lesson.";
+        let merged = merge_direct_turn_writeback(existing, proposal);
+
+        assert!(merged.starts_with(existing), "existing bytes were rewritten: {merged:?}");
+        assert!(merged.ends_with("# New\n\nDurable lesson.\n"), "{merged:?}");
+        assert_eq!(
+            merge_direct_turn_writeback(&merged, proposal),
+            merged,
+            "manual retry must not append the same proposal twice"
+        );
+    }
+
+    #[test]
+    fn direct_turn_writeback_does_not_treat_plain_substrings_as_existing_blocks() {
+        let existing = "# Existing\n\nfoobar is already documented.\n";
+        let merged = merge_direct_turn_writeback(existing, "foo");
+
+        assert!(merged.starts_with(existing));
+        assert!(merged.ends_with("\nfoo\n"), "{merged:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_md_path_rejects_final_and_parent_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let physical_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let root = physical_dir.join("kb");
+        let outside = physical_dir.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("target.md"), "outside").unwrap();
+
+        symlink(outside.join("target.md"), root.join("final.md")).unwrap();
+        let final_error = safe_md_path(&root, "final.md").unwrap_err();
+        assert!(final_error.to_string().contains("symlinks"), "{final_error}");
+
+        symlink(&outside, root.join("linked-dir")).unwrap();
+        let parent_error = safe_md_path(&root, "linked-dir/new.md").unwrap_err();
+        assert!(parent_error.to_string().contains("symlinks"), "{parent_error}");
+
+        symlink(outside.join("missing.md"), root.join("dangling.md")).unwrap();
+        let dangling_error = safe_md_path(&root, "dangling.md").unwrap_err();
+        assert!(dangling_error.to_string().contains("symlinks"), "{dangling_error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn safe_md_path_windows_reparse_attribute_is_always_fail_closed() {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        };
+
+        assert!(!windows_file_attributes_are_reparse_point(
+            FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_DIRECTORY
+        ));
+        assert!(windows_file_attributes_are_reparse_point(
+            FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT
+        ));
     }
 
     #[test]
@@ -4631,7 +8149,7 @@ mod tests {
     #[tokio::test]
     async fn toc_lists_all_and_skips_inbox() {
         let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::write(root.join("guide.md"), "# 使用指南\n正文").unwrap();
         let inbox = root.join("_inbox/0190f5fe-7c00-7a00-8000-000000000011");
         std::fs::create_dir_all(&inbox).unwrap();
@@ -4639,7 +8157,7 @@ mod tests {
         std::fs::create_dir_all(root.join("sub")).unwrap();
         std::fs::write(root.join("sub/notes.md"), "no heading here").unwrap();
 
-        let toc = build_toc(root).await;
+        let toc = build_toc(&root).await;
         assert_eq!(toc.len(), 2, "{toc:?}");
         assert!(toc.contains(&"guide.md — 使用指南".to_string()));
         assert!(toc.contains(&"sub/notes.md".to_string()));
@@ -4652,11 +8170,11 @@ mod tests {
     #[tokio::test]
     async fn build_toc_returns_full_listing_without_cap() {
         let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
         for i in 0..35 {
             std::fs::write(root.join(format!("f{i:02}.md")), "x").unwrap();
         }
-        let toc = build_toc(root).await;
+        let toc = build_toc(&root).await;
         assert_eq!(toc.len(), 35, "{toc:?}");
         assert!(!toc.iter().any(|l| l.contains("more files")), "{toc:?}");
     }
@@ -4664,12 +8182,12 @@ mod tests {
     #[tokio::test]
     async fn build_toc_orders_index_and_shallow_first() {
         let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::create_dir_all(root.join("aaa")).unwrap();
         std::fs::write(root.join("aaa/early.md"), "# Early\n").unwrap();
         std::fs::write(root.join("zzz.md"), "# Zzz\n").unwrap();
         std::fs::write(root.join("overview.md"), "# Overview\n").unwrap();
-        let toc = build_toc(root).await;
+        let toc = build_toc(&root).await;
         assert!(toc[0].starts_with("overview.md"), "index file first: {toc:?}");
         let shallow = toc.iter().position(|l| l.starts_with("zzz.md")).unwrap();
         let deep = toc.iter().position(|l| l.starts_with("aaa/early.md")).unwrap();
@@ -4682,14 +8200,14 @@ mod tests {
     #[tokio::test]
     async fn build_toc_skips_machinery_dirs() {
         let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::create_dir_all(root.join(".obsidian")).unwrap();
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(root.join("note.md"), "# Note\n").unwrap();
         std::fs::write(root.join(".obsidian/workspace.md"), "# machinery\n").unwrap();
         std::fs::write(root.join(".git/COMMIT_EDITMSG.md"), "# machinery\n").unwrap();
 
-        let toc = build_toc(root).await;
+        let toc = build_toc(&root).await;
         assert_eq!(toc.len(), 1, "only the real note belongs in the toc: {toc:?}");
         assert!(toc[0].starts_with("note.md"), "{toc:?}");
     }
@@ -4777,12 +8295,18 @@ mod tests {
     #[tokio::test]
     async fn base_summary_read_from_readme_first_paragraph() {
         let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
+        // macOS exposes TempDir through `/var -> /private/var`. Production
+        // registrations persist the physical path, so the fixture must model
+        // the same invariant rather than feeding a lexical symlink root.
+        let root = std::fs::canonicalize(dir.path()).unwrap();
         // No README yet (autogen lands later) → None.
-        assert_eq!(read_base_summary(root).await, None);
+        assert_eq!(read_base_summary(&root).await, None);
 
         std::fs::write(root.join("README.md"), "# 库\n\n这套库覆盖部署与运维流程。\n\n## 结构\n…").unwrap();
-        assert_eq!(read_base_summary(root).await.as_deref(), Some("这套库覆盖部署与运维流程。"));
+        assert_eq!(
+            read_base_summary(&root).await.as_deref(),
+            Some("这套库覆盖部署与运维流程。")
+        );
     }
 
     /// README detection is case-insensitive: on case-sensitive filesystems a
@@ -4790,13 +8314,20 @@ mod tests {
     #[tokio::test]
     async fn base_summary_reads_lowercase_readme_variant() {
         let dir = tempfile::TempDir::new().unwrap();
-        let root = dir.path();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::write(root.join("readme.md"), "# 库\n\n小写文件名也必须能读到。\n").unwrap();
-        assert_eq!(read_base_summary(root).await.as_deref(), Some("小写文件名也必须能读到。"));
+        assert_eq!(
+            read_base_summary(&root).await.as_deref(),
+            Some("小写文件名也必须能读到。")
+        );
 
         let dir2 = tempfile::TempDir::new().unwrap();
-        std::fs::write(dir2.path().join("ReadMe.MD"), "混合大小写同样命中。\n").unwrap();
-        assert_eq!(read_base_summary(dir2.path()).await.as_deref(), Some("混合大小写同样命中。"));
+        let root2 = std::fs::canonicalize(dir2.path()).unwrap();
+        std::fs::write(root2.join("ReadMe.MD"), "混合大小写同样命中。\n").unwrap();
+        assert_eq!(
+            read_base_summary(&root2).await.as_deref(),
+            Some("混合大小写同样命中。")
+        );
     }
 
     /// Autogen's "README already exists" check must also be case-insensitive:
@@ -4840,7 +8371,7 @@ mod tests {
     }
 
     #[test]
-    fn link_names_sanitize_and_dedupe() {
+    fn portable_writeback_mount_link_names_sanitize_and_dedupe() {
         let mut used = HashSet::new();
         let knowledge_base_id_a = KnowledgeBaseId::new();
         let row_a = KnowledgeBaseRow {
@@ -4866,6 +8397,18 @@ mod tests {
         let name_b = unique_link_name(&row_b, &mut used);
         assert_ne!(name_a, name_b);
         assert!(name_b.starts_with("领域_知识_v1-"));
+
+        let row_c = KnowledgeBaseRow {
+            id: 3,
+            knowledge_base_id: KnowledgeBaseId::new().into_string(),
+            name: "领域_知识_V1".into(),
+            ..row_a.clone()
+        };
+        let name_c = unique_link_name(&row_c, &mut used);
+        assert_ne!(
+            portable_path_component_identity(&name_a),
+            portable_path_component_identity(&name_c)
+        );
     }
 
     /// A base named like a platform-managed companion file (`README.md`,
@@ -4873,8 +8416,17 @@ mod tests {
     /// the sweep exempts those names, so the link would collide with the
     /// managed file.
     #[test]
-    fn link_names_avoid_managed_companion_files() {
-        for name in ["README.md", "readme.MD", ".gitignore"] {
+    fn portable_writeback_mount_link_names_are_valid_on_every_platform() {
+        let long_name = "界".repeat(100);
+        for name in [
+            "README.md",
+            "readme.MD",
+            ".gitignore",
+            "CON",
+            "AUX.md",
+            "COM¹",
+            long_name.as_str(),
+        ] {
             let mut used = HashSet::new();
             let row = KnowledgeBaseRow {
                 id: 1,
@@ -4890,13 +8442,17 @@ mod tests {
             };
             let link = unique_link_name(&row, &mut used);
             assert!(
-                !mount::MANAGED_KEEP.iter().any(|k| k.eq_ignore_ascii_case(&link)),
+                !mount::MANAGED_KEEP.iter().any(|kept| {
+                    portable_path_component_identity(kept)
+                        == portable_path_component_identity(&link)
+                }),
                 "{name} → {link}"
             );
-            assert_eq!(
-                link,
-                format!("{name}-{}", row.knowledge_base_id)
+            assert!(
+                validate_portable_path_component(&link).is_ok(),
+                "{name} → {link}"
             );
+            assert!(link.ends_with(&row.knowledge_base_id));
         }
     }
 
@@ -4920,6 +8476,24 @@ mod tests {
                 compress_reply: compress_reply.to_owned(),
                 calls: AtomicUsize::new(0),
             })
+        }
+    }
+
+    struct PausedOverviewCompleter {
+        entered: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait::async_trait]
+    impl KnowledgeCompleter for PausedOverviewCompleter {
+        async fn complete(
+            &self,
+            _system: &str,
+            _user: &str,
+        ) -> Result<String, AppError> {
+            self.entered.wait().await;
+            self.release.wait().await;
+            Ok(OVERVIEW_JSON.into())
         }
     }
 
@@ -4999,6 +8573,133 @@ mod tests {
             vec!["note.md", "sub/real.md"],
             "dot-dir files must not appear in the document listing"
         );
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_walkers_hide_portable_machinery_aliases_and_links() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let vault = dir.path().join("vault");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(vault.join("Node_Modules/pkg")).unwrap();
+        std::fs::create_dir_all(vault.join("_INBOX/scope")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(vault.join("visible.md"), "# Visible\npublic")
+            .unwrap();
+        std::fs::write(
+            vault.join("Node_Modules/pkg/hidden.md"),
+            "# Hidden\nmachinery-secret",
+        )
+        .unwrap();
+        std::fs::write(
+            vault.join("_INBOX/scope/draft.md"),
+            "# Draft\ninbox-secret",
+        )
+        .unwrap();
+        std::fs::write(
+            outside.join("secret.md"),
+            "# Outside\njunction-secret",
+        )
+        .unwrap();
+        let linked = vault.join("linked");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+        #[cfg(windows)]
+        junction::create(&outside, &linked).unwrap();
+
+        let kb = service
+            .create_base(
+                "portable walk",
+                "",
+                Some(vault.to_str().unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        let listed = service
+            .list_files(kb.knowledge_base_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|entry| entry.rel_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["visible.md"]
+        );
+        for query in ["machinery-secret", "inbox-secret", "junction-secret"] {
+            assert!(
+                service
+                    .search_bases(
+                        std::slice::from_ref(&kb.knowledge_base_id),
+                        query,
+                        10,
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{query} leaked through search"
+            );
+        }
+        let toc = build_toc(Path::new(&kb.root_path)).await;
+        assert_eq!(toc, vec!["visible.md — Visible"]);
+        #[cfg(windows)]
+        junction::delete(&linked).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn portable_writeback_walkers_skip_non_unicode_markdown_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let invalid_name =
+            std::ffi::OsString::from_vec(vec![0xff, b'.', b'm', b'd']);
+        if let Err(error) = std::fs::write(
+            vault.join(invalid_name),
+            "# Invalid\nnon-unicode-secret",
+        ) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                // Some macOS sandbox profiles reject non-Unicode path bytes
+                // before the filesystem sees them. Linux/unsandboxed Unix CI
+                // still exercises the actual walker contract.
+                return;
+            }
+            panic!("failed to create non-Unicode test path: {error}");
+        }
+        let kb = service
+            .create_base(
+                "invalid path",
+                "",
+                Some(vault.to_str().unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            service
+                .list_files(kb.knowledge_base_id.as_str())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            service
+                .search_bases(
+                    std::slice::from_ref(&kb.knowledge_base_id),
+                    "non-unicode-secret",
+                    10,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(build_toc(Path::new(&kb.root_path)).await.is_empty());
+        assert!(!vault.join("�.md").exists());
     }
 
     #[tokio::test]
@@ -5170,6 +8871,78 @@ mod tests {
         assert_eq!(v, 999, "a walk that exceeds the budget must degrade to the fallback");
     }
 
+    #[tokio::test]
+    async fn portable_writeback_root_inspection_is_single_flight_after_timeout() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Condvar, Mutex};
+
+        let slow = tempfile::TempDir::new().unwrap();
+        let healthy = tempfile::TempDir::new().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let entered_wait = entered.notified();
+        let first = {
+            let root = slow.path().to_path_buf();
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let starts = Arc::clone(&starts);
+            tokio::spawn(async move {
+                bounded_root_blocking(
+                    &root,
+                    Duration::from_millis(30),
+                    99u32,
+                    move || {
+                        starts.fetch_add(1, Ordering::SeqCst);
+                        entered.notify_one();
+                        let (lock, condition) = &*release;
+                        let mut ready = lock.lock().unwrap();
+                        while !*ready {
+                            ready = condition.wait(ready).unwrap();
+                        }
+                        1
+                    },
+                )
+                .await
+            })
+        };
+        entered_wait.await;
+        assert_eq!(first.await.unwrap(), 99);
+
+        let slow_retry = bounded_root_blocking(
+            slow.path(),
+            Duration::from_millis(30),
+            88u32,
+            {
+                let starts = Arc::clone(&starts);
+                move || {
+                    starts.fetch_add(1, Ordering::SeqCst);
+                    2
+                }
+            },
+        )
+        .await;
+        assert_eq!(slow_retry, 88);
+        assert_eq!(
+            starts.load(Ordering::SeqCst),
+            1,
+            "a retry for the same timed-out root must not start another blocker"
+        );
+
+        let healthy_value = bounded_root_blocking(
+            healthy.path(),
+            Duration::from_secs(1),
+            0u32,
+            || 7,
+        )
+        .await;
+        assert_eq!(healthy_value, 7);
+
+        let (lock, condition) = &*release;
+        *lock.lock().unwrap() = true;
+        condition.notify_all();
+    }
+
     /// `list_base_ids` returns every registered base id straight from the DB,
     /// with no directory walk — the disk-free path binding/ensure-known callers
     /// must use instead of the walking `list_bases`.
@@ -5232,6 +9005,63 @@ mod tests {
         assert!(outcome.readme_written);
         assert!(!outcome.description_updated);
         assert_eq!(outcome.base.description, "人工描述");
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_autogen_preserves_readme_created_during_completion() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service =
+            Arc::new(make_service(&dir.path().join("data")));
+        let kb = service.create_base("库", "", None, None).await.unwrap();
+        service
+            .write_file(&kb.knowledge_base_id, "a.md", "# A")
+            .await
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        service.set_completer(Arc::new(PausedOverviewCompleter {
+            entered: entered.clone(),
+            release: release.clone(),
+        }));
+
+        let generation_service = service.clone();
+        let kb_id = kb.knowledge_base_id.clone();
+        let generation = tokio::spawn(async move {
+            generation_service
+                .generate_overview(kb_id.as_str(), false, None)
+                .await
+        });
+        entered.wait().await;
+        service
+            .write_file(
+                kb.knowledge_base_id.as_str(),
+                "readme.md",
+                "# User README\n",
+            )
+            .await
+            .unwrap();
+        release.wait().await;
+
+        let outcome = generation.await.unwrap().unwrap();
+        assert!(!outcome.readme_written);
+        assert_eq!(
+            std::fs::read_to_string(
+                PathBuf::from(&kb.root_path).join("readme.md")
+            )
+            .unwrap(),
+            "# User README\n"
+        );
+        let readme_names = std::fs::read_dir(&kb.root_path)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .filter(|name| name.eq_ignore_ascii_case("README.md"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            readme_names.len(),
+            1,
+            "autogen must not create a portable alias beside a user write: {readme_names:?}"
+        );
     }
 
     #[tokio::test]
@@ -5336,27 +9166,8 @@ mod tests {
                 ));
             }
 
-            if system == crate::turn_writeback::TURN_WRITEBACK_MERGE_SYSTEM {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                let existing = extract_tagged_section(user, "existing");
-                let proposal = extract_tagged_section(user, "proposal");
-                return Ok(format!(
-                    r#"{{"content":{}}}"#,
-                    serde_json::to_string(&format!("{existing}\n\n{proposal}")).unwrap()
-                ));
-            }
-
             Ok(r#"{"candidates":[]}"#.into())
         }
-    }
-
-    fn extract_tagged_section(prompt: &str, tag: &str) -> String {
-        let open = format!("<{tag}>");
-        let close = format!("</{tag}>");
-        prompt
-            .split_once(&open)
-            .and_then(|(_, rest)| rest.split_once(&close).map(|(body, _)| body.trim().to_owned()))
-            .unwrap_or_default()
     }
 
     /// Explicit `Some((provider_id, model))` must reach the completer via
@@ -6234,9 +10045,17 @@ mod tests {
         let slug_b = source_url::slug_for_url(&Url::parse(&url_b).unwrap());
         assert!(
             !names.contains(&format!("{slug_b}.md")),
-            "orphan snapshot for the removed entry must be deleted: {names:?}"
+            "orphan snapshot for the removed entry must leave the live set: {names:?}"
         );
-        assert_eq!(names.len(), 3, "{names:?}");
+        assert!(names.contains(&"_trash".to_owned()), "{names:?}");
+        assert_eq!(names.len(), 4, "{names:?}");
+        let quarantined = std::fs::read_dir(snap_dir.join("_trash"))
+            .unwrap()
+            .flatten()
+            .map(|entry| std::fs::read_to_string(entry.path()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(quarantined.len(), 1);
+        assert!(quarantined[0].contains(&url_b));
     }
 
     /// `MemRepo` whose `update_base` always fails — simulates the registry
@@ -6377,8 +10196,12 @@ mod tests {
         // Seed rows directly (the persisted-but-unfetched shape a background
         // create leaves behind when the process dies mid-run).
         let seed = |id: &str, mode: KnowledgeSourceMode, stamp: Option<i64>| -> PathBuf {
-            let root = data_dir.join(KB_MANAGED_REL_DIR).join(id);
-            std::fs::create_dir_all(&root).unwrap();
+            let lexical_root = data_dir.join(KB_MANAGED_REL_DIR).join(id);
+            std::fs::create_dir_all(&lexical_root).unwrap();
+            // `register_base` stores a physical root. This fixture seeds the
+            // repository directly, so canonicalize explicitly to preserve
+            // the same no-retargeting contract on macOS (`/var` is a link).
+            let root = std::fs::canonicalize(&lexical_root).unwrap();
             let source = KnowledgeSource {
                 kind: "url".into(),
                 mode,
@@ -6993,6 +10816,63 @@ mod tests {
         (service, kb.knowledge_base_id, dir)
     }
 
+    #[tokio::test]
+    async fn write_file_atomically_replaces_existing_file_without_temp_leaks() {
+        let (service, kb_id, _dir) = test_service_with_file("nested/existing.md", "first").await;
+
+        service
+            .write_file(&kb_id, "nested/existing.md", "second")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            service
+                .read_file(&kb_id, "nested/existing.md")
+                .await
+                .unwrap()
+                .content,
+            "second"
+        );
+        let base = service.get_base_info(&kb_id).await.unwrap();
+        let nested = PathBuf::from(base.root_path).join("nested");
+        let names = std::fs::read_dir(nested)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["existing.md"], "atomic temp sibling leaked: {names:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_writeback_no_clobber_link_fallback_rolls_back_when_source_unlink_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("source.md");
+        let destination = dir.path().join("destination.md");
+        std::fs::write(&source, "keep me live").unwrap();
+
+        let result = hard_link_move_no_clobber_with(
+            &source,
+            &destination,
+            |path| {
+                if path == source {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected source unlink failure",
+                    ))
+                } else {
+                    std::fs::remove_file(path)
+                }
+            },
+        );
+
+        assert!(result.is_err(), "a copied-but-not-moved file is not success");
+        assert!(source.exists(), "failed move must leave the live source intact");
+        assert!(
+            !destination.exists(),
+            "failed move must roll back its destination hard link"
+        );
+    }
+
     #[test]
     fn deconfuse_strips_mount_prefix() {
         assert_eq!(deconfuse_rel_path(".nomi/knowledge/Finance/terms.md"), "terms.md");
@@ -7030,12 +10910,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_basename_collision_elsewhere_errors_with_handle() {
+    async fn portable_writeback_create_preserves_existing_parent_spelling() {
+        let (svc, kb_id, _dir) =
+            test_service_with_file("Notes/Archive/existing.md", "x").await;
+        let spec = WriteTargetSpec::Path {
+            kb_id: kb_id.clone(),
+            rel_path: "notes/archive/new.md".into(),
+        };
+
+        let resolution = svc
+            .resolve_write_target(&[kb_id.clone()], &spec)
+            .await
+            .unwrap();
+
+        assert_eq!(resolution.op, WriteOp::Create);
+        assert_eq!(
+            resolution.canonical_rel_path,
+            "Notes/Archive/new.md"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_novel_path_does_not_scan_unrelated_same_basename() {
         let (svc, kb_id, _dir) = test_service_with_file("deep/terms.md", "x").await;
         let spec = WriteTargetSpec::Path { kb_id: kb_id.clone(), rel_path: "terms.md".into() };
-        let err = svc.resolve_write_target(&[kb_id.clone()], &spec).await.unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("deep/terms.md") && msg.contains("kdoc_"), "{msg}");
+        let resolution = svc
+            .resolve_write_target(&[kb_id.clone()], &spec)
+            .await
+            .unwrap();
+        assert_eq!(resolution.op, WriteOp::Create);
+        assert_eq!(resolution.canonical_rel_path, "terms.md");
     }
 
     #[tokio::test]
@@ -7044,6 +10948,704 @@ mod tests {
         let h = encode_doc_handle(&kb_id, "terms.md");
         let err = svc.resolve_write_target(&[], &WriteTargetSpec::Handle(h)).await.unwrap_err();
         assert!(matches!(err, AppError::Forbidden(_)));
+    }
+
+    #[test]
+    fn portable_writeback_path_validation_matches_all_supported_filesystems() {
+        for invalid in [
+            "CON.md",
+            "com¹.md",
+            "LPT³",
+            "trailing.",
+            "trailing ",
+            "a:b.md",
+        ] {
+            assert!(
+                validate_portable_path_component(invalid).is_err(),
+                "{invalid} must be rejected portably"
+            );
+        }
+        assert!(
+            validate_portable_path_component(&format!(
+                "{}.md",
+                "界".repeat(86)
+            ))
+            .is_err(),
+            "component must honor the 255-byte Unix name limit"
+        );
+        assert_eq!(
+            portable_path_component_identity("Maße.md"),
+            portable_path_component_identity("MASSE.md")
+        );
+        assert_eq!(
+            portable_path_component_identity("ß.md"),
+            portable_path_component_identity("ẞ.md")
+        );
+        assert_eq!(
+            portable_path_component_identity("οσ.md"),
+            portable_path_component_identity("ος.md")
+        );
+        assert_eq!(
+            portable_path_component_identity("café.md"),
+            portable_path_component_identity("cafe\u{301}.md")
+        );
+        assert_ne!(
+            portable_path_component_identity("①.md"),
+            portable_path_component_identity("1.md"),
+            "compatibility characters that filesystems keep distinct must not collide"
+        );
+        assert!(validate_portable_path_component("portable.md").is_ok());
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_source_snapshot_paths_are_read_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let kb = service
+            .create_base(
+                "Live source",
+                "",
+                None,
+                Some(url_source(
+                    KnowledgeSourceMode::Live,
+                    &["https://example.com/docs"],
+                )),
+            )
+            .await
+            .unwrap();
+
+        let error = service
+            .write_document(WriteRequest {
+                spec: WriteTargetSpec::Path {
+                    kb_id: kb.knowledge_base_id.clone(),
+                    rel_path: "snapshots/manual.md".into(),
+                },
+                content: "# Must not overwrite source state\n".into(),
+                policy: WritePolicy {
+                    mode: WriteMode::Direct,
+                    allow_create: true,
+                    surface: WriteSurface::RegularChat,
+                },
+                bound_kb_ids: vec![kb.knowledge_base_id.clone()],
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::Forbidden(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_staged_snapshot_cannot_merge_after_source_attach() {
+        let (service, kb_id, _dir) =
+            test_service_with_file("terms.md", "x").await;
+        let proposal_rel =
+            format!("{KB_INBOX_REL_DIR}/{TEST_CONVERSATION_ID}/snapshots/manual.md");
+        service
+            .write_document(WriteRequest {
+                spec: WriteTargetSpec::Path {
+                    kb_id: kb_id.clone(),
+                    rel_path: "snapshots/manual.md".into(),
+                },
+                content: "# Stale proposal\n".into(),
+                policy: WritePolicy {
+                    mode: WriteMode::Staged {
+                        scope: TEST_CONVERSATION_ID.into(),
+                    },
+                    allow_create: true,
+                    surface: WriteSurface::RegularChat,
+                },
+                bound_kb_ids: vec![kb_id.clone()],
+            })
+            .await
+            .unwrap();
+        service
+            .set_source(
+                kb_id.as_str(),
+                Some(url_source(
+                    KnowledgeSourceMode::Live,
+                    &["https://example.com/docs"],
+                )),
+            )
+            .await
+            .unwrap();
+
+        let error = service
+            .merge_inbox(
+                kb_id.as_str(),
+                TEST_CONVERSATION_ID,
+                "snapshots/manual.md",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::Forbidden(_)), "{error:?}");
+        assert!(
+            service
+                .read_file(kb_id.as_str(), "snapshots/manual.md")
+                .await
+                .is_err()
+        );
+        let proposal = service
+            .read_file(kb_id.as_str(), &proposal_rel)
+            .await
+            .unwrap();
+        let base = service.get_base_info(kb_id.as_str()).await.unwrap();
+        let proposal_abs =
+            safe_md_path(Path::new(&base.root_path), &proposal_rel).unwrap();
+        assert_eq!(proposal.content, "# Stale proposal\n");
+        assert!(
+            staged_proposal_metadata_path(&proposal_abs).exists(),
+            "blocked proposal and its CAS metadata must remain reviewable"
+        );
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_publication_revalidates_source_after_resolution() {
+        let (service, kb_id, _dir) =
+            test_service_with_file("terms.md", "x").await;
+        let direct_spec = WriteTargetSpec::Path {
+            kb_id: kb_id.clone(),
+            rel_path: "snapshots/direct.md".into(),
+        };
+        let staged_spec = WriteTargetSpec::Path {
+            kb_id: kb_id.clone(),
+            rel_path: "snapshots/staged.md".into(),
+        };
+        let direct_resolution = service
+            .resolve_write_target(
+                std::slice::from_ref(&kb_id),
+                &direct_spec,
+            )
+            .await
+            .unwrap();
+        let staged_resolution = service
+            .resolve_write_target(
+                std::slice::from_ref(&kb_id),
+                &staged_spec,
+            )
+            .await
+            .unwrap();
+
+        service
+            .set_source(
+                kb_id.as_str(),
+                Some(url_source(
+                    KnowledgeSourceMode::Live,
+                    &["https://example.com/docs"],
+                )),
+            )
+            .await
+            .unwrap();
+
+        let direct_error = service
+            .write_resolved_document_under_target_lock(
+                WriteRequest {
+                    spec: direct_spec,
+                    content: "# Direct\n".into(),
+                    policy: WritePolicy {
+                        mode: WriteMode::Direct,
+                        allow_create: true,
+                        surface: WriteSurface::RegularChat,
+                    },
+                    bound_kb_ids: vec![kb_id.clone()],
+                },
+                direct_resolution,
+                None,
+            )
+            .await
+            .unwrap_err();
+        let staged_error = service
+            .write_resolved_document_under_target_lock(
+                WriteRequest {
+                    spec: staged_spec,
+                    content: "# Staged\n".into(),
+                    policy: WritePolicy {
+                        mode: WriteMode::Staged {
+                            scope: TEST_CONVERSATION_ID.into(),
+                        },
+                        allow_create: true,
+                        surface: WriteSurface::RegularChat,
+                    },
+                    bound_kb_ids: vec![kb_id.clone()],
+                },
+                staged_resolution,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(direct_error, AppError::Forbidden(_)));
+        assert!(matches!(staged_error, AppError::Forbidden(_)));
+        assert!(
+            service
+                .read_file(kb_id.as_str(), "snapshots/direct.md")
+                .await
+                .is_err()
+        );
+        assert!(
+            service
+                .read_file(
+                    kb_id.as_str(),
+                    &format!(
+                        "{KB_INBOX_REL_DIR}/{TEST_CONVERSATION_ID}/snapshots/staged.md"
+                    ),
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_stale_source_refresh_cannot_overwrite_new_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, repo) =
+            service_with_repo(&dir.path().join("data"));
+        let source_a = url_source(
+            KnowledgeSourceMode::Live,
+            &["https://example.com/a"],
+        );
+        let kb = service
+            .create_base("Source", "", None, Some(source_a))
+            .await
+            .unwrap();
+        let mut stale_row =
+            service.require_base(kb.knowledge_base_id.as_str()).await.unwrap();
+        let mut stale_source =
+            source_from_extra(&stale_row.extra).unwrap().unwrap();
+        stale_source.last_fetched_at = Some(123);
+        let source_b = url_source(
+            KnowledgeSourceMode::Live,
+            &["https://example.com/b"],
+        );
+        service
+            .set_source(kb.knowledge_base_id.as_str(), Some(source_b))
+            .await
+            .unwrap();
+
+        let error = service
+            .persist_source(&mut stale_row, &stale_source)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
+        let stored =
+            extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap();
+        assert_eq!(stored.entries[0].url, "https://example.com/b");
+
+        service
+            .update_base(
+                kb.knowledge_base_id.as_str(),
+                Some("Renamed"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let stored_after_metadata =
+            extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap();
+        assert_eq!(
+            stored_after_metadata.entries[0].url,
+            "https://example.com/b"
+        );
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_source_switch_prevents_stale_snapshot_publication() {
+        use crate::source_url::FetchedPage;
+        use tokio::sync::Barrier;
+
+        #[derive(Clone)]
+        struct PausingFetcher {
+            started: Arc<Barrier>,
+            resume: Arc<Barrier>,
+        }
+
+        #[async_trait::async_trait]
+        impl PageFetcher for PausingFetcher {
+            async fn fetch_page(
+                &self,
+                raw_url: &str,
+            ) -> Result<FetchedPage, AppError> {
+                self.started.wait().await;
+                self.resume.wait().await;
+                Ok(FetchedPage {
+                    final_url: raw_url.to_owned(),
+                    title: Some("stale A".into()),
+                    markdown: "source A body".into(),
+                    truncated: false,
+                })
+            }
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let repo = Arc::new(MemRepo::default());
+        let started = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let service = Arc::new(
+            KnowledgeService::new(
+                repo.clone(),
+                &dir.path().join("data"),
+                KnowledgeEventEmitter::new(
+                    Arc::new(NoopBroadcaster),
+                    Arc::from(TEST_OWNER_ID),
+                ),
+            )
+            .with_url_fetcher(PausingFetcher {
+                started: Arc::clone(&started),
+                resume: Arc::clone(&resume),
+            }),
+        );
+        let source_a = url_source(
+            KnowledgeSourceMode::Live,
+            &["https://example.com/a"],
+        );
+        let kb = service
+            .create_base("Source race", "", None, Some(source_a))
+            .await
+            .unwrap();
+        let kb_id = kb.knowledge_base_id.clone();
+        let refreshing = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service.refresh_source(kb_id.as_str()).await
+            })
+        };
+
+        started.wait().await;
+        service
+            .set_source(
+                kb.knowledge_base_id.as_str(),
+                Some(url_source(
+                    KnowledgeSourceMode::Live,
+                    &["https://example.com/b"],
+                )),
+            )
+            .await
+            .unwrap();
+        resume.wait().await;
+
+        let error = refreshing.await.unwrap().unwrap_err();
+        assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
+        let stored =
+            extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap();
+        assert_eq!(stored.entries[0].url, "https://example.com/b");
+        let snapshots =
+            Path::new(&kb.root_path).join(source_url::SNAPSHOT_REL_DIR);
+        assert!(
+            !snapshots.exists()
+                || std::fs::read_dir(&snapshots)
+                    .unwrap()
+                    .next()
+                    .is_none(),
+            "stale source A must not publish any snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_tree_mutations_reject_aliases_and_allow_case_rename() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = make_service(&dir.path().join("data"));
+        let kb = service.create_base("Tree", "", None, None).await.unwrap();
+        service
+            .create_folder(kb.knowledge_base_id.as_str(), "Notes")
+            .await
+            .unwrap();
+        let duplicate = service
+            .create_folder(kb.knowledge_base_id.as_str(), "notes")
+            .await
+            .unwrap_err();
+        assert!(matches!(duplicate, AppError::Conflict(_)), "{duplicate:?}");
+
+        service
+            .write_file(kb.knowledge_base_id.as_str(), "Notes/Alpha.md", "x")
+            .await
+            .unwrap();
+        service
+            .rename_tree_entry(
+                kb.knowledge_base_id.as_str(),
+                "Notes/Alpha.md",
+                "alpha.md",
+            )
+            .await
+            .unwrap();
+        let names = std::fs::read_dir(Path::new(&kb.root_path).join("Notes"))
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["alpha.md"]);
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_legacy_root_alias_is_never_blessed_on_startup() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let physical_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let real_parent = physical_dir.join("real-parent");
+        let alias_parent = physical_dir.join("alias-parent");
+        let real_root = real_parent.join("kb");
+        std::fs::create_dir_all(&real_root).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_parent, &alias_parent).unwrap();
+        #[cfg(windows)]
+        junction::create(&real_parent, &alias_parent).unwrap();
+
+        let repo = Arc::new(MemRepo::default());
+        let kb_id = KnowledgeBaseId::new();
+        repo.bases.lock().unwrap().push(KnowledgeBaseRow {
+            id: 1,
+            knowledge_base_id: kb_id.clone().into_string(),
+            name: "Legacy".into(),
+            description: String::new(),
+            root_path: alias_parent
+                .join("kb")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            managed: false,
+            extra: "{}".into(),
+            created_at: 0,
+            updated_at: 0,
+            tags: None,
+        });
+        let service = KnowledgeService::new(
+            repo.clone(),
+            &physical_dir.join("data"),
+            KnowledgeEventEmitter::new(
+                Arc::new(NoopBroadcaster),
+                Arc::from(TEST_OWNER_ID),
+            ),
+        );
+
+        let stored = repo
+            .bases
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|row| row.knowledge_base_id == kb_id.as_str())
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            PathBuf::from(stored.root_path),
+            alias_parent.join("kb"),
+            "startup must never rewrite an unsafe legacy alias into a newly trusted root"
+        );
+        let error = service
+            .write_file(kb_id.as_str(), "blocked.md", "must not escape")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
+        assert!(!real_root.join("blocked.md").exists());
+        #[cfg(windows)]
+        junction::delete(&alias_parent).unwrap();
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_rejects_registered_root_retargeting() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let physical_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let service = make_service(&physical_dir.join("data"));
+        let registered_root = physical_dir.join("registered");
+        let moved_root = physical_dir.join("moved");
+        let outside = physical_dir.join("outside");
+        std::fs::create_dir_all(&registered_root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let kb = service
+            .create_base(
+                "External",
+                "",
+                Some(registered_root.to_str().unwrap()),
+                None,
+            )
+            .await
+            .unwrap();
+        service
+            .write_file(
+                kb.knowledge_base_id.as_str(),
+                "before.md",
+                "safe",
+            )
+            .await
+            .unwrap();
+        std::fs::rename(&registered_root, &moved_root).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &registered_root).unwrap();
+        #[cfg(windows)]
+        junction::create(&outside, &registered_root).unwrap();
+        std::fs::write(
+            outside.join("secret.md"),
+            "# Outside secret\nnever expose",
+        )
+        .unwrap();
+
+        let error = service
+            .write_file(
+                kb.knowledge_base_id.as_str(),
+                "escaped.md",
+                "must not escape",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
+        assert!(!outside.join("escaped.md").exists());
+        assert!(
+            service
+                .list_files(kb.knowledge_base_id.as_str())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            service
+                .search_bases(
+                    std::slice::from_ref(&kb.knowledge_base_id),
+                    "never expose",
+                    10,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(build_toc(&registered_root).await.is_empty());
+        #[cfg(unix)]
+        std::fs::remove_file(&registered_root).unwrap();
+        #[cfg(windows)]
+        junction::delete(&registered_root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_refresh_rejects_retargeted_root_before_prune() {
+        use crate::source_url::FetchedPage;
+
+        struct CannedFetcher;
+        #[async_trait::async_trait]
+        impl PageFetcher for CannedFetcher {
+            async fn fetch_page(
+                &self,
+                raw_url: &str,
+            ) -> Result<FetchedPage, AppError> {
+                Ok(FetchedPage {
+                    final_url: raw_url.into(),
+                    title: None,
+                    markdown: "fresh".into(),
+                    truncated: false,
+                })
+            }
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let physical_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let repo = Arc::new(MemRepo::default());
+        let service = KnowledgeService::new(
+            repo,
+            &physical_dir.join("data"),
+            KnowledgeEventEmitter::new(
+                Arc::new(NoopBroadcaster),
+                Arc::from(TEST_OWNER_ID),
+            ),
+        )
+        .with_url_fetcher(CannedFetcher);
+        let registered = physical_dir.join("refresh-root");
+        let moved = physical_dir.join("refresh-moved");
+        let outside = physical_dir.join("refresh-outside");
+        std::fs::create_dir_all(&registered).unwrap();
+        std::fs::create_dir_all(outside.join("snapshots")).unwrap();
+        let kb = service
+            .create_base(
+                "refresh root",
+                "",
+                Some(registered.to_str().unwrap()),
+                Some(url_source(
+                    KnowledgeSourceMode::Live,
+                    &["https://example.com/current"],
+                )),
+            )
+            .await
+            .unwrap();
+        service
+            .write_file(
+                kb.knowledge_base_id.as_str(),
+                "prime-lock-cache.md",
+                "safe",
+            )
+            .await
+            .unwrap();
+        std::fs::rename(&registered, &moved).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &registered).unwrap();
+        #[cfg(windows)]
+        junction::create(&outside, &registered).unwrap();
+        let orphan = outside.join("snapshots/orphan.md");
+        std::fs::write(
+            &orphan,
+            "---\nsource_url: https://example.com/old\n---\nexternal",
+        )
+        .unwrap();
+
+        let error = service
+            .refresh_source(kb.knowledge_base_id.as_str())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
+        assert_eq!(
+            std::fs::read_to_string(&orphan).unwrap(),
+            "---\nsource_url: https://example.com/old\n---\nexternal"
+        );
+        #[cfg(unix)]
+        std::fs::remove_file(&registered).unwrap();
+        #[cfg(windows)]
+        junction::delete(&registered).unwrap();
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_uuid_first_logical_path_is_not_an_inbox_scope() {
+        let (service, kb_id, _dir) =
+            test_service_with_file("terms.md", "x").await;
+        let uuid_directory = "0190f5fe-7c00-7a00-8000-000000000099";
+        let outcome = service
+            .write_document(WriteRequest {
+                spec: WriteTargetSpec::Path {
+                    kb_id: kb_id.clone(),
+                    rel_path: format!("{uuid_directory}/note.md"),
+                },
+                content: "# UUID directory\n".into(),
+                policy: WritePolicy {
+                    mode: WriteMode::Staged {
+                        scope: TEST_CONVERSATION_ID.into(),
+                    },
+                    allow_create: true,
+                    surface: WriteSurface::RegularChat,
+                },
+                bound_kb_ids: vec![kb_id.clone()],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.final_rel_path,
+            format!(
+                "{KB_INBOX_REL_DIR}/{TEST_CONVERSATION_ID}/{uuid_directory}/note.md"
+            )
+        );
+        service
+            .merge_inbox(
+                kb_id.as_str(),
+                TEST_CONVERSATION_ID,
+                &format!("{uuid_directory}/note.md"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .read_file(
+                    kb_id.as_str(),
+                    &format!("{uuid_directory}/note.md"),
+                )
+                .await
+                .unwrap()
+                .content,
+            "# UUID directory\n"
+        );
     }
 
     // ── write_document + per-surface WritePolicy (P1) ─────────────────
@@ -7231,6 +11833,9 @@ mod tests {
                 scope: TEST_CONVERSATION_ID.to_owned(),
                 user_text: "请分析为什么暂存没有产出。".into(),
                 assistant_text: "结论：触发时机应放在最终答复之后。".into(),
+                model: None,
+                excluded_targets: None,
+                cancellation: None,
             })
             .await;
 
@@ -7255,6 +11860,161 @@ mod tests {
         assert!(
             completer.last_user.lock().unwrap().contains("eagerness: aggressive"),
             "eagerness must shape extraction, not placement"
+        );
+        assert_eq!(
+            *completer.last_override.lock().unwrap(),
+            None,
+            "a request without an explicit model must keep the completer's default path"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_finalizer_uses_explicit_effective_model_override() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "ORIGINAL").await;
+        let completer = ScriptedCompleter::new(&[r#"{"candidates":[]}"#]);
+        svc.set_completer(completer.clone());
+
+        let report = svc
+            .finalize_turn_writeback(TurnWritebackRequest {
+                mounts: vec![KnowledgeMountInfo {
+                    knowledge_base_id: kb_id.clone(),
+                    name: "领域库".into(),
+                    description: String::new(),
+                    rel_path: ".nomi/knowledge/领域库".into(),
+                    toc: Vec::new(),
+                    summary: None,
+                    live_sources: Vec::new(),
+                }],
+                binding: KnowledgeBinding {
+                    enabled: true,
+                    writeback: true,
+                    writeback_mode: "staged".into(),
+                    kb_ids: vec![kb_id],
+                    ..Default::default()
+                },
+                surface: WriteSurface::RegularChat,
+                scope: TEST_CONVERSATION_ID.to_owned(),
+                user_text: "u".into(),
+                assistant_text: "a".into(),
+                model: Some(ProviderWithModel {
+                    provider_id: TEST_PROVIDER_ID_2.to_owned(),
+                    model: "configured-name".into(),
+                    use_model: Some("effective-name".into()),
+                }),
+                excluded_targets: None,
+                cancellation: None,
+            })
+            .await;
+
+        assert_eq!(report.status, TurnWritebackStatus::NoCandidate);
+        assert_eq!(completer.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *completer.last_override.lock().unwrap(),
+            Some((TEST_PROVIDER_ID_2.to_owned(), "effective-name".to_owned())),
+            "turn-final write-back must call complete_with using use_model when present"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_finalizer_rejects_candidate_overflow_before_any_write() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "ORIGINAL").await;
+        let candidates = (0..=TURN_WRITEBACK_MAX_CANDIDATES)
+            .map(|index| {
+                serde_json::json!({
+                    "kb_id": kb_id.as_str(),
+                    "rel_path": format!("overflow/{index}.md"),
+                    "content": format!("# Candidate {index}")
+                })
+            })
+            .collect::<Vec<_>>();
+        let reply = serde_json::json!({ "candidates": candidates }).to_string();
+        let completer = ScriptedCompleter::new(&[&reply]);
+        svc.set_completer(completer.clone());
+
+        let report = svc
+            .finalize_turn_writeback(TurnWritebackRequest {
+                mounts: vec![KnowledgeMountInfo {
+                    knowledge_base_id: kb_id.clone(),
+                    name: "领域库".into(),
+                    description: String::new(),
+                    rel_path: ".nomi/knowledge/领域库".into(),
+                    toc: Vec::new(),
+                    summary: None,
+                    live_sources: Vec::new(),
+                }],
+                binding: KnowledgeBinding {
+                    enabled: true,
+                    writeback: true,
+                    writeback_mode: "staged".into(),
+                    kb_ids: vec![kb_id.clone()],
+                    ..Default::default()
+                },
+                surface: WriteSurface::RegularChat,
+                scope: TEST_CONVERSATION_ID.to_owned(),
+                user_text: "u".into(),
+                assistant_text: "a".into(),
+                model: None,
+                excluded_targets: None,
+                cancellation: None,
+            })
+            .await;
+
+        assert_eq!(report.status, TurnWritebackStatus::Failed);
+        assert_eq!(report.candidates, TURN_WRITEBACK_MAX_CANDIDATES + 1);
+        assert!(report.written.is_empty());
+        assert!(report.failures[0].error.contains("maximum is 8"));
+        assert!(
+            svc.list_files(&kb_id)
+                .await
+                .unwrap()
+                .iter()
+                .all(|file| file.rel_path == "terms.md"),
+            "candidate overflow must fail before the first disk write"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_finalizer_malformed_output_is_not_automatically_retried() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "ORIGINAL").await;
+        let completer = ScriptedCompleter::new(&[
+            "not valid JSON",
+            r#"{"candidates":[]}"#,
+        ]);
+        svc.set_completer(completer.clone());
+
+        let report = svc
+            .finalize_turn_writeback(TurnWritebackRequest {
+                mounts: vec![KnowledgeMountInfo {
+                    knowledge_base_id: kb_id.clone(),
+                    name: "领域库".into(),
+                    description: String::new(),
+                    rel_path: ".nomi/knowledge/领域库".into(),
+                    toc: Vec::new(),
+                    summary: None,
+                    live_sources: Vec::new(),
+                }],
+                binding: KnowledgeBinding {
+                    enabled: true,
+                    writeback: true,
+                    writeback_mode: "staged".into(),
+                    kb_ids: vec![kb_id],
+                    ..Default::default()
+                },
+                surface: WriteSurface::RegularChat,
+                scope: TEST_CONVERSATION_ID.to_owned(),
+                user_text: "u".into(),
+                assistant_text: "a".into(),
+                model: None,
+                excluded_targets: None,
+                cancellation: None,
+            })
+            .await;
+
+        assert_eq!(report.status, TurnWritebackStatus::Failed);
+        assert_eq!(
+            completer.calls.load(Ordering::SeqCst),
+            1,
+            "one background attempt must make exactly one extraction call; retry is user-driven"
         );
     }
 
@@ -7287,6 +12047,9 @@ mod tests {
                 scope: TEST_CONVERSATION_ID.to_owned(),
                 user_text: "u".into(),
                 assistant_text: "a".into(),
+                model: None,
+                excluded_targets: None,
+                cancellation: None,
             })
             .await;
 
@@ -7302,7 +12065,7 @@ mod tests {
     async fn turn_finalizer_rejects_candidates_that_target_inbox_directly() {
         let (svc, kb_id, _dir) = test_service_with_file("terms.md", "ORIGINAL").await;
         let reply = format!(
-            r##"{{"candidates":[{{"kb_id":"{kb_id}","rel_path":"_inbox/manual.md","content":"# Bad"}}]}}"##
+            r##"{{"candidates":[{{"kb_id":"{kb_id}","rel_path":"_INBOX/manual.md","content":"# Bad"}}]}}"##
         );
         svc.set_completer(ScriptedCompleter::new(&[&reply]));
 
@@ -7328,6 +12091,9 @@ mod tests {
                 scope: TEST_CONVERSATION_ID.to_owned(),
                 user_text: "u".into(),
                 assistant_text: "a".into(),
+                model: None,
+                excluded_targets: None,
+                cancellation: None,
             })
             .await;
 
@@ -7337,17 +12103,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_finalizer_direct_update_merges_existing_document_instead_of_overwriting() {
+    async fn turn_finalizer_direct_update_appends_without_rewriting_existing_document() {
+        let existing = format!(
+            "# Existing\n\nKeep this established section.\n\n{}\nTAIL-SENTINEL",
+            "preserve-this-line\n".repeat(2_000)
+        );
+        assert!(
+            existing.chars().count() > 24_000,
+            "fixture must exceed the removed merge prompt's historical truncation bound"
+        );
         let (svc, kb_id, _dir) = test_service_with_file(
             "patterns/safe.md",
-            "# Existing\n\nKeep this established section.",
+            &existing,
         )
         .await;
         let candidate = format!(
             r##"{{"candidates":[{{"kb_id":"{kb_id}","rel_path":"patterns/safe.md","content":"# New\n\nAdd this durable lesson."}}]}}"##
         );
-        let merged = r##"{"content":"# Existing\n\nKeep this established section.\n\n# New\n\nAdd this durable lesson."}"##;
-        let completer = ScriptedCompleter::new(&[&candidate, merged]);
+        let completer = ScriptedCompleter::new(&[&candidate]);
         svc.set_completer(completer.clone());
 
         let report = svc
@@ -7373,15 +12146,24 @@ mod tests {
                 scope: TEST_CONVERSATION_ID.to_owned(),
                 user_text: "请补充这个经验。".into(),
                 assistant_text: "结论：应保留旧内容并追加新经验。".into(),
+                model: None,
+                excluded_targets: None,
+                cancellation: None,
             })
             .await;
 
         assert_eq!(report.status, TurnWritebackStatus::Written, "{report:?}");
         assert_eq!(report.written[0].final_rel_path, "patterns/safe.md");
         let body = svc.read_file(&kb_id, "patterns/safe.md").await.unwrap().content;
+        assert!(body.starts_with(&existing), "existing document bytes were rewritten or truncated");
         assert!(body.contains("Keep this established section."), "{body}");
+        assert!(body.contains("TAIL-SENTINEL"), "long document tail was lost");
         assert!(body.contains("Add this durable lesson."), "{body}");
-        assert_eq!(completer.calls.load(Ordering::SeqCst), 2, "extract + safe merge");
+        assert_eq!(
+            completer.calls.load(Ordering::SeqCst),
+            1,
+            "direct mode must not make a second model call that can rewrite or truncate existing content"
+        );
     }
 
     #[tokio::test]
@@ -7411,6 +12193,9 @@ mod tests {
             scope: TEST_CONVERSATION_ID.to_owned(),
             user_text: user_text.into(),
             assistant_text: "final durable answer".into(),
+            model: None,
+            excluded_targets: None,
+            cancellation: None,
         };
 
         let (alpha, beta) = tokio::join!(
@@ -7468,10 +12253,13 @@ mod tests {
                 scope: TEST_CONVERSATION_ID.to_owned(),
                 user_text: "u".into(),
                 assistant_text: "a".into(),
+                model: None,
+                excluded_targets: None,
+                cancellation: None,
             })
             .await;
 
-        assert_eq!(report.status, TurnWritebackStatus::Written, "{report:?}");
+        assert_eq!(report.status, TurnWritebackStatus::Failed, "{report:?}");
         assert_eq!(
             svc.read_file(
                 &kb_id,
@@ -7482,36 +12270,29 @@ mod tests {
                 .content,
             "FIRST"
         );
-        assert_ne!(
-            report.written[0].final_rel_path,
-            "_inbox/0190f5fe-7c00-7a00-8000-000000000011/patterns/note.md"
-        );
-        assert!(
-            svc.read_file(&kb_id, &report.written[0].final_rel_path)
-                .await
-                .unwrap()
-                .content
-                .contains("SECOND")
-        );
-    }
-
-    #[test]
-    fn turn_finalizer_staged_collision_suffix_uses_stable_sha256_prefix() {
-        assert_eq!(short_content_hash("SECOND"), "84747dcd");
-        assert_eq!(
-            append_markdown_path_suffix("patterns/note.md", &short_content_hash("SECOND")),
-            "patterns/note--84747dcd.md"
-        );
+        assert!(report.written.is_empty());
+        assert!(report.failures[0].error.contains("pending review proposal"));
     }
 
     #[tokio::test]
     async fn turn_finalizer_staged_skips_candidate_already_written_by_explicit_tool() {
         let (svc, kb_id, _dir) = test_service_with_file("terms.md", "ORIGINAL").await;
-        svc.write_file(
-            &kb_id,
-            "_inbox/0190f5fe-7c00-7a00-8000-000000000011/patterns/note.md",
-            "# Durable\n\nAlready staged by knowledge_write.",
-        )
+        let parsed_kb_id = KnowledgeBaseId::parse(kb_id.clone()).unwrap();
+        svc.write_document(WriteRequest {
+            spec: WriteTargetSpec::Path {
+                kb_id: parsed_kb_id.clone(),
+                rel_path: "patterns/note.md".into(),
+            },
+            content: "# Durable\n\nAlready staged by knowledge_write.".into(),
+            policy: WritePolicy {
+                mode: WriteMode::Staged {
+                    scope: TEST_CONVERSATION_ID.into(),
+                },
+                allow_create: true,
+                surface: WriteSurface::RegularChat,
+            },
+            bound_kb_ids: vec![parsed_kb_id],
+        })
         .await
         .unwrap();
         let reply = format!(
@@ -7538,9 +12319,12 @@ mod tests {
                     ..Default::default()
                 },
                 surface: WriteSurface::RegularChat,
-                scope: "0190f5fe-7c00-7a00-8000-000000000011/0190f5fe-7c00-7a00-8000-000000000041".into(),
+                scope: TEST_CONVERSATION_ID.to_owned(),
                 user_text: "u".into(),
                 assistant_text: "a".into(),
+                model: None,
+                excluded_targets: None,
+                cancellation: None,
             })
             .await;
 
@@ -7549,21 +12333,21 @@ mod tests {
         assert!(
             svc.read_file(
                 &kb_id,
-                "_inbox/0190f5fe-7c00-7a00-8000-000000000011/0190f5fe-7c00-7a00-8000-000000000041/patterns/note.md",
+                "_inbox/0190f5fe-7c00-7a00-8000-000000000011/patterns/note.md",
             )
                 .await
-                .is_err(),
-            "finalizer must not duplicate a same-content explicit knowledge_write proposal"
+                .is_ok(),
+            "finalizer must preserve the same-content explicit knowledge_write proposal"
         );
     }
 
     /// **P3 connector sync e2e**: register a mock connector + credential store,
     /// create a connector-backed base, and prove `sync_connector_source` writes
-    /// one snapshot per remote doc (slug = sanitized remote_id, frontmatter
-    /// carries the web source_url), persists the cursor, and on a second sync
-    /// moves a vanished doc into `snapshots/_trash/` (never hard-deletes).
+    /// one snapshot per remote doc using a stable collision-resistant filename,
+    /// persists the cursor, and on a second sync moves a vanished doc into
+    /// `snapshots/_trash/` (never hard-deletes).
     #[tokio::test]
-    async fn connector_sync_writes_snapshots_persists_cursor_and_trashes_deletions() {
+    async fn portable_writeback_connector_sync_is_collision_safe_and_migrates_legacy_files() {
         use crate::connector::FetchedConnectorDoc;
         struct MockConn {
             docs: StdMutex<Vec<RemoteDocRef>>,
@@ -7573,6 +12357,19 @@ mod tests {
         impl KnowledgeConnector for MockConn {
             fn kind(&self) -> &'static str {
                 "mock"
+            }
+            fn source_url_for_remote_id(&self, remote_id: &str) -> Option<String> {
+                Some(if matches!(
+                    remote_id,
+                    "SHARED:A"
+                        | "SHARED:B"
+                        | "LEGACY:SHARED:A"
+                        | "LEGACY:SHARED:B"
+                ) {
+                    "https://mock/shared".into()
+                } else {
+                    format!("https://mock/{remote_id}")
+                })
             }
             async fn validate_credentials(&self, cred: &ConnectorCredential) -> Result<ConnectorIdentity, AppError> {
                 // Reject an obviously-bad payload so create_credential's fail-fast is exercised elsewhere.
@@ -7605,7 +12402,7 @@ mod tests {
                     title: doc.title.clone(),
                     markdown: format!("# {}\n\nbody of {}", doc.title, doc.remote_id),
                     edit_time: doc.edit_time,
-                    source_url: Some(format!("https://mock/{}", doc.remote_id)),
+                    source_url: self.source_url_for_remote_id(&doc.remote_id),
                 })
             }
         }
@@ -7615,7 +12412,9 @@ mod tests {
         let conn = Arc::new(MockConn {
             docs: StdMutex::new(vec![
                 RemoteDocRef { remote_id: "DOCAAA".into(), title: "Alpha".into(), edit_time: 10, doc_type: "docx".into() },
-                RemoteDocRef { remote_id: "DOCBBB".into(), title: "Beta".into(), edit_time: 20, doc_type: "docx".into() },
+                // This deliberately collides with `DOCAAA` under the legacy
+                // lower-cased slug algorithm.
+                RemoteDocRef { remote_id: "docaaa".into(), title: "Beta".into(), edit_time: 20, doc_type: "docx".into() },
             ]),
             deleted: StdMutex::new(vec![]),
         });
@@ -7650,13 +12449,18 @@ mod tests {
         let summary = service.sync_connector_source(&kb.knowledge_base_id).await.unwrap();
         assert_eq!(summary.fetched, 2);
         assert_eq!(summary.failed, 0);
-        let a = snap_dir.join("docaaa.md");
-        let b = snap_dir.join("docbbb.md");
+        let a = snap_dir.join(format!("{}.md", connector_doc_slug("DOCAAA")));
+        let b = snap_dir.join(format!("{}.md", connector_doc_slug("docaaa")));
+        assert_ne!(a, b, "case-distinct remote ids must not share a snapshot");
         assert!(a.exists() && b.exists(), "both snapshots written");
         let a_body = std::fs::read_to_string(&a).unwrap();
         assert!(a_body.contains("# Alpha"), "body rendered: {a_body}");
         assert!(a_body.contains("body of DOCAAA"));
         assert!(a_body.contains("https://mock/DOCAAA"), "frontmatter carries web source_url");
+        assert!(
+            has_connector_snapshot_identity(&a_body),
+            "new connector snapshots carry a non-lossy identity marker"
+        );
 
         // Cursor + stamp persisted; no error.
         let stored = extra_source(&repo, kb.knowledge_base_id.as_str()).unwrap();
@@ -7668,15 +12472,362 @@ mod tests {
         // what the incremental filter resumes from, avoiding clock-skew misses.
         assert_eq!(sync.watermark, Some(20), "watermark = max remote edit_time");
 
-        // Second sync: DOCBBB deleted → moved to _trash, DOCAAA survives.
+        // Second sync: the colliding lower-case id is deleted, while the
+        // upper-case id must remain untouched.
         *conn.docs.lock().unwrap() =
             vec![RemoteDocRef { remote_id: "DOCAAA".into(), title: "Alpha".into(), edit_time: 10, doc_type: "docx".into() }];
-        *conn.deleted.lock().unwrap() = vec!["DOCBBB".into()];
+        *conn.deleted.lock().unwrap() = vec!["docaaa".into()];
         let summary2 = service.sync_connector_source(&kb.knowledge_base_id).await.unwrap();
         assert_eq!(summary2.fetched, 1);
         assert!(!b.exists(), "deleted doc removed from live snapshots");
-        assert!(snap_dir.join("_trash").join("docbbb.md").exists(), "deleted doc moved to _trash");
+        let trash = snap_dir.join("_trash");
+        assert_eq!(
+            std::fs::read_dir(&trash).unwrap().flatten().count(),
+            1,
+            "deleted doc moved to unique _trash entry"
+        );
         assert!(a.exists(), "surviving doc remains");
+
+        // Re-add and delete the same remote document again. A fixed trash
+        // destination overwrites on Unix but fails on Windows; unique
+        // quarantine names must preserve both audit copies and remove the live
+        // snapshot consistently on every platform.
+        *conn.docs.lock().unwrap() = vec![
+            RemoteDocRef {
+                remote_id: "DOCAAA".into(),
+                title: "Alpha".into(),
+                edit_time: 10,
+                doc_type: "docx".into(),
+            },
+            RemoteDocRef {
+                remote_id: "docaaa".into(),
+                title: "Beta".into(),
+                edit_time: 30,
+                doc_type: "docx".into(),
+            },
+        ];
+        conn.deleted.lock().unwrap().clear();
+        service
+            .sync_connector_source(&kb.knowledge_base_id)
+            .await
+            .unwrap();
+        assert!(b.exists(), "re-added document returns to the live set");
+
+        *conn.docs.lock().unwrap() = vec![RemoteDocRef {
+            remote_id: "DOCAAA".into(),
+            title: "Alpha".into(),
+            edit_time: 10,
+            doc_type: "docx".into(),
+        }];
+        *conn.deleted.lock().unwrap() = vec!["docaaa".into()];
+        service
+            .sync_connector_source(&kb.knowledge_base_id)
+            .await
+            .unwrap();
+        assert!(!b.exists());
+        assert_eq!(
+            std::fs::read_dir(&trash).unwrap().flatten().count(),
+            2,
+            "both deletion audit copies must survive without platform overwrite differences"
+        );
+
+        // Upgrade path: a changed document can still exist under the legacy
+        // lossy filename. Publishing the stable hashed path must quarantine
+        // the legacy alias instead of leaving duplicate searchable content.
+        let legacy_changed_id = "LEGACY:CHANGE";
+        let legacy_changed = snap_dir.join("legacy-change.md");
+        std::fs::write(
+            &legacy_changed,
+            source_url::snapshot_markdown(
+                &format!("https://mock/{legacy_changed_id}"),
+                "2026-01-01T00:00:00Z",
+                Some("Legacy changed"),
+                "old body",
+            ),
+        )
+        .unwrap();
+        *conn.docs.lock().unwrap() = vec![RemoteDocRef {
+            remote_id: legacy_changed_id.into(),
+            title: "Legacy changed".into(),
+            edit_time: 40,
+            doc_type: "docx".into(),
+        }];
+        conn.deleted.lock().unwrap().clear();
+        service
+            .sync_connector_source(&kb.knowledge_base_id)
+            .await
+            .unwrap();
+        assert!(
+            !legacy_changed.exists(),
+            "legacy update alias must leave the live snapshot directory"
+        );
+        assert!(
+            snap_dir
+                .join(format!(
+                    "{}.md",
+                    connector_doc_slug(legacy_changed_id)
+                ))
+                .exists(),
+            "updated document must land at its stable hashed path"
+        );
+
+        // A deletion tombstone can be the first event after upgrading, so no
+        // changed document body is available. The connector's exact source
+        // URL mapping must still find and quarantine the legacy snapshot.
+        let legacy_deleted_id = "LEGACY/DELETE";
+        let legacy_deleted = snap_dir.join("legacy-delete.md");
+        std::fs::write(
+            &legacy_deleted,
+            source_url::snapshot_markdown(
+                &format!("https://mock/{legacy_deleted_id}"),
+                "2026-01-01T00:00:00Z",
+                Some("Legacy deleted"),
+                "stale deleted body",
+            ),
+        )
+        .unwrap();
+        conn.docs.lock().unwrap().clear();
+        *conn.deleted.lock().unwrap() = vec![legacy_deleted_id.into()];
+        service
+            .sync_connector_source(&kb.knowledge_base_id)
+            .await
+            .unwrap();
+        assert!(
+            !legacy_deleted.exists(),
+            "legacy tombstone must not leave deleted content searchable"
+        );
+        assert_eq!(
+            std::fs::read_dir(&trash).unwrap().flatten().count(),
+            4,
+            "update migration and deletion must each create a recoverable trash entry"
+        );
+
+        // Two provider documents may share one canonical URL. After a full
+        // batch, an incremental update containing only A must not classify
+        // the omitted current-format B snapshot as a legacy alias.
+        *conn.docs.lock().unwrap() = vec![
+            RemoteDocRef {
+                remote_id: "SHARED:A".into(),
+                title: "Shared A".into(),
+                edit_time: 50,
+                doc_type: "docx".into(),
+            },
+            RemoteDocRef {
+                remote_id: "SHARED:B".into(),
+                title: "Shared B".into(),
+                edit_time: 60,
+                doc_type: "docx".into(),
+            },
+        ];
+        conn.deleted.lock().unwrap().clear();
+        service
+            .sync_connector_source(&kb.knowledge_base_id)
+            .await
+            .unwrap();
+        let shared_b = snap_dir.join(format!(
+            "{}.md",
+            connector_doc_slug("SHARED:B")
+        ));
+        assert!(shared_b.exists());
+
+        *conn.docs.lock().unwrap() = vec![RemoteDocRef {
+            remote_id: "SHARED:A".into(),
+            title: "Shared A updated".into(),
+            edit_time: 70,
+            doc_type: "docx".into(),
+        }];
+        service
+            .sync_connector_source(&kb.knowledge_base_id)
+            .await
+            .unwrap();
+        assert!(
+            shared_b.exists(),
+            "incremental alias cleanup must preserve omitted current-format documents sharing the same URL"
+        );
+        assert_eq!(
+            std::fs::read_dir(&trash).unwrap().flatten().count(),
+            4,
+            "shared-URL incremental update must not quarantine a current snapshot"
+        );
+
+        // Legacy snapshots lack a remote-id marker. If two of them share one
+        // URL, an incremental update cannot prove which alias belongs to A.
+        // Keep both live and report a conflict so the watermark does not
+        // advance; never sacrifice B merely to clean up A.
+        let legacy_shared_a = snap_dir.join("legacy-shared-a.md");
+        let legacy_shared_b = snap_dir.join("legacy-shared-b.md");
+        for (path, title) in [
+            (&legacy_shared_a, "Legacy shared A"),
+            (&legacy_shared_b, "Legacy shared B"),
+        ] {
+            std::fs::write(
+                path,
+                source_url::snapshot_markdown(
+                    "https://mock/shared",
+                    "2026-01-01T00:00:00Z",
+                    Some(title),
+                    title,
+                ),
+            )
+            .unwrap();
+        }
+        *conn.docs.lock().unwrap() = vec![RemoteDocRef {
+            remote_id: "LEGACY:SHARED:A".into(),
+            title: "Legacy shared A updated".into(),
+            edit_time: 80,
+            doc_type: "docx".into(),
+        }];
+        let summary = service
+            .sync_connector_source(&kb.knowledge_base_id)
+            .await
+            .unwrap();
+        assert_eq!(summary.failed, 1, "{:?}", summary.errors);
+        assert!(
+            summary.errors[0].contains("cannot safely migrate or delete"),
+            "{:?}",
+            summary.errors
+        );
+        assert!(
+            legacy_shared_a.exists() && legacy_shared_b.exists(),
+            "ambiguous legacy aliases must remain untouched"
+        );
+        assert_eq!(
+            std::fs::read_dir(&trash).unwrap().flatten().count(),
+            4,
+            "ambiguous migration must not move either legacy file"
+        );
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_connector_source_switch_prevents_stale_publication() {
+        use crate::connector::FetchedConnectorDoc;
+        use tokio::sync::Barrier;
+
+        struct PausingConnector {
+            started: Arc<Barrier>,
+            resume: Arc<Barrier>,
+        }
+
+        #[async_trait::async_trait]
+        impl KnowledgeConnector for PausingConnector {
+            fn kind(&self) -> &'static str {
+                "pausing"
+            }
+
+            async fn validate_credentials(
+                &self,
+                _cred: &ConnectorCredential,
+            ) -> Result<ConnectorIdentity, AppError> {
+                Ok(ConnectorIdentity {
+                    tenant_name: None,
+                    scopes_available: Vec::new(),
+                })
+            }
+
+            async fn list_documents(
+                &self,
+                _cred: &ConnectorCredential,
+                _scope: &ConnectorScope,
+                _cursor: &SyncCursor,
+                _page_token: Option<&str>,
+            ) -> Result<SyncPage, AppError> {
+                Ok(SyncPage {
+                    docs: vec![RemoteDocRef {
+                        remote_id: "STALE".into(),
+                        title: "Stale".into(),
+                        edit_time: 1,
+                        doc_type: "doc".into(),
+                    }],
+                    deleted_ids: Vec::new(),
+                    next_page_token: None,
+                    updated_cursor: SyncCursor::default(),
+                })
+            }
+
+            async fn fetch_document(
+                &self,
+                _cred: &ConnectorCredential,
+                doc: &RemoteDocRef,
+            ) -> Result<FetchedConnectorDoc, AppError> {
+                self.started.wait().await;
+                self.resume.wait().await;
+                Ok(FetchedConnectorDoc {
+                    remote_id: doc.remote_id.clone(),
+                    title: doc.title.clone(),
+                    markdown: "stale connector body".into(),
+                    edit_time: doc.edit_time,
+                    source_url: None,
+                })
+            }
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (service, repo) = service_with_repo(&dir.path().join("data"));
+        let service = Arc::new(service);
+        let started = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        service.register_connector(Arc::new(PausingConnector {
+            started: Arc::clone(&started),
+            resume: Arc::clone(&resume),
+        }));
+        service.set_connector_credentials(
+            Arc::new(TestCredentialRepo::default()),
+            [9u8; 32],
+        );
+        let credential = service
+            .create_credential(
+                "pausing",
+                "pause",
+                serde_json::json!({ "token": "x" }),
+            )
+            .await
+            .unwrap();
+        let kb = service
+            .create_base(
+                "connector race",
+                "",
+                None,
+                Some(KnowledgeSource {
+                    kind: "pausing".into(),
+                    mode: KnowledgeSourceMode::Snapshot,
+                    entries: Vec::new(),
+                    last_fetched_at: None,
+                    credential_ref: Some(credential.credential_id),
+                    scope: Some(serde_json::json!({ "space": "test" })),
+                    sync: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let kb_id = kb.knowledge_base_id.clone();
+        let syncing = {
+            let service = Arc::clone(&service);
+            tokio::spawn(async move {
+                service.sync_connector_source(kb_id.as_str()).await
+            })
+        };
+
+        started.wait().await;
+        service
+            .set_source(kb.knowledge_base_id.as_str(), None)
+            .await
+            .unwrap();
+        resume.wait().await;
+
+        let error = syncing.await.unwrap().unwrap_err();
+        assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
+        assert!(
+            extra_source(&repo, kb.knowledge_base_id.as_str()).is_none()
+        );
+        let snapshots =
+            Path::new(&kb.root_path).join(source_url::SNAPSHOT_REL_DIR);
+        assert!(
+            !snapshots.exists()
+                || std::fs::read_dir(&snapshots)
+                    .unwrap()
+                    .next()
+                    .is_none()
+        );
     }
 
     /// **P4 inbox e2e**: stage proposals via the P1 staged-write path, then
@@ -7757,6 +12908,158 @@ mod tests {
                 .is_err()
         );
         assert!(svc.inbox_diff(&kb_id, "..", "terms.md").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_staged_merge_rejects_changed_base() {
+        let (svc, kb_id, _dir) =
+            test_service_with_file("terms.md", "ORIGINAL\n").await;
+        svc.write_document(WriteRequest {
+            spec: WriteTargetSpec::Path {
+                kb_id: kb_id.clone(),
+                rel_path: "terms.md".into(),
+            },
+            content: "PROPOSED\n".into(),
+            policy: WritePolicy {
+                mode: WriteMode::Staged {
+                    scope: TEST_CONVERSATION_ID.into(),
+                },
+                allow_create: true,
+                surface: WriteSurface::RegularChat,
+            },
+            bound_kb_ids: vec![kb_id.clone()],
+        })
+        .await
+        .unwrap();
+        svc.write_file(&kb_id, "terms.md", "USER EDIT\n")
+            .await
+            .unwrap();
+
+        let error = svc
+            .merge_inbox(&kb_id, TEST_CONVERSATION_ID, "terms.md")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
+        assert_eq!(
+            svc.read_file(&kb_id, "terms.md").await.unwrap().content,
+            "USER EDIT\n"
+        );
+        assert!(
+            svc.read_file(
+                &kb_id,
+                &format!(
+                    "{KB_INBOX_REL_DIR}/{TEST_CONVERSATION_ID}/terms.md"
+                ),
+            )
+            .await
+            .is_ok(),
+            "stale proposal must remain available to inspect or discard"
+        );
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_staged_merge_recovers_after_publication() {
+        let (svc, kb_id, _dir) =
+            test_service_with_file("terms.md", "ORIGINAL\n").await;
+        let proposal_rel =
+            format!("{KB_INBOX_REL_DIR}/{TEST_CONVERSATION_ID}/terms.md");
+        svc.write_document(WriteRequest {
+            spec: WriteTargetSpec::Path {
+                kb_id: kb_id.clone(),
+                rel_path: "terms.md".into(),
+            },
+            content: "PROPOSED\n".into(),
+            policy: WritePolicy {
+                mode: WriteMode::Staged {
+                    scope: TEST_CONVERSATION_ID.into(),
+                },
+                allow_create: true,
+                surface: WriteSurface::RegularChat,
+            },
+            bound_kb_ids: vec![kb_id.clone()],
+        })
+        .await
+        .unwrap();
+        svc.write_file(&kb_id, "terms.md", "PROPOSED\n")
+            .await
+            .unwrap();
+        let base = svc.get_base_info(&kb_id).await.unwrap();
+        let proposal_abs =
+            safe_md_path(Path::new(&base.root_path), &proposal_rel).unwrap();
+        std::fs::remove_file(staged_proposal_metadata_path(&proposal_abs))
+            .unwrap();
+
+        svc.merge_inbox(&kb_id, TEST_CONVERSATION_ID, "terms.md")
+            .await
+            .unwrap();
+
+        assert!(svc.read_file(&kb_id, &proposal_rel).await.is_err());
+        assert_eq!(
+            svc.read_file(&kb_id, "terms.md").await.unwrap().content,
+            "PROPOSED\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_staged_retry_reuses_case_alias_and_sidecar() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "x").await;
+        let request = |rel_path: &str| WriteRequest {
+            spec: WriteTargetSpec::Path {
+                kb_id: kb_id.clone(),
+                rel_path: rel_path.into(),
+            },
+            content: "# Portable proposal\n".into(),
+            policy: WritePolicy {
+                mode: WriteMode::Staged {
+                    scope: TEST_CONVERSATION_ID.into(),
+                },
+                allow_create: true,
+                surface: WriteSurface::RegularChat,
+            },
+            bound_kb_ids: vec![kb_id.clone()],
+        };
+        svc.write_document(request("Notes/Foo.md")).await.unwrap();
+        let retried = svc.write_document(request("notes/foo.md")).await.unwrap();
+
+        assert_eq!(
+            retried.final_rel_path,
+            format!(
+                "{KB_INBOX_REL_DIR}/{TEST_CONVERSATION_ID}/Notes/Foo.md"
+            )
+        );
+        let proposals = svc.list_inbox(&kb_id).await.unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].rel_path, "Notes/Foo.md");
+    }
+
+    #[tokio::test]
+    async fn portable_writeback_staged_write_rejects_inbox_alias() {
+        let (svc, kb_id, _dir) = test_service_with_file("terms.md", "x").await;
+        let base = svc.get_base_info(&kb_id).await.unwrap();
+        std::fs::create_dir(Path::new(&base.root_path).join("_INBOX"))
+            .unwrap();
+
+        let error = svc
+            .write_document(WriteRequest {
+                spec: WriteTargetSpec::Path {
+                    kb_id: kb_id.clone(),
+                    rel_path: "new.md".into(),
+                },
+                content: "new".into(),
+                policy: WritePolicy {
+                    mode: WriteMode::Staged {
+                        scope: TEST_CONVERSATION_ID.into(),
+                    },
+                    allow_create: true,
+                    surface: WriteSurface::RegularChat,
+                },
+                bound_kb_ids: vec![kb_id.clone()],
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AppError::Conflict(_)), "{error:?}");
     }
 
     /// **Batch merge**: merge_all_inbox accepts all staged proposals and count

@@ -43,6 +43,7 @@ use nomifun_common::{
     KnowledgeBaseId, LoopbackCapabilityIssuer, LoopbackCapabilityRenewalRequest,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -265,16 +266,24 @@ async fn handle_tool_request(
             let write_scope = claims
                 .session
                 .conversation_id
-                .as_deref()
-                .unwrap_or(&wp_key);
+                .clone()
+                .unwrap_or_else(|| opaque_workpath_write_scope(&wp_key));
             info!(tool, kb_ids = bound_kb_ids.len(), workspace = %workspace_path, "Knowledge MCP: dispatching tool");
-            finish(dispatch_write(&service, &bound_kb_ids, &binding, write_scope, &args).await)
+            finish(dispatch_write(&service, &bound_kb_ids, &binding, &write_scope, &args).await)
         }
         _ => {
             warn!(tool, "Knowledge MCP: unknown tool");
             finish(json!({"error": format!("unknown tool: {tool}")}))
         }
     }
+}
+
+fn opaque_workpath_write_scope(workpath_key: &str) -> String {
+    // `workpath_key` is already the binding subsystem's canonical identity.
+    // Hash its exact bytes: Linux intentionally distinguishes case and Unicode
+    // normalization forms, so additional folding would merge unrelated scopes.
+    let digest = Sha256::digest(workpath_key.as_bytes());
+    format!("workpath-{}", &hex::encode(digest)[..32])
 }
 
 /// Renew access from the issuer's immutable authorization registry. The

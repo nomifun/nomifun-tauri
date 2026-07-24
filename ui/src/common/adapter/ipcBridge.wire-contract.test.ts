@@ -53,4 +53,17 @@ describe('ipc bridge wire ID contracts', () => {
     }
     expect(rejected).toBe(true);
   });
+
+  test('manual knowledge writeback retry uses the owning conversation and message IDs', () => {
+    expect(
+      /retryKnowledgeWriteback:\s*httpPost<\s*void,\s*\{\s*conversation_id:\s*ConversationId;\s*message_id:\s*MessageId;\s*attempt_id:\s*string;?\s*\}\s*>/.test(
+        source
+      )
+    ).toBe(true);
+    expect(
+      source.includes(
+        '`/api/conversations/${p.conversation_id}/messages/${p.message_id}/knowledge-writeback/retry`'
+      )
+    ).toBe(true);
+  });
 });

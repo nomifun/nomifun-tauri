@@ -68,7 +68,11 @@
     "noCandidate": "未发现需要回写的知识",
     "noCompleter": "知识库回写不可用",
     "disabled": "知识库回写未启用",
-    "interrupted": "知识库回写中断"
+    "interrupted": "知识库回写中断",
+    "retry": "重试",
+    "retrying": "正在重试...",
+    "retryStarted": "已开始重试知识库回写",
+    "retryFailed": "重试知识库回写失败"
   },
   "planTodoList": "待办队列",
   "planProgress": "{{done}}/{{total}}",

@@ -939,7 +939,7 @@ mod tests {
         let resp = app.clone().oneshot(create).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let created = json_body(resp).await;
-        let kb_id = created["data"]["id"].as_str().unwrap();
+        let kb_id = created["data"]["knowledge_base_id"].as_str().unwrap();
 
         // Write under a trailing-slash spelling…
         let set = Request::post("/api/knowledge/binding/workpath/%2FUsers%2Fme%2Fproj%2F")
@@ -1062,7 +1062,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let v = json_body(resp).await;
-        let kb_id = v["data"]["id"].as_str().unwrap().to_owned();
+        let kb_id = v["data"]["knowledge_base_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
 
         // 2. Write a file with a keyword.
         let write_body = serde_json::json!({

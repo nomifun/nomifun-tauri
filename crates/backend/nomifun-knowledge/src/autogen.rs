@@ -32,9 +32,10 @@ pub trait KnowledgeCompleter: Send + Sync {
     /// fakes) keep compiling and behaving unchanged; the production
     /// completer overrides this to honor the caller's pick. Used by the
     /// user-facing autogen/description endpoints where the UI lets the user
-    /// pick a model; background best-effort call sites keep using
-    /// [`Self::complete`] (or pass `None`) so a transient UI choice never
-    /// leaks into server-driven curation tasks.
+    /// pick a model, and by turn-final write-back after the conversation layer
+    /// has resolved the user's knowledge-model preference or the model that
+    /// actually answered the turn. Callers without an explicit provider-backed
+    /// model keep using [`Self::complete`].
     async fn complete_with(
         &self,
         system: &str,

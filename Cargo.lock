@@ -5732,6 +5732,7 @@ dependencies = [
  "async-trait",
  "axum",
  "futures-util",
+ "nomi-redact",
  "nomifun-ai-agent",
  "nomifun-api-types",
  "nomifun-auth",
@@ -6008,12 +6009,16 @@ dependencies = [
  "similar",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tower",
  "tracing",
+ "unicase",
+ "unicode-normalization",
  "url",
  "walkdir",
  "windows-sys 0.61.2",
  "wiremock",
+ "xattr",
  "zip 2.4.2",
 ]
 
@@ -6149,6 +6154,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite 0.26.2",
+ "tokio-util",
  "tracing",
 ]
 

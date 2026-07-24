@@ -21,7 +21,9 @@ use nomifun_ai_agent::{
 use crate::response_middleware::{ICronService, MessageMiddleware, MiddlewareResult};
 use crate::runtime_state::{AgentTurnCancellation, ConversationRuntimeStateService};
 use nomifun_api_types::{AgentErrorCode, ConversationRuntimeSummary, WebSocketMessage};
-use nomifun_common::{CompanionId, ErrorChain, MessageId, normalize_keys_to_snake_case, now_ms};
+use nomifun_common::{
+    CompanionId, ErrorChain, MessageId, generate_id, normalize_keys_to_snake_case, now_ms,
+};
 
 use crate::service::ConversationService;
 use nomifun_db::{IConversationRepository, MessageRowUpdate, TurnArtifactMessageCommit};
@@ -37,10 +39,8 @@ const TURN_COMPLETION_PERSIST_GRACE: Duration = Duration::from_secs(1);
 const TERMINAL_FINALIZATION_GRACE: Duration = Duration::from_secs(5);
 const ARTIFACT_COMMIT_GRACE: Duration = Duration::from_secs(5);
 const EVENT_SIDE_EFFECT_GRACE: Duration = Duration::from_secs(1);
-/// Write-back status persistence is observability, not turn ownership. A
-/// wedged repository must not suppress the corresponding realtime event or
-/// keep the post-turn worker alive indefinitely.
-const TURN_WRITEBACK_STATE_PERSIST_GRACE: Duration = Duration::from_secs(1);
+const TURN_WRITEBACK_STATE_PERSIST_ATTEMPTS: usize = 3;
+const TURN_WRITEBACK_STATE_RETRY_BASE_DELAY: Duration = Duration::from_millis(25);
 const MAX_TERMINAL_ACTIVE_ITEMS: usize = 256;
 const ARTIFACT_DELIVERY_COMMITTED_FIELD: &str = "artifact_delivery_committed";
 const ARTIFACT_DELIVERY_PENDING_OUTPUT: &str =
@@ -328,125 +328,222 @@ fn turn_writeback_phase_label(phase: nomifun_knowledge::TurnWritebackPhase) -> &
     }
 }
 
-fn turn_writeback_retryable(status: nomifun_knowledge::TurnWritebackStatus) -> bool {
-    matches!(
-        status,
-        nomifun_knowledge::TurnWritebackStatus::NoCompleter
-            | nomifun_knowledge::TurnWritebackStatus::Partial
-            | nomifun_knowledge::TurnWritebackStatus::Failed
-    )
-}
-
-fn turn_writeback_running_state(status: &str, attempt_id: &str, started_at: i64, updated_at: i64) -> Value {
+fn turn_writeback_running_state(
+    status: &str,
+    attempt_id: &str,
+    attempt_generation: u64,
+    started_at: i64,
+    updated_at: i64,
+    prior_written: &[Value],
+    prior_failures: &[Value],
+) -> Value {
     json!({
         "status": status,
         "attempt_id": attempt_id,
+        "attempt_generation": attempt_generation,
         "started_at": started_at,
         "updated_at": updated_at,
         "finished_at": Value::Null,
         "retryable": false,
         "candidates": 0,
-        "written": [],
-        "failures": [],
+        "written": prior_written,
+        "failures": prior_failures,
     })
 }
 
 fn turn_writeback_interrupted_state(
     attempt_id: &str,
+    attempt_generation: u64,
     started_at: i64,
     interrupted_at: i64,
     reason: &str,
+    prior_written: &[Value],
+    prior_failures: &[Value],
 ) -> Value {
+    // A global/provider failure describes one attempt, not a durable target.
+    // Keep target-specific failures across partial retries, but replace any
+    // historical global failure with this interruption so retry metadata stays
+    // bounded even when providers include unique request IDs.
+    let mut failures = prior_failures
+        .iter()
+        .filter(|failure| {
+            failure.get("kb_id").and_then(Value::as_str).is_some()
+                && failure.get("rel_path").and_then(Value::as_str).is_some()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    failures.push(json!({
+        "kb_id": Value::Null,
+        "rel_path": Value::Null,
+        "error": reason,
+    }));
     json!({
         "status": "interrupted",
         "attempt_id": attempt_id,
+        "attempt_generation": attempt_generation,
         "started_at": started_at,
         "updated_at": interrupted_at,
         "finished_at": interrupted_at,
         "interrupted_at": interrupted_at,
         "retryable": true,
         "candidates": 0,
-        "written": [],
-        "failures": [{
-            "kb_id": Value::Null,
-            "rel_path": Value::Null,
-            "error": reason,
-        }],
+        "written": prior_written,
+        "failures": failures,
     })
 }
 
 fn turn_writeback_final_state(
     report: &nomifun_knowledge::TurnWritebackReport,
-    status: &str,
     attempt_id: &str,
+    attempt_generation: u64,
     started_at: i64,
     finished_at: i64,
+    prior_written: &[Value],
+    prior_failures: &[Value],
+    _scope: &str,
 ) -> Value {
+    let target_key = |kb_id: &str, rel_path: &str| {
+        let logical =
+            nomifun_knowledge::service::logical_writeback_target_from_storage_path(
+                rel_path,
+            );
+        format!(
+            "{kb_id}\0{}",
+            nomifun_knowledge::service::portable_writeback_path_identity(&logical)
+        )
+    };
+    let value_target_key = |item: &Value| {
+        Some(target_key(
+            item.get("kb_id")?.as_str()?,
+            item.get("rel_path")?.as_str()?,
+        ))
+    };
+
+    let mut written = Vec::new();
+    let mut seen_written = HashSet::new();
+    for item in prior_written {
+        let dedupe_key = value_target_key(item)
+            .or_else(|| serde_json::to_string(item).ok());
+        if dedupe_key.is_none_or(|key| seen_written.insert(key)) {
+            written.push(item.clone());
+        }
+    }
+    for outcome in &report.written {
+        let item = json!({
+            "kb_id": outcome.kb_id.clone(),
+            "rel_path": outcome.final_rel_path.clone(),
+            "staged": outcome.staged,
+        });
+        let key = target_key(
+            outcome.kb_id.as_str(),
+            &outcome.final_rel_path,
+        );
+        if seen_written.insert(key)
+        {
+            written.push(item);
+        }
+    }
+    // Preserve unresolved target failures when a retry produces no candidate
+    // (or only resolves a subset). A single failed target may legitimately be
+    // corrected to a different path, so one successful write clears that lone
+    // historical target; with several historical targets, only an exact
+    // successful target is cleared and the rest remain retryable.
+    let prior_target_failures = prior_failures
+        .iter()
+        .filter(|failure| value_target_key(failure).is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    let corrected_single_target = prior_target_failures
+        .first()
+        .and_then(|failure| failure.get("kb_id"))
+        .and_then(Value::as_str)
+        .is_some_and(|prior_kb_id| {
+            prior_target_failures.len() == 1
+                && report
+                    .written
+                    .iter()
+                    .any(|outcome| outcome.kb_id.as_str() == prior_kb_id)
+        });
+    let mut failures = if corrected_single_target {
+        Vec::new()
+    } else {
+        prior_target_failures
+    };
+    for outcome in &report.written {
+        let key = target_key(
+            outcome.kb_id.as_str(),
+            &outcome.final_rel_path,
+        );
+        failures.retain(|existing| {
+            value_target_key(existing).as_deref() != Some(key.as_str())
+        });
+    }
+    for failure in &report.failures {
+        let item = json!({
+            "kb_id": failure.kb_id.clone(),
+            "rel_path": failure.rel_path.clone(),
+            "error": failure.error.clone(),
+        });
+        if let (Some(kb_id), Some(rel_path)) =
+            (failure.kb_id.as_ref(), failure.rel_path.as_deref())
+        {
+            let key = target_key(kb_id.as_str(), rel_path);
+            failures.retain(|existing| {
+                value_target_key(existing).as_deref() != Some(key.as_str())
+            });
+            failures.push(item);
+        } else if !failures.iter().any(|existing| existing == &item) {
+            failures.push(item);
+        }
+    }
+    let status = if !written.is_empty() && !failures.is_empty() {
+        "partial"
+    } else if !failures.is_empty() {
+        "failed"
+    } else {
+        turn_writeback_status_label(report.status)
+    };
+    let retryable = matches!(status, "partial" | "failed" | "no_completer");
     json!({
         "status": status,
         "attempt_id": attempt_id,
+        "attempt_generation": attempt_generation,
         "started_at": started_at,
         "updated_at": finished_at,
         "finished_at": finished_at,
-        "retryable": turn_writeback_retryable(report.status),
+        "retryable": retryable,
         "candidates": report.candidates,
-        "written": report.written.iter().map(|w| json!({
-            "kb_id": w.kb_id.clone(),
-            "rel_path": w.final_rel_path.clone(),
-            "staged": w.staged,
-        })).collect::<Vec<_>>(),
-        "failures": report.failures.iter().map(|f| json!({
-            "kb_id": f.kb_id.clone(),
-            "rel_path": f.rel_path.clone(),
-            "error": f.error.clone(),
-        })).collect::<Vec<_>>(),
+        "written": written,
+        "failures": failures,
     })
 }
 
 fn turn_writeback_event_payload(conversation_id: &str, msg_id: &str, state: &Value) -> Value {
     let mut payload = state.clone();
     if let Some(obj) = payload.as_object_mut() {
+        // These fields are persisted solely so an explicit retry can recreate
+        // the exact source turn and idempotency scope. They are not part of the
+        // realtime presentation contract.
+        obj.remove("source_message_id");
+        obj.remove("scope");
+        obj.remove("assistant_text");
         obj.insert("conversation_id".to_owned(), json!(conversation_id));
         obj.insert("msg_id".to_owned(), json!(msg_id));
     }
     payload
 }
 
-async fn persist_turn_writeback_state(
+async fn persist_turn_writeback_state_once(
     repo: &Arc<dyn IConversationRepository>,
     conversation_id: &str,
     msg_id: &str,
     state: &Value,
-) {
-    let row = match tokio::time::timeout(
-        TURN_WRITEBACK_STATE_PERSIST_GRACE,
-        repo.get_message(conversation_id, msg_id),
-    )
-    .await
-    {
-        Ok(Ok(Some(row))) => row,
-        Ok(Ok(None)) => {
-            debug!(conversation_id, msg_id, "skip writeback state persist; assistant message row not found");
-            return;
-        }
-        Ok(Err(e)) => {
-            warn!(
-                conversation_id,
-                msg_id,
-                error = %ErrorChain(&e),
-                "failed to load assistant message for writeback state"
-            );
-            return;
-        }
-        Err(_) => {
-            warn!(
-                conversation_id,
-                msg_id,
-                "timed out loading assistant message for writeback state"
-            );
-            return;
-        }
-    };
+) -> Result<(), String> {
+    let row = repo
+        .get_message(conversation_id, msg_id)
+        .await
+        .map_err(|error| format!("failed to load assistant message: {error}"))?
+        .ok_or_else(|| "assistant message no longer exists".to_owned())?;
 
     let mut content: Value =
         serde_json::from_str(&row.content).unwrap_or_else(|_| json!({ "content": row.content }));
@@ -462,29 +559,39 @@ async fn persist_turn_writeback_state(
         status: None,
         hidden: None,
     };
-    match tokio::time::timeout(
-        TURN_WRITEBACK_STATE_PERSIST_GRACE,
-        repo.update_message(&row.message_id, &update),
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            warn!(
-                conversation_id,
-                msg_id,
-                error = %ErrorChain(&e),
-                "failed to persist assistant message writeback state"
-            );
-        }
-        Err(_) => {
-            warn!(
-                conversation_id,
-                msg_id,
-                "timed out persisting assistant message writeback state"
-            );
+    repo.update_message(&row.message_id, &update)
+        .await
+        .map_err(|error| format!("failed to update assistant message: {error}"))
+}
+
+async fn persist_turn_writeback_state(
+    repo: &Arc<dyn IConversationRepository>,
+    conversation_id: &str,
+    msg_id: &str,
+    state: &Value,
+) -> Result<(), String> {
+    let mut last_error = None;
+    for attempt in 1..=TURN_WRITEBACK_STATE_PERSIST_ATTEMPTS {
+        match persist_turn_writeback_state_once(repo, conversation_id, msg_id, state).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < TURN_WRITEBACK_STATE_PERSIST_ATTEMPTS {
+                    let multiplier = 1_u32 << (attempt - 1);
+                    tokio::time::sleep(TURN_WRITEBACK_STATE_RETRY_BASE_DELAY * multiplier).await;
+                }
+            }
         }
     }
+    let error = last_error.unwrap_or_else(|| "unknown persistence error".to_owned());
+    warn!(
+        conversation_id,
+        msg_id,
+        attempts = TURN_WRITEBACK_STATE_PERSIST_ATTEMPTS,
+        error,
+        "failed to durably persist knowledge write-back state"
+    );
+    Err(error)
 }
 
 async fn emit_turn_writeback_state(
@@ -494,8 +601,8 @@ async fn emit_turn_writeback_state(
     conversation_id: &str,
     msg_id: &str,
     state: Value,
-) {
-    persist_turn_writeback_state(repo, conversation_id, msg_id, &state).await;
+) -> Result<(), String> {
+    persist_turn_writeback_state(repo, conversation_id, msg_id, &state).await?;
     user_events.send_to_user(
         user_id,
         WebSocketMessage::new(
@@ -503,6 +610,7 @@ async fn emit_turn_writeback_state(
             turn_writeback_event_payload(conversation_id, msg_id, &state),
         ),
     );
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -512,7 +620,13 @@ pub(crate) struct TurnWritebackAttempt {
     user_id: String,
     conversation_id: String,
     msg_id: String,
+    source_message_id: String,
+    scope: String,
+    assistant_text: String,
+    prior_written: Vec<Value>,
+    prior_failures: Vec<Value>,
     attempt_id: String,
+    attempt_generation: u64,
     started_at: i64,
 }
 
@@ -523,6 +637,12 @@ impl TurnWritebackAttempt {
         user_id: String,
         conversation_id: String,
         msg_id: String,
+        source_message_id: String,
+        scope: String,
+        assistant_text: String,
+        prior_written: Vec<Value>,
+        prior_failures: Vec<Value>,
+        attempt_generation: u64,
     ) -> Self {
         let started_at = now_ms();
         Self {
@@ -530,14 +650,93 @@ impl TurnWritebackAttempt {
             user_events,
             user_id,
             conversation_id,
-            attempt_id: format!("{msg_id}:{started_at}"),
+            source_message_id,
+            scope,
+            assistant_text: nomifun_knowledge::turn_writeback::bounded_assistant_text(
+                &assistant_text,
+            ),
+            prior_written,
+            prior_failures,
+            attempt_id: generate_id(),
+            attempt_generation,
             msg_id,
             started_at,
         }
     }
 
-    async fn emit(&self, state: Value) {
-        emit_turn_writeback_state(
+    fn durable_state(&self, mut state: Value) -> Value {
+        if let Some(obj) = state.as_object_mut() {
+            obj.insert(
+                "source_message_id".to_owned(),
+                json!(self.source_message_id),
+            );
+            obj.insert("scope".to_owned(), json!(self.scope));
+            obj.insert("assistant_text".to_owned(), json!(self.assistant_text));
+        }
+        state
+    }
+
+    pub(crate) async fn persist_started_intent(&self) -> Result<(), String> {
+        let state = self.durable_state(turn_writeback_running_state(
+            "started",
+            &self.attempt_id,
+            self.attempt_generation,
+            self.started_at,
+            self.started_at,
+            &self.prior_written,
+            &self.prior_failures,
+        ));
+        persist_turn_writeback_state(
+            &self.repo,
+            &self.conversation_id,
+            &self.msg_id,
+            &state,
+        )
+        .await
+    }
+
+    pub(crate) async fn announce_started(
+        &self,
+        intent_is_durable: bool,
+    ) -> Result<(), String> {
+        let state = turn_writeback_running_state(
+            "started",
+            &self.attempt_id,
+            self.attempt_generation,
+            self.started_at,
+            self.started_at,
+            &self.prior_written,
+            &self.prior_failures,
+        );
+        if intent_is_durable {
+            self.broadcast(state);
+            Ok(())
+        } else {
+            self.emit(state).await
+        }
+    }
+
+    async fn broadcast_progress(&self, state: Value) {
+        self.broadcast(state);
+    }
+
+    fn broadcast(&self, state: Value) {
+        self.user_events.send_to_user(
+            &self.user_id,
+            WebSocketMessage::new(
+                "knowledge.writeback",
+                turn_writeback_event_payload(
+                    &self.conversation_id,
+                    &self.msg_id,
+                    &state,
+                ),
+            ),
+        );
+    }
+
+    async fn emit(&self, state: Value) -> Result<(), String> {
+        let state = self.durable_state(state);
+        let result = emit_turn_writeback_state(
             &self.repo,
             &self.user_events,
             &self.user_id,
@@ -546,66 +745,44 @@ impl TurnWritebackAttempt {
             state,
         )
         .await;
+        if let Err(error) = &result {
+            warn!(
+                conversation_id = %self.conversation_id,
+                msg_id = %self.msg_id,
+                error,
+                "knowledge write-back state was not broadcast because durable persistence failed"
+            );
+        }
+        result
     }
 
-    /// Publish a real terminal state when the bounded post-turn worker is
-    /// cancelled, times out, or panics. This is deliberately independent of
-    /// the conversation turn handle: write-back is optional post-processing
-    /// and must never resurrect or prolong the authoritative turn lifecycle.
-    pub(crate) async fn interrupt(&self, reason: &'static str) {
+    /// Publish a real terminal state if the detached one-shot worker panics.
+    /// This is deliberately independent of the conversation turn handle:
+    /// write-back is optional post-processing and must never resurrect or
+    /// prolong the authoritative turn lifecycle.
+    pub(crate) async fn interrupt(&self, reason: &str) {
         let interrupted_at = now_ms();
-        self.emit(turn_writeback_interrupted_state(
+        let _ = self
+            .emit(turn_writeback_interrupted_state(
             &self.attempt_id,
+            self.attempt_generation,
             self.started_at,
-            interrupted_at,
-            reason,
-        ))
-        .await;
+                interrupted_at,
+                reason,
+                &self.prior_written,
+                &self.prior_failures,
+            ))
+            .await;
     }
 }
 
-pub(crate) async fn run_turn_writeback_report(
-    service: Arc<nomifun_knowledge::KnowledgeService>,
-    mut request: nomifun_knowledge::TurnWritebackRequest,
-    final_text: String,
+async fn finish_turn_writeback_report(
     attempt: TurnWritebackAttempt,
+    report: nomifun_knowledge::TurnWritebackReport,
 ) {
-    if final_text.trim().is_empty() {
-        return;
-    }
-    request.assistant_text = final_text;
     let started_at = attempt.started_at;
     let attempt_id = attempt.attempt_id.clone();
-    attempt
-        .emit(turn_writeback_running_state(
-            "started",
-            &attempt_id,
-            started_at,
-            started_at,
-        ))
-        .await;
-
-    let progress_attempt = attempt.clone();
-    let progress_attempt_id = attempt_id.clone();
-    let report = service
-        .finalize_turn_writeback_with_progress(request, move |phase| {
-            let attempt = progress_attempt.clone();
-            let attempt_id = progress_attempt_id.clone();
-            let status = turn_writeback_phase_label(phase);
-            async move {
-                let updated_at = now_ms();
-                attempt
-                    .emit(turn_writeback_running_state(
-                        status,
-                        &attempt_id,
-                        started_at,
-                        updated_at,
-                    ))
-                    .await;
-            }
-        })
-        .await;
-    let status = turn_writeback_status_label(report.status);
+    let attempt_generation = attempt.attempt_generation;
     match report.status {
         nomifun_knowledge::TurnWritebackStatus::Written
         | nomifun_knowledge::TurnWritebackStatus::Partial => {
@@ -637,15 +814,75 @@ pub(crate) async fn run_turn_writeback_report(
         }
     }
     let finished_at = now_ms();
-    attempt
+    let _ = attempt
         .emit(turn_writeback_final_state(
             &report,
-            status,
             &attempt_id,
+            attempt_generation,
             started_at,
             finished_at,
+            &attempt.prior_written,
+            &attempt.prior_failures,
+            &attempt.scope,
         ))
         .await;
+}
+
+pub(crate) async fn finish_turn_writeback_failure(
+    attempt: TurnWritebackAttempt,
+    error: String,
+) {
+    finish_turn_writeback_report(
+        attempt,
+        nomifun_knowledge::TurnWritebackReport::failed(error),
+    )
+    .await;
+}
+
+pub(crate) async fn run_turn_writeback_report(
+    service: Arc<nomifun_knowledge::KnowledgeService>,
+    mut request: nomifun_knowledge::TurnWritebackRequest,
+    attempt: TurnWritebackAttempt,
+) {
+    let final_text = attempt.assistant_text.clone();
+    if final_text.trim().is_empty() {
+        return;
+    }
+    request.assistant_text = final_text;
+    let started_at = attempt.started_at;
+    let attempt_id = attempt.attempt_id.clone();
+    let attempt_generation = attempt.attempt_generation;
+
+    let progress_attempt = attempt.clone();
+    let progress_attempt_id = attempt_id;
+    let report = if request.model.is_none() {
+        nomifun_knowledge::TurnWritebackReport::failed(
+            "This session has no provider-backed model for knowledge write-back; configure a knowledge model and retry",
+        )
+    } else {
+        service
+            .finalize_turn_writeback_with_progress(request, move |phase| {
+                let attempt = progress_attempt.clone();
+                let attempt_id = progress_attempt_id.clone();
+                let status = turn_writeback_phase_label(phase);
+                async move {
+                    let updated_at = now_ms();
+                    attempt
+                        .broadcast_progress(turn_writeback_running_state(
+                            status,
+                            &attempt_id,
+                            attempt_generation,
+                            started_at,
+                            updated_at,
+                            &attempt.prior_written,
+                            &attempt.prior_failures,
+                        ))
+                        .await;
+                }
+            })
+            .await
+    };
+    finish_turn_writeback_report(attempt, report).await;
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -4360,6 +4597,116 @@ mod tests {
 
     fn test_conversation_id() -> String {
         ConversationId::new().into_string()
+    }
+
+    #[test]
+    fn corrected_retry_path_clears_historical_failure_terminal_state() {
+        let kb_id = nomifun_common::KnowledgeBaseId::new();
+        let report = nomifun_knowledge::TurnWritebackReport {
+            status: nomifun_knowledge::TurnWritebackStatus::Written,
+            candidates: 1,
+            written: vec![nomifun_knowledge::WriteOutcome {
+                kb_id: kb_id.clone(),
+                final_rel_path: "Foo.md".into(),
+                op: nomifun_knowledge::WriteOp::Create,
+                staged: false,
+            }],
+            failures: Vec::new(),
+        };
+        let prior_failures = vec![json!({
+            "kb_id": kb_id,
+            "rel_path": "Foo?.md",
+            "error": "path component is not portable",
+        })];
+
+        let state = turn_writeback_final_state(
+            &report,
+            "attempt-2",
+            2,
+            1,
+            2,
+            &[],
+            &prior_failures,
+            "scope",
+        );
+
+        assert_eq!(state["status"], "written");
+        assert_eq!(state["retryable"], false);
+        assert_eq!(state["failures"], json!([]));
+        assert_eq!(state["written"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retry_without_candidate_keeps_unresolved_target_retryable() {
+        let kb_id = nomifun_common::KnowledgeBaseId::new();
+        let report = nomifun_knowledge::TurnWritebackReport {
+            status: nomifun_knowledge::TurnWritebackStatus::NoCandidate,
+            candidates: 0,
+            written: Vec::new(),
+            failures: Vec::new(),
+        };
+        let prior_written = vec![json!({
+            "kb_id": kb_id,
+            "rel_path": "A.md",
+            "staged": false,
+        })];
+        let prior_failures = vec![json!({
+            "kb_id": kb_id,
+            "rel_path": "B.md",
+            "error": "temporary failure",
+        })];
+
+        let state = turn_writeback_final_state(
+            &report,
+            "attempt-2",
+            2,
+            1,
+            2,
+            &prior_written,
+            &prior_failures,
+            "scope",
+        );
+
+        assert_eq!(state["status"], "partial");
+        assert_eq!(state["retryable"], true);
+        assert_eq!(state["failures"], json!(prior_failures));
+    }
+
+    #[test]
+    fn retry_success_in_another_base_does_not_clear_prior_failure() {
+        let failed_kb = nomifun_common::KnowledgeBaseId::new();
+        let written_kb = nomifun_common::KnowledgeBaseId::new();
+        let report = nomifun_knowledge::TurnWritebackReport {
+            status: nomifun_knowledge::TurnWritebackStatus::Written,
+            candidates: 1,
+            written: vec![nomifun_knowledge::WriteOutcome {
+                kb_id: written_kb,
+                final_rel_path: "Unrelated.md".into(),
+                op: nomifun_knowledge::WriteOp::Create,
+                staged: false,
+            }],
+            failures: Vec::new(),
+        };
+        let prior_failures = vec![json!({
+            "kb_id": failed_kb,
+            "rel_path": "StillPending.md",
+            "error": "temporary failure",
+        })];
+
+        let state = turn_writeback_final_state(
+            &report,
+            "attempt-2",
+            2,
+            1,
+            2,
+            &[],
+            &prior_failures,
+            "scope",
+        );
+
+        assert_eq!(state["status"], "partial");
+        assert_eq!(state["retryable"], true);
+        assert_eq!(state["failures"], json!(prior_failures));
     }
 
     fn test_artifact(id: &str) -> nomifun_ai_agent::artifact_store::PersistedArtifact {

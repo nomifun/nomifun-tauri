@@ -1090,6 +1090,49 @@ async fn create_stores_model_as_json() {
 // ── Get tests ──────────────────────────────────────────────────────
 
 #[tokio::test]
+async fn message_read_immediately_projects_orphaned_writeback_as_retryable() {
+    let (svc, _broadcaster, repo, _runtime_registry) = make_service();
+    let conversation = svc.create(TEST_USER_1, make_create_req()).await.unwrap();
+    let message_id = nomifun_common::generate_id();
+    repo.insert_message(&MessageRow {
+        id: 0,
+        message_id: message_id.clone(),
+        conversation_id: conversation.conversation_id.clone(),
+        msg_id: Some(message_id.clone()),
+        r#type: "text".into(),
+        content: serde_json::json!({
+            "content": "durable answer",
+            "knowledge_writeback": {
+                "status": "writing",
+                "attempt_id": nomifun_common::generate_id(),
+                "started_at": now_ms(),
+                "updated_at": now_ms(),
+                "retryable": false
+            }
+        })
+        .to_string(),
+        position: Some("left".into()),
+        status: Some("finish".into()),
+        hidden: false,
+        created_at: now_ms(),
+    })
+    .await
+    .unwrap();
+
+    let response = svc
+        .get_message(TEST_USER_1, &conversation.conversation_id, &message_id)
+        .await
+        .unwrap();
+
+    assert_eq!(response.content["knowledge_writeback"]["status"], "interrupted");
+    assert_eq!(response.content["knowledge_writeback"]["retryable"], true);
+    assert!(
+        response.content["knowledge_writeback"]["finished_at"].is_i64(),
+        "an orphaned running state must become retryable immediately after restart, not after a heuristic delay"
+    );
+}
+
+#[tokio::test]
 async fn get_existing_conversation() {
     let (svc, _broadcaster, _repo, _runtime_registry) = make_service();
     let created = svc.create(TEST_USER_1, make_create_req()).await.unwrap();
@@ -3269,6 +3312,7 @@ impl AgentRuntimeRegistry for MockAgentRuntimeRegistryWithWorkspace {
 struct ScriptedAgent {
     conversation_id: String,
     agent_type: AgentType,
+    workspace: String,
     event_tx: broadcast::Sender<AgentStreamEvent>,
     scripts: Mutex<VecDeque<Vec<AgentStreamEvent>>>,
     sent_contents: Mutex<Vec<String>>,
@@ -3280,6 +3324,7 @@ impl ScriptedAgent {
         Self {
             conversation_id: conversation_id.to_owned(),
             agent_type: AgentType::Acp,
+            workspace: "/tmp/test".into(),
             event_tx,
             scripts: Mutex::new(VecDeque::from(scripts)),
             sent_contents: Mutex::new(vec![]),
@@ -3288,6 +3333,11 @@ impl ScriptedAgent {
 
     fn with_agent_type(mut self, agent_type: AgentType) -> Self {
         self.agent_type = agent_type;
+        self
+    }
+
+    fn with_workspace(mut self, workspace: impl Into<String>) -> Self {
+        self.workspace = workspace.into();
         self
     }
 
@@ -3307,7 +3357,7 @@ impl AgentRuntimeControl for ScriptedAgent {
     }
 
     fn workspace(&self) -> &str {
-        "/tmp/test"
+        &self.workspace
     }
 
     fn status(&self) -> Option<ConversationStatus> {
@@ -3493,6 +3543,7 @@ impl ICronService for MockCronContinuationService {
 struct RecordingKnowledgeCompleter {
     response: String,
     prompts: Mutex<Vec<(String, String)>>,
+    models: Mutex<Vec<(String, String)>>,
 }
 
 impl RecordingKnowledgeCompleter {
@@ -3500,11 +3551,16 @@ impl RecordingKnowledgeCompleter {
         Self {
             response,
             prompts: Mutex::new(Vec::new()),
+            models: Mutex::new(Vec::new()),
         }
     }
 
     fn prompts(&self) -> Vec<(String, String)> {
         self.prompts.lock().unwrap().clone()
+    }
+
+    fn models(&self) -> Vec<(String, String)> {
+        self.models.lock().unwrap().clone()
     }
 }
 
@@ -3514,10 +3570,25 @@ impl KnowledgeCompleter for RecordingKnowledgeCompleter {
         self.prompts.lock().unwrap().push((system.to_owned(), user.to_owned()));
         Ok(self.response.clone())
     }
+
+    async fn complete_with(
+        &self,
+        system: &str,
+        user: &str,
+        provider_id: &str,
+        model: &str,
+    ) -> Result<String, AppError> {
+        self.models
+            .lock()
+            .unwrap()
+            .push((provider_id.to_owned(), model.to_owned()));
+        self.complete(system, user).await
+    }
 }
 
 struct BlockingFirstKnowledgeCompleter {
-    response: String,
+    first_response: String,
+    subsequent_response: String,
     prompts: Mutex<Vec<(String, String)>>,
     calls: AtomicUsize,
     has_started: AtomicBool,
@@ -3526,9 +3597,10 @@ struct BlockingFirstKnowledgeCompleter {
 }
 
 impl BlockingFirstKnowledgeCompleter {
-    fn new(response: String) -> Self {
+    fn new_sequence(first_response: String, subsequent_response: String) -> Self {
         Self {
-            response,
+            first_response,
+            subsequent_response,
             prompts: Mutex::new(Vec::new()),
             calls: AtomicUsize::new(0),
             has_started: AtomicBool::new(false),
@@ -3558,12 +3630,17 @@ impl BlockingFirstKnowledgeCompleter {
 impl KnowledgeCompleter for BlockingFirstKnowledgeCompleter {
     async fn complete(&self, system: &str, user: &str) -> Result<String, AppError> {
         self.prompts.lock().unwrap().push((system.to_owned(), user.to_owned()));
-        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
             self.has_started.store(true, Ordering::Release);
             self.started.notify_waiters();
             self.release.notified().await;
         }
-        Ok(self.response.clone())
+        Ok(if call == 0 {
+            self.first_response.clone()
+        } else {
+            self.subsequent_response.clone()
+        })
     }
 }
 
@@ -4373,8 +4450,9 @@ async fn send_message_turn_writeback_runs_after_system_continuation_final_answer
     svc.with_knowledge_service(knowledge.clone());
 
     let create_req: CreateConversationRequest = serde_json::from_value(json!({
-        "type": "acp",
-        "extra": { "agent_id": TEST_ACP_AGENT_ID, "workspace": workspace }
+        "type": "nomi",
+        "model": { "provider_id": PROVIDER_ID_1, "model": "m1" },
+        "extra": { "workspace": workspace }
     }))
     .unwrap();
     let conv = svc.create(TEST_USER_1, create_req).await.unwrap();
@@ -4412,9 +4490,10 @@ async fn send_message_turn_writeback_runs_after_system_continuation_final_answer
     let completer = Arc::new(RecordingKnowledgeCompleter::new(candidate));
     knowledge.set_completer(completer.clone());
 
-    let scripted_agent = Arc::new(ScriptedAgent::new(
-        &conv.conversation_id,
-        vec![
+    let scripted_agent = Arc::new(
+        ScriptedAgent::new(
+            &conv.conversation_id,
+            vec![
             vec![
                 AgentStreamEvent::Text(TextEventData {
                     content: "I'll check. [CRON_LIST]".into(),
@@ -4434,7 +4513,10 @@ async fn send_message_turn_writeback_runs_after_system_continuation_final_answer
                 AgentStreamEvent::Finish(FinishEventData::default()),
             ],
         ],
-    ));
+        )
+        .with_agent_type(AgentType::Nomi)
+        .with_workspace(workspace.to_string_lossy().into_owned()),
+    );
     runtime_registry.insert_agent(&conv.conversation_id, AgentRuntimeHandle::Mock(scripted_agent.clone()));
     svc.with_cron_service(Some(Arc::new(MockCronContinuationService)));
     broadcaster.take_events();
@@ -4539,6 +4621,11 @@ async fn send_message_turn_writeback_runs_after_system_continuation_final_answer
         !prompts[0].1.contains("[System: No scheduled tasks]"),
         "hidden system continuation text must not replace the human turn input"
     );
+    assert_eq!(
+        completer.models(),
+        vec![(PROVIDER_ID_1.to_owned(), "m1".to_owned())],
+        "without an explicit knowledge model, write-back must use the conversation model"
+    );
 
     let _ = tokio::fs::remove_dir_all(&workspace).await;
     let _ = tokio::fs::remove_dir_all(&data_dir).await;
@@ -4568,8 +4655,9 @@ async fn send_message_releases_turn_before_slow_turn_writeback_finishes() {
     svc.with_knowledge_service(knowledge.clone());
 
     let create_req: CreateConversationRequest = serde_json::from_value(json!({
-        "type": "acp",
-        "extra": { "agent_id": TEST_ACP_AGENT_ID, "workspace": workspace }
+        "type": "nomi",
+        "model": { "provider_id": PROVIDER_ID_1, "model": "m1" },
+        "extra": { "workspace": workspace }
     }))
     .unwrap();
     let conv = svc.create(TEST_USER_1, create_req).await.unwrap();
@@ -4600,12 +4688,16 @@ async fn send_message_releases_turn_before_slow_turn_writeback_finishes() {
         )
         .await
         .unwrap();
-    let completer = Arc::new(BlockingFirstKnowledgeCompleter::new(r#"{"candidates":[]}"#.into()));
+    let completer = Arc::new(BlockingFirstKnowledgeCompleter::new_sequence(
+        "not valid JSON".into(),
+        r#"{"candidates":[]}"#.into(),
+    ));
     knowledge.set_completer(completer.clone());
 
-    let scripted_agent = Arc::new(ScriptedAgent::new(
-        &conv.conversation_id,
-        vec![
+    let scripted_agent = Arc::new(
+        ScriptedAgent::new(
+            &conv.conversation_id,
+            vec![
             vec![
                 AgentStreamEvent::Text(TextEventData {
                     content: "First answer.".into(),
@@ -4619,7 +4711,9 @@ async fn send_message_releases_turn_before_slow_turn_writeback_finishes() {
                 AgentStreamEvent::Finish(FinishEventData::default()),
             ],
         ],
-    ));
+        )
+        .with_workspace(workspace.to_string_lossy().into_owned()),
+    );
     runtime_registry.insert_agent(&conv.conversation_id, AgentRuntimeHandle::Mock(scripted_agent));
     let runtime_registry_dyn: Arc<dyn AgentRuntimeRegistry> = runtime_registry.clone();
 
@@ -4642,14 +4736,34 @@ async fn send_message_releases_turn_before_slow_turn_writeback_finishes() {
         "slow turn-final writeback must not keep the conversation running: {second:?}"
     );
 
-    let interrupted = tokio::time::timeout(Duration::from_secs(8), async {
+    // The knowledge layer permits a provider call to run for 45 seconds. The
+    // conversation layer must not reintroduce the old, contradictory 5-second
+    // outer timeout after the turn has already been released.
+    tokio::time::sleep(Duration::from_millis(5_200)).await;
+    let events_before_release = broadcaster.take_events();
+    assert!(
+        !events_before_release.iter().any(|event| {
+            event.name == "knowledge.writeback" && event.data["status"] == "interrupted"
+        }),
+        "a healthy one-shot write-back must remain alive beyond the old five-second turn grace"
+    );
+    let blocked_msg_id = events_before_release
+        .iter()
+        .find(|event| event.name == "knowledge.writeback")
+        .and_then(|event| event.data["msg_id"].as_str())
+        .expect("blocked writeback should have published its message id")
+        .to_owned();
+
+    completer.release();
+    let failed = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if let Some(event) = broadcaster
                 .take_events()
                 .into_iter()
                 .find(|event| {
                     event.name == "knowledge.writeback"
-                        && event.data["status"] == "interrupted"
+                        && event.data["status"] == "failed"
+                        && event.data["msg_id"].as_str() == Some(blocked_msg_id.as_str())
                 })
             {
                 break event;
@@ -4658,32 +4772,64 @@ async fn send_message_releases_turn_before_slow_turn_writeback_finishes() {
         }
     })
     .await
-    .expect("timed-out turn-final writeback should publish an interrupted terminal state");
-    assert_eq!(interrupted.data["retryable"], true);
-    assert_eq!(
-        interrupted.data["failures"][0]["error"],
-        "Knowledge write-back timed out after the turn completed"
-    );
+    .expect("released one-shot writeback should publish its real failed terminal state");
+    assert_eq!(failed.data["retryable"], true);
 
-    let interrupted_msg_id = interrupted.data["msg_id"]
+    let failed_msg_id = failed.data["msg_id"]
         .as_str()
-        .expect("interrupted writeback msg_id");
+        .expect("failed writeback msg_id");
     let stored = repo
-        .get_message(&conv.conversation_id, interrupted_msg_id)
+        .get_message(&conv.conversation_id, failed_msg_id)
         .await
         .unwrap()
-        .expect("assistant message should retain interrupted writeback state");
+        .expect("assistant message should retain failed writeback state");
     let stored_content: serde_json::Value = serde_json::from_str(&stored.content).unwrap();
     assert_eq!(
         stored_content["knowledge_writeback"]["status"],
-        "interrupted"
+        "failed"
     );
-    assert_eq!(
-        stored_content["knowledge_writeback"]["finished_at"],
-        stored_content["knowledge_writeback"]["interrupted_at"]
+    assert!(
+        stored_content["knowledge_writeback"]["source_message_id"].is_string(),
+        "manual retry needs the exact originating user message"
+    );
+    assert!(
+        stored_content["knowledge_writeback"]["scope"].is_string(),
+        "manual retry needs the original idempotency scope"
     );
 
-    completer.release();
+    let first_attempt_id = stored_content["knowledge_writeback"]["attempt_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    svc.retry_knowledge_writeback(
+        TEST_USER_1,
+        &conv.conversation_id,
+        failed_msg_id,
+        &first_attempt_id,
+    )
+        .await
+        .expect("retryable terminal state should start one manual retry");
+    let retried = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(event) = broadcaster.take_events().into_iter().find(|event| {
+                event.name == "knowledge.writeback"
+                    && event.data["status"] == "no_candidate"
+                    && event.data["msg_id"].as_str() == Some(failed_msg_id)
+            }) {
+                break event;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("manual retry should publish its independent terminal state");
+    assert_ne!(
+        retried.data["attempt_id"].as_str().unwrap(),
+        first_attempt_id,
+        "manual retry must use a fresh attempt generation"
+    );
+
     let _ = tokio::fs::remove_dir_all(&workspace).await;
     let _ = tokio::fs::remove_dir_all(&data_dir).await;
 }
@@ -5772,6 +5918,107 @@ impl IClientPreferenceRepository for StubClientPrefRepo {
     async fn delete_keys(&self, _keys: &[&str]) -> Result<(), DbError> {
         Ok(())
     }
+}
+
+struct FixedClientPrefRepo {
+    preferences: Vec<ClientPreference>,
+}
+
+#[async_trait::async_trait]
+impl IClientPreferenceRepository for FixedClientPrefRepo {
+    async fn get_all(&self) -> Result<Vec<ClientPreference>, DbError> {
+        Ok(self.preferences.clone())
+    }
+
+    async fn get_by_keys(&self, keys: &[&str]) -> Result<Vec<ClientPreference>, DbError> {
+        Ok(self
+            .preferences
+            .iter()
+            .filter(|preference| keys.contains(&preference.key.as_str()))
+            .cloned()
+            .collect())
+    }
+
+    async fn upsert_batch(&self, _entries: &[(&str, &str)]) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn delete_keys(&self, _keys: &[&str]) -> Result<(), DbError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn explicit_knowledge_model_preference_overrides_the_conversation_model() {
+    let (svc, _broadcaster, _repo, _runtime_registry) = make_service();
+    svc.with_failover_deps(
+        Arc::new(StubProviderRepo::new(vec![test_provider(
+            PROVIDER_ID_2,
+            &["knowledge-model"],
+        )])),
+        Arc::new(FixedClientPrefRepo {
+            preferences: vec![ClientPreference {
+                id: 1,
+                key: "knowledge.autogenModel".into(),
+                value: serde_json::json!({
+                    "provider_id": PROVIDER_ID_2,
+                    "model": "knowledge-model",
+                    "use_model": "stale-session-only-override"
+                })
+                .to_string(),
+                updated_at: 1,
+            }],
+        }),
+    );
+    let session_model = ProviderWithModel {
+        provider_id: PROVIDER_ID_1.into(),
+        model: "session-model".into(),
+        use_model: Some("session-wire-model".into()),
+    };
+
+    let selected = svc
+        .resolve_turn_writeback_model(Some(&session_model))
+        .await
+        .expect("knowledge model resolution should succeed")
+        .expect("explicit knowledge model should resolve");
+
+    assert_eq!(selected.provider_id, PROVIDER_ID_2);
+    assert_eq!(selected.model, "knowledge-model");
+    assert_eq!(selected.use_model, None);
+}
+
+#[tokio::test]
+async fn invalid_explicit_knowledge_model_never_falls_back_to_session_model() {
+    let (svc, _broadcaster, _repo, _runtime_registry) = make_service();
+    svc.with_failover_deps(
+        Arc::new(StubProviderRepo::new(vec![test_provider(
+            PROVIDER_ID_1,
+            &["session-model"],
+        )])),
+        Arc::new(FixedClientPrefRepo {
+            preferences: vec![ClientPreference {
+                id: 1,
+                key: "knowledge.autogenModel".into(),
+                value: "{broken explicit preference".into(),
+                updated_at: 1,
+            }],
+        }),
+    );
+    let session_model = ProviderWithModel {
+        provider_id: PROVIDER_ID_1.into(),
+        model: "session-model".into(),
+        use_model: Some("session-wire-model".into()),
+    };
+
+    let error = svc
+        .resolve_turn_writeback_model(Some(&session_model))
+        .await
+        .unwrap_err();
+
+    assert!(
+        error.contains("configured knowledge write-back model is invalid"),
+        "{error}"
+    );
 }
 
 /// Runtime registry that returns ONE persistent scripted Agent across rebuilds, so a

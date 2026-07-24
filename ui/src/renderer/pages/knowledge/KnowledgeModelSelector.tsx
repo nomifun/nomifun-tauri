@@ -29,29 +29,22 @@ const STORAGE_KEY = 'knowledge.autogenModel';
 
 /**
  * Persisted-default selection for the knowledge-base AI description/overview
- * generators. Reads/writes `knowledge.autogenModel`; an absent or now-invalid
- * stored pair resolves to `null` (backend default). Exposes the choice plus a
- * setter so callers can hand the pair straight to the three knowledge invokes.
+ * generators. Reads/writes `knowledge.autogenModel`; only an absent setting
+ * resolves to `null`. A now-unavailable stored pair stays visible until the
+ * user explicitly picks another model/default, matching the backend's
+ * fail-closed interpretation of an explicit model preference.
  */
 export function useKnowledgeAutogenModel() {
-  const { providers, getAvailableModels } = useModelProviderList();
-
   // Read reactively (useSyncExternalStore subscription), NOT a one-shot
   // configService.get(): setChoice writes via set/remove, which notify
   // subscribers — without subscribing, the selector kept showing the old label
   // ("默认模型") until the modal remounted ("点击切换模型没有任何反应").
   const [stored] = useConfig(STORAGE_KEY);
 
-  // A stored pair is only honoured while the provider is still enabled and the
-  // model still available; otherwise we fall back to the backend default so a
-  // deleted/disabled provider can never pin a broken selection.
   const choice = useMemo<KnowledgeModelChoice>(() => {
     if (!stored?.provider_id || !stored.model) return null;
-    const provider = providers.find((p) => p.id === stored.provider_id);
-    if (!provider) return null;
-    if (!getAvailableModels(provider).includes(stored.model)) return null;
     return { provider_id: stored.provider_id, model: stored.model };
-  }, [stored?.provider_id, stored?.model, providers, getAvailableModels]);
+  }, [stored?.provider_id, stored?.model]);
 
   const setChoice = useCallback(async (next: KnowledgeModelChoice) => {
     if (next) {
@@ -86,12 +79,24 @@ const KnowledgeModelSelector: React.FC<KnowledgeModelSelectorProps> = ({
 }) => {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const { providers, getAvailableModels } = useModelProviderList();
+  const { providers, getAvailableModels, isLoading } = useModelProviderList();
   const { data: modelConfig } = useProvidersQuery();
   const providerLabel = useModelSelectorProviderLabel();
 
   const defaultLabel = t('common.defaultModel');
-  const buttonLabel = choice ? choice.model : defaultLabel;
+  const choiceAvailable =
+    !choice ||
+    providers.some(
+      (provider) =>
+        provider.id === choice.provider_id &&
+        getAvailableModels(provider).includes(choice.model),
+    );
+  const choiceUnavailable = Boolean(choice && !isLoading && !choiceAvailable);
+  const buttonLabel = choice
+    ? choiceUnavailable
+      ? `${choice.model} · ${t('knowledge.form.modelUnavailable')}`
+      : choice.model
+    : defaultLabel;
 
   const droplist = (
     <Menu selectedKeys={choice ? [`${choice.provider_id}:${choice.model}`] : ['__default__']}>
@@ -145,7 +150,17 @@ const KnowledgeModelSelector: React.FC<KnowledgeModelSelectorProps> = ({
 
   return (
     <Dropdown trigger='click' droplist={droplist} disabled={disabled}>
-      <Button size={size} type='text' disabled={disabled} title={t('knowledge.form.modelSelectTooltip')}>
+      <Button
+        size={size}
+        type='text'
+        disabled={disabled}
+        status={choiceUnavailable ? 'warning' : undefined}
+        title={
+          choiceUnavailable
+            ? t('knowledge.form.modelUnavailableHint')
+            : t('knowledge.form.modelSelectTooltip')
+        }
+      >
         <span className='flex items-center gap-4px min-w-0 max-w-160px'>
           <Brain theme='outline' size='12' fill={iconColors.secondary} className='shrink-0' />
           <span className='truncate'>{buttonLabel}</span>

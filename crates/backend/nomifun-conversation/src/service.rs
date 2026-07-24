@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, LazyLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
@@ -54,7 +54,8 @@ use crate::convert::{
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::compute_initial_skills;
 use crate::stream_relay::{
-    RelayTerminal, StreamRelay, TurnWritebackAttempt, run_turn_writeback_report,
+    RelayTerminal, StreamRelay, TurnWritebackAttempt,
+    finish_turn_writeback_failure, run_turn_writeback_report,
 };
 use std::sync::RwLock;
 
@@ -68,8 +69,7 @@ const CANCEL_TEARDOWN_GRACE: Duration = Duration::from_secs(7);
 const CANCEL_COMPLETION_GRACE: Duration = Duration::from_secs(2);
 const CANCEL_HANDLER_GRACE: Duration = Duration::from_secs(11);
 const CANCEL_AUTH_PREFLIGHT_GRACE: Duration = Duration::from_secs(2);
-const TURN_WRITEBACK_GRACE: Duration = Duration::from_secs(5);
-const TURN_WRITEBACK_TERMINAL_GRACE: Duration = Duration::from_secs(3);
+const KNOWLEDGE_AUTOGEN_MODEL_PREF_KEY: &str = "knowledge.autogenModel";
 /// One relay terminal may trigger session persistence, failover/image rebuild,
 /// and ACP eviction. They share one deadline so several individually bounded
 /// operations cannot add up to an apparently permanent Running turn.
@@ -77,6 +77,8 @@ const POST_TERMINAL_TRANSITION_GRACE: Duration = Duration::from_secs(10);
 const DELETE_CORE_GRACE: Duration = Duration::from_secs(5);
 const DELETE_CLEANUP_ITEM_GRACE: Duration = Duration::from_secs(5);
 const DELETE_STOP_GRACE: Duration = Duration::from_secs(30);
+const TURN_WRITEBACK_INTENT_FOREGROUND_BUDGET: Duration = Duration::from_secs(1);
+const TURN_WRITEBACK_CANCEL_GRACE: Duration = Duration::from_secs(10);
 
 tokio::task_local! {
     static DELETED_CRON_JOB_IDS: Arc<[String]>;
@@ -147,6 +149,55 @@ struct DurableOperationLease {
 
 type DurableOperationGuards =
     Arc<std::sync::Mutex<std::collections::HashMap<String, DurableOperationLease>>>;
+struct TurnWritebackRun {
+    generation: u64,
+    cancellation: CancellationToken,
+}
+
+static TURN_WRITEBACKS_IN_FLIGHT: LazyLock<
+    std::sync::Mutex<HashMap<String, TurnWritebackRun>>,
+> = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static NEXT_TURN_WRITEBACK_RUN_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Process-local ownership for one detached write-back attempt. It deliberately
+/// has no durable queue semantics: after a process exit, history projection
+/// marks the orphaned running state retryable and the user can start one fresh
+/// attempt explicitly.
+struct TurnWritebackRunGuard {
+    key: String,
+    generation: u64,
+    cancellation: CancellationToken,
+}
+
+/// The automatic attempt intent is started before the foreground turn is
+/// released, but a slow database must not keep the conversation busy. A
+/// pending task is handed to the detached worker and awaited exactly once, so
+/// a late `started` write can never race a terminal state.
+enum TurnWritebackIntent {
+    Durable,
+    RetryPersistence,
+    Pending(tokio::task::JoinHandle<Result<(), String>>),
+}
+
+impl TurnWritebackRunGuard {
+    fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+}
+
+impl Drop for TurnWritebackRunGuard {
+    fn drop(&mut self) {
+        let mut in_flight = TURN_WRITEBACKS_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if in_flight
+            .get(&self.key)
+            .is_some_and(|run| run.generation == self.generation)
+        {
+            in_flight.remove(&self.key);
+        }
+    }
+}
 
 /// Ownership token passed from the synchronous idempotent admission path into
 /// whichever path is responsible for completing the durable receipt.  The
@@ -849,6 +900,321 @@ impl ConversationService {
         let provider_repo = self.failover_provider_repo.read().ok()?.clone()?;
         let client_prefs = self.failover_client_prefs.read().ok()?.clone()?;
         Some((provider_repo, client_prefs))
+    }
+
+    /// Resolve the model for one knowledge write-back. A valid explicit
+    /// knowledge preference wins; otherwise the model that actually completed
+    /// the conversation turn is used, including its provider-specific
+    /// `use_model` override.
+    pub(crate) async fn resolve_turn_writeback_model(
+        &self,
+        session_model: Option<&ProviderWithModel>,
+    ) -> Result<Option<ProviderWithModel>, String> {
+        let fallback = session_model.cloned();
+        let Some((provider_repo, client_prefs)) = self.failover_deps() else {
+            return Ok(fallback);
+        };
+        let preferences = match client_prefs
+            .get_by_keys(&[KNOWLEDGE_AUTOGEN_MODEL_PREF_KEY])
+            .await
+        {
+            Ok(preferences) => preferences,
+            Err(error) => {
+                warn!(
+                    error = %ErrorChain(&error),
+                    "Failed to read explicit knowledge write-back model"
+                );
+                return Err(
+                    "Could not read the configured knowledge write-back model; retry"
+                        .to_owned(),
+                );
+            }
+        };
+        let Some(raw) = preferences
+            .into_iter()
+            .find(|preference| preference.key == KNOWLEDGE_AUTOGEN_MODEL_PREF_KEY)
+            .map(|preference| preference.value)
+        else {
+            return Ok(fallback);
+        };
+        let mut selected = match serde_json::from_str::<ProviderWithModel>(&raw) {
+            Ok(selected) if selected.validate().is_ok() => selected,
+            Ok(_) | Err(_) => {
+                warn!(
+                    preference = KNOWLEDGE_AUTOGEN_MODEL_PREF_KEY,
+                    "Invalid explicit knowledge write-back model preference"
+                );
+                return Err(
+                    "The configured knowledge write-back model is invalid; update it and retry"
+                        .to_owned(),
+                );
+            }
+        };
+        // The knowledge preference UI selects exactly provider_id + model.
+        // `use_model` is a per-turn session failover override and must not be
+        // accepted from stale/manually imported preference JSON, where it
+        // could bypass the availability check below and call another model.
+        selected.use_model = None;
+        let provider = match provider_repo.find_by_id(&selected.provider_id).await {
+            Ok(Some(provider)) => provider,
+            Ok(None) => {
+                warn!(
+                    provider_id = %selected.provider_id,
+                    "Knowledge write-back model provider no longer exists"
+                );
+                return Err(
+                    "The configured knowledge write-back provider no longer exists; choose another model and retry"
+                        .to_owned(),
+                );
+            }
+            Err(error) => {
+                warn!(
+                    provider_id = %selected.provider_id,
+                    error = %ErrorChain(&error),
+                    "Failed to validate explicit knowledge write-back model"
+                );
+                return Err(
+                    "Could not validate the configured knowledge write-back model; retry"
+                        .to_owned(),
+                );
+            }
+        };
+        let models = serde_json::from_str::<Vec<String>>(&provider.models).unwrap_or_default();
+        let model_enabled = provider
+            .model_enabled
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<HashMap<String, bool>>(raw).ok())
+            .unwrap_or_default();
+        if !provider.enabled
+            || !models.iter().any(|model| model == &selected.model)
+            || model_enabled.get(&selected.model) == Some(&false)
+        {
+            warn!(
+                provider_id = %selected.provider_id,
+                model = %selected.model,
+                "Knowledge write-back model is unavailable"
+            );
+            return Err(
+                "The configured knowledge write-back model is unavailable; choose another model and retry"
+                    .to_owned(),
+            );
+        }
+        Ok(Some(selected))
+    }
+
+    fn turn_writeback_key(conversation_id: &str, message_id: &str) -> String {
+        format!("{conversation_id}\0{message_id}")
+    }
+
+    fn try_start_turn_writeback(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Option<TurnWritebackRunGuard> {
+        let key = Self::turn_writeback_key(conversation_id, message_id);
+        let mut in_flight = TURN_WRITEBACKS_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if in_flight.contains_key(&key) {
+            return None;
+        }
+        let generation =
+            NEXT_TURN_WRITEBACK_RUN_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let cancellation = CancellationToken::new();
+        in_flight.insert(
+            key.clone(),
+            TurnWritebackRun {
+                generation,
+                cancellation: cancellation.clone(),
+            },
+        );
+        Some(TurnWritebackRunGuard {
+            key,
+            generation,
+            cancellation,
+        })
+    }
+
+    fn turn_writeback_is_running(&self, conversation_id: &str, message_id: &str) -> bool {
+        TURN_WRITEBACKS_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&Self::turn_writeback_key(conversation_id, message_id))
+    }
+
+    fn cancel_turn_writebacks_for_conversation(&self, conversation_id: &str) {
+        let prefix = format!("{conversation_id}\0");
+        let cancellations: Vec<CancellationToken> = TURN_WRITEBACKS_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, run)| run.cancellation.clone())
+            .collect();
+        for cancellation in cancellations {
+            cancellation.cancel();
+        }
+    }
+
+    /// Cancel every process-local attempt for a conversation and wait until
+    /// each owner has reached a cancellation-safe boundary. Message
+    /// reset/delete must not race a late atomic knowledge-file publication or
+    /// let a detached state update recreate a row after the transcript is
+    /// gone.
+    async fn cancel_and_wait_for_turn_writebacks(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(), AppError> {
+        self.cancel_turn_writebacks_for_conversation(conversation_id);
+        let prefix = format!("{conversation_id}\0");
+        let drained = async {
+            loop {
+                let any_running = TURN_WRITEBACKS_IN_FLIGHT
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .keys()
+                    .any(|key| key.starts_with(&prefix));
+                if !any_running {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(TURN_WRITEBACK_CANCEL_GRACE, drained)
+            .await
+            .map_err(|_| {
+                AppError::Conflict(
+                    "Knowledge write-back is finishing a filesystem operation; retry clearing or deleting the conversation"
+                        .into(),
+                )
+            })
+    }
+
+    fn spawn_turn_writeback(
+        &self,
+        knowledge_service: Arc<nomifun_knowledge::KnowledgeService>,
+        mut request: nomifun_knowledge::TurnWritebackRequest,
+        session_model: Option<ProviderWithModel>,
+        attempt: TurnWritebackAttempt,
+        guard: TurnWritebackRunGuard,
+        intent: TurnWritebackIntent,
+    ) {
+        let resolver = self.clone();
+        let cancellation = guard.cancellation_token();
+        tokio::spawn(async move {
+            let _guard = guard;
+            let panic_attempt = attempt.clone();
+            let worker = async {
+                let intent_is_durable = match intent {
+                    TurnWritebackIntent::Durable => true,
+                    TurnWritebackIntent::RetryPersistence => false,
+                    TurnWritebackIntent::Pending(task) => match task.await {
+                        Ok(Ok(())) => true,
+                        Ok(Err(error)) => {
+                            warn!(
+                                error,
+                                "Pending automatic knowledge write-back intent persistence failed"
+                            );
+                            false
+                        }
+                        Err(error) => {
+                            warn!(
+                                error = %error,
+                                "Automatic knowledge write-back intent task exited unexpectedly"
+                            );
+                            false
+                        }
+                    },
+                };
+                if cancellation.is_cancelled() {
+                    attempt
+                        .interrupt("Knowledge write-back was cancelled because the conversation changed")
+                        .await;
+                    return;
+                }
+                if let Err(error) = attempt.announce_started(intent_is_durable).await {
+                    warn!(
+                        error,
+                        "Knowledge write-back did not start because its durable intent could not be persisted"
+                    );
+                    return;
+                }
+                request.cancellation = Some(cancellation);
+                request.model = match tokio::time::timeout(
+                    Duration::from_secs(3),
+                    resolver.resolve_turn_writeback_model(session_model.as_ref()),
+                )
+                .await
+                {
+                    Ok(Ok(model)) => model,
+                    Ok(Err(error)) => {
+                        finish_turn_writeback_failure(attempt, error).await;
+                        return;
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Knowledge write-back model resolution timed out"
+                        );
+                        finish_turn_writeback_failure(
+                            attempt,
+                            "Knowledge write-back model resolution timed out; retry"
+                                .to_owned(),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                run_turn_writeback_report(knowledge_service, request, attempt).await;
+            };
+            let result = AssertUnwindSafe(worker).catch_unwind().await;
+            match result {
+                Err(_) => {
+                    warn!("Detached knowledge write-back panicked");
+                    panic_attempt
+                        .interrupt("Knowledge write-back stopped unexpectedly")
+                        .await;
+                }
+                Ok(()) => {}
+            }
+        });
+    }
+
+    fn project_orphaned_turn_writeback(
+        &self,
+        mut response: MessageResponse,
+    ) -> MessageResponse {
+        let Some(writeback) = response
+            .content
+            .as_object_mut()
+            .and_then(|content| content.get_mut("knowledge_writeback"))
+        else {
+            return response;
+        };
+        if !writeback
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|status| matches!(status, "started" | "extracting" | "writing"))
+            || self.turn_writeback_is_running(&response.conversation_id, &response.message_id)
+        {
+            return response;
+        }
+        let interrupted_at = now_ms();
+        if let Some(state) = writeback.as_object_mut() {
+            state.insert("status".to_owned(), serde_json::json!("interrupted"));
+            state.insert("retryable".to_owned(), serde_json::json!(true));
+            state.insert("updated_at".to_owned(), serde_json::json!(interrupted_at));
+            state.insert("finished_at".to_owned(), serde_json::json!(interrupted_at));
+            state.insert("interrupted_at".to_owned(), serde_json::json!(interrupted_at));
+            state.insert(
+                "failures".to_owned(),
+                serde_json::json!([{
+                    "kb_id": serde_json::Value::Null,
+                    "rel_path": serde_json::Value::Null,
+                    "error": "Knowledge write-back was interrupted when the application stopped"
+                }]),
+            );
+        }
+        response
     }
 
     pub fn runtime_state(&self) -> Arc<ConversationRuntimeStateService> {
@@ -2634,6 +3000,8 @@ impl ConversationService {
             ));
         }
 
+        self.cancel_and_wait_for_turn_writebacks(conv_id).await?;
+
         // Deletion is stronger than a stop: block all future admissions in
         // the same synchronous boundary used by turn acquisition, then tear
         // down/force-release the exact current generation before deleting any
@@ -2714,6 +3082,8 @@ impl ConversationService {
 
         self.ensure_not_retained_execution_attempt(user_id, conv_id)
             .await?;
+
+        self.cancel_and_wait_for_turn_writebacks(conv_id).await?;
 
         // Delete all messages
         self.conversation_repo
@@ -2882,6 +3252,10 @@ impl ConversationService {
             let items = self
                 .project_history_artifact_integrity(&conversation, items)
                 .await?;
+            let items = items
+                .into_iter()
+                .map(|message| self.project_orphaned_turn_writeback(message))
+                .collect();
             return Ok(PaginatedResult {
                 items,
                 total: 0,
@@ -2947,6 +3321,10 @@ impl ConversationService {
         let items = self
             .project_history_artifact_integrity(&conversation, items)
             .await?;
+        let items = items
+            .into_iter()
+            .map(|message| self.project_orphaned_turn_writeback(message))
+            .collect();
         Ok(PaginatedResult {
             items,
             total: result.total,
@@ -2987,6 +3365,7 @@ impl ConversationService {
         let response = responses
             .pop()
             .ok_or_else(|| AppError::Internal("Message history projection returned no item".into()))?;
+        let response = self.project_orphaned_turn_writeback(response);
         if is_tool_message_type(response.r#type) || content_bytes > TOOL_CONTENT_COMPACT_THRESHOLD_BYTES {
             info!(
                 conversation_id,
@@ -2998,6 +3377,346 @@ impl ConversationService {
         }
 
         Ok(response)
+    }
+
+    /// Start exactly one user-requested retry of a failed turn-final knowledge
+    /// write-back. This intentionally does not enqueue or persist a job: the
+    /// detached worker owns one attempt, and another retry remains an explicit
+    /// user action after any terminal failure.
+    pub async fn retry_knowledge_writeback(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        expected_attempt_id: &str,
+    ) -> Result<(), AppError> {
+        let conversation_id = parse_conv_id(conversation_id)?;
+        let message_id = parse_message_id(message_id)?;
+        let conversation = self
+            .conversation_repo
+            .get(conversation_id)
+            .await?
+            .filter(|row| row.user_id == user_id)
+            .ok_or_else(|| AppError::NotFound(format!("Conversation {conversation_id} not found")))?;
+        let mut assistant = self
+            .conversation_repo
+            .get_message(conversation_id, message_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Message {message_id} not found")))?;
+        if assistant.r#type != "text"
+            || assistant.position.as_deref() != Some("left")
+            || assistant.status.as_deref() != Some("finish")
+        {
+            return Err(AppError::Conflict(
+                "Only a completed assistant text response can retry knowledge write-back".into(),
+            ));
+        }
+        let mut assistant_content: serde_json::Value = serde_json::from_str(&assistant.content)
+            .map_err(|error| AppError::Internal(format!("Invalid assistant message content JSON: {error}")))?;
+        let initial_state = assistant_content
+            .get("knowledge_writeback")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| AppError::Conflict("Message has no knowledge write-back attempt".into()))?;
+        if initial_state
+            .get("attempt_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            != expected_attempt_id
+        {
+            return Err(AppError::Conflict(
+                "Knowledge write-back attempt changed; refresh the message before retrying".into(),
+            ));
+        }
+        let status = initial_state
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let orphaned_running = matches!(status, "started" | "extracting" | "writing");
+        let retryable_terminal = initial_state
+            .get("retryable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            && matches!(status, "no_completer" | "partial" | "failed" | "interrupted");
+        if !orphaned_running && !retryable_terminal {
+            return Err(AppError::Conflict(
+                "Knowledge write-back is not in a retryable state".into(),
+            ));
+        }
+
+        // Admit the expected generation before any mount/file/model preparation.
+        // Re-read under the guard so two concurrent POSTs for the same old
+        // attempt cannot execute sequentially if the first finishes quickly.
+        let guard = self
+            .try_start_turn_writeback(conversation_id, message_id)
+            .ok_or_else(|| {
+                AppError::Conflict("Knowledge write-back is already running for this message".into())
+            })?;
+        assistant = self
+            .conversation_repo
+            .get_message(conversation_id, message_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Message {message_id} not found")))?;
+        assistant_content = serde_json::from_str(&assistant.content)
+            .map_err(|error| AppError::Internal(format!("Invalid assistant message content JSON: {error}")))?;
+        let state = assistant_content
+            .get("knowledge_writeback")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| AppError::Conflict("Message has no knowledge write-back attempt".into()))?;
+        if state
+            .get("attempt_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            != expected_attempt_id
+        {
+            return Err(AppError::Conflict(
+                "Knowledge write-back attempt changed; refresh the message before retrying".into(),
+            ));
+        }
+        let current_status = state
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let current_retryable = matches!(
+            current_status,
+            "started" | "extracting" | "writing"
+        ) || (state
+            .get("retryable")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            && matches!(
+                current_status,
+                "no_completer" | "partial" | "failed" | "interrupted"
+            ));
+        if !current_retryable {
+            return Err(AppError::Conflict(
+                "Knowledge write-back is not in a retryable state".into(),
+            ));
+        }
+
+        let final_text = state
+            .get("assistant_text")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                assistant_content
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .map(str::to_owned)
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| AppError::Conflict("Assistant response has no text to write back".into()))?;
+        let attempt_generation = state
+            .get("attempt_generation")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| AppError::Conflict("Knowledge write-back attempt generation overflow".into()))?;
+
+        // New attempts persist the exact source id. For pre-fix failures,
+        // recover the nearest preceding visible user text so those messages are
+        // not permanently stranded without a retry path.
+        let source = if let Some(source_message_id) = state
+            .get("source_message_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            let source_message_id = parse_message_id(source_message_id)?;
+            self.conversation_repo
+                .get_message(conversation_id, source_message_id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::Conflict(
+                        "The source user message for this write-back no longer exists".into(),
+                    )
+                })?
+        } else {
+            let mut before = Some((assistant.created_at, assistant.message_id.clone()));
+            let mut recovered = None;
+            loop {
+                let page = self
+                    .conversation_repo
+                    .get_messages_keyset(
+                    conversation_id,
+                    before,
+                    200,
+                )
+                    .await?;
+                if let Some(source) = page
+                    .items
+                    .iter()
+                    .find(|row| {
+                        row.r#type == "text"
+                            && row.position.as_deref() == Some("right")
+                    })
+                    .cloned()
+                {
+                    recovered = Some(source);
+                    break;
+                }
+                if !page.has_more {
+                    break;
+                }
+                let Some(oldest) = page.items.last() else {
+                    break;
+                };
+                before = Some((oldest.created_at, oldest.message_id.clone()));
+            }
+            recovered.ok_or_else(|| {
+                AppError::Conflict(
+                    "Could not recover the source user message for this write-back".into(),
+                )
+            })?
+        };
+        if source.r#type != "text" || source.position.as_deref() != Some("right") {
+            return Err(AppError::Conflict(
+                "Knowledge write-back source is not a user text message".into(),
+            ));
+        }
+        let source_content: serde_json::Value = serde_json::from_str(&source.content)
+            .map_err(|error| AppError::Internal(format!("Invalid source message content JSON: {error}")))?;
+        let user_text = source_content
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| AppError::Conflict("Source user message has no text".into()))?;
+
+        let mut runtime_options = self.build_runtime_options(&conversation)?;
+        self.apply_knowledge_mounts(&conversation, &mut runtime_options, None)
+            .await;
+        let (companion, _companion_id, channel_platform) =
+            companion_context_from_extra(&conversation.extra)?;
+        let agent_type = string_to_enum(&conversation.r#type)?;
+        let (knowledge_service, mut request) = self
+            .build_turn_writeback_request(
+                &runtime_options.extra,
+                conversation_id,
+                &assistant.message_id,
+                &user_text,
+                None,
+                agent_type,
+                companion,
+                channel_platform.as_deref(),
+            )
+            .ok_or_else(|| {
+                AppError::Conflict(
+                    "Knowledge write-back is no longer enabled or has no mounted knowledge base"
+                        .into(),
+                )
+            })?;
+        // Staged writes use one conversation scope across explicit tool writes
+        // and turn-final extraction. This lets an automatic attempt de-duplicate
+        // a proposal already staged during the same conversation.
+        request.scope = conversation_id.to_owned();
+        let prior_written = state
+            .get("written")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let prior_failures = state
+            .get("failures")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let retry_error_context = prior_failures
+            .iter()
+            .take(8)
+            .map(|failure| {
+                let normalize = |value: &str, max_chars: usize| {
+                    nomi_redact::redact_secrets_owned(value.to_owned())
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .chars()
+                        .take(max_chars)
+                        .collect::<String>()
+                };
+                let kb_id = normalize(failure
+                    .get("kb_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("<global>"), 96);
+                let path = normalize(failure
+                    .get("rel_path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("<global>"), 320);
+                let error = normalize(failure
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unspecified failure"), 512);
+                format!(
+                    "- retry target {kb_id}:{path}; previous error: {error}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !retry_error_context.is_empty() {
+            request.user_text.push_str(
+                "\n\nPrevious knowledge write-back errors to correct on this retry:\n",
+            );
+            request.user_text.push_str(&retry_error_context);
+        }
+        if !prior_written.is_empty() {
+            let persisted_scope = state
+                .get("scope")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&request.scope);
+            let staged_prefix =
+                format!("_inbox/{}/", persisted_scope.trim_matches('/'));
+            let excluded_targets: Vec<(nomifun_common::KnowledgeBaseId, String)> =
+                prior_written
+                .iter()
+                .filter_map(|written| {
+                    let kb_id = serde_json::from_value(
+                        written.get("kb_id")?.clone(),
+                    )
+                    .ok()?;
+                    let stored_path = written
+                        .get("rel_path")?
+                        .as_str()?
+                        .trim()
+                        .to_owned();
+                    let rel_path = if written
+                        .get("staged")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        stored_path.strip_prefix(&staged_prefix)?.to_owned()
+                    } else {
+                        stored_path
+                    };
+                    (!rel_path.is_empty()).then_some((kb_id, rel_path))
+                })
+                .collect();
+            if !excluded_targets.is_empty() {
+                request.excluded_targets = Some(excluded_targets);
+            }
+        }
+        let session_model = runtime_options.model.clone();
+        let attempt = TurnWritebackAttempt::new(
+            Arc::clone(&self.conversation_repo),
+            Arc::clone(&self.user_events),
+            user_id.to_owned(),
+            conversation_id.to_owned(),
+            message_id.to_owned(),
+            source.message_id,
+            request.scope.clone(),
+            final_text,
+            prior_written,
+            prior_failures,
+            attempt_generation,
+        );
+        attempt.persist_started_intent().await.map_err(|error| {
+            AppError::Internal(format!(
+                "Failed to persist knowledge write-back retry intent: {error}"
+            ))
+        })?;
+        self.spawn_turn_writeback(
+            knowledge_service,
+            request,
+            session_model,
+            attempt,
+            guard,
+            TurnWritebackIntent::Durable,
+        );
+        Ok(())
     }
 
     /// List artifacts for a conversation with durable status state.
@@ -3846,6 +4565,7 @@ impl ConversationService {
         // correlation id so DB row, WebSocket stream events, and
         // agent-internal tracing all share one identifier per turn.
         let user_msg_id_ret = user_msg_id.clone();
+        let source_user_message_id = user_msg_id.clone();
         let stable_turn_id = first_turn_msg_id.clone();
         let owner_turn_generation = turn_handle.turn_id();
         let owner_conversation_id = conversation_key.clone();
@@ -3880,6 +4600,7 @@ impl ConversationService {
             let build_started_at = now_ms();
             info!(conversation_id = %conv_id, "Agent runtime build started");
             let knowledge_extra = runtime_options.extra.clone();
+            let mut successful_turn_model = runtime_options.model.clone();
             let mut agent = match runtime_registry
                 .get_or_create_runtime_for_turn(
                     &conv_id,
@@ -4057,6 +4778,7 @@ impl ConversationService {
                 nomifun_knowledge::TurnWritebackRequest,
                 String,
                 String,
+                Option<ProviderWithModel>,
             )> = None;
             let mut durable_completion: Option<(bool, Option<String>, Option<String>)> = None;
             // Phase 3 (review #1/#5): resolve the effective failover config ONCE
@@ -4293,6 +5015,7 @@ impl ConversationService {
                 if let Some(switch) = failover_switch {
                     failover_switches_done += 1;
                     failover_tried.push(switch.picked.clone());
+                    successful_turn_model = Some(switch.picked.clone());
                     info!(
                         conversation_id = %conv_id,
                         switch = failover_switches_done,
@@ -4503,9 +5226,15 @@ impl ConversationService {
                             agent.agent_type(),
                             companion,
                             channel_platform.as_deref(),
-                        )
+                    )
                     {
-                        final_turn_writeback = Some((knowledge_service, request, final_text_msg_id, final_text));
+                        final_turn_writeback = Some((
+                            knowledge_service,
+                            request,
+                            final_text_msg_id,
+                            final_text,
+                            successful_turn_model.clone(),
+                        ));
                     }
                     break;
                 }
@@ -4557,6 +5286,90 @@ impl ConversationService {
             )
             .await;
 
+            // Persist only the one-shot intent before publishing authoritative
+            // idle. No model call or knowledge I/O starts here. If the process
+            // exits after turn completion but before the detached worker is
+            // first polled, history can still project this durable marker as an
+            // interrupted attempt and offer manual retry.
+            let prepared_turn_writeback = if let Some((
+                knowledge_service,
+                request,
+                msg_id,
+                final_text,
+                session_model,
+            )) = final_turn_writeback
+            {
+                match service.try_start_turn_writeback(&conv_id, &msg_id) {
+                    Some(guard) => {
+                        let attempt = TurnWritebackAttempt::new(
+                            Arc::clone(&repo),
+                            Arc::clone(&user_events),
+                            user_id_owned.clone(),
+                            conv_id.clone(),
+                            msg_id,
+                            source_user_message_id,
+                            request.scope.clone(),
+                            final_text,
+                            Vec::new(),
+                            Vec::new(),
+                            1,
+                        );
+                        let intent_attempt = attempt.clone();
+                        let mut intent_task = tokio::spawn(async move {
+                            intent_attempt.persist_started_intent().await
+                        });
+                        let intent = match tokio::time::timeout(
+                            TURN_WRITEBACK_INTENT_FOREGROUND_BUDGET,
+                            &mut intent_task,
+                        )
+                        .await
+                        {
+                            Ok(Ok(Ok(()))) => TurnWritebackIntent::Durable,
+                            Ok(Ok(Err(error))) => {
+                                warn!(
+                                    conversation_id = %conv_id,
+                                    error,
+                                    "Failed to persist automatic knowledge write-back intent before turn release"
+                                );
+                                TurnWritebackIntent::RetryPersistence
+                            }
+                            Ok(Err(error)) => {
+                                warn!(
+                                    conversation_id = %conv_id,
+                                    error = %error,
+                                    "Automatic knowledge write-back intent task exited unexpectedly"
+                                );
+                                TurnWritebackIntent::RetryPersistence
+                            }
+                            Err(_) => {
+                                debug!(
+                                    conversation_id = %conv_id,
+                                    "Knowledge write-back intent persistence exceeded the foreground budget; handing it to the detached worker"
+                                );
+                                TurnWritebackIntent::Pending(intent_task)
+                            }
+                        };
+                        Some((
+                            knowledge_service,
+                            request,
+                            session_model,
+                            attempt,
+                            guard,
+                            intent,
+                        ))
+                    }
+                    None => {
+                        warn!(
+                            conversation_id = %conv_id,
+                            "Skipped duplicate automatic knowledge write-back attempt"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             // The model turn is finished at this point. Release the exact turn
             // and publish authoritative idle before optional knowledge
             // write-back: post-processing must never keep the conversation
@@ -4574,56 +5387,23 @@ impl ConversationService {
                 )
                 .await;
 
-            if !turn_token.is_cancelled()
-                && let Some((knowledge_service, request, msg_id, final_text)) = final_turn_writeback
+            if let Some((
+                knowledge_service,
+                request,
+                session_model,
+                attempt,
+                guard,
+                intent,
+            )) = prepared_turn_writeback
             {
-                let attempt = TurnWritebackAttempt::new(
-                    Arc::clone(&repo),
-                    Arc::clone(&user_events),
-                    user_id_owned.clone(),
-                    conv_id.clone(),
-                    msg_id,
-                );
-                let writeback = AssertUnwindSafe(run_turn_writeback_report(
+                service.spawn_turn_writeback(
                     knowledge_service,
                     request,
-                    final_text,
-                    attempt.clone(),
-                ))
-                .catch_unwind();
-                let interrupted_reason = tokio::select! {
-                    biased;
-                    _ = turn_token.cancelled() => {
-                        info!(conversation_id = %conv_id, "Post-turn write-back cancelled");
-                        Some("Knowledge write-back was cancelled after the turn completed")
-                    }
-                    result = tokio::time::timeout(TURN_WRITEBACK_GRACE, writeback) => {
-                        match result {
-                            Ok(Ok(())) => None,
-                            Ok(Err(_)) => {
-                                warn!(conversation_id = %conv_id, "Post-turn write-back panicked");
-                                Some("Knowledge write-back stopped unexpectedly after the turn completed")
-                            }
-                            Err(_) => {
-                                warn!(conversation_id = %conv_id, "Turn write-back exceeded the hard bound");
-                                Some("Knowledge write-back timed out after the turn completed")
-                            }
-                        }
-                    }
-                };
-                if let Some(reason) = interrupted_reason
-                    && tokio::time::timeout(
-                        TURN_WRITEBACK_TERMINAL_GRACE,
-                        attempt.interrupt(reason),
-                    )
-                    .await
-                    .is_err()
-                {
-                    warn!(
-                        conversation_id = %conv_id,
-                        "Timed out publishing interrupted write-back terminal state"
-                    );
-                }
+                    session_model,
+                    attempt,
+                    guard,
+                    intent,
+                );
             }
             })
             .catch_unwind()
@@ -5109,6 +5889,12 @@ impl ConversationService {
         // 4. 取在飞 agent 并回退最后一个 turn（内部会先停掉在飞 turn）。
         let agent = self.runtime_handle(conversation_id)?;
         agent.rewind_last_turn().await?;
+        runtime_build_lease.ensure_active()?;
+
+        // The completed old turn may already own a detached knowledge
+        // write-back. Drain it before deleting its source/assistant rows so it
+        // cannot publish late knowledge or recreate state after the rewind.
+        self.cancel_and_wait_for_turn_writebacks(conv_id).await?;
         runtime_build_lease.ensure_active()?;
 
         // 5. 截断 DB：删除目标(含)及其后所有消息。
@@ -5679,6 +6465,8 @@ impl ConversationService {
         self.ensure_not_retained_execution_attempt(user_id, conv_id)
             .await?;
 
+        self.cancel_and_wait_for_turn_writebacks(conv_id).await?;
+
         // 1. Delete the persisted transcript and artifacts (NOT status).
         self.conversation_repo.delete_messages_by_conversation(conv_id).await?;
         self.conversation_repo.delete_artifacts_by_conversation(conv_id).await?;
@@ -6108,7 +6896,7 @@ impl ConversationService {
         &self,
         extra: &serde_json::Value,
         conversation_id: &str,
-        msg_id: &str,
+        _msg_id: &str,
         user_text: &str,
         origin: Option<&str>,
         agent_type: AgentType,
@@ -6163,13 +6951,7 @@ impl ConversationService {
         } else {
             nomifun_knowledge::WriteSurface::RegularChat
         };
-        let conversation_scope = conversation_id.trim_matches('/');
-        let turn_scope = msg_id.trim_matches('/');
-        let scope = if turn_scope.is_empty() {
-            conversation_scope.to_owned()
-        } else {
-            format!("{conversation_scope}/{turn_scope}")
-        };
+        let scope = conversation_id.trim_matches('/').to_owned();
         let request = nomifun_knowledge::TurnWritebackRequest {
             mounts: mounts.clone(),
             binding: nomifun_knowledge::KnowledgeBinding {
@@ -6185,6 +6967,9 @@ impl ConversationService {
             scope,
             user_text: user_text.to_owned(),
             assistant_text: String::new(),
+            model: None,
+            excluded_targets: None,
+            cancellation: None,
         };
 
         Some((service, request))

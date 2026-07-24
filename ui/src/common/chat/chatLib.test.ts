@@ -14,6 +14,7 @@ import {
 import {
   composeMessage,
   joinPath,
+  mergeTextMessageContent,
   transformKnowledgeWritebackEvent,
   transformMessage,
   transformUserCreatedEvent,
@@ -34,6 +35,62 @@ describe('joinPath compatibility export', () => {
   test('preserves UNC and URI prefixes', () => {
     expect(joinPath('//server/share/project', '../cat.png')).toBe('//server/share/cat.png');
     expect(joinPath('https://example.com/assets', 'cat.png')).toBe('https://example.com/assets/cat.png');
+  });
+});
+
+describe('knowledge writeback attempt ordering', () => {
+  test('does not let a delayed older attempt overwrite a newer manual retry', () => {
+    const merged = mergeTextMessageContent(
+      {
+        content: 'Final answer.',
+        knowledge_writeback: {
+          status: 'writing',
+          attempt_id: 'attempt-2',
+          started_at: 200,
+          updated_at: 220,
+        },
+      },
+      {
+        content: '',
+        knowledge_writeback: {
+          status: 'failed',
+          attempt_id: 'attempt-1',
+          started_at: 100,
+          // Deliberately later than attempt-2's latest progress timestamp:
+          // generation order must come from started_at, not delivery time.
+          updated_at: 999,
+          retryable: true,
+        },
+      }
+    );
+
+    expect(merged.knowledge_writeback?.attempt_id).toBe('attempt-2');
+    expect(merged.knowledge_writeback?.status).toBe('writing');
+  });
+
+  test('keeps terminal state monotonic within one attempt', () => {
+    const merged = mergeTextMessageContent(
+      {
+        content: 'Final answer.',
+        knowledge_writeback: {
+          status: 'written',
+          attempt_id: 'attempt-1',
+          started_at: 100,
+          updated_at: 200,
+        },
+      },
+      {
+        content: '',
+        knowledge_writeback: {
+          status: 'writing',
+          attempt_id: 'attempt-1',
+          started_at: 100,
+          updated_at: 300,
+        },
+      }
+    );
+
+    expect(merged.knowledge_writeback?.status).toBe('written');
   });
 });
 

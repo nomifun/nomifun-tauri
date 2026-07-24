@@ -597,6 +597,14 @@ export const conversation = {
   clearMessages: httpPost<boolean, { conversation_id: ConversationId }>(
     (p) => `/api/conversations/${p.conversation_id}/clear-messages`
   ),
+  retryKnowledgeWriteback: httpPost<
+    void,
+    { conversation_id: ConversationId; message_id: MessageId; attempt_id: string }
+  >(
+    (p) =>
+      `/api/conversations/${p.conversation_id}/messages/${p.message_id}/knowledge-writeback/retry`,
+    (p) => ({ attempt_id: p.attempt_id })
+  ),
   activeCount: httpGet<{ count: number }>('/api/conversations/active-count'),
   sendMessage: withResponseMap(
     httpPost<ISendMessageResult, ISendMessageParams>(
@@ -678,6 +686,9 @@ export const conversation = {
   knowledgeWriteback: wsMappedEmitter<IKnowledgeWritebackEvent>('knowledge.writeback', (raw) =>
     fromApiKnowledgeWritebackEvent(raw as IKnowledgeWritebackEvent)
   ),
+  /** The server does not replay WebSocket frames. Consumers with durable
+   * projections must reload them after a successful reconnect. */
+  reconnected: wsEmitter<undefined>('ws.reconnected'),
   turnStarted: wsMappedEmitter<IConversationTurnStartedEvent, unknown>('turn.started', (raw) => {
     const r = raw as Record<string, unknown>;
     const rawRuntime = (r.runtime ?? {}) as Record<string, unknown>;
@@ -2619,9 +2630,10 @@ export interface IKnowledgeWritebackEvent {
     | 'failed'
     | 'no_candidate'
     | 'no_completer'
-    | 'disabled'
-    | 'interrupted';
+  | 'disabled'
+  | 'interrupted';
   attempt_id?: string;
+  attempt_generation?: number;
   started_at?: number;
   updated_at?: number;
   finished_at?: number | null;

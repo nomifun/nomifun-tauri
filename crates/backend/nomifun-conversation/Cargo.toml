@@ -16,6 +16,7 @@ nomifun-knowledge.workspace = true
 nomifun-preset.workspace = true
 nomifun-mcp.workspace = true
 nomifun-runtime.workspace = true
+nomi-redact.workspace = true
 axum.workspace = true
 regex.workspace = true
 tokio.workspace = true

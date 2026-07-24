@@ -104,6 +104,16 @@ pub trait KnowledgeConnector: Send + Sync {
     /// Discriminator stored in `extra.source.kind` (e.g. "feishu").
     fn kind(&self) -> &'static str;
 
+    /// Reconstruct the canonical source URL from a deletion tombstone's
+    /// remote id. The coordinator uses this to find and quarantine snapshots
+    /// written by older filename schemes without guessing from a lossy slug.
+    /// Connectors whose fetched documents have no canonical URL may keep the
+    /// default: their snapshots use the coordinator's exact `kind://remote_id`
+    /// fallback, which is always checked as well.
+    fn source_url_for_remote_id(&self, _remote_id: &str) -> Option<String> {
+        None
+    }
+
     /// Validate credentials; returns connector identity. Used at credential
     /// registration time and the UI "test connection" action.
     async fn validate_credentials(&self, cred: &ConnectorCredential) -> Result<ConnectorIdentity, AppError>;
